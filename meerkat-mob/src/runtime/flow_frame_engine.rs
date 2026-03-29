@@ -146,13 +146,10 @@ impl FlowFrameEngine {
                 .await?;
             match effects_opt {
                 None => {
-                    // Queue empty — check if frame is fully done.
-                    let snap = self.require_frame(run_id, frame_id).await?;
-                    if snap.kernel_state.phase != "Running" {
-                        break;
-                    }
-                    // Sequential executor: if queue is empty and still Running,
-                    // all remaining nodes are either Running or blocked — break.
+                    // Queue empty — frame is done or every remaining node is
+                    // blocked on a Running predecessor. In the sequential
+                    // executor neither case can make progress; break and
+                    // terminalize below if all nodes are terminal.
                     break;
                 }
                 Some(effects) => {
@@ -223,8 +220,10 @@ impl FlowFrameEngine {
                                 }
                             };
 
+                            // Use "::" as the separator so loop_instance_id can never
+                            // collide with a node whose name happens to contain "-iter-".
                             let loop_instance_id =
-                                LoopInstanceId::from(format!("{frame_id}-{node_id}").as_str());
+                                LoopInstanceId::from(format!("{frame_id}::{node_id}").as_str());
                             let loop_id = loop_spec.loop_id.clone();
 
                             let loop_result = self
@@ -328,12 +327,24 @@ impl FlowFrameEngine {
         max_iterations: u32,
         context: &FlowContext,
     ) -> Result<LoopResult, MobError> {
+        // Context isolation note: `iter_context` starts as a clone of the
+        // parent frame's context at the moment the loop node is admitted.
+        // In the sequential executor, every node that could possibly have
+        // completed before the loop node (i.e. every transitive dependency)
+        // is already reflected in `context.step_outputs` at this point.
+        //
+        // In a hypothetical parallel executor, sibling nodes that share no
+        // dependency with the loop node may not have completed yet — their
+        // outputs would be absent from `iter_context`. That is intentional:
+        // loop bodies are logically encapsulated and should not race on
+        // sibling output availability.
         let mut iter_context = context.clone();
         let mut condition_met = false;
 
         for iteration in 0..max_iterations as u64 {
+            // Use "::" separator consistent with loop_instance_id construction.
             let body_frame_id =
-                FrameId::from(format!("{loop_instance_id}-iter-{iteration}").as_str());
+                FrameId::from(format!("{loop_instance_id}::iter-{iteration}").as_str());
 
             // Execute the body frame with loop context so each step's output is
             // routed to loop_iteration_outputs[loop_id][iteration] in the store.
@@ -377,7 +388,10 @@ impl FlowFrameEngine {
             }
         }
 
-        // Extract the accumulated iteration outputs from the context.
+        // Extract the accumulated iteration outputs.
+        // shift_remove preserves insertion order of the remaining map entries
+        // (vs the deprecated remove which would disrupt order); since loop_outputs
+        // is small this is negligible but avoids the deprecation warning.
         let all_iter_outputs = iter_context
             .loop_outputs
             .shift_remove(loop_id)

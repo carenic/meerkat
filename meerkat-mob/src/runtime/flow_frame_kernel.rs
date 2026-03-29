@@ -146,14 +146,15 @@ impl FlowFrameKernel {
     ///
     /// Reads the current snapshot, applies `input` to produce `next_snapshot`,
     /// then CAS-updates the store. Returns the effects from the transition on
-    /// success, or `None` if the CAS was lost (retry up to `max_retries` times).
+    /// success. Returns `Err` on both transition failure and CAS exhaustion —
+    /// callers must treat `Ok(Some(effects))` as the only success path.
     async fn transition_frame(
         &self,
         run_id: &RunId,
         frame_id: &FrameId,
         input: KernelInput,
         max_retries: usize,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError> {
+    ) -> Result<Vec<KernelEffect>, MobError> {
         for _ in 0..=max_retries {
             let current = self.require_frame(run_id, frame_id).await?;
             let outcome = flow_frame::transition(&current.kernel_state, &input)
@@ -167,10 +168,12 @@ impl FlowFrameKernel {
                 .cas_frame_state(run_id, frame_id, Some(&current), next)
                 .await?;
             if won {
-                return Ok(Some(effects));
+                return Ok(effects);
             }
         }
-        Ok(None)
+        Err(MobError::Internal(format!(
+            "transition_frame: CAS exhausted {max_retries} retries for frame '{frame_id}'"
+        )))
     }
 }
 
@@ -185,6 +188,17 @@ impl FlowFrameMutator for FlowFrameKernel {
         frame_id: &FrameId,
         spec: &FrameSpec,
     ) -> Result<FrameSnapshot, MobError> {
+        // Resume guard: if the frame was already started (e.g. crash-recovery),
+        // return the existing snapshot rather than re-initializing it.
+        let run = self
+            .run_store
+            .get_run(run_id)
+            .await?
+            .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
+        if let Some(existing) = run.frames.get(frame_id) {
+            return Ok(existing.clone());
+        }
+
         let initial = flow_frame::initial_state()
             .map_err(|e| MobError::Internal(format!("flow_frame initial_state failed: {e:?}")))?;
         let ordered = topological_order(spec)?;
@@ -194,15 +208,24 @@ impl FlowFrameMutator for FlowFrameKernel {
         let snapshot = FrameSnapshot {
             kernel_state: outcome.next_state,
         };
-        // Insert as a new frame (expected = None)
+        // CAS-insert the new frame (expected = None means "must not yet exist").
         let inserted = self
             .run_store
             .cas_frame_state(run_id, frame_id, None, snapshot.clone())
             .await?;
         if !inserted {
-            return Err(MobError::Internal(format!(
-                "frame '{frame_id}' already exists in run '{run_id}'"
-            )));
+            // A concurrent writer started the frame between our read and insert.
+            // Read the winner's snapshot and return it.
+            let run2 = self
+                .run_store
+                .get_run(run_id)
+                .await?
+                .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
+            return run2.frames.get(frame_id).cloned().ok_or_else(|| {
+                MobError::Internal(format!(
+                    "frame '{frame_id}' missing after concurrent insert in run '{run_id}'"
+                ))
+            });
         }
         Ok(snapshot)
     }
@@ -216,7 +239,10 @@ impl FlowFrameMutator for FlowFrameKernel {
             variant: "AdmitNextReadyNode".into(),
             fields: BTreeMap::new(),
         };
-        self.transition_frame(run_id, frame_id, input, 5).await
+        // Map Ok(effects) → Ok(Some(effects)); errors propagate as-is.
+        self.transition_frame(run_id, frame_id, input, 5)
+            .await
+            .map(Some)
     }
 
     async fn admit_next_ready_node_with_retry(
@@ -365,10 +391,11 @@ impl FlowFrameMutator for FlowFrameKernel {
             variant: "CompleteNode".into(),
             fields: BTreeMap::from([("node_id".into(), Self::node_val(node_id))]),
         };
-        Ok(self
-            .transition_frame(run_id, frame_id, input, 5)
-            .await?
-            .is_some())
+        // transition_frame now returns Err on CAS exhaustion rather than Ok(None),
+        // so Ok always means the transition fired successfully.
+        self.transition_frame(run_id, frame_id, input, 5)
+            .await
+            .map(|_| true)
     }
 
     async fn fail_node(
@@ -381,10 +408,9 @@ impl FlowFrameMutator for FlowFrameKernel {
             variant: "FailNode".into(),
             fields: BTreeMap::from([("node_id".into(), Self::node_val(node_id))]),
         };
-        Ok(self
-            .transition_frame(run_id, frame_id, input, 5)
-            .await?
-            .is_some())
+        self.transition_frame(run_id, frame_id, input, 5)
+            .await
+            .map(|_| true)
     }
 
     async fn skip_node(
@@ -397,10 +423,9 @@ impl FlowFrameMutator for FlowFrameKernel {
             variant: "SkipNode".into(),
             fields: BTreeMap::from([("node_id".into(), Self::node_val(node_id))]),
         };
-        Ok(self
-            .transition_frame(run_id, frame_id, input, 5)
-            .await?
-            .is_some())
+        self.transition_frame(run_id, frame_id, input, 5)
+            .await
+            .map(|_| true)
     }
 
     async fn terminalize_frame(
@@ -412,10 +437,9 @@ impl FlowFrameMutator for FlowFrameKernel {
             variant: "TerminalizeCompleted".into(),
             fields: BTreeMap::new(),
         };
-        Ok(self
-            .transition_frame(run_id, frame_id, input, 5)
-            .await?
-            .is_some())
+        self.transition_frame(run_id, frame_id, input, 5)
+            .await
+            .map(|_| true)
     }
 }
 
