@@ -80,6 +80,20 @@ impl FlowEngine {
 
         // If the flow uses the new frame-based execution path, dispatch to FlowFrameEngine.
         if let Some(root_spec) = &config.flow_spec.root {
+            if !self.run_store.supports_frame_execution() {
+                return self
+                    .fail_run(
+                        &run_id,
+                        &config.flow_id,
+                        MobError::NotYetImplemented(
+                            "frame-based flows (FlowSpec.root) require InMemoryMobRunStore; \
+                             redb CAS wrappers are not yet implemented"
+                                .into(),
+                        ),
+                    )
+                    .await;
+            }
+
             let frame_id = crate::ids::FrameId::from(format!("{run_id}-root").as_str());
             let context = FlowContext {
                 run_id: run_id.clone(),
@@ -96,11 +110,27 @@ impl FlowEngine {
                 self.run_store.clone(),
                 Arc::new(adapter),
             );
-            let result = frame_engine
-                .execute_frame(&run_id, &frame_id, root_spec, &context)
-                .await;
+            let frame_result = if let Some(limit_ms) =
+                config.limits.as_ref().and_then(|l| l.max_flow_duration_ms)
+            {
+                tokio::select! {
+                    r = frame_engine.execute_frame(&run_id, &frame_id, root_spec, &context) => r,
+                    _ = cancel.cancelled() => Err(MobError::RunCanceled(run_id.clone())),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(limit_ms)) => {
+                        Err(MobError::FlowFailed {
+                            run_id: run_id.clone(),
+                            reason: format!("max flow duration exceeded ({limit_ms}ms)"),
+                        })
+                    }
+                }
+            } else {
+                tokio::select! {
+                    r = frame_engine.execute_frame(&run_id, &frame_id, root_spec, &context) => r,
+                    _ = cancel.cancelled() => Err(MobError::RunCanceled(run_id.clone())),
+                }
+            };
 
-            match result {
+            match frame_result {
                 Ok(_outputs) => {
                     let flow_id = config.flow_id;
                     if let super::terminalization::TerminalizationOutcome::Transitioned = self
@@ -1605,6 +1635,21 @@ impl super::flow_frame_engine::FrameStepExecutor for FlowTurnExecutorAdapter {
             .map(|entry| entry.meerkat_id)
             .collect();
         targets.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+
+        // Frame-based execution supports exactly one target per step.
+        // Multi-target dispatch (FanOut, FanIn, Quorum) requires concurrent
+        // dispatching semantics that are not yet implemented in FlowFrameEngine.
+        // Return a clear error rather than silently dropping extra targets.
+        if targets.len() > 1 {
+            return Err(MobError::NotYetImplemented(format!(
+                "step '{}' matched {} targets for role '{}'; multi-target dispatch \
+                 is not yet supported in frame-based flows — \
+                 ensure at most one member per role or restructure as a loop body",
+                step_id,
+                targets.len(),
+                step.role
+            )));
+        }
 
         let target = targets.into_iter().next().ok_or_else(|| {
             MobError::Internal(format!(

@@ -8,8 +8,8 @@ use crate::error::MobError;
 use crate::ids::{FlowNodeId, FrameId, LoopId, RunId, StepId};
 use crate::run::FrameSnapshot;
 use crate::store::MobRunStore;
-use meerkat_machine_kernels::generated::{flow_frame, flow_run};
-use meerkat_machine_kernels::{KernelEffect, KernelInput, KernelValue, TransitionRefusal};
+use meerkat_machine_kernels::generated::flow_frame;
+use meerkat_machine_kernels::{KernelEffect, KernelInput, KernelValue};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
@@ -271,51 +271,15 @@ impl FlowFrameMutator for FlowFrameKernel {
                 kernel_state: outcome.next_state,
             };
 
-            // Use cas_grant_node_slot to atomically update BOTH the run's scheduler
-            // state (PumpNodeScheduler: active_node_count++) and the frame state
-            // (AdmitNextReadyNode: pops ready_queue).
-            //
-            // PumpNodeScheduler requires max_active_nodes > 0 and the frame to be
-            // in ready_frames. When the run scheduler is not configured (e.g.
-            // sequential FlowFrameEngine with default max_active_nodes = 0 =
-            // unlimited), the pump guard fails with NoMatchingTransition — in that
-            // case we fall back to cas_frame_state for frame-only update.
-            let run = self
+            // The sequential FlowFrameEngine drives nodes one at a time and does not
+            // participate in FlowRunMachine's slot scheduler (ready_frames /
+            // max_active_nodes). Concurrency limits will be enforced by a future
+            // orchestrated multi-frame executor that registers frames before
+            // admission. For now: update frame state only via CAS.
+            let won = self
                 .run_store
-                .get_run(run_id)
-                .await?
-                .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
-            let pump_input = KernelInput {
-                variant: "PumpNodeScheduler".into(),
-                fields: BTreeMap::new(),
-            };
-            let won = match flow_run::transition(&run.flow_state, &pump_input) {
-                Ok(run_outcome) => {
-                    // Run scheduler active — atomically update run + frame state.
-                    self.run_store
-                        .cas_grant_node_slot(
-                            run_id,
-                            &run.flow_state,
-                            run_outcome.next_state,
-                            frame_id,
-                            &snap,
-                            next_snap,
-                        )
-                        .await?
-                }
-                Err(TransitionRefusal::NoMatchingTransition { .. }) => {
-                    // Run scheduler not configured — update frame state only.
-                    self.run_store
-                        .cas_frame_state(run_id, frame_id, Some(&snap), next_snap)
-                        .await?
-                }
-                // Propagate genuine machine errors (evaluation error, unknown variant, etc.)
-                Err(e) => {
-                    return Err(MobError::Internal(format!(
-                        "PumpNodeScheduler evaluation error: {e:?}"
-                    )));
-                }
-            };
+                .cas_frame_state(run_id, frame_id, Some(&snap), next_snap)
+                .await?;
             if won {
                 return Ok(Some(outcome.effects));
             }
