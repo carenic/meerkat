@@ -20,6 +20,16 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+// ─── FrameStepResult ─────────────────────────────────────────────────────────
+
+/// Result of executing a single step node within a frame.
+pub enum FrameStepResult {
+    /// Step executed successfully and produced output.
+    Completed(serde_json::Value),
+    /// Step was skipped (condition evaluated to false).
+    Skipped,
+}
+
 // ─── FrameStepExecutor ───────────────────────────────────────────────────────
 
 /// Trait for executing a single step node within a frame.
@@ -35,7 +45,7 @@ pub trait FrameStepExecutor: Send + Sync {
         node_id: &FlowNodeId,
         step_id: &StepId,
         context: &FlowContext,
-    ) -> Result<serde_json::Value, MobError>;
+    ) -> Result<FrameStepResult, MobError>;
 }
 
 // ─── LoopResult ─────────────────────────────────────────────────────────────
@@ -56,15 +66,22 @@ pub struct FlowFrameEngine {
     run_store: Arc<dyn MobRunStore>,
     executor: Arc<dyn FrameStepExecutor>,
     frame_kernel: Arc<FlowFrameKernel>,
+    /// Maximum nesting depth for body frames. 0 means unlimited.
+    max_frame_depth: u32,
 }
 
 impl FlowFrameEngine {
-    pub fn new(run_store: Arc<dyn MobRunStore>, executor: Arc<dyn FrameStepExecutor>) -> Self {
+    pub fn new(
+        run_store: Arc<dyn MobRunStore>,
+        executor: Arc<dyn FrameStepExecutor>,
+        max_frame_depth: u32,
+    ) -> Self {
         let frame_kernel = Arc::new(FlowFrameKernel::new(run_store.clone()));
         Self {
             run_store,
             executor,
             frame_kernel,
+            max_frame_depth,
         }
     }
 
@@ -83,7 +100,7 @@ impl FlowFrameEngine {
     ) -> Pin<
         Box<dyn Future<Output = Result<IndexMap<StepId, serde_json::Value>, MobError>> + Send + 'a>,
     > {
-        Box::pin(self.execute_frame_inner(run_id, frame_id, spec, context, None))
+        Box::pin(self.execute_frame_inner(run_id, frame_id, spec, context, None, 0))
     }
 
     // ─── Private helpers ─────────────────────────────────────────────────────
@@ -94,6 +111,9 @@ impl FlowFrameEngine {
     /// for frames that are executing as a loop iteration body. This is threaded
     /// into `cas_complete_step_and_record_output` so each step's output lands in
     /// the correct field (`root_step_outputs` vs `loop_iteration_outputs`).
+    ///
+    /// `depth` tracks the current nesting depth (0 = root frame). Used to enforce
+    /// `max_frame_depth` before recursing into a loop body frame.
     async fn execute_frame_inner(
         &self,
         run_id: &RunId,
@@ -101,6 +121,7 @@ impl FlowFrameEngine {
         spec: &FrameSpec,
         context: &FlowContext,
         loop_context: Option<(LoopId, u64)>,
+        depth: u32,
     ) -> Result<IndexMap<StepId, serde_json::Value>, MobError> {
         // Initialize the frame via the kernel (computes topo order + StartFrame).
         self.frame_kernel
@@ -139,6 +160,16 @@ impl FlowFrameEngine {
         let mut frame_outputs: IndexMap<StepId, serde_json::Value> = IndexMap::new();
 
         // Pump the admit loop until the frame is terminal.
+        //
+        // Terminalization invariant: after the loop exits (via either `None` or the
+        // in-loop `break`), we attempt to terminalize the frame. This covers two cases:
+        //   1. Empty frames: `admit_next_ready_node_with_retry` returns `None` immediately
+        //      because the ready_queue starts empty (no nodes → all nodes are already
+        //      terminal vacuously). The in-loop terminalize never fires; the post-loop
+        //      check below catches this.
+        //   2. Normal frames: all nodes complete inside the loop and the in-loop
+        //      terminalize already fired before the `break`. The post-loop check is a
+        //      no-op (frame is already Completed, not Running).
         loop {
             let effects_opt = self
                 .frame_kernel
@@ -175,7 +206,7 @@ impl FlowFrameEngine {
                                 .await;
 
                             match output {
-                                Ok(out) => {
+                                Ok(FrameStepResult::Completed(out)) => {
                                     // Record output in the local in-memory context.
                                     frame_outputs.insert(step_id.clone(), out.clone());
                                     local_context
@@ -197,6 +228,12 @@ impl FlowFrameEngine {
                                                 max_retries: 5,
                                             },
                                         )
+                                        .await?;
+                                }
+                                Ok(FrameStepResult::Skipped) => {
+                                    // Condition was false — skip the node in the frame machine.
+                                    self.frame_kernel
+                                        .skip_node(run_id, frame_id, &node_id)
                                         .await?;
                                 }
                                 Err(err) => {
@@ -235,6 +272,7 @@ impl FlowFrameEngine {
                                     &loop_spec.until,
                                     loop_spec.max_iterations,
                                     &local_context,
+                                    depth,
                                 )
                                 .await?;
 
@@ -295,6 +333,19 @@ impl FlowFrameEngine {
             }
         }
 
+        // Post-loop terminalize: catches the empty-frame case (queue was immediately
+        // empty so no in-loop terminalize ever fired) and acts as a safety net for
+        // any other case where the in-loop check was bypassed. Double-terminalizing is
+        // safe: `terminalize_frame` returns `false` (no-op) when the frame is already
+        // in a terminal phase.
+        let snap = self.require_frame(run_id, frame_id).await?;
+        if snap.kernel_state.phase == "Running" && self.all_nodes_terminal(&snap.kernel_state, spec)
+        {
+            self.frame_kernel
+                .terminalize_frame(run_id, frame_id)
+                .await?;
+        }
+
         Ok(frame_outputs)
     }
 
@@ -318,6 +369,7 @@ impl FlowFrameEngine {
         until: &'a ConditionExpr,
         max_iterations: u32,
         context: &'a FlowContext,
+        depth: u32,
     ) -> Pin<Box<dyn Future<Output = Result<LoopResult, MobError>> + Send + 'a>> {
         Box::pin(self.execute_loop_inner(
             run_id,
@@ -327,6 +379,7 @@ impl FlowFrameEngine {
             until,
             max_iterations,
             context,
+            depth,
         ))
     }
 
@@ -340,6 +393,7 @@ impl FlowFrameEngine {
         until: &ConditionExpr,
         max_iterations: u32,
         context: &FlowContext,
+        depth: u32,
     ) -> Result<LoopResult, MobError> {
         // Context isolation note: `iter_context` starts as a clone of the
         // parent frame's context at the moment the loop node is admitted.
@@ -355,6 +409,16 @@ impl FlowFrameEngine {
         let mut iter_context = context.clone();
         let mut condition_met = false;
 
+        // Check depth before recursing into the loop body frame.
+        let next_depth = depth + 1;
+        if self.max_frame_depth > 0 && next_depth > self.max_frame_depth {
+            return Err(MobError::NotYetImplemented(format!(
+                "loop '{}' would exceed max_frame_depth={} (current depth={}); \
+                 nested loops require a higher limit in LimitsSpec.max_frame_depth",
+                loop_id, self.max_frame_depth, depth
+            )));
+        }
+
         for iteration in 0..max_iterations as u64 {
             // Use "::" separator consistent with loop_instance_id construction.
             let body_frame_id =
@@ -369,6 +433,7 @@ impl FlowFrameEngine {
                     body_spec,
                     &iter_context,
                     Some((loop_id.clone(), iteration)),
+                    next_depth,
                 )
                 .await?;
 

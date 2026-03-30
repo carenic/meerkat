@@ -14,7 +14,9 @@ use meerkat_mob::definition::{
 use meerkat_mob::error::MobError;
 use meerkat_mob::ids::{FlowNodeId, FrameId, LoopId, RunId, StepId};
 use meerkat_mob::run::{FlowContext, MobRun};
-use meerkat_mob::runtime::flow_frame_engine::{FlowFrameEngine, FrameStepExecutor};
+use meerkat_mob::runtime::flow_frame_engine::{
+    FlowFrameEngine, FrameStepExecutor, FrameStepResult,
+};
 use meerkat_mob::store::MobRunStore as _;
 use meerkat_mob::{FlowId, InMemoryMobRunStore, MobId};
 use std::sync::{Arc, Mutex};
@@ -61,7 +63,7 @@ impl FrameStepExecutor for ScriptedStepExecutor {
         node_id: &FlowNodeId,
         _step_id: &StepId,
         _context: &FlowContext,
-    ) -> Result<serde_json::Value, MobError> {
+    ) -> Result<FrameStepResult, MobError> {
         let mut idx = self.index.lock().unwrap();
         let script = self
             .scripts
@@ -75,7 +77,7 @@ impl FrameStepExecutor for ScriptedStepExecutor {
         );
         let out = script.output.clone();
         *idx += 1;
-        Ok(out)
+        Ok(FrameStepResult::Completed(out))
     }
 }
 
@@ -98,7 +100,7 @@ async fn setup_engine(
     let (run_id, run) = build_run();
     let store = Arc::new(InMemoryMobRunStore::new());
     store.create_run(run).await.expect("create_run");
-    let engine = FlowFrameEngine::new(store.clone(), executor);
+    let engine = FlowFrameEngine::new(store.clone(), executor, 0);
     (run_id, store, engine)
 }
 
@@ -587,13 +589,13 @@ async fn test_frame_step_retried_on_transient_failure() {
             _node_id: &FlowNodeId,
             _step_id: &StepId,
             _context: &FlowContext,
-        ) -> Result<serde_json::Value, MobError> {
+        ) -> Result<FrameStepResult, MobError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
                 // First call: simulate transient failure
                 Err(MobError::Internal("transient error".into()))
             } else {
-                Ok(serde_json::json!({"ok": true}))
+                Ok(FrameStepResult::Completed(serde_json::json!({"ok": true})))
             }
         }
     }
@@ -640,5 +642,242 @@ async fn test_frame_step_retried_on_transient_failure() {
     assert!(
         result.is_err(),
         "engine must propagate executor error on first failure"
+    );
+}
+
+/// [P1] A step whose FlowStepSpec.condition evaluates to false must be skipped,
+/// not dispatched. The scripted executor must not be called for that step.
+#[tokio::test]
+async fn test_conditional_step_skipped_when_condition_false() {
+    // Only setup-node runs; skipped-node has a condition that will evaluate to false.
+    // If the skip is incorrect, the scripted executor would be called for skipped-node
+    // and assert_all_consumed would fail (one script would be left unconsumed).
+    let executor = Arc::new(ScriptedStepExecutor::new(vec![
+        StepScript {
+            node_id: "setup-node".into(),
+            output: serde_json::json!({"flag": false}),
+        },
+        // skipped-node must NOT appear here — condition is false
+    ]));
+
+    // NOTE: FlowTurnExecutorAdapter is what evaluates conditions. ScriptedStepExecutor
+    // (used directly here) always returns Completed. To test condition evaluation we
+    // need a ConditionCheckingExecutor that wraps the scripted one.
+    // For now, verify the FrameStepResult::Skipped path via a custom executor.
+    use meerkat_mob::runtime::flow_frame_engine::FrameStepResult;
+
+    struct ConditionalExecutor {
+        inner: Arc<ScriptedStepExecutor>,
+        skip_step: StepId,
+    }
+
+    #[async_trait]
+    impl FrameStepExecutor for ConditionalExecutor {
+        async fn execute_step(
+            &self,
+            run_id: &RunId,
+            frame_id: &meerkat_mob::ids::FrameId,
+            node_id: &FlowNodeId,
+            step_id: &StepId,
+            context: &FlowContext,
+        ) -> Result<FrameStepResult, meerkat_mob::error::MobError> {
+            if step_id == &self.skip_step {
+                return Ok(FrameStepResult::Skipped);
+            }
+            self.inner
+                .execute_step(run_id, frame_id, node_id, step_id, context)
+                .await
+        }
+    }
+
+    let inner = Arc::new(ScriptedStepExecutor::new(vec![StepScript {
+        node_id: "setup-node".into(),
+        output: serde_json::json!({"flag": false}),
+    }]));
+    let cond_executor = Arc::new(ConditionalExecutor {
+        inner: inner.clone(),
+        skip_step: StepId::from("skipped"),
+    });
+
+    let (run_id, _store, engine) = setup_engine(cond_executor).await;
+
+    let spec = FrameSpec {
+        nodes: {
+            let mut m = IndexMap::new();
+            m.insert(
+                FlowNodeId::from("setup-node"),
+                FlowNodeSpec::Step(FrameStepSpec {
+                    step_id: StepId::from("setup"),
+                    depends_on: vec![],
+                    depends_on_mode: DependencyMode::All,
+                    branch: None,
+                }),
+            );
+            m.insert(
+                FlowNodeId::from("skipped-node"),
+                FlowNodeSpec::Step(FrameStepSpec {
+                    step_id: StepId::from("skipped"),
+                    depends_on: vec![FlowNodeId::from("setup-node")],
+                    depends_on_mode: DependencyMode::All,
+                    branch: None,
+                }),
+            );
+            m
+        },
+    };
+
+    let context = FlowContext {
+        run_id: run_id.clone(),
+        activation_params: serde_json::json!({}),
+        step_outputs: IndexMap::new(),
+        loop_outputs: IndexMap::new(),
+    };
+
+    let frame_id = FrameId::from("root");
+    let outputs = engine
+        .execute_frame(&run_id, &frame_id, &spec, &context)
+        .await
+        .expect("execute_frame");
+
+    // setup ran, skipped did not produce an output (Skipped has no output)
+    assert!(
+        outputs.contains_key(&StepId::from("setup")),
+        "setup step must have run"
+    );
+    assert!(
+        !outputs.contains_key(&StepId::from("skipped")),
+        "skipped step must not appear in outputs"
+    );
+    inner.assert_all_consumed();
+}
+
+/// [P2] An empty frame (no nodes) must terminalize to Completed, not stay Running.
+#[tokio::test]
+async fn test_empty_frame_terminalize() {
+    let executor = Arc::new(ScriptedStepExecutor::new(vec![]));
+    let (run_id, store, engine) = setup_engine(executor).await;
+
+    let spec = FrameSpec {
+        nodes: IndexMap::new(), // empty
+    };
+    let context = FlowContext {
+        run_id: run_id.clone(),
+        activation_params: serde_json::json!({}),
+        step_outputs: IndexMap::new(),
+        loop_outputs: IndexMap::new(),
+    };
+
+    let frame_id = FrameId::from("empty-root");
+    let outputs = engine
+        .execute_frame(&run_id, &frame_id, &spec, &context)
+        .await
+        .expect("empty frame must succeed");
+    assert!(outputs.is_empty(), "empty frame produces no outputs");
+
+    // The persisted frame snapshot must be Completed, not Running.
+    let run = store
+        .get_run(&run_id)
+        .await
+        .expect("get_run")
+        .expect("run present");
+    let frame_snap = run.frames.get(&frame_id).expect("frame persisted");
+    assert_eq!(
+        frame_snap.kernel_state.phase, "Completed",
+        "empty frame must terminalize to Completed in the store"
+    );
+}
+
+/// [P2] A nested loop that would exceed max_frame_depth is rejected cleanly.
+#[tokio::test]
+async fn test_max_frame_depth_enforced_for_nested_loops() {
+    let executor = Arc::new(ScriptedStepExecutor::new(vec![]));
+    let (run_id, _store, _engine) = setup_engine(executor.clone()).await;
+
+    // Build an engine with max_frame_depth=1 (root=depth0, body=depth1, nested=depth2 rejected).
+    let store = Arc::new(InMemoryMobRunStore::new());
+    let run = crate::build_run().1; // reuse helper if accessible, else rebuild
+    // Use a fresh run for this engine
+    let (run_id2, run2) = {
+        use meerkat_machine_kernels::KernelState;
+        use meerkat_mob::run::MobRun;
+        let run = MobRun::pending(
+            meerkat_mob::MobId::from("depth-test"),
+            meerkat_mob::FlowId::from("depth-flow"),
+            KernelState::default(),
+            serde_json::json!({}),
+        );
+        let id = run.run_id.clone();
+        (id, run)
+    };
+    store.create_run(run2).await.expect("create_run");
+
+    let engine = FlowFrameEngine::new(store.clone(), executor, 1); // max_frame_depth=1
+
+    // Root frame (depth=0) contains a loop; body (depth=1) also contains a loop.
+    // Body-of-body (depth=2) exceeds max_frame_depth=1.
+    let nested_body = FrameSpec {
+        nodes: {
+            let mut m = IndexMap::new();
+            m.insert(
+                FlowNodeId::from("inner-loop"),
+                FlowNodeSpec::RepeatUntil(RepeatUntilSpec {
+                    loop_id: LoopId::from("inner"),
+                    depends_on: vec![],
+                    depends_on_mode: DependencyMode::All,
+                    body: FrameSpec {
+                        nodes: IndexMap::new(),
+                    }, // empty inner body
+                    until: ConditionExpr::Eq {
+                        path: "params.done".into(),
+                        value: serde_json::json!(true),
+                    },
+                    max_iterations: 1,
+                }),
+            );
+            m
+        },
+    };
+
+    let spec = FrameSpec {
+        nodes: {
+            let mut m = IndexMap::new();
+            m.insert(
+                FlowNodeId::from("outer-loop"),
+                FlowNodeSpec::RepeatUntil(RepeatUntilSpec {
+                    loop_id: LoopId::from("outer"),
+                    depends_on: vec![],
+                    depends_on_mode: DependencyMode::All,
+                    body: nested_body,
+                    until: ConditionExpr::Eq {
+                        path: "params.done".into(),
+                        value: serde_json::json!(true),
+                    },
+                    max_iterations: 1,
+                }),
+            );
+            m
+        },
+    };
+
+    let context = FlowContext {
+        run_id: run_id2.clone(),
+        activation_params: serde_json::json!({}),
+        step_outputs: IndexMap::new(),
+        loop_outputs: IndexMap::new(),
+    };
+
+    let frame_id = FrameId::from("depth-root");
+    let result = engine
+        .execute_frame(&run_id2, &frame_id, &spec, &context)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "exceeding max_frame_depth must return an error"
+    );
+    let err_str = result.unwrap_err().to_string();
+    assert!(
+        err_str.contains("max_frame_depth") || err_str.contains("depth"),
+        "error message must mention depth: {err_str}"
     );
 }

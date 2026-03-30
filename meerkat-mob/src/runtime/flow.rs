@@ -94,9 +94,15 @@ impl FlowEngine {
                 self.run_store.clone(),
                 self.emitter.clone(),
             );
+            let max_depth = config
+                .limits
+                .as_ref()
+                .and_then(|l| l.max_frame_depth)
+                .unwrap_or(0) as u32;
             let frame_engine = super::flow_frame_engine::FlowFrameEngine::new(
                 self.run_store.clone(),
                 Arc::new(adapter),
+                max_depth,
             );
             let frame_result = if let Some(limit_ms) =
                 config.limits.as_ref().and_then(|l| l.max_flow_duration_ms)
@@ -1606,7 +1612,7 @@ impl super::flow_frame_engine::FrameStepExecutor for FlowTurnExecutorAdapter {
         _node_id: &crate::ids::FlowNodeId,
         step_id: &StepId,
         context: &FlowContext,
-    ) -> Result<serde_json::Value, MobError> {
+    ) -> Result<super::flow_frame_engine::FrameStepResult, MobError> {
         // Look up the step spec from the v1 steps map.
         let step = self
             .config
@@ -1622,6 +1628,13 @@ impl super::flow_frame_engine::FrameStepExecutor for FlowTurnExecutorAdapter {
                 ))
             })?
             .clone();
+
+        // Evaluate condition before dispatch. A false condition skips the step.
+        if let Some(cond) = &step.condition {
+            if !super::conditions::evaluate_condition(cond, context) {
+                return Ok(super::flow_frame_engine::FrameStepResult::Skipped);
+            }
+        }
 
         // Render the prompt template.
         let prompt = render_content_input_template(&step.message, context).map_err(|e| {
@@ -1720,7 +1733,7 @@ impl super::flow_frame_engine::FrameStepExecutor for FlowTurnExecutorAdapter {
                             self.emitter
                                 .step_completed(run_id.clone(), step_id.clone())
                                 .await?;
-                            return Ok(value);
+                            return Ok(super::flow_frame_engine::FrameStepResult::Completed(value));
                         }
                         Err(reason) => {
                             if attempt < max_retries {

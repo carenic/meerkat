@@ -270,20 +270,80 @@ fn guard_head_is_loop() -> Guard {
 }
 
 /// Guard: head node's deps are satisfied for a run (all Completed or no deps for All-mode;
-/// any Completed for Any-mode).
+/// any Completed for Any-mode), AND its branch (if any) has not already won.
 fn guard_head_can_run() -> Guard {
     Guard {
         name: "head_deps_eligible_for_run".into(),
-        expr: Expr::Or(vec![
-            // No deps at all
-            Expr::Eq(
-                Box::new(Expr::Len(Box::new(Expr::MapGet {
-                    map: Box::new(Expr::Field("node_dependencies".into())),
+        expr: Expr::And(vec![
+            // Branch must not have already won: the head node's branch (if any) is NOT in branch_winners.
+            // For nodes without a branch (None), Contains(branch_winners, None) is always false because
+            // branch_winners only contains BranchId strings — so this AND arm is a no-op for branchless nodes.
+            Expr::Not(Box::new(Expr::Contains {
+                collection: Box::new(Expr::Field("branch_winners".into())),
+                value: Box::new(Expr::MapGet {
+                    map: Box::new(Expr::Field("node_branches".into())),
                     key: Box::new(Expr::Head(Box::new(Expr::Field("ready_queue".into())))),
-                }))),
-                Box::new(Expr::U64(0)),
-            ),
-            // All-mode AND all deps Completed
+                }),
+            })),
+            // Dep satisfaction: any of the three eligibility cases.
+            Expr::Or(vec![
+                // No deps at all
+                Expr::Eq(
+                    Box::new(Expr::Len(Box::new(Expr::MapGet {
+                        map: Box::new(Expr::Field("node_dependencies".into())),
+                        key: Box::new(Expr::Head(Box::new(Expr::Field("ready_queue".into())))),
+                    }))),
+                    Box::new(Expr::U64(0)),
+                ),
+                // All-mode AND all deps Completed
+                Expr::And(vec![
+                    Expr::Eq(
+                        Box::new(Expr::MapGet {
+                            map: Box::new(Expr::Field("node_dependency_modes".into())),
+                            key: Box::new(Expr::Head(Box::new(Expr::Field("ready_queue".into())))),
+                        }),
+                        Box::new(Expr::NamedVariant {
+                            enum_name: "DependencyMode".into(),
+                            variant: "All".into(),
+                        }),
+                    ),
+                    Expr::Call {
+                        helper: "AllDepsCompleted".into(),
+                        args: vec![Expr::Head(Box::new(Expr::Field("ready_queue".into())))],
+                    },
+                ]),
+                // Any-mode AND any dep Completed
+                Expr::And(vec![
+                    Expr::Eq(
+                        Box::new(Expr::MapGet {
+                            map: Box::new(Expr::Field("node_dependency_modes".into())),
+                            key: Box::new(Expr::Head(Box::new(Expr::Field("ready_queue".into())))),
+                        }),
+                        Box::new(Expr::NamedVariant {
+                            enum_name: "DependencyMode".into(),
+                            variant: "Any".into(),
+                        }),
+                    ),
+                    Expr::Call {
+                        helper: "AnyDepCompleted".into(),
+                        args: vec![Expr::Head(Box::new(Expr::Field("ready_queue".into())))],
+                    },
+                ]),
+            ]),
+        ]),
+    }
+}
+
+/// Guard: head node should be skipped.
+/// Fires when either:
+///   (a) All-mode: any dep has a non-Completed terminal status (Failed, Skipped, Canceled), OR
+///   (b) Branch-already-won: the head node belongs to a branch group and another node in
+///       that group has already completed (its BranchId is in branch_winners).
+fn guard_head_should_skip() -> Guard {
+    Guard {
+        name: "head_should_skip".into(),
+        expr: Expr::Or(vec![
+            // (a) All-mode AND at least one dep is Failed, Skipped, or Canceled (not Completed)
             Expr::And(vec![
                 Expr::Eq(
                     Box::new(Expr::MapGet {
@@ -295,89 +355,58 @@ fn guard_head_can_run() -> Guard {
                         variant: "All".into(),
                     }),
                 ),
-                Expr::Call {
-                    helper: "AllDepsCompleted".into(),
-                    args: vec![Expr::Head(Box::new(Expr::Field("ready_queue".into())))],
-                },
-            ]),
-            // Any-mode AND any dep Completed
-            Expr::And(vec![
-                Expr::Eq(
-                    Box::new(Expr::MapGet {
-                        map: Box::new(Expr::Field("node_dependency_modes".into())),
+                // At least one dep is in a non-Completed terminal state
+                Expr::Quantified {
+                    quantifier: Quantifier::Any,
+                    binding: "dep_id".into(),
+                    over: Box::new(Expr::MapGet {
+                        map: Box::new(Expr::Field("node_dependencies".into())),
                         key: Box::new(Expr::Head(Box::new(Expr::Field("ready_queue".into())))),
                     }),
-                    Box::new(Expr::NamedVariant {
-                        enum_name: "DependencyMode".into(),
-                        variant: "Any".into(),
-                    }),
-                ),
-                Expr::Call {
-                    helper: "AnyDepCompleted".into(),
-                    args: vec![Expr::Head(Box::new(Expr::Field("ready_queue".into())))],
+                    body: Box::new(Expr::Or(vec![
+                        Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_status".into())),
+                                key: Box::new(Expr::Binding("dep_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "NodeRunStatus".into(),
+                                variant: "Failed".into(),
+                            }),
+                        ),
+                        Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_status".into())),
+                                key: Box::new(Expr::Binding("dep_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "NodeRunStatus".into(),
+                                variant: "Skipped".into(),
+                            }),
+                        ),
+                        Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_status".into())),
+                                key: Box::new(Expr::Binding("dep_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "NodeRunStatus".into(),
+                                variant: "Canceled".into(),
+                            }),
+                        ),
+                    ])),
                 },
             ]),
-        ]),
-    }
-}
-
-/// Guard: head node should be skipped.
-/// All-mode: any dep has a non-Completed terminal status (Failed, Skipped, Canceled).
-fn guard_head_should_skip() -> Guard {
-    Guard {
-        name: "head_should_skip".into(),
-        // All-mode AND at least one dep is Failed, Skipped, or Canceled (not Completed)
-        expr: Expr::And(vec![
-            Expr::Eq(
-                Box::new(Expr::MapGet {
-                    map: Box::new(Expr::Field("node_dependency_modes".into())),
+            // (b) Branch-already-won: head node has a branch AND it's already in branch_winners.
+            // Nodes without a branch have None as their branch value; branch_winners only contains
+            // BranchId strings, so Contains(branch_winners, None) is always false — branchless
+            // nodes are unaffected.
+            Expr::Contains {
+                collection: Box::new(Expr::Field("branch_winners".into())),
+                value: Box::new(Expr::MapGet {
+                    map: Box::new(Expr::Field("node_branches".into())),
                     key: Box::new(Expr::Head(Box::new(Expr::Field("ready_queue".into())))),
                 }),
-                Box::new(Expr::NamedVariant {
-                    enum_name: "DependencyMode".into(),
-                    variant: "All".into(),
-                }),
-            ),
-            // At least one dep is in a non-Completed terminal state
-            Expr::Quantified {
-                quantifier: Quantifier::Any,
-                binding: "dep_id".into(),
-                over: Box::new(Expr::MapGet {
-                    map: Box::new(Expr::Field("node_dependencies".into())),
-                    key: Box::new(Expr::Head(Box::new(Expr::Field("ready_queue".into())))),
-                }),
-                body: Box::new(Expr::Or(vec![
-                    Expr::Eq(
-                        Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field("node_status".into())),
-                            key: Box::new(Expr::Binding("dep_id".into())),
-                        }),
-                        Box::new(Expr::NamedVariant {
-                            enum_name: "NodeRunStatus".into(),
-                            variant: "Failed".into(),
-                        }),
-                    ),
-                    Expr::Eq(
-                        Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field("node_status".into())),
-                            key: Box::new(Expr::Binding("dep_id".into())),
-                        }),
-                        Box::new(Expr::NamedVariant {
-                            enum_name: "NodeRunStatus".into(),
-                            variant: "Skipped".into(),
-                        }),
-                    ),
-                    Expr::Eq(
-                        Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field("node_status".into())),
-                            key: Box::new(Expr::Binding("dep_id".into())),
-                        }),
-                        Box::new(Expr::NamedVariant {
-                            enum_name: "NodeRunStatus".into(),
-                            variant: "Canceled".into(),
-                        }),
-                    ),
-                ])),
             },
         ]),
     }
@@ -538,6 +567,12 @@ pub fn flow_frame_machine() -> MachineSchema {
                         Box::new(TypeRef::Option(Box::new(TypeRef::Named("BranchId".into())))),
                     ),
                 ),
+                // Branch winner tracking: once a node in a branch group completes,
+                // its BranchId is added here to suppress all sibling branch nodes.
+                field(
+                    "branch_winners",
+                    TypeRef::Set(Box::new(TypeRef::Named("BranchId".into()))),
+                ),
                 // Status
                 field(
                     "node_status",
@@ -579,6 +614,7 @@ pub fn flow_frame_machine() -> MachineSchema {
                     init("node_dependencies", Expr::EmptyMap),
                     init("node_dependency_modes", Expr::EmptyMap),
                     init("node_branches", Expr::EmptyMap),
+                    init("branch_winners", Expr::EmptySet),
                     init("node_status", Expr::EmptyMap),
                     init("ready_queue", Expr::SeqLiteral(vec![])),
                     init("output_recorded", Expr::EmptyMap),
@@ -1073,14 +1109,35 @@ pub fn flow_frame_machine() -> MachineSchema {
                     ),
                 }],
                 updates: {
-                    let mut updates = vec![Update::MapInsert {
-                        field: "node_status".into(),
-                        key: Expr::Binding("node_id".into()),
-                        value: Expr::NamedVariant {
-                            enum_name: "NodeRunStatus".into(),
-                            variant: "Completed".into(),
+                    let mut updates = vec![
+                        Update::MapInsert {
+                            field: "node_status".into(),
+                            key: Expr::Binding("node_id".into()),
+                            value: Expr::NamedVariant {
+                                enum_name: "NodeRunStatus".into(),
+                                variant: "Completed".into(),
+                            },
                         },
-                    }];
+                        // If this node belongs to a branch group, record it as the branch winner
+                        // so that sibling branch nodes are subsequently skipped.
+                        Update::Conditional {
+                            condition: Expr::Neq(
+                                Box::new(Expr::MapGet {
+                                    map: Box::new(Expr::Field("node_branches".into())),
+                                    key: Box::new(Expr::Binding("node_id".into())),
+                                }),
+                                Box::new(Expr::None),
+                            ),
+                            then_updates: vec![Update::SetInsert {
+                                field: "branch_winners".into(),
+                                value: Expr::MapGet {
+                                    map: Box::new(Expr::Field("node_branches".into())),
+                                    key: Box::new(Expr::Binding("node_id".into())),
+                                },
+                            }],
+                            else_updates: vec![],
+                        },
+                    ];
                     updates.extend(refresh_ready_frontier_updates());
                     updates
                 },

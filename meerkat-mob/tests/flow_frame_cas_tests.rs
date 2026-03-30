@@ -472,7 +472,9 @@ async fn test_loop_instance_id_separator_is_colon_colon() {
     };
     use meerkat_mob::ids::{FlowNodeId, LoopId, StepId};
     use meerkat_mob::run::FlowContext;
-    use meerkat_mob::runtime::flow_frame_engine::{FlowFrameEngine, FrameStepExecutor};
+    use meerkat_mob::runtime::flow_frame_engine::{
+        FlowFrameEngine, FrameStepExecutor, FrameStepResult,
+    };
     use std::sync::Mutex;
 
     // A mock executor that records which frame_ids it was called with.
@@ -489,9 +491,9 @@ async fn test_loop_instance_id_separator_is_colon_colon() {
             _node_id: &FlowNodeId,
             _step_id: &StepId,
             _context: &FlowContext,
-        ) -> Result<serde_json::Value, meerkat_mob::error::MobError> {
+        ) -> Result<FrameStepResult, meerkat_mob::error::MobError> {
             self.frame_ids.lock().unwrap().push(frame_id.to_string());
-            Ok(serde_json::json!({"ok": true}))
+            Ok(FrameStepResult::Completed(serde_json::json!({"ok": true})))
         }
     }
 
@@ -503,7 +505,7 @@ async fn test_loop_instance_id_separator_is_colon_colon() {
     let executor = Arc::new(RecordingExecutor {
         frame_ids: Mutex::new(vec![]),
     });
-    let engine = FlowFrameEngine::new(store, executor.clone());
+    let engine = FlowFrameEngine::new(store, executor.clone(), 0);
 
     // A frame with one loop node. The loop body has one step, and the until
     // condition is always true (single iteration).

@@ -14542,7 +14542,7 @@ async fn test_flow_with_root_frame_spec_executes_frame_nodes() {
     use crate::definition::{FlowNodeSpec, FrameSpec, FrameStepSpec};
     use crate::ids::{FlowNodeId, FrameId};
     use crate::run::FlowContext;
-    use crate::runtime::flow_frame_engine::{FlowFrameEngine, FrameStepExecutor};
+    use crate::runtime::flow_frame_engine::{FlowFrameEngine, FrameStepExecutor, FrameStepResult};
 
     /// Scripted executor that returns pre-configured output per node.
     struct ScriptedExecutor {
@@ -14558,10 +14558,11 @@ async fn test_flow_with_root_frame_spec_executes_frame_nodes() {
             node_id: &FlowNodeId,
             _step_id: &crate::ids::StepId,
             _context: &FlowContext,
-        ) -> Result<serde_json::Value, MobError> {
+        ) -> Result<FrameStepResult, MobError> {
             self.outputs
                 .get(&node_id.to_string())
                 .cloned()
+                .map(FrameStepResult::Completed)
                 .ok_or_else(|| MobError::Internal(format!("no scripted output for {node_id}")))
         }
     }
@@ -14614,7 +14615,7 @@ async fn test_flow_with_root_frame_spec_executes_frame_nodes() {
     let executor = Arc::new(ScriptedExecutor {
         outputs: scripted_outputs,
     });
-    let engine = FlowFrameEngine::new(store.clone(), executor);
+    let engine = FlowFrameEngine::new(store.clone(), executor, 0);
     let context = FlowContext {
         run_id: run_id.clone(),
         activation_params: serde_json::json!({}),
