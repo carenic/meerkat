@@ -1775,7 +1775,11 @@ fn render_default_domain_assignment(
             if sample_cardinality > 1 {
                 "{0, 1, 2}".into()
             } else {
-                "{0, 1}".into()
+                // CI uses {1} to avoid state explosion from zero-as-unlimited
+                // semantics in scheduler guards (Or(max==0, count<max)).
+                // Counter fields that start at 0 get it via Init, not NatValues.
+                // Deep uses {0, 1} to cover the full range.
+                "{1}".into()
             }
         }
         TypeRef::String => {
@@ -5996,7 +6000,11 @@ fn effective_composition_state_limits(
 }
 
 fn render_machine_state_constraint(schema: &MachineSchema, deep: bool) -> String {
-    let step_limit = if deep { 8 } else { 6 };
+    let step_limit = if deep {
+        8
+    } else {
+        schema.ci_step_limit.unwrap_or(6) as usize
+    };
     let seq_limit = if deep { 2 } else { 1 };
     let set_limit = if deep { 2 } else { 1 };
     let map_limit = if deep { 2 } else { 1 };

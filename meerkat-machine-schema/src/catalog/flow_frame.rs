@@ -1384,6 +1384,7 @@ pub fn flow_frame_machine() -> MachineSchema {
                 }],
             },
         ],
+        ci_step_limit: None,
         effect_dispositions: vec![
             disposition("ReadyFrontierChanged", EffectDisposition::External),
             disposition("AdmitStepWork", EffectDisposition::External),

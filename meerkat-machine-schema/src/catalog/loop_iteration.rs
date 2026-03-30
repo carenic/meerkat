@@ -319,6 +319,7 @@ pub fn loop_iteration_machine() -> MachineSchema {
                 )],
             },
         ],
+        ci_step_limit: None,
         effect_dispositions: vec![
             disposition("RequestBodyFrameStart", EffectDisposition::External),
             disposition("EvaluateUntilCondition", EffectDisposition::External),

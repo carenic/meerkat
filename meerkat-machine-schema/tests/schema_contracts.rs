@@ -381,6 +381,7 @@ fn rejects_routed_effect_without_route_in_closed_world_composition() {
                 fields: IndexMap::new(),
             }],
         }],
+        ci_step_limit: None,
         effect_dispositions: vec![EffectDispositionRule {
             effect_variant: "Handoff".into(),
             disposition: EffectDisposition::Routed {
@@ -427,6 +428,7 @@ fn rejects_routed_effect_without_route_in_closed_world_composition() {
         derived: vec![],
         invariants: vec![],
         transitions: vec![],
+        ci_step_limit: None,
         effect_dispositions: vec![],
     };
 
@@ -529,6 +531,7 @@ fn handoff_protocol_accepted_on_local_effect() {
         derived: vec![],
         invariants: vec![],
         transitions: vec![],
+        ci_step_limit: None,
         effect_dispositions: vec![EffectDispositionRule {
             effect_variant: "DoSomething".into(),
             disposition: EffectDisposition::Local,
@@ -586,6 +589,7 @@ fn handoff_protocol_accepted_on_external_effect() {
         derived: vec![],
         invariants: vec![],
         transitions: vec![],
+        ci_step_limit: None,
         effect_dispositions: vec![EffectDispositionRule {
             effect_variant: "Notify".into(),
             disposition: EffectDisposition::External,
@@ -640,6 +644,7 @@ fn handoff_protocol_rejected_on_routed_effect() {
         derived: vec![],
         invariants: vec![],
         transitions: vec![],
+        ci_step_limit: None,
         effect_dispositions: vec![EffectDispositionRule {
             effect_variant: "Route".into(),
             disposition: EffectDisposition::Routed {
@@ -807,6 +812,7 @@ fn handoff_protocol_valid_round_trip() {
         derived: vec![],
         invariants: vec![],
         transitions: vec![],
+        ci_step_limit: None,
         effect_dispositions: vec![EffectDispositionRule {
             effect_variant: "RequestWork".into(),
             disposition: EffectDisposition::External,
@@ -1089,6 +1095,7 @@ fn handoff_protocol_unknown_effect_cross_schema() {
         derived: vec![],
         invariants: vec![],
         transitions: vec![],
+        ci_step_limit: None,
         effect_dispositions: vec![EffectDispositionRule {
             effect_variant: "RealEffect".into(),
             disposition: EffectDisposition::External,
@@ -1200,6 +1207,7 @@ fn handoff_protocol_terminal_closure_requires_terminal_phases() {
         derived: vec![],
         invariants: vec![],
         transitions: vec![],
+        ci_step_limit: None,
         effect_dispositions: vec![EffectDispositionRule {
             effect_variant: "Work".into(),
             disposition: EffectDisposition::External,
@@ -1306,6 +1314,7 @@ fn closed_world_rejects_missing_handoff_protocol() {
         derived: vec![],
         invariants: vec![],
         transitions: vec![],
+        ci_step_limit: None,
         effect_dispositions: vec![EffectDispositionRule {
             effect_variant: "Work".into(),
             disposition: EffectDisposition::External,
@@ -1416,6 +1425,7 @@ fn closed_world_accepts_handoff_protocol_present() {
         derived: vec![],
         invariants: vec![],
         transitions: vec![],
+        ci_step_limit: None,
         effect_dispositions: vec![EffectDispositionRule {
             effect_variant: "Work".into(),
             disposition: EffectDisposition::External,

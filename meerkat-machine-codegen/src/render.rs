@@ -1066,6 +1066,7 @@ mod tests {
                     emit: vec![],
                 },
             ],
+            ci_step_limit: None,
             effect_dispositions: vec![],
         }
     }
