@@ -115,8 +115,8 @@ impl FlowEngine {
             {
                 tokio::select! {
                     r = frame_engine.execute_frame(&run_id, &frame_id, root_spec, &context) => r,
-                    _ = cancel.cancelled() => Err(MobError::RunCanceled(run_id.clone())),
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(limit_ms)) => {
+                    () = cancel.cancelled() => Err(MobError::RunCanceled(run_id.clone())),
+                    () = tokio::time::sleep(std::time::Duration::from_millis(limit_ms)) => {
                         Err(MobError::FlowFailed {
                             run_id: run_id.clone(),
                             reason: format!("max flow duration exceeded ({limit_ms}ms)"),
@@ -126,7 +126,7 @@ impl FlowEngine {
             } else {
                 tokio::select! {
                     r = frame_engine.execute_frame(&run_id, &frame_id, root_spec, &context) => r,
-                    _ = cancel.cancelled() => Err(MobError::RunCanceled(run_id.clone())),
+                    () = cancel.cancelled() => Err(MobError::RunCanceled(run_id.clone())),
                 }
             };
 
