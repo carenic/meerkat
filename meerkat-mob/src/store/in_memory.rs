@@ -655,7 +655,7 @@ mod tests {
             loop_iteration_ledger: Vec::new(),
             schema_version: 2,
             root_step_outputs: IndexMap::new(),
-            loop_iteration_outputs: IndexMap::new(),
+            loop_iteration_outputs: BTreeMap::new(),
         }
     }
 

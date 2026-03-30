@@ -151,8 +151,11 @@ pub fn flow_run_machine() -> MachineSchema {
                 field("max_active_nodes", TypeRef::U32),
                 field("max_active_frames", TypeRef::U32),
                 field("max_frame_depth", TypeRef::U32),
-                // v2: scratch fields to capture head value before SeqPopFront
-                // (effects are evaluated after updates, so we capture head first)
+                // v2: transient scratch fields — valid only within a single PumpNodeScheduler
+                // or PumpFrameScheduler transition. They capture the queue head BEFORE
+                // SeqPopFront runs, because effects are evaluated against post-update state
+                // and the head is gone by then. Do NOT read these fields between transitions;
+                // their values are stale until the next pump assigns them.
                 field("last_granted_frame", TypeRef::Named("FrameId".into())),
                 field("last_granted_loop", TypeRef::Named("LoopInstanceId".into())),
                 // v2: frame and loop registries

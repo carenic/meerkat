@@ -125,6 +125,14 @@ pub enum MobError {
     /// An internal error (unexpected state, logic errors).
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// Operation is not yet implemented for the given storage backend.
+    ///
+    /// Callers can match on this to fall back gracefully (e.g., refuse
+    /// frame-aware flows when the redb backend is in use until CAS wrappers
+    /// are fully implemented).
+    #[error("not yet implemented: {0}")]
+    NotYetImplemented(String),
 }
 
 fn format_diagnostics(diagnostics: &[Diagnostic]) -> String {
@@ -287,6 +295,7 @@ mod tests {
             MobError::SessionError(meerkat_core::service::SessionError::PersistenceDisabled),
             MobError::CommsError(meerkat_core::comms::SendError::PeerOffline),
             MobError::Internal("i".to_string()),
+            MobError::NotYetImplemented("redb cas".to_string()),
         ];
     }
 }

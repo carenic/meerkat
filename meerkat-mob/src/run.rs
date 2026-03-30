@@ -61,8 +61,11 @@ pub struct MobRun {
     #[serde(default)]
     pub root_step_outputs: IndexMap<StepId, serde_json::Value>,
     /// Loop iteration outputs: key=loop_id, value=per-iteration step outputs.
+    ///
+    /// Uses `BTreeMap` (not `IndexMap`) so that recovery reconciliation can iterate
+    /// in stable key order without depending on insertion order.
     #[serde(default)]
-    pub loop_iteration_outputs: IndexMap<LoopId, Vec<IndexMap<StepId, serde_json::Value>>>,
+    pub loop_iteration_outputs: BTreeMap<LoopId, Vec<IndexMap<StepId, serde_json::Value>>>,
 }
 
 impl MobRun {
@@ -100,7 +103,7 @@ impl MobRun {
             loop_iteration_ledger: Vec::new(),
             schema_version: 2,
             root_step_outputs: IndexMap::new(),
-            loop_iteration_outputs: IndexMap::new(),
+            loop_iteration_outputs: BTreeMap::new(),
         }
     }
 
@@ -714,7 +717,7 @@ mod tests {
             loop_iteration_ledger: Vec::new(),
             schema_version: 2,
             root_step_outputs: IndexMap::new(),
-            loop_iteration_outputs: IndexMap::new(),
+            loop_iteration_outputs: BTreeMap::new(),
         };
 
         let encoded = serde_json::to_string(&run).unwrap();

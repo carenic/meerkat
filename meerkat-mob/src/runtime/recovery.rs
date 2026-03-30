@@ -4,7 +4,7 @@
 //! scheduler's `ready_frames` and `pending_body_frame_loops` fields are
 //! consistent with the per-frame and per-loop kernel snapshots.
 
-use crate::ids::FrameId;
+use crate::ids::{FrameId, LoopInstanceId};
 use crate::run::{FrameSnapshot, LoopSnapshot, MobRun, MobRunStatus};
 use meerkat_machine_kernels::KernelValue;
 
@@ -137,7 +137,7 @@ fn reconcile_pending_body_frame_loops(run: &mut MobRun) {
     let mut pending_loop_ids: Vec<String> = run
         .loops
         .iter()
-        .filter(|(_, snap)| loop_is_pending_body_frame(snap))
+        .filter(|(loop_id, snap)| loop_is_pending_body_frame(loop_id, snap))
         .map(|(loop_id, _)| loop_id.to_string())
         .collect();
     pending_loop_ids.sort();
@@ -163,15 +163,29 @@ fn reconcile_pending_body_frame_loops(run: &mut MobRun) {
         .insert("pending_body_frame_loop_membership".to_string(), new_set);
 }
 
-/// Return true if a loop snapshot represents a loop that is pending a body frame.
-fn loop_is_pending_body_frame(snap: &LoopSnapshot) -> bool {
+/// Return true if a loop snapshot represents a loop that is pending a body frame start.
+///
+/// A loop is pending iff it is in Running phase with no active body frame
+/// (`active_body_frame_id == KernelValue::None`). The `None` (field absent) arm
+/// guards against corrupt snapshots — legitimate Running loops always initialize
+/// this field; if it is missing entirely, we treat the loop as pending and emit a
+/// warning so the anomaly is visible in logs.
+fn loop_is_pending_body_frame(loop_id: &LoopInstanceId, snap: &LoopSnapshot) -> bool {
     if snap.kernel_state.phase != "Running" {
         return false;
     }
-    matches!(
-        snap.kernel_state.fields.get("active_body_frame_id"),
-        Some(KernelValue::None) | None
-    )
+    match snap.kernel_state.fields.get("active_body_frame_id") {
+        Some(KernelValue::None) => true,
+        None => {
+            tracing::warn!(
+                loop_instance_id = %loop_id,
+                "loop snapshot is missing active_body_frame_id field; \
+                 treating as pending body frame — snapshot may be corrupt"
+            );
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Return true if the frame's `ready_queue` is present and non-empty.
@@ -222,7 +236,7 @@ mod tests {
             loop_iteration_ledger: vec![],
             schema_version: 2,
             root_step_outputs: indexmap::IndexMap::new(),
-            loop_iteration_outputs: indexmap::IndexMap::new(),
+            loop_iteration_outputs: std::collections::BTreeMap::new(),
         }
     }
 

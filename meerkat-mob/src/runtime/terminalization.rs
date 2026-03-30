@@ -529,7 +529,7 @@ mod tests {
             loop_iteration_ledger: Vec::new(),
             schema_version: 2,
             root_step_outputs: indexmap::IndexMap::new(),
-            loop_iteration_outputs: indexmap::IndexMap::new(),
+            loop_iteration_outputs: std::collections::BTreeMap::new(),
         }
     }
 

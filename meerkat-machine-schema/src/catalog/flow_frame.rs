@@ -494,7 +494,11 @@ pub fn flow_frame_machine() -> MachineSchema {
             fields: vec![
                 // Frame identity (stored so effects can reference it without bindings)
                 field("frame_id", TypeRef::Named("FrameId".into())),
-                // Last admitted node (set before pop so effects can reference it)
+                // Transient scratch: the node ID admitted in the most recent
+                // AdmitNextReadyNode transition. Set BEFORE SeqPopFront so that
+                // effects emitted in the same transition can reference it via
+                // Expr::Field("last_admitted_node"). Stale between transitions —
+                // do not read this field outside of an AdmitNextReadyNode context.
                 field("last_admitted_node", TypeRef::Named("FlowNodeId".into())),
                 // Node graph
                 field(

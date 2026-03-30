@@ -31,7 +31,7 @@ fn minimal_run_with_schema_v2() -> MobRun {
         loop_iteration_ledger: vec![],
         schema_version: 2,
         root_step_outputs: IndexMap::new(),
-        loop_iteration_outputs: IndexMap::new(),
+        loop_iteration_outputs: BTreeMap::new(),
     }
 }
 
@@ -137,6 +137,45 @@ fn test_flow_context_accesses_loop_iteration_outputs() {
     // Non-existent loop → None.
     let val3 = resolve_context_path(&ctx, "loops.other-loop.iterations.0.steps.impl.result");
     assert_eq!(val3, None);
+}
+
+/// Populated iteration 1 is accessible at its index — not just the out-of-bounds None case.
+#[test]
+fn test_flow_context_accesses_iteration_one_with_real_data() {
+    use meerkat_mob::runtime::path::resolve_context_path;
+
+    let mut iter0: IndexMap<StepId, serde_json::Value> = IndexMap::new();
+    iter0.insert(StepId::from("review"), serde_json::json!({"passes": false}));
+
+    let mut iter1: IndexMap<StepId, serde_json::Value> = IndexMap::new();
+    iter1.insert(StepId::from("review"), serde_json::json!({"passes": true}));
+
+    let mut loop_outputs: IndexMap<LoopId, LoopContextHistory> = IndexMap::new();
+    loop_outputs.insert(
+        LoopId::from("review-loop"),
+        LoopContextHistory {
+            iterations: vec![iter0, iter1],
+        },
+    );
+
+    let ctx = FlowContext {
+        run_id: RunId::new(),
+        activation_params: serde_json::json!({}),
+        step_outputs: IndexMap::new(),
+        loop_outputs,
+    };
+
+    // iteration 0 — first attempt failed
+    let v0 = resolve_context_path(&ctx, "loops.review-loop.iterations.0.steps.review.passes");
+    assert_eq!(v0, Some(&serde_json::json!(false)));
+
+    // iteration 1 — second attempt passed
+    let v1 = resolve_context_path(&ctx, "loops.review-loop.iterations.1.steps.review.passes");
+    assert_eq!(v1, Some(&serde_json::json!(true)));
+
+    // out of bounds → None
+    let v2 = resolve_context_path(&ctx, "loops.review-loop.iterations.2.steps.review.passes");
+    assert_eq!(v2, None);
 }
 
 // ─── REQ-11 / CHOKE-05: Recovery drops stale ready_frames entries ────────────
