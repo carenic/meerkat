@@ -707,10 +707,10 @@ fn running_node_ids(kernel_state: &meerkat_machine_kernels::KernelState) -> Vec<
         Some(KernelValue::Map(map)) => map
             .iter()
             .filter_map(|(key, status)| {
-                if matches!(status, KernelValue::NamedVariant { variant, .. } if variant == "Running") {
-                    if let KernelValue::String(id) = key {
-                        return Some(FlowNodeId::from(id.as_str()));
-                    }
+                if matches!(status, KernelValue::NamedVariant { variant, .. } if variant == "Running")
+                    && let KernelValue::String(id) = key
+                {
+                    return Some(FlowNodeId::from(id.as_str()));
                 }
                 None
             })
