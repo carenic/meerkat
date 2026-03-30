@@ -312,8 +312,10 @@ impl FlowRunKernel {
         flow_id: FlowId,
         completed_step_ids: &[&StepId],
     ) -> Result<TerminalizationOutcome, MobError> {
-        let completed_set: std::collections::BTreeSet<String> =
-            completed_step_ids.iter().map(|s| s.to_string()).collect();
+        let completed_set: std::collections::BTreeSet<String> = completed_step_ids
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
 
         // CAS loop: read, mutate step_status in place, write back.
         for attempt in 0..=5usize {
@@ -348,10 +350,10 @@ impl FlowRunKernel {
                 next_state.fields.get_mut("output_recorded")
             {
                 for (key, val) in output_recorded.iter_mut() {
-                    if let KernelValue::String(s) = key {
-                        if completed_set.contains(s.as_str()) {
-                            *val = KernelValue::Bool(true);
-                        }
+                    if let KernelValue::String(s) = key
+                        && completed_set.contains(s.as_str())
+                    {
+                        *val = KernelValue::Bool(true);
                     }
                 }
             }
