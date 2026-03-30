@@ -148,17 +148,6 @@ pub trait MobRunStore: Send + Sync {
     /// Returns `Ok(true)` on success, `Ok(false)` on mismatch.
     ///
     /// # Frame support
-    /// This method requires [`InMemoryMobRunStore`]. The [`RedbMobRunStore`] returns
-    /// `Err(MobError::Internal(...))` until redb transactions are implemented for frame-aware flows.
-    /// Returns true if this store supports the frame-aware CAS operations
-    /// (cas_frame_state, cas_grant_node_slot, etc.) required by frame-based flows.
-    ///
-    /// Defaults to `false`. Only `InMemoryMobRunStore` returns `true` currently.
-    /// A flow with `root: Some(_)` will be rejected at startup if this returns false.
-    fn supports_frame_execution(&self) -> bool {
-        false
-    }
-
     async fn cas_frame_state(
         &self,
         run_id: &RunId,

@@ -104,10 +104,6 @@ impl InMemoryMobRunStore {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl MobRunStore for InMemoryMobRunStore {
-    fn supports_frame_execution(&self) -> bool {
-        true
-    }
-
     async fn create_run(&self, run: MobRun) -> Result<(), MobStoreError> {
         let mut runs = self.runs.write().await;
         if runs.contains_key(&run.run_id) {

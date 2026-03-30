@@ -80,20 +80,6 @@ impl FlowEngine {
 
         // If the flow uses the new frame-based execution path, dispatch to FlowFrameEngine.
         if let Some(root_spec) = &config.flow_spec.root {
-            if !self.run_store.supports_frame_execution() {
-                return self
-                    .fail_run(
-                        &run_id,
-                        &config.flow_id,
-                        MobError::NotYetImplemented(
-                            "frame-based flows (FlowSpec.root) require InMemoryMobRunStore; \
-                             redb CAS wrappers are not yet implemented"
-                                .into(),
-                        ),
-                    )
-                    .await;
-            }
-
             let frame_id = crate::ids::FrameId::from(format!("{run_id}-root").as_str());
             let context = FlowContext {
                 run_id: run_id.clone(),
