@@ -157,8 +157,42 @@ impl FlowFrameEngine {
             ctx
         };
 
-        // Accumulate step outputs for this frame.
-        let mut frame_outputs: IndexMap<StepId, serde_json::Value> = IndexMap::new();
+        // [P2] Seed frame_outputs from the persisted store — not from a local empty map.
+        // On a fresh run this is empty. On a resume it reflects steps that completed
+        // before the crash, so advance_frame_steps_and_terminalize correctly marks
+        // those steps Completed rather than Skipped.
+        // Root frames read from root_step_outputs; body frames read from the correct
+        // loop_iteration_outputs slot.
+        let mut frame_outputs: IndexMap<StepId, serde_json::Value> = match &loop_context {
+            None => run.root_step_outputs.clone(),
+            Some((loop_id, iteration)) => run
+                .loop_iteration_outputs
+                .get(loop_id)
+                .and_then(|iters| iters.get(*iteration as usize))
+                .cloned()
+                .unwrap_or_default(),
+        };
+
+        // [P1] Fail any Running nodes left by a previous process crash.
+        // When a node is admitted (popped from ready_queue → Running) and the
+        // process dies before the step completes, the persisted frame has an
+        // empty ready_queue with at least one Running node. Those in-flight
+        // step handles are gone — we fail the nodes now so that their dependents
+        // become eligible for skip/fail admission in the loop below.
+        // Ref: dogma Rule 3 — the machine's node_status is the authoritative
+        // source of which nodes are running; do not infer completion from queue size.
+        loop {
+            let snap = self.require_frame(run_id, frame_id).await?;
+            let running = running_node_ids(&snap.kernel_state);
+            if running.is_empty() {
+                break;
+            }
+            for node_id in &running {
+                self.frame_kernel
+                    .fail_node(run_id, frame_id, node_id)
+                    .await?;
+            }
+        }
 
         // Pump the admit loop until the frame is terminal.
         //
@@ -558,6 +592,47 @@ impl FlowFrameEngine {
             .map(|h| h.iterations)
             .unwrap_or_default();
 
+        // [P1] Persist terminal loop state before returning.
+        // The last per-iteration snapshot leaves phase = "Running" with
+        // active_body_frame_id = None. Without a final write, a crashed
+        // process that restarts between loop completion and parent-frame
+        // finalization would see a "Running/no active frame" snapshot and
+        // enqueue the loop again via reconcile_pending_body_frame_loops.
+        // Ref: dogma Rule 13 — the authoritative phase must be persisted;
+        // it is not sufficient to leave it derivable from iteration count.
+        let terminal_phase = if condition_met {
+            "Completed"
+        } else {
+            "Exhausted"
+        };
+        self.run_store
+            .upsert_loop_snapshot(
+                run_id,
+                loop_instance_id,
+                LoopSnapshot {
+                    kernel_state: KernelState {
+                        phase: terminal_phase.into(),
+                        fields: std::collections::BTreeMap::from([
+                            (
+                                "loop_instance_id".into(),
+                                KernelValue::String(loop_instance_id.to_string()),
+                            ),
+                            (
+                                "current_iteration".into(),
+                                KernelValue::U64(all_iter_outputs.len() as u64),
+                            ),
+                            (
+                                "max_iterations".into(),
+                                KernelValue::U64(max_iterations as u64),
+                            ),
+                            ("active_body_frame_id".into(), KernelValue::None),
+                        ]),
+                    },
+                },
+                None,
+            )
+            .await?;
+
         if condition_met {
             Ok(LoopResult::ConditionMet(all_iter_outputs))
         } else {
@@ -622,5 +697,24 @@ fn string_from_effect_field(
             "effect '{}' missing String field '{}': {other:?}",
             effect.variant, field
         ))),
+    }
+}
+
+/// Collect the IDs of all nodes whose `node_status` is `Running` in the given
+/// kernel state. Used to detect orphaned in-flight nodes after a process crash.
+fn running_node_ids(kernel_state: &meerkat_machine_kernels::KernelState) -> Vec<FlowNodeId> {
+    match kernel_state.fields.get("node_status") {
+        Some(KernelValue::Map(map)) => map
+            .iter()
+            .filter_map(|(key, status)| {
+                if matches!(status, KernelValue::NamedVariant { variant, .. } if variant == "Running") {
+                    if let KernelValue::String(id) = key {
+                        return Some(FlowNodeId::from(id.as_str()));
+                    }
+                }
+                None
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }

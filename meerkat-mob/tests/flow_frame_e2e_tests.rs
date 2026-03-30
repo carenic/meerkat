@@ -871,3 +871,376 @@ async fn test_max_frame_depth_enforced_for_nested_loops() {
         "error message must mention depth: {err_str}"
     );
 }
+
+/// [P1] A frame resumed with an orphaned Running node must not silently succeed.
+/// The orphaned Running node should be failed and its dependents skipped.
+#[tokio::test]
+async fn test_resumed_frame_with_running_node_fails_orphan() {
+    use meerkat_machine_kernels::{KernelState, KernelValue};
+    use meerkat_mob::run::FrameSnapshot;
+    use meerkat_mob::store::MobRunStore as _;
+    use std::collections::BTreeMap;
+
+    // Setup engine with a scripted executor that only runs the first step.
+    // The second step (node-b) will never be called because node-a will be
+    // "already Running" when the frame is loaded — simulating a crashed process.
+    let executor = Arc::new(ScriptedStepExecutor::new(vec![]));
+    let (run_id, store, engine) = setup_engine(executor).await;
+
+    let spec = FrameSpec {
+        nodes: {
+            let mut m = IndexMap::new();
+            m.insert(
+                FlowNodeId::from("node-a"),
+                FlowNodeSpec::Step(FrameStepSpec {
+                    step_id: StepId::from("step-a"),
+                    depends_on: vec![],
+                    depends_on_mode: DependencyMode::All,
+                    branch: None,
+                }),
+            );
+            m.insert(
+                FlowNodeId::from("node-b"),
+                FlowNodeSpec::Step(FrameStepSpec {
+                    step_id: StepId::from("step-b"),
+                    depends_on: vec![FlowNodeId::from("node-a")],
+                    depends_on_mode: DependencyMode::All,
+                    branch: None,
+                }),
+            );
+            m
+        },
+    };
+
+    let frame_id = FrameId::from("resume-test");
+
+    // Inject a pre-existing frame snapshot where node-a is Running (orphaned)
+    // and ready_queue is empty — simulating a crash mid-step.
+    let orphaned_snapshot = FrameSnapshot {
+        kernel_state: KernelState {
+            phase: "Running".into(),
+            fields: BTreeMap::from([
+                ("frame_id".into(), KernelValue::String(frame_id.to_string())),
+                (
+                    "last_admitted_node".into(),
+                    KernelValue::String("node-a".into()),
+                ),
+                ("ready_queue".into(), KernelValue::Seq(vec![])), // empty — was popped
+                (
+                    "tracked_nodes".into(),
+                    KernelValue::Set(
+                        [
+                            KernelValue::String("node-a".into()),
+                            KernelValue::String("node-b".into()),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                ),
+                (
+                    "ordered_nodes".into(),
+                    KernelValue::Seq(vec![
+                        KernelValue::String("node-a".into()),
+                        KernelValue::String("node-b".into()),
+                    ]),
+                ),
+                (
+                    "node_kind".into(),
+                    KernelValue::Map(
+                        [
+                            (
+                                KernelValue::String("node-a".into()),
+                                KernelValue::NamedVariant {
+                                    enum_name: "FlowNodeKind".into(),
+                                    variant: "Step".into(),
+                                },
+                            ),
+                            (
+                                KernelValue::String("node-b".into()),
+                                KernelValue::NamedVariant {
+                                    enum_name: "FlowNodeKind".into(),
+                                    variant: "Step".into(),
+                                },
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                ),
+                (
+                    "node_status".into(),
+                    KernelValue::Map(
+                        [
+                            (
+                                KernelValue::String("node-a".into()),
+                                // ORPHANED: was Running when the process crashed
+                                KernelValue::NamedVariant {
+                                    enum_name: "NodeRunStatus".into(),
+                                    variant: "Running".into(),
+                                },
+                            ),
+                            (
+                                KernelValue::String("node-b".into()),
+                                KernelValue::NamedVariant {
+                                    enum_name: "NodeRunStatus".into(),
+                                    variant: "Pending".into(),
+                                },
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                ),
+                (
+                    "node_dependencies".into(),
+                    KernelValue::Map(
+                        [
+                            (
+                                KernelValue::String("node-a".into()),
+                                KernelValue::Seq(vec![]),
+                            ),
+                            (
+                                KernelValue::String("node-b".into()),
+                                KernelValue::Seq(vec![KernelValue::String("node-a".into())]),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                ),
+                (
+                    "node_dependency_modes".into(),
+                    KernelValue::Map(
+                        [
+                            (
+                                KernelValue::String("node-a".into()),
+                                KernelValue::NamedVariant {
+                                    enum_name: "DependencyMode".into(),
+                                    variant: "All".into(),
+                                },
+                            ),
+                            (
+                                KernelValue::String("node-b".into()),
+                                KernelValue::NamedVariant {
+                                    enum_name: "DependencyMode".into(),
+                                    variant: "All".into(),
+                                },
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                ),
+                (
+                    "node_branches".into(),
+                    KernelValue::Map(
+                        [
+                            (KernelValue::String("node-a".into()), KernelValue::None),
+                            (KernelValue::String("node-b".into()), KernelValue::None),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                ),
+                ("output_recorded".into(), KernelValue::Map(BTreeMap::new())),
+                (
+                    "node_condition_results".into(),
+                    KernelValue::Map(BTreeMap::new()),
+                ),
+                (
+                    "branch_winners".into(),
+                    KernelValue::Set(Default::default()),
+                ),
+            ]),
+        },
+    };
+
+    // Inject the orphaned snapshot directly into the store.
+    store
+        .cas_frame_state(&run_id, &frame_id, None, orphaned_snapshot)
+        .await
+        .expect("inject orphaned frame");
+
+    let context = FlowContext {
+        run_id: run_id.clone(),
+        activation_params: serde_json::json!({}),
+        step_outputs: IndexMap::new(),
+        loop_outputs: IndexMap::new(),
+    };
+
+    // Execute the frame — the engine should detect node-a as orphaned Running,
+    // fail it, which causes node-b to be Skip-admitted (All-mode dep failed).
+    // The frame should terminalize to Completed (all nodes terminal: a=Failed, b=Skipped).
+    let outputs = engine
+        .execute_frame(&run_id, &frame_id, &spec, &context)
+        .await
+        .expect("frame must complete after failing orphaned running node");
+
+    // Neither step produced output (node-a failed, node-b was skipped).
+    assert!(
+        outputs.is_empty(),
+        "no outputs expected when steps are failed/skipped: {outputs:?}"
+    );
+
+    // Verify the frame is now Completed in the store.
+    let run = store.get_run(&run_id).await.expect("get_run").expect("run");
+    let snap = run.frames.get(&frame_id).expect("frame persisted");
+    assert_eq!(
+        snap.kernel_state.phase, "Completed",
+        "frame must be Completed after handling orphaned Running node"
+    );
+}
+
+/// [P1] A loop that met its condition must persist Completed phase, not stay Running.
+/// reconcile_pending_body_frame_loops must not re-enqueue a completed loop.
+#[tokio::test]
+async fn test_completed_loop_persisted_as_completed_not_running() {
+    use meerkat_mob::store::MobRunStore as _;
+
+    let executor = Arc::new(ScriptedStepExecutor::new(vec![StepScript {
+        node_id: "review-node".into(),
+        output: serde_json::json!({"passes": true}), // condition met on first try
+    }]));
+    let (run_id, store, engine) = setup_engine(executor).await;
+
+    let loop_instance_id = meerkat_mob::ids::LoopInstanceId::from("root::loop-node");
+
+    let spec = FrameSpec {
+        nodes: {
+            let mut m = IndexMap::new();
+            m.insert(
+                FlowNodeId::from("loop-node"),
+                FlowNodeSpec::RepeatUntil(RepeatUntilSpec {
+                    loop_id: LoopId::from("review"),
+                    depends_on: vec![],
+                    depends_on_mode: DependencyMode::All,
+                    body: FrameSpec {
+                        nodes: {
+                            let mut b = IndexMap::new();
+                            b.insert(
+                                FlowNodeId::from("review-node"),
+                                FlowNodeSpec::Step(FrameStepSpec {
+                                    step_id: StepId::from("review"),
+                                    depends_on: vec![],
+                                    depends_on_mode: DependencyMode::All,
+                                    branch: None,
+                                }),
+                            );
+                            b
+                        },
+                    },
+                    until: ConditionExpr::Eq {
+                        path: "steps.review.passes".into(),
+                        value: serde_json::json!(true),
+                    },
+                    max_iterations: 3,
+                }),
+            );
+            m
+        },
+    };
+
+    let context = FlowContext {
+        run_id: run_id.clone(),
+        activation_params: serde_json::json!({}),
+        step_outputs: IndexMap::new(),
+        loop_outputs: IndexMap::new(),
+    };
+
+    let frame_id = FrameId::from("root");
+    engine
+        .execute_frame(&run_id, &frame_id, &spec, &context)
+        .await
+        .expect("execute_frame");
+
+    // The persisted loop snapshot must have phase = "Completed", not "Running".
+    let run = store.get_run(&run_id).await.expect("get_run").expect("run");
+    let loop_snap = run
+        .loops
+        .get(&loop_instance_id)
+        .expect("loop snapshot must be persisted");
+    assert_eq!(
+        loop_snap.kernel_state.phase, "Completed",
+        "loop must be persisted as Completed after condition is met"
+    );
+
+    // reconcile_pending_body_frame_loops must not enqueue the completed loop.
+    use meerkat_mob::runtime::recovery::reconcile_run_state;
+    let mut run_copy = run.clone();
+    reconcile_run_state(&mut run_copy).expect("reconcile");
+    let pending_loops = match run_copy.flow_state.fields.get("pending_body_frame_loops") {
+        Some(meerkat_machine_kernels::KernelValue::Seq(s)) => s.len(),
+        _ => 0,
+    };
+    assert_eq!(
+        pending_loops, 0,
+        "completed loop must not appear in pending_body_frame_loops after reconcile"
+    );
+}
+
+/// [P2] frame_outputs must be seeded from persisted root_step_outputs on resume,
+/// so advance_frame_steps_and_terminalize marks pre-crash steps as Completed not Skipped.
+#[tokio::test]
+async fn test_frame_outputs_seeded_from_persisted_state_on_resume() {
+    use meerkat_mob::store::MobRunStore as _;
+
+    // First execution: run node-a and complete it (with a one-step frame).
+    let executor = Arc::new(ScriptedStepExecutor::new(vec![StepScript {
+        node_id: "node-a".into(),
+        output: serde_json::json!({"x": 1}),
+    }]));
+    let (run_id, store, engine) = setup_engine(executor).await;
+
+    let spec = FrameSpec {
+        nodes: {
+            let mut m = IndexMap::new();
+            m.insert(
+                FlowNodeId::from("node-a"),
+                FlowNodeSpec::Step(FrameStepSpec {
+                    step_id: StepId::from("step-a"),
+                    depends_on: vec![],
+                    depends_on_mode: DependencyMode::All,
+                    branch: None,
+                }),
+            );
+            m
+        },
+    };
+
+    let frame_id = FrameId::from("root");
+    let context = FlowContext {
+        run_id: run_id.clone(),
+        activation_params: serde_json::json!({}),
+        step_outputs: IndexMap::new(),
+        loop_outputs: IndexMap::new(),
+    };
+
+    // Full execution: node-a runs and completes.
+    let outputs = engine
+        .execute_frame(&run_id, &frame_id, &spec, &context)
+        .await
+        .expect("execute_frame");
+    assert_eq!(
+        outputs.get(&StepId::from("step-a")),
+        Some(&serde_json::json!({"x": 1}))
+    );
+
+    // Simulate a resume by creating a new engine (empty executor — no new steps run).
+    let resume_executor = Arc::new(ScriptedStepExecutor::new(vec![]));
+    let resume_engine = FlowFrameEngine::new(store.clone(), resume_executor, 0);
+
+    // Re-execute the frame (frame is already Completed in the store — it terminalized).
+    // The resumed execute_frame should see the Completed phase and return the
+    // persisted outputs without re-running anything.
+    let resume_outputs = resume_engine
+        .execute_frame(&run_id, &frame_id, &spec, &context)
+        .await
+        .expect("resume execute_frame");
+
+    // The resumed outputs must include the pre-crash completed step.
+    assert_eq!(
+        resume_outputs.get(&StepId::from("step-a")),
+        Some(&serde_json::json!({"x": 1})),
+        "pre-crash completed step must appear in resumed frame_outputs (seeded from store)"
+    );
+}
