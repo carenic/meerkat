@@ -240,7 +240,21 @@ impl FlowFrameEngine {
 
                             match loop_result {
                                 LoopResult::ConditionMet(all_iter_outputs) => {
-                                    // Update local_context with the completed loop history.
+                                    // Merge the last iteration's step outputs into both
+                                    // local_context.step_outputs (for template/condition
+                                    // evaluation in downstream steps) and frame_outputs
+                                    // (so callers of execute_frame can read them at
+                                    // steps.<body_step>...).
+                                    if let Some(last_iter) = all_iter_outputs.last() {
+                                        for (sid, out) in last_iter {
+                                            local_context
+                                                .step_outputs
+                                                .insert(sid.clone(), out.clone());
+                                            frame_outputs.insert(sid.clone(), out.clone());
+                                        }
+                                    }
+                                    // Also record the full iteration history in loop_outputs
+                                    // so loops.<id>.iterations.<n>.steps.<step>... paths work.
                                     local_context.loop_outputs.insert(
                                         loop_id.clone(),
                                         LoopContextHistory {

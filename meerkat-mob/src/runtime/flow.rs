@@ -91,6 +91,8 @@ impl FlowEngine {
                 self.executor.clone(),
                 self.handle.clone(),
                 config.clone(),
+                self.run_store.clone(),
+                self.emitter.clone(),
             );
             let frame_engine = super::flow_frame_engine::FlowFrameEngine::new(
                 self.run_store.clone(),
@@ -1563,18 +1565,33 @@ fn resolve_template_value<'a>(expression: &str, context: &'a FlowContext) -> Opt
 /// Adapter that implements `FrameStepExecutor` by delegating to the existing
 /// `FlowTurnExecutor` infrastructure. Maps `FlowNodeId` + `StepId` to the v1
 /// dispatch/await flow, looking up role and message template from `FlowRunConfig`.
+///
+/// Preserves the same retry, event, and ledger semantics as the flat-step path:
+/// - Emits `step_dispatched` / `step_completed` / `step_failed` events.
+/// - Appends step ledger entries for observability.
+/// - Retries transient failures up to `limits.max_step_retries`.
 struct FlowTurnExecutorAdapter {
     executor: Arc<dyn FlowTurnExecutor>,
     handle: MobHandle,
     config: FlowRunConfig,
+    run_store: Arc<dyn crate::store::MobRunStore>,
+    emitter: MobEventEmitter,
 }
 
 impl FlowTurnExecutorAdapter {
-    fn new(executor: Arc<dyn FlowTurnExecutor>, handle: MobHandle, config: FlowRunConfig) -> Self {
+    fn new(
+        executor: Arc<dyn FlowTurnExecutor>,
+        handle: MobHandle,
+        config: FlowRunConfig,
+        run_store: Arc<dyn crate::store::MobRunStore>,
+        emitter: MobEventEmitter,
+    ) -> Self {
         Self {
             executor,
             handle,
             config,
+            run_store,
+            emitter,
         }
     }
 }
@@ -1648,28 +1665,111 @@ impl super::flow_frame_engine::FrameStepExecutor for FlowTurnExecutorAdapter {
             meerkat_core::time_compat::Duration::from_millis(step.timeout_ms.unwrap_or(30_000));
         let flow_tool_overlay = step_tool_overlay(&step);
 
-        // Dispatch.
-        let ticket = self
-            .executor
-            .dispatch(run_id, step_id, &target, prompt, flow_tool_overlay)
-            .await?;
+        let max_retries = self
+            .config
+            .limits
+            .as_ref()
+            .and_then(|l| l.max_step_retries)
+            .unwrap_or(0) as usize;
 
-        // Await terminal.
-        match self.executor.await_terminal(ticket, step_timeout).await? {
-            FlowTurnOutcome::Completed { output } => {
-                let parsed = parse_output_value(&output, step_id, &target, &step.output_format);
-                match parsed {
-                    Ok(value) => Ok(value),
-                    Err(reason) => Err(MobError::Internal(format!(
-                        "output parse failed for step '{step_id}': {reason}"
-                    ))),
+        let mut attempt = 0usize;
+        loop {
+            // Lifecycle: emit dispatch event and append ledger entry.
+            self.emitter
+                .step_dispatched(run_id.clone(), step_id.clone(), target.clone())
+                .await?;
+            self.run_store
+                .append_step_entry_if_absent(
+                    run_id,
+                    crate::run::StepLedgerEntry {
+                        step_id: step_id.clone(),
+                        meerkat_id: target.clone(),
+                        status: crate::run::StepRunStatus::Dispatched,
+                        output: None,
+                        timestamp: chrono::Utc::now(),
+                    },
+                )
+                .await?;
+
+            let ticket = self
+                .executor
+                .dispatch(
+                    run_id,
+                    step_id,
+                    &target,
+                    prompt.clone(),
+                    flow_tool_overlay.clone(),
+                )
+                .await?;
+
+            match self.executor.await_terminal(ticket, step_timeout).await? {
+                FlowTurnOutcome::Completed { output } => {
+                    match parse_output_value(&output, step_id, &target, &step.output_format) {
+                        Ok(value) => {
+                            // Record output in the step ledger and emit completion events.
+                            self.run_store
+                                .put_step_output(run_id, step_id, value.clone())
+                                .await?;
+                            self.emitter
+                                .step_target_completed(
+                                    run_id.clone(),
+                                    step_id.clone(),
+                                    target.clone(),
+                                )
+                                .await?;
+                            self.emitter
+                                .step_completed(run_id.clone(), step_id.clone())
+                                .await?;
+                            return Ok(value);
+                        }
+                        Err(reason) => {
+                            if attempt < max_retries {
+                                attempt += 1;
+                                self.emitter
+                                    .step_target_failed(
+                                        run_id.clone(),
+                                        step_id.clone(),
+                                        target.clone(),
+                                        reason.clone(),
+                                    )
+                                    .await?;
+                                continue;
+                            }
+                            self.emitter
+                                .step_failed(run_id.clone(), step_id.clone(), reason.clone())
+                                .await?;
+                            return Err(MobError::Internal(format!(
+                                "output parse failed for step '{step_id}' after {attempt} retries: {reason}"
+                            )));
+                        }
+                    }
                 }
-            }
-            FlowTurnOutcome::Failed { reason } => Err(MobError::Internal(format!(
-                "step '{step_id}' failed: {reason}"
-            ))),
-            FlowTurnOutcome::Canceled => {
-                Err(MobError::Internal(format!("step '{step_id}' was canceled")))
+                FlowTurnOutcome::Failed { reason } => {
+                    if attempt < max_retries {
+                        attempt += 1;
+                        self.emitter
+                            .step_target_failed(
+                                run_id.clone(),
+                                step_id.clone(),
+                                target.clone(),
+                                reason.clone(),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    self.emitter
+                        .step_failed(run_id.clone(), step_id.clone(), reason.clone())
+                        .await?;
+                    return Err(MobError::Internal(format!(
+                        "step '{step_id}' failed after {attempt} retries: {reason}"
+                    )));
+                }
+                FlowTurnOutcome::Canceled => {
+                    self.emitter
+                        .step_failed(run_id.clone(), step_id.clone(), "step canceled".to_string())
+                        .await?;
+                    return Err(MobError::Internal(format!("step '{step_id}' was canceled")));
+                }
             }
         }
     }
