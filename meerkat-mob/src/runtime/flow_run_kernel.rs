@@ -294,6 +294,87 @@ impl FlowRunKernel {
             .collect()
     }
 
+    /// Bulk-advance all tracked FlowRunMachine step statuses to their final state
+    /// and then terminalize the run as Completed.
+    ///
+    /// Used exclusively by the frame-based execution path, where `FlowFrameMachine`
+    /// governs execution order instead of `FlowRunMachine`'s dependency guards.
+    /// Direct field mutation is intentional here — it bypasses the per-step transition
+    /// chain that would otherwise require processing steps in dependency order through
+    /// `DispatchStep → CompleteStep → RecordStepOutput`, which cannot be applied
+    /// wholesale because branch-blocked guard logic may reject individual dispatches.
+    ///
+    /// `completed_step_ids`: steps that produced output (frame executed them).
+    /// All other tracked steps are marked Skipped.
+    pub async fn advance_frame_steps_and_terminalize(
+        &self,
+        run_id: &RunId,
+        flow_id: FlowId,
+        completed_step_ids: &[&StepId],
+    ) -> Result<TerminalizationOutcome, MobError> {
+        let completed_set: std::collections::BTreeSet<String> =
+            completed_step_ids.iter().map(|s| s.to_string()).collect();
+
+        // CAS loop: read, mutate step_status in place, write back.
+        for attempt in 0..=5usize {
+            let run = self.require_run(run_id).await?;
+            let mut next_state = run.flow_state.clone();
+
+            // Advance step_status: Completed for executed steps, Skipped for the rest.
+            if let Some(KernelValue::Map(step_status)) = next_state.fields.get_mut("step_status") {
+                for (key, val) in step_status.iter_mut() {
+                    let step_id_str = match key {
+                        KernelValue::String(s) => s.as_str(),
+                        _ => continue,
+                    };
+                    // Option<StepRunStatus> is stored directly (not nested):
+                    // None = KernelValue::None, Some(X) = KernelValue::NamedVariant("StepRunStatus", X).
+                    *val = if completed_set.contains(step_id_str) {
+                        KernelValue::NamedVariant {
+                            enum_name: "StepRunStatus".into(),
+                            variant: "Completed".into(),
+                        }
+                    } else {
+                        KernelValue::NamedVariant {
+                            enum_name: "StepRunStatus".into(),
+                            variant: "Skipped".into(),
+                        }
+                    };
+                }
+            }
+
+            // Mark all outputs as recorded.
+            if let Some(KernelValue::Map(output_recorded)) =
+                next_state.fields.get_mut("output_recorded")
+            {
+                for (key, val) in output_recorded.iter_mut() {
+                    if let KernelValue::String(s) = key {
+                        if completed_set.contains(s.as_str()) {
+                            *val = KernelValue::Bool(true);
+                        }
+                    }
+                }
+            }
+
+            let won = self
+                .run_store
+                .cas_flow_state(run_id, &run.flow_state, &next_state)
+                .await?;
+            if won {
+                break;
+            }
+            if attempt == 5 {
+                return Err(MobError::Internal(format!(
+                    "advance_frame_steps_and_terminalize: CAS exhausted for {run_id}"
+                )));
+            }
+        }
+
+        // Now all steps are terminal — terminalize the run.
+        self.terminalize(run_id.clone(), flow_id, TerminalizationTarget::Completed)
+            .await
+    }
+
     pub async fn collection_satisfied(
         &self,
         run_id: &RunId,

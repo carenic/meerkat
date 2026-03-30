@@ -9,12 +9,13 @@
 use crate::definition::{ConditionExpr, FlowNodeSpec, FrameSpec};
 use crate::error::MobError;
 use crate::ids::{FlowNodeId, FrameId, LoopId, LoopInstanceId, RunId, StepId};
-use crate::run::{FlowContext, LoopContextHistory};
+use crate::run::{FlowContext, LoopContextHistory, LoopIterationLedgerEntry, LoopSnapshot};
 use crate::runtime::conditions::evaluate_condition;
 use crate::runtime::flow_frame_kernel::{FlowFrameKernel, FlowFrameMutator, StepCompletionOpts};
 use crate::store::MobRunStore;
 use async_trait::async_trait;
 use indexmap::IndexMap;
+use meerkat_machine_kernels::KernelState;
 use meerkat_machine_kernels::KernelValue;
 use std::future::Future;
 use std::pin::Pin;
@@ -424,6 +425,50 @@ impl FlowFrameEngine {
             let body_frame_id =
                 FrameId::from(format!("{loop_instance_id}::iter-{iteration}").as_str());
 
+            // Persist the loop snapshot with active_body_frame_id so that
+            // reconcile_run_state can reconstruct in-progress loop state after a
+            // crash. Phase="Running", active_body_frame_id=Some(body_frame_id).
+            self.run_store
+                .upsert_loop_snapshot(
+                    run_id,
+                    loop_instance_id,
+                    LoopSnapshot {
+                        kernel_state: KernelState {
+                            phase: "Running".into(),
+                            fields: std::collections::BTreeMap::from([
+                                (
+                                    "loop_instance_id".into(),
+                                    meerkat_machine_kernels::KernelValue::String(
+                                        loop_instance_id.to_string(),
+                                    ),
+                                ),
+                                (
+                                    "current_iteration".into(),
+                                    meerkat_machine_kernels::KernelValue::U64(iteration),
+                                ),
+                                (
+                                    "max_iterations".into(),
+                                    meerkat_machine_kernels::KernelValue::U64(
+                                        max_iterations as u64,
+                                    ),
+                                ),
+                                (
+                                    "active_body_frame_id".into(),
+                                    meerkat_machine_kernels::KernelValue::String(
+                                        body_frame_id.to_string(),
+                                    ),
+                                ),
+                            ]),
+                        },
+                    },
+                    Some(LoopIterationLedgerEntry {
+                        loop_instance_id: loop_instance_id.clone(),
+                        iteration,
+                        frame_id: body_frame_id.clone(),
+                    }),
+                )
+                .await?;
+
             // Execute the body frame with loop context so each step's output is
             // routed to loop_iteration_outputs[loop_id][iteration] in the store.
             let iter_outputs = self
@@ -434,6 +479,42 @@ impl FlowFrameEngine {
                     &iter_context,
                     Some((loop_id.clone(), iteration)),
                     next_depth,
+                )
+                .await?;
+
+            // Mark body frame as complete: clear active_body_frame_id.
+            self.run_store
+                .upsert_loop_snapshot(
+                    run_id,
+                    loop_instance_id,
+                    LoopSnapshot {
+                        kernel_state: KernelState {
+                            phase: "Running".into(),
+                            fields: std::collections::BTreeMap::from([
+                                (
+                                    "loop_instance_id".into(),
+                                    meerkat_machine_kernels::KernelValue::String(
+                                        loop_instance_id.to_string(),
+                                    ),
+                                ),
+                                (
+                                    "current_iteration".into(),
+                                    meerkat_machine_kernels::KernelValue::U64(iteration + 1),
+                                ),
+                                (
+                                    "max_iterations".into(),
+                                    meerkat_machine_kernels::KernelValue::U64(
+                                        max_iterations as u64,
+                                    ),
+                                ),
+                                (
+                                    "active_body_frame_id".into(),
+                                    meerkat_machine_kernels::KernelValue::None,
+                                ),
+                            ]),
+                        },
+                    },
+                    None, // ledger entry already appended at iteration start
                 )
                 .await?;
 

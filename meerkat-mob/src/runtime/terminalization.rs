@@ -254,6 +254,18 @@ mod tests {
             self.inner.append_failure_entry(run_id, entry).await
         }
 
+        async fn upsert_loop_snapshot(
+            &self,
+            run_id: &RunId,
+            loop_instance_id: &crate::ids::LoopInstanceId,
+            snapshot: crate::run::LoopSnapshot,
+            ledger_entry: Option<crate::run::LoopIterationLedgerEntry>,
+        ) -> Result<(), crate::error::MobError> {
+            self.inner
+                .upsert_loop_snapshot(run_id, loop_instance_id, snapshot, ledger_entry)
+                .await
+        }
+
         async fn cas_frame_state(
             &self,
             run_id: &RunId,

@@ -5,7 +5,8 @@ use crate::definition::MobDefinition;
 use crate::event::{MobEvent, NewMobEvent};
 use crate::ids::{FlowId, FrameId, LoopId, LoopInstanceId, MobId, RunId, StepId};
 use crate::run::{
-    FailureLedgerEntry, FrameSnapshot, LoopSnapshot, MobRun, MobRunStatus, StepLedgerEntry,
+    FailureLedgerEntry, FrameSnapshot, LoopIterationLedgerEntry, LoopSnapshot, MobRun,
+    MobRunStatus, StepLedgerEntry,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
@@ -271,6 +272,24 @@ impl MobRunStore for InMemoryMobRunStore {
             .get_mut(run_id)
             .ok_or_else(|| MobStoreError::NotFound(format!("run not found: {run_id}")))?;
         run.failure_ledger.push(entry);
+        Ok(())
+    }
+
+    async fn upsert_loop_snapshot(
+        &self,
+        run_id: &RunId,
+        loop_instance_id: &LoopInstanceId,
+        snapshot: LoopSnapshot,
+        ledger_entry: Option<LoopIterationLedgerEntry>,
+    ) -> Result<(), MobError> {
+        let mut runs = self.runs.write().await;
+        let run = runs
+            .get_mut(run_id)
+            .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
+        run.loops.insert(loop_instance_id.clone(), snapshot);
+        if let Some(entry) = ledger_entry {
+            run.loop_iteration_ledger.push(entry);
+        }
         Ok(())
     }
 

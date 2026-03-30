@@ -125,11 +125,19 @@ impl FlowEngine {
             };
 
             match frame_result {
-                Ok(_outputs) => {
-                    let flow_id = config.flow_id;
+                Ok(outputs) => {
+                    // Advance FlowRunMachine step statuses to their final values so
+                    // that terminalize_completed's "all steps Completed or Skipped"
+                    // guard passes. The frame path executes via FlowFrameMachine so
+                    // the legacy per-step FlowRunMachine transitions were never called.
+                    let completed_step_ids: Vec<&StepId> = outputs.keys().collect();
                     if let super::terminalization::TerminalizationOutcome::Transitioned = self
                         .flow_kernel
-                        .terminalize_completed(run_id.clone(), flow_id)
+                        .advance_frame_steps_and_terminalize(
+                            &run_id,
+                            config.flow_id.clone(),
+                            &completed_step_ids,
+                        )
                         .await?
                     {
                         tracing::debug!(run_id = %run_id, "frame-based flow completed terminalization applied");
@@ -1654,19 +1662,26 @@ impl super::flow_frame_engine::FrameStepExecutor for FlowTurnExecutorAdapter {
             .collect();
         targets.sort_by(|a, b| a.as_str().cmp(b.as_str()));
 
-        // Frame-based execution supports exactly one target per step.
-        // Multi-target dispatch (FanOut, FanIn, Quorum) requires concurrent
-        // dispatching semantics that are not yet implemented in FlowFrameEngine.
-        // Return a clear error rather than silently dropping extra targets.
+        // Frame-based execution runs one target per step.
+        // OneToOne: pick the first sorted member, consistent with the flat-step path.
+        // FanOut / FanIn with multiple targets requires concurrent dispatch semantics
+        // that are not yet implemented in FlowFrameEngine.
         if targets.len() > 1 {
-            return Err(MobError::NotYetImplemented(format!(
-                "step '{}' matched {} targets for role '{}'; multi-target dispatch \
-                 is not yet supported in frame-based flows — \
-                 ensure at most one member per role or restructure as a loop body",
-                step_id,
-                targets.len(),
-                step.role
-            )));
+            match step.dispatch_mode {
+                crate::definition::DispatchMode::OneToOne => {
+                    targets.truncate(1);
+                }
+                _ => {
+                    return Err(MobError::NotYetImplemented(format!(
+                        "step '{}' matched {} targets for role '{}'; FanOut/FanIn dispatch \
+                         is not yet supported in frame-based flows — \
+                         use OneToOne or ensure at most one member per role",
+                        step_id,
+                        targets.len(),
+                        step.role
+                    )));
+                }
+            }
         }
 
         let target = targets.into_iter().next().ok_or_else(|| {

@@ -12,7 +12,8 @@ use crate::definition::MobDefinition;
 use crate::event::{MobEvent, NewMobEvent};
 use crate::ids::{FlowId, FrameId, LoopId, LoopInstanceId, MobId, RunId, StepId};
 use crate::run::{
-    FailureLedgerEntry, FrameSnapshot, LoopSnapshot, MobRun, MobRunStatus, StepLedgerEntry,
+    FailureLedgerEntry, FrameSnapshot, LoopIterationLedgerEntry, LoopSnapshot, MobRun,
+    MobRunStatus, StepLedgerEntry,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -137,6 +138,19 @@ pub trait MobRunStore: Send + Sync {
         &self,
         run_id: &RunId,
         entry: FailureLedgerEntry,
+    ) -> Result<(), MobStoreError>;
+
+    /// Upsert a loop snapshot. Creates or overwrites the entry for `loop_instance_id`
+    /// in `run.loops` and optionally appends a `LoopIterationLedgerEntry`.
+    ///
+    /// Used by the sequential `FlowFrameEngine` to persist loop state so that
+    /// `reconcile_run_state` can reconstruct in-progress loops after a crash.
+    async fn upsert_loop_snapshot(
+        &self,
+        run_id: &RunId,
+        loop_instance_id: &LoopInstanceId,
+        snapshot: LoopSnapshot,
+        ledger_entry: Option<LoopIterationLedgerEntry>,
     ) -> Result<(), MobStoreError>;
 
     // Phase 3: CAS wrappers for frame and loop state.
