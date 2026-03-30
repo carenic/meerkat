@@ -1663,23 +1663,22 @@ impl super::flow_frame_engine::FrameStepExecutor for FlowTurnExecutorAdapter {
         })?;
 
         // Topology policy (mirrors flat-step path at flow.rs:261–288).
-        if let Some(topology_spec) = &self.config.topology {
-            if let Some(from_role) = &self.config.orchestrator_role {
-                if matches!(
-                    self.topology.evaluate(from_role, &step.role),
-                    PolicyDecision::Deny
-                ) {
-                    if matches!(topology_spec.mode, PolicyMode::Strict) {
-                        return Err(MobError::TopologyViolation {
-                            from_role: from_role.clone(),
-                            to_role: step.role.clone(),
-                        });
-                    }
-                    self.emitter
-                        .topology_violation(from_role.clone(), step.role.clone())
-                        .await?;
-                }
+        if let (Some(topology_spec), Some(from_role)) =
+            (&self.config.topology, &self.config.orchestrator_role)
+            && matches!(
+                self.topology.evaluate(from_role, &step.role),
+                PolicyDecision::Deny
+            )
+        {
+            if matches!(topology_spec.mode, PolicyMode::Strict) {
+                return Err(MobError::TopologyViolation {
+                    from_role: from_role.clone(),
+                    to_role: step.role.clone(),
+                });
             }
+            self.emitter
+                .topology_violation(from_role.clone(), step.role.clone())
+                .await?;
         }
 
         // Select target(s) by role.
