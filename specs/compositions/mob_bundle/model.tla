@@ -1810,7 +1810,7 @@ flow_run_PumpNodeScheduler ==
        /\ packet.variant = "PumpNodeScheduler"
        /\ ~HigherPriorityReady("flow_engine")
        /\ flow_run_phase = "Running"
-       /\ ((Len(flow_run_ready_frames) > 0) /\ (flow_run_active_node_count < flow_run_max_active_nodes))
+       /\ ((Len(flow_run_ready_frames) > 0) /\ ((flow_run_max_active_nodes = 0) \/ (flow_run_active_node_count < flow_run_max_active_nodes)))
        /\ flow_run_phase' = "Running"
        /\ flow_run_ready_frames' = Tail(flow_run_ready_frames)
        /\ flow_run_ready_frame_membership' = (flow_run_ready_frame_membership \ {Head(flow_run_ready_frames)})
@@ -1835,7 +1835,7 @@ flow_run_RegisterPendingBodyFrame(arg_loop_instance_id, arg_depth) ==
        /\ packet.payload.depth = arg_depth
        /\ ~HigherPriorityReady("flow_engine")
        /\ flow_run_phase = "Running"
-       /\ (packet.payload.depth < flow_run_max_frame_depth)
+       /\ ((flow_run_max_frame_depth = 0) \/ (packet.payload.depth < flow_run_max_frame_depth))
        /\ ~((packet.payload.loop_instance_id \in flow_run_pending_body_frame_loop_membership))
        /\ flow_run_phase' = "Running"
        /\ flow_run_pending_body_frame_loops' = Append(flow_run_pending_body_frame_loops, packet.payload.loop_instance_id)
@@ -1857,7 +1857,7 @@ flow_run_PumpFrameScheduler ==
        /\ packet.variant = "PumpFrameScheduler"
        /\ ~HigherPriorityReady("flow_engine")
        /\ flow_run_phase = "Running"
-       /\ ((Len(flow_run_pending_body_frame_loops) > 0) /\ (flow_run_active_frame_count < flow_run_max_active_frames))
+       /\ ((Len(flow_run_pending_body_frame_loops) > 0) /\ ((flow_run_max_active_frames = 0) \/ (flow_run_active_frame_count < flow_run_max_active_frames)))
        /\ flow_run_phase' = "Running"
        /\ flow_run_pending_body_frame_loops' = Tail(flow_run_pending_body_frame_loops)
        /\ flow_run_pending_body_frame_loop_membership' = (flow_run_pending_body_frame_loop_membership \ {Head(flow_run_pending_body_frame_loops)})

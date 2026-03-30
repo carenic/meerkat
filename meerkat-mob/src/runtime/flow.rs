@@ -1668,6 +1668,26 @@ impl super::flow_frame_engine::FrameStepExecutor for FlowTurnExecutorAdapter {
             .as_ref()
             .is_some_and(|cond| !super::conditions::evaluate_condition(cond, context))
         {
+            // Emit StepSkipped event and append Skipped ledger entry before returning
+            // (mirrors record_step_skipped in the flat-step path — Rule 1).
+            // No target is known yet (condition is evaluated before target selection),
+            // so meerkat_id is empty.
+            let reason = "condition evaluated to false".to_string();
+            self.run_store
+                .append_step_entry(
+                    run_id,
+                    StepLedgerEntry {
+                        step_id: step_id.clone(),
+                        meerkat_id: MeerkatId::from(""),
+                        status: StepRunStatus::Skipped,
+                        output: None,
+                        timestamp: Utc::now(),
+                    },
+                )
+                .await?;
+            self.emitter
+                .step_skipped(run_id.clone(), step_id.clone(), reason)
+                .await?;
             return Ok(super::flow_frame_engine::FrameStepResult::Skipped);
         }
 

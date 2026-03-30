@@ -352,7 +352,7 @@ RegisterReadyFrame(frame_id) ==
 
 PumpNodeScheduler ==
     /\ phase = "Running"
-    /\ ((Len(ready_frames) > 0) /\ (active_node_count < max_active_nodes))
+    /\ ((Len(ready_frames) > 0) /\ ((max_active_nodes = 0) \/ (active_node_count < max_active_nodes)))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ ready_frames' = Tail(ready_frames)
@@ -364,7 +364,7 @@ PumpNodeScheduler ==
 
 RegisterPendingBodyFrame(loop_instance_id, depth) ==
     /\ phase = "Running"
-    /\ (depth < max_frame_depth)
+    /\ ((max_frame_depth = 0) \/ (depth < max_frame_depth))
     /\ ~((loop_instance_id \in pending_body_frame_loop_membership))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
@@ -375,7 +375,7 @@ RegisterPendingBodyFrame(loop_instance_id, depth) ==
 
 PumpFrameScheduler ==
     /\ phase = "Running"
-    /\ ((Len(pending_body_frame_loops) > 0) /\ (active_frame_count < max_active_frames))
+    /\ ((Len(pending_body_frame_loops) > 0) /\ ((max_active_frames = 0) \/ (active_frame_count < max_active_frames)))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ pending_body_frame_loops' = Tail(pending_body_frame_loops)

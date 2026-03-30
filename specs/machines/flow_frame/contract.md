@@ -15,6 +15,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `node_dependencies`: `Map<FlowNodeId, Seq<FlowNodeId>>`
 - `node_dependency_modes`: `Map<FlowNodeId, DependencyMode>`
 - `node_branches`: `Map<FlowNodeId, Option<BranchId>>`
+- `branch_winners`: `Set<BranchId>`
 - `node_status`: `Map<FlowNodeId, NodeRunStatus>`
 - `ready_queue`: `Seq<FlowNodeId>`
 - `output_recorded`: `Map<FlowNodeId, Bool>`

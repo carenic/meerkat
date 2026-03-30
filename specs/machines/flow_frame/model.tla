@@ -24,9 +24,9 @@ SeqRemove(seq, value) == IF Len(seq) = 0 THEN <<>> ELSE IF Head(seq) = value THE
 RECURSIVE SeqRemoveAll(_, _)
 SeqRemoveAll(seq, values) == IF Len(values) = 0 THEN seq ELSE SeqRemoveAll(SeqRemove(seq, Head(values)), Tail(values))
 
-VARIABLES phase, model_step_count, frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_status, ready_queue, output_recorded, node_condition_results
+VARIABLES phase, model_step_count, frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, branch_winners, node_status, ready_queue, output_recorded, node_condition_results
 
-vars == << phase, model_step_count, frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_status, ready_queue, output_recorded, node_condition_results >>
+vars == << phase, model_step_count, frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, branch_winners, node_status, ready_queue, output_recorded, node_condition_results >>
 
 AllNodesTerminal == (\A t_node \in tracked_nodes : (((IF t_node \in DOMAIN node_status THEN node_status[t_node] ELSE "None") = "Completed") \/ ((IF t_node \in DOMAIN node_status THEN node_status[t_node] ELSE "None") = "Failed") \/ ((IF t_node \in DOMAIN node_status THEN node_status[t_node] ELSE "None") = "Skipped") \/ ((IF t_node \in DOMAIN node_status THEN node_status[t_node] ELSE "None") = "Canceled")))
 AnyDepCompleted(node_id) == (\E dep_id \in (IF node_id \in DOMAIN node_dependencies THEN node_dependencies[node_id] ELSE <<>>) : ((IF dep_id \in DOMAIN node_status THEN node_status[dep_id] ELSE "None") = "Completed"))
@@ -44,6 +44,7 @@ Init ==
     /\ node_dependencies = [x \in {} |-> None]
     /\ node_dependency_modes = [x \in {} |-> None]
     /\ node_branches = [x \in {} |-> None]
+    /\ branch_winners = {}
     /\ node_status = [x \in {} |-> None]
     /\ ready_queue = <<>>
     /\ output_recorded = [x \in {} |-> None]
@@ -111,45 +112,45 @@ StartFrame(arg_frame_id, arg_tracked_nodes, arg_ordered_nodes, arg_node_kind, ar
     /\ node_branches' = arg_node_branches
     /\ node_status' = StartFrame_ForEach1_node_status(StartFrame_ForEach0_node_status(node_status, arg_tracked_nodes), arg_ordered_nodes)
     /\ ready_queue' = StartFrame_ForEach2_ready_queue(ready_queue, arg_ordered_nodes, StartFrame_ForEach1_node_status(StartFrame_ForEach0_node_status(node_status, arg_tracked_nodes), arg_ordered_nodes))
-    /\ UNCHANGED << last_admitted_node, output_recorded, node_condition_results >>
+    /\ UNCHANGED << last_admitted_node, branch_winners, output_recorded, node_condition_results >>
 
 
 AdmitNextReadyNode_StepRun ==
     /\ phase = "Running"
     /\ (Len(ready_queue) > 0)
     /\ ((IF Head(ready_queue) \in DOMAIN node_kind THEN node_kind[Head(ready_queue)] ELSE "None") = "Step")
-    /\ ((Len((IF Head(ready_queue) \in DOMAIN node_dependencies THEN node_dependencies[Head(ready_queue)] ELSE <<>>)) = 0) \/ (((IF Head(ready_queue) \in DOMAIN node_dependency_modes THEN node_dependency_modes[Head(ready_queue)] ELSE "None") = "All") /\ AllDepsCompleted(Head(ready_queue))) \/ (((IF Head(ready_queue) \in DOMAIN node_dependency_modes THEN node_dependency_modes[Head(ready_queue)] ELSE "None") = "Any") /\ AnyDepCompleted(Head(ready_queue))))
+    /\ (~(((IF Head(ready_queue) \in DOMAIN node_branches THEN node_branches[Head(ready_queue)] ELSE None) \in branch_winners)) /\ ((Len((IF Head(ready_queue) \in DOMAIN node_dependencies THEN node_dependencies[Head(ready_queue)] ELSE <<>>)) = 0) \/ (((IF Head(ready_queue) \in DOMAIN node_dependency_modes THEN node_dependency_modes[Head(ready_queue)] ELSE "None") = "All") /\ AllDepsCompleted(Head(ready_queue))) \/ (((IF Head(ready_queue) \in DOMAIN node_dependency_modes THEN node_dependency_modes[Head(ready_queue)] ELSE "None") = "Any") /\ AnyDepCompleted(Head(ready_queue)))))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ last_admitted_node' = Head(ready_queue)
     /\ node_status' = MapSet(node_status, Head(ready_queue), "Running")
     /\ ready_queue' = Tail(ready_queue)
-    /\ UNCHANGED << frame_id, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, output_recorded, node_condition_results >>
+    /\ UNCHANGED << frame_id, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, branch_winners, output_recorded, node_condition_results >>
 
 
 AdmitNextReadyNode_LoopRun ==
     /\ phase = "Running"
     /\ (Len(ready_queue) > 0)
     /\ ((IF Head(ready_queue) \in DOMAIN node_kind THEN node_kind[Head(ready_queue)] ELSE "None") = "Loop")
-    /\ ((Len((IF Head(ready_queue) \in DOMAIN node_dependencies THEN node_dependencies[Head(ready_queue)] ELSE <<>>)) = 0) \/ (((IF Head(ready_queue) \in DOMAIN node_dependency_modes THEN node_dependency_modes[Head(ready_queue)] ELSE "None") = "All") /\ AllDepsCompleted(Head(ready_queue))) \/ (((IF Head(ready_queue) \in DOMAIN node_dependency_modes THEN node_dependency_modes[Head(ready_queue)] ELSE "None") = "Any") /\ AnyDepCompleted(Head(ready_queue))))
+    /\ (~(((IF Head(ready_queue) \in DOMAIN node_branches THEN node_branches[Head(ready_queue)] ELSE None) \in branch_winners)) /\ ((Len((IF Head(ready_queue) \in DOMAIN node_dependencies THEN node_dependencies[Head(ready_queue)] ELSE <<>>)) = 0) \/ (((IF Head(ready_queue) \in DOMAIN node_dependency_modes THEN node_dependency_modes[Head(ready_queue)] ELSE "None") = "All") /\ AllDepsCompleted(Head(ready_queue))) \/ (((IF Head(ready_queue) \in DOMAIN node_dependency_modes THEN node_dependency_modes[Head(ready_queue)] ELSE "None") = "Any") /\ AnyDepCompleted(Head(ready_queue)))))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ last_admitted_node' = Head(ready_queue)
     /\ node_status' = MapSet(node_status, Head(ready_queue), "Running")
     /\ ready_queue' = Tail(ready_queue)
-    /\ UNCHANGED << frame_id, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, output_recorded, node_condition_results >>
+    /\ UNCHANGED << frame_id, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, branch_winners, output_recorded, node_condition_results >>
 
 
 AdmitNextReadyNode_Skip ==
     /\ phase = "Running"
     /\ (Len(ready_queue) > 0)
-    /\ (((IF Head(ready_queue) \in DOMAIN node_dependency_modes THEN node_dependency_modes[Head(ready_queue)] ELSE "None") = "All") /\ (\E dep_id \in (IF Head(ready_queue) \in DOMAIN node_dependencies THEN node_dependencies[Head(ready_queue)] ELSE <<>>) : (((IF dep_id \in DOMAIN node_status THEN node_status[dep_id] ELSE "None") = "Failed") \/ ((IF dep_id \in DOMAIN node_status THEN node_status[dep_id] ELSE "None") = "Skipped") \/ ((IF dep_id \in DOMAIN node_status THEN node_status[dep_id] ELSE "None") = "Canceled"))))
+    /\ ((((IF Head(ready_queue) \in DOMAIN node_dependency_modes THEN node_dependency_modes[Head(ready_queue)] ELSE "None") = "All") /\ (\E dep_id \in (IF Head(ready_queue) \in DOMAIN node_dependencies THEN node_dependencies[Head(ready_queue)] ELSE <<>>) : (((IF dep_id \in DOMAIN node_status THEN node_status[dep_id] ELSE "None") = "Failed") \/ ((IF dep_id \in DOMAIN node_status THEN node_status[dep_id] ELSE "None") = "Skipped") \/ ((IF dep_id \in DOMAIN node_status THEN node_status[dep_id] ELSE "None") = "Canceled")))) \/ ((IF Head(ready_queue) \in DOMAIN node_branches THEN node_branches[Head(ready_queue)] ELSE None) \in branch_winners))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ last_admitted_node' = Head(ready_queue)
     /\ node_status' = AdmitNextReadyNode_Skip_ForEach3_node_status(MapSet(node_status, Head(ready_queue), "Skipped"), ordered_nodes)
     /\ ready_queue' = AdmitNextReadyNode_Skip_ForEach4_ready_queue(Tail(ready_queue), ordered_nodes, AdmitNextReadyNode_Skip_ForEach3_node_status(MapSet(node_status, Head(ready_queue), "Skipped"), ordered_nodes))
-    /\ UNCHANGED << frame_id, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, output_recorded, node_condition_results >>
+    /\ UNCHANGED << frame_id, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, branch_winners, output_recorded, node_condition_results >>
 
 
 AdmitNextReadyNode_Fail ==
@@ -161,7 +162,7 @@ AdmitNextReadyNode_Fail ==
     /\ last_admitted_node' = Head(ready_queue)
     /\ node_status' = AdmitNextReadyNode_Fail_ForEach5_node_status(MapSet(node_status, Head(ready_queue), "Failed"), ordered_nodes)
     /\ ready_queue' = AdmitNextReadyNode_Fail_ForEach6_ready_queue(Tail(ready_queue), ordered_nodes, AdmitNextReadyNode_Fail_ForEach5_node_status(MapSet(node_status, Head(ready_queue), "Failed"), ordered_nodes))
-    /\ UNCHANGED << frame_id, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, output_recorded, node_condition_results >>
+    /\ UNCHANGED << frame_id, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, branch_winners, output_recorded, node_condition_results >>
 
 
 CompleteNode(node_id) ==
@@ -169,6 +170,7 @@ CompleteNode(node_id) ==
     /\ ((IF node_id \in DOMAIN node_status THEN node_status[node_id] ELSE "None") = "Running")
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
+    /\ branch_winners' = IF ((IF node_id \in DOMAIN node_branches THEN node_branches[node_id] ELSE None) # None) THEN (branch_winners \cup {(IF node_id \in DOMAIN node_branches THEN node_branches[node_id] ELSE None)}) ELSE branch_winners
     /\ node_status' = CompleteNode_ForEach7_node_status(MapSet(node_status, node_id, "Completed"), ordered_nodes)
     /\ ready_queue' = CompleteNode_ForEach8_ready_queue(ready_queue, ordered_nodes, CompleteNode_ForEach7_node_status(MapSet(node_status, node_id, "Completed"), ordered_nodes))
     /\ UNCHANGED << frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, output_recorded, node_condition_results >>
@@ -179,7 +181,7 @@ RecordNodeOutput(node_id) ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ output_recorded' = MapSet(output_recorded, node_id, TRUE)
-    /\ UNCHANGED << frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_status, ready_queue, node_condition_results >>
+    /\ UNCHANGED << frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, branch_winners, node_status, ready_queue, node_condition_results >>
 
 
 FailNode(node_id) ==
@@ -189,7 +191,7 @@ FailNode(node_id) ==
     /\ model_step_count' = model_step_count + 1
     /\ node_status' = FailNode_ForEach9_node_status(MapSet(node_status, node_id, "Failed"), ordered_nodes)
     /\ ready_queue' = FailNode_ForEach10_ready_queue(ready_queue, ordered_nodes, FailNode_ForEach9_node_status(MapSet(node_status, node_id, "Failed"), ordered_nodes))
-    /\ UNCHANGED << frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, output_recorded, node_condition_results >>
+    /\ UNCHANGED << frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, branch_winners, output_recorded, node_condition_results >>
 
 
 SkipNode(node_id) ==
@@ -199,7 +201,7 @@ SkipNode(node_id) ==
     /\ model_step_count' = model_step_count + 1
     /\ node_status' = SkipNode_ForEach11_node_status(MapSet(node_status, node_id, "Skipped"), ordered_nodes)
     /\ ready_queue' = SkipNode_ForEach12_ready_queue(ready_queue, ordered_nodes, SkipNode_ForEach11_node_status(MapSet(node_status, node_id, "Skipped"), ordered_nodes))
-    /\ UNCHANGED << frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, output_recorded, node_condition_results >>
+    /\ UNCHANGED << frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, branch_winners, output_recorded, node_condition_results >>
 
 
 CancelNode(node_id) ==
@@ -209,7 +211,7 @@ CancelNode(node_id) ==
     /\ model_step_count' = model_step_count + 1
     /\ node_status' = CancelNode_ForEach13_node_status(MapSet(node_status, node_id, "Canceled"), ordered_nodes)
     /\ ready_queue' = CancelNode_ForEach14_ready_queue(ready_queue, ordered_nodes, CancelNode_ForEach13_node_status(MapSet(node_status, node_id, "Canceled"), ordered_nodes))
-    /\ UNCHANGED << frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, output_recorded, node_condition_results >>
+    /\ UNCHANGED << frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, branch_winners, output_recorded, node_condition_results >>
 
 
 TerminalizeCompleted ==
@@ -217,21 +219,21 @@ TerminalizeCompleted ==
     /\ AllNodesTerminal
     /\ phase' = "Completed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_status, ready_queue, output_recorded, node_condition_results >>
+    /\ UNCHANGED << frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, branch_winners, node_status, ready_queue, output_recorded, node_condition_results >>
 
 
 TerminalizeFailed ==
     /\ phase = "Running" \/ phase = "Absent"
     /\ phase' = "Failed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_status, ready_queue, output_recorded, node_condition_results >>
+    /\ UNCHANGED << frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, branch_winners, node_status, ready_queue, output_recorded, node_condition_results >>
 
 
 TerminalizeCanceled ==
     /\ phase = "Running" \/ phase = "Absent"
     /\ phase' = "Canceled"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_status, ready_queue, output_recorded, node_condition_results >>
+    /\ UNCHANGED << frame_id, last_admitted_node, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, branch_winners, node_status, ready_queue, output_recorded, node_condition_results >>
 
 
 Next ==
@@ -252,8 +254,8 @@ Next ==
 
 ready_queue_membership_matches_ready_status == ((\A q_node \in SeqElements(ready_queue) : ((IF q_node \in DOMAIN node_status THEN node_status[q_node] ELSE "None") = "Ready")) /\ (\A t_node \in tracked_nodes : (((IF t_node \in DOMAIN node_status THEN node_status[t_node] ELSE "None") # "Ready") \/ (t_node \in SeqElements(ready_queue)))))
 
-CiStateConstraint == /\ model_step_count <= 6 /\ Cardinality(tracked_nodes) <= 1 /\ Len(ordered_nodes) <= 1 /\ Cardinality(DOMAIN node_kind) <= 1 /\ Cardinality(DOMAIN node_dependencies) <= 1 /\ Cardinality(DOMAIN node_dependency_modes) <= 1 /\ Cardinality(DOMAIN node_branches) <= 1 /\ Cardinality(DOMAIN node_status) <= 1 /\ Len(ready_queue) <= 1 /\ Cardinality(DOMAIN output_recorded) <= 1 /\ Cardinality(DOMAIN node_condition_results) <= 1
-DeepStateConstraint == /\ model_step_count <= 8 /\ Cardinality(tracked_nodes) <= 2 /\ Len(ordered_nodes) <= 2 /\ Cardinality(DOMAIN node_kind) <= 2 /\ Cardinality(DOMAIN node_dependencies) <= 2 /\ Cardinality(DOMAIN node_dependency_modes) <= 2 /\ Cardinality(DOMAIN node_branches) <= 2 /\ Cardinality(DOMAIN node_status) <= 2 /\ Len(ready_queue) <= 2 /\ Cardinality(DOMAIN output_recorded) <= 2 /\ Cardinality(DOMAIN node_condition_results) <= 2
+CiStateConstraint == /\ model_step_count <= 6 /\ Cardinality(tracked_nodes) <= 1 /\ Len(ordered_nodes) <= 1 /\ Cardinality(DOMAIN node_kind) <= 1 /\ Cardinality(DOMAIN node_dependencies) <= 1 /\ Cardinality(DOMAIN node_dependency_modes) <= 1 /\ Cardinality(DOMAIN node_branches) <= 1 /\ Cardinality(branch_winners) <= 1 /\ Cardinality(DOMAIN node_status) <= 1 /\ Len(ready_queue) <= 1 /\ Cardinality(DOMAIN output_recorded) <= 1 /\ Cardinality(DOMAIN node_condition_results) <= 1
+DeepStateConstraint == /\ model_step_count <= 8 /\ Cardinality(tracked_nodes) <= 2 /\ Len(ordered_nodes) <= 2 /\ Cardinality(DOMAIN node_kind) <= 2 /\ Cardinality(DOMAIN node_dependencies) <= 2 /\ Cardinality(DOMAIN node_dependency_modes) <= 2 /\ Cardinality(DOMAIN node_branches) <= 2 /\ Cardinality(branch_winners) <= 2 /\ Cardinality(DOMAIN node_status) <= 2 /\ Len(ready_queue) <= 2 /\ Cardinality(DOMAIN output_recorded) <= 2 /\ Cardinality(DOMAIN node_condition_results) <= 2
 
 Spec == Init /\ [][Next]_vars
 

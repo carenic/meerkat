@@ -1682,16 +1682,24 @@ pub fn flow_run_machine() -> MachineSchema {
                     bindings: vec![],
                 },
                 guards: vec![Guard {
+                    // 0 means unlimited (dogma Rule 5: zero-as-unlimited is a typed semantic,
+                    // not a convention; it must be encoded in the guard, not only in comments).
                     name: "ready_frames_available_and_under_limit".into(),
                     expr: Expr::And(vec![
                         Expr::Gt(
                             Box::new(Expr::Len(Box::new(Expr::Field("ready_frames".into())))),
                             Box::new(Expr::U64(0)),
                         ),
-                        Expr::Lt(
-                            Box::new(Expr::Field("active_node_count".into())),
-                            Box::new(Expr::Field("max_active_nodes".into())),
-                        ),
+                        Expr::Or(vec![
+                            Expr::Eq(
+                                Box::new(Expr::Field("max_active_nodes".into())),
+                                Box::new(Expr::U64(0)),
+                            ),
+                            Expr::Lt(
+                                Box::new(Expr::Field("active_node_count".into())),
+                                Box::new(Expr::Field("max_active_nodes".into())),
+                            ),
+                        ]),
                     ]),
                 }],
                 updates: vec![
@@ -1734,11 +1742,18 @@ pub fn flow_run_machine() -> MachineSchema {
                 },
                 guards: vec![
                     Guard {
+                        // 0 means unlimited: skip the depth check when max_frame_depth == 0.
                         name: "depth_within_limit".into(),
-                        expr: Expr::Lt(
-                            Box::new(Expr::Binding("depth".into())),
-                            Box::new(Expr::Field("max_frame_depth".into())),
-                        ),
+                        expr: Expr::Or(vec![
+                            Expr::Eq(
+                                Box::new(Expr::Field("max_frame_depth".into())),
+                                Box::new(Expr::U64(0)),
+                            ),
+                            Expr::Lt(
+                                Box::new(Expr::Binding("depth".into())),
+                                Box::new(Expr::Field("max_frame_depth".into())),
+                            ),
+                        ]),
                     },
                     Guard {
                         name: "loop_not_already_pending".into(),
@@ -1780,10 +1795,16 @@ pub fn flow_run_machine() -> MachineSchema {
                             )))),
                             Box::new(Expr::U64(0)),
                         ),
-                        Expr::Lt(
-                            Box::new(Expr::Field("active_frame_count".into())),
-                            Box::new(Expr::Field("max_active_frames".into())),
-                        ),
+                        Expr::Or(vec![
+                            Expr::Eq(
+                                Box::new(Expr::Field("max_active_frames".into())),
+                                Box::new(Expr::U64(0)),
+                            ),
+                            Expr::Lt(
+                                Box::new(Expr::Field("active_frame_count".into())),
+                                Box::new(Expr::Field("max_active_frames".into())),
+                            ),
+                        ]),
                     ]),
                 }],
                 updates: vec![
