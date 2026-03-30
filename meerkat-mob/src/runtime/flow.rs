@@ -1783,57 +1783,52 @@ impl super::flow_frame_engine::FrameStepExecutor for FlowTurnExecutorAdapter {
                             // Schema validation (mirrors flat-step path at flow.rs:453–468).
                             // A step with expected_schema_ref must produce a conformant payload;
                             // a schema-invalid response is a retryable failure (Rule 15).
-                            if let Some(schema_ref) = &step.expected_schema_ref {
-                                if let Err(schema_err) =
+                            if let Some(schema_ref) = &step.expected_schema_ref
+                                && let Err(schema_err) =
                                     validate_schema_ref(schema_ref, step_id, &value).await
-                                {
-                                    let reason = schema_err.to_string();
-                                    if attempt < max_retries {
-                                        attempt += 1;
-                                        self.emitter
-                                            .step_target_failed(
-                                                run_id.clone(),
-                                                step_id.clone(),
-                                                target.clone(),
-                                                reason.clone(),
-                                            )
-                                            .await?;
-                                        continue;
-                                    }
-                                    self.run_store
-                                        .append_step_entry(
-                                            run_id,
-                                            StepLedgerEntry {
-                                                step_id: step_id.clone(),
-                                                meerkat_id: target.clone(),
-                                                status: StepRunStatus::Failed,
-                                                output: None,
-                                                timestamp: Utc::now(),
-                                            },
-                                        )
-                                        .await?;
-                                    self.run_store
-                                        .append_failure_entry(
-                                            run_id,
-                                            FailureLedgerEntry {
-                                                step_id: step_id.clone(),
-                                                reason: reason.clone(),
-                                                timestamp: Utc::now(),
-                                            },
-                                        )
-                                        .await?;
+                            {
+                                let reason = schema_err.to_string();
+                                if attempt < max_retries {
+                                    attempt += 1;
                                     self.emitter
-                                        .step_failed(
+                                        .step_target_failed(
                                             run_id.clone(),
                                             step_id.clone(),
+                                            target.clone(),
                                             reason.clone(),
                                         )
                                         .await?;
-                                    return Err(MobError::SchemaValidation {
-                                        step_id: step_id.clone(),
-                                        message: reason,
-                                    });
+                                    continue;
                                 }
+                                self.run_store
+                                    .append_step_entry(
+                                        run_id,
+                                        StepLedgerEntry {
+                                            step_id: step_id.clone(),
+                                            meerkat_id: target.clone(),
+                                            status: StepRunStatus::Failed,
+                                            output: None,
+                                            timestamp: Utc::now(),
+                                        },
+                                    )
+                                    .await?;
+                                self.run_store
+                                    .append_failure_entry(
+                                        run_id,
+                                        FailureLedgerEntry {
+                                            step_id: step_id.clone(),
+                                            reason: reason.clone(),
+                                            timestamp: Utc::now(),
+                                        },
+                                    )
+                                    .await?;
+                                self.emitter
+                                    .step_failed(run_id.clone(), step_id.clone(), reason.clone())
+                                    .await?;
+                                return Err(MobError::SchemaValidation {
+                                    step_id: step_id.clone(),
+                                    message: reason,
+                                });
                             }
 
                             // Append a Completed ledger entry (mirrors apply_target_success_projection).
