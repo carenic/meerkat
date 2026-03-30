@@ -1630,10 +1630,12 @@ impl super::flow_frame_engine::FrameStepExecutor for FlowTurnExecutorAdapter {
             .clone();
 
         // Evaluate condition before dispatch. A false condition skips the step.
-        if let Some(cond) = &step.condition {
-            if !super::conditions::evaluate_condition(cond, context) {
-                return Ok(super::flow_frame_engine::FrameStepResult::Skipped);
-            }
+        if step
+            .condition
+            .as_ref()
+            .is_some_and(|cond| !super::conditions::evaluate_condition(cond, context))
+        {
+            return Ok(super::flow_frame_engine::FrameStepResult::Skipped);
         }
 
         // Render the prompt template.
