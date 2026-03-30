@@ -67,6 +67,7 @@ impl SpecValidator {
 
     /// Validate a `FrameSpec` rooted at `location` within `flow`.
     /// Called recursively for loop body frames.
+    #[allow(clippy::only_used_in_recursion)]
     fn validate_frame_spec(
         definition: &MobDefinition,
         flow_name: &FlowId,
@@ -98,8 +99,8 @@ impl SpecValidator {
                         diagnostics.push(Diagnostic {
                             code: DiagnosticCode::FlowUnknownStep,
                             message: format!(
-                                "frame node '{}' references step_id '{}' which is not defined in flow '{}'",
-                                node_id, step_spec.step_id, flow_name
+                                "frame node '{node_id}' references step_id '{}' which is not defined in flow '{flow_name}'",
+                                step_spec.step_id
                             ),
                             location: Some(format!("{node_loc}.step_id")),
                             severity: DiagnosticSeverity::Error,
@@ -110,10 +111,7 @@ impl SpecValidator {
                         if !node_ids.contains(dep) {
                             diagnostics.push(Diagnostic {
                                 code: DiagnosticCode::FlowUnknownStep,
-                                message: format!(
-                                    "frame node '{}' depends_on unknown node '{dep}' in frame '{location}'",
-                                    node_id
-                                ),
+                                message: format!("frame node '{node_id}' depends_on unknown node '{dep}' in frame '{location}'"),
                                 location: Some(format!("{node_loc}.depends_on")),
                                 severity: DiagnosticSeverity::Error,
                             });
@@ -126,10 +124,7 @@ impl SpecValidator {
                         if !node_ids.contains(dep) {
                             diagnostics.push(Diagnostic {
                                 code: DiagnosticCode::FlowUnknownStep,
-                                message: format!(
-                                    "loop node '{}' depends_on unknown node '{dep}' in frame '{location}'",
-                                    node_id
-                                ),
+                                message: format!("loop node '{node_id}' depends_on unknown node '{dep}' in frame '{location}'"),
                                 location: Some(format!("{node_loc}.depends_on")),
                                 severity: DiagnosticSeverity::Error,
                             });
