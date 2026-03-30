@@ -319,17 +319,28 @@ impl FlowFrameEngine {
 
                             match loop_result {
                                 LoopResult::ConditionMet(all_iter_outputs) => {
-                                    // Merge the last iteration's step outputs into both
-                                    // local_context.step_outputs (for template/condition
-                                    // evaluation in downstream steps) and frame_outputs
-                                    // (so callers of execute_frame can read them at
-                                    // steps.<body_step>...).
+                                    // Merge the UNION of all iterations into frame_outputs
+                                    // (dogma Rule 13: frame_outputs must reflect all steps
+                                    // that ever completed, not just the final iteration).
+                                    // advance_frame_steps_and_terminalize uses frame_outputs.keys()
+                                    // to classify steps as Completed vs Skipped — a step that
+                                    // completed in iteration 0 but was absent in the terminating
+                                    // iteration must still be Completed, not Skipped.
+                                    // Iteration outputs are accumulated in forward order; later
+                                    // iterations overwrite earlier ones so the final value wins.
+                                    for iter in &all_iter_outputs {
+                                        for (sid, out) in iter {
+                                            frame_outputs.insert(sid.clone(), out.clone());
+                                        }
+                                    }
+                                    // local_context.step_outputs uses the last iteration only —
+                                    // downstream template/condition evaluation should see the
+                                    // most recent value, not all historical values.
                                     if let Some(last_iter) = all_iter_outputs.last() {
                                         for (sid, out) in last_iter {
                                             local_context
                                                 .step_outputs
                                                 .insert(sid.clone(), out.clone());
-                                            frame_outputs.insert(sid.clone(), out.clone());
                                         }
                                     }
                                     // Also record the full iteration history in loop_outputs

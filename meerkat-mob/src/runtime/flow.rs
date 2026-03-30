@@ -152,6 +152,20 @@ impl FlowEngine {
                     return Ok(());
                 }
                 Err(e) => {
+                    // Preserve the cancel/fail distinction (dogma Rule 4: one semantic
+                    // condition, one canonical terminal path). The flat-step path calls
+                    // terminalize_canceled when canceled — the frame path must too.
+                    if matches!(e, MobError::RunCanceled(_)) {
+                        self.flow_kernel.cancel_dispatched_steps(&run_id).await?;
+                        if let super::terminalization::TerminalizationOutcome::Transitioned = self
+                            .flow_kernel
+                            .terminalize_canceled(run_id.clone(), config.flow_id.clone())
+                            .await?
+                        {
+                            tracing::debug!(run_id = %run_id, "frame-based flow canceled terminalization applied");
+                        }
+                        return Ok(());
+                    }
                     return self.fail_run(&run_id, &config.flow_id, e).await;
                 }
             }
@@ -1766,6 +1780,62 @@ impl super::flow_frame_engine::FrameStepExecutor for FlowTurnExecutorAdapter {
                 FlowTurnOutcome::Completed { output } => {
                     match parse_output_value(&output, step_id, &target, &step.output_format) {
                         Ok(value) => {
+                            // Schema validation (mirrors flat-step path at flow.rs:453–468).
+                            // A step with expected_schema_ref must produce a conformant payload;
+                            // a schema-invalid response is a retryable failure (Rule 15).
+                            if let Some(schema_ref) = &step.expected_schema_ref {
+                                if let Err(schema_err) =
+                                    validate_schema_ref(schema_ref, step_id, &value).await
+                                {
+                                    let reason = schema_err.to_string();
+                                    if attempt < max_retries {
+                                        attempt += 1;
+                                        self.emitter
+                                            .step_target_failed(
+                                                run_id.clone(),
+                                                step_id.clone(),
+                                                target.clone(),
+                                                reason.clone(),
+                                            )
+                                            .await?;
+                                        continue;
+                                    }
+                                    self.run_store
+                                        .append_step_entry(
+                                            run_id,
+                                            StepLedgerEntry {
+                                                step_id: step_id.clone(),
+                                                meerkat_id: target.clone(),
+                                                status: StepRunStatus::Failed,
+                                                output: None,
+                                                timestamp: Utc::now(),
+                                            },
+                                        )
+                                        .await?;
+                                    self.run_store
+                                        .append_failure_entry(
+                                            run_id,
+                                            FailureLedgerEntry {
+                                                step_id: step_id.clone(),
+                                                reason: reason.clone(),
+                                                timestamp: Utc::now(),
+                                            },
+                                        )
+                                        .await?;
+                                    self.emitter
+                                        .step_failed(
+                                            run_id.clone(),
+                                            step_id.clone(),
+                                            reason.clone(),
+                                        )
+                                        .await?;
+                                    return Err(MobError::SchemaValidation {
+                                        step_id: step_id.clone(),
+                                        message: reason,
+                                    });
+                                }
+                            }
+
                             // Append a Completed ledger entry (mirrors apply_target_success_projection).
                             // Note: we do NOT call put_step_output — that only mutates the existing
                             // Dispatched entry. Callers (e.g. deliberate) read Completed entries.
