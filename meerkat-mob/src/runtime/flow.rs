@@ -752,8 +752,12 @@ impl FlowEngine {
                 )
                 .await?;
 
-            match self.executor.await_terminal(ticket, step_timeout).await? {
-                FlowTurnOutcome::Completed { output } => {
+            match self
+                .executor
+                .await_terminal(ticket.clone(), step_timeout)
+                .await
+            {
+                Ok(FlowTurnOutcome::Completed { output }) => {
                     match parse_output_value(&output, step_id, &target, &step.output_format) {
                         Ok(value) => {
                             // ── 9. Schema validation ───────────────────────
@@ -894,7 +898,7 @@ impl FlowEngine {
                         }
                     }
                 }
-                FlowTurnOutcome::Failed { reason } => {
+                Ok(FlowTurnOutcome::Failed { reason }) => {
                     if attempt < max_retries {
                         attempt += 1;
                         self.emitter
@@ -939,7 +943,7 @@ impl FlowEngine {
                         "step '{step_id}' failed after {attempt} retries: {reason}"
                     )));
                 }
-                FlowTurnOutcome::Canceled => {
+                Ok(FlowTurnOutcome::Canceled) => {
                     let reason = format!("step '{step_id}' was canceled");
                     self.run_store
                         .append_step_entry(
@@ -970,6 +974,73 @@ impl FlowEngine {
                         .await?;
                     return Err(MobError::Internal(reason));
                 }
+                // Timeout: detach/cancel the worker turn, record as target failure,
+                // consume retry budget (mirrors flat-step execute_target_with_retries).
+                Err(MobError::FlowTurnTimedOut) => {
+                    let timeout_reason = match self.executor.on_timeout(ticket).await {
+                        Ok(TimeoutDisposition::Detached) => {
+                            format!("timeout after {}ms", step_timeout.as_millis())
+                        }
+                        Ok(TimeoutDisposition::Canceled) => {
+                            format!("timeout + canceled after {}ms", step_timeout.as_millis())
+                        }
+                        Err(timeout_error) => {
+                            return Err(MobError::FlowFailed {
+                                run_id: run_id.clone(),
+                                reason: timeout_error.to_string(),
+                            });
+                        }
+                    };
+                    if attempt < max_retries {
+                        attempt += 1;
+                        self.emitter
+                            .step_target_failed(
+                                run_id.clone(),
+                                step_id.clone(),
+                                target.clone(),
+                                timeout_reason,
+                            )
+                            .await?;
+                        continue;
+                    }
+                    self.run_store
+                        .append_step_entry(
+                            run_id,
+                            StepLedgerEntry {
+                                step_id: step_id.clone(),
+                                meerkat_id: target.clone(),
+                                status: StepRunStatus::Failed,
+                                output: None,
+                                timestamp: Utc::now(),
+                            },
+                        )
+                        .await?;
+                    self.run_store
+                        .append_failure_entry(
+                            run_id,
+                            FailureLedgerEntry {
+                                step_id: step_id.clone(),
+                                reason: timeout_reason.clone(),
+                                timestamp: Utc::now(),
+                            },
+                        )
+                        .await?;
+                    self.emitter
+                        .step_failed(run_id.clone(), step_id.clone(), timeout_reason.clone())
+                        .await?;
+                    self.maybe_escalate_guard(
+                        &supervisor,
+                        config,
+                        run_id,
+                        step_id,
+                        &timeout_reason,
+                    )
+                    .await?;
+                    return Err(MobError::Internal(format!(
+                        "step '{step_id}' timed out after {attempt} retries: {timeout_reason}"
+                    )));
+                }
+                Err(other) => return Err(other),
             }
         }
     }
@@ -1032,8 +1103,12 @@ impl FlowEngine {
                     )
                     .await?;
 
-                match self.executor.await_terminal(ticket, step_timeout).await? {
-                    FlowTurnOutcome::Completed { output } => {
+                match self
+                    .executor
+                    .await_terminal(ticket.clone(), step_timeout)
+                    .await
+                {
+                    Ok(FlowTurnOutcome::Completed { output }) => {
                         match parse_output_value(&output, step_id, target, &step.output_format) {
                             Ok(value) => break Ok(value),
                             Err(reason) => {
@@ -1045,14 +1120,33 @@ impl FlowEngine {
                             }
                         }
                     }
-                    FlowTurnOutcome::Failed { reason } => {
+                    Ok(FlowTurnOutcome::Failed { reason }) => {
                         if attempt < max_retries {
                             attempt += 1;
                             continue;
                         }
                         break Err(reason);
                     }
-                    FlowTurnOutcome::Canceled => break Err("canceled".into()),
+                    Ok(FlowTurnOutcome::Canceled) => break Err("canceled".into()),
+                    Err(MobError::FlowTurnTimedOut) => {
+                        let timeout_reason = match self.executor.on_timeout(ticket).await {
+                            Ok(TimeoutDisposition::Detached) => {
+                                format!("timeout after {}ms", step_timeout.as_millis())
+                            }
+                            Ok(TimeoutDisposition::Canceled) => {
+                                format!("timeout + canceled after {}ms", step_timeout.as_millis())
+                            }
+                            Err(e) => {
+                                break Err(e.to_string());
+                            }
+                        };
+                        if attempt < max_retries {
+                            attempt += 1;
+                            continue;
+                        }
+                        break Err(timeout_reason);
+                    }
+                    Err(other) => return Err(other),
                 }
             };
 
@@ -1101,20 +1195,53 @@ impl FlowEngine {
             }
         }
 
-        if successes.is_empty() {
-            let combined = failures.join("; ");
+        // Enforce collection policy (mirrors flat-step path's collection_satisfied check).
+        let policy_satisfied = match &step.collection_policy {
+            CollectionPolicy::All => failures.is_empty(),
+            CollectionPolicy::Any => !successes.is_empty(),
+            CollectionPolicy::Quorum { n } => successes.len() >= *n as usize,
+        };
+
+        if !policy_satisfied {
+            let combined = if failures.is_empty() {
+                format!(
+                    "collection policy {:?} not satisfied: {} successes, {} failures",
+                    step.collection_policy,
+                    successes.len(),
+                    failures.len()
+                )
+            } else {
+                failures.join("; ")
+            };
             self.emitter
                 .step_failed(run_id.clone(), step_id.clone(), combined.clone())
                 .await?;
             self.maybe_escalate_guard(supervisor, config, run_id, step_id, &combined)
                 .await?;
             return Err(MobError::Internal(format!(
-                "all targets failed for step '{step_id}': {combined}"
+                "step '{step_id}' failed collection policy: {combined}"
             )));
         }
 
         // Aggregate output using the step's dispatch/collection policy.
         let aggregate = aggregate_output(&step.dispatch_mode, &step.collection_policy, &successes);
+
+        // Validate aggregated schema (mirrors flat-step path at flow.rs:453-468).
+        if let Some(schema_ref) = &step.expected_schema_ref {
+            if let Err(schema_err) = validate_schema_ref(schema_ref, step_id, &aggregate).await {
+                let reason = schema_err.to_string();
+                self.emitter
+                    .step_failed(run_id.clone(), step_id.clone(), reason.clone())
+                    .await?;
+                self.maybe_escalate_guard(supervisor, config, run_id, step_id, &reason)
+                    .await?;
+                return Err(MobError::SchemaValidation {
+                    step_id: step_id.clone(),
+                    message: reason,
+                });
+            }
+        }
+
         self.emitter
             .step_completed(run_id.clone(), step_id.clone())
             .await?;
