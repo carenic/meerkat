@@ -185,7 +185,21 @@ impl FlowFrameEngine {
         // Root frames read from root_step_outputs; body frames read from the correct
         // loop_iteration_outputs slot.
         let mut frame_outputs: IndexMap<StepId, serde_json::Value> = match &loop_context {
-            None => run.root_step_outputs.clone(),
+            None => {
+                // Root frame: seed from root_step_outputs AND all loop iteration outputs.
+                // advance_frame_steps_and_terminalize uses outputs.keys() to classify steps
+                // as Completed vs Skipped — loop body steps that completed before a crash
+                // must appear here so they aren't reclassified as Skipped on resume.
+                let mut outputs = run.root_step_outputs.clone();
+                for iterations in run.loop_iteration_outputs.values() {
+                    for iter in iterations {
+                        for (sid, out) in iter {
+                            outputs.entry(sid.clone()).or_insert_with(|| out.clone());
+                        }
+                    }
+                }
+                outputs
+            }
             Some((loop_id, iteration)) => run
                 .loop_iteration_outputs
                 .get(loop_id)

@@ -149,6 +149,31 @@ impl FlowEngine {
                     {
                         tracing::debug!(run_id = %run_id, "frame-based flow completed terminalization applied");
                     }
+                    // Emit Skipped ledger entries + step_skipped events for auto-skipped steps
+                    // (dogma Rule 1: step_ledger must reflect all terminal step outcomes).
+                    for step_id in config.flow_spec.steps.keys() {
+                        if !outputs.contains_key(step_id) {
+                            self.run_store
+                                .append_step_entry(
+                                    &run_id,
+                                    StepLedgerEntry {
+                                        step_id: step_id.clone(),
+                                        meerkat_id: MeerkatId::from(""),
+                                        status: StepRunStatus::Skipped,
+                                        output: None,
+                                        timestamp: Utc::now(),
+                                    },
+                                )
+                                .await?;
+                            self.emitter
+                                .step_skipped(
+                                    run_id.clone(),
+                                    step_id.clone(),
+                                    "auto-skipped by frame execution".into(),
+                                )
+                                .await?;
+                        }
+                    }
                     return Ok(());
                 }
                 Err(e) => {
@@ -1745,26 +1770,23 @@ impl super::flow_frame_engine::FrameStepExecutor for FlowTurnExecutorAdapter {
             .collect();
         targets.sort_by(|a, b| a.as_str().cmp(b.as_str()));
 
-        // Frame-based execution runs one target per step.
-        // OneToOne: pick the first sorted member, consistent with the flat-step path.
-        // FanOut / FanIn with multiple targets requires concurrent dispatch semantics
-        // that are not yet implemented in FlowFrameEngine.
+        // OneToOne: pick the first sorted member (consistent with flat-step path).
+        if targets.len() > 1
+            && matches!(
+                step.dispatch_mode,
+                crate::definition::DispatchMode::OneToOne
+            )
+        {
+            targets.truncate(1);
+        }
+
+        // FanOut/FanIn with multiple targets: dispatch to each target sequentially
+        // (flat-step path does this concurrently, but sequential is semantically correct
+        // for collection policy evaluation). Aggregate the outputs afterward.
         if targets.len() > 1 {
-            match step.dispatch_mode {
-                crate::definition::DispatchMode::OneToOne => {
-                    targets.truncate(1);
-                }
-                _ => {
-                    return Err(MobError::NotYetImplemented(format!(
-                        "step '{}' matched {} targets for role '{}'; FanOut/FanIn dispatch \
-                         is not yet supported in frame-based flows — \
-                         use OneToOne or ensure at most one member per role",
-                        step_id,
-                        targets.len(),
-                        step.role
-                    )));
-                }
-            }
+            return self
+                .dispatch_multi_target(run_id, step_id, &targets, &step, context)
+                .await;
         }
 
         let target = targets.into_iter().next().ok_or_else(|| {
@@ -2021,6 +2043,156 @@ impl super::flow_frame_engine::FrameStepExecutor for FlowTurnExecutorAdapter {
                 }
             }
         }
+    }
+}
+
+impl FlowTurnExecutorAdapter {
+    /// Dispatch to multiple targets (FanOut/FanIn), collect results, and aggregate.
+    /// Sequential dispatch: each target is dispatched and awaited before the next.
+    /// Returns the aggregated output matching the step's collection policy.
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_multi_target(
+        &self,
+        run_id: &RunId,
+        step_id: &StepId,
+        targets: &[MeerkatId],
+        step: &crate::definition::FlowStepSpec,
+        context: &FlowContext,
+    ) -> Result<super::flow_frame_engine::FrameStepResult, MobError> {
+        let step_timeout =
+            meerkat_core::time_compat::Duration::from_millis(step.timeout_ms.unwrap_or(30_000));
+        let flow_tool_overlay = step_tool_overlay(step);
+        let prompt = render_content_input_template(&step.message, context).map_err(|e| {
+            MobError::Internal(format!("template render failed for step '{step_id}': {e}"))
+        })?;
+        let max_retries = self
+            .config
+            .limits
+            .as_ref()
+            .and_then(|l| l.max_step_retries)
+            .unwrap_or(0) as usize;
+
+        let mut successes: Vec<(MeerkatId, serde_json::Value)> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+
+        for target in targets {
+            self.emitter
+                .step_dispatched(run_id.clone(), step_id.clone(), target.clone())
+                .await?;
+            self.run_store
+                .append_step_entry_if_absent(
+                    run_id,
+                    StepLedgerEntry {
+                        step_id: step_id.clone(),
+                        meerkat_id: target.clone(),
+                        status: StepRunStatus::Dispatched,
+                        output: None,
+                        timestamp: Utc::now(),
+                    },
+                )
+                .await?;
+
+            let mut attempt = 0usize;
+            let result = loop {
+                let ticket = self
+                    .executor
+                    .dispatch(
+                        run_id,
+                        step_id,
+                        target,
+                        prompt.clone(),
+                        flow_tool_overlay.clone(),
+                    )
+                    .await?;
+
+                match self.executor.await_terminal(ticket, step_timeout).await? {
+                    FlowTurnOutcome::Completed { output } => {
+                        match parse_output_value(&output, step_id, target, &step.output_format) {
+                            Ok(value) => break Ok(value),
+                            Err(reason) => {
+                                if attempt < max_retries {
+                                    attempt += 1;
+                                    continue;
+                                }
+                                break Err(reason);
+                            }
+                        }
+                    }
+                    FlowTurnOutcome::Failed { reason } => {
+                        if attempt < max_retries {
+                            attempt += 1;
+                            continue;
+                        }
+                        break Err(reason);
+                    }
+                    FlowTurnOutcome::Canceled => break Err("canceled".into()),
+                }
+            };
+
+            match result {
+                Ok(value) => {
+                    self.run_store
+                        .append_step_entry(
+                            run_id,
+                            StepLedgerEntry {
+                                step_id: step_id.clone(),
+                                meerkat_id: target.clone(),
+                                status: StepRunStatus::Completed,
+                                output: Some(value.clone()),
+                                timestamp: Utc::now(),
+                            },
+                        )
+                        .await?;
+                    self.emitter
+                        .step_target_completed(run_id.clone(), step_id.clone(), target.clone())
+                        .await?;
+                    successes.push((target.clone(), value));
+                }
+                Err(reason) => {
+                    self.run_store
+                        .append_step_entry(
+                            run_id,
+                            StepLedgerEntry {
+                                step_id: step_id.clone(),
+                                meerkat_id: target.clone(),
+                                status: StepRunStatus::Failed,
+                                output: None,
+                                timestamp: Utc::now(),
+                            },
+                        )
+                        .await?;
+                    self.emitter
+                        .step_target_failed(
+                            run_id.clone(),
+                            step_id.clone(),
+                            target.clone(),
+                            reason.clone(),
+                        )
+                        .await?;
+                    failures.push(reason);
+                }
+            }
+        }
+
+        if successes.is_empty() {
+            let combined = failures.join("; ");
+            self.emitter
+                .step_failed(run_id.clone(), step_id.clone(), combined.clone())
+                .await?;
+            self.maybe_escalate(run_id, step_id, &combined).await?;
+            return Err(MobError::Internal(format!(
+                "all targets failed for step '{step_id}': {combined}"
+            )));
+        }
+
+        // Aggregate output using the step's dispatch/collection policy.
+        let aggregate = aggregate_output(&step.dispatch_mode, &step.collection_policy, &successes);
+        self.emitter
+            .step_completed(run_id.clone(), step_id.clone())
+            .await?;
+        Ok(super::flow_frame_engine::FrameStepResult::Completed(
+            aggregate,
+        ))
     }
 }
 
