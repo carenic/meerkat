@@ -977,6 +977,7 @@ impl FlowEngine {
     /// Multi-target dispatch for FanOut/FanIn, used by `execute_step_with_all_guards`.
     /// Sequential dispatch: each target is dispatched and awaited before the next.
     /// Returns the aggregated output matching the step's collection policy.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_multi_target_canonical(
         &self,
         run_id: &RunId,
