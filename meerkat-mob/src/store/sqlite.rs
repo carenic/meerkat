@@ -906,10 +906,7 @@ impl MobRunStore for SqliteMobRunStore {
                         .insert(StepId::from(step_output_key.as_str()), step_output);
                 }
                 Some((loop_id, iteration)) => {
-                    let outputs = run
-                        .loop_iteration_outputs
-                        .entry(loop_id)
-                        .or_insert_with(Vec::new);
+                    let outputs = run.loop_iteration_outputs.entry(loop_id).or_default();
                     while outputs.len() <= iteration as usize {
                         outputs.push(indexmap::IndexMap::new());
                     }
