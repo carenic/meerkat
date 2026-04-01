@@ -91,7 +91,7 @@ fn start_frame_input_single_root_node() -> KernelInput {
     // Single node "A" with no deps, kind=Step
     let node_a = str_val("node-a");
     KernelInput {
-        variant: "StartFrame".into(),
+        variant: "StartRootFrame".into(),
         fields: BTreeMap::from([
             ("frame_id".into(), frame_id_val()),
             ("tracked_nodes".into(), set(vec![node_a.clone()])),
@@ -121,7 +121,7 @@ fn start_frame_input_dag_a_then_b() -> KernelInput {
     let node_a = str_val("node-a");
     let node_b = str_val("node-b");
     KernelInput {
-        variant: "StartFrame".into(),
+        variant: "StartRootFrame".into(),
         fields: BTreeMap::from([
             ("frame_id".into(), frame_id_val()),
             (
@@ -171,11 +171,11 @@ fn test_ready_queue_invariant_holds_across_all_transitions() {
     let state = flow_frame::initial_state().expect("init");
     assert_ready_queue_invariant(&state, "initial");
 
-    // StartFrame with A->B DAG
+    // StartRootFrame with A->B DAG
     let start_input = start_frame_input_dag_a_then_b();
-    let outcome = flow_frame::transition(&state, &start_input).expect("StartFrame");
+    let outcome = flow_frame::transition(&state, &start_input).expect("StartRootFrame");
     let state = outcome.next_state;
-    assert_ready_queue_invariant(&state, "after StartFrame");
+    assert_ready_queue_invariant(&state, "after StartRootFrame");
 
     // Only A should be in ready_queue (B has dep on A)
     let queue = match state.fields.get("ready_queue").expect("ready_queue") {
@@ -237,26 +237,26 @@ fn test_ready_queue_invariant_holds_across_all_transitions() {
     let state = outcome.next_state;
     assert_ready_queue_invariant(&state, "after CompleteNode B");
 
-    // TerminalizeCompleted
+    // SealFrame
     let term_input = KernelInput {
-        variant: "TerminalizeCompleted".into(),
+        variant: "SealFrame".into(),
         fields: BTreeMap::new(),
     };
-    let outcome = flow_frame::transition(&state, &term_input).expect("TerminalizeCompleted");
+    let outcome = flow_frame::transition(&state, &term_input).expect("SealFrame");
     let state = outcome.next_state;
-    assert_ready_queue_invariant(&state, "after TerminalizeCompleted");
+    assert_ready_queue_invariant(&state, "after SealFrame");
     assert_eq!(state.phase, "Completed");
 }
 
 #[test]
 fn test_refresh_ready_frontier_seeds_roots_on_start_frame() {
-    // A->B->C (all All-mode), only A should be in queue after StartFrame
+    // A->B->C (all All-mode), only A should be in queue after StartRootFrame
     let node_a = str_val("node-a");
     let node_b = str_val("node-b");
     let node_c = str_val("node-c");
     let state = flow_frame::initial_state().expect("init");
     let start = KernelInput {
-        variant: "StartFrame".into(),
+        variant: "StartRootFrame".into(),
         fields: BTreeMap::from([
             ("frame_id".into(), frame_id_val()),
             (
@@ -301,7 +301,7 @@ fn test_refresh_ready_frontier_seeds_roots_on_start_frame() {
             ),
         ]),
     };
-    let outcome = flow_frame::transition(&state, &start).expect("StartFrame");
+    let outcome = flow_frame::transition(&state, &start).expect("StartRootFrame");
     let state = outcome.next_state;
     let queue = match state.fields.get("ready_queue").expect("rq") {
         KernelValue::Seq(v) => v.clone(),
@@ -330,7 +330,7 @@ fn test_refresh_ready_frontier_seeds_roots_on_start_frame() {
 fn test_admit_step_run_pops_head_and_marks_running() {
     let state = flow_frame::initial_state().expect("init");
     let start = start_frame_input_single_root_node();
-    let outcome = flow_frame::transition(&state, &start).expect("StartFrame");
+    let outcome = flow_frame::transition(&state, &start).expect("StartRootFrame");
     let state = outcome.next_state;
 
     // Queue: [A], status[A] = Ready
@@ -376,7 +376,7 @@ fn test_admit_skip_when_all_dep_failed() {
     let node_b = str_val("node-b");
     let state = flow_frame::initial_state().expect("init");
     let start = start_frame_input_dag_a_then_b();
-    let outcome = flow_frame::transition(&state, &start).expect("StartFrame");
+    let outcome = flow_frame::transition(&state, &start).expect("StartRootFrame");
     let state = outcome.next_state;
 
     // Admit A
@@ -433,7 +433,7 @@ fn test_admit_loop_node_emits_start_loop_node() {
     let loop_node = str_val("loop-node");
     let state = flow_frame::initial_state().expect("init");
     let start = KernelInput {
-        variant: "StartFrame".into(),
+        variant: "StartRootFrame".into(),
         fields: BTreeMap::from([
             ("frame_id".into(), frame_id_val()),
             ("tracked_nodes".into(), set(vec![loop_node.clone()])),
@@ -456,9 +456,9 @@ fn test_admit_loop_node_emits_start_loop_node() {
             ),
         ]),
     };
-    let outcome = flow_frame::transition(&state, &start).expect("StartFrame");
+    let outcome = flow_frame::transition(&state, &start).expect("StartRootFrame");
     let state = outcome.next_state;
-    assert_ready_queue_invariant(&state, "after StartFrame loop");
+    assert_ready_queue_invariant(&state, "after StartRootFrame loop");
 
     let admit = KernelInput {
         variant: "AdmitNextReadyNode".into(),
@@ -499,7 +499,7 @@ fn test_admit_fail_when_any_mode_all_deps_skipped_or_failed() {
 
     let state = flow_frame::initial_state().expect("init");
     let start = KernelInput {
-        variant: "StartFrame".into(),
+        variant: "StartRootFrame".into(),
         fields: BTreeMap::from([
             ("frame_id".into(), str_val("frame-test")),
             (
@@ -544,9 +544,9 @@ fn test_admit_fail_when_any_mode_all_deps_skipped_or_failed() {
             ),
         ]),
     };
-    let outcome = flow_frame::transition(&state, &start).expect("StartFrame");
+    let outcome = flow_frame::transition(&state, &start).expect("StartRootFrame");
     let mut state = outcome.next_state;
-    assert_ready_queue_invariant(&state, "after StartFrame");
+    assert_ready_queue_invariant(&state, "after StartRootFrame");
 
     // Admit A and B (both roots), skip each after admission
     for node in [&node_a, &node_b] {
@@ -604,16 +604,16 @@ fn test_admit_fail_when_any_mode_all_deps_skipped_or_failed() {
 
 #[test]
 fn test_ready_frontier_emits_ready_frontier_changed_effect() {
-    // StartFrame should emit ReadyFrontierChanged when root nodes exist
+    // StartRootFrame should emit ReadyFrontierChanged when root nodes exist
     let state = flow_frame::initial_state().expect("init");
     let start = start_frame_input_single_root_node();
-    let outcome = flow_frame::transition(&state, &start).expect("StartFrame");
+    let outcome = flow_frame::transition(&state, &start).expect("StartRootFrame");
     assert!(
         outcome
             .effects
             .iter()
             .any(|e| e.variant == "ReadyFrontierChanged"),
-        "StartFrame should emit ReadyFrontierChanged when ready_queue becomes non-empty, got: {:?}",
+        "StartRootFrame should emit ReadyFrontierChanged when ready_queue becomes non-empty, got: {:?}",
         outcome
             .effects
             .iter()

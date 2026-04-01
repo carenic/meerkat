@@ -14,7 +14,10 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `start-run-terminalize` — frame starts, admits nodes, and terminalizes (Phase 1 complete)
 
 ### Transitions
-- `StartFrame`
+- `StartRootFrame`
+  - anchors: `flow_frame_schema`
+  - scenarios: `start-run-terminalize`
+- `StartBodyFrame`
   - anchors: `flow_frame_schema`
   - scenarios: `start-run-terminalize`
 - `AdmitNextReadyNode_StepRun`
@@ -29,28 +32,49 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `AdmitNextReadyNode_Fail`
   - anchors: `flow_frame_schema`
   - scenarios: `start-run-terminalize`
-- `CompleteNode`
+- `CompleteNode_Step`
+  - anchors: `flow_frame_schema`
+  - scenarios: `start-run-terminalize`
+- `CompleteNode_Loop`
   - anchors: `flow_frame_schema`
   - scenarios: `start-run-terminalize`
 - `RecordNodeOutput`
   - anchors: `flow_frame_schema`
   - scenarios: `start-run-terminalize`
-- `FailNode`
+- `FailNode_Step`
   - anchors: `flow_frame_schema`
   - scenarios: `start-run-terminalize`
-- `SkipNode`
+- `FailNode_Loop`
   - anchors: `flow_frame_schema`
   - scenarios: `start-run-terminalize`
-- `CancelNode`
+- `SkipNode_Step`
   - anchors: `flow_frame_schema`
   - scenarios: `start-run-terminalize`
-- `TerminalizeCompleted`
+- `SkipNode_Loop`
   - anchors: `flow_frame_schema`
   - scenarios: `start-run-terminalize`
-- `TerminalizeFailed`
+- `CancelNode_Step`
   - anchors: `flow_frame_schema`
   - scenarios: `start-run-terminalize`
-- `TerminalizeCanceled`
+- `CancelNode_Loop`
+  - anchors: `flow_frame_schema`
+  - scenarios: `start-run-terminalize`
+- `SealRootFrameCanceled`
+  - anchors: `flow_frame_schema`
+  - scenarios: `start-run-terminalize`
+- `SealRootFrameFailed`
+  - anchors: `flow_frame_schema`
+  - scenarios: `start-run-terminalize`
+- `SealRootFrameCompleted`
+  - anchors: `flow_frame_schema`
+  - scenarios: `start-run-terminalize`
+- `SealBodyFrameCanceled`
+  - anchors: `flow_frame_schema`
+  - scenarios: `start-run-terminalize`
+- `SealBodyFrameFailed`
+  - anchors: `flow_frame_schema`
+  - scenarios: `start-run-terminalize`
+- `SealBodyFrameCompleted`
   - anchors: `flow_frame_schema`
   - scenarios: `start-run-terminalize`
 
@@ -70,7 +94,22 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `NodeExecutionReleased`
   - anchors: `flow_frame_schema`
   - scenarios: `start-run-terminalize`
-- `FrameTerminalized`
+- `RootFrameCompleted`
+  - anchors: `flow_frame_schema`
+  - scenarios: `start-run-terminalize`
+- `RootFrameFailed`
+  - anchors: `flow_frame_schema`
+  - scenarios: `start-run-terminalize`
+- `RootFrameCanceled`
+  - anchors: `flow_frame_schema`
+  - scenarios: `start-run-terminalize`
+- `BodyFrameCompleted`
+  - anchors: `flow_frame_schema`
+  - scenarios: `start-run-terminalize`
+- `BodyFrameFailed`
+  - anchors: `flow_frame_schema`
+  - scenarios: `start-run-terminalize`
+- `BodyFrameCanceled`
   - anchors: `flow_frame_schema`
   - scenarios: `start-run-terminalize`
 

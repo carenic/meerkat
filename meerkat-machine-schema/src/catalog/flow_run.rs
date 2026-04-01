@@ -9,7 +9,7 @@ use crate::{
 pub fn flow_run_machine() -> MachineSchema {
     MachineSchema {
         machine: "FlowRunMachine".into(),
-        version: 2,
+        version: 4,
         rust: RustBinding {
             crate_name: "meerkat-mob".into(),
             module: "generated::flow_run".into(),
@@ -158,21 +158,6 @@ pub fn flow_run_machine() -> MachineSchema {
                 // their values are stale until the next pump assigns them.
                 field("last_granted_frame", TypeRef::Named("FrameId".into())),
                 field("last_granted_loop", TypeRef::Named("LoopInstanceId".into())),
-                // v2: frame and loop registries
-                field(
-                    "frames",
-                    TypeRef::Map(
-                        Box::new(TypeRef::Named("FrameId".into())),
-                        Box::new(TypeRef::Named("FrameSnapshotRef".into())),
-                    ),
-                ),
-                field(
-                    "loops",
-                    TypeRef::Map(
-                        Box::new(TypeRef::Named("LoopInstanceId".into())),
-                        Box::new(TypeRef::Named("LoopSnapshotRef".into())),
-                    ),
-                ),
             ],
             init: InitSchema {
                 phase: "Absent".into(),
@@ -209,9 +194,6 @@ pub fn flow_run_machine() -> MachineSchema {
                     // v2: scratch fields for head capture
                     init("last_granted_frame", Expr::String(String::new())),
                     init("last_granted_loop", Expr::String(String::new())),
-                    // v2: frame and loop registry inits
-                    init("frames", Expr::EmptyMap),
-                    init("loops", Expr::EmptyMap),
                 ],
             },
             terminal_phases: vec!["Completed".into(), "Failed".into(), "Canceled".into()],
@@ -349,17 +331,6 @@ pub fn flow_run_machine() -> MachineSchema {
                     ],
                 },
                 VariantSchema {
-                    name: "RegisterFrame".into(),
-                    fields: vec![field("frame_id", TypeRef::Named("FrameId".into()))],
-                },
-                VariantSchema {
-                    name: "RegisterLoop".into(),
-                    fields: vec![field(
-                        "loop_instance_id",
-                        TypeRef::Named("LoopInstanceId".into()),
-                    )],
-                },
-                VariantSchema {
                     name: "RegisterReadyFrame".into(),
                     fields: vec![field("frame_id", TypeRef::Named("FrameId".into()))],
                 },
@@ -378,18 +349,7 @@ pub fn flow_run_machine() -> MachineSchema {
                 },
                 VariantSchema {
                     name: "FrameTerminated".into(),
-                    fields: vec![
-                        field("frame_id", TypeRef::Named("FrameId".into())),
-                        field("status", TypeRef::Enum("FlowFrameStatus".into())),
-                        field("released_count", TypeRef::U32),
-                    ],
-                },
-                VariantSchema {
-                    name: "LoopTerminated".into(),
-                    fields: vec![
-                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
-                        field("outcome", TypeRef::Enum("LoopOutcome".into())),
-                    ],
+                    fields: vec![field("frame_id", TypeRef::Named("FrameId".into()))],
                 },
                 variant("TerminalizeCompleted"),
                 variant("TerminalizeFailed"),
@@ -1169,14 +1129,6 @@ pub fn flow_run_machine() -> MachineSchema {
                         field: "last_granted_loop".into(),
                         expr: Expr::String(String::new()),
                     },
-                    Update::Assign {
-                        field: "frames".into(),
-                        expr: Expr::EmptyMap,
-                    },
-                    Update::Assign {
-                        field: "loops".into(),
-                        expr: Expr::EmptyMap,
-                    },
                     Update::ForEach {
                         binding: "step_id".into(),
                         over: Expr::Binding("step_ids".into()),
@@ -1620,31 +1572,6 @@ pub fn flow_run_machine() -> MachineSchema {
                     effect_with_step("AppendFailureLedger", "step_id"),
                 ],
             },
-            // v2 stub transitions
-            TransitionSchema {
-                name: "RegisterFrame".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    variant: "RegisterFrame".into(),
-                    bindings: vec!["frame_id".into()],
-                },
-                guards: vec![],
-                updates: vec![],
-                to: "Running".into(),
-                emit: vec![],
-            },
-            TransitionSchema {
-                name: "RegisterLoop".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    variant: "RegisterLoop".into(),
-                    bindings: vec!["loop_instance_id".into()],
-                },
-                guards: vec![],
-                updates: vec![],
-                to: "Running".into(),
-                emit: vec![],
-            },
             // RegisterReadyFrame: add frame to ready queue (dedup via membership set)
             TransitionSchema {
                 name: "RegisterReadyFrame".into(),
@@ -1749,7 +1676,7 @@ pub fn flow_run_machine() -> MachineSchema {
                                 Box::new(Expr::Field("max_frame_depth".into())),
                                 Box::new(Expr::U64(0)),
                             ),
-                            Expr::Lt(
+                            Expr::Lte(
                                 Box::new(Expr::Binding("depth".into())),
                                 Box::new(Expr::Field("max_frame_depth".into())),
                             ),
@@ -1837,7 +1764,7 @@ pub fn flow_run_machine() -> MachineSchema {
                     )]),
                 }],
             },
-            // NodeExecutionReleased: no-op, shell-driven
+            // NodeExecutionReleased: decrements active_node_count by 1
             TransitionSchema {
                 name: "NodeExecutionReleased".into(),
                 from: vec!["Running".into()],
@@ -1845,52 +1772,39 @@ pub fn flow_run_machine() -> MachineSchema {
                     variant: "NodeExecutionReleased".into(),
                     bindings: vec!["frame_id".into()],
                 },
-                guards: vec![],
-                updates: vec![],
+                guards: vec![Guard {
+                    name: "at_least_one_active_node".into(),
+                    expr: Expr::Gt(
+                        Box::new(Expr::Field("active_node_count".into())),
+                        Box::new(Expr::U64(0)),
+                    ),
+                }],
+                updates: vec![Update::Decrement {
+                    field: "active_node_count".into(),
+                    amount: 1,
+                }],
                 to: "Running".into(),
                 emit: vec![],
             },
-            // FrameTerminated: subtract released_count from active_node_count, decrement active_frame_count
+            // FrameTerminated: decrement active_frame_count by 1
             TransitionSchema {
                 name: "FrameTerminated".into(),
                 from: vec!["Running".into()],
                 on: InputMatch {
                     variant: "FrameTerminated".into(),
-                    bindings: vec!["frame_id".into(), "status".into(), "released_count".into()],
+                    bindings: vec!["frame_id".into()],
                 },
                 guards: vec![Guard {
-                    name: "sufficient_active_nodes".into(),
-                    expr: Expr::Gte(
-                        Box::new(Expr::Field("active_node_count".into())),
-                        Box::new(Expr::Binding("released_count".into())),
+                    name: "at_least_one_active_frame".into(),
+                    expr: Expr::Gt(
+                        Box::new(Expr::Field("active_frame_count".into())),
+                        Box::new(Expr::U64(0)),
                     ),
                 }],
-                updates: vec![
-                    Update::Assign {
-                        field: "active_node_count".into(),
-                        expr: Expr::Sub(
-                            Box::new(Expr::Field("active_node_count".into())),
-                            Box::new(Expr::Binding("released_count".into())),
-                        ),
-                    },
-                    Update::Decrement {
-                        field: "active_frame_count".into(),
-                        amount: 1,
-                    },
-                ],
-                to: "Running".into(),
-                emit: vec![],
-            },
-            // LoopTerminated: no-op at the run level for Phase 2; shell handles routing
-            TransitionSchema {
-                name: "LoopTerminated".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    variant: "LoopTerminated".into(),
-                    bindings: vec!["loop_instance_id".into(), "outcome".into()],
-                },
-                guards: vec![],
-                updates: vec![],
+                updates: vec![Update::Decrement {
+                    field: "active_frame_count".into(),
+                    amount: 1,
+                }],
                 to: "Running".into(),
                 emit: vec![],
             },

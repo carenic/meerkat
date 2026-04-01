@@ -1,22 +1,28 @@
-//! FlowFrameEngine: drives a FrameSpec to completion by stepping through
-//! the FlowFrameKernel's admit/complete cycle.
+//! FlowFrameEngine: drives a frame-backed flow through the scheduler-owned
+//! admission, execution, and terminalization cycle.
 //!
 //! This executor handles:
-//! - Step nodes: delegates to `FrameStepExecutor`, records outputs.
-//! - Loop nodes: runs body frame iterations until the `until` condition is met
-//!   or `max_iterations` is exhausted, storing per-iteration outputs.
+//! - Step nodes: delegates async work to `FrameStepExecutor` and projects the
+//!   typed outcome back through machine-owned transitions.
+//! - Loop nodes: routes loop lifecycle and body-frame starts through the
+//!   run/frame/loop kernels rather than a recursive shell executor.
 
-use crate::definition::{ConditionExpr, FlowNodeSpec, FrameSpec};
+use crate::definition::{FlowNodeSpec, FrameSpec};
 use crate::error::MobError;
+use crate::generated::flow_frame_loop_driver::{
+    FlowFrameLoopDecision, FlowFrameLoopDriver, FlowFrameLoopStorePlan, FlowFrameLoopWork,
+    FlowFrameTerminalPhase,
+};
 use crate::ids::{FlowNodeId, FrameId, LoopId, LoopInstanceId, RunId, StepId};
-use crate::run::{FlowContext, LoopContextHistory, LoopIterationLedgerEntry, LoopSnapshot};
+use crate::run::{FlowContext, FrameSnapshot, LoopSnapshot, MobRun, StepRunStatus};
 use crate::runtime::conditions::evaluate_condition;
 use crate::runtime::flow_frame_kernel::{FlowFrameKernel, FlowFrameMutator, StepCompletionOpts};
 use crate::store::MobRunStore;
 use async_trait::async_trait;
+use futures::stream::{FuturesUnordered, StreamExt};
 use indexmap::IndexMap;
-use meerkat_machine_kernels::KernelState;
 use meerkat_machine_kernels::KernelValue;
+use meerkat_machine_kernels::generated::flow_run;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -29,6 +35,38 @@ pub enum FrameStepResult {
     Completed(serde_json::Value),
     /// Step was skipped (condition evaluated to false).
     Skipped,
+    /// Step failed for a step-local reason; the frame should fail this node
+    /// but continue admitting unrelated siblings.
+    Failed,
+}
+
+/// Canonical outcome of executing a frame subtree.
+#[derive(Debug)]
+pub struct FrameExecutionOutcome {
+    pub outputs: IndexMap<StepId, serde_json::Value>,
+    pub step_statuses: IndexMap<StepId, StepRunStatus>,
+    pub root_phase: FlowFrameTerminalPhase,
+}
+
+enum FrameNodeTaskResult {
+    Step {
+        frame_id: FrameId,
+        node_id: FlowNodeId,
+        step_id: StepId,
+        loop_context: Option<(LoopId, u64)>,
+        result: Result<FrameStepResult, MobError>,
+    },
+}
+
+type FrameNodeTaskFuture = Pin<Box<dyn Future<Output = FrameNodeTaskResult> + Send>>;
+type FrameNodeWorkers = FuturesUnordered<FrameNodeTaskFuture>;
+
+struct SpawnStepTask {
+    frame_id: FrameId,
+    node_id: FlowNodeId,
+    step_id: StepId,
+    loop_context: Option<(LoopId, u64)>,
+    context: FlowContext,
 }
 
 // ─── FrameStepExecutor ───────────────────────────────────────────────────────
@@ -39,6 +77,10 @@ pub enum FrameStepResult {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait FrameStepExecutor: Send + Sync {
+    async fn check_runtime_guards(&self, _run_id: &RunId) -> Result<(), MobError> {
+        Ok(())
+    }
+
     async fn execute_step(
         &self,
         run_id: &RunId,
@@ -49,29 +91,18 @@ pub trait FrameStepExecutor: Send + Sync {
     ) -> Result<FrameStepResult, MobError>;
 }
 
-// ─── LoopResult ─────────────────────────────────────────────────────────────
-
-/// Outcome of executing a repeat_until loop body.
-enum LoopResult {
-    /// The `until` condition was met; contains all iteration outputs.
-    ConditionMet(Vec<IndexMap<StepId, serde_json::Value>>),
-    /// `max_iterations` exhausted without the condition being met.
-    Exhausted,
-}
-
 // ─── FlowFrameEngine ─────────────────────────────────────────────────────────
 
-/// Drives a `FrameSpec` to completion using a `FrameStepExecutor` for step work
-/// and recursive body-frame execution for loop nodes.
+/// Drives a `FrameSpec` to completion using a scheduler-backed concurrent
+/// coordinator for frame-local work.
 pub struct FlowFrameEngine {
     run_store: Arc<dyn MobRunStore>,
     executor: Arc<dyn FrameStepExecutor>,
     frame_kernel: Arc<FlowFrameKernel>,
     /// Maximum nesting depth for body frames. 0 means unlimited.
     max_frame_depth: u32,
-    /// Maximum number of simultaneously active body frames (each loop level adds one).
-    /// 0 means unlimited. In the sequential executor, active_body_frames == depth, so
-    /// this is enforced at the same site as max_frame_depth.
+    /// Maximum number of simultaneously active body frames admitted by the run scheduler.
+    /// 0 means unlimited.
     max_active_frames: u32,
 }
 
@@ -104,699 +135,1046 @@ impl FlowFrameEngine {
         frame_id: &'a FrameId,
         spec: &'a FrameSpec,
         context: &'a FlowContext,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<IndexMap<StepId, serde_json::Value>, MobError>> + Send + 'a>,
-    > {
-        Box::pin(self.execute_frame_inner(run_id, frame_id, spec, context, None, 0))
+    ) -> Pin<Box<dyn Future<Output = Result<FrameExecutionOutcome, MobError>> + Send + 'a>> {
+        Box::pin(self.execute_frame_concurrent_root(run_id, frame_id, spec, context))
     }
 
     // ─── Private helpers ─────────────────────────────────────────────────────
 
-    /// Execute a frame, with an optional loop context for body frames.
-    ///
-    /// `loop_context` is `None` for root frames and `Some((loop_id, iteration))`
-    /// for frames that are executing as a loop iteration body. This is threaded
-    /// into `cas_complete_step_and_record_output` so each step's output lands in
-    /// the correct field (`root_step_outputs` vs `loop_iteration_outputs`).
-    ///
-    /// `depth` tracks the current nesting depth (0 = root frame). Used to enforce
-    /// `max_frame_depth` before recursing into a loop body frame.
-    async fn execute_frame_inner(
+    async fn execute_frame_concurrent_root(
+        &self,
+        run_id: &RunId,
+        root_frame_id: &FrameId,
+        root_spec: &FrameSpec,
+        context: &FlowContext,
+    ) -> Result<FrameExecutionOutcome, MobError> {
+        self.ensure_scheduler_state_initialized(run_id).await?;
+        self.frame_kernel
+            .start_frame(run_id, root_frame_id, root_spec)
+            .await?;
+        self.heal_terminal_body_frames(run_id, root_frame_id, root_spec, context)
+            .await?;
+        self.heal_orphaned_running_nodes(run_id, root_frame_id, root_spec, context)
+            .await?;
+        self.revisit_frame(run_id, root_frame_id, root_spec, context, root_frame_id)
+            .await?;
+
+        let mut workers: FrameNodeWorkers = FuturesUnordered::new();
+
+        loop {
+            self.executor.check_runtime_guards(run_id).await?;
+
+            let mut progressed = false;
+            while self
+                .try_admit_one(run_id, root_frame_id, root_spec, context, &mut workers)
+                .await?
+            {
+                progressed = true;
+            }
+
+            if !progressed {
+                match workers.next().await {
+                    Some(task) => {
+                        self.handle_task_result(run_id, root_frame_id, root_spec, context, task)
+                            .await?;
+                        progressed = true;
+                    }
+                    None => {
+                        self.revisit_frame(
+                            run_id,
+                            root_frame_id,
+                            root_spec,
+                            context,
+                            root_frame_id,
+                        )
+                        .await?;
+                    }
+                }
+            }
+
+            let root_snapshot = self.require_frame(run_id, root_frame_id).await?;
+            if root_snapshot.kernel_state.phase != "Running" && workers.is_empty() {
+                break;
+            }
+
+            if !progressed && workers.is_empty() {
+                return Err(MobError::Internal(format!(
+                    "frame runtime stalled for root frame '{root_frame_id}' in run '{run_id}'"
+                )));
+            }
+        }
+
+        let run = self.require_run(run_id).await?;
+        let outputs = root_outputs_from_run(&run);
+        let step_statuses = self.collect_all_step_statuses(&run, root_frame_id, root_spec)?;
+        let root_frame = run.frames.get(root_frame_id).cloned().ok_or_else(|| {
+            MobError::Internal(format!(
+                "root frame '{root_frame_id}' missing at end of run '{run_id}'"
+            ))
+        })?;
+        let root_phase =
+            FlowFrameLoopDriver::root_terminal_phase(&root_frame).ok_or_else(|| {
+                MobError::Internal(format!(
+                    "root frame '{root_frame_id}' ended in non-terminal phase '{}'",
+                    root_frame.kernel_state.phase
+                ))
+            })?;
+
+        Ok(FrameExecutionOutcome {
+            outputs,
+            step_statuses,
+            root_phase,
+        })
+    }
+
+    async fn try_admit_one(
+        &self,
+        run_id: &RunId,
+        root_frame_id: &FrameId,
+        root_spec: &FrameSpec,
+        context: &FlowContext,
+        workers: &mut FrameNodeWorkers,
+    ) -> Result<bool, MobError> {
+        if self
+            .try_ack_node_grant(run_id, root_frame_id, root_spec, context, workers)
+            .await?
+        {
+            return Ok(true);
+        }
+
+        self.try_ack_body_frame_start(run_id, root_frame_id, root_spec, context)
+            .await
+    }
+
+    async fn try_ack_node_grant(
+        &self,
+        run_id: &RunId,
+        root_frame_id: &FrameId,
+        root_spec: &FrameSpec,
+        context: &FlowContext,
+        workers: &mut FrameNodeWorkers,
+    ) -> Result<bool, MobError> {
+        for _ in 0..=5usize {
+            let run = self.require_run(run_id).await?;
+            let Some(grant) = FlowFrameLoopDriver::preview_node_grant(&run.flow_state)? else {
+                return Ok(false);
+            };
+            let frame_id = grant.frame_id.clone();
+
+            let current_frame = run.frames.get(&frame_id).cloned().ok_or_else(|| {
+                MobError::Internal(format!(
+                    "run '{run_id}' granted node slot for unknown frame '{frame_id}'"
+                ))
+            })?;
+            let frame_spec = self.resolve_frame_spec(&run, root_frame_id, root_spec, &frame_id)?;
+            let frame_depth = self.frame_depth(&run, root_frame_id, &frame_id)?;
+            let decision = FlowFrameLoopDriver::acknowledge_node_grant(
+                &run.flow_state,
+                &grant,
+                &current_frame,
+                &frame_spec,
+                frame_depth,
+                self.max_frame_depth,
+            )?;
+            if !self
+                .execute_decision(
+                    run_id,
+                    root_frame_id,
+                    root_spec,
+                    context,
+                    Some(workers),
+                    decision,
+                )
+                .await?
+            {
+                continue;
+            }
+            return Ok(true);
+        }
+
+        Err(MobError::Internal(format!(
+            "node grant CAS exhausted for run '{run_id}'"
+        )))
+    }
+
+    async fn try_ack_body_frame_start(
+        &self,
+        run_id: &RunId,
+        root_frame_id: &FrameId,
+        root_spec: &FrameSpec,
+        context: &FlowContext,
+    ) -> Result<bool, MobError> {
+        for _ in 0..=5usize {
+            let run = self.require_run(run_id).await?;
+            let Some(grant) = FlowFrameLoopDriver::preview_body_frame_grant(&run.flow_state)?
+            else {
+                return Ok(false);
+            };
+            let loop_instance_id = grant.loop_instance_id.clone();
+
+            let loop_snapshot = run.loops.get(&loop_instance_id).cloned().ok_or_else(|| {
+                MobError::Internal(format!(
+                    "run '{run_id}' granted body frame start for unknown loop '{loop_instance_id}'"
+                ))
+            })?;
+            let loop_spec =
+                self.resolve_loop_spec(&run, root_frame_id, root_spec, &loop_instance_id)?;
+            let decision = FlowFrameLoopDriver::acknowledge_body_frame_start(
+                &run.flow_state,
+                &grant,
+                &loop_snapshot,
+                &loop_spec,
+            )?;
+            if !self
+                .execute_decision(run_id, root_frame_id, root_spec, context, None, decision)
+                .await?
+            {
+                continue;
+            }
+            return Ok(true);
+        }
+
+        Err(MobError::Internal(format!(
+            "body-frame grant CAS exhausted for run '{run_id}'"
+        )))
+    }
+
+    fn spawn_step_task(&self, workers: &mut FrameNodeWorkers, run_id: &RunId, task: SpawnStepTask) {
+        let executor = self.executor.clone();
+        let run_id = run_id.clone();
+        let SpawnStepTask {
+            frame_id,
+            node_id,
+            step_id,
+            loop_context,
+            context,
+        } = task;
+        workers.push(Box::pin(async move {
+            let result = executor
+                .execute_step(&run_id, &frame_id, &node_id, &step_id, &context)
+                .await;
+            FrameNodeTaskResult::Step {
+                frame_id,
+                node_id,
+                step_id,
+                loop_context,
+                result,
+            }
+        }));
+    }
+
+    async fn handle_task_result(
+        &self,
+        run_id: &RunId,
+        root_frame_id: &FrameId,
+        root_spec: &FrameSpec,
+        context: &FlowContext,
+        task: FrameNodeTaskResult,
+    ) -> Result<(), MobError> {
+        match task {
+            FrameNodeTaskResult::Step {
+                frame_id,
+                node_id,
+                step_id,
+                loop_context,
+                result,
+            } => {
+                match result {
+                    Ok(FrameStepResult::Completed(output)) => {
+                        let loop_context = loop_context
+                            .as_ref()
+                            .map(|(loop_id, iteration)| (loop_id, *iteration));
+                        self.frame_kernel
+                            .complete_step(
+                                run_id,
+                                &frame_id,
+                                StepCompletionOpts {
+                                    node_id: &node_id,
+                                    step_id: &step_id,
+                                    output,
+                                    loop_context,
+                                    max_retries: 5,
+                                },
+                            )
+                            .await?;
+                    }
+                    Ok(FrameStepResult::Skipped) => {
+                        self.frame_kernel
+                            .skip_node(run_id, &frame_id, &node_id)
+                            .await?;
+                    }
+                    Ok(FrameStepResult::Failed) => {
+                        self.frame_kernel
+                            .fail_node(run_id, &frame_id, &node_id)
+                            .await?;
+                    }
+                    Err(error) => {
+                        self.frame_kernel
+                            .fail_node(run_id, &frame_id, &node_id)
+                            .await?;
+                        return Err(error);
+                    }
+                }
+
+                self.release_node_execution_and_revisit(
+                    run_id,
+                    &frame_id,
+                    root_frame_id,
+                    root_spec,
+                    context,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn revisit_frame(
+        &self,
+        run_id: &RunId,
+        root_frame_id: &FrameId,
+        root_spec: &FrameSpec,
+        context: &FlowContext,
+        frame_id: &FrameId,
+    ) -> Result<(), MobError> {
+        loop {
+            let run = self.require_run(run_id).await?;
+            let Some(frame) = run.frames.get(frame_id).cloned() else {
+                return Ok(());
+            };
+
+            if let Some(plan) = FlowFrameLoopDriver::register_ready_frame_if_needed(
+                &run.flow_state,
+                frame_id,
+                &frame.kernel_state,
+            )? {
+                let _ = self.execute_store_plan(run_id, &plan).await?;
+                continue;
+            }
+
+            let frame_spec = self.resolve_frame_spec(&run, root_frame_id, root_spec, frame_id)?;
+            if let Some(plan) =
+                FlowFrameLoopDriver::seal_frame_if_ready(frame_id, &frame, &frame_spec)?
+            {
+                let _ = self.execute_store_plan(run_id, &plan).await?;
+                continue;
+            }
+
+            let run = self.require_run(run_id).await?;
+            let Some(frame) = run.frames.get(frame_id).cloned() else {
+                return Ok(());
+            };
+
+            if let Some(loop_instance_id) = frame_loop_instance_id(&frame.kernel_state)
+                && let Some(loop_snapshot) = run.loops.get(&loop_instance_id).cloned()
+            {
+                if let Some(obligation) =
+                    FlowFrameLoopDriver::pending_until_obligation(&loop_snapshot)?
+                {
+                    self.resolve_until_feedback(
+                        run_id,
+                        root_frame_id,
+                        root_spec,
+                        context,
+                        obligation,
+                    )
+                    .await?;
+                    continue;
+                }
+
+                let parent_frame = self.parent_frame_for_loop(&run, &loop_snapshot);
+                if let Some(decision) = FlowFrameLoopDriver::advance_body_frame_after_seal(
+                    &run.flow_state,
+                    frame_id,
+                    &frame,
+                    &loop_snapshot,
+                    parent_frame.as_ref(),
+                )? {
+                    let _ = self
+                        .execute_decision(run_id, root_frame_id, root_spec, context, None, decision)
+                        .await?;
+                    continue;
+                }
+            }
+
+            return Ok(());
+        }
+    }
+
+    async fn ensure_scheduler_state_initialized(&self, run_id: &RunId) -> Result<(), MobError> {
+        for _ in 0..=5usize {
+            let run = self.require_run(run_id).await?;
+            let mut reconciled = run.clone();
+            if !reconciled
+                .flow_state
+                .fields
+                .contains_key("ready_frame_membership")
+            {
+                let mut next_state = flow_run::initial_state().map_err(|error| {
+                    MobError::Internal(format!("flow_run initial_state failed: {error:?}"))
+                })?;
+                next_state.phase = "Running".into();
+                next_state.fields.insert(
+                    "max_frame_depth".into(),
+                    KernelValue::U64(self.max_frame_depth as u64),
+                );
+                next_state.fields.insert(
+                    "max_active_frames".into(),
+                    KernelValue::U64(self.max_active_frames as u64),
+                );
+                reconciled.flow_state = next_state;
+            }
+            crate::runtime::recovery::reconcile_run_state(&mut reconciled).map_err(|error| {
+                MobError::Internal(format!(
+                    "scheduler state reconciliation failed for run '{run_id}': {error}"
+                ))
+            })?;
+            if reconciled.flow_state == run.flow_state {
+                return Ok(());
+            }
+
+            let won = self
+                .run_store
+                .cas_flow_state(run_id, &run.flow_state, &reconciled.flow_state)
+                .await?;
+            if won {
+                return Ok(());
+            }
+        }
+
+        Err(MobError::Internal(format!(
+            "scheduler state bootstrap CAS exhausted for run '{run_id}'"
+        )))
+    }
+
+    async fn heal_orphaned_running_nodes(
+        &self,
+        run_id: &RunId,
+        root_frame_id: &FrameId,
+        root_spec: &FrameSpec,
+        context: &FlowContext,
+    ) -> Result<(), MobError> {
+        loop {
+            let run = self.require_run(run_id).await?;
+            let frame_ids: Vec<FrameId> = run.frames.keys().cloned().collect();
+            let mut healed_any = false;
+
+            for frame_id in frame_ids {
+                let run = self.require_run(run_id).await?;
+                let Some(frame) = run.frames.get(&frame_id).cloned() else {
+                    continue;
+                };
+                let spec = self.resolve_frame_spec(&run, root_frame_id, root_spec, &frame_id)?;
+                for node_id in running_node_ids(&frame.kernel_state) {
+                    let mut healed_this_node = false;
+                    match spec.nodes.get(&node_id) {
+                        Some(FlowNodeSpec::Step(_)) => {
+                            healed_any = true;
+                            self.frame_kernel
+                                .fail_node(run_id, &frame_id, &node_id)
+                                .await?;
+                            self.release_node_execution_and_revisit(
+                                run_id,
+                                &frame_id,
+                                root_frame_id,
+                                root_spec,
+                                context,
+                            )
+                            .await?;
+                            healed_this_node = true;
+                        }
+                        Some(FlowNodeSpec::RepeatUntil(_)) => {
+                            let loop_instance_id =
+                                LoopInstanceId::from(format!("{frame_id}::{node_id}").as_str());
+                            if let Some(loop_snapshot) = run.loops.get(&loop_instance_id) {
+                                if let Some(decision) =
+                                    FlowFrameLoopDriver::recover_terminal_loop_projection(
+                                        &run.flow_state,
+                                        loop_snapshot,
+                                        &frame,
+                                    )?
+                                {
+                                    healed_any = true;
+                                    let _ = self
+                                        .execute_decision(
+                                            run_id,
+                                            root_frame_id,
+                                            root_spec,
+                                            context,
+                                            None,
+                                            decision,
+                                        )
+                                        .await?;
+                                    continue;
+                                }
+                                continue;
+                            }
+                            healed_any = true;
+                            self.frame_kernel
+                                .fail_node(run_id, &frame_id, &node_id)
+                                .await?;
+                            self.release_node_execution_and_revisit(
+                                run_id,
+                                &frame_id,
+                                root_frame_id,
+                                root_spec,
+                                context,
+                            )
+                            .await?;
+                            healed_this_node = true;
+                        }
+                        None => {}
+                    }
+                    let _ = healed_this_node;
+                }
+            }
+
+            if !healed_any {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn heal_terminal_body_frames(
+        &self,
+        run_id: &RunId,
+        root_frame_id: &FrameId,
+        root_spec: &FrameSpec,
+        context: &FlowContext,
+    ) -> Result<(), MobError> {
+        loop {
+            let run = self.require_run(run_id).await?;
+            let body_frame_ids: Vec<FrameId> = run
+                .frames
+                .iter()
+                .filter(|(_, frame)| frame_is_body(&frame.kernel_state))
+                .map(|(frame_id, _)| frame_id.clone())
+                .collect();
+            let mut healed_any = false;
+
+            for frame_id in body_frame_ids {
+                let run = self.require_run(run_id).await?;
+                let Some(frame) = run.frames.get(&frame_id) else {
+                    continue;
+                };
+                let Some(loop_instance_id) = frame_loop_instance_id(&frame.kernel_state) else {
+                    continue;
+                };
+                let Some(loop_snapshot) = run.loops.get(&loop_instance_id) else {
+                    continue;
+                };
+                let active_body_owner =
+                    active_body_frame_id(&loop_snapshot.kernel_state).as_ref() == Some(&frame_id);
+                let awaiting_until =
+                    FlowFrameLoopDriver::pending_until_obligation(loop_snapshot)?.is_some();
+                if frame.kernel_state.phase == "Running" || (!active_body_owner && !awaiting_until)
+                {
+                    continue;
+                }
+                healed_any = true;
+                self.revisit_frame(run_id, root_frame_id, root_spec, context, &frame_id)
+                    .await?;
+                break;
+            }
+
+            if !healed_any {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn release_node_execution_and_revisit(
         &self,
         run_id: &RunId,
         frame_id: &FrameId,
-        spec: &FrameSpec,
+        root_frame_id: &FrameId,
+        root_spec: &FrameSpec,
         context: &FlowContext,
-        loop_context: Option<(LoopId, u64)>,
-        depth: u32,
-    ) -> Result<IndexMap<StepId, serde_json::Value>, MobError> {
-        // Initialize the frame via the kernel (computes topo order + StartFrame).
-        self.frame_kernel
-            .start_frame(run_id, frame_id, spec)
-            .await?;
+    ) -> Result<(), MobError> {
+        for _ in 0..=5usize {
+            let run = self.require_run(run_id).await?;
+            let plan = FlowFrameLoopDriver::release_node_execution(&run.flow_state, frame_id)?;
+            let won = self.execute_store_plan(run_id, &plan).await?;
+            if won {
+                self.revisit_frame(run_id, root_frame_id, root_spec, context, frame_id)
+                    .await?;
+                return Ok(());
+            }
+        }
+        Err(MobError::Internal(format!(
+            "NodeExecutionReleased CAS exhausted for frame '{frame_id}' in run '{run_id}'"
+        )))
+    }
 
-        // Rebuild context from stored outputs for resume correctness.
-        // Propagate store errors — a failure here means the run is in a bad state.
-        let run = self
-            .run_store
-            .get_run(run_id)
-            .await?
-            .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
-        let mut local_context = {
-            let rebuilt = FlowContext::from_run_aggregate(
+    async fn execute_decision(
+        &self,
+        run_id: &RunId,
+        root_frame_id: &FrameId,
+        root_spec: &FrameSpec,
+        context: &FlowContext,
+        workers: Option<&mut FrameNodeWorkers>,
+        decision: FlowFrameLoopDecision,
+    ) -> Result<bool, MobError> {
+        if let Some(plan) = &decision.store_plan
+            && !self.execute_store_plan(run_id, plan).await?
+        {
+            return Ok(false);
+        }
+
+        let mut workers = workers;
+        for work in decision.follow_up {
+            match work {
+                FlowFrameLoopWork::SpawnStep {
+                    frame_id,
+                    node_id,
+                    step_id,
+                } => {
+                    let workers = workers.as_deref_mut().ok_or_else(|| {
+                        MobError::Internal(
+                            "SpawnStep follow-up requires a live worker queue".into(),
+                        )
+                    })?;
+                    let run_after = self.require_run(run_id).await?;
+                    let worker_context = self.build_context_for_frame(
+                        &run_after,
+                        run_id.clone(),
+                        context,
+                        &frame_id,
+                    );
+                    let loop_context = self.frame_loop_context(&run_after, &frame_id);
+                    self.spawn_step_task(
+                        workers,
+                        run_id,
+                        SpawnStepTask {
+                            frame_id,
+                            node_id,
+                            step_id,
+                            loop_context,
+                            context: worker_context,
+                        },
+                    );
+                }
+                FlowFrameLoopWork::EvaluateUntil { obligation } => {
+                    Box::pin(self.resolve_until_feedback(
+                        run_id,
+                        root_frame_id,
+                        root_spec,
+                        context,
+                        obligation,
+                    ))
+                    .await?;
+                }
+                FlowFrameLoopWork::RevisitFrame { frame_id } => {
+                    Box::pin(self.revisit_frame(
+                        run_id,
+                        root_frame_id,
+                        root_spec,
+                        context,
+                        &frame_id,
+                    ))
+                    .await?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    async fn execute_store_plan(
+        &self,
+        run_id: &RunId,
+        plan: &FlowFrameLoopStorePlan,
+    ) -> Result<bool, MobError> {
+        match plan {
+            FlowFrameLoopStorePlan::GrantNodeSlot {
+                expected_run_state,
+                next_run_state,
+                frame_id,
+                expected_frame,
+                next_frame,
+            } => {
+                self.run_store
+                    .cas_grant_node_slot(
+                        run_id,
+                        expected_run_state,
+                        next_run_state.clone(),
+                        frame_id,
+                        expected_frame,
+                        next_frame.clone(),
+                    )
+                    .await
+            }
+            FlowFrameLoopStorePlan::StartLoop {
+                loop_instance_id,
+                expected_run_state,
+                next_run_state,
+                frame_id,
+                expected_frame,
+                next_frame,
+                initial_loop,
+            } => {
+                self.run_store
+                    .cas_start_loop(
+                        run_id,
+                        loop_instance_id,
+                        expected_run_state,
+                        next_run_state.clone(),
+                        frame_id,
+                        expected_frame,
+                        next_frame.clone(),
+                        initial_loop.clone(),
+                    )
+                    .await
+            }
+            FlowFrameLoopStorePlan::GrantBodyFrameStart {
+                loop_instance_id,
+                expected_loop,
+                next_loop,
+                frame_id,
+                initial_frame,
+                ledger_entry,
+                expected_run_state,
+                next_run_state,
+            } => {
+                self.run_store
+                    .cas_grant_body_frame_start(
+                        run_id,
+                        loop_instance_id,
+                        expected_loop,
+                        next_loop.clone(),
+                        frame_id,
+                        initial_frame.clone(),
+                        ledger_entry.clone(),
+                        expected_run_state,
+                        next_run_state.clone(),
+                    )
+                    .await
+            }
+            FlowFrameLoopStorePlan::RunStateOnly {
+                expected_run_state,
+                next_run_state,
+            } => {
+                self.run_store
+                    .cas_flow_state(run_id, expected_run_state, next_run_state)
+                    .await
+            }
+            FlowFrameLoopStorePlan::SealFrame {
+                frame_id,
+                expected_frame,
+                next_frame,
+            } => {
+                self.run_store
+                    .cas_frame_state(run_id, frame_id, Some(expected_frame), next_frame.clone())
+                    .await
+            }
+            FlowFrameLoopStorePlan::CompleteBodyFrame {
+                loop_instance_id,
+                expected_loop,
+                next_loop,
+                frame_id,
+                expected_frame,
+                next_frame,
+                expected_run_state,
+                next_run_state,
+            } => {
+                self.run_store
+                    .cas_complete_body_frame(
+                        run_id,
+                        loop_instance_id,
+                        expected_loop,
+                        next_loop.clone(),
+                        frame_id,
+                        expected_frame,
+                        next_frame.clone(),
+                        expected_run_state,
+                        next_run_state.clone(),
+                    )
+                    .await
+            }
+            FlowFrameLoopStorePlan::LoopRequestBodyFrame {
+                loop_instance_id,
+                expected_loop,
+                next_loop,
+                expected_run_state,
+                next_run_state,
+            } => {
+                self.run_store
+                    .cas_loop_request_body_frame(
+                        run_id,
+                        loop_instance_id,
+                        expected_loop,
+                        next_loop.clone(),
+                        expected_run_state,
+                        next_run_state.clone(),
+                    )
+                    .await
+            }
+            FlowFrameLoopStorePlan::CompleteLoop {
+                loop_instance_id,
+                expected_loop,
+                next_loop,
+                frame_id,
+                expected_frame,
+                next_frame,
+                expected_run_state,
+                next_run_state,
+            } => {
+                self.run_store
+                    .cas_complete_loop(
+                        run_id,
+                        loop_instance_id,
+                        expected_loop,
+                        next_loop.clone(),
+                        frame_id,
+                        expected_frame,
+                        next_frame.clone(),
+                        expected_run_state,
+                        next_run_state.clone(),
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn resolve_until_feedback(
+        &self,
+        run_id: &RunId,
+        root_frame_id: &FrameId,
+        root_spec: &FrameSpec,
+        context: &FlowContext,
+        obligation: crate::generated::protocol_flow_loop_until_evaluation::FlowLoopUntilEvaluationObligation,
+    ) -> Result<(), MobError> {
+        for _ in 0..=5usize {
+            let run = self.require_run(run_id).await?;
+            let Some(loop_snapshot) = run.loops.get(&obligation.loop_instance_id) else {
+                return Ok(());
+            };
+            if FlowFrameLoopDriver::pending_until_obligation(loop_snapshot)?.is_none() {
+                return Ok(());
+            }
+            let parent_frame = run
+                .frames
+                .get(&obligation.parent_frame_id)
+                .cloned()
+                .ok_or_else(|| {
+                    MobError::Internal(format!(
+                        "missing parent frame '{}' for loop '{}'",
+                        obligation.parent_frame_id, obligation.loop_instance_id
+                    ))
+                })?;
+            let loop_spec = self.resolve_loop_spec_by_parent_node(
+                &run,
+                root_frame_id,
+                root_spec,
+                &obligation.parent_frame_id,
+                &obligation.parent_node_id,
+                &obligation.loop_id,
+            )?;
+            let eval_context = FlowContext::from_run_aggregate(
                 &run,
                 run_id.clone(),
                 context.activation_params.clone(),
             );
-            // Merge any caller-provided outputs not yet persisted (e.g. from a parent frame).
-            let mut ctx = rebuilt;
-            for (k, v) in &context.step_outputs {
-                ctx.step_outputs
-                    .entry(k.clone())
-                    .or_insert_with(|| v.clone());
-            }
-            for (k, v) in &context.loop_outputs {
-                ctx.loop_outputs
-                    .entry(k.clone())
-                    .or_insert_with(|| v.clone());
-            }
-            // [P2] When resuming a body frame mid-iteration, merge the step outputs
-            // already persisted for THIS iteration slot into step_outputs. Without this,
-            // a step that completed before the crash is invisible to sibling steps that
-            // run after the resume — conditions/templates inside the same iteration
-            // diverge from the pre-crash path (dogma Rule 13).
-            if let Some((loop_id, iteration)) = &loop_context
-                && let Some(iters) = run.loop_iteration_outputs.get(loop_id)
-                && let Some(iter_out) = iters.get(*iteration as usize)
-            {
-                for (sid, out) in iter_out {
-                    ctx.step_outputs
-                        .entry(sid.clone())
-                        .or_insert_with(|| out.clone());
-                }
-            }
-            ctx
-        };
-
-        // [P2] Seed frame_outputs from the persisted store — not from a local empty map.
-        // On a fresh run this is empty. On a resume it reflects steps that completed
-        // before the crash, so advance_frame_steps_and_terminalize correctly marks
-        // those steps Completed rather than Skipped.
-        // Root frames read from root_step_outputs; body frames read from the correct
-        // loop_iteration_outputs slot.
-        let mut frame_outputs: IndexMap<StepId, serde_json::Value> = match &loop_context {
-            None => {
-                // Root frame: seed from root_step_outputs AND all loop iteration outputs.
-                // advance_frame_steps_and_terminalize uses outputs.keys() to classify steps
-                // as Completed vs Skipped — loop body steps that completed before a crash
-                // must appear here so they aren't reclassified as Skipped on resume.
-                let mut outputs = run.root_step_outputs.clone();
-                for iterations in run.loop_iteration_outputs.values() {
-                    for iter in iterations {
-                        for (sid, out) in iter {
-                            outputs.entry(sid.clone()).or_insert_with(|| out.clone());
-                        }
-                    }
-                }
-                outputs
-            }
-            Some((loop_id, iteration)) => run
-                .loop_iteration_outputs
-                .get(loop_id)
-                .and_then(|iters| iters.get(*iteration as usize))
-                .cloned()
-                .unwrap_or_default(),
-        };
-
-        // [P1] Resolve Running nodes left by a previous process crash.
-        // Consult the authoritative source for each running node's kind:
-        //  - Step nodes: in-flight work is lost → fail the node.
-        //  - Loop nodes: check the persisted LoopSnapshot. If the loop already
-        //    reached a terminal phase (Completed/Exhausted), complete the node.
-        //    If still Running or absent, fail it. (Dogma Rule 13: the LoopSnapshot
-        //    is the authoritative source; the frame's node_status is stale.)
-        loop {
-            let snap = self.require_frame(run_id, frame_id).await?;
-            let running = running_node_ids(&snap.kernel_state);
-            if running.is_empty() {
-                break;
-            }
-            let run_for_loops = self
-                .run_store
-                .get_run(run_id)
+            let until_met = evaluate_condition(&loop_spec.until, &eval_context);
+            let decision = FlowFrameLoopDriver::resolve_until_feedback(
+                &run.flow_state,
+                loop_snapshot,
+                &parent_frame,
+                obligation.clone(),
+                until_met,
+            )?;
+            if self
+                .execute_decision(run_id, root_frame_id, root_spec, context, None, decision)
                 .await?
-                .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
-            for node_id in &running {
-                let is_loop = spec
-                    .nodes
-                    .get(node_id)
-                    .is_some_and(|n| matches!(n, FlowNodeSpec::RepeatUntil(_)));
-                if is_loop {
-                    // Check if the persisted loop snapshot is already terminal.
-                    let loop_instance_id =
-                        LoopInstanceId::from(format!("{frame_id}::{node_id}").as_str());
-                    let loop_terminal =
-                        run_for_loops
-                            .loops
-                            .get(&loop_instance_id)
-                            .is_some_and(|ls| {
-                                matches!(ls.kernel_state.phase.as_str(), "Completed" | "Exhausted")
-                            });
-                    if loop_terminal {
-                        self.frame_kernel
-                            .complete_node(run_id, frame_id, node_id)
-                            .await?;
-                    } else {
-                        self.frame_kernel
-                            .fail_node(run_id, frame_id, node_id)
-                            .await?;
-                    }
-                } else {
-                    // Step node: in-flight work is gone.
-                    self.frame_kernel
-                        .fail_node(run_id, frame_id, node_id)
-                        .await?;
-                }
+            {
+                return Ok(());
             }
         }
 
-        // Pump the admit loop until the frame is terminal.
-        //
-        // Terminalization invariant: after the loop exits (via either `None` or the
-        // in-loop `break`), we attempt to terminalize the frame. This covers two cases:
-        //   1. Empty frames: `admit_next_ready_node_with_retry` returns `None` immediately
-        //      because the ready_queue starts empty (no nodes → all nodes are already
-        //      terminal vacuously). The in-loop terminalize never fires; the post-loop
-        //      check below catches this.
-        //   2. Normal frames: all nodes complete inside the loop and the in-loop
-        //      terminalize already fired before the `break`. The post-loop check is a
-        //      no-op (frame is already Completed, not Running).
-        loop {
-            let effects_opt = self
-                .frame_kernel
-                .admit_next_ready_node_with_retry(run_id, frame_id, 5)
-                .await?;
-            match effects_opt {
-                None => {
-                    // Queue empty — frame is done or every remaining node is
-                    // blocked on a Running predecessor. In the sequential
-                    // executor neither case can make progress; break and
-                    // terminalize below if all nodes are terminal.
-                    break;
-                }
-                Some(effects) => {
-                    for effect in &effects {
-                        if effect.variant == "AdmitStepWork" {
-                            let node_id_str = string_from_effect_field(effect, "node_id")?;
-                            let node_id = FlowNodeId::from(node_id_str.as_str());
-
-                            // Resolve the step_id from the frame spec.
-                            let step_id = match spec.nodes.get(&node_id) {
-                                Some(FlowNodeSpec::Step(s)) => s.step_id.clone(),
-                                _ => {
-                                    return Err(MobError::Internal(format!(
-                                        "node '{node_id}' is not a step node"
-                                    )));
-                                }
-                            };
-
-                            // Execute the step.
-                            let output = self
-                                .executor
-                                .execute_step(run_id, frame_id, &node_id, &step_id, &local_context)
-                                .await;
-
-                            match output {
-                                Ok(FrameStepResult::Completed(out)) => {
-                                    // Record output in the local in-memory context.
-                                    frame_outputs.insert(step_id.clone(), out.clone());
-                                    local_context
-                                        .step_outputs
-                                        .insert(step_id.clone(), out.clone());
-
-                                    // CAS-complete the node + route the output to the
-                                    // correct store field (root vs loop body).
-                                    let lc = loop_context.as_ref().map(|(lid, iter)| (lid, *iter));
-                                    self.frame_kernel
-                                        .complete_step(
-                                            run_id,
-                                            frame_id,
-                                            StepCompletionOpts {
-                                                node_id: &node_id,
-                                                step_id: &step_id,
-                                                output: out,
-                                                loop_context: lc,
-                                                max_retries: 5,
-                                            },
-                                        )
-                                        .await?;
-                                }
-                                Ok(FrameStepResult::Skipped) => {
-                                    // Condition was false — skip the node in the frame machine.
-                                    self.frame_kernel
-                                        .skip_node(run_id, frame_id, &node_id)
-                                        .await?;
-                                }
-                                Err(err) => {
-                                    self.frame_kernel
-                                        .fail_node(run_id, frame_id, &node_id)
-                                        .await?;
-                                    return Err(err);
-                                }
-                            }
-                        } else if effect.variant == "StartLoopNode" {
-                            let node_id_str = string_from_effect_field(effect, "node_id")?;
-                            let node_id = FlowNodeId::from(node_id_str.as_str());
-
-                            // Resolve the RepeatUntil spec.
-                            let loop_spec = match spec.nodes.get(&node_id) {
-                                Some(FlowNodeSpec::RepeatUntil(l)) => l.clone(),
-                                _ => {
-                                    return Err(MobError::Internal(format!(
-                                        "node '{node_id}' is not a loop node"
-                                    )));
-                                }
-                            };
-
-                            // Use "::" as the separator so loop_instance_id can never
-                            // collide with a node whose name happens to contain "-iter-".
-                            let loop_instance_id =
-                                LoopInstanceId::from(format!("{frame_id}::{node_id}").as_str());
-                            let loop_id = loop_spec.loop_id.clone();
-
-                            let loop_result = self
-                                .execute_loop(
-                                    run_id,
-                                    &loop_instance_id,
-                                    &loop_id,
-                                    &loop_spec.body,
-                                    &loop_spec.until,
-                                    loop_spec.max_iterations,
-                                    &local_context,
-                                    depth,
-                                )
-                                .await?;
-
-                            match loop_result {
-                                LoopResult::ConditionMet(all_iter_outputs) => {
-                                    // Merge the UNION of all iterations into frame_outputs
-                                    // (dogma Rule 13: frame_outputs must reflect all steps
-                                    // that ever completed, not just the final iteration).
-                                    // advance_frame_steps_and_terminalize uses frame_outputs.keys()
-                                    // to classify steps as Completed vs Skipped — a step that
-                                    // completed in iteration 0 but was absent in the terminating
-                                    // iteration must still be Completed, not Skipped.
-                                    // Iteration outputs are accumulated in forward order; later
-                                    // iterations overwrite earlier ones so the final value wins.
-                                    for iter in &all_iter_outputs {
-                                        for (sid, out) in iter {
-                                            frame_outputs.insert(sid.clone(), out.clone());
-                                        }
-                                    }
-                                    // local_context.step_outputs uses the last iteration only —
-                                    // downstream template/condition evaluation should see the
-                                    // most recent value, not all historical values.
-                                    if let Some(last_iter) = all_iter_outputs.last() {
-                                        for (sid, out) in last_iter {
-                                            local_context
-                                                .step_outputs
-                                                .insert(sid.clone(), out.clone());
-                                        }
-                                    }
-                                    // Also record the full iteration history in loop_outputs
-                                    // so loops.<id>.iterations.<n>.steps.<step>... paths work.
-                                    local_context.loop_outputs.insert(
-                                        loop_id.clone(),
-                                        LoopContextHistory {
-                                            iterations: all_iter_outputs,
-                                        },
-                                    );
-                                    self.frame_kernel
-                                        .complete_node(run_id, frame_id, &node_id)
-                                        .await?;
-                                }
-                                LoopResult::Exhausted => {
-                                    self.frame_kernel
-                                        .fail_node(run_id, frame_id, &node_id)
-                                        .await?;
-                                    return Err(MobError::Internal(format!(
-                                        "repeat_until loop '{loop_id}' exhausted \
-                                         max iterations ({})",
-                                        loop_spec.max_iterations
-                                    )));
-                                }
-                            }
-                        }
-                        // Other effects (ReadyFrontierChanged, FrameTerminalized) are
-                        // informational — continue the admit loop.
-                    }
-
-                    // Terminalize once all nodes are done.
-                    let snap = self.require_frame(run_id, frame_id).await?;
-                    if snap.kernel_state.phase == "Running"
-                        && self.all_nodes_terminal(&snap.kernel_state, spec)
-                    {
-                        self.frame_kernel
-                            .terminalize_frame(run_id, frame_id)
-                            .await?;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Post-loop terminalize: catches the empty-frame case (queue was immediately
-        // empty so no in-loop terminalize ever fired) and acts as a safety net for
-        // any other case where the in-loop check was bypassed. Double-terminalizing is
-        // safe: `terminalize_frame` returns `false` (no-op) when the frame is already
-        // in a terminal phase.
-        let snap = self.require_frame(run_id, frame_id).await?;
-        if snap.kernel_state.phase == "Running" && self.all_nodes_terminal(&snap.kernel_state, spec)
-        {
-            self.frame_kernel
-                .terminalize_frame(run_id, frame_id)
-                .await?;
-        }
-
-        Ok(frame_outputs)
+        Err(MobError::Internal(format!(
+            "until feedback CAS exhausted for loop '{}' in run '{run_id}'",
+            obligation.loop_instance_id
+        )))
     }
 
-    // ─── Loop execution ──────────────────────────────────────────────────────
+    fn parent_frame_for_loop(
+        &self,
+        run: &MobRun,
+        loop_snapshot: &LoopSnapshot,
+    ) -> Option<FrameSnapshot> {
+        let parent_frame_id = loop_parent_frame_id(&loop_snapshot.kernel_state).ok()?;
+        run.frames.get(&parent_frame_id).cloned()
+    }
 
-    /// Execute a repeat_until loop body iteratively.
-    ///
-    /// Returns `ConditionMet(outputs)` when the until condition is satisfied, or
-    /// `Exhausted` when max_iterations is reached without the condition being met.
-    ///
-    /// The `Pin<Box<...>>` is needed because `execute_loop_inner` calls
-    /// `execute_frame_inner` which in turn calls `execute_loop`, creating a
-    /// recursive async call chain that cannot be represented as a plain `async fn`.
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    fn execute_loop<'a>(
-        &'a self,
-        run_id: &'a RunId,
-        loop_instance_id: &'a LoopInstanceId,
-        loop_id: &'a LoopId,
-        body_spec: &'a FrameSpec,
-        until: &'a ConditionExpr,
-        max_iterations: u32,
-        context: &'a FlowContext,
-        depth: u32,
-    ) -> Pin<Box<dyn Future<Output = Result<LoopResult, MobError>> + Send + 'a>> {
-        Box::pin(self.execute_loop_inner(
-            run_id,
-            loop_instance_id,
-            loop_id,
-            body_spec,
-            until,
-            max_iterations,
-            context,
-            depth,
+    fn collect_all_step_statuses(
+        &self,
+        run: &MobRun,
+        root_frame_id: &FrameId,
+        root_spec: &FrameSpec,
+    ) -> Result<IndexMap<StepId, StepRunStatus>, MobError> {
+        let mut step_statuses = IndexMap::new();
+        for (frame_id, frame) in &run.frames {
+            let spec = self.resolve_frame_spec(run, root_frame_id, root_spec, frame_id)?;
+            merge_step_statuses(
+                &mut step_statuses,
+                collect_frame_step_statuses(&spec, &frame.kernel_state),
+            );
+        }
+        Ok(step_statuses)
+    }
+
+    fn build_context_for_frame(
+        &self,
+        run: &MobRun,
+        run_id: RunId,
+        base_context: &FlowContext,
+        frame_id: &FrameId,
+    ) -> FlowContext {
+        let mut context =
+            FlowContext::from_run_aggregate(run, run_id, base_context.activation_params.clone());
+        for (step_id, output) in &base_context.step_outputs {
+            context
+                .step_outputs
+                .entry(step_id.clone())
+                .or_insert_with(|| output.clone());
+        }
+        for (loop_id, history) in &base_context.loop_outputs {
+            context
+                .loop_outputs
+                .entry(loop_id.clone())
+                .or_insert_with(|| history.clone());
+        }
+        if let Some((loop_id, iteration)) = self.frame_loop_context(run, frame_id)
+            && let Some(iterations) = run.loop_iteration_outputs.get(&loop_id)
+            && let Some(iter_outputs) = iterations.get(iteration as usize)
+        {
+            for (step_id, output) in iter_outputs {
+                // Current-iteration outputs must override the last completed
+                // iteration projection from FlowContext::from_run_aggregate.
+                context.step_outputs.insert(step_id.clone(), output.clone());
+            }
+        }
+        context
+    }
+
+    fn frame_loop_context(&self, run: &MobRun, frame_id: &FrameId) -> Option<(LoopId, u64)> {
+        let frame = run.frames.get(frame_id)?;
+        let loop_instance_id = frame_loop_instance_id(&frame.kernel_state)?;
+        let loop_snapshot = run.loops.get(&loop_instance_id)?;
+        Some((
+            loop_id_from_state(&loop_snapshot.kernel_state).ok()?,
+            frame_iteration(&frame.kernel_state).ok()?,
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_loop_inner(
+    fn resolve_frame_spec(
         &self,
-        run_id: &RunId,
+        run: &MobRun,
+        root_frame_id: &FrameId,
+        root_spec: &FrameSpec,
+        frame_id: &FrameId,
+    ) -> Result<FrameSpec, MobError> {
+        if frame_id == root_frame_id {
+            return Ok(root_spec.clone());
+        }
+        let frame = run.frames.get(frame_id).ok_or_else(|| {
+            MobError::Internal(format!(
+                "missing frame '{frame_id}' in run '{}'",
+                run.run_id
+            ))
+        })?;
+        if !frame_is_body(&frame.kernel_state) {
+            return Ok(root_spec.clone());
+        }
+        let loop_instance_id = frame_loop_instance_id(&frame.kernel_state).ok_or_else(|| {
+            MobError::Internal(format!("body frame '{frame_id}' missing loop ownership"))
+        })?;
+        self.resolve_loop_spec(run, root_frame_id, root_spec, &loop_instance_id)
+            .map(|loop_spec| loop_spec.body)
+    }
+
+    fn resolve_loop_spec(
+        &self,
+        run: &MobRun,
+        root_frame_id: &FrameId,
+        root_spec: &FrameSpec,
         loop_instance_id: &LoopInstanceId,
-        loop_id: &LoopId,
-        body_spec: &FrameSpec,
-        until: &ConditionExpr,
-        max_iterations: u32,
-        context: &FlowContext,
-        depth: u32,
-    ) -> Result<LoopResult, MobError> {
-        // Context isolation note: `iter_context` starts as a clone of the
-        // parent frame's context at the moment the loop node is admitted.
-        // In the sequential executor, every node that could possibly have
-        // completed before the loop node (i.e. every transitive dependency)
-        // is already reflected in `context.step_outputs` at this point.
-        //
-        // In a hypothetical parallel executor, sibling nodes that share no
-        // dependency with the loop node may not have completed yet — their
-        // outputs would be absent from `iter_context`. That is intentional:
-        // loop bodies are logically encapsulated and should not race on
-        // sibling output availability.
-        let mut iter_context = context.clone();
-        let mut condition_met = false;
+    ) -> Result<crate::definition::RepeatUntilSpec, MobError> {
+        let loop_snapshot = run.loops.get(loop_instance_id).ok_or_else(|| {
+            MobError::Internal(format!("loop '{loop_instance_id}' missing snapshot"))
+        })?;
+        let parent_frame_id = loop_parent_frame_id(&loop_snapshot.kernel_state)?;
+        let parent_node_id = loop_parent_node_id(&loop_snapshot.kernel_state)?;
+        let loop_id = loop_id_from_state(&loop_snapshot.kernel_state)?;
+        self.resolve_loop_spec_by_parent_node(
+            run,
+            root_frame_id,
+            root_spec,
+            &parent_frame_id,
+            &parent_node_id,
+            &loop_id,
+        )
+    }
 
-        // Resume from the persisted iteration counter (dogma Rule 13: the store is
-        // authoritative for how far the loop progressed). On a fresh run, no
-        // LoopSnapshot exists so start_iteration == 0. On a resume, earlier iterations
-        // are already persisted — restarting from 0 would duplicate ledger entries
-        // and replay stale body-frame IDs into loop_outputs.
-        let start_iteration = {
-            let run = self
-                .run_store
-                .get_run(run_id)
-                .await?
-                .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
-            run.loops
-                .get(loop_instance_id)
-                .and_then(|snap| {
-                    snap.kernel_state
-                        .fields
-                        .get("current_iteration")
-                        .and_then(|v| {
-                            if let meerkat_machine_kernels::KernelValue::U64(n) = v {
-                                Some(*n)
-                            } else {
-                                None
-                            }
-                        })
-                })
-                .unwrap_or(0)
-        };
-
-        // Hydrate iter_context with outputs from already-completed iterations so
-        // the until-condition evaluator and downstream templates see the full history.
-        if start_iteration > 0 {
-            let run = self
-                .run_store
-                .get_run(run_id)
-                .await?
-                .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
-            if let Some(persisted_iters) = run.loop_iteration_outputs.get(loop_id) {
-                for (i, iter_out) in persisted_iters.iter().enumerate() {
-                    if (i as u64) < start_iteration {
-                        // Merge into step_outputs (last write wins, like runtime).
-                        for (sid, out) in iter_out {
-                            iter_context.step_outputs.insert(sid.clone(), out.clone());
-                        }
-                        // Append to loop_outputs history.
-                        iter_context
-                            .loop_outputs
-                            .entry(loop_id.clone())
-                            .or_insert_with(|| LoopContextHistory {
-                                iterations: Vec::new(),
-                            })
-                            .iterations
-                            .push(iter_out.clone());
-                    }
-                }
+    fn resolve_loop_spec_by_parent_node(
+        &self,
+        run: &MobRun,
+        root_frame_id: &FrameId,
+        root_spec: &FrameSpec,
+        parent_frame_id: &FrameId,
+        parent_node_id: &FlowNodeId,
+        expected_loop_id: &LoopId,
+    ) -> Result<crate::definition::RepeatUntilSpec, MobError> {
+        let parent_spec =
+            self.resolve_frame_spec(run, root_frame_id, root_spec, parent_frame_id)?;
+        match parent_spec.nodes.get(parent_node_id) {
+            Some(FlowNodeSpec::RepeatUntil(spec)) if spec.loop_id == *expected_loop_id => {
+                Ok(spec.clone())
             }
-        }
-
-        // [P1] Re-evaluate the until condition before entering the iteration loop on resume.
-        // If the process crashed between "body frame completed" and "evaluate_condition(until)",
-        // the persisted LoopSnapshot has current_iteration = N+1 but the condition was never
-        // checked. Without this gate, a loop that should have terminated executes one extra
-        // body frame on resume (dogma Rule 3: semantic decisions must survive crashes).
-        if start_iteration > 0 && evaluate_condition(until, &iter_context) {
-            condition_met = true;
-        }
-
-        // Check depth and active-frame count before recursing into the loop body frame.
-        // In the sequential executor, active_body_frames == depth (each recursion level
-        // adds one body frame). Both limits apply at the same site.
-        let next_depth = depth + 1;
-        if self.max_frame_depth > 0 && next_depth > self.max_frame_depth {
-            return Err(MobError::NotYetImplemented(format!(
-                "loop '{}' would exceed max_frame_depth={} (current depth={}); \
-                 nested loops require a higher limit in LimitsSpec.max_frame_depth",
-                loop_id, self.max_frame_depth, depth
-            )));
-        }
-        // max_active_frames: next_depth body frames would be simultaneously active.
-        if self.max_active_frames > 0 && next_depth > self.max_active_frames {
-            return Err(MobError::NotYetImplemented(format!(
-                "loop '{}' would activate {} concurrent body frames, exceeding \
-                 max_active_frames={}; raise LimitsSpec.max_active_frames to allow nesting",
-                loop_id, next_depth, self.max_active_frames
-            )));
-        }
-
-        // Only enter the iteration loop if the condition wasn't already met on resume.
-        if !condition_met {
-            for iteration in start_iteration..max_iterations as u64 {
-                // Use "::" separator consistent with loop_instance_id construction.
-                let body_frame_id =
-                    FrameId::from(format!("{loop_instance_id}::iter-{iteration}").as_str());
-
-                // Persist the loop snapshot with active_body_frame_id so that
-                // reconcile_run_state can reconstruct in-progress loop state after a
-                // crash. Phase="Running", active_body_frame_id=Some(body_frame_id).
-                self.run_store
-                    .upsert_loop_snapshot(
-                        run_id,
-                        loop_instance_id,
-                        LoopSnapshot {
-                            kernel_state: KernelState {
-                                phase: "Running".into(),
-                                fields: std::collections::BTreeMap::from([
-                                    (
-                                        "loop_instance_id".into(),
-                                        meerkat_machine_kernels::KernelValue::String(
-                                            loop_instance_id.to_string(),
-                                        ),
-                                    ),
-                                    (
-                                        "current_iteration".into(),
-                                        meerkat_machine_kernels::KernelValue::U64(iteration),
-                                    ),
-                                    (
-                                        "max_iterations".into(),
-                                        meerkat_machine_kernels::KernelValue::U64(
-                                            max_iterations as u64,
-                                        ),
-                                    ),
-                                    (
-                                        "active_body_frame_id".into(),
-                                        meerkat_machine_kernels::KernelValue::String(
-                                            body_frame_id.to_string(),
-                                        ),
-                                    ),
-                                ]),
-                            },
-                        },
-                        Some(LoopIterationLedgerEntry {
-                            loop_instance_id: loop_instance_id.clone(),
-                            iteration,
-                            frame_id: body_frame_id.clone(),
-                        }),
-                    )
-                    .await?;
-
-                // Execute the body frame with loop context so each step's output is
-                // routed to loop_iteration_outputs[loop_id][iteration] in the store.
-                let iter_outputs = self
-                    .execute_frame_inner(
-                        run_id,
-                        &body_frame_id,
-                        body_spec,
-                        &iter_context,
-                        Some((loop_id.clone(), iteration)),
-                        next_depth,
-                    )
-                    .await?;
-
-                // Mark body frame as complete: clear active_body_frame_id.
-                self.run_store
-                    .upsert_loop_snapshot(
-                        run_id,
-                        loop_instance_id,
-                        LoopSnapshot {
-                            kernel_state: KernelState {
-                                phase: "Running".into(),
-                                fields: std::collections::BTreeMap::from([
-                                    (
-                                        "loop_instance_id".into(),
-                                        meerkat_machine_kernels::KernelValue::String(
-                                            loop_instance_id.to_string(),
-                                        ),
-                                    ),
-                                    (
-                                        "current_iteration".into(),
-                                        meerkat_machine_kernels::KernelValue::U64(iteration + 1),
-                                    ),
-                                    (
-                                        "max_iterations".into(),
-                                        meerkat_machine_kernels::KernelValue::U64(
-                                            max_iterations as u64,
-                                        ),
-                                    ),
-                                    (
-                                        "active_body_frame_id".into(),
-                                        meerkat_machine_kernels::KernelValue::None,
-                                    ),
-                                ]),
-                            },
-                        },
-                        None, // ledger entry already appended at iteration start
-                    )
-                    .await?;
-
-                // Merge this iteration's step outputs into the rolling context so
-                // sibling nodes after the loop can reference them.
-                for (step_id, output) in &iter_outputs {
-                    iter_context
-                        .step_outputs
-                        .insert(step_id.clone(), output.clone());
-                }
-
-                // Append this iteration's outputs to the loop history in O(1) — we
-                // push a single IndexMap rather than cloning the entire history Vec.
-                // The history is used for condition evaluation and returned on success.
-                //
-                // TODO: consider compacting per-iteration history after N iterations
-                // if loop counts grow large, to prevent unbounded MobRun growth.
-                iter_context
-                    .loop_outputs
-                    .entry(loop_id.clone())
-                    .or_insert_with(|| LoopContextHistory {
-                        iterations: Vec::new(),
-                    })
-                    .iterations
-                    .push(iter_outputs);
-
-                // Evaluate the until condition against the updated context.
-                if evaluate_condition(until, &iter_context) {
-                    condition_met = true;
-                    break;
-                }
-            }
-        } // end if !condition_met
-
-        // Extract the accumulated iteration outputs.
-        // shift_remove preserves insertion order of the remaining map entries
-        // (vs the deprecated remove which would disrupt order); since loop_outputs
-        // is small this is negligible but avoids the deprecation warning.
-        let all_iter_outputs = iter_context
-            .loop_outputs
-            .shift_remove(loop_id)
-            .map(|h| h.iterations)
-            .unwrap_or_default();
-
-        // [P1] Persist terminal loop state before returning.
-        // The last per-iteration snapshot leaves phase = "Running" with
-        // active_body_frame_id = None. Without a final write, a crashed
-        // process that restarts between loop completion and parent-frame
-        // finalization would see a "Running/no active frame" snapshot and
-        // enqueue the loop again via reconcile_pending_body_frame_loops.
-        // Ref: dogma Rule 13 — the authoritative phase must be persisted;
-        // it is not sufficient to leave it derivable from iteration count.
-        let terminal_phase = if condition_met {
-            "Completed"
-        } else {
-            "Exhausted"
-        };
-        self.run_store
-            .upsert_loop_snapshot(
-                run_id,
-                loop_instance_id,
-                LoopSnapshot {
-                    kernel_state: KernelState {
-                        phase: terminal_phase.into(),
-                        fields: std::collections::BTreeMap::from([
-                            (
-                                "loop_instance_id".into(),
-                                KernelValue::String(loop_instance_id.to_string()),
-                            ),
-                            (
-                                "current_iteration".into(),
-                                KernelValue::U64(all_iter_outputs.len() as u64),
-                            ),
-                            (
-                                "max_iterations".into(),
-                                KernelValue::U64(max_iterations as u64),
-                            ),
-                            ("active_body_frame_id".into(), KernelValue::None),
-                        ]),
-                    },
-                },
-                None,
-            )
-            .await?;
-
-        if condition_met {
-            Ok(LoopResult::ConditionMet(all_iter_outputs))
-        } else {
-            Ok(LoopResult::Exhausted)
+            Some(FlowNodeSpec::RepeatUntil(spec)) => Err(MobError::Internal(format!(
+                "loop node '{}' resolved unexpected loop id '{}' (expected '{}')",
+                parent_node_id, spec.loop_id, expected_loop_id
+            ))),
+            other => Err(MobError::Internal(format!(
+                "loop node '{parent_node_id}' in frame '{parent_frame_id}' does not resolve to RepeatUntil: {other:?}"
+            ))),
         }
     }
 
-    // ─── Frame snapshot helpers ──────────────────────────────────────────────
+    fn frame_depth(
+        &self,
+        run: &MobRun,
+        root_frame_id: &FrameId,
+        frame_id: &FrameId,
+    ) -> Result<u32, MobError> {
+        if frame_id == root_frame_id {
+            return Ok(0);
+        }
+        let frame = run.frames.get(frame_id).ok_or_else(|| {
+            MobError::Internal(format!(
+                "missing frame '{frame_id}' in run '{}'",
+                run.run_id
+            ))
+        })?;
+        if !frame_is_body(&frame.kernel_state) {
+            return Ok(0);
+        }
+        let loop_instance_id = frame_loop_instance_id(&frame.kernel_state).ok_or_else(|| {
+            MobError::Internal(format!("body frame '{frame_id}' missing loop ownership"))
+        })?;
+        let loop_snapshot = run.loops.get(&loop_instance_id).ok_or_else(|| {
+            MobError::Internal(format!(
+                "missing loop '{loop_instance_id}' for body frame '{frame_id}'"
+            ))
+        })?;
+        loop_depth(&loop_snapshot.kernel_state)
+    }
+
+    async fn require_run(&self, run_id: &RunId) -> Result<MobRun, MobError> {
+        self.run_store
+            .get_run(run_id)
+            .await?
+            .ok_or_else(|| MobError::RunNotFound(run_id.clone()))
+    }
 
     /// Read the current frame snapshot, propagating errors from the store.
     async fn require_frame(
@@ -813,46 +1191,98 @@ impl FlowFrameEngine {
             MobError::Internal(format!("frame '{frame_id}' not found in run '{run_id}'"))
         })
     }
-
-    /// Return `true` if every tracked node in the frame has a terminal status.
-    fn all_nodes_terminal(
-        &self,
-        state: &meerkat_machine_kernels::KernelState,
-        spec: &FrameSpec,
-    ) -> bool {
-        let status_map = match state.fields.get("node_status") {
-            Some(KernelValue::Map(m)) => m,
-            _ => return false,
-        };
-        let terminal = ["Completed", "Failed", "Skipped", "Canceled"];
-        for node_id in spec.nodes.keys() {
-            let key = KernelValue::String(node_id.to_string());
-            match status_map.get(&key) {
-                Some(KernelValue::NamedVariant { variant, .. }) => {
-                    if !terminal.contains(&variant.as_str()) {
-                        return false;
-                    }
-                }
-                _ => return false,
-            }
-        }
-        true
-    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Extract a `String` from a named field of a `KernelEffect`.
-fn string_from_effect_field(
-    effect: &meerkat_machine_kernels::KernelEffect,
+fn root_outputs_from_run(run: &MobRun) -> IndexMap<StepId, serde_json::Value> {
+    let mut outputs = run.root_step_outputs.clone();
+    for iterations in run.loop_iteration_outputs.values() {
+        for iteration in iterations {
+            for (step_id, output) in iteration {
+                outputs.insert(step_id.clone(), output.clone());
+            }
+        }
+    }
+    outputs
+}
+
+fn string_from_state_field(
+    kernel_state: &meerkat_machine_kernels::KernelState,
     field: &str,
 ) -> Result<String, MobError> {
-    match effect.fields.get(field) {
-        Some(KernelValue::String(s)) => Ok(s.clone()),
+    match kernel_state.fields.get(field) {
+        Some(KernelValue::String(value)) => Ok(value.clone()),
         other => Err(MobError::Internal(format!(
-            "effect '{}' missing String field '{}': {other:?}",
-            effect.variant, field
+            "kernel state missing String field '{field}': {other:?}"
         ))),
+    }
+}
+
+fn u64_from_state_field(
+    kernel_state: &meerkat_machine_kernels::KernelState,
+    field: &str,
+) -> Result<u64, MobError> {
+    match kernel_state.fields.get(field) {
+        Some(KernelValue::U64(value)) => Ok(*value),
+        other => Err(MobError::Internal(format!(
+            "kernel state missing U64 field '{field}': {other:?}"
+        ))),
+    }
+}
+
+fn frame_is_body(kernel_state: &meerkat_machine_kernels::KernelState) -> bool {
+    matches!(
+        kernel_state.fields.get("frame_scope"),
+        Some(KernelValue::NamedVariant { variant, .. }) if variant == "Body"
+    )
+}
+
+fn frame_loop_instance_id(
+    kernel_state: &meerkat_machine_kernels::KernelState,
+) -> Option<LoopInstanceId> {
+    match kernel_state.fields.get("loop_instance_id") {
+        Some(KernelValue::String(loop_instance_id)) if !loop_instance_id.is_empty() => {
+            Some(LoopInstanceId::from(loop_instance_id.as_str()))
+        }
+        _ => None,
+    }
+}
+
+fn frame_iteration(kernel_state: &meerkat_machine_kernels::KernelState) -> Result<u64, MobError> {
+    u64_from_state_field(kernel_state, "iteration")
+}
+
+fn loop_parent_frame_id(
+    kernel_state: &meerkat_machine_kernels::KernelState,
+) -> Result<FrameId, MobError> {
+    string_from_state_field(kernel_state, "parent_frame_id")
+        .map(|value| FrameId::from(value.as_str()))
+}
+
+fn loop_parent_node_id(
+    kernel_state: &meerkat_machine_kernels::KernelState,
+) -> Result<FlowNodeId, MobError> {
+    string_from_state_field(kernel_state, "parent_node_id")
+        .map(|value| FlowNodeId::from(value.as_str()))
+}
+
+fn loop_id_from_state(
+    kernel_state: &meerkat_machine_kernels::KernelState,
+) -> Result<LoopId, MobError> {
+    string_from_state_field(kernel_state, "loop_id").map(|value| LoopId::from(value.as_str()))
+}
+
+fn loop_depth(kernel_state: &meerkat_machine_kernels::KernelState) -> Result<u32, MobError> {
+    u64_from_state_field(kernel_state, "depth").map(|value| value as u32)
+}
+
+fn active_body_frame_id(kernel_state: &meerkat_machine_kernels::KernelState) -> Option<FrameId> {
+    match kernel_state.fields.get("active_body_frame_id") {
+        Some(KernelValue::String(frame_id)) if !frame_id.is_empty() => {
+            Some(FrameId::from(frame_id.as_str()))
+        }
+        _ => None,
     }
 }
 
@@ -872,5 +1302,77 @@ fn running_node_ids(kernel_state: &meerkat_machine_kernels::KernelState) -> Vec<
             })
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+fn collect_frame_step_statuses(
+    spec: &FrameSpec,
+    kernel_state: &meerkat_machine_kernels::KernelState,
+) -> IndexMap<StepId, StepRunStatus> {
+    let Some(KernelValue::Map(status_map)) = kernel_state.fields.get("node_status") else {
+        return IndexMap::new();
+    };
+
+    let mut step_statuses = IndexMap::new();
+    for (node_id, node_spec) in &spec.nodes {
+        let FlowNodeSpec::Step(step_spec) = node_spec else {
+            continue;
+        };
+        let Some(status) = status_map.get(&KernelValue::String(node_id.to_string())) else {
+            continue;
+        };
+        let Some(step_status) = node_terminal_step_status(status) else {
+            continue;
+        };
+        merge_step_status(&mut step_statuses, step_spec.step_id.clone(), step_status);
+    }
+    step_statuses
+}
+
+fn node_terminal_step_status(value: &KernelValue) -> Option<StepRunStatus> {
+    match value {
+        KernelValue::NamedVariant { variant, .. } if variant == "Completed" => {
+            Some(StepRunStatus::Completed)
+        }
+        KernelValue::NamedVariant { variant, .. } if variant == "Skipped" => {
+            Some(StepRunStatus::Skipped)
+        }
+        KernelValue::NamedVariant { variant, .. } if variant == "Failed" => {
+            Some(StepRunStatus::Failed)
+        }
+        _ => None,
+    }
+}
+
+fn merge_step_statuses(
+    into: &mut IndexMap<StepId, StepRunStatus>,
+    updates: IndexMap<StepId, StepRunStatus>,
+) {
+    for (step_id, status) in updates {
+        merge_step_status(into, step_id, status);
+    }
+}
+
+fn merge_step_status(
+    into: &mut IndexMap<StepId, StepRunStatus>,
+    step_id: StepId,
+    status: StepRunStatus,
+) {
+    let next_rank = step_status_rank(&status);
+    match into.get_mut(&step_id) {
+        Some(existing) if step_status_rank(existing) >= next_rank => {}
+        Some(existing) => *existing = status,
+        None => {
+            into.insert(step_id, status);
+        }
+    }
+}
+
+fn step_status_rank(status: &StepRunStatus) -> u8 {
+    match status {
+        StepRunStatus::Failed => 3,
+        StepRunStatus::Completed => 2,
+        StepRunStatus::Skipped => 1,
+        StepRunStatus::Dispatched | StepRunStatus::Canceled => 0,
     }
 }

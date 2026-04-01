@@ -134,7 +134,7 @@ mod tests {
             frames: std::collections::BTreeMap::new(),
             loops: std::collections::BTreeMap::new(),
             loop_iteration_ledger: Vec::new(),
-            schema_version: 2,
+            schema_version: 4,
             root_step_outputs: indexmap::IndexMap::new(),
             loop_iteration_outputs: std::collections::BTreeMap::new(),
         };
@@ -184,7 +184,7 @@ model = "test"
             frames: std::collections::BTreeMap::new(),
             loops: std::collections::BTreeMap::new(),
             loop_iteration_ledger: Vec::new(),
-            schema_version: 2,
+            schema_version: 4,
             root_step_outputs: indexmap::IndexMap::new(),
             loop_iteration_outputs: std::collections::BTreeMap::new(),
         };

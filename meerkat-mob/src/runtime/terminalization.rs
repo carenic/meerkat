@@ -376,6 +376,7 @@ mod tests {
             next_loop: crate::run::LoopSnapshot,
             frame_id: &crate::ids::FrameId,
             initial_frame: crate::run::FrameSnapshot,
+            ledger_entry: crate::run::LoopIterationLedgerEntry,
             expected_run_state: &meerkat_machine_kernels::KernelState,
             next_run_state: meerkat_machine_kernels::KernelState,
         ) -> Result<bool, crate::error::MobError> {
@@ -387,6 +388,7 @@ mod tests {
                     next_loop,
                     frame_id,
                     initial_frame,
+                    ledger_entry,
                     expected_run_state,
                     next_run_state,
                 )
@@ -539,7 +541,7 @@ mod tests {
             frames: std::collections::BTreeMap::new(),
             loops: std::collections::BTreeMap::new(),
             loop_iteration_ledger: Vec::new(),
-            schema_version: 2,
+            schema_version: 4,
             root_step_outputs: indexmap::IndexMap::new(),
             loop_iteration_outputs: std::collections::BTreeMap::new(),
         }

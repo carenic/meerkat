@@ -173,6 +173,55 @@ fn emit_node_execution_released(node_id_expr: Expr) -> EffectEmit {
     }
 }
 
+fn emit_root_frame_terminal(effect_variant: &str) -> EffectEmit {
+    EffectEmit {
+        variant: effect_variant.into(),
+        fields: IndexMap::from([("frame_id".into(), Expr::Field("frame_id".into()))]),
+    }
+}
+
+fn emit_body_frame_terminal(effect_variant: &str) -> EffectEmit {
+    EffectEmit {
+        variant: effect_variant.into(),
+        fields: IndexMap::from([
+            ("frame_id".into(), Expr::Field("frame_id".into())),
+            (
+                "loop_instance_id".into(),
+                Expr::Field("loop_instance_id".into()),
+            ),
+            ("iteration".into(), Expr::Field("iteration".into())),
+        ]),
+    }
+}
+
+fn any_node_with_status_expr(status_variant: &str) -> Expr {
+    Expr::Quantified {
+        quantifier: Quantifier::Any,
+        binding: "status_node".into(),
+        over: Box::new(Expr::Field("tracked_nodes".into())),
+        body: Box::new(Expr::Eq(
+            Box::new(Expr::MapGet {
+                map: Box::new(Expr::Field("node_status".into())),
+                key: Box::new(Expr::Binding("status_node".into())),
+            }),
+            Box::new(Expr::NamedVariant {
+                enum_name: "NodeRunStatus".into(),
+                variant: status_variant.into(),
+            }),
+        )),
+    }
+}
+
+fn frame_scope_expr(scope_variant: &str) -> Expr {
+    Expr::Eq(
+        Box::new(Expr::Field("frame_scope".into())),
+        Box::new(Expr::NamedVariant {
+            enum_name: "FrameScope".into(),
+            variant: scope_variant.into(),
+        }),
+    )
+}
+
 /// Build updates for StartFrame: assign topology fields, init all nodes Pending,
 /// then seed the ready frontier.
 fn start_frame_updates() -> Vec<Update> {
@@ -221,6 +270,50 @@ fn start_frame_updates() -> Vec<Update> {
     ];
     // Seed the ready frontier (roots → Ready, appended to ready_queue)
     updates.extend(refresh_ready_frontier_updates());
+    updates
+}
+
+fn start_root_frame_updates() -> Vec<Update> {
+    let mut updates = vec![
+        Update::Assign {
+            field: "frame_scope".into(),
+            expr: Expr::NamedVariant {
+                enum_name: "FrameScope".into(),
+                variant: "Root".into(),
+            },
+        },
+        Update::Assign {
+            field: "loop_instance_id".into(),
+            expr: Expr::String(String::new()),
+        },
+        Update::Assign {
+            field: "iteration".into(),
+            expr: Expr::U64(0),
+        },
+    ];
+    updates.extend(start_frame_updates());
+    updates
+}
+
+fn start_body_frame_updates() -> Vec<Update> {
+    let mut updates = vec![
+        Update::Assign {
+            field: "frame_scope".into(),
+            expr: Expr::NamedVariant {
+                enum_name: "FrameScope".into(),
+                variant: "Body".into(),
+            },
+        },
+        Update::Assign {
+            field: "loop_instance_id".into(),
+            expr: Expr::Binding("loop_instance_id".into()),
+        },
+        Update::Assign {
+            field: "iteration".into(),
+            expr: Expr::Binding("iteration".into()),
+        },
+    ];
+    updates.extend(start_frame_updates());
     updates
 }
 
@@ -504,7 +597,7 @@ fn admit_terminal_updates(status_variant: &str) -> Vec<Update> {
 pub fn flow_frame_machine() -> MachineSchema {
     MachineSchema {
         machine: "FlowFrameMachine".into(),
-        version: 1,
+        version: 3,
         rust: RustBinding {
             crate_name: "meerkat-mob".into(),
             module: "generated::flow_frame".into(),
@@ -523,6 +616,9 @@ pub fn flow_frame_machine() -> MachineSchema {
             fields: vec![
                 // Frame identity (stored so effects can reference it without bindings)
                 field("frame_id", TypeRef::Named("FrameId".into())),
+                field("frame_scope", TypeRef::Enum("FrameScope".into())),
+                field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
+                field("iteration", TypeRef::U32),
                 // Transient scratch: the node ID admitted in the most recent
                 // AdmitNextReadyNode transition. Set BEFORE SeqPopFront so that
                 // effects emitted in the same transition can reference it via
@@ -607,6 +703,15 @@ pub fn flow_frame_machine() -> MachineSchema {
                 phase: "Absent".into(),
                 fields: vec![
                     init("frame_id", Expr::String(String::new())),
+                    init(
+                        "frame_scope",
+                        Expr::NamedVariant {
+                            enum_name: "FrameScope".into(),
+                            variant: "Root".into(),
+                        },
+                    ),
+                    init("loop_instance_id", Expr::String(String::new())),
+                    init("iteration", Expr::U64(0)),
                     init("last_admitted_node", Expr::String(String::new())),
                     init("tracked_nodes", Expr::EmptySet),
                     init("ordered_nodes", Expr::SeqLiteral(vec![])),
@@ -627,9 +732,57 @@ pub fn flow_frame_machine() -> MachineSchema {
             name: "FlowFrameInput".into(),
             variants: vec![
                 VariantSchema {
-                    name: "StartFrame".into(),
+                    name: "StartRootFrame".into(),
                     fields: vec![
                         field("frame_id", TypeRef::Named("FrameId".into())),
+                        field(
+                            "tracked_nodes",
+                            TypeRef::Set(Box::new(TypeRef::Named("FlowNodeId".into()))),
+                        ),
+                        field(
+                            "ordered_nodes",
+                            TypeRef::Seq(Box::new(TypeRef::Named("FlowNodeId".into()))),
+                        ),
+                        field(
+                            "node_kind",
+                            TypeRef::Map(
+                                Box::new(TypeRef::Named("FlowNodeId".into())),
+                                Box::new(TypeRef::Enum("FlowNodeKind".into())),
+                            ),
+                        ),
+                        field(
+                            "node_dependencies",
+                            TypeRef::Map(
+                                Box::new(TypeRef::Named("FlowNodeId".into())),
+                                Box::new(TypeRef::Seq(Box::new(TypeRef::Named(
+                                    "FlowNodeId".into(),
+                                )))),
+                            ),
+                        ),
+                        field(
+                            "node_dependency_modes",
+                            TypeRef::Map(
+                                Box::new(TypeRef::Named("FlowNodeId".into())),
+                                Box::new(TypeRef::Enum("DependencyMode".into())),
+                            ),
+                        ),
+                        field(
+                            "node_branches",
+                            TypeRef::Map(
+                                Box::new(TypeRef::Named("FlowNodeId".into())),
+                                Box::new(TypeRef::Option(Box::new(TypeRef::Named(
+                                    "BranchId".into(),
+                                )))),
+                            ),
+                        ),
+                    ],
+                },
+                VariantSchema {
+                    name: "StartBodyFrame".into(),
+                    fields: vec![
+                        field("frame_id", TypeRef::Named("FrameId".into())),
+                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
+                        field("iteration", TypeRef::U32),
                         field(
                             "tracked_nodes",
                             TypeRef::Set(Box::new(TypeRef::Named("FlowNodeId".into()))),
@@ -693,9 +846,7 @@ pub fn flow_frame_machine() -> MachineSchema {
                     name: "CancelNode".into(),
                     fields: vec![field("node_id", TypeRef::Named("FlowNodeId".into()))],
                 },
-                variant("TerminalizeCompleted"),
-                variant("TerminalizeFailed"),
-                variant("TerminalizeCanceled"),
+                variant("SealFrame"),
             ],
         },
         effects: EnumSchema {
@@ -734,10 +885,39 @@ pub fn flow_frame_machine() -> MachineSchema {
                     ],
                 },
                 VariantSchema {
-                    name: "FrameTerminalized".into(),
+                    name: "RootFrameCompleted".into(),
+                    fields: vec![field("frame_id", TypeRef::Named("FrameId".into()))],
+                },
+                VariantSchema {
+                    name: "RootFrameFailed".into(),
+                    fields: vec![field("frame_id", TypeRef::Named("FrameId".into()))],
+                },
+                VariantSchema {
+                    name: "RootFrameCanceled".into(),
+                    fields: vec![field("frame_id", TypeRef::Named("FrameId".into()))],
+                },
+                VariantSchema {
+                    name: "BodyFrameCompleted".into(),
                     fields: vec![
                         field("frame_id", TypeRef::Named("FrameId".into())),
-                        field("status", TypeRef::Enum("FlowFrameStatus".into())),
+                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
+                        field("iteration", TypeRef::U32),
+                    ],
+                },
+                VariantSchema {
+                    name: "BodyFrameFailed".into(),
+                    fields: vec![
+                        field("frame_id", TypeRef::Named("FrameId".into())),
+                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
+                        field("iteration", TypeRef::U32),
+                    ],
+                },
+                VariantSchema {
+                    name: "BodyFrameCanceled".into(),
+                    fields: vec![
+                        field("frame_id", TypeRef::Named("FrameId".into())),
+                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
+                        field("iteration", TypeRef::U32),
                     ],
                 },
             ],
@@ -971,15 +1151,15 @@ pub fn flow_frame_machine() -> MachineSchema {
         }],
         transitions: vec![
             // ----------------------------------------------------------------
-            // StartFrame: Absent -> Running
+            // StartRootFrame: Absent -> Running
             // Stores frame topology, initializes all nodes as Pending,
             // then seeds the ready frontier.
             // ----------------------------------------------------------------
             TransitionSchema {
-                name: "StartFrame".into(),
+                name: "StartRootFrame".into(),
                 from: vec!["Absent".into()],
                 on: InputMatch {
-                    variant: "StartFrame".into(),
+                    variant: "StartRootFrame".into(),
                     bindings: vec![
                         "frame_id".into(),
                         "tracked_nodes".into(),
@@ -991,7 +1171,29 @@ pub fn flow_frame_machine() -> MachineSchema {
                     ],
                 },
                 guards: vec![],
-                updates: start_frame_updates(),
+                updates: start_root_frame_updates(),
+                to: "Running".into(),
+                emit: vec![emit_ready_frontier_changed()],
+            },
+            TransitionSchema {
+                name: "StartBodyFrame".into(),
+                from: vec!["Absent".into()],
+                on: InputMatch {
+                    variant: "StartBodyFrame".into(),
+                    bindings: vec![
+                        "frame_id".into(),
+                        "loop_instance_id".into(),
+                        "iteration".into(),
+                        "tracked_nodes".into(),
+                        "ordered_nodes".into(),
+                        "node_kind".into(),
+                        "node_dependencies".into(),
+                        "node_dependency_modes".into(),
+                        "node_branches".into(),
+                    ],
+                },
+                guards: vec![],
+                updates: start_body_frame_updates(),
                 to: "Running".into(),
                 emit: vec![emit_ready_frontier_changed()],
             },
@@ -1013,13 +1215,16 @@ pub fn flow_frame_machine() -> MachineSchema {
                 ],
                 updates: admit_run_updates("Running"),
                 to: "Running".into(),
-                emit: vec![EffectEmit {
-                    variant: "AdmitStepWork".into(),
-                    fields: IndexMap::from([
-                        ("frame_id".into(), Expr::Field("frame_id".into())),
-                        ("node_id".into(), Expr::Field("last_admitted_node".into())),
-                    ]),
-                }],
+                emit: vec![
+                    EffectEmit {
+                        variant: "AdmitStepWork".into(),
+                        fields: IndexMap::from([
+                            ("frame_id".into(), Expr::Field("frame_id".into())),
+                            ("node_id".into(), Expr::Field("last_admitted_node".into())),
+                        ]),
+                    },
+                    emit_ready_frontier_changed(),
+                ],
             },
             // ----------------------------------------------------------------
             // AdmitNextReadyNode_LoopRun
@@ -1039,13 +1244,17 @@ pub fn flow_frame_machine() -> MachineSchema {
                 ],
                 updates: admit_run_updates("Running"),
                 to: "Running".into(),
-                emit: vec![EffectEmit {
-                    variant: "StartLoopNode".into(),
-                    fields: IndexMap::from([
-                        ("frame_id".into(), Expr::Field("frame_id".into())),
-                        ("node_id".into(), Expr::Field("last_admitted_node".into())),
-                    ]),
-                }],
+                emit: vec![
+                    EffectEmit {
+                        variant: "StartLoopNode".into(),
+                        fields: IndexMap::from([
+                            ("frame_id".into(), Expr::Field("frame_id".into())),
+                            ("node_id".into(), Expr::Field("last_admitted_node".into())),
+                        ]),
+                    },
+                    emit_node_execution_released(Expr::Field("last_admitted_node".into())),
+                    emit_ready_frontier_changed(),
+                ],
             },
             // ----------------------------------------------------------------
             // AdmitNextReadyNode_Skip
@@ -1086,28 +1295,43 @@ pub fn flow_frame_machine() -> MachineSchema {
                 ],
             },
             // ----------------------------------------------------------------
-            // CompleteNode: marks a Running node as Completed, refreshes frontier
+            // CompleteNode_Step: marks a Running Step node as Completed, refreshes frontier
             // ----------------------------------------------------------------
             TransitionSchema {
-                name: "CompleteNode".into(),
+                name: "CompleteNode_Step".into(),
                 from: vec!["Running".into()],
                 on: InputMatch {
                     variant: "CompleteNode".into(),
                     bindings: vec!["node_id".into()],
                 },
-                guards: vec![Guard {
-                    name: "node_is_running".into(),
-                    expr: Expr::Eq(
-                        Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field("node_status".into())),
-                            key: Box::new(Expr::Binding("node_id".into())),
-                        }),
-                        Box::new(Expr::NamedVariant {
-                            enum_name: "NodeRunStatus".into(),
-                            variant: "Running".into(),
-                        }),
-                    ),
-                }],
+                guards: vec![
+                    Guard {
+                        name: "node_is_running".into(),
+                        expr: Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_status".into())),
+                                key: Box::new(Expr::Binding("node_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "NodeRunStatus".into(),
+                                variant: "Running".into(),
+                            }),
+                        ),
+                    },
+                    Guard {
+                        name: "node_is_step".into(),
+                        expr: Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_kind".into())),
+                                key: Box::new(Expr::Binding("node_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "FlowNodeKind".into(),
+                                variant: "Step".into(),
+                            }),
+                        ),
+                    },
+                ],
                 updates: {
                     let mut updates = vec![
                         Update::MapInsert {
@@ -1148,6 +1372,79 @@ pub fn flow_frame_machine() -> MachineSchema {
                 ],
             },
             // ----------------------------------------------------------------
+            // CompleteNode_Loop: marks a Running Loop node as Completed, refreshes frontier
+            // without releasing a node slot (the slot was released on loop handoff).
+            // ----------------------------------------------------------------
+            TransitionSchema {
+                name: "CompleteNode_Loop".into(),
+                from: vec!["Running".into()],
+                on: InputMatch {
+                    variant: "CompleteNode".into(),
+                    bindings: vec!["node_id".into()],
+                },
+                guards: vec![
+                    Guard {
+                        name: "node_is_running".into(),
+                        expr: Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_status".into())),
+                                key: Box::new(Expr::Binding("node_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "NodeRunStatus".into(),
+                                variant: "Running".into(),
+                            }),
+                        ),
+                    },
+                    Guard {
+                        name: "node_is_loop".into(),
+                        expr: Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_kind".into())),
+                                key: Box::new(Expr::Binding("node_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "FlowNodeKind".into(),
+                                variant: "Loop".into(),
+                            }),
+                        ),
+                    },
+                ],
+                updates: {
+                    let mut updates = vec![
+                        Update::MapInsert {
+                            field: "node_status".into(),
+                            key: Expr::Binding("node_id".into()),
+                            value: Expr::NamedVariant {
+                                enum_name: "NodeRunStatus".into(),
+                                variant: "Completed".into(),
+                            },
+                        },
+                        Update::Conditional {
+                            condition: Expr::Neq(
+                                Box::new(Expr::MapGet {
+                                    map: Box::new(Expr::Field("node_branches".into())),
+                                    key: Box::new(Expr::Binding("node_id".into())),
+                                }),
+                                Box::new(Expr::None),
+                            ),
+                            then_updates: vec![Update::SetInsert {
+                                field: "branch_winners".into(),
+                                value: Expr::MapGet {
+                                    map: Box::new(Expr::Field("node_branches".into())),
+                                    key: Box::new(Expr::Binding("node_id".into())),
+                                },
+                            }],
+                            else_updates: vec![],
+                        },
+                    ];
+                    updates.extend(refresh_ready_frontier_updates());
+                    updates
+                },
+                to: "Running".into(),
+                emit: vec![emit_ready_frontier_changed()],
+            },
+            // ----------------------------------------------------------------
             // RecordNodeOutput: marks output as recorded for a node
             // ----------------------------------------------------------------
             TransitionSchema {
@@ -1173,28 +1470,43 @@ pub fn flow_frame_machine() -> MachineSchema {
                 }],
             },
             // ----------------------------------------------------------------
-            // FailNode: marks a Running node as Failed, refreshes frontier
+            // FailNode_Step: marks a Running Step node as Failed, refreshes frontier
             // ----------------------------------------------------------------
             TransitionSchema {
-                name: "FailNode".into(),
+                name: "FailNode_Step".into(),
                 from: vec!["Running".into()],
                 on: InputMatch {
                     variant: "FailNode".into(),
                     bindings: vec!["node_id".into()],
                 },
-                guards: vec![Guard {
-                    name: "node_is_running".into(),
-                    expr: Expr::Eq(
-                        Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field("node_status".into())),
-                            key: Box::new(Expr::Binding("node_id".into())),
-                        }),
-                        Box::new(Expr::NamedVariant {
-                            enum_name: "NodeRunStatus".into(),
-                            variant: "Running".into(),
-                        }),
-                    ),
-                }],
+                guards: vec![
+                    Guard {
+                        name: "node_is_running".into(),
+                        expr: Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_status".into())),
+                                key: Box::new(Expr::Binding("node_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "NodeRunStatus".into(),
+                                variant: "Running".into(),
+                            }),
+                        ),
+                    },
+                    Guard {
+                        name: "node_is_step".into(),
+                        expr: Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_kind".into())),
+                                key: Box::new(Expr::Binding("node_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "FlowNodeKind".into(),
+                                variant: "Step".into(),
+                            }),
+                        ),
+                    },
+                ],
                 updates: {
                     let mut updates = vec![Update::MapInsert {
                         field: "node_status".into(),
@@ -1214,28 +1526,97 @@ pub fn flow_frame_machine() -> MachineSchema {
                 ],
             },
             // ----------------------------------------------------------------
-            // SkipNode: marks a Running node as Skipped, refreshes frontier
+            // FailNode_Loop: marks a Running Loop node as Failed, refreshes frontier
+            // without releasing a node slot (the slot was released on loop handoff).
             // ----------------------------------------------------------------
             TransitionSchema {
-                name: "SkipNode".into(),
+                name: "FailNode_Loop".into(),
+                from: vec!["Running".into()],
+                on: InputMatch {
+                    variant: "FailNode".into(),
+                    bindings: vec!["node_id".into()],
+                },
+                guards: vec![
+                    Guard {
+                        name: "node_is_running".into(),
+                        expr: Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_status".into())),
+                                key: Box::new(Expr::Binding("node_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "NodeRunStatus".into(),
+                                variant: "Running".into(),
+                            }),
+                        ),
+                    },
+                    Guard {
+                        name: "node_is_loop".into(),
+                        expr: Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_kind".into())),
+                                key: Box::new(Expr::Binding("node_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "FlowNodeKind".into(),
+                                variant: "Loop".into(),
+                            }),
+                        ),
+                    },
+                ],
+                updates: {
+                    let mut updates = vec![Update::MapInsert {
+                        field: "node_status".into(),
+                        key: Expr::Binding("node_id".into()),
+                        value: Expr::NamedVariant {
+                            enum_name: "NodeRunStatus".into(),
+                            variant: "Failed".into(),
+                        },
+                    }];
+                    updates.extend(refresh_ready_frontier_updates());
+                    updates
+                },
+                to: "Running".into(),
+                emit: vec![emit_ready_frontier_changed()],
+            },
+            // ----------------------------------------------------------------
+            // SkipNode_Step: marks a Running Step node as Skipped, refreshes frontier
+            // ----------------------------------------------------------------
+            TransitionSchema {
+                name: "SkipNode_Step".into(),
                 from: vec!["Running".into()],
                 on: InputMatch {
                     variant: "SkipNode".into(),
                     bindings: vec!["node_id".into()],
                 },
-                guards: vec![Guard {
-                    name: "node_is_running".into(),
-                    expr: Expr::Eq(
-                        Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field("node_status".into())),
-                            key: Box::new(Expr::Binding("node_id".into())),
-                        }),
-                        Box::new(Expr::NamedVariant {
-                            enum_name: "NodeRunStatus".into(),
-                            variant: "Running".into(),
-                        }),
-                    ),
-                }],
+                guards: vec![
+                    Guard {
+                        name: "node_is_running".into(),
+                        expr: Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_status".into())),
+                                key: Box::new(Expr::Binding("node_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "NodeRunStatus".into(),
+                                variant: "Running".into(),
+                            }),
+                        ),
+                    },
+                    Guard {
+                        name: "node_is_step".into(),
+                        expr: Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_kind".into())),
+                                key: Box::new(Expr::Binding("node_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "FlowNodeKind".into(),
+                                variant: "Step".into(),
+                            }),
+                        ),
+                    },
+                ],
                 updates: {
                     let mut updates = vec![Update::MapInsert {
                         field: "node_status".into(),
@@ -1255,28 +1636,97 @@ pub fn flow_frame_machine() -> MachineSchema {
                 ],
             },
             // ----------------------------------------------------------------
-            // CancelNode: marks a Running node as Canceled, refreshes frontier
+            // SkipNode_Loop: marks a Running Loop node as Skipped, refreshes frontier
+            // without releasing a node slot (the slot was released on loop handoff).
             // ----------------------------------------------------------------
             TransitionSchema {
-                name: "CancelNode".into(),
+                name: "SkipNode_Loop".into(),
+                from: vec!["Running".into()],
+                on: InputMatch {
+                    variant: "SkipNode".into(),
+                    bindings: vec!["node_id".into()],
+                },
+                guards: vec![
+                    Guard {
+                        name: "node_is_running".into(),
+                        expr: Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_status".into())),
+                                key: Box::new(Expr::Binding("node_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "NodeRunStatus".into(),
+                                variant: "Running".into(),
+                            }),
+                        ),
+                    },
+                    Guard {
+                        name: "node_is_loop".into(),
+                        expr: Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_kind".into())),
+                                key: Box::new(Expr::Binding("node_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "FlowNodeKind".into(),
+                                variant: "Loop".into(),
+                            }),
+                        ),
+                    },
+                ],
+                updates: {
+                    let mut updates = vec![Update::MapInsert {
+                        field: "node_status".into(),
+                        key: Expr::Binding("node_id".into()),
+                        value: Expr::NamedVariant {
+                            enum_name: "NodeRunStatus".into(),
+                            variant: "Skipped".into(),
+                        },
+                    }];
+                    updates.extend(refresh_ready_frontier_updates());
+                    updates
+                },
+                to: "Running".into(),
+                emit: vec![emit_ready_frontier_changed()],
+            },
+            // ----------------------------------------------------------------
+            // CancelNode_Step: marks a Running Step node as Canceled, refreshes frontier
+            // ----------------------------------------------------------------
+            TransitionSchema {
+                name: "CancelNode_Step".into(),
                 from: vec!["Running".into()],
                 on: InputMatch {
                     variant: "CancelNode".into(),
                     bindings: vec!["node_id".into()],
                 },
-                guards: vec![Guard {
-                    name: "node_is_running".into(),
-                    expr: Expr::Eq(
-                        Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field("node_status".into())),
-                            key: Box::new(Expr::Binding("node_id".into())),
-                        }),
-                        Box::new(Expr::NamedVariant {
-                            enum_name: "NodeRunStatus".into(),
-                            variant: "Running".into(),
-                        }),
-                    ),
-                }],
+                guards: vec![
+                    Guard {
+                        name: "node_is_running".into(),
+                        expr: Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_status".into())),
+                                key: Box::new(Expr::Binding("node_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "NodeRunStatus".into(),
+                                variant: "Running".into(),
+                            }),
+                        ),
+                    },
+                    Guard {
+                        name: "node_is_step".into(),
+                        expr: Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_kind".into())),
+                                key: Box::new(Expr::Binding("node_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "FlowNodeKind".into(),
+                                variant: "Step".into(),
+                            }),
+                        ),
+                    },
+                ],
                 updates: {
                     let mut updates = vec![Update::MapInsert {
                         field: "node_status".into(),
@@ -1296,102 +1746,261 @@ pub fn flow_frame_machine() -> MachineSchema {
                 ],
             },
             // ----------------------------------------------------------------
-            // TerminalizeCompleted: Running -> Completed
-            // Guard: all tracked nodes must be in a terminal state.
+            // CancelNode_Loop: marks a Running Loop node as Canceled, refreshes frontier
+            // without releasing a node slot (the slot was released on loop handoff).
             // ----------------------------------------------------------------
             TransitionSchema {
-                name: "TerminalizeCompleted".into(),
+                name: "CancelNode_Loop".into(),
                 from: vec!["Running".into()],
                 on: InputMatch {
-                    variant: "TerminalizeCompleted".into(),
-                    bindings: vec![],
+                    variant: "CancelNode".into(),
+                    bindings: vec!["node_id".into()],
                 },
-                guards: vec![Guard {
-                    name: "all_nodes_terminal".into(),
-                    expr: Expr::Call {
-                        helper: "AllNodesTerminal".into(),
-                        args: vec![],
+                guards: vec![
+                    Guard {
+                        name: "node_is_running".into(),
+                        expr: Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_status".into())),
+                                key: Box::new(Expr::Binding("node_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "NodeRunStatus".into(),
+                                variant: "Running".into(),
+                            }),
+                        ),
                     },
-                }],
-                updates: vec![],
-                to: "Completed".into(),
-                emit: vec![EffectEmit {
-                    variant: "FrameTerminalized".into(),
-                    fields: IndexMap::from([
-                        ("frame_id".into(), Expr::Field("frame_id".into())),
-                        (
-                            "status".into(),
-                            Expr::NamedVariant {
-                                enum_name: "FlowFrameStatus".into(),
-                                variant: "Completed".into(),
-                            },
+                    Guard {
+                        name: "node_is_loop".into(),
+                        expr: Expr::Eq(
+                            Box::new(Expr::MapGet {
+                                map: Box::new(Expr::Field("node_kind".into())),
+                                key: Box::new(Expr::Binding("node_id".into())),
+                            }),
+                            Box::new(Expr::NamedVariant {
+                                enum_name: "FlowNodeKind".into(),
+                                variant: "Loop".into(),
+                            }),
                         ),
-                    ]),
-                }],
+                    },
+                ],
+                updates: {
+                    let mut updates = vec![Update::MapInsert {
+                        field: "node_status".into(),
+                        key: Expr::Binding("node_id".into()),
+                        value: Expr::NamedVariant {
+                            enum_name: "NodeRunStatus".into(),
+                            variant: "Canceled".into(),
+                        },
+                    }];
+                    updates.extend(refresh_ready_frontier_updates());
+                    updates
+                },
+                to: "Running".into(),
+                emit: vec![emit_ready_frontier_changed()],
             },
             // ----------------------------------------------------------------
-            // TerminalizeFailed: Running|Absent -> Failed
-            // ----------------------------------------------------------------
+            // SealFrame_*: Running -> Completed|Failed|Canceled.
+            // Ordinary frame closeout is machine-owned and derived from node truth:
+            // canceled outranks failed; failed outranks completed.
             TransitionSchema {
-                name: "TerminalizeFailed".into(),
-                from: vec!["Running".into(), "Absent".into()],
+                name: "SealRootFrameCanceled".into(),
+                from: vec!["Running".into()],
                 on: InputMatch {
-                    variant: "TerminalizeFailed".into(),
+                    variant: "SealFrame".into(),
                     bindings: vec![],
                 },
-                guards: vec![],
-                updates: vec![],
-                to: "Failed".into(),
-                emit: vec![EffectEmit {
-                    variant: "FrameTerminalized".into(),
-                    fields: IndexMap::from([
-                        ("frame_id".into(), Expr::Field("frame_id".into())),
-                        (
-                            "status".into(),
-                            Expr::NamedVariant {
-                                enum_name: "FlowFrameStatus".into(),
-                                variant: "Failed".into(),
-                            },
-                        ),
-                    ]),
-                }],
-            },
-            // ----------------------------------------------------------------
-            // TerminalizeCanceled: Running|Absent -> Canceled
-            // ----------------------------------------------------------------
-            TransitionSchema {
-                name: "TerminalizeCanceled".into(),
-                from: vec!["Running".into(), "Absent".into()],
-                on: InputMatch {
-                    variant: "TerminalizeCanceled".into(),
-                    bindings: vec![],
-                },
-                guards: vec![],
+                guards: vec![
+                    Guard {
+                        name: "all_nodes_terminal".into(),
+                        expr: Expr::Call {
+                            helper: "AllNodesTerminal".into(),
+                            args: vec![],
+                        },
+                    },
+                    Guard {
+                        name: "root_frame".into(),
+                        expr: frame_scope_expr("Root"),
+                    },
+                    Guard {
+                        name: "has_canceled_nodes".into(),
+                        expr: any_node_with_status_expr("Canceled"),
+                    },
+                ],
                 updates: vec![],
                 to: "Canceled".into(),
-                emit: vec![EffectEmit {
-                    variant: "FrameTerminalized".into(),
-                    fields: IndexMap::from([
-                        ("frame_id".into(), Expr::Field("frame_id".into())),
-                        (
-                            "status".into(),
-                            Expr::NamedVariant {
-                                enum_name: "FlowFrameStatus".into(),
-                                variant: "Canceled".into(),
-                            },
-                        ),
-                    ]),
-                }],
+                emit: vec![emit_root_frame_terminal("RootFrameCanceled")],
+            },
+            TransitionSchema {
+                name: "SealRootFrameFailed".into(),
+                from: vec!["Running".into()],
+                on: InputMatch {
+                    variant: "SealFrame".into(),
+                    bindings: vec![],
+                },
+                guards: vec![
+                    Guard {
+                        name: "all_nodes_terminal".into(),
+                        expr: Expr::Call {
+                            helper: "AllNodesTerminal".into(),
+                            args: vec![],
+                        },
+                    },
+                    Guard {
+                        name: "root_frame".into(),
+                        expr: frame_scope_expr("Root"),
+                    },
+                    Guard {
+                        name: "no_canceled_nodes".into(),
+                        expr: Expr::Not(Box::new(any_node_with_status_expr("Canceled"))),
+                    },
+                    Guard {
+                        name: "has_failed_nodes".into(),
+                        expr: any_node_with_status_expr("Failed"),
+                    },
+                ],
+                updates: vec![],
+                to: "Failed".into(),
+                emit: vec![emit_root_frame_terminal("RootFrameFailed")],
+            },
+            TransitionSchema {
+                name: "SealRootFrameCompleted".into(),
+                from: vec!["Running".into()],
+                on: InputMatch {
+                    variant: "SealFrame".into(),
+                    bindings: vec![],
+                },
+                guards: vec![
+                    Guard {
+                        name: "all_nodes_terminal".into(),
+                        expr: Expr::Call {
+                            helper: "AllNodesTerminal".into(),
+                            args: vec![],
+                        },
+                    },
+                    Guard {
+                        name: "root_frame".into(),
+                        expr: frame_scope_expr("Root"),
+                    },
+                    Guard {
+                        name: "no_canceled_nodes".into(),
+                        expr: Expr::Not(Box::new(any_node_with_status_expr("Canceled"))),
+                    },
+                    Guard {
+                        name: "no_failed_nodes".into(),
+                        expr: Expr::Not(Box::new(any_node_with_status_expr("Failed"))),
+                    },
+                ],
+                updates: vec![],
+                to: "Completed".into(),
+                emit: vec![emit_root_frame_terminal("RootFrameCompleted")],
+            },
+            TransitionSchema {
+                name: "SealBodyFrameCanceled".into(),
+                from: vec!["Running".into()],
+                on: InputMatch {
+                    variant: "SealFrame".into(),
+                    bindings: vec![],
+                },
+                guards: vec![
+                    Guard {
+                        name: "all_nodes_terminal".into(),
+                        expr: Expr::Call {
+                            helper: "AllNodesTerminal".into(),
+                            args: vec![],
+                        },
+                    },
+                    Guard {
+                        name: "body_frame".into(),
+                        expr: frame_scope_expr("Body"),
+                    },
+                    Guard {
+                        name: "has_canceled_nodes".into(),
+                        expr: any_node_with_status_expr("Canceled"),
+                    },
+                ],
+                updates: vec![],
+                to: "Canceled".into(),
+                emit: vec![emit_body_frame_terminal("BodyFrameCanceled")],
+            },
+            TransitionSchema {
+                name: "SealBodyFrameFailed".into(),
+                from: vec!["Running".into()],
+                on: InputMatch {
+                    variant: "SealFrame".into(),
+                    bindings: vec![],
+                },
+                guards: vec![
+                    Guard {
+                        name: "all_nodes_terminal".into(),
+                        expr: Expr::Call {
+                            helper: "AllNodesTerminal".into(),
+                            args: vec![],
+                        },
+                    },
+                    Guard {
+                        name: "body_frame".into(),
+                        expr: frame_scope_expr("Body"),
+                    },
+                    Guard {
+                        name: "no_canceled_nodes".into(),
+                        expr: Expr::Not(Box::new(any_node_with_status_expr("Canceled"))),
+                    },
+                    Guard {
+                        name: "has_failed_nodes".into(),
+                        expr: any_node_with_status_expr("Failed"),
+                    },
+                ],
+                updates: vec![],
+                to: "Failed".into(),
+                emit: vec![emit_body_frame_terminal("BodyFrameFailed")],
+            },
+            TransitionSchema {
+                name: "SealBodyFrameCompleted".into(),
+                from: vec!["Running".into()],
+                on: InputMatch {
+                    variant: "SealFrame".into(),
+                    bindings: vec![],
+                },
+                guards: vec![
+                    Guard {
+                        name: "all_nodes_terminal".into(),
+                        expr: Expr::Call {
+                            helper: "AllNodesTerminal".into(),
+                            args: vec![],
+                        },
+                    },
+                    Guard {
+                        name: "body_frame".into(),
+                        expr: frame_scope_expr("Body"),
+                    },
+                    Guard {
+                        name: "no_canceled_nodes".into(),
+                        expr: Expr::Not(Box::new(any_node_with_status_expr("Canceled"))),
+                    },
+                    Guard {
+                        name: "no_failed_nodes".into(),
+                        expr: Expr::Not(Box::new(any_node_with_status_expr("Failed"))),
+                    },
+                ],
+                updates: vec![],
+                to: "Completed".into(),
+                emit: vec![emit_body_frame_terminal("BodyFrameCompleted")],
             },
         ],
         ci_step_limit: None,
         effect_dispositions: vec![
-            disposition("ReadyFrontierChanged", EffectDisposition::External),
+            routed_disposition("ReadyFrontierChanged", &["FlowRunMachine"]),
             disposition("AdmitStepWork", EffectDisposition::External),
             disposition("StartLoopNode", EffectDisposition::External),
             disposition("PersistStepOutput", EffectDisposition::Local),
-            disposition("NodeExecutionReleased", EffectDisposition::External),
-            disposition("FrameTerminalized", EffectDisposition::External),
+            routed_disposition("NodeExecutionReleased", &["FlowRunMachine"]),
+            disposition("RootFrameCompleted", EffectDisposition::External),
+            disposition("RootFrameFailed", EffectDisposition::External),
+            disposition("RootFrameCanceled", EffectDisposition::External),
+            routed_disposition("BodyFrameCompleted", &["LoopIterationMachine"]),
+            routed_disposition("BodyFrameFailed", &["LoopIterationMachine"]),
+            routed_disposition("BodyFrameCanceled", &["LoopIterationMachine"]),
         ],
     }
 }
@@ -1404,6 +2013,19 @@ fn disposition(name: &str, d: EffectDisposition) -> EffectDispositionRule {
     EffectDispositionRule {
         effect_variant: name.into(),
         disposition: d,
+        handoff_protocol: None,
+    }
+}
+
+fn routed_disposition(name: &str, consumer_machines: &[&str]) -> EffectDispositionRule {
+    EffectDispositionRule {
+        effect_variant: name.into(),
+        disposition: EffectDisposition::Routed {
+            consumer_machines: consumer_machines
+                .iter()
+                .map(|item| (*item).into())
+                .collect(),
+        },
         handoff_protocol: None,
     }
 }

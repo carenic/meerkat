@@ -11,8 +11,8 @@ use meerkat_machine_kernels::KernelValue;
 /// Errors that prevent a run from being resumed.
 #[derive(Debug, thiserror::Error)]
 pub enum RestoreIncompatible {
-    #[error("cannot resume pre-v2 run: schema_version={schema_version}")]
-    PreV2Schema { schema_version: u32 },
+    #[error("cannot resume pre-v3 frame run: schema_version={schema_version}")]
+    PreV3Schema { schema_version: u32 },
     #[error("frame invariant violated: frame {frame_id} has Ready nodes not in ready_queue")]
     FrameInvariantViolation { frame_id: FrameId },
     #[error("stale queue entries could not be reconciled")]
@@ -24,9 +24,9 @@ pub enum RestoreIncompatible {
 /// Must be called before resuming a run after a crash or restart.
 /// Returns `Err(RestoreIncompatible)` if the persisted state is irrecoverable.
 pub fn reconcile_run_state(run: &mut MobRun) -> Result<(), RestoreIncompatible> {
-    // 1. Pre-v2 check: reject active pre-v2 runs.
-    if run.schema_version < 2 && run.status != MobRunStatus::Pending && !run.status.is_terminal() {
-        return Err(RestoreIncompatible::PreV2Schema {
+    // 1. Pre-v3 check: reject active runs that predate descriptor-backed frame recovery.
+    if run.schema_version < 3 && run.status != MobRunStatus::Pending && !run.status.is_terminal() {
+        return Err(RestoreIncompatible::PreV3Schema {
             schema_version: run.schema_version,
         });
     }
@@ -45,6 +45,9 @@ pub fn reconcile_run_state(run: &mut MobRun) -> Result<(), RestoreIncompatible> 
 
     // 4. Reconcile pending_body_frame_loops in flow_state from loop snapshots.
     reconcile_pending_body_frame_loops(run);
+
+    // 5. Reconcile active scheduler counters from persisted frame/loop snapshots.
+    reconcile_active_counts(run);
 
     Ok(())
 }
@@ -163,6 +166,40 @@ fn reconcile_pending_body_frame_loops(run: &mut MobRun) {
         .insert("pending_body_frame_loop_membership".to_string(), new_set);
 }
 
+/// Rebuild the run-level active counters from persisted snapshots.
+///
+/// `active_node_count` counts running step nodes across all frames. Loop nodes
+/// are excluded because once a loop hands off to `LoopIterationMachine`, the
+/// run scheduler tracks the active body frame/step work instead of charging the
+/// parent loop node indefinitely.
+///
+/// `active_frame_count` counts body-frame grants that have not yet been released
+/// through `FrameTerminated`. A loop with `active_body_frame_id = Some(frame)`
+/// still owns that slot even if the body frame snapshot itself is already
+/// terminal and recovery must finish the handoff.
+fn reconcile_active_counts(run: &mut MobRun) {
+    let active_node_count = run
+        .frames
+        .values()
+        .map(count_running_step_nodes)
+        .sum::<u64>();
+    let active_frame_count = run
+        .loops
+        .values()
+        .filter_map(active_body_frame_id)
+        .filter(|frame_id| run.frames.contains_key(frame_id))
+        .count() as u64;
+
+    run.flow_state.fields.insert(
+        "active_node_count".to_string(),
+        KernelValue::U64(active_node_count),
+    );
+    run.flow_state.fields.insert(
+        "active_frame_count".to_string(),
+        KernelValue::U64(active_frame_count),
+    );
+}
+
 /// Return true if a loop snapshot represents a loop that is pending a body frame start.
 ///
 /// A loop is pending iff it is in Running phase with no active body frame
@@ -186,6 +223,33 @@ fn loop_is_pending_body_frame(loop_id: &LoopInstanceId, snap: &LoopSnapshot) -> 
         }
         _ => false,
     }
+}
+
+fn active_body_frame_id(snap: &LoopSnapshot) -> Option<FrameId> {
+    match snap.kernel_state.fields.get("active_body_frame_id") {
+        Some(KernelValue::String(frame_id)) => Some(FrameId::from(frame_id.as_str())),
+        _ => None,
+    }
+}
+
+fn count_running_step_nodes(snap: &FrameSnapshot) -> u64 {
+    let Some(KernelValue::Map(node_status)) = snap.kernel_state.fields.get("node_status") else {
+        return 0;
+    };
+    let Some(KernelValue::Map(node_kind)) = snap.kernel_state.fields.get("node_kind") else {
+        return 0;
+    };
+
+    node_status
+        .iter()
+        .filter(|(node_id, status)| {
+            matches!(status, KernelValue::NamedVariant { variant, .. } if variant == "Running")
+                && matches!(
+                    node_kind.get(*node_id),
+                    Some(KernelValue::NamedVariant { variant, .. }) if variant == "Step"
+                )
+        })
+        .count() as u64
 }
 
 /// Return true if the frame's `ready_queue` is present and non-empty.
@@ -234,7 +298,7 @@ mod tests {
             frames: BTreeMap::new(),
             loops: BTreeMap::new(),
             loop_iteration_ledger: vec![],
-            schema_version: 2,
+            schema_version: 4,
             root_step_outputs: indexmap::IndexMap::new(),
             loop_iteration_outputs: std::collections::BTreeMap::new(),
         }
@@ -287,23 +351,23 @@ mod tests {
     }
 
     #[test]
-    fn test_pre_v2_pending_run_is_accepted() {
-        // Pending runs (not active) are fine even at schema_version 0.
+    fn test_pre_v3_pending_run_is_accepted() {
+        // Pending runs (not active) are fine even before schema_version 3.
         let mut run = minimal_v2_run_running();
-        run.schema_version = 0;
+        run.schema_version = 2;
         run.status = MobRunStatus::Pending;
         assert!(reconcile_run_state(&mut run).is_ok());
     }
 
     #[test]
-    fn test_pre_v2_running_run_is_rejected() {
+    fn test_pre_v3_running_run_is_rejected() {
         let mut run = minimal_v2_run_running();
-        run.schema_version = 0;
+        run.schema_version = 2;
         run.status = MobRunStatus::Running;
         let result = reconcile_run_state(&mut run);
         assert!(
-            matches!(result, Err(RestoreIncompatible::PreV2Schema { .. })),
-            "Expected PreV2Schema, got: {result:?}"
+            matches!(result, Err(RestoreIncompatible::PreV3Schema { .. })),
+            "Expected PreV3Schema, got: {result:?}"
         );
     }
 
@@ -311,6 +375,96 @@ mod tests {
     fn test_empty_run_reconciles_ok() {
         let mut run = minimal_v2_run_running();
         assert!(reconcile_run_state(&mut run).is_ok());
+    }
+
+    #[test]
+    fn test_active_counts_reconcile_from_frames_and_loops() {
+        let mut run = minimal_v2_run_running();
+        run.frames.insert(
+            FrameId::from("root"),
+            FrameSnapshot {
+                kernel_state: KernelState {
+                    phase: "Running".into(),
+                    fields: BTreeMap::from([
+                        (
+                            "node_status".into(),
+                            KernelValue::Map(BTreeMap::from([(
+                                KernelValue::String("loop-node".into()),
+                                KernelValue::NamedVariant {
+                                    enum_name: "NodeRunStatus".into(),
+                                    variant: "Running".into(),
+                                },
+                            )])),
+                        ),
+                        (
+                            "node_kind".into(),
+                            KernelValue::Map(BTreeMap::from([(
+                                KernelValue::String("loop-node".into()),
+                                KernelValue::NamedVariant {
+                                    enum_name: "FlowNodeKind".into(),
+                                    variant: "Loop".into(),
+                                },
+                            )])),
+                        ),
+                        ("ready_queue".into(), KernelValue::Seq(vec![])),
+                    ]),
+                },
+            },
+        );
+        run.frames.insert(
+            FrameId::from("body-frame"),
+            FrameSnapshot {
+                kernel_state: KernelState {
+                    phase: "Running".into(),
+                    fields: BTreeMap::from([
+                        (
+                            "node_status".into(),
+                            KernelValue::Map(BTreeMap::from([(
+                                KernelValue::String("body-step".into()),
+                                KernelValue::NamedVariant {
+                                    enum_name: "NodeRunStatus".into(),
+                                    variant: "Running".into(),
+                                },
+                            )])),
+                        ),
+                        (
+                            "node_kind".into(),
+                            KernelValue::Map(BTreeMap::from([(
+                                KernelValue::String("body-step".into()),
+                                KernelValue::NamedVariant {
+                                    enum_name: "FlowNodeKind".into(),
+                                    variant: "Step".into(),
+                                },
+                            )])),
+                        ),
+                        ("ready_queue".into(), KernelValue::Seq(vec![])),
+                    ]),
+                },
+            },
+        );
+        run.loops.insert(
+            LoopInstanceId::from("loop-1"),
+            LoopSnapshot {
+                kernel_state: KernelState {
+                    phase: "Running".into(),
+                    fields: BTreeMap::from([(
+                        "active_body_frame_id".into(),
+                        KernelValue::String("body-frame".into()),
+                    )]),
+                },
+            },
+        );
+
+        reconcile_run_state(&mut run).expect("reconcile");
+
+        assert_eq!(
+            run.flow_state.fields.get("active_node_count"),
+            Some(&KernelValue::U64(1))
+        );
+        assert_eq!(
+            run.flow_state.fields.get("active_frame_count"),
+            Some(&KernelValue::U64(1))
+        );
     }
 
     #[test]

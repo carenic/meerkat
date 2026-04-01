@@ -287,7 +287,13 @@ impl MobRunStore for InMemoryMobRunStore {
             .get_mut(run_id)
             .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
         run.loops.insert(loop_instance_id.clone(), snapshot);
-        if let Some(entry) = ledger_entry {
+        if let Some(entry) = ledger_entry
+            && !run.loop_iteration_ledger.iter().any(|existing| {
+                existing.loop_instance_id == entry.loop_instance_id
+                    && existing.iteration == entry.iteration
+                    && existing.frame_id == entry.frame_id
+            })
+        {
             run.loop_iteration_ledger.push(entry);
         }
         Ok(())
@@ -452,6 +458,7 @@ impl MobRunStore for InMemoryMobRunStore {
         next_loop: LoopSnapshot,
         frame_id: &FrameId,
         initial_frame: FrameSnapshot,
+        ledger_entry: LoopIterationLedgerEntry,
         expected_run_state: &KernelState,
         next_run_state: KernelState,
     ) -> Result<bool, MobError> {
@@ -472,6 +479,13 @@ impl MobRunStore for InMemoryMobRunStore {
         run.flow_state = next_run_state;
         run.loops.insert(loop_instance_id.clone(), next_loop);
         run.frames.insert(frame_id.clone(), initial_frame);
+        if !run.loop_iteration_ledger.iter().any(|existing| {
+            existing.loop_instance_id == ledger_entry.loop_instance_id
+                && existing.iteration == ledger_entry.iteration
+                && existing.frame_id == ledger_entry.frame_id
+        }) {
+            run.loop_iteration_ledger.push(ledger_entry);
+        }
         Ok(true)
     }
 
@@ -672,7 +686,7 @@ mod tests {
             frames: std::collections::BTreeMap::new(),
             loops: std::collections::BTreeMap::new(),
             loop_iteration_ledger: Vec::new(),
-            schema_version: 2,
+            schema_version: 4,
             root_step_outputs: IndexMap::new(),
             loop_iteration_outputs: BTreeMap::new(),
         }

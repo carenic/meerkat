@@ -5,7 +5,7 @@
 
 use crate::definition::{DependencyMode, FlowNodeSpec, FrameSpec};
 use crate::error::MobError;
-use crate::ids::{FlowNodeId, FrameId, LoopId, RunId, StepId};
+use crate::ids::{FlowNodeId, FrameId, LoopId, LoopInstanceId, RunId, StepId};
 use crate::run::FrameSnapshot;
 use crate::store::MobRunStore;
 use meerkat_machine_kernels::generated::flow_frame;
@@ -99,6 +99,14 @@ pub trait FlowFrameMutator: sealed::Sealed {
 
     /// Mark a node as skipped. Returns `true` if the CAS succeeded.
     async fn skip_node(
+        &self,
+        run_id: &RunId,
+        frame_id: &FrameId,
+        node_id: &FlowNodeId,
+    ) -> Result<bool, MobError>;
+
+    /// Mark a node as canceled. Returns `true` if the CAS succeeded.
+    async fn cancel_node(
         &self,
         run_id: &RunId,
         frame_id: &FrameId,
@@ -202,9 +210,9 @@ impl FlowFrameMutator for FlowFrameKernel {
         let initial = flow_frame::initial_state()
             .map_err(|e| MobError::Internal(format!("flow_frame initial_state failed: {e:?}")))?;
         let ordered = topological_order(spec)?;
-        let start_input = build_start_frame_input(frame_id, spec, &ordered);
+        let start_input = build_start_root_frame_input(frame_id, spec, &ordered);
         let outcome = flow_frame::transition(&initial, &start_input)
-            .map_err(|e| MobError::Internal(format!("flow_frame StartFrame failed: {e:?}")))?;
+            .map_err(|e| MobError::Internal(format!("flow_frame StartRootFrame failed: {e:?}")))?;
         let snapshot = FrameSnapshot {
             kernel_state: outcome.next_state,
         };
@@ -398,8 +406,23 @@ impl FlowFrameMutator for FlowFrameKernel {
         frame_id: &FrameId,
     ) -> Result<bool, MobError> {
         let input = KernelInput {
-            variant: "TerminalizeCompleted".into(),
+            variant: "SealFrame".into(),
             fields: BTreeMap::new(),
+        };
+        self.transition_frame(run_id, frame_id, input, 5)
+            .await
+            .map(|_| true)
+    }
+
+    async fn cancel_node(
+        &self,
+        run_id: &RunId,
+        frame_id: &FrameId,
+        node_id: &FlowNodeId,
+    ) -> Result<bool, MobError> {
+        let input = KernelInput {
+            variant: "CancelNode".into(),
+            fields: BTreeMap::from([("node_id".into(), Self::node_val(node_id))]),
         };
         self.transition_frame(run_id, frame_id, input, 5)
             .await
@@ -409,12 +432,11 @@ impl FlowFrameMutator for FlowFrameKernel {
 
 // ─── Helpers (moved from flow_frame_engine.rs) ─────────────────────────────
 
-/// Build the `StartFrame` KernelInput from a `FrameSpec` and its topological order.
-pub(super) fn build_start_frame_input(
+fn build_frame_start_fields(
     frame_id: &FrameId,
     spec: &FrameSpec,
     ordered: &[FlowNodeId],
-) -> KernelInput {
+) -> BTreeMap<String, KernelValue> {
     let ordered_kv: Vec<KernelValue> = ordered
         .iter()
         .map(|n| KernelValue::String(n.to_string()))
@@ -481,20 +503,49 @@ pub(super) fn build_start_frame_input(
         }
     }
 
+    BTreeMap::from([
+        ("frame_id".into(), KernelValue::String(frame_id.to_string())),
+        ("tracked_nodes".into(), KernelValue::Set(tracked)),
+        ("ordered_nodes".into(), KernelValue::Seq(ordered_kv)),
+        ("node_kind".into(), KernelValue::Map(node_kind)),
+        ("node_dependencies".into(), KernelValue::Map(node_deps)),
+        (
+            "node_dependency_modes".into(),
+            KernelValue::Map(node_dep_modes),
+        ),
+        ("node_branches".into(), KernelValue::Map(node_branches)),
+    ])
+}
+
+/// Build the `StartRootFrame` KernelInput from a `FrameSpec` and its topological order.
+pub(crate) fn build_start_root_frame_input(
+    frame_id: &FrameId,
+    spec: &FrameSpec,
+    ordered: &[FlowNodeId],
+) -> KernelInput {
     KernelInput {
-        variant: "StartFrame".into(),
-        fields: BTreeMap::from([
-            ("frame_id".into(), KernelValue::String(frame_id.to_string())),
-            ("tracked_nodes".into(), KernelValue::Set(tracked)),
-            ("ordered_nodes".into(), KernelValue::Seq(ordered_kv)),
-            ("node_kind".into(), KernelValue::Map(node_kind)),
-            ("node_dependencies".into(), KernelValue::Map(node_deps)),
-            (
-                "node_dependency_modes".into(),
-                KernelValue::Map(node_dep_modes),
-            ),
-            ("node_branches".into(), KernelValue::Map(node_branches)),
-        ]),
+        variant: "StartRootFrame".into(),
+        fields: build_frame_start_fields(frame_id, spec, ordered),
+    }
+}
+
+/// Build the `StartBodyFrame` KernelInput from a `FrameSpec` and its topological order.
+pub(crate) fn build_start_body_frame_input(
+    frame_id: &FrameId,
+    loop_instance_id: &LoopInstanceId,
+    iteration: u64,
+    spec: &FrameSpec,
+    ordered: &[FlowNodeId],
+) -> KernelInput {
+    let mut fields = build_frame_start_fields(frame_id, spec, ordered);
+    fields.insert(
+        "loop_instance_id".into(),
+        KernelValue::String(loop_instance_id.to_string()),
+    );
+    fields.insert("iteration".into(), KernelValue::U64(iteration));
+    KernelInput {
+        variant: "StartBodyFrame".into(),
+        fields,
     }
 }
 
@@ -510,7 +561,7 @@ fn dep_mode_kv(mode: &DependencyMode) -> KernelValue {
 }
 
 /// Topological sort of a `FrameSpec` (Kahn's algorithm).
-pub(super) fn topological_order(spec: &FrameSpec) -> Result<Vec<FlowNodeId>, MobError> {
+pub(crate) fn topological_order(spec: &FrameSpec) -> Result<Vec<FlowNodeId>, MobError> {
     let mut in_degree: BTreeMap<FlowNodeId, usize> = BTreeMap::new();
     let mut outgoing: BTreeMap<FlowNodeId, Vec<FlowNodeId>> = BTreeMap::new();
 

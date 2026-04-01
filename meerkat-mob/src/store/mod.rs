@@ -141,10 +141,14 @@ pub trait MobRunStore: Send + Sync {
     ) -> Result<(), MobStoreError>;
 
     /// Upsert a loop snapshot. Creates or overwrites the entry for `loop_instance_id`
-    /// in `run.loops` and optionally appends a `LoopIterationLedgerEntry`.
+    /// in `run.loops` and optionally records a `LoopIterationLedgerEntry`.
     ///
     /// Used by the sequential `FlowFrameEngine` to persist loop state so that
     /// `reconcile_run_state` can reconstruct in-progress loops after a crash.
+    ///
+    /// Implementations must treat `ledger_entry` as idempotent by logical
+    /// iteration identity. Replaying the same `(loop_instance_id, iteration, frame_id)`
+    /// on resume must not append a duplicate row.
     async fn upsert_loop_snapshot(
         &self,
         run_id: &RunId,
@@ -253,6 +257,7 @@ pub trait MobRunStore: Send + Sync {
         next_loop: LoopSnapshot,
         frame_id: &FrameId,
         initial_frame: FrameSnapshot,
+        ledger_entry: LoopIterationLedgerEntry,
         expected_run_state: &KernelState,
         next_run_state: KernelState,
     ) -> Result<bool, MobStoreError>;

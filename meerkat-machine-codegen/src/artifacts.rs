@@ -323,6 +323,52 @@ pub fn render_composition_contract_markdown(
     }
     pushln!(&mut out);
 
+    pushln!(&mut out, "## Target Selectors");
+    if schema.route_target_selectors.is_empty() {
+        pushln!(&mut out, "- `(none)`");
+    } else {
+        for selector in &schema.route_target_selectors {
+            pushln!(
+                &mut out,
+                "- `{}` selects `{}` from `{:?}`",
+                selector.route_name,
+                selector.selector_field,
+                selector.source
+            );
+        }
+    }
+    pushln!(&mut out);
+
+    pushln!(&mut out, "## Driver");
+    if let Some(driver) = &schema.driver {
+        pushln!(
+            &mut out,
+            "- `{}` in `{}`",
+            driver.driver_type,
+            driver.module_path
+        );
+    } else {
+        pushln!(&mut out, "- `(none)`");
+    }
+    pushln!(&mut out);
+
+    pushln!(&mut out, "## Transaction Plans");
+    if schema.transaction_plans.is_empty() {
+        pushln!(&mut out, "- `(none)`");
+    } else {
+        for plan in &schema.transaction_plans {
+            pushln!(
+                &mut out,
+                "- `{}` via `{}` / `{}` — {}",
+                plan.name,
+                plan.trigger,
+                plan.store_primitive,
+                plan.description
+            );
+        }
+    }
+    pushln!(&mut out);
+
     pushln!(&mut out, "## Scheduler Rules");
     if schema.scheduler_rules.is_empty() {
         pushln!(&mut out, "- `(none)`");
@@ -760,6 +806,63 @@ pub fn render_composition_semantic_model(schema: &CompositionSchema) -> String {
         Ok(compiler) => compiler.render().unwrap_or_default(),
         Err(_) => String::new(),
     }
+}
+
+pub fn render_composition_driver(schema: &CompositionSchema) -> Option<String> {
+    let driver = schema.driver.as_ref()?;
+    if schema.name != "flow_frame_loop" {
+        return None;
+    }
+
+    let imports = driver.required_imports.join("\n");
+    let selector_docs = if schema.route_target_selectors.is_empty() {
+        "// (none)".to_string()
+    } else {
+        schema
+            .route_target_selectors
+            .iter()
+            .map(|selector| {
+                let source = match &selector.source {
+                    RouteBindingSource::Field { from_field, .. } => {
+                        format!("effect/state field `{from_field}`")
+                    }
+                    RouteBindingSource::Literal(expr) => format!("literal `{expr:?}`"),
+                    RouteBindingSource::OwnerProvided => "owner-provided value".into(),
+                };
+                format!(
+                    "// - `{}` selects `{}` from {}",
+                    selector.route_name, selector.selector_field, source
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let transaction_plan_docs = if schema.transaction_plans.is_empty() {
+        "// (none)".to_string()
+    } else {
+        schema
+            .transaction_plans
+            .iter()
+            .map(|plan| {
+                format!(
+                    "// - `{}` via `{}` (`{}`): {}",
+                    plan.name, plan.trigger, plan.store_primitive, plan.description
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    Some(
+        include_str!("templates/flow_frame_loop_driver.rs.tmpl")
+            .replace("{{IMPORTS}}", &imports)
+            .replace("{{SELECTOR_DOCS}}", &selector_docs)
+            .replace("{{TRANSACTION_PLAN_DOCS}}", &transaction_plan_docs)
+            .replace("{{DRIVER_TYPE}}", &driver.driver_type)
+            .replace("{{STORE_PLAN_TYPE}}", &driver.store_plan_type)
+            .replace("{{WORK_TYPE}}", &driver.work_type)
+            .replace("{{DECISION_TYPE}}", &driver.decision_type),
+    )
 }
 
 pub fn render_machine_semantic_model(schema: &MachineSchema) -> String {

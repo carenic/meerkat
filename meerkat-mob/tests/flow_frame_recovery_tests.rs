@@ -29,7 +29,7 @@ fn minimal_run_with_schema_v2() -> MobRun {
         frames: BTreeMap::new(),
         loops: BTreeMap::new(),
         loop_iteration_ledger: vec![],
-        schema_version: 2,
+        schema_version: 4,
         root_step_outputs: IndexMap::new(),
         loop_iteration_outputs: BTreeMap::new(),
     }
@@ -269,31 +269,31 @@ fn test_recovery_invalid_frame_invariant() {
     );
 }
 
-// ─── REQ-13: Pre-v2 runs are rejected with typed hard-cut error ──────────────
+// ─── REQ-13: Pre-v3 runs are rejected with typed hard-cut error ──────────────
 
-/// REQ-13: Pre-v2 pending/running runs rejected with a typed hard-cut error.
+/// REQ-13: Active pre-v3 frame runs are rejected with a typed hard-cut error.
 #[test]
-fn test_hard_cut_rejects_pre_v2_run() {
+fn test_hard_cut_rejects_pre_v3_run() {
     let mut run = minimal_run_with_schema_v2();
-    run.schema_version = 0; // Simulate a legacy run.
-    run.status = MobRunStatus::Running; // Active pre-v2 run.
+    run.schema_version = 2; // Simulate a pre-descriptor frame run.
+    run.status = MobRunStatus::Running; // Active pre-v3 run.
 
     let result = reconcile_run_state(&mut run);
     assert!(
-        matches!(result, Err(RestoreIncompatible::PreV2Schema { .. })),
-        "Pre-v2 run should be rejected, got: {result:?}"
+        matches!(result, Err(RestoreIncompatible::PreV3Schema { .. })),
+        "Pre-v3 run should be rejected, got: {result:?}"
     );
 }
 
-/// REQ-13: A pre-v2 run in Pending state is accepted (not yet active).
+/// REQ-13: A pre-v3 run in Pending state is accepted (not yet active).
 #[test]
-fn test_pre_v2_pending_run_is_accepted() {
+fn test_pre_v3_pending_run_is_accepted() {
     let mut run = minimal_run_with_schema_v2();
-    run.schema_version = 0;
+    run.schema_version = 2;
     run.status = MobRunStatus::Pending;
 
     let result = reconcile_run_state(&mut run);
-    assert!(result.is_ok(), "Pending pre-v2 run should be accepted");
+    assert!(result.is_ok(), "Pending pre-v3 run should be accepted");
 }
 
 // ─── Recovery: pending_body_frame_loops reconciliation ─────────────────────

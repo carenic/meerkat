@@ -40,6 +40,7 @@ pub mod build;
 pub mod definition;
 pub mod error;
 pub mod event;
+mod generated;
 pub mod ids;
 pub mod launch;
 pub mod profile;

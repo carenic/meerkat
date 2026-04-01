@@ -348,6 +348,28 @@ impl SpecValidator {
                 &mut seen_step_ids,
                 diagnostics,
             );
+
+            let omitted_steps: Vec<_> = flow
+                .steps
+                .keys()
+                .filter(|step_id| !seen_step_ids.contains(*step_id))
+                .cloned()
+                .collect();
+            if !omitted_steps.is_empty() {
+                diagnostics.push(Diagnostic {
+                    code: DiagnosticCode::FlowUnknownStep,
+                    message: format!(
+                        "root frame for flow '{flow_name}' does not reference declared flow steps: {}",
+                        omitted_steps
+                            .iter()
+                            .map(std::string::ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    location: Some(format!("flows.{flow_name}.root")),
+                    severity: DiagnosticSeverity::Error,
+                });
+            }
         }
     }
 }
@@ -711,6 +733,47 @@ mod tests {
                 .iter()
                 .all(|d| d.code != DiagnosticCode::TopologyUnknownRole),
             "wildcard topology roles should bypass unknown-role diagnostics"
+        );
+    }
+
+    #[test]
+    fn test_root_frame_must_reference_all_declared_steps() {
+        use crate::definition::{FlowNodeSpec, FrameSpec, FrameStepSpec};
+        use crate::ids::FlowNodeId;
+
+        let mut def = base_definition();
+        let mut steps = IndexMap::new();
+        steps.insert(StepId::from("included"), step("worker", "included"));
+        steps.insert(StepId::from("omitted"), step("worker", "omitted"));
+
+        let mut root_nodes = IndexMap::new();
+        root_nodes.insert(
+            FlowNodeId::from("included-node"),
+            FlowNodeSpec::Step(FrameStepSpec {
+                step_id: StepId::from("included"),
+                depends_on: Vec::new(),
+                depends_on_mode: DependencyMode::All,
+                branch: None,
+            }),
+        );
+
+        def.flows.insert(
+            FlowId::from("flow"),
+            FlowSpec {
+                description: None,
+                steps,
+                root: Some(FrameSpec { nodes: root_nodes }),
+            },
+        );
+
+        let diagnostics = SpecValidator::validate(&def);
+        assert!(
+            diagnostics.iter().any(|d| {
+                d.code == DiagnosticCode::FlowUnknownStep
+                    && d.message.contains("does not reference declared flow steps")
+                    && d.message.contains("omitted")
+            }),
+            "expected validator to reject root frames that omit declared steps"
         );
     }
 }

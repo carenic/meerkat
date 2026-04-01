@@ -4,9 +4,10 @@ use super::{
     comms_drain_lifecycle::comms_drain_lifecycle_machine,
     compositions::{
         comms_drain_lifecycle_composition, continuation_runtime_bundle_composition,
-        external_tool_bundle_composition, mob_bundle_composition, ops_peer_bundle_composition,
-        ops_runtime_bundle_composition, peer_runtime_bundle_composition,
-        runtime_pipeline_composition, surface_event_runtime_bundle_composition,
+        external_tool_bundle_composition, flow_frame_loop_composition, mob_bundle_composition,
+        ops_peer_bundle_composition, ops_runtime_bundle_composition,
+        peer_runtime_bundle_composition, runtime_pipeline_composition,
+        surface_event_runtime_bundle_composition,
     },
     external_tool_surface::external_tool_surface_machine,
     flow_frame::flow_frame_machine,
@@ -1090,6 +1091,41 @@ pub fn canonical_composition_coverage_manifests() -> Vec<CompositionCoverageMani
                 scenario(
                     "wasm-mob-examples",
                     "browser mob examples continue to fit the canonical mob/comms/runtime model",
+                ),
+            ],
+        ),
+        composition_manifest_from_schema(
+            &flow_frame_loop_composition(),
+            &[
+                anchor(
+                    "flow_frame_engine",
+                    "meerkat-mob/src/runtime/flow_frame_engine.rs",
+                    "async host that executes generated frame/loop driver plans and external step/until work",
+                ),
+                anchor(
+                    "flow_frame_loop_driver",
+                    "meerkat-mob/src/generated/flow_frame_loop_driver.rs",
+                    "generated composition driver that owns frame/loop route closure and transaction bundle selection",
+                ),
+                anchor(
+                    "loop_until_protocol",
+                    "meerkat-mob/src/generated/protocol_flow_loop_until_evaluation.rs",
+                    "generated until-evaluation handoff helper for loop completion feedback",
+                ),
+                anchor(
+                    "loop_iteration_authority",
+                    "meerkat-mob/src/runtime/loop_iteration_authority.rs",
+                    "loop iteration authority that closes until-evaluation feedback against persisted loop snapshots",
+                ),
+            ],
+            &[
+                scenario(
+                    "body-frame-terminal-routing",
+                    "body-frame terminal effects advance loop lifecycle and project the loop terminal outcome back into the parent frame node",
+                ),
+                scenario(
+                    "until-evaluation-feedback",
+                    "EvaluateUntilCondition is realized by runtime-owned condition evaluation and closed by typed feedback",
                 ),
             ],
         ),

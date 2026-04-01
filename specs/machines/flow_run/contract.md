@@ -2,7 +2,7 @@
 
 _Generated from the Rust machine catalog. Do not edit by hand._
 
-- Version: `2`
+- Version: `4`
 - Rust owner: `meerkat-mob` / `generated::flow_run`
 
 ## State
@@ -37,8 +37,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `max_frame_depth`: `u32`
 - `last_granted_frame`: `FrameId`
 - `last_granted_loop`: `LoopInstanceId`
-- `frames`: `Map<FrameId, FrameSnapshotRef>`
-- `loops`: `Map<LoopInstanceId, LoopSnapshotRef>`
 
 ## Inputs
 - `CreateRun`(step_ids: Seq<StepId>, ordered_steps: Seq<StepId>, step_has_conditions: Map<StepId, Bool>, step_dependencies: Map<StepId, Seq<StepId>>, step_dependency_modes: Map<StepId, DependencyMode>, step_branches: Map<StepId, Option<BranchId>>, step_collection_policies: Map<StepId, CollectionPolicyKind>, step_quorum_thresholds: Map<StepId, u32>, escalation_threshold: u32, max_step_retries: u32, max_active_nodes: u32, max_active_frames: u32, max_frame_depth: u32)
@@ -56,15 +54,12 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RecordTargetTerminalFailure`(step_id: StepId)
 - `RecordTargetCanceled`(step_id: StepId, target_id: MeerkatId)
 - `RecordTargetFailure`(step_id: StepId, target_id: MeerkatId, retry_key: String)
-- `RegisterFrame`(frame_id: FrameId)
-- `RegisterLoop`(loop_instance_id: LoopInstanceId)
 - `RegisterReadyFrame`(frame_id: FrameId)
 - `PumpNodeScheduler`
 - `RegisterPendingBodyFrame`(loop_instance_id: LoopInstanceId, depth: u32)
 - `PumpFrameScheduler`
 - `NodeExecutionReleased`(frame_id: FrameId)
-- `FrameTerminated`(frame_id: FrameId, status: FlowFrameStatus, released_count: u32)
-- `LoopTerminated`(loop_instance_id: LoopInstanceId, outcome: LoopOutcome)
+- `FrameTerminated`(frame_id: FrameId)
 - `TerminalizeCompleted`
 - `TerminalizeFailed`
 - `TerminalizeCanceled`
@@ -270,16 +265,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `ProjectTargetFailure`, `AppendFailureLedger`
 - To: `Running`
 
-### `RegisterFrame`
-- From: `Running`
-- On: `RegisterFrame`(frame_id)
-- To: `Running`
-
-### `RegisterLoop`
-- From: `Running`
-- On: `RegisterLoop`(loop_instance_id)
-- To: `Running`
-
 ### `RegisterReadyFrame`
 - From: `Running`
 - On: `RegisterReadyFrame`(frame_id)
@@ -314,18 +299,15 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ### `NodeExecutionReleased`
 - From: `Running`
 - On: `NodeExecutionReleased`(frame_id)
+- Guards:
+  - `at_least_one_active_node`
 - To: `Running`
 
 ### `FrameTerminated`
 - From: `Running`
-- On: `FrameTerminated`(frame_id, status, released_count)
+- On: `FrameTerminated`(frame_id)
 - Guards:
-  - `sufficient_active_nodes`
-- To: `Running`
-
-### `LoopTerminated`
-- From: `Running`
-- On: `LoopTerminated`(loop_instance_id, outcome)
+  - `at_least_one_active_frame`
 - To: `Running`
 
 ### `TerminalizeCompleted`

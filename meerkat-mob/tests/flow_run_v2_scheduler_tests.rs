@@ -180,9 +180,9 @@ fn test_pump_node_scheduler_increments_active_node_count() {
     );
 }
 
-/// REQ-06: FrameTerminated adjusts active_node_count by released_count and active_frame_count by 1
+/// REQ-06: node-slot release and frame-slot release are separate machine facts.
 #[test]
-fn test_frame_terminated_adjusts_counters() {
+fn test_node_and_frame_release_adjust_counters_independently() {
     let state = build_running_state();
 
     // Set up: register and pump node scheduler (active_node_count=1)
@@ -222,10 +222,31 @@ fn test_frame_terminated_adjusts_counters() {
     assert_eq!(
         active_nodes,
         Some(u64_val(1)),
-        "active_node_count should be 1 before FrameTerminated"
+        "active_node_count should be 1 before NodeExecutionReleased"
     );
 
-    // FrameTerminated with released_count=1 (matches active_node_count)
+    let release = KernelInput {
+        variant: "NodeExecutionReleased".into(),
+        fields: BTreeMap::from([("frame_id".into(), frame_id("frame-1"))]),
+    };
+    let released_state = flow_run::transition(&state, &release)
+        .expect("NodeExecutionReleased")
+        .next_state;
+
+    let active_nodes = released_state.fields.get("active_node_count").cloned();
+    let active_frames = released_state.fields.get("active_frame_count").cloned();
+
+    assert_eq!(
+        active_nodes,
+        Some(u64_val(0)),
+        "active_node_count should be 0 after NodeExecutionReleased"
+    );
+    assert_eq!(
+        active_frames,
+        Some(u64_val(1)),
+        "active_frame_count should remain 1 until FrameTerminated"
+    );
+
     let term = KernelInput {
         variant: "FrameTerminated".into(),
         fields: BTreeMap::from([
@@ -234,10 +255,9 @@ fn test_frame_terminated_adjusts_counters() {
                 "status".into(),
                 named_variant("FlowFrameStatus", "Completed"),
             ),
-            ("released_count".into(), u64_val(1)),
         ]),
     };
-    let outcome = flow_run::transition(&state, &term).expect("FrameTerminated");
+    let outcome = flow_run::transition(&released_state, &term).expect("FrameTerminated");
 
     let active_nodes = outcome.next_state.fields.get("active_node_count").cloned();
     let active_frames = outcome.next_state.fields.get("active_frame_count").cloned();
@@ -245,12 +265,12 @@ fn test_frame_terminated_adjusts_counters() {
     assert_eq!(
         active_nodes,
         Some(u64_val(0)),
-        "active_node_count should be 0 after FrameTerminated (1 - 1 = 0)"
+        "active_node_count should stay at 0 after FrameTerminated"
     );
     assert_eq!(
         active_frames,
         Some(u64_val(0)),
-        "active_frame_count should decrement by 1 after FrameTerminated (1 - 1 = 0)"
+        "active_frame_count should decrement by 1 after FrameTerminated"
     );
 }
 

@@ -13,12 +13,14 @@ use meerkat_mob::definition::{
 };
 use meerkat_mob::error::MobError;
 use meerkat_mob::ids::{FlowNodeId, FrameId, LoopId, RunId, StepId};
-use meerkat_mob::run::{FlowContext, MobRun};
+use meerkat_mob::run::{FlowContext, LoopSnapshot, MobRun};
+use meerkat_mob::runtime::FlowFrameKernel;
 use meerkat_mob::runtime::flow_frame_engine::{
     FlowFrameEngine, FrameStepExecutor, FrameStepResult,
 };
 use meerkat_mob::store::MobRunStore as _;
-use meerkat_mob::{FlowId, InMemoryMobRunStore, MobId};
+use meerkat_mob::{FlowFrameMutator, FlowId, InMemoryMobRunStore, MobId};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 // ─── Scripted executor ───────────────────────────────────────────────────────
@@ -78,6 +80,119 @@ impl FrameStepExecutor for ScriptedStepExecutor {
         let out = script.output.clone();
         *idx += 1;
         Ok(FrameStepResult::Completed(out))
+    }
+}
+
+/// A scripted executor that matches step calls by node id instead of call order.
+struct AnyOrderScriptedStepExecutor {
+    remaining: Mutex<Vec<StepScript>>,
+}
+
+impl AnyOrderScriptedStepExecutor {
+    fn new(scripts: Vec<StepScript>) -> Self {
+        Self {
+            remaining: Mutex::new(scripts),
+        }
+    }
+
+    fn assert_all_consumed(&self) {
+        let remaining = self.remaining.lock().unwrap();
+        assert!(
+            remaining.is_empty(),
+            "Not all scripted steps consumed; remaining nodes: {:?}",
+            remaining
+                .iter()
+                .map(|script| script.node_id.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[async_trait]
+impl FrameStepExecutor for AnyOrderScriptedStepExecutor {
+    async fn execute_step(
+        &self,
+        _run_id: &RunId,
+        _frame_id: &FrameId,
+        node_id: &FlowNodeId,
+        _step_id: &StepId,
+        _context: &FlowContext,
+    ) -> Result<FrameStepResult, MobError> {
+        let mut remaining = self.remaining.lock().unwrap();
+        let Some(index) = remaining
+            .iter()
+            .position(|script| script.node_id == node_id.to_string())
+        else {
+            panic!(
+                "no any-order script for node_id={node_id}; remaining={:?}",
+                remaining
+                    .iter()
+                    .map(|script| script.node_id.as_str())
+                    .collect::<Vec<_>>()
+            );
+        };
+        let script = remaining.remove(index);
+        Ok(FrameStepResult::Completed(script.output))
+    }
+}
+
+/// Scripted executor for loop-body context regressions where later body steps
+/// must observe outputs from the current iteration, not the previous one.
+struct LoopBodyContextCheckingExecutor {
+    call_index: Mutex<usize>,
+}
+
+impl LoopBodyContextCheckingExecutor {
+    fn new() -> Self {
+        Self {
+            call_index: Mutex::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl FrameStepExecutor for LoopBodyContextCheckingExecutor {
+    async fn execute_step(
+        &self,
+        _run_id: &RunId,
+        _frame_id: &FrameId,
+        node_id: &FlowNodeId,
+        _step_id: &StepId,
+        context: &FlowContext,
+    ) -> Result<FrameStepResult, MobError> {
+        let mut idx = self.call_index.lock().unwrap();
+        let call = *idx;
+        *idx += 1;
+
+        match (call, node_id.as_str()) {
+            (0, "source-node") => Ok(FrameStepResult::Completed(serde_json::json!({
+                "value": "old"
+            }))),
+            (1, "check-node") => {
+                assert_eq!(
+                    context.step_outputs.get(&StepId::from("source")),
+                    Some(&serde_json::json!({"value": "old"})),
+                    "first-iteration checker must see first-iteration source output"
+                );
+                Ok(FrameStepResult::Completed(
+                    serde_json::json!({"done": false}),
+                ))
+            }
+            (2, "source-node") => Ok(FrameStepResult::Completed(serde_json::json!({
+                "value": "new"
+            }))),
+            (3, "check-node") => {
+                assert_eq!(
+                    context.step_outputs.get(&StepId::from("source")),
+                    Some(&serde_json::json!({"value": "new"})),
+                    "second-iteration checker must see current-iteration source output"
+                );
+                Ok(FrameStepResult::Completed(
+                    serde_json::json!({"done": true}),
+                ))
+            }
+            _ => panic!("unexpected loop body executor call #{call} for node '{node_id}'"),
+        }
     }
 }
 
@@ -235,15 +350,15 @@ async fn test_reviewer_implementer_loop_inside_larger_dag() {
 
     // All 3 root step nodes should have output recorded.
     assert!(
-        outputs.contains_key(&StepId::from("setup")),
+        outputs.outputs.contains_key(&StepId::from("setup")),
         "setup output missing"
     );
     assert!(
-        outputs.contains_key(&StepId::from("finalize")),
+        outputs.outputs.contains_key(&StepId::from("finalize")),
         "finalize output missing"
     );
     assert_eq!(
-        outputs[&StepId::from("finalize")],
+        outputs.outputs[&StepId::from("finalize")],
         serde_json::json!({"complete": true})
     );
 
@@ -357,9 +472,9 @@ async fn test_nested_loop() {
 /// E2E-03: Sibling steps in the root frame complete alongside a loop.
 ///
 /// Frame: [step-a (no deps), loop-L (no deps), step-b (no deps)]
-/// All three nodes start as roots. In the sequential executor:
-/// step-a, loop-L (1 iter of body-step), step-b all complete.
-/// Verify all 3 nodes complete by checking outputs.
+/// All three nodes start as roots. Under the concurrent scheduler, the sibling
+/// step and the loop body may interleave in either order. Verify that all 3
+/// leaf steps complete without assuming a specific interleaving.
 #[tokio::test]
 async fn test_sibling_advances_during_loop() {
     let loop_body = FrameSpec {
@@ -417,9 +532,7 @@ async fn test_sibling_advances_during_loop() {
         },
     };
 
-    // In the sequential executor, nodes are admitted in topological order.
-    // All three nodes have no deps and will be admitted in insertion order.
-    let executor = Arc::new(ScriptedStepExecutor::new(vec![
+    let executor = Arc::new(AnyOrderScriptedStepExecutor::new(vec![
         StepScript {
             node_id: "step-a-node".into(),
             output: serde_json::json!({"a": 1}),
@@ -446,19 +559,19 @@ async fn test_sibling_advances_during_loop() {
     // All three leaf step nodes (step-a, step-b, and the loop body's body-step)
     // should have completed. step-a and step-b are directly in frame_outputs.
     assert!(
-        outputs.contains_key(&StepId::from("step-a")),
+        outputs.outputs.contains_key(&StepId::from("step-a")),
         "step-a output missing; outputs: {outputs:?}"
     );
     assert!(
-        outputs.contains_key(&StepId::from("step-b")),
+        outputs.outputs.contains_key(&StepId::from("step-b")),
         "step-b output missing; outputs: {outputs:?}"
     );
     assert_eq!(
-        outputs[&StepId::from("step-a")],
+        outputs.outputs[&StepId::from("step-a")],
         serde_json::json!({"a": 1})
     );
     assert_eq!(
-        outputs[&StepId::from("step-b")],
+        outputs.outputs[&StepId::from("step-b")],
         serde_json::json!({"b": 2})
     );
 
@@ -556,17 +669,86 @@ async fn test_loop_last_iteration_outputs_visible_in_step_outputs() {
 
     // The finalize step must have run and produced its output.
     assert_eq!(
-        outputs.get(&StepId::from("finalize")),
+        outputs.outputs.get(&StepId::from("finalize")),
         Some(&serde_json::json!({"done": true})),
         "finalize must complete — it can only run if loop outputs were visible to context"
     );
     // The last loop body's review output must also be in the frame outputs.
     assert_eq!(
-        outputs.get(&StepId::from("review")),
+        outputs.outputs.get(&StepId::from("review")),
         Some(&serde_json::json!({"passes": true})),
         "last iteration review output must be visible at steps.review"
     );
     executor.assert_all_consumed();
+}
+
+/// [P1] Later steps in a loop body must observe the current iteration's
+/// outputs, overriding the prior-iteration projection in FlowContext.
+#[tokio::test]
+async fn test_loop_body_steps_see_current_iteration_outputs() {
+    let executor = Arc::new(LoopBodyContextCheckingExecutor::new());
+    let (run_id, _store, engine) = setup_engine(executor).await;
+
+    let body = FrameSpec {
+        nodes: IndexMap::from([
+            (
+                FlowNodeId::from("source-node"),
+                FlowNodeSpec::Step(FrameStepSpec {
+                    step_id: StepId::from("source"),
+                    depends_on: vec![],
+                    depends_on_mode: DependencyMode::All,
+                    branch: None,
+                }),
+            ),
+            (
+                FlowNodeId::from("check-node"),
+                FlowNodeSpec::Step(FrameStepSpec {
+                    step_id: StepId::from("check"),
+                    depends_on: vec![FlowNodeId::from("source-node")],
+                    depends_on_mode: DependencyMode::All,
+                    branch: None,
+                }),
+            ),
+        ]),
+    };
+
+    let spec = FrameSpec {
+        nodes: IndexMap::from([(
+            FlowNodeId::from("loop-node"),
+            FlowNodeSpec::RepeatUntil(RepeatUntilSpec {
+                loop_id: LoopId::from("body-loop"),
+                depends_on: vec![],
+                depends_on_mode: DependencyMode::All,
+                body,
+                until: ConditionExpr::Eq {
+                    path: "steps.check.done".into(),
+                    value: serde_json::json!(true),
+                },
+                max_iterations: 5,
+            }),
+        )]),
+    };
+
+    let outputs = engine
+        .execute_frame(
+            &run_id,
+            &FrameId::from("root"),
+            &spec,
+            &empty_context(run_id.clone()),
+        )
+        .await
+        .expect("execute_frame");
+
+    assert_eq!(
+        outputs.outputs.get(&StepId::from("source")),
+        Some(&serde_json::json!({"value": "new"})),
+        "root outputs should expose the last completed loop iteration"
+    );
+    assert_eq!(
+        outputs.outputs.get(&StepId::from("check")),
+        Some(&serde_json::json!({"done": true})),
+        "loop should exit after the second iteration's checker succeeds"
+    );
 }
 
 /// [P1] A failing step must be retried up to max_step_retries before giving up.
@@ -733,12 +915,22 @@ async fn test_conditional_step_skipped_when_condition_false() {
 
     // setup ran, skipped did not produce an output (Skipped has no output)
     assert!(
-        outputs.contains_key(&StepId::from("setup")),
+        outputs.outputs.contains_key(&StepId::from("setup")),
         "setup step must have run"
     );
     assert!(
-        !outputs.contains_key(&StepId::from("skipped")),
+        !outputs.outputs.contains_key(&StepId::from("skipped")),
         "skipped step must not appear in outputs"
+    );
+    assert_eq!(
+        outputs.step_statuses.get(&StepId::from("setup")),
+        Some(&meerkat_mob::run::StepRunStatus::Completed),
+        "frame outcome should carry canonical completed status for executed steps"
+    );
+    assert_eq!(
+        outputs.step_statuses.get(&StepId::from("skipped")),
+        Some(&meerkat_mob::run::StepRunStatus::Skipped),
+        "frame outcome should carry canonical skipped status for skipped steps"
     );
     inner.assert_all_consumed();
 }
@@ -764,7 +956,10 @@ async fn test_empty_frame_terminalize() {
         .execute_frame(&run_id, &frame_id, &spec, &context)
         .await
         .expect("empty frame must succeed");
-    assert!(outputs.is_empty(), "empty frame produces no outputs");
+    assert!(
+        outputs.outputs.is_empty(),
+        "empty frame produces no outputs"
+    );
 
     // The persisted frame snapshot must be Completed, not Running.
     let run = store
@@ -776,6 +971,405 @@ async fn test_empty_frame_terminalize() {
     assert_eq!(
         frame_snap.kernel_state.phase, "Completed",
         "empty frame must terminalize to Completed in the store"
+    );
+}
+
+/// Empty loop body frames must be processed immediately instead of stalling the coordinator.
+#[tokio::test]
+async fn test_empty_loop_body_frame_does_not_stall() {
+    let executor = Arc::new(ScriptedStepExecutor::new(vec![]));
+    let (run_id, store, engine) = setup_engine(executor).await;
+
+    let spec = FrameSpec {
+        nodes: {
+            let mut nodes = IndexMap::new();
+            nodes.insert(
+                FlowNodeId::from("loop-node"),
+                FlowNodeSpec::RepeatUntil(RepeatUntilSpec {
+                    loop_id: LoopId::from("empty-loop"),
+                    depends_on: vec![],
+                    depends_on_mode: DependencyMode::All,
+                    body: FrameSpec {
+                        nodes: IndexMap::new(),
+                    },
+                    until: ConditionExpr::Eq {
+                        path: "params.done".into(),
+                        value: serde_json::json!(true),
+                    },
+                    max_iterations: 1,
+                }),
+            );
+            nodes
+        },
+    };
+    let context = FlowContext {
+        run_id: run_id.clone(),
+        activation_params: serde_json::json!({ "done": true }),
+        step_outputs: IndexMap::new(),
+        loop_outputs: IndexMap::new(),
+    };
+
+    let frame_id = FrameId::from("empty-loop-root");
+    let outputs = engine
+        .execute_frame(&run_id, &frame_id, &spec, &context)
+        .await
+        .expect("empty loop body should complete without stalling");
+    assert!(
+        outputs.outputs.is_empty(),
+        "empty loop body should not synthesize step outputs"
+    );
+
+    let run = store
+        .get_run(&run_id)
+        .await
+        .expect("get_run")
+        .expect("run present");
+    let root_frame = run.frames.get(&frame_id).expect("root frame");
+    assert_eq!(
+        root_frame.kernel_state.phase, "Completed",
+        "root frame should complete after empty loop body processing"
+    );
+    let loop_instance_id = meerkat_mob::ids::LoopInstanceId::from("empty-loop-root::loop-node");
+    let loop_snapshot = run.loops.get(&loop_instance_id).expect("loop snapshot");
+    assert_eq!(
+        loop_snapshot.kernel_state.phase, "Completed",
+        "empty loop body should still advance the loop lifecycle to Completed"
+    );
+}
+
+/// Resume must project a terminal loop snapshot back into the parent frame even if
+/// the previous process crashed before the parent node update.
+#[tokio::test]
+async fn test_resume_projects_terminal_loop_snapshot_to_parent() {
+    let executor = Arc::new(ScriptedStepExecutor::new(vec![]));
+    let (run_id, run) = build_run();
+    let store = Arc::new(InMemoryMobRunStore::new());
+    store.create_run(run).await.expect("create_run");
+    let engine = FlowFrameEngine::new(store.clone(), executor, 0, 0);
+    let kernel = FlowFrameKernel::new(store.clone());
+
+    let frame_id = FrameId::from("resume-root");
+    let loop_node_id = FlowNodeId::from("loop-node");
+    let loop_id = LoopId::from("resume-loop");
+    let spec = FrameSpec {
+        nodes: {
+            let mut nodes = IndexMap::new();
+            nodes.insert(
+                loop_node_id.clone(),
+                FlowNodeSpec::RepeatUntil(RepeatUntilSpec {
+                    loop_id: loop_id.clone(),
+                    depends_on: vec![],
+                    depends_on_mode: DependencyMode::All,
+                    body: FrameSpec {
+                        nodes: IndexMap::new(),
+                    },
+                    until: ConditionExpr::Eq {
+                        path: "params.done".into(),
+                        value: serde_json::json!(true),
+                    },
+                    max_iterations: 1,
+                }),
+            );
+            nodes
+        },
+    };
+    kernel
+        .start_frame(&run_id, &frame_id, &spec)
+        .await
+        .expect("start root frame");
+    let effects = kernel
+        .admit_next_ready_node(&run_id, &frame_id)
+        .await
+        .expect("admit loop node")
+        .expect("loop node effects");
+    assert!(
+        effects
+            .iter()
+            .any(|effect| effect.variant == "StartLoopNode"),
+        "admitting the loop node should emit StartLoopNode"
+    );
+
+    let loop_instance_id = meerkat_mob::ids::LoopInstanceId::from("resume-root::loop-node");
+    store
+        .upsert_loop_snapshot(
+            &run_id,
+            &loop_instance_id,
+            LoopSnapshot {
+                kernel_state: KernelState {
+                    phase: "Completed".into(),
+                    fields: BTreeMap::from([
+                        (
+                            "loop_instance_id".into(),
+                            meerkat_machine_kernels::KernelValue::String(
+                                loop_instance_id.to_string(),
+                            ),
+                        ),
+                        (
+                            "current_iteration".into(),
+                            meerkat_machine_kernels::KernelValue::U64(1),
+                        ),
+                        (
+                            "max_iterations".into(),
+                            meerkat_machine_kernels::KernelValue::U64(1),
+                        ),
+                        (
+                            "parent_frame_id".into(),
+                            meerkat_machine_kernels::KernelValue::String(frame_id.to_string()),
+                        ),
+                        (
+                            "parent_node_id".into(),
+                            meerkat_machine_kernels::KernelValue::String(loop_node_id.to_string()),
+                        ),
+                        (
+                            "loop_id".into(),
+                            meerkat_machine_kernels::KernelValue::String(loop_id.to_string()),
+                        ),
+                        ("depth".into(), meerkat_machine_kernels::KernelValue::U64(1)),
+                        (
+                            "stage".into(),
+                            meerkat_machine_kernels::KernelValue::NamedVariant {
+                                enum_name: "LoopIterationStage".into(),
+                                variant: "AwaitingUntil".into(),
+                            },
+                        ),
+                        (
+                            "last_completed_iteration".into(),
+                            meerkat_machine_kernels::KernelValue::U64(0),
+                        ),
+                        (
+                            "active_body_frame_id".into(),
+                            meerkat_machine_kernels::KernelValue::None,
+                        ),
+                    ]),
+                },
+            },
+            None,
+        )
+        .await
+        .expect("persist terminal loop snapshot");
+
+    let context = FlowContext {
+        run_id: run_id.clone(),
+        activation_params: serde_json::json!({ "done": true }),
+        step_outputs: IndexMap::new(),
+        loop_outputs: IndexMap::new(),
+    };
+    engine
+        .execute_frame(&run_id, &frame_id, &spec, &context)
+        .await
+        .expect("resume should project terminal loop snapshot");
+
+    let run = store
+        .get_run(&run_id)
+        .await
+        .expect("get_run")
+        .expect("run present");
+    let root_frame = run.frames.get(&frame_id).expect("root frame");
+    assert_eq!(
+        root_frame.kernel_state.phase, "Completed",
+        "parent frame should complete after projecting terminal loop snapshot"
+    );
+    let node_status = match root_frame.kernel_state.fields.get("node_status") {
+        Some(meerkat_machine_kernels::KernelValue::Map(map)) => map,
+        other => panic!("unexpected node_status map: {other:?}"),
+    };
+    match node_status.get(&meerkat_machine_kernels::KernelValue::String(
+        loop_node_id.to_string(),
+    )) {
+        Some(meerkat_machine_kernels::KernelValue::NamedVariant { variant, .. }) => {
+            assert_eq!(
+                variant, "Completed",
+                "loop node should be completed on resume"
+            );
+        }
+        other => panic!("unexpected loop node status: {other:?}"),
+    }
+}
+
+/// Resume must continue a terminal body frame that was already persisted as the active body frame.
+#[tokio::test]
+async fn test_resume_advances_terminal_body_frame_without_stall() {
+    let executor = Arc::new(ScriptedStepExecutor::new(vec![]));
+    let (run_id, run) = build_run();
+    let store = Arc::new(InMemoryMobRunStore::new());
+    store.create_run(run).await.expect("create_run");
+    let engine = FlowFrameEngine::new(store.clone(), executor, 0, 0);
+    let kernel = FlowFrameKernel::new(store.clone());
+
+    let frame_id = FrameId::from("resume-body-root");
+    let loop_node_id = FlowNodeId::from("loop-node");
+    let loop_id = LoopId::from("resume-body-loop");
+    let body_spec = FrameSpec {
+        nodes: IndexMap::new(),
+    };
+    let spec = FrameSpec {
+        nodes: {
+            let mut nodes = IndexMap::new();
+            nodes.insert(
+                loop_node_id.clone(),
+                FlowNodeSpec::RepeatUntil(RepeatUntilSpec {
+                    loop_id: loop_id.clone(),
+                    depends_on: vec![],
+                    depends_on_mode: DependencyMode::All,
+                    body: body_spec.clone(),
+                    until: ConditionExpr::Eq {
+                        path: "params.done".into(),
+                        value: serde_json::json!(true),
+                    },
+                    max_iterations: 1,
+                }),
+            );
+            nodes
+        },
+    };
+    kernel
+        .start_frame(&run_id, &frame_id, &spec)
+        .await
+        .expect("start root frame");
+    kernel
+        .admit_next_ready_node(&run_id, &frame_id)
+        .await
+        .expect("admit loop node")
+        .expect("loop node effects");
+
+    let loop_instance_id = meerkat_mob::ids::LoopInstanceId::from("resume-body-root::loop-node");
+    let body_frame_id = FrameId::from(format!("{loop_instance_id}::iter-0").as_str());
+    kernel
+        .start_frame(&run_id, &body_frame_id, &body_spec)
+        .await
+        .expect("start body frame");
+    kernel
+        .terminalize_frame(&run_id, &body_frame_id)
+        .await
+        .expect("terminalize empty body frame");
+    let rootish_body_frame = store
+        .get_run(&run_id)
+        .await
+        .expect("get run")
+        .expect("run present")
+        .frames
+        .get(&body_frame_id)
+        .cloned()
+        .expect("body frame snapshot");
+    let mut body_frame = rootish_body_frame.clone();
+    body_frame.kernel_state.fields.insert(
+        "frame_scope".into(),
+        meerkat_machine_kernels::KernelValue::NamedVariant {
+            enum_name: "FrameScope".into(),
+            variant: "Body".into(),
+        },
+    );
+    body_frame.kernel_state.fields.insert(
+        "loop_instance_id".into(),
+        meerkat_machine_kernels::KernelValue::String(loop_instance_id.to_string()),
+    );
+    body_frame.kernel_state.fields.insert(
+        "iteration".into(),
+        meerkat_machine_kernels::KernelValue::U64(0),
+    );
+    assert!(
+        store
+            .cas_frame_state(
+                &run_id,
+                &body_frame_id,
+                Some(&rootish_body_frame),
+                body_frame
+            )
+            .await
+            .expect("update body frame scope"),
+        "body frame scope update should succeed"
+    );
+    store
+        .upsert_loop_snapshot(
+            &run_id,
+            &loop_instance_id,
+            LoopSnapshot {
+                kernel_state: KernelState {
+                    phase: "Running".into(),
+                    fields: BTreeMap::from([
+                        (
+                            "loop_instance_id".into(),
+                            meerkat_machine_kernels::KernelValue::String(
+                                loop_instance_id.to_string(),
+                            ),
+                        ),
+                        (
+                            "current_iteration".into(),
+                            meerkat_machine_kernels::KernelValue::U64(0),
+                        ),
+                        (
+                            "max_iterations".into(),
+                            meerkat_machine_kernels::KernelValue::U64(1),
+                        ),
+                        (
+                            "parent_frame_id".into(),
+                            meerkat_machine_kernels::KernelValue::String(frame_id.to_string()),
+                        ),
+                        (
+                            "parent_node_id".into(),
+                            meerkat_machine_kernels::KernelValue::String(loop_node_id.to_string()),
+                        ),
+                        (
+                            "loop_id".into(),
+                            meerkat_machine_kernels::KernelValue::String(loop_id.to_string()),
+                        ),
+                        ("depth".into(), meerkat_machine_kernels::KernelValue::U64(1)),
+                        (
+                            "stage".into(),
+                            meerkat_machine_kernels::KernelValue::NamedVariant {
+                                enum_name: "LoopIterationStage".into(),
+                                variant: "BodyFrameActive".into(),
+                            },
+                        ),
+                        (
+                            "last_completed_iteration".into(),
+                            meerkat_machine_kernels::KernelValue::U64(0),
+                        ),
+                        (
+                            "active_body_frame_id".into(),
+                            meerkat_machine_kernels::KernelValue::String(body_frame_id.to_string()),
+                        ),
+                    ]),
+                },
+            },
+            None,
+        )
+        .await
+        .expect("persist running loop snapshot");
+
+    let context = FlowContext {
+        run_id: run_id.clone(),
+        activation_params: serde_json::json!({ "done": true }),
+        step_outputs: IndexMap::new(),
+        loop_outputs: IndexMap::new(),
+    };
+    engine
+        .execute_frame(&run_id, &frame_id, &spec, &context)
+        .await
+        .expect("resume should advance completed body frame");
+
+    let run = store
+        .get_run(&run_id)
+        .await
+        .expect("get_run")
+        .expect("run present");
+    assert_eq!(
+        run.loops
+            .get(&loop_instance_id)
+            .expect("loop snapshot")
+            .kernel_state
+            .phase,
+        "Completed",
+        "completed body frame should advance the loop to Completed on resume"
+    );
+    assert_eq!(
+        run.frames
+            .get(&frame_id)
+            .expect("root frame")
+            .kernel_state
+            .phase,
+        "Completed",
+        "root frame should complete after resuming the terminal body frame"
     );
 }
 
@@ -1042,6 +1636,18 @@ async fn test_resumed_frame_with_running_node_fails_orphan() {
                         .collect(),
                     ),
                 ),
+                (
+                    "frame_scope".into(),
+                    KernelValue::NamedVariant {
+                        enum_name: "FrameScope".into(),
+                        variant: "Root".into(),
+                    },
+                ),
+                (
+                    "loop_instance_id".into(),
+                    KernelValue::String(String::new()),
+                ),
+                ("iteration".into(), KernelValue::U64(0)),
                 ("output_recorded".into(), KernelValue::Map(BTreeMap::new())),
                 (
                     "node_condition_results".into(),
@@ -1070,7 +1676,8 @@ async fn test_resumed_frame_with_running_node_fails_orphan() {
 
     // Execute the frame — the engine should detect node-a as orphaned Running,
     // fail it, which causes node-b to be Skip-admitted (All-mode dep failed).
-    // The frame should terminalize to Completed (all nodes terminal: a=Failed, b=Skipped).
+    // The frame should terminalize to Failed because the frame machine now owns
+    // terminal classification and any failed node seals the frame as Failed.
     let outputs = engine
         .execute_frame(&run_id, &frame_id, &spec, &context)
         .await
@@ -1078,16 +1685,16 @@ async fn test_resumed_frame_with_running_node_fails_orphan() {
 
     // Neither step produced output (node-a failed, node-b was skipped).
     assert!(
-        outputs.is_empty(),
+        outputs.outputs.is_empty(),
         "no outputs expected when steps are failed/skipped: {outputs:?}"
     );
 
-    // Verify the frame is now Completed in the store.
+    // Verify the frame is now Failed in the store.
     let run = store.get_run(&run_id).await.expect("get_run").expect("run");
     let snap = run.frames.get(&frame_id).expect("frame persisted");
     assert_eq!(
-        snap.kernel_state.phase, "Completed",
-        "frame must be Completed after handling orphaned Running node"
+        snap.kernel_state.phase, "Failed",
+        "frame must be Failed after handling orphaned Running node"
     );
 }
 
@@ -1219,7 +1826,7 @@ async fn test_frame_outputs_seeded_from_persisted_state_on_resume() {
         .await
         .expect("execute_frame");
     assert_eq!(
-        outputs.get(&StepId::from("step-a")),
+        outputs.outputs.get(&StepId::from("step-a")),
         Some(&serde_json::json!({"x": 1}))
     );
 
@@ -1237,7 +1844,7 @@ async fn test_frame_outputs_seeded_from_persisted_state_on_resume() {
 
     // The resumed outputs must include the pre-crash completed step.
     assert_eq!(
-        resume_outputs.get(&StepId::from("step-a")),
+        resume_outputs.outputs.get(&StepId::from("step-a")),
         Some(&serde_json::json!({"x": 1})),
         "pre-crash completed step must appear in resumed frame_outputs (seeded from store)"
     );

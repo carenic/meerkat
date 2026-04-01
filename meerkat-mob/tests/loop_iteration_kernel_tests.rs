@@ -23,33 +23,46 @@ fn start_loop_input(loop_instance_id: &str, max_iterations: u64) -> KernelInput 
         fields: BTreeMap::from([
             ("loop_instance_id".into(), loop_inst(loop_instance_id)),
             ("max_iterations".into(), u64_val(max_iterations)),
+            ("parent_frame_id".into(), frame_id("parent-frame")),
+            ("parent_node_id".into(), str_val("parent-node")),
+            ("loop_id".into(), str_val("loop-spec")),
+            ("depth".into(), u64_val(1)),
         ]),
     }
 }
 
-fn body_frame_started_input(fid: &str) -> KernelInput {
+fn body_frame_started_input(loop_instance_id: &str, fid: &str, iteration: u64) -> KernelInput {
     KernelInput {
         variant: "BodyFrameStarted".into(),
-        fields: BTreeMap::from([("frame_id".into(), frame_id(fid))]),
+        fields: BTreeMap::from([
+            ("loop_instance_id".into(), loop_inst(loop_instance_id)),
+            ("frame_id".into(), frame_id(fid)),
+            ("iteration".into(), u64_val(iteration)),
+        ]),
     }
 }
 
-fn body_frame_completed_input() -> KernelInput {
+fn body_frame_completed_input(loop_instance_id: &str, iteration: u64) -> KernelInput {
     KernelInput {
         variant: "BodyFrameCompleted".into(),
-        fields: BTreeMap::new(),
+        fields: BTreeMap::from([
+            ("loop_instance_id".into(), loop_inst(loop_instance_id)),
+            ("iteration".into(), u64_val(iteration)),
+        ]),
     }
 }
 
 /// Advance through one complete iteration: BodyFrameStarted then BodyFrameCompleted
 fn advance_one_iteration(
+    loop_instance_id: &str,
+    iteration: u64,
     state: meerkat_machine_kernels::KernelState,
 ) -> meerkat_machine_kernels::KernelState {
-    let started = body_frame_started_input("frame-x");
+    let started = body_frame_started_input(loop_instance_id, "frame-x", iteration);
     let state = loop_iteration::transition(&state, &started)
         .expect("BodyFrameStarted")
         .next_state;
-    let completed = body_frame_completed_input();
+    let completed = body_frame_completed_input(loop_instance_id, iteration);
     loop_iteration::transition(&state, &completed)
         .expect("BodyFrameCompleted")
         .next_state
@@ -97,12 +110,13 @@ fn test_loop_iteration_advances_current_iteration() {
     let state = outcome.next_state;
 
     // BodyFrameStarted
-    let outcome = loop_iteration::transition(&state, &body_frame_started_input("frame-1"))
-        .expect("BodyFrameStarted");
+    let outcome =
+        loop_iteration::transition(&state, &body_frame_started_input("loop-a", "frame-1", 0))
+            .expect("BodyFrameStarted");
     let state = outcome.next_state;
 
     // BodyFrameCompleted → should emit EvaluateUntilCondition and increment iteration
-    let outcome = loop_iteration::transition(&state, &body_frame_completed_input())
+    let outcome = loop_iteration::transition(&state, &body_frame_completed_input("loop-a", 0))
         .expect("BodyFrameCompleted");
     let state = outcome.next_state;
 
@@ -133,11 +147,14 @@ fn test_until_condition_met_completes_loop() {
     let state = loop_iteration::initial_state().expect("init");
     let outcome =
         loop_iteration::transition(&state, &start_loop_input("loop-a", 5)).expect("StartLoop");
-    let state = advance_one_iteration(outcome.next_state);
+    let state = advance_one_iteration("loop-a", 0, outcome.next_state);
 
     let met = KernelInput {
         variant: "UntilConditionMet".into(),
-        fields: BTreeMap::new(),
+        fields: BTreeMap::from([
+            ("loop_instance_id".into(), loop_inst("loop-a")),
+            ("iteration".into(), u64_val(0)),
+        ]),
     };
     let outcome = loop_iteration::transition(&state, &met).expect("UntilConditionMet");
 
@@ -159,11 +176,14 @@ fn test_until_condition_failed_requests_next_body_frame() {
     let state = loop_iteration::initial_state().expect("init");
     let outcome =
         loop_iteration::transition(&state, &start_loop_input("loop-a", 5)).expect("StartLoop");
-    let state = advance_one_iteration(outcome.next_state);
+    let state = advance_one_iteration("loop-a", 0, outcome.next_state);
 
     let failed = KernelInput {
         variant: "UntilConditionFailed".into(),
-        fields: BTreeMap::new(),
+        fields: BTreeMap::from([
+            ("loop_instance_id".into(), loop_inst("loop-a")),
+            ("iteration".into(), u64_val(0)),
+        ]),
     };
     let outcome = loop_iteration::transition(&state, &failed).expect("UntilConditionFailed");
 
@@ -194,10 +214,13 @@ fn test_loop_exhausted_when_max_iterations_reached() {
         loop_iteration::transition(&state, &start_loop_input("loop-a", 2)).expect("StartLoop");
 
     // Run first iteration, condition fails
-    let state = advance_one_iteration(outcome.next_state);
+    let state = advance_one_iteration("loop-a", 0, outcome.next_state);
     let failed = KernelInput {
         variant: "UntilConditionFailed".into(),
-        fields: BTreeMap::new(),
+        fields: BTreeMap::from([
+            ("loop_instance_id".into(), loop_inst("loop-a")),
+            ("iteration".into(), u64_val(0)),
+        ]),
     };
     // After 1 iteration, current_iteration=1, max=2, so NOT exhausted → re-requests
     let outcome =
@@ -208,11 +231,14 @@ fn test_loop_exhausted_when_max_iterations_reached() {
     );
 
     // Run second iteration, condition fails again
-    let state = advance_one_iteration(outcome.next_state);
+    let state = advance_one_iteration("loop-a", 1, outcome.next_state);
     // current_iteration=2, max=2 → exhausted
     let failed2 = KernelInput {
         variant: "UntilConditionFailed".into(),
-        fields: BTreeMap::new(),
+        fields: BTreeMap::from([
+            ("loop_instance_id".into(), loop_inst("loop-a")),
+            ("iteration".into(), u64_val(1)),
+        ]),
     };
     let outcome =
         loop_iteration::transition(&state, &failed2).expect("UntilConditionFailed after iter 2");
@@ -238,14 +264,19 @@ fn test_body_frame_failed_transitions_to_failed() {
     let state = loop_iteration::initial_state().expect("init");
     let outcome =
         loop_iteration::transition(&state, &start_loop_input("loop-b", 3)).expect("StartLoop");
-    let state =
-        loop_iteration::transition(&outcome.next_state, &body_frame_started_input("frame-y"))
-            .expect("BodyFrameStarted")
-            .next_state;
+    let state = loop_iteration::transition(
+        &outcome.next_state,
+        &body_frame_started_input("loop-b", "frame-y", 0),
+    )
+    .expect("BodyFrameStarted")
+    .next_state;
 
     let failed = KernelInput {
         variant: "BodyFrameFailed".into(),
-        fields: BTreeMap::new(),
+        fields: BTreeMap::from([
+            ("loop_instance_id".into(), loop_inst("loop-b")),
+            ("iteration".into(), u64_val(0)),
+        ]),
     };
     let outcome = loop_iteration::transition(&state, &failed).expect("BodyFrameFailed");
 
@@ -267,14 +298,19 @@ fn test_body_frame_canceled_transitions_to_canceled() {
     let state = loop_iteration::initial_state().expect("init");
     let outcome =
         loop_iteration::transition(&state, &start_loop_input("loop-c", 3)).expect("StartLoop");
-    let state =
-        loop_iteration::transition(&outcome.next_state, &body_frame_started_input("frame-z"))
-            .expect("BodyFrameStarted")
-            .next_state;
+    let state = loop_iteration::transition(
+        &outcome.next_state,
+        &body_frame_started_input("loop-c", "frame-z", 0),
+    )
+    .expect("BodyFrameStarted")
+    .next_state;
 
     let canceled = KernelInput {
         variant: "BodyFrameCanceled".into(),
-        fields: BTreeMap::new(),
+        fields: BTreeMap::from([
+            ("loop_instance_id".into(), loop_inst("loop-c")),
+            ("iteration".into(), u64_val(0)),
+        ]),
     };
     let outcome = loop_iteration::transition(&state, &canceled).expect("BodyFrameCanceled");
 
@@ -300,7 +336,7 @@ fn test_cancel_loop_transitions_to_canceled() {
 
     let cancel = KernelInput {
         variant: "CancelLoop".into(),
-        fields: BTreeMap::new(),
+        fields: BTreeMap::from([("loop_instance_id".into(), loop_inst("loop-d"))]),
     };
     let outcome = loop_iteration::transition(&state, &cancel).expect("CancelLoop");
 

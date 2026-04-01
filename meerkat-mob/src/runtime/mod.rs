@@ -58,6 +58,7 @@ pub mod flow_frame_engine;
 pub mod flow_frame_kernel;
 mod flow_run_kernel;
 mod handle;
+pub(crate) mod loop_iteration_authority;
 mod mob_lifecycle_authority;
 mod mob_orchestrator_authority;
 mod ops_adapter;
