@@ -247,6 +247,19 @@ impl FlowRunKernel {
         KernelValue::String(step_id.to_string())
     }
 
+    fn step_status_value(status: &crate::run::StepRunStatus) -> KernelValue {
+        KernelValue::NamedVariant {
+            enum_name: "StepRunStatus".into(),
+            variant: match status {
+                crate::run::StepRunStatus::Dispatched => "Dispatched".into(),
+                crate::run::StepRunStatus::Completed => "Completed".into(),
+                crate::run::StepRunStatus::Failed => "Failed".into(),
+                crate::run::StepRunStatus::Skipped => "Skipped".into(),
+                crate::run::StepRunStatus::Canceled => "Canceled".into(),
+            },
+        }
+    }
+
     fn target_id_value(target_id: &str) -> KernelValue {
         KernelValue::String(target_id.to_string())
     }
@@ -295,128 +308,41 @@ impl FlowRunKernel {
             )));
         }
 
-        for attempt in 0..=5usize {
-            let run = self.require_run(run_id).await?;
-            let current_status = self.step_status(run_id, step_id).await?;
-            if current_status == Some(step_status.clone()) {
-                return Ok(None);
-            }
-            if let Some(existing) = current_status
-                && !matches!(existing, crate::run::StepRunStatus::Dispatched)
-            {
-                return Err(MobError::Internal(format!(
-                    "project_frame_step_status refuses to overwrite step '{step_id}' in run \
-                     '{run_id}' from {existing:?} to {step_status:?}"
-                )));
-            }
-
-            let mut next_state = run.flow_state.clone();
-            let step_key = KernelValue::String(step_id.to_string());
-            if let Some(KernelValue::Map(step_status_map)) =
-                next_state.fields.get_mut("step_status")
-            {
-                step_status_map.insert(
-                    step_key.clone(),
-                    match step_status {
-                        crate::run::StepRunStatus::Completed => KernelValue::NamedVariant {
-                            enum_name: "StepRunStatus".into(),
-                            variant: "Completed".into(),
-                        },
-                        crate::run::StepRunStatus::Skipped => KernelValue::NamedVariant {
-                            enum_name: "StepRunStatus".into(),
-                            variant: "Skipped".into(),
-                        },
-                        crate::run::StepRunStatus::Failed => KernelValue::NamedVariant {
-                            enum_name: "StepRunStatus".into(),
-                            variant: "Failed".into(),
-                        },
-                        _ => unreachable!("guarded above"),
-                    },
-                );
-            }
-            if let Some(KernelValue::Map(output_recorded)) =
-                next_state.fields.get_mut("output_recorded")
-            {
-                output_recorded.insert(
-                    step_key,
-                    KernelValue::Bool(matches!(step_status, crate::run::StepRunStatus::Completed)),
-                );
-            }
-
-            let mut append_failure_ledger = false;
-            let mut escalate_supervisor = false;
-            match step_status {
-                crate::run::StepRunStatus::Completed => {
-                    next_state
-                        .fields
-                        .insert("consecutive_failure_count".into(), KernelValue::U64(0));
-                }
-                crate::run::StepRunStatus::Skipped => {}
-                crate::run::StepRunStatus::Failed => {
-                    let failure_count = match next_state.fields.get("failure_count") {
-                        Some(KernelValue::U64(n)) => *n + 1,
-                        other => {
-                            return Err(MobError::Internal(format!(
-                                "flow_run failure_count missing or invalid for {run_id}: {other:?}"
-                            )));
-                        }
-                    };
-                    next_state
-                        .fields
-                        .insert("failure_count".into(), KernelValue::U64(failure_count));
-
-                    let consecutive_failure_count =
-                        match next_state.fields.get("consecutive_failure_count") {
-                            Some(KernelValue::U64(n)) => *n + 1,
-                            other => {
-                                return Err(MobError::Internal(format!(
-                                    "flow_run consecutive_failure_count missing or invalid for \
-                                     {run_id}: {other:?}"
-                                )));
-                            }
-                        };
-                    next_state.fields.insert(
-                        "consecutive_failure_count".into(),
-                        KernelValue::U64(consecutive_failure_count),
-                    );
-
-                    append_failure_ledger = requested_failure_ledger_append;
-                    let escalation_threshold = match next_state.fields.get("escalation_threshold") {
-                        Some(KernelValue::U64(n)) => *n,
-                        other => {
-                            return Err(MobError::Internal(format!(
-                                "flow_run escalation_threshold missing or invalid for {run_id}: {other:?}"
-                            )));
-                        }
-                    };
-                    escalate_supervisor = escalation_threshold > 0
-                        && consecutive_failure_count >= escalation_threshold;
-                }
-                _ => unreachable!("guarded above"),
-            }
-
-            let won = self
-                .run_store
-                .cas_flow_state(run_id, &run.flow_state, &next_state)
-                .await?;
-            if won {
-                return Ok(Some(FrameStepProjectionEffects {
-                    step_status: step_status.clone(),
-                    persist_output: matches!(step_status, crate::run::StepRunStatus::Completed),
-                    append_failure_ledger,
-                    escalate_supervisor,
-                }));
-            }
-            if attempt == 5 {
-                return Err(MobError::Internal(format!(
-                    "project_frame_step_status: CAS exhausted for run '{run_id}' step '{step_id}'"
-                )));
-            }
+        let current_status = self.step_status(run_id, step_id).await?;
+        if current_status == Some(step_status.clone()) {
+            return Ok(None);
         }
 
-        Err(MobError::Internal(format!(
-            "project_frame_step_status: unreachable retry exit for run '{run_id}' step '{step_id}'"
-        )))
+        let effects = self
+            .cas_with_retry(
+                run_id,
+                "ProjectFrameStepStatus",
+                BTreeMap::from([
+                    ("step_id".to_string(), Self::step_id_value(step_id)),
+                    (
+                        "step_status".to_string(),
+                        Self::step_status_value(&step_status),
+                    ),
+                    (
+                        "append_failure_ledger".to_string(),
+                        KernelValue::Bool(requested_failure_ledger_append),
+                    ),
+                ]),
+            )
+            .await?
+            .ok_or_else(|| {
+                MobError::Internal(format!(
+                    "project_frame_step_status: transition returned no effects for run '{run_id}' \
+                     step '{step_id}'"
+                ))
+            })?;
+
+        Ok(Some(FrameStepProjectionEffects {
+            step_status: step_status.clone(),
+            persist_output: matches!(step_status, crate::run::StepRunStatus::Completed),
+            append_failure_ledger: has_step_effect(&effects, "AppendFailureLedger", step_id)?,
+            escalate_supervisor: has_step_effect(&effects, "EscalateSupervisor", step_id)?,
+        }))
     }
 
     pub async fn step_branch_blocked(
@@ -503,69 +429,36 @@ impl FlowRunKernel {
             }
         }
 
-        // CAS loop: read, mutate step_status in place, write back.
-        for attempt in 0..=5usize {
-            let run = self.require_run(run_id).await?;
-            let mut next_state = run.flow_state.clone();
-
-            // Advance step_status from the typed frame outcome rather than inferring
-            // completion from output side maps.
-            if let Some(KernelValue::Map(step_status)) = next_state.fields.get_mut("step_status") {
-                for (key, val) in step_status.iter_mut() {
-                    let step_id = match key {
-                        KernelValue::String(s) => StepId::from(s.as_str()),
-                        _ => continue,
-                    };
-                    let status = step_statuses
-                        .get(&step_id)
-                        .cloned()
-                        .unwrap_or(crate::run::StepRunStatus::Skipped);
-                    *val = match status {
-                        crate::run::StepRunStatus::Completed => KernelValue::NamedVariant {
-                            enum_name: "StepRunStatus".into(),
-                            variant: "Completed".into(),
-                        },
-                        crate::run::StepRunStatus::Skipped => KernelValue::NamedVariant {
-                            enum_name: "StepRunStatus".into(),
-                            variant: "Skipped".into(),
-                        },
-                        other => {
-                            return Err(MobError::Internal(format!(
-                                "terminalize_completed_from_frame cannot project status {other:?} \
-                                 for step '{step_id}' in run '{run_id}'"
-                            )));
-                        }
-                    };
+        for step_id in self.ordered_steps(run_id).await? {
+            let status = step_statuses
+                .get(&step_id)
+                .cloned()
+                .unwrap_or(crate::run::StepRunStatus::Skipped);
+            match status {
+                crate::run::StepRunStatus::Completed => {
+                    let _ = self
+                        .project_frame_step_status(
+                            run_id,
+                            &step_id,
+                            FrameStepProjectionRequest::completed(),
+                        )
+                        .await?;
                 }
-            }
-
-            // Mark outputs as recorded only for steps canonically completed by the
-            // frame execution seam.
-            if let Some(KernelValue::Map(output_recorded)) =
-                next_state.fields.get_mut("output_recorded")
-            {
-                for (key, val) in output_recorded.iter_mut() {
-                    if let KernelValue::String(s) = key {
-                        let step_id = StepId::from(s.as_str());
-                        *val = KernelValue::Bool(matches!(
-                            step_statuses.get(&step_id),
-                            Some(crate::run::StepRunStatus::Completed)
-                        ));
-                    }
+                crate::run::StepRunStatus::Skipped => {
+                    let _ = self
+                        .project_frame_step_status(
+                            run_id,
+                            &step_id,
+                            FrameStepProjectionRequest::skipped(),
+                        )
+                        .await?;
                 }
-            }
-
-            let won = self
-                .run_store
-                .cas_flow_state(run_id, &run.flow_state, &next_state)
-                .await?;
-            if won {
-                break;
-            }
-            if attempt == 5 {
-                return Err(MobError::Internal(format!(
-                    "terminalize_completed_from_frame: CAS exhausted for {run_id}"
-                )));
+                other => {
+                    return Err(MobError::Internal(format!(
+                        "terminalize_completed_from_frame cannot project status {other:?} \
+                         for step '{step_id}' in run '{run_id}'"
+                    )));
+                }
             }
         }
 
@@ -1155,6 +1048,33 @@ fn parse_step_run_status(
             "flow_run step_status entry invalid for {run_id}: {reason}"
         ))),
     }
+}
+
+fn has_step_effect(
+    effects: &[KernelEffect],
+    variant: &str,
+    step_id: &StepId,
+) -> Result<bool, MobError> {
+    let expected = step_id.to_string();
+    for effect in effects {
+        if effect.variant != variant {
+            continue;
+        }
+        match effect.fields.get("step_id") {
+            Some(KernelValue::String(candidate)) if candidate == &expected => return Ok(true),
+            Some(other) => {
+                return Err(MobError::Internal(format!(
+                    "flow_run effect `{variant}` carried invalid step_id payload: {other:?}"
+                )));
+            }
+            None => {
+                return Err(MobError::Internal(format!(
+                    "flow_run effect `{variant}` missing step_id payload"
+                )));
+            }
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@ use crate::{
 pub fn flow_run_machine() -> MachineSchema {
     MachineSchema {
         machine: "FlowRunMachine".into(),
-        version: 4,
+        version: 5,
         rust: RustBinding {
             crate_name: "meerkat-mob".into(),
             module: "generated::flow_run".into(),
@@ -292,6 +292,14 @@ pub fn flow_run_machine() -> MachineSchema {
                 VariantSchema {
                     name: "SkipStep".into(),
                     fields: vec![field("step_id", TypeRef::Named("StepId".into()))],
+                },
+                VariantSchema {
+                    name: "ProjectFrameStepStatus".into(),
+                    fields: vec![
+                        field("step_id", TypeRef::Named("StepId".into())),
+                        field("step_status", TypeRef::Enum("StepRunStatus".into())),
+                        field("append_failure_ledger", TypeRef::Bool),
+                    ],
                 },
                 VariantSchema {
                     name: "CancelStep".into(),
@@ -1390,6 +1398,243 @@ pub fn flow_run_machine() -> MachineSchema {
                 }],
                 vec![step_notice("step_id", StepStatusVariant::Skipped)],
             ),
+            frame_projection_transition(
+                "ProjectFrameStepCompleted",
+                vec![
+                    tracked_step_guard("step_id"),
+                    frame_projectable_guard("step_id"),
+                    binding_step_status_guard(
+                        "step_status",
+                        "frame_status_is_completed",
+                        StepStatusVariant::Completed,
+                    ),
+                ],
+                vec![
+                    Update::MapInsert {
+                        field: "step_status".into(),
+                        key: Expr::Binding("step_id".into()),
+                        value: Expr::Some(Box::new(step_status(StepStatusVariant::Completed))),
+                    },
+                    Update::MapInsert {
+                        field: "output_recorded".into(),
+                        key: Expr::Binding("step_id".into()),
+                        value: Expr::Bool(true),
+                    },
+                    Update::Assign {
+                        field: "consecutive_failure_count".into(),
+                        expr: Expr::U64(0),
+                    },
+                ],
+                vec![],
+            ),
+            frame_projection_transition(
+                "ProjectFrameStepSkipped",
+                vec![
+                    tracked_step_guard("step_id"),
+                    frame_projectable_guard("step_id"),
+                    binding_step_status_guard(
+                        "step_status",
+                        "frame_status_is_skipped",
+                        StepStatusVariant::Skipped,
+                    ),
+                ],
+                vec![
+                    Update::MapInsert {
+                        field: "step_status".into(),
+                        key: Expr::Binding("step_id".into()),
+                        value: Expr::Some(Box::new(step_status(StepStatusVariant::Skipped))),
+                    },
+                    Update::MapInsert {
+                        field: "output_recorded".into(),
+                        key: Expr::Binding("step_id".into()),
+                        value: Expr::Bool(false),
+                    },
+                ],
+                vec![],
+            ),
+            frame_projection_transition(
+                "ProjectFrameStepFailedEscalatingWithLedger",
+                vec![
+                    tracked_step_guard("step_id"),
+                    frame_projectable_guard("step_id"),
+                    binding_step_status_guard(
+                        "step_status",
+                        "frame_status_is_failed",
+                        StepStatusVariant::Failed,
+                    ),
+                    bool_binding_guard(
+                        "append_failure_ledger",
+                        "append_failure_ledger_requested",
+                        true,
+                    ),
+                    Guard {
+                        name: "escalation_will_trigger".into(),
+                        expr: Expr::Call {
+                            helper: "EscalationWillTrigger".into(),
+                            args: vec![],
+                        },
+                    },
+                ],
+                vec![
+                    Update::MapInsert {
+                        field: "step_status".into(),
+                        key: Expr::Binding("step_id".into()),
+                        value: Expr::Some(Box::new(step_status(StepStatusVariant::Failed))),
+                    },
+                    Update::MapInsert {
+                        field: "output_recorded".into(),
+                        key: Expr::Binding("step_id".into()),
+                        value: Expr::Bool(false),
+                    },
+                    Update::Increment {
+                        field: "failure_count".into(),
+                        amount: 1,
+                    },
+                    Update::Increment {
+                        field: "consecutive_failure_count".into(),
+                        amount: 1,
+                    },
+                ],
+                vec![
+                    effect_with_step("AppendFailureLedger", "step_id"),
+                    effect_with_step("EscalateSupervisor", "step_id"),
+                ],
+            ),
+            frame_projection_transition(
+                "ProjectFrameStepFailedEscalatingWithoutLedger",
+                vec![
+                    tracked_step_guard("step_id"),
+                    frame_projectable_guard("step_id"),
+                    binding_step_status_guard(
+                        "step_status",
+                        "frame_status_is_failed",
+                        StepStatusVariant::Failed,
+                    ),
+                    bool_binding_guard(
+                        "append_failure_ledger",
+                        "append_failure_ledger_not_requested",
+                        false,
+                    ),
+                    Guard {
+                        name: "escalation_will_trigger".into(),
+                        expr: Expr::Call {
+                            helper: "EscalationWillTrigger".into(),
+                            args: vec![],
+                        },
+                    },
+                ],
+                vec![
+                    Update::MapInsert {
+                        field: "step_status".into(),
+                        key: Expr::Binding("step_id".into()),
+                        value: Expr::Some(Box::new(step_status(StepStatusVariant::Failed))),
+                    },
+                    Update::MapInsert {
+                        field: "output_recorded".into(),
+                        key: Expr::Binding("step_id".into()),
+                        value: Expr::Bool(false),
+                    },
+                    Update::Increment {
+                        field: "failure_count".into(),
+                        amount: 1,
+                    },
+                    Update::Increment {
+                        field: "consecutive_failure_count".into(),
+                        amount: 1,
+                    },
+                ],
+                vec![effect_with_step("EscalateSupervisor", "step_id")],
+            ),
+            frame_projection_transition(
+                "ProjectFrameStepFailedWithLedger",
+                vec![
+                    tracked_step_guard("step_id"),
+                    frame_projectable_guard("step_id"),
+                    binding_step_status_guard(
+                        "step_status",
+                        "frame_status_is_failed",
+                        StepStatusVariant::Failed,
+                    ),
+                    bool_binding_guard(
+                        "append_failure_ledger",
+                        "append_failure_ledger_requested",
+                        true,
+                    ),
+                    Guard {
+                        name: "escalation_does_not_trigger".into(),
+                        expr: Expr::Not(Box::new(Expr::Call {
+                            helper: "EscalationWillTrigger".into(),
+                            args: vec![],
+                        })),
+                    },
+                ],
+                vec![
+                    Update::MapInsert {
+                        field: "step_status".into(),
+                        key: Expr::Binding("step_id".into()),
+                        value: Expr::Some(Box::new(step_status(StepStatusVariant::Failed))),
+                    },
+                    Update::MapInsert {
+                        field: "output_recorded".into(),
+                        key: Expr::Binding("step_id".into()),
+                        value: Expr::Bool(false),
+                    },
+                    Update::Increment {
+                        field: "failure_count".into(),
+                        amount: 1,
+                    },
+                    Update::Increment {
+                        field: "consecutive_failure_count".into(),
+                        amount: 1,
+                    },
+                ],
+                vec![effect_with_step("AppendFailureLedger", "step_id")],
+            ),
+            frame_projection_transition(
+                "ProjectFrameStepFailedWithoutLedger",
+                vec![
+                    tracked_step_guard("step_id"),
+                    frame_projectable_guard("step_id"),
+                    binding_step_status_guard(
+                        "step_status",
+                        "frame_status_is_failed",
+                        StepStatusVariant::Failed,
+                    ),
+                    bool_binding_guard(
+                        "append_failure_ledger",
+                        "append_failure_ledger_not_requested",
+                        false,
+                    ),
+                    Guard {
+                        name: "escalation_does_not_trigger".into(),
+                        expr: Expr::Not(Box::new(Expr::Call {
+                            helper: "EscalationWillTrigger".into(),
+                            args: vec![],
+                        })),
+                    },
+                ],
+                vec![
+                    Update::MapInsert {
+                        field: "step_status".into(),
+                        key: Expr::Binding("step_id".into()),
+                        value: Expr::Some(Box::new(step_status(StepStatusVariant::Failed))),
+                    },
+                    Update::MapInsert {
+                        field: "output_recorded".into(),
+                        key: Expr::Binding("step_id".into()),
+                        value: Expr::Bool(false),
+                    },
+                    Update::Increment {
+                        field: "failure_count".into(),
+                        amount: 1,
+                    },
+                    Update::Increment {
+                        field: "consecutive_failure_count".into(),
+                        amount: 1,
+                    },
+                ],
+                vec![],
+            ),
             step_transition(
                 "CancelStep",
                 "CancelStep",
@@ -2039,6 +2284,30 @@ fn step_transition(
     }
 }
 
+fn frame_projection_transition(
+    name: &str,
+    guards: Vec<Guard>,
+    updates: Vec<Update>,
+    emit: Vec<EffectEmit>,
+) -> TransitionSchema {
+    TransitionSchema {
+        name: name.into(),
+        from: vec![flow_run_phase_name(FlowRunPhaseVariant::Running)],
+        on: InputMatch {
+            variant: "ProjectFrameStepStatus".into(),
+            bindings: vec![
+                "step_id".into(),
+                "step_status".into(),
+                "append_failure_ledger".into(),
+            ],
+        },
+        guards,
+        updates,
+        to: flow_run_phase_name(FlowRunPhaseVariant::Running),
+        emit,
+    }
+}
+
 fn tracked_step_guard(binding: &str) -> Guard {
     Guard {
         name: "step_is_tracked".into(),
@@ -2066,6 +2335,13 @@ fn step_is_not_started_guard(binding: &str, name: &str) -> Guard {
     }
 }
 
+fn frame_projectable_guard(binding: &str) -> Guard {
+    Guard {
+        name: "frame_projection_origin_is_unstarted_or_dispatched".into(),
+        expr: step_is_frame_projectable_expr(binding),
+    }
+}
+
 fn step_is_not_started_expr(binding: &str) -> Expr {
     Expr::Eq(
         Box::new(Expr::MapGet {
@@ -2074,6 +2350,39 @@ fn step_is_not_started_expr(binding: &str) -> Expr {
         }),
         Box::new(Expr::None),
     )
+}
+
+fn step_is_frame_projectable_expr(binding: &str) -> Expr {
+    Expr::Or(vec![
+        step_is_not_started_expr(binding),
+        Expr::Call {
+            helper: "StepStatusIs".into(),
+            args: vec![
+                Expr::Binding(binding.into()),
+                step_status(StepStatusVariant::Dispatched),
+            ],
+        },
+    ])
+}
+
+fn binding_step_status_guard(binding: &str, name: &str, status: StepStatusVariant) -> Guard {
+    Guard {
+        name: name.into(),
+        expr: Expr::Eq(
+            Box::new(Expr::Binding(binding.into())),
+            Box::new(step_status(status)),
+        ),
+    }
+}
+
+fn bool_binding_guard(binding: &str, name: &str, expected: bool) -> Guard {
+    Guard {
+        name: name.into(),
+        expr: Expr::Eq(
+            Box::new(Expr::Binding(binding.into())),
+            Box::new(Expr::Bool(expected)),
+        ),
+    }
 }
 
 fn sequence_members_are_in_binding(seq_binding: &str, allowed_binding: &str) -> Expr {

@@ -3,7 +3,7 @@ EXTENDS TLC, Naturals, Sequences, FiniteSets
 
 \* Generated semantic machine model for FlowRunMachine.
 
-CONSTANTS BooleanValues, BranchIdValues, CollectionPolicyKindValues, DependencyModeValues, FrameIdValues, LoopInstanceIdValues, MeerkatIdValues, NatValues, StepIdValues, StringValues
+CONSTANTS BooleanValues, BranchIdValues, CollectionPolicyKindValues, DependencyModeValues, FrameIdValues, LoopInstanceIdValues, MeerkatIdValues, NatValues, StepIdValues, StepRunStatusValues, StringValues
 
 None == [tag |-> "none", value |-> "none"]
 Some(v) == [tag |-> "some", value |-> v]
@@ -260,6 +260,95 @@ SkipStep(step_id) ==
     /\ UNCHANGED << tracked_steps, ordered_steps, output_recorded, step_condition_results, step_has_conditions, step_dependencies, step_dependency_modes, step_branches, step_collection_policies, step_quorum_thresholds, step_target_counts, step_target_success_counts, step_target_terminal_failure_counts, target_retry_counts, failure_count, consecutive_failure_count, escalation_threshold, max_step_retries, ready_frames, ready_frame_membership, pending_body_frame_loops, pending_body_frame_loop_membership, active_node_count, active_frame_count, max_active_nodes, max_active_frames, max_frame_depth, last_granted_frame, last_granted_loop >>
 
 
+ProjectFrameStepCompleted(step_id, arg_step_status, append_failure_ledger) ==
+    /\ phase = "Running"
+    /\ StepIsTracked(step_id)
+    /\ (((IF step_id \in DOMAIN step_status THEN step_status[step_id] ELSE None) = None) \/ StepStatusIs(step_id, "Dispatched"))
+    /\ (arg_step_status = "Completed")
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ step_status' = MapSet(step_status, step_id, Some("Completed"))
+    /\ output_recorded' = MapSet(output_recorded, step_id, TRUE)
+    /\ consecutive_failure_count' = 0
+    /\ UNCHANGED << tracked_steps, ordered_steps, step_condition_results, step_has_conditions, step_dependencies, step_dependency_modes, step_branches, step_collection_policies, step_quorum_thresholds, step_target_counts, step_target_success_counts, step_target_terminal_failure_counts, target_retry_counts, failure_count, escalation_threshold, max_step_retries, ready_frames, ready_frame_membership, pending_body_frame_loops, pending_body_frame_loop_membership, active_node_count, active_frame_count, max_active_nodes, max_active_frames, max_frame_depth, last_granted_frame, last_granted_loop >>
+
+
+ProjectFrameStepSkipped(step_id, arg_step_status, append_failure_ledger) ==
+    /\ phase = "Running"
+    /\ StepIsTracked(step_id)
+    /\ (((IF step_id \in DOMAIN step_status THEN step_status[step_id] ELSE None) = None) \/ StepStatusIs(step_id, "Dispatched"))
+    /\ (arg_step_status = "Skipped")
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ step_status' = MapSet(step_status, step_id, Some("Skipped"))
+    /\ output_recorded' = MapSet(output_recorded, step_id, FALSE)
+    /\ UNCHANGED << tracked_steps, ordered_steps, step_condition_results, step_has_conditions, step_dependencies, step_dependency_modes, step_branches, step_collection_policies, step_quorum_thresholds, step_target_counts, step_target_success_counts, step_target_terminal_failure_counts, target_retry_counts, failure_count, consecutive_failure_count, escalation_threshold, max_step_retries, ready_frames, ready_frame_membership, pending_body_frame_loops, pending_body_frame_loop_membership, active_node_count, active_frame_count, max_active_nodes, max_active_frames, max_frame_depth, last_granted_frame, last_granted_loop >>
+
+
+ProjectFrameStepFailedEscalatingWithLedger(step_id, arg_step_status, append_failure_ledger) ==
+    /\ phase = "Running"
+    /\ StepIsTracked(step_id)
+    /\ (((IF step_id \in DOMAIN step_status THEN step_status[step_id] ELSE None) = None) \/ StepStatusIs(step_id, "Dispatched"))
+    /\ (arg_step_status = "Failed")
+    /\ (append_failure_ledger = TRUE)
+    /\ EscalationWillTrigger
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ step_status' = MapSet(step_status, step_id, Some("Failed"))
+    /\ output_recorded' = MapSet(output_recorded, step_id, FALSE)
+    /\ failure_count' = (failure_count) + 1
+    /\ consecutive_failure_count' = (consecutive_failure_count) + 1
+    /\ UNCHANGED << tracked_steps, ordered_steps, step_condition_results, step_has_conditions, step_dependencies, step_dependency_modes, step_branches, step_collection_policies, step_quorum_thresholds, step_target_counts, step_target_success_counts, step_target_terminal_failure_counts, target_retry_counts, escalation_threshold, max_step_retries, ready_frames, ready_frame_membership, pending_body_frame_loops, pending_body_frame_loop_membership, active_node_count, active_frame_count, max_active_nodes, max_active_frames, max_frame_depth, last_granted_frame, last_granted_loop >>
+
+
+ProjectFrameStepFailedEscalatingWithoutLedger(step_id, arg_step_status, append_failure_ledger) ==
+    /\ phase = "Running"
+    /\ StepIsTracked(step_id)
+    /\ (((IF step_id \in DOMAIN step_status THEN step_status[step_id] ELSE None) = None) \/ StepStatusIs(step_id, "Dispatched"))
+    /\ (arg_step_status = "Failed")
+    /\ (append_failure_ledger = FALSE)
+    /\ EscalationWillTrigger
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ step_status' = MapSet(step_status, step_id, Some("Failed"))
+    /\ output_recorded' = MapSet(output_recorded, step_id, FALSE)
+    /\ failure_count' = (failure_count) + 1
+    /\ consecutive_failure_count' = (consecutive_failure_count) + 1
+    /\ UNCHANGED << tracked_steps, ordered_steps, step_condition_results, step_has_conditions, step_dependencies, step_dependency_modes, step_branches, step_collection_policies, step_quorum_thresholds, step_target_counts, step_target_success_counts, step_target_terminal_failure_counts, target_retry_counts, escalation_threshold, max_step_retries, ready_frames, ready_frame_membership, pending_body_frame_loops, pending_body_frame_loop_membership, active_node_count, active_frame_count, max_active_nodes, max_active_frames, max_frame_depth, last_granted_frame, last_granted_loop >>
+
+
+ProjectFrameStepFailedWithLedger(step_id, arg_step_status, append_failure_ledger) ==
+    /\ phase = "Running"
+    /\ StepIsTracked(step_id)
+    /\ (((IF step_id \in DOMAIN step_status THEN step_status[step_id] ELSE None) = None) \/ StepStatusIs(step_id, "Dispatched"))
+    /\ (arg_step_status = "Failed")
+    /\ (append_failure_ledger = TRUE)
+    /\ ~(EscalationWillTrigger)
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ step_status' = MapSet(step_status, step_id, Some("Failed"))
+    /\ output_recorded' = MapSet(output_recorded, step_id, FALSE)
+    /\ failure_count' = (failure_count) + 1
+    /\ consecutive_failure_count' = (consecutive_failure_count) + 1
+    /\ UNCHANGED << tracked_steps, ordered_steps, step_condition_results, step_has_conditions, step_dependencies, step_dependency_modes, step_branches, step_collection_policies, step_quorum_thresholds, step_target_counts, step_target_success_counts, step_target_terminal_failure_counts, target_retry_counts, escalation_threshold, max_step_retries, ready_frames, ready_frame_membership, pending_body_frame_loops, pending_body_frame_loop_membership, active_node_count, active_frame_count, max_active_nodes, max_active_frames, max_frame_depth, last_granted_frame, last_granted_loop >>
+
+
+ProjectFrameStepFailedWithoutLedger(step_id, arg_step_status, append_failure_ledger) ==
+    /\ phase = "Running"
+    /\ StepIsTracked(step_id)
+    /\ (((IF step_id \in DOMAIN step_status THEN step_status[step_id] ELSE None) = None) \/ StepStatusIs(step_id, "Dispatched"))
+    /\ (arg_step_status = "Failed")
+    /\ (append_failure_ledger = FALSE)
+    /\ ~(EscalationWillTrigger)
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ step_status' = MapSet(step_status, step_id, Some("Failed"))
+    /\ output_recorded' = MapSet(output_recorded, step_id, FALSE)
+    /\ failure_count' = (failure_count) + 1
+    /\ consecutive_failure_count' = (consecutive_failure_count) + 1
+    /\ UNCHANGED << tracked_steps, ordered_steps, step_condition_results, step_has_conditions, step_dependencies, step_dependency_modes, step_branches, step_collection_policies, step_quorum_thresholds, step_target_counts, step_target_success_counts, step_target_terminal_failure_counts, target_retry_counts, escalation_threshold, max_step_retries, ready_frames, ready_frame_membership, pending_body_frame_loops, pending_body_frame_loop_membership, active_node_count, active_frame_count, max_active_nodes, max_active_frames, max_frame_depth, last_granted_frame, last_granted_loop >>
+
+
 CancelStep(step_id) ==
     /\ phase = "Running"
     /\ StepIsTracked(step_id)
@@ -420,6 +509,12 @@ Next ==
     \/ \E step_id \in StepIdValues : FailStepEscalating(step_id)
     \/ \E step_id \in StepIdValues : FailStep(step_id)
     \/ \E step_id \in StepIdValues : SkipStep(step_id)
+    \/ \E step_id \in StepIdValues : \E arg_step_status \in StepRunStatusValues : \E append_failure_ledger \in BOOLEAN : ProjectFrameStepCompleted(step_id, arg_step_status, append_failure_ledger)
+    \/ \E step_id \in StepIdValues : \E arg_step_status \in StepRunStatusValues : \E append_failure_ledger \in BOOLEAN : ProjectFrameStepSkipped(step_id, arg_step_status, append_failure_ledger)
+    \/ \E step_id \in StepIdValues : \E arg_step_status \in StepRunStatusValues : \E append_failure_ledger \in BOOLEAN : ProjectFrameStepFailedEscalatingWithLedger(step_id, arg_step_status, append_failure_ledger)
+    \/ \E step_id \in StepIdValues : \E arg_step_status \in StepRunStatusValues : \E append_failure_ledger \in BOOLEAN : ProjectFrameStepFailedEscalatingWithoutLedger(step_id, arg_step_status, append_failure_ledger)
+    \/ \E step_id \in StepIdValues : \E arg_step_status \in StepRunStatusValues : \E append_failure_ledger \in BOOLEAN : ProjectFrameStepFailedWithLedger(step_id, arg_step_status, append_failure_ledger)
+    \/ \E step_id \in StepIdValues : \E arg_step_status \in StepRunStatusValues : \E append_failure_ledger \in BOOLEAN : ProjectFrameStepFailedWithoutLedger(step_id, arg_step_status, append_failure_ledger)
     \/ \E step_id \in StepIdValues : CancelStep(step_id)
     \/ \E step_id \in StepIdValues : \E target_count \in 0..2 : RegisterTargets(step_id, target_count)
     \/ \E step_id \in StepIdValues : \E target_id \in MeerkatIdValues : RecordTargetSuccess(step_id, target_id)

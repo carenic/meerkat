@@ -566,7 +566,6 @@ impl FlowFrameEngine {
                 };
                 let spec = self.resolve_frame_spec(&run, root_frame_id, root_spec, &frame_id)?;
                 for node_id in running_node_ids(&frame.kernel_state) {
-                    let mut healed_this_node = false;
                     match spec.nodes.get(&node_id) {
                         Some(FlowNodeSpec::Step(_)) => {
                             healed_any = true;
@@ -581,7 +580,6 @@ impl FlowFrameEngine {
                                 context,
                             )
                             .await?;
-                            healed_this_node = true;
                         }
                         Some(FlowNodeSpec::RepeatUntil(_)) => {
                             let loop_instance_id =
@@ -621,11 +619,9 @@ impl FlowFrameEngine {
                                 context,
                             )
                             .await?;
-                            healed_this_node = true;
                         }
                         None => {}
                     }
-                    let _ = healed_this_node;
                 }
             }
 
@@ -740,7 +736,7 @@ impl FlowFrameEngine {
                         run_id.clone(),
                         context,
                         &frame_id,
-                    );
+                    )?;
                     let loop_context = self.frame_loop_context(&run_after, &frame_id);
                     self.spawn_step_task(
                         workers,
@@ -1028,7 +1024,7 @@ impl FlowFrameEngine {
         run_id: RunId,
         base_context: &FlowContext,
         frame_id: &FrameId,
-    ) -> FlowContext {
+    ) -> Result<FlowContext, MobError> {
         let mut context =
             FlowContext::from_run_aggregate(run, run_id, base_context.activation_params.clone());
         for (step_id, output) in &base_context.step_outputs {
@@ -1045,15 +1041,17 @@ impl FlowFrameEngine {
         }
         if let Some((loop_id, iteration)) = self.frame_loop_context(run, frame_id)
             && let Some(iterations) = run.loop_iteration_outputs.get(&loop_id)
-            && let Some(iter_outputs) = iterations.get(iteration as usize)
         {
-            for (step_id, output) in iter_outputs {
-                // Current-iteration outputs must override the last completed
-                // iteration projection from FlowContext::from_run_aggregate.
-                context.step_outputs.insert(step_id.clone(), output.clone());
+            let iteration_index = usize_from_u64(iteration, "loop iteration index")?;
+            if let Some(iter_outputs) = iterations.get(iteration_index) {
+                for (step_id, output) in iter_outputs {
+                    // Current-iteration outputs must override the last completed
+                    // iteration projection from FlowContext::from_run_aggregate.
+                    context.step_outputs.insert(step_id.clone(), output.clone());
+                }
             }
         }
-        context
+        Ok(context)
     }
 
     fn frame_loop_context(&self, run: &MobRun, frame_id: &FrameId) -> Option<(LoopId, u64)> {
@@ -1274,7 +1272,20 @@ fn loop_id_from_state(
 }
 
 fn loop_depth(kernel_state: &meerkat_machine_kernels::KernelState) -> Result<u32, MobError> {
-    u64_from_state_field(kernel_state, "depth").map(|value| value as u32)
+    let value = u64_from_state_field(kernel_state, "depth")?;
+    u32::try_from(value).map_err(|_| {
+        MobError::Internal(format!(
+            "kernel state field 'depth' value {value} exceeds u32::MAX"
+        ))
+    })
+}
+
+fn usize_from_u64(value: u64, context: &str) -> Result<usize, MobError> {
+    usize::try_from(value).map_err(|_| {
+        MobError::Internal(format!(
+            "{context} value {value} exceeds usize::MAX on this target"
+        ))
+    })
 }
 
 fn active_body_frame_id(kernel_state: &meerkat_machine_kernels::KernelState) -> Option<FrameId> {

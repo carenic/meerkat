@@ -105,6 +105,24 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `SkipStep`
   - anchors: `flow_run_aggregate`, `flow_runtime`, `flow_terminalization`
   - scenarios: `terminalize-on-failure-or-cancel`
+- `ProjectFrameStepCompleted`
+  - anchors: `flow_run_aggregate`, `flow_runtime`, `flow_terminalization`
+  - scenarios: `create-dispatch-complete`
+- `ProjectFrameStepSkipped`
+  - anchors: `flow_run_aggregate`, `flow_runtime`, `flow_terminalization`
+  - scenarios: `terminalize-on-failure-or-cancel`
+- `ProjectFrameStepFailedEscalatingWithLedger`
+  - anchors: `flow_run_aggregate`, `flow_runtime`, `flow_terminalization`
+  - scenarios: `terminalize-on-failure-or-cancel`
+- `ProjectFrameStepFailedEscalatingWithoutLedger`
+  - anchors: `flow_run_aggregate`, `flow_runtime`, `flow_terminalization`
+  - scenarios: `terminalize-on-failure-or-cancel`
+- `ProjectFrameStepFailedWithLedger`
+  - anchors: `flow_run_aggregate`, `flow_runtime`, `flow_terminalization`
+  - scenarios: `terminalize-on-failure-or-cancel`
+- `ProjectFrameStepFailedWithoutLedger`
+  - anchors: `flow_run_aggregate`, `flow_runtime`, `flow_terminalization`
+  - scenarios: `terminalize-on-failure-or-cancel`
 - `CancelStep`
   - anchors: `flow_run_aggregate`, `flow_runtime`, `flow_terminalization`
   - scenarios: `terminalize-on-failure-or-cancel`

@@ -2,7 +2,7 @@
 
 _Generated from the Rust machine catalog. Do not edit by hand._
 
-- Version: `4`
+- Version: `5`
 - Rust owner: `meerkat-mob` / `generated::flow_run`
 
 ## State
@@ -48,6 +48,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ConditionRejected`(step_id: StepId)
 - `FailStep`(step_id: StepId)
 - `SkipStep`(step_id: StepId)
+- `ProjectFrameStepStatus`(step_id: StepId, step_status: StepRunStatus, append_failure_ledger: Bool)
 - `CancelStep`(step_id: StepId)
 - `RegisterTargets`(step_id: StepId, target_count: u32)
 - `RecordTargetSuccess`(step_id: StepId, target_id: MeerkatId)
@@ -211,6 +212,71 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `step_is_tracked`
   - `step_is_not_started`
 - Emits: `EmitStepNotice`
+- To: `Running`
+
+### `ProjectFrameStepCompleted`
+- From: `Running`
+- On: `ProjectFrameStepStatus`(step_id, step_status, append_failure_ledger)
+- Guards:
+  - `step_is_tracked`
+  - `frame_projection_origin_is_unstarted_or_dispatched`
+  - `frame_status_is_completed`
+- To: `Running`
+
+### `ProjectFrameStepSkipped`
+- From: `Running`
+- On: `ProjectFrameStepStatus`(step_id, step_status, append_failure_ledger)
+- Guards:
+  - `step_is_tracked`
+  - `frame_projection_origin_is_unstarted_or_dispatched`
+  - `frame_status_is_skipped`
+- To: `Running`
+
+### `ProjectFrameStepFailedEscalatingWithLedger`
+- From: `Running`
+- On: `ProjectFrameStepStatus`(step_id, step_status, append_failure_ledger)
+- Guards:
+  - `step_is_tracked`
+  - `frame_projection_origin_is_unstarted_or_dispatched`
+  - `frame_status_is_failed`
+  - `append_failure_ledger_requested`
+  - `escalation_will_trigger`
+- Emits: `AppendFailureLedger`, `EscalateSupervisor`
+- To: `Running`
+
+### `ProjectFrameStepFailedEscalatingWithoutLedger`
+- From: `Running`
+- On: `ProjectFrameStepStatus`(step_id, step_status, append_failure_ledger)
+- Guards:
+  - `step_is_tracked`
+  - `frame_projection_origin_is_unstarted_or_dispatched`
+  - `frame_status_is_failed`
+  - `append_failure_ledger_not_requested`
+  - `escalation_will_trigger`
+- Emits: `EscalateSupervisor`
+- To: `Running`
+
+### `ProjectFrameStepFailedWithLedger`
+- From: `Running`
+- On: `ProjectFrameStepStatus`(step_id, step_status, append_failure_ledger)
+- Guards:
+  - `step_is_tracked`
+  - `frame_projection_origin_is_unstarted_or_dispatched`
+  - `frame_status_is_failed`
+  - `append_failure_ledger_requested`
+  - `escalation_does_not_trigger`
+- Emits: `AppendFailureLedger`
+- To: `Running`
+
+### `ProjectFrameStepFailedWithoutLedger`
+- From: `Running`
+- On: `ProjectFrameStepStatus`(step_id, step_status, append_failure_ledger)
+- Guards:
+  - `step_is_tracked`
+  - `frame_projection_origin_is_unstarted_or_dispatched`
+  - `frame_status_is_failed`
+  - `append_failure_ledger_not_requested`
+  - `escalation_does_not_trigger`
 - To: `Running`
 
 ### `CancelStep`

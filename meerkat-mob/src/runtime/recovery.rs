@@ -22,6 +22,13 @@ pub enum RestoreIncompatible {
 /// Reconcile run scheduler state from frame/loop snapshots.
 ///
 /// Must be called before resuming a run after a crash or restart.
+///
+/// RMAT exception:
+/// `ready_frames`, `pending_body_frame_loops`, `active_node_count`, and
+/// `active_frame_count` are rebuildable scheduler projections, not canonical
+/// semantic truth. Recovery is therefore allowed to overwrite them directly
+/// from the authoritative frame/loop snapshots after a crash.
+///
 /// Returns `Err(RestoreIncompatible)` if the persisted state is irrecoverable.
 pub fn reconcile_run_state(run: &mut MobRun) -> Result<(), RestoreIncompatible> {
     // 1. Pre-v3 check: reject active runs that predate descriptor-backed frame recovery.

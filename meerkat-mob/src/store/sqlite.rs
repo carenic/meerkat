@@ -906,11 +906,16 @@ impl MobRunStore for SqliteMobRunStore {
                         .insert(StepId::from(step_output_key.as_str()), step_output);
                 }
                 Some((loop_id, iteration)) => {
+                    let iteration_index = usize::try_from(iteration).map_err(|_| {
+                        MobError::Internal(format!(
+                            "loop iteration index {iteration} exceeds usize::MAX on this target"
+                        ))
+                    })?;
                     let outputs = run.loop_iteration_outputs.entry(loop_id).or_default();
-                    while outputs.len() <= iteration as usize {
+                    while outputs.len() <= iteration_index {
                         outputs.push(indexmap::IndexMap::new());
                     }
-                    outputs[iteration as usize]
+                    outputs[iteration_index]
                         .insert(StepId::from(step_output_key.as_str()), step_output);
                 }
             }

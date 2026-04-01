@@ -377,14 +377,19 @@ impl MobRunStore for InMemoryMobRunStore {
                 );
             }
             Some((loop_id, iteration)) => {
+                let iteration_index = usize::try_from(iteration).map_err(|_| {
+                    MobError::Internal(format!(
+                        "loop iteration index {iteration} exceeds usize::MAX on this target"
+                    ))
+                })?;
                 let vec = run
                     .loop_iteration_outputs
                     .entry(loop_id.clone())
-                    .or_insert_with(Vec::new);
-                while vec.len() <= iteration as usize {
+                    .or_default();
+                while vec.len() <= iteration_index {
                     vec.push(IndexMap::new());
                 }
-                vec[iteration as usize].insert(
+                vec[iteration_index].insert(
                     crate::ids::StepId::from(step_output_key.as_str()),
                     step_output,
                 );
