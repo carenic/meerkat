@@ -177,8 +177,8 @@ pub trait MobRunStore: Send + Sync {
     /// CAS wrapper 2: grant node slot — atomically update run flow state + frame state.
     ///
     /// # Frame support
-    /// This method requires [`InMemoryMobRunStore`]. The [`RedbMobRunStore`] returns
-    /// `Err(MobError::Internal(...))` until redb transactions are implemented for frame-aware flows.
+    /// Backends that do not support frame-aware atomic persistence may return
+    /// `Err(MobError::NotYetImplemented(...))`.
     async fn cas_grant_node_slot(
         &self,
         run_id: &RunId,
@@ -196,8 +196,8 @@ pub trait MobRunStore: Send + Sync {
     /// in `loop_iteration_outputs[loop_id][iteration]`.
     ///
     /// # Frame support
-    /// This method requires [`InMemoryMobRunStore`]. The [`RedbMobRunStore`] returns
-    /// `Err(MobError::Internal(...))` until redb transactions are implemented for frame-aware flows.
+    /// Backends that do not support frame-aware atomic persistence may return
+    /// `Err(MobError::NotYetImplemented(...))`.
     #[allow(clippy::too_many_arguments)]
     async fn cas_complete_step_and_record_output(
         &self,
@@ -213,8 +213,8 @@ pub trait MobRunStore: Send + Sync {
     /// CAS wrapper 4: start loop — register loop + update run state + parent frame.
     ///
     /// # Frame support
-    /// This method requires [`InMemoryMobRunStore`]. The [`RedbMobRunStore`] returns
-    /// `Err(MobError::Internal(...))` until redb transactions are implemented for frame-aware flows.
+    /// Backends that do not support frame-aware atomic persistence may return
+    /// `Err(MobError::NotYetImplemented(...))`.
     #[allow(clippy::too_many_arguments)]
     async fn cas_start_loop(
         &self,
@@ -231,8 +231,8 @@ pub trait MobRunStore: Send + Sync {
     /// CAS wrapper 5: register pending body frame — loop transition + run state update.
     ///
     /// # Frame support
-    /// This method requires [`InMemoryMobRunStore`]. The [`RedbMobRunStore`] returns
-    /// `Err(MobError::Internal(...))` until redb transactions are implemented for frame-aware flows.
+    /// Backends that do not support frame-aware atomic persistence may return
+    /// `Err(MobError::NotYetImplemented(...))`.
     async fn cas_loop_request_body_frame(
         &self,
         run_id: &RunId,
@@ -246,8 +246,8 @@ pub trait MobRunStore: Send + Sync {
     /// CAS wrapper 6: body frame start — loop transition + register new frame + run state update.
     ///
     /// # Frame support
-    /// This method requires [`InMemoryMobRunStore`]. The [`RedbMobRunStore`] returns
-    /// `Err(MobError::Internal(...))` until redb transactions are implemented for frame-aware flows.
+    /// Backends that do not support frame-aware atomic persistence may return
+    /// `Err(MobError::NotYetImplemented(...))`.
     #[allow(clippy::too_many_arguments)]
     async fn cas_grant_body_frame_start(
         &self,
@@ -265,8 +265,8 @@ pub trait MobRunStore: Send + Sync {
     /// CAS wrapper 7: body frame completion — terminalize frame + loop state update + run state.
     ///
     /// # Frame support
-    /// This method requires [`InMemoryMobRunStore`]. The [`RedbMobRunStore`] returns
-    /// `Err(MobError::Internal(...))` until redb transactions are implemented for frame-aware flows.
+    /// Backends that do not support frame-aware atomic persistence may return
+    /// `Err(MobError::NotYetImplemented(...))`.
     #[allow(clippy::too_many_arguments)]
     async fn cas_complete_body_frame(
         &self,
@@ -284,8 +284,8 @@ pub trait MobRunStore: Send + Sync {
     /// CAS wrapper 8: loop completion — loop state + run state + parent frame update.
     ///
     /// # Frame support
-    /// This method requires [`InMemoryMobRunStore`]. The [`RedbMobRunStore`] returns
-    /// `Err(MobError::Internal(...))` until redb transactions are implemented for frame-aware flows.
+    /// Backends that do not support frame-aware atomic persistence may return
+    /// `Err(MobError::NotYetImplemented(...))`.
     #[allow(clippy::too_many_arguments)]
     async fn cas_complete_loop(
         &self,

@@ -139,7 +139,7 @@ impl FlowSmokePaths {
             project_root: root.join("project-root"),
             context_root: root.join("context-root"),
             sessions_root: root.join("sessions-jsonl"),
-            mob_db_path: root.join("mob.redb"),
+            mob_db_path: root.join("mob.db"),
         }
     }
 }
@@ -2445,7 +2445,8 @@ async fn setup_flow_mob(
     let session_service = persistent_service(&paths);
     let mob_service: Arc<dyn MobSessionService> = session_service.clone();
     let runtime_adapter = Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral());
-    let storage = MobStorage::redb(&paths.mob_db_path).expect("create redb mob storage");
+    let storage =
+        MobStorage::persistent(&paths.mob_db_path).expect("create persistent mob storage");
 
     let handle = MobBuilder::new(flow_definition(models), storage)
         .with_session_service(mob_service.clone())
