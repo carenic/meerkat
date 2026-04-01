@@ -298,30 +298,20 @@ pub async fn handle_create(
         .preload_skills
         .map(|ids| ids.into_iter().map(meerkat_core::skills::SkillId).collect());
 
-    // Wire callback tools if external_tools are provided or globally registered.
-    // Inline (per-session) tools take precedence over globals with the same name.
+    // Wire callback tools backed by the live registered_tools list.
+    // Tools added later via tools/register are picked up dynamically at each
+    // turn boundary (via poll_external_updates). Per-session inline tools
+    // (from params.external_tools) are held separately inside the dispatcher
+    // and take precedence on name collision with globals.
     {
-        let mut all_tools: Vec<meerkat_core::ToolDef> = params.external_tools.unwrap_or_default();
-        let mut seen: std::collections::HashSet<String> =
-            all_tools.iter().map(|t| t.name.clone()).collect();
-
-        // Merge globally registered tools, skipping duplicates (inline wins).
-        if let Ok(global) = runtime.registered_tools().read() {
-            for tool in global.iter() {
-                if seen.insert(tool.name.clone()) {
-                    all_tools.push(tool.clone());
-                }
-            }
-        }
-
-        if !all_tools.is_empty()
-            && let Some(tx) = runtime.callback_request_tx()
-        {
+        let inline_tools: Vec<meerkat_core::ToolDef> = params.external_tools.unwrap_or_default();
+        if let Some(tx) = runtime.callback_request_tx() {
             let dispatcher: Arc<dyn meerkat_core::AgentToolDispatcher> =
                 Arc::new(crate::callback_dispatcher::CallbackToolDispatcher::new(
-                    all_tools,
+                    runtime.registered_tools(),
                     tx,
                     runtime.callback_id_counter(),
+                    inline_tools,
                 ));
             build_config.external_tools = Some(dispatcher);
         }

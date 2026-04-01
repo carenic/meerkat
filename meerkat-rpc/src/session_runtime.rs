@@ -624,6 +624,25 @@ impl SessionRuntime {
         self.service.clone()
     }
 
+    /// Pre-initialize the callback channel and return the receiver half.
+    ///
+    /// Call this before any code that reads `callback_request_tx()` (e.g.
+    /// mob resume that invokes an `ExternalToolsProvider`). The server
+    /// constructor that accepts a pre-created rx will reuse this channel
+    /// instead of creating a new one.
+    pub fn init_callback_channel(
+        &self,
+    ) -> mpsc::Receiver<(
+        crate::protocol::RpcRequest,
+        tokio::sync::oneshot::Sender<crate::protocol::RpcResponse>,
+    )> {
+        let (tx, rx) = mpsc::channel(crate::NOTIFICATION_CHANNEL_CAPACITY);
+        let id_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let registered_tools = Arc::new(StdRwLock::new(Vec::new()));
+        self.set_callback_channel(tx, id_counter, registered_tools);
+        rx
+    }
+
     /// Set the callback request channel for tool callbacks.
     ///
     /// Takes `&self` so it can be called after the runtime is wrapped in `Arc`
@@ -1972,25 +1991,18 @@ impl SessionRuntime {
             build_config.llm_client_override = Some(client.clone());
         }
 
-        // Restore callback tools from globally registered definitions.
-        // Note: per-session external_tools (from CreateSessionParams) are
-        // ephemeral in-process handlers and cannot survive a runtime restart.
-        // Only globally registered tools (via tools/register) are restored.
+        // Restore callback tools backed by the live registered_tools list.
+        // The dynamic dispatcher picks up tools registered later via
+        // tools/register at each turn boundary (poll_external_updates).
         if let Some(tx) = self.callback_request_tx() {
-            let tools: Vec<meerkat_core::ToolDef> = self
-                .registered_tools()
-                .read()
-                .map(|g| g.iter().cloned().collect())
-                .unwrap_or_default();
-            if !tools.is_empty() {
-                let dispatcher: Arc<dyn meerkat_core::AgentToolDispatcher> =
-                    Arc::new(crate::callback_dispatcher::CallbackToolDispatcher::new(
-                        tools,
-                        tx,
-                        self.callback_id_counter(),
-                    ));
-                build_config.external_tools = Some(dispatcher);
-            }
+            let dispatcher: Arc<dyn meerkat_core::AgentToolDispatcher> =
+                Arc::new(crate::callback_dispatcher::CallbackToolDispatcher::new(
+                    self.registered_tools(),
+                    tx,
+                    self.callback_id_counter(),
+                    vec![],
+                ));
+            build_config.external_tools = Some(dispatcher);
         }
 
         // Stage as pending and re-enter the materialization path.
