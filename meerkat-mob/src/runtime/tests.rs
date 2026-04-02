@@ -4265,7 +4265,7 @@ async fn test_wait_for_kickoff_complete_returns_broken_snapshot_without_hanging(
 }
 
 #[tokio::test]
-async fn test_mob_flow_tools_dispatch_mutate_and_query_real_run_state() {
+async fn test_mob_flow_tools_hidden_without_operator_context() {
     let mut definition =
         with_cancel_grace_timeout(sample_definition_with_single_step_flow(60_000, 8), 25);
     let worker = definition
@@ -4283,8 +4283,6 @@ async fn test_mob_flow_tools_dispatch_mutate_and_query_real_run_state() {
         .session_id()
         .expect("session-backed")
         .clone();
-    service.set_flow_turn_delay_ms(60_000);
-    service.set_flow_turn_never_terminal(true);
 
     let tool_names = service.external_tool_names(&sid_1).await;
     for required in [
@@ -4294,20 +4292,18 @@ async fn test_mob_flow_tools_dispatch_mutate_and_query_real_run_state() {
         "mob_cancel_flow",
     ] {
         assert!(
-            tool_names.contains(&required.to_string()),
-            "expected flow tool '{required}' to be present"
+            !tool_names.contains(&required.to_string()),
+            "flow operator tool '{required}' must stay hidden without runtime-injected operator context"
         );
     }
 
-    let listed = service
+    let listed_err = service
         .dispatch_external_tool(&sid_1, "mob_list_flows", serde_json::json!({}))
         .await
-        .expect("mob_list_flows");
-    let listed_json: serde_json::Value =
-        serde_json::from_str(&listed.text_content()).expect("flows payload json");
-    assert_eq!(listed_json["flows"], serde_json::json!(["demo"]));
+        .expect_err("mob_list_flows should be unavailable");
+    assert!(matches!(listed_err, ToolError::NotFound { .. }));
 
-    let started = service
+    let started_err = service
         .dispatch_external_tool(
             &sid_1,
             "mob_run_flow",
@@ -4317,57 +4313,12 @@ async fn test_mob_flow_tools_dispatch_mutate_and_query_real_run_state() {
             }),
         )
         .await
-        .expect("mob_run_flow");
-    let started_json: serde_json::Value =
-        serde_json::from_str(&started.text_content()).expect("run payload json");
-    let run_id_str = started_json["run_id"]
-        .as_str()
-        .expect("run_id should be a string");
-    let run_id = run_id_str.parse::<RunId>().expect("run_id should parse");
-
-    let status = service
-        .dispatch_external_tool(
-            &sid_1,
-            "mob_flow_status",
-            serde_json::json!({"run_id": run_id_str}),
-        )
-        .await
-        .expect("mob_flow_status");
-    let status_json: serde_json::Value =
-        serde_json::from_str(&status.text_content()).expect("status payload json");
-    assert_eq!(status_json["run"]["run_id"], run_id_str);
-    assert_eq!(status_json["run"]["flow_id"], "demo");
-
-    service
-        .dispatch_external_tool(
-            &sid_1,
-            "mob_cancel_flow",
-            serde_json::json!({"run_id": run_id_str}),
-        )
-        .await
-        .expect("mob_cancel_flow");
-
-    let terminal = wait_for_run_terminal(&handle, &run_id, Duration::from_secs(8)).await;
-    assert_eq!(
-        terminal.status,
-        MobRunStatus::Canceled,
-        "cancel dispatch should drive the run to canceled"
-    );
-
-    let events = handle.events().replay_all().await.expect("replay");
-    assert!(
-        events.iter().any(|event| {
-            matches!(
-                &event.kind,
-                MobEventKind::FlowCanceled { run_id: id, .. } if id == &run_id
-            )
-        }),
-        "cancel dispatch should emit FlowCanceled"
-    );
+        .expect_err("mob_run_flow should be unavailable");
+    assert!(matches!(started_err, ToolError::NotFound { .. }));
 }
 
 #[tokio::test]
-async fn test_mob_flow_tools_reject_invalid_run_id_arguments() {
+async fn test_mob_flow_status_tool_is_hidden_without_operator_context_even_for_bad_args() {
     let mut definition = sample_definition_with_single_step_flow(500, 8);
     let worker = definition
         .profiles
@@ -4391,22 +4342,16 @@ async fn test_mob_flow_tools_reject_invalid_run_id_arguments() {
             serde_json::json!({"run_id":"not-a-uuid"}),
         )
         .await
-        .expect_err("invalid run_id should fail");
+        .expect_err("mob_flow_status should be unavailable");
     assert!(
-        matches!(error, ToolError::InvalidArguments { .. }),
-        "flow status should surface invalid run_id as invalid arguments"
+        matches!(error, ToolError::NotFound { .. }),
+        "flow operator tools should stay hidden without runtime-injected operator context"
     );
 }
 
 #[tokio::test]
 async fn test_flow_step_tool_overlay_is_step_scoped() {
     let mut definition = sample_definition_with_single_step_flow(2_000, 8);
-    let worker = definition
-        .profiles
-        .get_mut(&ProfileName::from("worker"))
-        .expect("worker profile exists");
-    worker.tools.mob = true;
-
     let flow = definition
         .flows
         .get_mut(&flow_id("demo"))
@@ -4433,24 +4378,10 @@ async fn test_flow_step_tool_overlay_is_step_scoped() {
         .expect("session-backed")
         .clone();
 
-    let started = service
-        .dispatch_external_tool(
-            &sid,
-            "mob_run_flow",
-            serde_json::json!({
-                "flow_id": "demo",
-                "params": {}
-            }),
-        )
+    let run_id = handle
+        .run_flow(FlowId::from("demo"), serde_json::json!({}))
         .await
         .expect("start flow");
-    let started_json: serde_json::Value =
-        serde_json::from_str(&started.text_content()).expect("run payload json");
-    let run_id = started_json["run_id"]
-        .as_str()
-        .expect("run_id string")
-        .parse::<RunId>()
-        .expect("run_id parse");
 
     let terminal = wait_for_run_terminal(&handle, &run_id, Duration::from_secs(5)).await;
     assert!(

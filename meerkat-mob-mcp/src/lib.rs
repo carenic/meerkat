@@ -2623,11 +2623,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dispatcher_exposes_16_tools() {
+    async fn test_dispatcher_exposes_expected_tools() {
         let svc = Arc::new(MockSessionSvc::new());
         let state = Arc::new(MobMcpState::new(svc));
         let d = MobMcpDispatcher::new(state);
-        assert_eq!(d.tools().len(), 16);
+        let tools = d.tools();
+        let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(
+            tool_names,
+            vec![
+                "mob_create",
+                "mob_list",
+                "mob_lifecycle",
+                "mob_events",
+                "mob_run_flow",
+                "mob_flow_status",
+                "mob_cancel_flow",
+                "meerkat_spawn",
+                "meerkat_retire",
+                "meerkat_list",
+                "meerkat_wire",
+                "mob_respawn",
+                "meerkat_force_cancel",
+                "meerkat_status",
+                "mob_wait_kickoff",
+            ]
+        );
     }
 
     #[tokio::test]
