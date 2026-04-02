@@ -853,7 +853,6 @@ async fn initialize_methods_list_complete() {
             "mob/wire",
             "mob/unwire",
             "mob/members",
-            "mob/send",
             "mob/events",
             "mob/append_system_context",
             "mob/flows",

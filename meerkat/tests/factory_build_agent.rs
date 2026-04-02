@@ -15,8 +15,9 @@ use meerkat::BuildAgentError;
 use meerkat::{AgentBuildConfig, AgentFactory, LlmDoneOutcome, LlmEvent, LlmRequest};
 use meerkat_client::LlmClient;
 use meerkat_core::{
-    Config, Provider, ProviderConfig, Session, SessionId, SessionMetadata, SessionTooling,
-    ToolCategoryOverride, UserMessage,
+    AgentToolDispatcher, Config, Provider, ProviderConfig, Session, SessionId, SessionMetadata,
+    SessionTooling, ToolCallView, ToolCategoryOverride, ToolDef, ToolDispatchOutcome, ToolError,
+    UserMessage,
 };
 use meerkat_store::{SessionFilter, SessionStore, SessionStoreError};
 use serde_json::json;
@@ -62,6 +63,37 @@ impl LlmClient for MockLlmClient {
 
 fn temp_factory(temp: &tempfile::TempDir) -> AgentFactory {
     AgentFactory::new(temp.path().join("sessions"))
+}
+
+struct EmptyDispatcher;
+
+#[async_trait]
+impl AgentToolDispatcher for EmptyDispatcher {
+    fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+        Vec::<Arc<ToolDef>>::new().into()
+    }
+
+    async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
+        Err(ToolError::not_found(call.name))
+    }
+}
+
+struct RecordingMobToolsFactory {
+    observed_operator_capability: Arc<std::sync::Mutex<Vec<bool>>>,
+}
+
+#[async_trait]
+impl meerkat_core::service::MobToolsFactory for RecordingMobToolsFactory {
+    async fn build_mob_tools(
+        &self,
+        args: meerkat_core::service::MobToolsBuildArgs,
+    ) -> Result<Arc<dyn AgentToolDispatcher>, Box<dyn std::error::Error + Send + Sync>> {
+        self.observed_operator_capability
+            .lock()
+            .expect("recording mutex")
+            .push(args.operator_capabilities_present);
+        Ok(Arc::new(EmptyDispatcher))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,4 +1190,24 @@ async fn resume_with_enable_mob_stays_enabled() {
         ToolCategoryOverride::Enable,
         "Enable mob should be preserved on resume despite factory disabling it"
     );
+}
+
+#[tokio::test]
+async fn ambient_factory_mob_enable_does_not_imply_operator_capabilities() {
+    let temp = tempfile::tempdir().unwrap();
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mob_factory = Arc::new(RecordingMobToolsFactory {
+        observed_operator_capability: Arc::clone(&observed),
+    });
+    let factory = temp_factory(&temp).mob(true).mob_tools_factory(mob_factory);
+    let config = Config::default();
+
+    let build_config = AgentBuildConfig {
+        llm_client_override: Some(Arc::new(MockLlmClient)),
+        ..AgentBuildConfig::new("claude-sonnet-4-5")
+    };
+
+    let _agent = factory.build_agent(build_config, &config).await.unwrap();
+    let observed = observed.lock().expect("recording mutex");
+    assert_eq!(observed.as_slice(), &[false]);
 }

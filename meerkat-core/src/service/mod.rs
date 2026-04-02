@@ -247,6 +247,11 @@ pub struct MobToolsBuildArgs {
     pub session_id: crate::SessionId,
     /// Model name of the owning agent — inherited by implicit mob helpers.
     pub model: String,
+    /// Whether runtime-injected operator capabilities are explicitly present.
+    ///
+    /// This is capability-oriented only; it does not imply identity,
+    /// ownership, or durable authorization semantics.
+    pub operator_capabilities_present: bool,
     /// Comms name of the owning agent (for building TrustedPeerSpec).
     pub comms_name: Option<String>,
     /// Optional comms runtime for auto-wiring spawned members.

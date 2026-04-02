@@ -1304,77 +1304,6 @@ impl MobMcpDispatcher {
                 json!({"type":"object","properties":{"mob_id":{"type":"string"},"a":{"type":"string"},"b":{"type":"string"},"action":{"type":"string","enum":["wire","unwire"]}},"required":["mob_id","a","b","action"]}),
             ),
             tool(
-                "meerkat_message",
-                &format!(
-                    "Send typed external content to a spawned meerkat. Required: mob_id, meerkat_id, content. Optional: handling_mode, render_metadata. {COMMON}"
-                ),
-                json!({
-                    "type":"object",
-                    "properties":{
-                        "mob_id":{"type":"string"},
-                        "meerkat_id":{"type":"string"},
-                        "content":{
-                            "oneOf":[
-                                {"type":"string"},
-                                {
-                                    "type":"array",
-                                    "items":{
-                                        "oneOf":[
-                                            {
-                                                "type":"object",
-                                                "properties":{
-                                                    "type":{"const":"text"},
-                                                    "text":{"type":"string"}
-                                                },
-                                                "required":["type","text"]
-                                            },
-                                            {
-                                                "type":"object",
-                                                "properties":{
-                                                    "type":{"const":"image"},
-                                                    "media_type":{"type":"string"},
-                                                    "data":{"type":"string"}
-                                                },
-                                                "required":["type","media_type","data"]
-                                            }
-                                        ]
-                                    }
-                                }
-                            ]
-                        },
-                        "handling_mode":{
-                            "type":"string",
-                            "enum":["queue","steer"]
-                        },
-                        "render_metadata":{
-                            "type":"object",
-                            "properties":{
-                                "class":{
-                                    "type":"string",
-                                    "enum":[
-                                        "user_prompt",
-                                        "peer_message",
-                                        "peer_request",
-                                        "peer_response",
-                                        "external_event",
-                                        "flow_step",
-                                        "continuation",
-                                        "system_notice",
-                                        "tool_scope_notice",
-                                        "ops_progress"
-                                    ]
-                                },
-                                "salience":{
-                                    "type":"string",
-                                    "enum":["background","normal","important","urgent"]
-                                }
-                            }
-                        }
-                    },
-                    "required":["mob_id","meerkat_id","content"]
-                }),
-            ),
-            tool(
                 "mob_respawn",
                 &format!("Retire and re-spawn a meerkat with the same profile. \
                      Required: mob_id, meerkat_id. Optional: initial_message. \
@@ -1547,16 +1476,6 @@ impl WireActionArgs {
             _ => Err("wire action requires either {local, target} or legacy {a, b}".to_string()),
         }
     }
-}
-#[derive(Deserialize)]
-struct MessageArgs {
-    mob_id: String,
-    meerkat_id: String,
-    content: ContentInput,
-    #[serde(default)]
-    handling_mode: HandlingMode,
-    #[serde(default)]
-    render_metadata: Option<RenderMetadata>,
 }
 #[derive(Deserialize)]
 struct RunFlowArgs {
@@ -1864,23 +1783,6 @@ impl AgentToolDispatcher for MobMcpDispatcher {
                     }
                 }
                 encode(call, json!({"ok": true}))
-            }
-            "meerkat_message" => {
-                let args: MessageArgs = call
-                    .parse_args()
-                    .map_err(|e| ToolError::invalid_arguments(call.name, e.to_string()))?;
-                let receipt = self
-                    .state
-                    .mob_member_send(
-                        &MobId::from(args.mob_id),
-                        MeerkatId::from(args.meerkat_id),
-                        args.content,
-                        args.handling_mode,
-                        args.render_metadata,
-                    )
-                    .await
-                    .map_err(|e| map_mob_err(call, e))?;
-                encode(call, json!(receipt))
             }
             "mob_respawn" => {
                 let args: RespawnArgs = call
@@ -2721,11 +2623,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dispatcher_exposes_16_tools() {
+    async fn test_dispatcher_exposes_expected_tools() {
         let svc = Arc::new(MockSessionSvc::new());
         let state = Arc::new(MobMcpState::new(svc));
         let d = MobMcpDispatcher::new(state);
-        assert_eq!(d.tools().len(), 16);
+        let tools = d.tools();
+        let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(
+            tool_names,
+            vec![
+                "mob_create",
+                "mob_list",
+                "mob_lifecycle",
+                "mob_events",
+                "mob_run_flow",
+                "mob_flow_status",
+                "mob_cancel_flow",
+                "meerkat_spawn",
+                "meerkat_retire",
+                "meerkat_list",
+                "meerkat_wire",
+                "mob_respawn",
+                "meerkat_force_cancel",
+                "meerkat_status",
+                "mob_wait_kickoff",
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2996,12 +2919,6 @@ timeout_ms = 1000
             json!({"mob_id": mob_id, "a":"w1", "b":"w2", "action":"wire"}),
         )
         .await;
-        let _ = call_tool(
-            &d,
-            "meerkat_message",
-            json!({"mob_id": mob_id, "meerkat_id":"lead", "content":"ping"}),
-        )
-        .await;
         let listed = call_tool(&d, "meerkat_list", json!({"mob_id": mob_id})).await;
         assert_eq!(
             listed["members"].as_array().map(std::vec::Vec::len),
@@ -3100,12 +3017,6 @@ timeout_ms = 1000
         .await;
         let members = call_tool(&d, "meerkat_list", json!({"mob_id": mob_id})).await;
         assert_eq!(members["members"].as_array().unwrap().len(), 3); // lead + 2 workers
-        call_tool(
-            &d,
-            "meerkat_message",
-            json!({"mob_id": mob_id, "meerkat_id":"lead", "content":"status"}),
-        )
-        .await;
         let status = call_tool(&d, "mob_list", json!({"mob_id": mob_id})).await;
         assert_eq!(status["status"], "Running");
 

@@ -518,8 +518,18 @@ pub async fn handle_lifecycle(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MobSendParams {
+pub struct MobAppendSystemContextParams {
+    pub mob_id: String,
+    pub meerkat_id: String,
+    pub text: String,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MobMemberSendParams {
     pub mob_id: String,
     pub meerkat_id: String,
     pub content: ContentInput,
@@ -529,12 +539,12 @@ pub struct MobSendParams {
     pub render_metadata: Option<RenderMetadata>,
 }
 
-pub async fn handle_send(
+pub async fn handle_member_send(
     id: Option<RpcId>,
     params: Option<&RawValue>,
     state: &Arc<MobMcpState>,
 ) -> RpcResponse {
-    let params: MobSendParams = match parse_params(params) {
+    let params: MobMemberSendParams = match parse_params(params) {
         Ok(p) => p,
         Err(resp) => return resp.with_id(id),
     };
@@ -542,30 +552,28 @@ pub async fn handle_send(
         Ok(m) => m,
         Err(resp) => return resp,
     };
+    let meerkat_id = MeerkatId::from(params.meerkat_id.as_str());
     match state
         .mob_member_send(
             &mob_id,
-            MeerkatId::from(params.meerkat_id.as_str()),
+            meerkat_id.clone(),
             params.content,
             params.handling_mode,
             params.render_metadata,
         )
         .await
     {
-        Ok(receipt) => RpcResponse::success(id, serde_json::json!(receipt)),
+        Ok(receipt) => RpcResponse::success(
+            id,
+            serde_json::json!({
+                "mob_id": mob_id,
+                "member_id": receipt.member_id,
+                "session_id": receipt.session_id,
+                "handling_mode": receipt.handling_mode,
+            }),
+        ),
         Err(err) => invalid_params(id, err.to_string()),
     }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct MobAppendSystemContextParams {
-    pub mob_id: String,
-    pub meerkat_id: String,
-    pub text: String,
-    #[serde(default)]
-    pub source: Option<String>,
-    #[serde(default)]
-    pub idempotency_key: Option<String>,
 }
 
 pub async fn handle_append_system_context(
@@ -1022,33 +1030,6 @@ mod tests {
             serde_json::json!(["peer-a", "peer-b"])
         );
         Ok(())
-    }
-
-    #[test]
-    fn mob_send_params_accept_canonical_content_field() -> Result<(), Box<dyn std::error::Error>> {
-        let value = serde_json::json!({
-            "mob_id": "mob-1",
-            "meerkat_id": "worker-1",
-            "content": "hello from canonical caller"
-        });
-        let params: MobSendParams = serde_json::from_value(value)?;
-        assert_eq!(
-            params.content,
-            ContentInput::Text("hello from canonical caller".into())
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn mob_send_params_reject_legacy_message_field() {
-        let value = serde_json::json!({
-            "mob_id": "mob-1",
-            "meerkat_id": "worker-1",
-            "message": "legacy hello"
-        });
-        let err = serde_json::from_value::<MobSendParams>(value)
-            .expect_err("legacy message field must be rejected");
-        assert!(err.to_string().contains("unknown field `message`"));
     }
 
     #[test]

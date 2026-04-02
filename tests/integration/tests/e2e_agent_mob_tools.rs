@@ -812,6 +812,7 @@ async fn e2e_resume_model_override_recreates_implicit_mob() {
         .build_mob_tools(meerkat_core::service::MobToolsBuildArgs {
             session_id: session_id.clone(),
             model: model_b.clone(),
+            operator_capabilities_present: true,
             comms_name: None,
             comms_runtime: None,
         })

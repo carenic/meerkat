@@ -302,38 +302,6 @@
     ],
     "title": "MobPeerTarget"
   },
-  "MobSendResult": {
-    "$defs": {
-      "WireHandlingMode": {
-        "description": "Public handling mode for mob member delivery.",
-        "enum": [
-          "queue",
-          "steer"
-        ],
-        "type": "string"
-      }
-    },
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Response payload for `mob/send`.",
-    "properties": {
-      "handling_mode": {
-        "$ref": "#/$defs/WireHandlingMode"
-      },
-      "member_id": {
-        "type": "string"
-      },
-      "session_id": {
-        "type": "string"
-      }
-    },
-    "required": [
-      "member_id",
-      "session_id",
-      "handling_mode"
-    ],
-    "title": "MobSendResult",
-    "type": "object"
-  },
   "MobUnwireResult": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "description": "Response payload for `mob/unwire`.",

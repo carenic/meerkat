@@ -3707,7 +3707,7 @@ async fn test_spawn_fails_when_tool_bundle_not_registered() {
 }
 
 #[tokio::test]
-async fn test_mob_management_tools_dispatch_to_handle() {
+async fn test_mob_management_tools_hidden_without_operator_context() {
     let (handle, service) = create_test_mob(sample_definition_with_mob_tools()).await;
     let sid_1 = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
@@ -3727,120 +3727,23 @@ async fn test_mob_management_tools_dispatch_to_handle() {
         "list_meerkats",
     ] {
         assert!(
-            tool_names.contains(&required.to_string()),
-            "expected tool '{required}' to be present"
+            !tool_names.contains(&required.to_string()),
+            "operator tool '{required}' must stay hidden without runtime-injected operator context"
         );
     }
 
-    let spawn_outcome = service
+    let spawn_err = service
         .dispatch_external_tool_outcome(
             &sid_1,
             "spawn_meerkat",
             serde_json::json!({"profile": "worker", "meerkat_id": "w-2"}),
         )
         .await
-        .expect("spawn_meerkat tool");
-    let spawn_json: serde_json::Value = serde_json::from_str(&spawn_outcome.result.text_content())
-        .expect("spawn_meerkat result JSON");
-    assert!(
-        spawn_json.get("operation_id").is_none(),
-        "app-facing mob spawn result must not expose raw operation_id"
-    );
-    assert!(
-        handle.get_member(&MeerkatId::from("w-2")).await.is_some(),
-        "spawn_meerkat should create a new roster entry"
-    );
-
-    let spawn_many_outcome = service
-        .dispatch_external_tool_outcome(
-            &sid_1,
-            "spawn_many_meerkats",
-            serde_json::json!({
-                "specs": [
-                    {"profile": "worker", "meerkat_id": "w-many-1"},
-                    {"profile": "worker", "meerkat_id": "w-many-2"}
-                ]
-            }),
-        )
-        .await
-        .expect("spawn_many_meerkats tool");
-    let spawn_many_json: serde_json::Value =
-        serde_json::from_str(&spawn_many_outcome.result.text_content())
-            .expect("spawn_many_meerkats result JSON");
-    let results = spawn_many_json["results"]
-        .as_array()
-        .expect("spawn_many results array");
-    assert!(
-        results
-            .iter()
-            .all(|item| item.get("operation_id").is_none()),
-        "app-facing mob batch spawn results must not expose raw operation_id"
-    );
-    assert!(
-        handle
-            .get_member(&MeerkatId::from("w-many-1"))
-            .await
-            .is_some(),
-        "spawn_many_meerkats should create first roster entry"
-    );
-    assert!(
-        handle
-            .get_member(&MeerkatId::from("w-many-2"))
-            .await
-            .is_some(),
-        "spawn_many_meerkats should create second roster entry"
-    );
-
-    service
-        .dispatch_external_tool(
-            &sid_1,
-            "wire_peers",
-            serde_json::json!({"a": "w-1", "b": "w-2"}),
-        )
-        .await
-        .expect("wire peers");
-    let w1 = handle
-        .get_member(&MeerkatId::from("w-1"))
-        .await
-        .expect("w-1");
-    assert!(
-        w1.wired_to.contains(&MeerkatId::from("w-2")),
-        "wire_peers should update roster wiring"
-    );
-
-    let listed = service
-        .dispatch_external_tool(&sid_1, "list_meerkats", serde_json::json!({}))
-        .await
-        .expect("list_meerkats");
-    let listed_json: serde_json::Value =
-        serde_json::from_str(&listed.text_content()).expect("list content json");
-    assert!(
-        listed_json["meerkats"]
-            .as_array()
-            .map_or(0, std::vec::Vec::len)
-            >= 2,
-        "list_meerkats should include spawned peers"
-    );
-
-    service
-        .dispatch_external_tool(
-            &sid_1,
-            "unwire_peers",
-            serde_json::json!({"a": "w-1", "b": "w-2"}),
-        )
-        .await
-        .expect("unwire peers");
-    service
-        .dispatch_external_tool(
-            &sid_1,
-            "retire_meerkat",
-            serde_json::json!({"meerkat_id": "w-2"}),
-        )
-        .await
-        .expect("retire_meerkat");
+        .expect_err("spawn_meerkat tool should be unavailable");
+    assert!(matches!(spawn_err, ToolError::NotFound { .. }));
     assert!(
         handle.get_member(&MeerkatId::from("w-2")).await.is_none(),
-        "retire_meerkat should remove roster entry"
+        "hidden operator tools must not mutate roster state"
     );
 }
 
@@ -4362,7 +4265,7 @@ async fn test_wait_for_kickoff_complete_returns_broken_snapshot_without_hanging(
 }
 
 #[tokio::test]
-async fn test_mob_flow_tools_dispatch_mutate_and_query_real_run_state() {
+async fn test_mob_flow_tools_hidden_without_operator_context() {
     let mut definition =
         with_cancel_grace_timeout(sample_definition_with_single_step_flow(60_000, 8), 25);
     let worker = definition
@@ -4380,8 +4283,6 @@ async fn test_mob_flow_tools_dispatch_mutate_and_query_real_run_state() {
         .session_id()
         .expect("session-backed")
         .clone();
-    service.set_flow_turn_delay_ms(60_000);
-    service.set_flow_turn_never_terminal(true);
 
     let tool_names = service.external_tool_names(&sid_1).await;
     for required in [
@@ -4391,20 +4292,18 @@ async fn test_mob_flow_tools_dispatch_mutate_and_query_real_run_state() {
         "mob_cancel_flow",
     ] {
         assert!(
-            tool_names.contains(&required.to_string()),
-            "expected flow tool '{required}' to be present"
+            !tool_names.contains(&required.to_string()),
+            "flow operator tool '{required}' must stay hidden without runtime-injected operator context"
         );
     }
 
-    let listed = service
+    let listed_err = service
         .dispatch_external_tool(&sid_1, "mob_list_flows", serde_json::json!({}))
         .await
-        .expect("mob_list_flows");
-    let listed_json: serde_json::Value =
-        serde_json::from_str(&listed.text_content()).expect("flows payload json");
-    assert_eq!(listed_json["flows"], serde_json::json!(["demo"]));
+        .expect_err("mob_list_flows should be unavailable");
+    assert!(matches!(listed_err, ToolError::NotFound { .. }));
 
-    let started = service
+    let started_err = service
         .dispatch_external_tool(
             &sid_1,
             "mob_run_flow",
@@ -4414,57 +4313,12 @@ async fn test_mob_flow_tools_dispatch_mutate_and_query_real_run_state() {
             }),
         )
         .await
-        .expect("mob_run_flow");
-    let started_json: serde_json::Value =
-        serde_json::from_str(&started.text_content()).expect("run payload json");
-    let run_id_str = started_json["run_id"]
-        .as_str()
-        .expect("run_id should be a string");
-    let run_id = run_id_str.parse::<RunId>().expect("run_id should parse");
-
-    let status = service
-        .dispatch_external_tool(
-            &sid_1,
-            "mob_flow_status",
-            serde_json::json!({"run_id": run_id_str}),
-        )
-        .await
-        .expect("mob_flow_status");
-    let status_json: serde_json::Value =
-        serde_json::from_str(&status.text_content()).expect("status payload json");
-    assert_eq!(status_json["run"]["run_id"], run_id_str);
-    assert_eq!(status_json["run"]["flow_id"], "demo");
-
-    service
-        .dispatch_external_tool(
-            &sid_1,
-            "mob_cancel_flow",
-            serde_json::json!({"run_id": run_id_str}),
-        )
-        .await
-        .expect("mob_cancel_flow");
-
-    let terminal = wait_for_run_terminal(&handle, &run_id, Duration::from_secs(8)).await;
-    assert_eq!(
-        terminal.status,
-        MobRunStatus::Canceled,
-        "cancel dispatch should drive the run to canceled"
-    );
-
-    let events = handle.events().replay_all().await.expect("replay");
-    assert!(
-        events.iter().any(|event| {
-            matches!(
-                &event.kind,
-                MobEventKind::FlowCanceled { run_id: id, .. } if id == &run_id
-            )
-        }),
-        "cancel dispatch should emit FlowCanceled"
-    );
+        .expect_err("mob_run_flow should be unavailable");
+    assert!(matches!(started_err, ToolError::NotFound { .. }));
 }
 
 #[tokio::test]
-async fn test_mob_flow_tools_reject_invalid_run_id_arguments() {
+async fn test_mob_flow_status_tool_is_hidden_without_operator_context_even_for_bad_args() {
     let mut definition = sample_definition_with_single_step_flow(500, 8);
     let worker = definition
         .profiles
@@ -4488,22 +4342,16 @@ async fn test_mob_flow_tools_reject_invalid_run_id_arguments() {
             serde_json::json!({"run_id":"not-a-uuid"}),
         )
         .await
-        .expect_err("invalid run_id should fail");
+        .expect_err("mob_flow_status should be unavailable");
     assert!(
-        matches!(error, ToolError::InvalidArguments { .. }),
-        "flow status should surface invalid run_id as invalid arguments"
+        matches!(error, ToolError::NotFound { .. }),
+        "flow operator tools should stay hidden without runtime-injected operator context"
     );
 }
 
 #[tokio::test]
 async fn test_flow_step_tool_overlay_is_step_scoped() {
     let mut definition = sample_definition_with_single_step_flow(2_000, 8);
-    let worker = definition
-        .profiles
-        .get_mut(&ProfileName::from("worker"))
-        .expect("worker profile exists");
-    worker.tools.mob = true;
-
     let flow = definition
         .flows
         .get_mut(&flow_id("demo"))
@@ -4530,24 +4378,10 @@ async fn test_flow_step_tool_overlay_is_step_scoped() {
         .expect("session-backed")
         .clone();
 
-    let started = service
-        .dispatch_external_tool(
-            &sid,
-            "mob_run_flow",
-            serde_json::json!({
-                "flow_id": "demo",
-                "params": {}
-            }),
-        )
+    let run_id = handle
+        .run_flow(FlowId::from("demo"), serde_json::json!({}))
         .await
         .expect("start flow");
-    let started_json: serde_json::Value =
-        serde_json::from_str(&started.text_content()).expect("run payload json");
-    let run_id = started_json["run_id"]
-        .as_str()
-        .expect("run_id string")
-        .parse::<RunId>()
-        .expect("run_id parse");
 
     let terminal = wait_for_run_terminal(&handle, &run_id, Duration::from_secs(5)).await;
     assert!(
@@ -4678,7 +4512,7 @@ async fn test_spawn_meerkat_tool_dispatches_backend_selection() {
         .expect("session-backed")
         .clone();
 
-    let spawned = service
+    let err = service
         .dispatch_external_tool(
             &sid_1,
             "spawn_meerkat",
@@ -4689,23 +4523,17 @@ async fn test_spawn_meerkat_tool_dispatches_backend_selection() {
             }),
         )
         .await
-        .expect("spawn external via tool");
-    let payload: serde_json::Value =
-        serde_json::from_str(&spawned.text_content()).expect("spawn payload json");
-    assert_eq!(payload["member_ref"]["kind"], "backend_peer");
+        .expect_err("spawn external via tool should be unavailable");
+    assert!(matches!(err, ToolError::NotFound { .. }));
 
-    let entry = handle
-        .get_member(&MeerkatId::from("w-ext"))
-        .await
-        .expect("w-ext exists");
     assert!(
-        matches!(entry.member_ref, MemberRef::BackendPeer { .. }),
-        "tool backend selection should flow into runtime provisioning"
+        handle.get_member(&MeerkatId::from("w-ext")).await.is_none(),
+        "hidden operator spawn tool must not provision a backend peer"
     );
 }
 
 #[tokio::test]
-async fn test_mob_task_tools_dispatch_and_blocked_by_enforcement() {
+async fn test_mob_task_tools_hidden_without_operator_context() {
     let (handle, service) = create_test_mob(sample_definition_with_mob_tools()).await;
     let sid_1 = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
@@ -4722,15 +4550,15 @@ async fn test_mob_task_tools_dispatch_and_blocked_by_enforcement() {
         "mob_task_get",
     ] {
         assert!(
-            service
+            !service
                 .external_tool_names(&sid_1)
                 .await
                 .contains(&required.to_string()),
-            "expected task tool '{required}'"
+            "task operator tool '{required}' must stay hidden without runtime-injected operator context"
         );
     }
 
-    let created_1 = service
+    let create_err = service
         .dispatch_external_tool(
             &sid_1,
             "mob_task_create",
@@ -4740,97 +4568,8 @@ async fn test_mob_task_tools_dispatch_and_blocked_by_enforcement() {
             }),
         )
         .await
-        .expect("create t1");
-    let created_1_json: serde_json::Value =
-        serde_json::from_str(&created_1.text_content()).expect("task create content json");
-    let t1 = created_1_json["task_id"]
-        .as_str()
-        .expect("task_id should be present")
-        .to_string();
-
-    let created_2 = service
-        .dispatch_external_tool(
-            &sid_1,
-            "mob_task_create",
-            serde_json::json!({
-                "subject": "Main work",
-                "description": "Depends on t1",
-                "blocked_by": [t1]
-            }),
-        )
-        .await
-        .expect("create t2");
-    let created_2_json: serde_json::Value =
-        serde_json::from_str(&created_2.text_content()).expect("task create content json");
-    let t2 = created_2_json["task_id"]
-        .as_str()
-        .expect("task_id should be present")
-        .to_string();
-
-    let blocked = service
-        .dispatch_external_tool(
-            &sid_1,
-            "mob_task_update",
-            serde_json::json!({"task_id": t2.clone(), "status": "in_progress", "owner": "w-1"}),
-        )
-        .await
-        .expect_err("blocked task should not be claimable");
-    assert!(
-        blocked.to_string().contains("blocked"),
-        "blocked-by enforcement should reject task claim"
-    );
-    // Providing `owner` alongside a non-in_progress status should be accepted, but the
-    // owner value must be ignored (owner is only mutable when status is in_progress).
-    service
-        .dispatch_external_tool(
-            &sid_1,
-            "mob_task_update",
-            serde_json::json!({"task_id": t2.clone(), "status": "completed", "owner": "w-1"}),
-        )
-        .await
-        .expect("completing with owner present should succeed (owner ignored)");
-
-    service
-        .dispatch_external_tool(
-            &sid_1,
-            "mob_task_update",
-            serde_json::json!({"task_id": t1.clone(), "status": "completed"}),
-        )
-        .await
-        .expect("complete dependency");
-    service
-        .dispatch_external_tool(
-            &sid_1,
-            "mob_task_update",
-            serde_json::json!({"task_id": t2.clone(), "status": "in_progress", "owner": "w-1"}),
-        )
-        .await
-        .expect("claim unblocked task");
-
-    let task = service
-        .dispatch_external_tool(
-            &sid_1,
-            "mob_task_get",
-            serde_json::json!({"task_id": t2.clone()}),
-        )
-        .await
-        .expect("task get");
-    let task_json: serde_json::Value =
-        serde_json::from_str(&task.text_content()).expect("task get content json");
-    assert_eq!(task_json["task"]["status"], "in_progress");
-    assert_eq!(task_json["task"]["owner"], "w-1");
-
-    let listed = service
-        .dispatch_external_tool(&sid_1, "mob_task_list", serde_json::json!({}))
-        .await
-        .expect("task list");
-    let list_json: serde_json::Value =
-        serde_json::from_str(&listed.text_content()).expect("task list content json");
-    assert_eq!(
-        list_json["tasks"].as_array().map_or(0, std::vec::Vec::len),
-        2,
-        "mob_task_list should project created tasks"
-    );
+        .expect_err("mob_task_create should be unavailable");
+    assert!(matches!(create_err, ToolError::NotFound { .. }));
 }
 
 #[tokio::test]
@@ -5120,12 +4859,12 @@ async fn test_resume_restores_missing_sessions_with_tool_wiring() {
 
     let names = service.external_tool_names(&restored_sid).await;
     assert!(
-        names.contains(&"spawn_meerkat".to_string()),
-        "mob tools must be wired on restored sessions"
+        !names.contains(&"spawn_meerkat".to_string()),
+        "restored sessions must not regain mob operator tools without runtime-injected context"
     );
     assert!(
-        names.contains(&"mob_task_create".to_string()),
-        "mob task tools must be wired on restored sessions"
+        !names.contains(&"mob_task_create".to_string()),
+        "restored sessions must not regain mob task operator tools without runtime-injected context"
     );
     assert!(
         names.contains(&"bundle_echo".to_string()),
@@ -5916,6 +5655,7 @@ async fn test_build_resumed_agent_config_rejects_mismatched_session_identity() {
                 labels: None,
                 additional_instructions: None,
                 shell_env: None,
+                mob_tool_access_context: crate::build::MobToolAccessContext::None,
             },
             expected_session_id: &wrong_session_id,
             resumed_session: resumed,
@@ -14413,7 +14153,8 @@ async fn test_external_tools_provider_called_per_spawn() {
 
 #[tokio::test]
 async fn test_external_tools_name_collision_profile_wins() {
-    // Provider returns a dispatcher with tool "spawn_meerkat" (collides with mob tool)
+    // Provider returns a dispatcher with tool "spawn_meerkat". Without operator
+    // context, the callback tool should pass through unchanged.
     let provider: crate::ExternalToolsProvider = Arc::new(|| {
         Some(
             Arc::new(MultiToolDispatcher::new(&["spawn_meerkat", "my_callback"]))
@@ -14439,10 +14180,11 @@ async fn test_external_tools_name_collision_profile_wins() {
     let session_id = member_ref.session_id().expect("session-backed").clone();
     let tool_names = service.external_tool_names(&session_id).await;
 
-    // mob's spawn_meerkat should win — callback's spawn_meerkat should be filtered out
+    // Without operator context there is no mob-owned spawn_meerkat, so the callback
+    // tool should remain visible.
     assert!(
         tool_names.contains(&"spawn_meerkat".to_string()),
-        "mob's spawn_meerkat should be present"
+        "callback spawn_meerkat should be present when operator tools are hidden"
     );
     // callback's unique tool should still be present
     assert!(
@@ -14450,20 +14192,15 @@ async fn test_external_tools_name_collision_profile_wins() {
         "non-colliding callback tool should be present"
     );
 
-    // Dispatch spawn_meerkat — should hit the mob dispatcher, not the callback one
+    // Dispatch spawn_meerkat — should hit the callback dispatcher directly.
     let raw_args = serde_json::json!({"profile": "worker", "meerkat_id": "w-test"});
     let result = service
         .dispatch_external_tool_outcome(&session_id, "spawn_meerkat", raw_args)
-        .await;
-    // The mob dispatcher will try to actually process the spawn — either succeeds
-    // or returns an execution error (not a not_found error).
-    match result {
-        Ok(_) => {} // mob dispatcher handled it
-        Err(ToolError::NotFound { .. }) => {
-            panic!("spawn_meerkat should NOT be routed to the filtered callback dispatcher")
-        }
-        Err(_) => {} // mob dispatcher handled it but spawn may fail for other reasons
-    }
+        .await
+        .expect("callback spawn_meerkat should dispatch");
+    let payload: serde_json::Value =
+        serde_json::from_str(&result.result.text_content()).expect("callback result json");
+    assert_eq!(payload["tool"], "spawn_meerkat");
 }
 
 #[tokio::test]

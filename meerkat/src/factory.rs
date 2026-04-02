@@ -1555,6 +1555,7 @@ impl AgentFactory {
 
         // 9b. Compose tools with mob surface (after comms, so mob gateway wraps the
         // already-composed comms gateway).
+        let operator_capabilities_present = build_config.override_mob == Some(true);
         let effective_mob = build_config.override_mob.unwrap_or(self.enable_mob);
         let mob_factory = build_config
             .mob_tools
@@ -1572,6 +1573,7 @@ impl AgentFactory {
             let mob_args = meerkat_core::service::MobToolsBuildArgs {
                 session_id: session.id().clone(),
                 model: model.clone(),
+                operator_capabilities_present,
                 comms_name: build_config.comms_name.clone(),
                 comms_runtime: mob_comms,
             };

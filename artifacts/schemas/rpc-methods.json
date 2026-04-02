@@ -172,12 +172,6 @@
       "name": "mob/members"
     },
     {
-      "description": "Deliver content to a mob member",
-      "name": "mob/send",
-      "params_type": "MobSendParams",
-      "result_type": "MobSendResult"
-    },
-    {
       "description": "Read mob event history",
       "name": "mob/events"
     },

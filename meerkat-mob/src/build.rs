@@ -16,6 +16,13 @@ use meerkat_core::session::SessionMetadata;
 use meerkat_core::types::SessionId;
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MobToolAccessContext {
+    #[default]
+    None,
+    OperatorCapabilitiesPresent,
+}
+
 /// Parameters for building an agent config from a mob profile.
 pub struct BuildAgentConfigParams<'a> {
     pub mob_id: &'a MobId,
@@ -28,6 +35,7 @@ pub struct BuildAgentConfigParams<'a> {
     pub labels: Option<std::collections::BTreeMap<String, String>>,
     pub additional_instructions: Option<Vec<String>>,
     pub shell_env: Option<std::collections::HashMap<String, String>>,
+    pub mob_tool_access_context: MobToolAccessContext,
 }
 
 pub struct BuildResumedAgentConfigParams<'a> {
@@ -59,6 +67,7 @@ pub async fn build_agent_config(
         labels,
         additional_instructions,
         shell_env,
+        mob_tool_access_context,
     } = params;
 
     if !profile.tools.comms {
@@ -119,6 +128,11 @@ pub async fn build_agent_config(
     config.override_builtins = Some(profile.tools.builtins);
     config.override_shell = Some(profile.tools.shell);
     config.override_memory = Some(profile.tools.memory);
+    config.override_mob = Some(matches!(
+        mob_tool_access_context,
+        MobToolAccessContext::OperatorCapabilitiesPresent
+    ));
+    config.resume_override_mask.override_mob = true;
 
     // External tools (mob tools, task tools, rust bundles composed externally)
     config.external_tools = external_tools;
@@ -208,7 +222,9 @@ fn apply_resumed_session_metadata(
     config.override_builtins = metadata.tooling.builtins.to_override();
     config.override_shell = metadata.tooling.shell.to_override();
     config.override_memory = metadata.tooling.memory.to_override();
-    config.override_mob = metadata.tooling.mob.to_override();
+    if !config.resume_override_mask.override_mob {
+        config.override_mob = metadata.tooling.mob.to_override();
+    }
     config.preload_skills = metadata.tooling.active_skills.clone();
     // keep_alive is NOT restored from metadata — mob runtime owns it
     // (determined by runtime_mode == AutonomousHost). §1: one owner.
@@ -388,6 +404,7 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect("build_agent_config");
@@ -410,6 +427,7 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect("build_agent_config");
@@ -436,6 +454,7 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect("build_agent_config");
@@ -468,6 +487,7 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect("build_agent_config");
@@ -496,12 +516,15 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect("build_agent_config");
         assert_eq!(config.override_builtins, Some(true));
         assert_eq!(config.override_shell, Some(true));
         assert_eq!(config.override_memory, Some(false));
+        assert_eq!(config.override_mob, Some(false));
+        assert!(config.resume_override_mask.override_mob);
         // Worker profile has builtins=true, shell=false, memory=false
         let worker = &def.profiles[&ProfileName::from("worker")];
         let config = build_agent_config(BuildAgentConfigParams {
@@ -515,12 +538,98 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect("build_agent_config");
         assert_eq!(config.override_builtins, Some(true));
         assert_eq!(config.override_shell, Some(false));
         assert_eq!(config.override_memory, Some(false));
+        assert_eq!(config.override_mob, Some(false));
+        assert!(config.resume_override_mask.override_mob);
+    }
+
+    #[tokio::test]
+    async fn test_build_agent_config_operator_context_enables_mob_override() {
+        let def = sample_definition();
+        let lead = &def.profiles[&ProfileName::from("lead")];
+        let config = build_agent_config(BuildAgentConfigParams {
+            mob_id: &def.id,
+            profile_name: &ProfileName::from("lead"),
+            meerkat_id: &MeerkatId::from("lead-operator"),
+            profile: lead,
+            definition: &def,
+            external_tools: None,
+            context: None,
+            labels: None,
+            additional_instructions: None,
+            shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::OperatorCapabilitiesPresent,
+        })
+        .await
+        .expect("build_agent_config");
+
+        assert_eq!(config.override_mob, Some(true));
+        assert!(config.resume_override_mask.override_mob);
+    }
+
+    #[tokio::test]
+    async fn test_build_resumed_agent_config_does_not_restore_mob_override_without_operator_context()
+     {
+        let def = sample_definition();
+        let lead = &def.profiles[&ProfileName::from("lead")];
+        let session_id = SessionId::new();
+        let mut resumed_session = Session::with_id(session_id.clone());
+        resumed_session
+            .set_session_metadata(SessionMetadata {
+                model: "claude-opus-4-6".to_string(),
+                max_tokens: 2048,
+                structured_output_retries: 2,
+                provider: meerkat_core::Provider::Anthropic,
+                provider_params: None,
+                tooling: meerkat_core::session::SessionTooling {
+                    builtins: meerkat_core::session::ToolCategoryOverride::Enable,
+                    shell: meerkat_core::session::ToolCategoryOverride::Enable,
+                    comms: meerkat_core::session::ToolCategoryOverride::Enable,
+                    mob: meerkat_core::session::ToolCategoryOverride::Enable,
+                    memory: meerkat_core::session::ToolCategoryOverride::Disable,
+                    active_skills: None,
+                },
+                keep_alive: false,
+                comms_name: Some("test-mob/lead/lead-1".to_string()),
+                peer_meta: None,
+                realm_id: None,
+                instance_id: None,
+                backend: None,
+                config_generation: None,
+            })
+            .expect("session metadata");
+
+        let config = build_resumed_agent_config(BuildResumedAgentConfigParams {
+            base: BuildAgentConfigParams {
+                mob_id: &def.id,
+                profile_name: &ProfileName::from("lead"),
+                meerkat_id: &MeerkatId::from("lead-1"),
+                profile: lead,
+                definition: &def,
+                external_tools: None,
+                context: None,
+                labels: None,
+                additional_instructions: None,
+                shell_env: None,
+                mob_tool_access_context: MobToolAccessContext::None,
+            },
+            expected_session_id: &session_id,
+            resumed_session,
+        })
+        .await
+        .expect("build_resumed_agent_config");
+
+        assert_eq!(
+            config.override_mob,
+            Some(false),
+            "runtime-injected absence of operator capabilities must beat resumed mob metadata"
+        );
     }
 
     #[tokio::test]
@@ -547,6 +656,7 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await;
         assert!(
@@ -570,6 +680,7 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect("build_agent_config");
@@ -599,6 +710,7 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect("build_agent_config");
@@ -628,6 +740,7 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect("build_agent_config");
@@ -667,6 +780,7 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect("build_agent_config");
@@ -689,6 +803,7 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect("build_agent_config");
@@ -711,6 +826,7 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect("build_agent_config");
@@ -743,6 +859,7 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect("build_agent_config");
@@ -787,6 +904,7 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect("build_agent_config should resolve path skill");
@@ -830,6 +948,7 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect_err("missing path skill should fail");
@@ -859,6 +978,7 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect("build_agent_config");
@@ -885,6 +1005,7 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect("build_agent_config");
@@ -919,6 +1040,7 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect("build_agent_config");
@@ -964,6 +1086,7 @@ mod tests {
             labels: Some(app_labels),
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: MobToolAccessContext::None,
         })
         .await
         .expect("build_agent_config");

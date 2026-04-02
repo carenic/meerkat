@@ -213,16 +213,11 @@ In addition to tool-driven orchestration (where an agent calls mob tools), there
       "definition": {"id":"my-mob","profiles":{}}
     }}
 
-    // Spawn and send work
+    // Spawn work-capable members
     {"jsonrpc":"2.0","id":3,"method":"mob/spawn","params":{
       "mob_id": "my-mob",
       "profile": "lead",
       "meerkat_id": "lead-1"
-    }}
-    {"jsonrpc":"2.0","id":4,"method":"mob/send","params":{
-      "mob_id": "my-mob",
-      "meerkat_id": "lead-1",
-      "content": "Coordinate the release triage."
     }}
     ```
   </Tab>

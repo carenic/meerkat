@@ -171,12 +171,6 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
                 "MobUnwireResult",
             ),
             RpcMethodDescriptor::basic("mob/members", "List members in a mob roster"),
-            RpcMethodDescriptor::typed(
-                "mob/send",
-                "Deliver content to a mob member",
-                "MobSendParams",
-                "MobSendResult",
-            ),
             RpcMethodDescriptor::basic("mob/events", "Read mob event history"),
             RpcMethodDescriptor::basic(
                 "mob/append_system_context",

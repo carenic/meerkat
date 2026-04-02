@@ -523,6 +523,9 @@ impl meerkat_core::service::MobToolsFactory for AgentMobToolSurfaceFactory {
         &self,
         args: meerkat_core::service::MobToolsBuildArgs,
     ) -> Result<Arc<dyn AgentToolDispatcher>, Box<dyn std::error::Error + Send + Sync>> {
+        if !args.operator_capabilities_present {
+            return Ok(Arc::new(EmptyAgentToolSurface));
+        }
         let session_id_str = args.session_id.to_string();
         let mut implicit_mob_id = self.state.find_implicit_mob(&session_id_str).await;
 
@@ -558,6 +561,23 @@ impl meerkat_core::service::MobToolsFactory for AgentMobToolSurfaceFactory {
             args.comms_runtime,
         );
         Ok(Arc::new(surface))
+    }
+}
+
+struct EmptyAgentToolSurface;
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl AgentToolDispatcher for EmptyAgentToolSurface {
+    fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+        Vec::<Arc<ToolDef>>::new().into()
+    }
+
+    async fn dispatch(
+        &self,
+        call: ToolCallView<'_>,
+    ) -> Result<meerkat_core::ToolDispatchOutcome, ToolError> {
+        Err(ToolError::not_found(call.name))
     }
 }
 
@@ -794,6 +814,7 @@ pub async fn archive_session_with_mob_cleanup(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use meerkat_core::service::MobToolsFactory;
 
     #[test]
     fn test_all_tool_definitions_present() {
@@ -858,6 +879,27 @@ mod tests {
         };
         let result = surface.dispatch(call).await;
         assert!(matches!(result, Err(ToolError::NotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_build_mob_tools_returns_empty_surface_without_operator_capabilities() {
+        let state = MobMcpState::new_in_memory();
+        let factory = AgentMobToolSurfaceFactory::new(state);
+        let dispatcher = factory
+            .build_mob_tools(meerkat_core::service::MobToolsBuildArgs {
+                session_id: SessionId::new(),
+                model: "claude-sonnet-4-5".to_string(),
+                operator_capabilities_present: false,
+                comms_name: None,
+                comms_runtime: None,
+            })
+            .await
+            .expect("build_mob_tools");
+
+        assert!(
+            dispatcher.tools().is_empty(),
+            "ambient mob enablement must not surface operator tools without runtime-injected capabilities"
+        );
     }
 
     #[tokio::test]

@@ -17,9 +17,8 @@ pub use mcp_live::{
     McpRemoveParams,
 };
 pub use mob::{
-    MobPeerTarget, MobSendParams, MobSendResult, MobUnwireParams, MobUnwireResult, MobWireParams,
-    MobWireResult, WireHandlingMode, WireRenderClass, WireRenderMetadata, WireRenderSalience,
-    WireTrustedPeerSpec,
+    MobPeerTarget, MobUnwireParams, MobUnwireResult, MobWireParams, MobWireResult,
+    WireHandlingMode, WireRenderClass, WireRenderMetadata, WireRenderSalience, WireTrustedPeerSpec,
 };
 pub use models::{
     CatalogModelEntry, ModelsCatalogResponse, ProviderCatalog, WireModelProfile, WireModelTier,
