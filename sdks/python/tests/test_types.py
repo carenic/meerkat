@@ -795,8 +795,6 @@ async def test_client_mob_lifecycle_and_send_methods_use_explicit_rpc_methods():
             return {"run_id": "run-1"}
         if method == "mob/flow_status":
             return {"run": {"status": "running"}}
-        if method == "mob/send":
-            return {"session_id": "session-1", "member_id": "agent-a"}
         if method == "mob/wait_kickoff":
             return {
                 "members": [
@@ -828,9 +826,6 @@ async def test_client_mob_lifecycle_and_send_methods_use_explicit_rpc_methods():
         {"external": {"name": "remote", "peer_id": "ed25519:remote", "address": "inproc://remote"}},
     )
     await client.mob_lifecycle("mob-1", "start")
-    send_receipt = await client.send_mob_member_content("mob-1", "agent-a", "hello")
-    assert send_receipt["session_id"] == "session-1"
-    assert send_receipt["member_id"] == "agent-a"
     wait_members = await client.wait_mob_kickoff(
         "mob-1",
         member_ids=["agent-a"],
@@ -860,7 +855,6 @@ async def test_client_mob_lifecycle_and_send_methods_use_explicit_rpc_methods():
         "mob/wire",
         "mob/unwire",
         "mob/lifecycle",
-        "mob/send",
         "mob/wait_kickoff",
         "mob/wait_kickoff",
         "mob/append_system_context",

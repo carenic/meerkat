@@ -849,30 +849,6 @@ class MeerkatClient:
     async def mob_lifecycle(self, mob_id: str, action: str) -> None:
         await self._request("mob/lifecycle", {"mob_id": mob_id, "action": action})
 
-    async def send_mob_member_content(
-        self,
-        mob_id: str,
-        meerkat_id: str,
-        content: str | list[dict[str, Any]],
-        *,
-        handling_mode: Literal["queue", "steer"] = "queue",
-        render_metadata: RenderMetadata | None = None,
-    ) -> dict[str, Any]:
-        result = await self._request(
-            "mob/send",
-            {
-                "mob_id": mob_id,
-                "meerkat_id": meerkat_id,
-                "content": content,
-                "handling_mode": handling_mode,
-                "render_metadata": render_metadata,
-            },
-        )
-        session_id = result.get("session_id")
-        if not isinstance(session_id, str) or not session_id:
-            raise MeerkatError("INVALID_RESPONSE", "Invalid mob/send response: missing session_id")
-        return result
-
     async def append_mob_system_context(
         self,
         mob_id: str,

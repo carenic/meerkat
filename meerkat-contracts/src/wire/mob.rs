@@ -2,8 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::wire::WireContentInput;
-
 /// Minimal trusted peer spec for public mob wiring surfaces.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -102,29 +100,6 @@ pub struct WireRenderMetadata {
     pub salience: Option<WireRenderSalience>,
 }
 
-/// Request payload for `mob/send`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
-pub struct MobSendParams {
-    pub mob_id: String,
-    pub meerkat_id: String,
-    pub content: WireContentInput,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub handling_mode: Option<WireHandlingMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub render_metadata: Option<WireRenderMetadata>,
-}
-
-/// Response payload for `mob/send`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct MobSendResult {
-    pub member_id: String,
-    pub session_id: String,
-    pub handling_mode: WireHandlingMode,
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -143,22 +118,6 @@ mod tests {
         assert!(
             msg.contains("unknown field `local`") || msg.contains("missing field `member`"),
             "unexpected error: {msg}"
-        );
-    }
-
-    #[test]
-    fn mob_send_params_reject_unknown_legacy_message_field() {
-        let err = serde_json::from_value::<MobSendParams>(serde_json::json!({
-            "mob_id": "mob-1",
-            "meerkat_id": "alpha",
-            "content": "hello",
-            "message": "legacy hello"
-        }))
-        .expect_err("legacy message field must be rejected");
-
-        assert!(
-            err.to_string().contains("unknown field `message`"),
-            "unexpected error: {err}"
         );
     }
 }

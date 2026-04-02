@@ -21,15 +21,6 @@ RenderMetadata = TypedDict(
     {"class": RenderClass, "salience": NotRequired[RenderSalience]},
 )
 
-MemberDeliveryReceipt = TypedDict(
-    "MemberDeliveryReceipt",
-    {
-        "member_id": str,
-        "session_id": str,
-        "handling_mode": Literal["queue", "steer"],
-    },
-)
-
 MemberRespawnReceipt = TypedDict(
     "MemberRespawnReceipt",
     {
@@ -123,21 +114,6 @@ class Member:
     def __init__(self, mob: "Mob", meerkat_id: str):
         self._mob = mob
         self.meerkat_id = meerkat_id
-
-    async def send(
-        self,
-        content: str | list[dict[str, Any]],
-        *,
-        handling_mode: Literal["queue", "steer"] = "queue",
-        render_metadata: RenderMetadata | None = None,
-    ) -> MemberDeliveryReceipt:
-        return await self._mob._client.send_mob_member_content(
-            self._mob.id,
-            self.meerkat_id,
-            content,
-            handling_mode=handling_mode,
-            render_metadata=render_metadata,
-        )
 
     async def events(self) -> EventSubscription:
         return await self._mob.subscribe_member_events(self.meerkat_id)

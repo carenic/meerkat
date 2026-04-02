@@ -10,7 +10,7 @@ use crate::error;
 use crate::protocol::{RpcId, RpcResponse};
 use crate::session_runtime::SessionRuntime;
 use meerkat_core::service::AppendSystemContextRequest;
-use meerkat_core::types::{ContentInput, HandlingMode, RenderMetadata, SessionId};
+use meerkat_core::types::{ContentInput, SessionId};
 use meerkat_mob::{
     FlowId, MeerkatId, MemberRespawnReceipt, MobBackendKind, MobDefinition, MobId, MobRespawnError,
     MobRuntimeMode, RunId, SpawnMemberSpec,
@@ -518,46 +518,6 @@ pub async fn handle_lifecycle(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MobSendParams {
-    pub mob_id: String,
-    pub meerkat_id: String,
-    pub content: ContentInput,
-    #[serde(default)]
-    pub handling_mode: HandlingMode,
-    #[serde(default)]
-    pub render_metadata: Option<RenderMetadata>,
-}
-
-pub async fn handle_send(
-    id: Option<RpcId>,
-    params: Option<&RawValue>,
-    state: &Arc<MobMcpState>,
-) -> RpcResponse {
-    let params: MobSendParams = match parse_params(params) {
-        Ok(p) => p,
-        Err(resp) => return resp.with_id(id),
-    };
-    let mob_id = match parse_mob_id(id.clone(), &params.mob_id) {
-        Ok(m) => m,
-        Err(resp) => return resp,
-    };
-    match state
-        .mob_member_send(
-            &mob_id,
-            MeerkatId::from(params.meerkat_id.as_str()),
-            params.content,
-            params.handling_mode,
-            params.render_metadata,
-        )
-        .await
-    {
-        Ok(receipt) => RpcResponse::success(id, serde_json::json!(receipt)),
-        Err(err) => invalid_params(id, err.to_string()),
-    }
-}
-
-#[derive(Debug, Deserialize)]
 pub struct MobAppendSystemContextParams {
     pub mob_id: String,
     pub meerkat_id: String,
@@ -1022,33 +982,6 @@ mod tests {
             serde_json::json!(["peer-a", "peer-b"])
         );
         Ok(())
-    }
-
-    #[test]
-    fn mob_send_params_accept_canonical_content_field() -> Result<(), Box<dyn std::error::Error>> {
-        let value = serde_json::json!({
-            "mob_id": "mob-1",
-            "meerkat_id": "worker-1",
-            "content": "hello from canonical caller"
-        });
-        let params: MobSendParams = serde_json::from_value(value)?;
-        assert_eq!(
-            params.content,
-            ContentInput::Text("hello from canonical caller".into())
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn mob_send_params_reject_legacy_message_field() {
-        let value = serde_json::json!({
-            "mob_id": "mob-1",
-            "meerkat_id": "worker-1",
-            "message": "legacy hello"
-        });
-        let err = serde_json::from_value::<MobSendParams>(value)
-            .expect_err("legacy message field must be rejected");
-        assert!(err.to_string().contains("unknown field `message`"));
     }
 
     #[test]

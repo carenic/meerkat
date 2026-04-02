@@ -100,11 +100,16 @@ pub(super) fn compose_external_tools_for_profile(
     tool_bundles: &BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
     mob_handle: MobHandle,
     default_external_tools: Option<Arc<dyn AgentToolDispatcher>>,
+    mob_tool_access_context: crate::build::MobToolAccessContext,
 ) -> Result<Option<Arc<dyn AgentToolDispatcher>>, MobError> {
     let mut dispatchers: Vec<Arc<dyn AgentToolDispatcher>> = Vec::new();
 
-    if profile.tools.mob || profile.tools.mob_tasks {
-        dispatchers.push(Arc::new(MobToolDispatcher::new(
+    if matches!(
+        mob_tool_access_context,
+        crate::build::MobToolAccessContext::OperatorCapabilitiesPresent
+    ) && (profile.tools.mob || profile.tools.mob_tasks)
+    {
+        dispatchers.push(Arc::new(MobOperatorToolDispatcher::new(
             mob_handle,
             profile.tools.mob,
             profile.tools.mob_tasks,
@@ -160,14 +165,14 @@ pub(super) fn compose_external_tools_for_profile(
     Ok(Some(Arc::new(DynamicToolComposite::new(dispatchers))))
 }
 
-struct MobToolDispatcher {
+struct MobOperatorToolDispatcher {
     handle: MobHandle,
     tools: Arc<[Arc<ToolDef>]>,
     owner_session_id: Option<SessionId>,
     ops_registry: Option<Arc<dyn OpsLifecycleRegistry>>,
 }
 
-impl MobToolDispatcher {
+impl MobOperatorToolDispatcher {
     fn new(handle: MobHandle, enable_mob: bool, enable_mob_tasks: bool) -> Self {
         let mut defs: Vec<Arc<ToolDef>> = Vec::new();
         if enable_mob {
@@ -529,7 +534,7 @@ struct FlowStatusArgs {
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-impl AgentToolDispatcher for MobToolDispatcher {
+impl AgentToolDispatcher for MobOperatorToolDispatcher {
     fn tools(&self) -> Arc<[Arc<ToolDef>]> {
         Arc::clone(&self.tools)
     }

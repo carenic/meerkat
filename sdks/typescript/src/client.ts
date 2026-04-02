@@ -57,9 +57,7 @@ import {
   Mob,
   type MobKickoffMemberSnapshot,
   type MobKickoffWaitOptions,
-  type MobHandlingMode,
   type MobPeerTarget,
-  type MobRenderMetadata,
 } from "./mob.js";
 import { parseCoreEvent } from "./events.js";
 import { EventStream, AsyncQueue } from "./streaming.js";
@@ -899,38 +897,6 @@ export class MeerkatClient {
 
   async mobLifecycle(mobId: string, action: 'stop' | 'resume' | 'complete' | 'reset' | 'destroy'): Promise<void> {
     await this.request("mob/lifecycle", { mob_id: mobId, action });
-  }
-
-  async sendMobMemberContent(
-    mobId: string,
-    meerkatId: string,
-    content: string | ContentBlock[],
-    options?: {
-      handlingMode?: MobHandlingMode;
-      renderMetadata?: MobRenderMetadata;
-    },
-  ): Promise<{ memberId: string; sessionId: string; handlingMode: MobHandlingMode }> {
-    const result = await this.request("mob/send", {
-      mob_id: mobId,
-      meerkat_id: meerkatId,
-      content,
-      handling_mode: options?.handlingMode ?? "queue",
-      render_metadata: options?.renderMetadata,
-    });
-    const sessionId = result.session_id;
-    if (typeof sessionId !== "string" || sessionId.length === 0) {
-      throw new MeerkatError(
-        "INVALID_RESPONSE",
-        "Invalid mob/send response: missing session_id",
-      );
-    }
-    return {
-      memberId: String(result.member_id ?? meerkatId),
-      sessionId,
-      handlingMode: String(
-        result.handling_mode ?? options?.handlingMode ?? "queue",
-      ) as MobHandlingMode,
-    };
   }
 
   async appendMobSystemContext(

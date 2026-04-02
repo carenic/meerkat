@@ -687,8 +687,6 @@ impl MethodRouter {
             #[cfg(feature = "mob")]
             "mob/unwire" => handlers::mob::handle_unwire(id, params, &self.mob_state).await,
             #[cfg(feature = "mob")]
-            "mob/send" => handlers::mob::handle_send(id, params, &self.mob_state).await,
-            #[cfg(feature = "mob")]
             "mob/events" => handlers::mob::handle_events(id, params, &self.mob_state).await,
             #[cfg(feature = "mob")]
             "mob/append_system_context" => {
@@ -3576,7 +3574,7 @@ mod tests {
 
     #[cfg(feature = "mob")]
     #[tokio::test]
-    async fn mob_send_rejects_while_archive_retirement_is_in_flight() {
+    async fn mob_send_route_is_unavailable_while_archive_retirement_is_in_flight() {
         let (router, _notif_rx) = test_router_with_mob_state(
             meerkat_mob_mcp::MobMcpState::new_in_memory_with_archive_delay(250),
         )
@@ -3661,10 +3659,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert!(
-            send_resp.error.is_some(),
-            "retiring member must reject new mob/send work before archive completes"
-        );
+        assert_eq!(error_code(&send_resp), error::METHOD_NOT_FOUND);
 
         let archive_resp = archive.await.expect("archive join");
         assert_eq!(result_value(&archive_resp)["archived"], true);
@@ -4008,7 +4003,7 @@ mod tests {
 
     #[cfg(feature = "mob")]
     #[tokio::test]
-    async fn mob_send_rejects_legacy_message_shape() {
+    async fn mob_send_route_is_not_found() {
         let (router, _notif_rx) = test_router().await;
         let req = make_request(
             "mob/send",
@@ -4020,11 +4015,7 @@ mod tests {
         );
 
         let resp = router.dispatch(req).await.unwrap();
-        assert_eq!(error_code(&resp), error::INVALID_PARAMS);
-        assert!(
-            error_message(&resp).contains("unknown field `message`"),
-            "legacy mob/send payloads should be rejected after the 0.5 clean cut"
-        );
+        assert_eq!(error_code(&resp), error::METHOD_NOT_FOUND);
     }
 
     #[cfg(feature = "mob")]

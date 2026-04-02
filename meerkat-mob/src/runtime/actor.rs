@@ -1847,6 +1847,7 @@ impl MobActor {
                                 labels: labels.clone(),
                                 additional_instructions,
                                 shell_env,
+                                mob_tool_access_context: crate::build::MobToolAccessContext::None,
                             },
                             expected_session_id: &resume_id,
                             resumed_session: stored_session,
@@ -1967,6 +1968,7 @@ impl MobActor {
                 labels: labels.clone(),
                 additional_instructions,
                 shell_env,
+                mob_tool_access_context: crate::build::MobToolAccessContext::None,
             })
             .await?;
             config.keep_alive =
@@ -2364,6 +2366,7 @@ impl MobActor {
             labels: Some(labels.clone()),
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: crate::build::MobToolAccessContext::None,
         })
         .await?;
         config.keep_alive = runtime_mode == crate::MobRuntimeMode::AutonomousHost;
@@ -2927,6 +2930,7 @@ impl MobActor {
             labels: Some(snapshot.labels.clone()),
             additional_instructions: None,
             shell_env: None,
+            mob_tool_access_context: crate::build::MobToolAccessContext::None,
         })
         .await?;
         config.keep_alive = snapshot.runtime_mode == crate::MobRuntimeMode::AutonomousHost;
@@ -4866,6 +4870,7 @@ impl MobActor {
             &self.tool_bundles,
             self.mob_handle_for_tools(),
             default_tools,
+            crate::build::MobToolAccessContext::None,
         )
     }
 

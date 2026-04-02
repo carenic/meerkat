@@ -9253,7 +9253,6 @@ printf '\0\141\163\155' > "$out_dir/runtime_bg.wasm"
             composed.tools().iter().map(|t| t.name.clone()).collect();
         assert!(names.contains("mob_create"));
         assert!(names.contains("meerkat_spawn"));
-        assert!(names.contains("meerkat_message"));
     }
 
     #[tokio::test]

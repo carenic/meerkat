@@ -530,11 +530,13 @@ impl MobBuilder {
                                 tool_bundles,
                                 tool_handle.clone(),
                                 default_ext,
+                                crate::build::MobToolAccessContext::None,
                             )?,
                             context: None,
                             labels: Some(entry.labels.clone()),
                             additional_instructions: None,
                             shell_env: None,
+                            mob_tool_access_context: crate::build::MobToolAccessContext::None,
                         },
                         expected_session_id: &session_id,
                         resumed_session: stored_session,
@@ -593,11 +595,13 @@ impl MobBuilder {
                     tool_bundles,
                     tool_handle.clone(),
                     default_ext_fresh,
+                    crate::build::MobToolAccessContext::None,
                 )?,
                 context: None,
                 labels: None,
                 additional_instructions: None,
                 shell_env: None,
+                mob_tool_access_context: crate::build::MobToolAccessContext::None,
             })
             .await?;
             config.keep_alive = entry.runtime_mode == crate::MobRuntimeMode::AutonomousHost;
