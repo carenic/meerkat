@@ -58,8 +58,18 @@ enum FrameNodeTaskResult {
     },
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 type FrameNodeTaskFuture = Pin<Box<dyn Future<Output = FrameNodeTaskResult> + Send>>;
+#[cfg(target_arch = "wasm32")]
+type FrameNodeTaskFuture = Pin<Box<dyn Future<Output = FrameNodeTaskResult>>>;
 type FrameNodeWorkers = FuturesUnordered<FrameNodeTaskFuture>;
+
+#[cfg(not(target_arch = "wasm32"))]
+type FrameExecutionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<FrameExecutionOutcome, MobError>> + Send + 'a>>;
+#[cfg(target_arch = "wasm32")]
+type FrameExecutionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<FrameExecutionOutcome, MobError>> + 'a>>;
 
 struct SpawnStepTask {
     frame_id: FrameId,
@@ -135,7 +145,7 @@ impl FlowFrameEngine {
         frame_id: &'a FrameId,
         spec: &'a FrameSpec,
         context: &'a FlowContext,
-    ) -> Pin<Box<dyn Future<Output = Result<FrameExecutionOutcome, MobError>> + Send + 'a>> {
+    ) -> FrameExecutionFuture<'a> {
         Box::pin(self.execute_frame_concurrent_root(run_id, frame_id, spec, context))
     }
 

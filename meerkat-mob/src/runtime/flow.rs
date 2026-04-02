@@ -20,6 +20,8 @@ use crate::run::{
     FailureLedgerEntry, FlowContext, FlowRunConfig, MobRunStatus, StepLedgerEntry, StepRunStatus,
 };
 use crate::store::{MobEventStore, MobRunStore};
+#[cfg(target_arch = "wasm32")]
+use crate::tokio;
 use chrono::Utc;
 use futures::stream::{FuturesUnordered, StreamExt};
 use indexmap::IndexMap;
