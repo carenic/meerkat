@@ -3185,49 +3185,21 @@ fn discover_local_ip(host: &str, port: u16) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    mod test_support {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/test_support.rs"));
+    }
+
     use super::{
         App, Mode, TransportMode, build_hive_with_llm_override, format_tool_completion,
         is_known_slash_command, normalize_tool_text, parse_provider_override, scroll_timeline_down,
         scroll_timeline_up, timeline_max_scroll,
     };
-    use async_trait::async_trait;
     use mdm_tux::ProviderKind;
     use meerkat::LlmClient;
-    use meerkat_client::types::LlmStream;
-    use meerkat_client::{LlmError, LlmRequest, TestClient};
     use meerkat_comms::identity::Keypair;
     use std::collections::{BTreeMap, HashMap, VecDeque};
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Default)]
-    struct CaptureClient {
-        inner: TestClient,
-        seen_tools: Mutex<Vec<String>>,
-    }
-
-    impl CaptureClient {
-        fn tool_names(&self) -> Vec<String> {
-            self.seen_tools.lock().expect("capture lock").clone()
-        }
-    }
-
-    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-    impl LlmClient for CaptureClient {
-        fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
-            *self.seen_tools.lock().expect("capture lock") =
-                request.tools.iter().map(|tool| tool.name.clone()).collect();
-            self.inner.stream(request)
-        }
-
-        fn provider(&self) -> &'static str {
-            self.inner.provider()
-        }
-
-        async fn health_check(&self) -> Result<(), LlmError> {
-            self.inner.health_check().await
-        }
-    }
+    use std::sync::Arc;
+    use test_support::CaptureClient;
 
     #[test]
     fn provider_override_requires_model_and_provider_together() {
