@@ -83,23 +83,23 @@ fn begin_immediate(conn: &mut Connection) -> Result<Transaction<'_>, MobStoreErr
         .map_err(se)
 }
 
-fn load_run_bytes(tx: &Transaction<'_>, key: &str) -> Result<Option<Vec<u8>>, MobError> {
+fn load_run_bytes(tx: &Transaction<'_>, key: &str) -> Result<Option<Vec<u8>>, MobStoreError> {
     tx.query_row(
         "SELECT run_json FROM mob_runs WHERE run_id = ?1",
         params![key],
         |row| row.get(0),
     )
     .optional()
-    .map_err(storage_error)
+    .map_err(se)
 }
 
-fn write_run_json(tx: &Transaction<'_>, key: &str, run: &MobRun) -> Result<(), MobError> {
+fn write_run_json(tx: &Transaction<'_>, key: &str, run: &MobRun) -> Result<(), MobStoreError> {
     let encoded = encode_json(run)?;
     tx.execute(
         "UPDATE mob_runs SET run_json = ?1 WHERE run_id = ?2",
         params![encoded, key],
     )
-    .map_err(storage_error)?;
+    .map_err(se)?;
     Ok(())
 }
 
@@ -772,7 +772,7 @@ impl MobRunStore for SqliteMobRunStore {
         loop_instance_id: &LoopInstanceId,
         snapshot: LoopSnapshot,
         ledger_entry: Option<LoopIterationLedgerEntry>,
-    ) -> Result<(), MobError> {
+    ) -> Result<(), MobStoreError> {
         let path = self.path.clone();
         let key = run_id.to_string();
         let run_id = run_id.clone();
@@ -782,7 +782,7 @@ impl MobRunStore for SqliteMobRunStore {
             let tx = begin_immediate(&mut conn)?;
             let bytes = load_run_bytes(&tx, &key)?;
             let Some(bytes) = bytes else {
-                return Err(MobError::RunNotFound(run_id));
+                return Err(MobStoreError::NotFound(format!("run not found: {run_id}")));
             };
             let mut run: MobRun = decode_json(&bytes)?;
             run.loops.insert(loop_instance_id, snapshot);
@@ -790,7 +790,7 @@ impl MobRunStore for SqliteMobRunStore {
                 append_loop_iteration_ledger_if_absent(&mut run, entry);
             }
             write_run_json(&tx, &key, &run)?;
-            tx.commit().map_err(storage_error)?;
+            tx.commit().map_err(se)?;
             Ok(())
         })
         .await
@@ -802,7 +802,7 @@ impl MobRunStore for SqliteMobRunStore {
         frame_id: &FrameId,
         expected: Option<&FrameSnapshot>,
         next: FrameSnapshot,
-    ) -> Result<bool, MobError> {
+    ) -> Result<bool, MobStoreError> {
         let path = self.path.clone();
         let key = run_id.to_string();
         let run_id = run_id.clone();
@@ -813,7 +813,7 @@ impl MobRunStore for SqliteMobRunStore {
             let tx = begin_immediate(&mut conn)?;
             let bytes = load_run_bytes(&tx, &key)?;
             let Some(bytes) = bytes else {
-                return Err(MobError::RunNotFound(run_id));
+                return Err(MobStoreError::NotFound(format!("run not found: {run_id}")));
             };
             let mut run: MobRun = decode_json(&bytes)?;
             let current = run.frames.get(&frame_id);
@@ -827,7 +827,7 @@ impl MobRunStore for SqliteMobRunStore {
             }
             run.frames.insert(frame_id, next);
             write_run_json(&tx, &key, &run)?;
-            tx.commit().map_err(storage_error)?;
+            tx.commit().map_err(se)?;
             Ok(true)
         })
         .await
@@ -841,7 +841,7 @@ impl MobRunStore for SqliteMobRunStore {
         frame_id: &FrameId,
         expected_frame: &FrameSnapshot,
         next_frame: FrameSnapshot,
-    ) -> Result<bool, MobError> {
+    ) -> Result<bool, MobStoreError> {
         let path = self.path.clone();
         let key = run_id.to_string();
         let run_id = run_id.clone();
@@ -853,7 +853,7 @@ impl MobRunStore for SqliteMobRunStore {
             let tx = begin_immediate(&mut conn)?;
             let bytes = load_run_bytes(&tx, &key)?;
             let Some(bytes) = bytes else {
-                return Err(MobError::RunNotFound(run_id));
+                return Err(MobStoreError::NotFound(format!("run not found: {run_id}")));
             };
             let mut run: MobRun = decode_json(&bytes)?;
             if run.flow_state != expected_run_state {
@@ -865,7 +865,7 @@ impl MobRunStore for SqliteMobRunStore {
             run.flow_state = next_run_state;
             run.frames.insert(frame_id, next_frame);
             write_run_json(&tx, &key, &run)?;
-            tx.commit().map_err(storage_error)?;
+            tx.commit().map_err(se)?;
             Ok(true)
         })
         .await
@@ -881,7 +881,7 @@ impl MobRunStore for SqliteMobRunStore {
         step_output_key: String,
         step_output: serde_json::Value,
         loop_context: Option<(&LoopId, u64)>,
-    ) -> Result<bool, MobError> {
+    ) -> Result<bool, MobStoreError> {
         let path = self.path.clone();
         let key = run_id.to_string();
         let run_id = run_id.clone();
@@ -893,7 +893,7 @@ impl MobRunStore for SqliteMobRunStore {
             let tx = begin_immediate(&mut conn)?;
             let bytes = load_run_bytes(&tx, &key)?;
             let Some(bytes) = bytes else {
-                return Err(MobError::RunNotFound(run_id));
+                return Err(MobStoreError::NotFound(format!("run not found: {run_id}")));
             };
             let mut run: MobRun = decode_json(&bytes)?;
             if run.frames.get(&frame_id) != Some(&expected_frame) {
@@ -907,7 +907,7 @@ impl MobRunStore for SqliteMobRunStore {
                 }
                 Some((loop_id, iteration)) => {
                     let iteration_index = usize::try_from(iteration).map_err(|_| {
-                        MobError::Internal(format!(
+                        MobStoreError::Internal(format!(
                             "loop iteration index {iteration} exceeds usize::MAX on this target"
                         ))
                     })?;
@@ -920,7 +920,7 @@ impl MobRunStore for SqliteMobRunStore {
                 }
             }
             write_run_json(&tx, &key, &run)?;
-            tx.commit().map_err(storage_error)?;
+            tx.commit().map_err(se)?;
             Ok(true)
         })
         .await
@@ -937,7 +937,7 @@ impl MobRunStore for SqliteMobRunStore {
         expected_frame: &FrameSnapshot,
         next_frame: FrameSnapshot,
         initial_loop: LoopSnapshot,
-    ) -> Result<bool, MobError> {
+    ) -> Result<bool, MobStoreError> {
         let path = self.path.clone();
         let key = run_id.to_string();
         let run_id = run_id.clone();
@@ -950,7 +950,7 @@ impl MobRunStore for SqliteMobRunStore {
             let tx = begin_immediate(&mut conn)?;
             let bytes = load_run_bytes(&tx, &key)?;
             let Some(bytes) = bytes else {
-                return Err(MobError::RunNotFound(run_id));
+                return Err(MobStoreError::NotFound(format!("run not found: {run_id}")));
             };
             let mut run: MobRun = decode_json(&bytes)?;
             if run.flow_state != expected_run_state {
@@ -966,7 +966,7 @@ impl MobRunStore for SqliteMobRunStore {
             run.frames.insert(frame_id, next_frame);
             run.loops.insert(loop_instance_id, initial_loop);
             write_run_json(&tx, &key, &run)?;
-            tx.commit().map_err(storage_error)?;
+            tx.commit().map_err(se)?;
             Ok(true)
         })
         .await
@@ -980,7 +980,7 @@ impl MobRunStore for SqliteMobRunStore {
         next_loop: LoopSnapshot,
         expected_run_state: &KernelState,
         next_run_state: KernelState,
-    ) -> Result<bool, MobError> {
+    ) -> Result<bool, MobStoreError> {
         let path = self.path.clone();
         let key = run_id.to_string();
         let run_id = run_id.clone();
@@ -992,7 +992,7 @@ impl MobRunStore for SqliteMobRunStore {
             let tx = begin_immediate(&mut conn)?;
             let bytes = load_run_bytes(&tx, &key)?;
             let Some(bytes) = bytes else {
-                return Err(MobError::RunNotFound(run_id));
+                return Err(MobStoreError::NotFound(format!("run not found: {run_id}")));
             };
             let mut run: MobRun = decode_json(&bytes)?;
             if run.flow_state != expected_run_state {
@@ -1004,7 +1004,7 @@ impl MobRunStore for SqliteMobRunStore {
             run.flow_state = next_run_state;
             run.loops.insert(loop_instance_id, next_loop);
             write_run_json(&tx, &key, &run)?;
-            tx.commit().map_err(storage_error)?;
+            tx.commit().map_err(se)?;
             Ok(true)
         })
         .await
@@ -1022,7 +1022,7 @@ impl MobRunStore for SqliteMobRunStore {
         ledger_entry: LoopIterationLedgerEntry,
         expected_run_state: &KernelState,
         next_run_state: KernelState,
-    ) -> Result<bool, MobError> {
+    ) -> Result<bool, MobStoreError> {
         let path = self.path.clone();
         let key = run_id.to_string();
         let run_id = run_id.clone();
@@ -1035,7 +1035,7 @@ impl MobRunStore for SqliteMobRunStore {
             let tx = begin_immediate(&mut conn)?;
             let bytes = load_run_bytes(&tx, &key)?;
             let Some(bytes) = bytes else {
-                return Err(MobError::RunNotFound(run_id));
+                return Err(MobStoreError::NotFound(format!("run not found: {run_id}")));
             };
             let mut run: MobRun = decode_json(&bytes)?;
             if run.flow_state != expected_run_state {
@@ -1052,7 +1052,7 @@ impl MobRunStore for SqliteMobRunStore {
             run.frames.insert(frame_id, initial_frame);
             append_loop_iteration_ledger_if_absent(&mut run, ledger_entry);
             write_run_json(&tx, &key, &run)?;
-            tx.commit().map_err(storage_error)?;
+            tx.commit().map_err(se)?;
             Ok(true)
         })
         .await
@@ -1070,7 +1070,7 @@ impl MobRunStore for SqliteMobRunStore {
         next_frame: FrameSnapshot,
         expected_run_state: &KernelState,
         next_run_state: KernelState,
-    ) -> Result<bool, MobError> {
+    ) -> Result<bool, MobStoreError> {
         let path = self.path.clone();
         let key = run_id.to_string();
         let run_id = run_id.clone();
@@ -1084,7 +1084,7 @@ impl MobRunStore for SqliteMobRunStore {
             let tx = begin_immediate(&mut conn)?;
             let bytes = load_run_bytes(&tx, &key)?;
             let Some(bytes) = bytes else {
-                return Err(MobError::RunNotFound(run_id));
+                return Err(MobStoreError::NotFound(format!("run not found: {run_id}")));
             };
             let mut run: MobRun = decode_json(&bytes)?;
             if run.flow_state != expected_run_state {
@@ -1100,7 +1100,7 @@ impl MobRunStore for SqliteMobRunStore {
             run.loops.insert(loop_instance_id, next_loop);
             run.frames.insert(frame_id, next_frame);
             write_run_json(&tx, &key, &run)?;
-            tx.commit().map_err(storage_error)?;
+            tx.commit().map_err(se)?;
             Ok(true)
         })
         .await
@@ -1118,7 +1118,7 @@ impl MobRunStore for SqliteMobRunStore {
         next_frame: FrameSnapshot,
         expected_run_state: &KernelState,
         next_run_state: KernelState,
-    ) -> Result<bool, MobError> {
+    ) -> Result<bool, MobStoreError> {
         let path = self.path.clone();
         let key = run_id.to_string();
         let run_id = run_id.clone();
@@ -1132,7 +1132,7 @@ impl MobRunStore for SqliteMobRunStore {
             let tx = begin_immediate(&mut conn)?;
             let bytes = load_run_bytes(&tx, &key)?;
             let Some(bytes) = bytes else {
-                return Err(MobError::RunNotFound(run_id));
+                return Err(MobStoreError::NotFound(format!("run not found: {run_id}")));
             };
             let mut run: MobRun = decode_json(&bytes)?;
             if run.flow_state != expected_run_state {
@@ -1148,7 +1148,7 @@ impl MobRunStore for SqliteMobRunStore {
             run.loops.insert(loop_instance_id, next_loop);
             run.frames.insert(frame_id, next_frame);
             write_run_json(&tx, &key, &run)?;
-            tx.commit().map_err(storage_error)?;
+            tx.commit().map_err(se)?;
             Ok(true)
         })
         .await

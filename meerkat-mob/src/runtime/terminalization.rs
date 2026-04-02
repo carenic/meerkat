@@ -260,7 +260,7 @@ mod tests {
             loop_instance_id: &crate::ids::LoopInstanceId,
             snapshot: crate::run::LoopSnapshot,
             ledger_entry: Option<crate::run::LoopIterationLedgerEntry>,
-        ) -> Result<(), crate::error::MobError> {
+        ) -> Result<(), MobStoreError> {
             self.inner
                 .upsert_loop_snapshot(run_id, loop_instance_id, snapshot, ledger_entry)
                 .await
@@ -272,7 +272,7 @@ mod tests {
             frame_id: &crate::ids::FrameId,
             expected: Option<&crate::run::FrameSnapshot>,
             next: crate::run::FrameSnapshot,
-        ) -> Result<bool, crate::error::MobError> {
+        ) -> Result<bool, MobStoreError> {
             self.inner
                 .cas_frame_state(run_id, frame_id, expected, next)
                 .await
@@ -286,7 +286,7 @@ mod tests {
             frame_id: &crate::ids::FrameId,
             expected_frame: &crate::run::FrameSnapshot,
             next_frame: crate::run::FrameSnapshot,
-        ) -> Result<bool, crate::error::MobError> {
+        ) -> Result<bool, MobStoreError> {
             self.inner
                 .cas_grant_node_slot(
                     run_id,
@@ -308,7 +308,7 @@ mod tests {
             step_output_key: String,
             step_output: serde_json::Value,
             loop_context: Option<(&crate::ids::LoopId, u64)>,
-        ) -> Result<bool, crate::error::MobError> {
+        ) -> Result<bool, MobStoreError> {
             self.inner
                 .cas_complete_step_and_record_output(
                     run_id,
@@ -332,7 +332,7 @@ mod tests {
             expected_frame: &crate::run::FrameSnapshot,
             next_frame: crate::run::FrameSnapshot,
             initial_loop: crate::run::LoopSnapshot,
-        ) -> Result<bool, crate::error::MobError> {
+        ) -> Result<bool, MobStoreError> {
             self.inner
                 .cas_start_loop(
                     run_id,
@@ -355,7 +355,7 @@ mod tests {
             next_loop: crate::run::LoopSnapshot,
             expected_run_state: &meerkat_machine_kernels::KernelState,
             next_run_state: meerkat_machine_kernels::KernelState,
-        ) -> Result<bool, crate::error::MobError> {
+        ) -> Result<bool, MobStoreError> {
             self.inner
                 .cas_loop_request_body_frame(
                     run_id,
@@ -379,7 +379,7 @@ mod tests {
             ledger_entry: crate::run::LoopIterationLedgerEntry,
             expected_run_state: &meerkat_machine_kernels::KernelState,
             next_run_state: meerkat_machine_kernels::KernelState,
-        ) -> Result<bool, crate::error::MobError> {
+        ) -> Result<bool, MobStoreError> {
             self.inner
                 .cas_grant_body_frame_start(
                     run_id,
@@ -406,7 +406,7 @@ mod tests {
             next_frame: crate::run::FrameSnapshot,
             expected_run_state: &meerkat_machine_kernels::KernelState,
             next_run_state: meerkat_machine_kernels::KernelState,
-        ) -> Result<bool, crate::error::MobError> {
+        ) -> Result<bool, MobStoreError> {
             self.inner
                 .cas_complete_body_frame(
                     run_id,
@@ -433,7 +433,7 @@ mod tests {
             next_frame: crate::run::FrameSnapshot,
             expected_run_state: &meerkat_machine_kernels::KernelState,
             next_run_state: meerkat_machine_kernels::KernelState,
-        ) -> Result<bool, crate::error::MobError> {
+        ) -> Result<bool, MobStoreError> {
             self.inner
                 .cas_complete_loop(
                     run_id,

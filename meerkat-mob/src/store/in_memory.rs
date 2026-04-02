@@ -281,11 +281,11 @@ impl MobRunStore for InMemoryMobRunStore {
         loop_instance_id: &LoopInstanceId,
         snapshot: LoopSnapshot,
         ledger_entry: Option<LoopIterationLedgerEntry>,
-    ) -> Result<(), MobError> {
+    ) -> Result<(), MobStoreError> {
         let mut runs = self.runs.write().await;
         let run = runs
             .get_mut(run_id)
-            .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
+            .ok_or_else(|| MobStoreError::NotFound(format!("run not found: {run_id}")))?;
         run.loops.insert(loop_instance_id.clone(), snapshot);
         if let Some(entry) = ledger_entry
             && !run.loop_iteration_ledger.iter().any(|existing| {
@@ -305,11 +305,11 @@ impl MobRunStore for InMemoryMobRunStore {
         frame_id: &FrameId,
         expected: Option<&FrameSnapshot>,
         next: FrameSnapshot,
-    ) -> Result<bool, MobError> {
+    ) -> Result<bool, MobStoreError> {
         let mut runs = self.runs.write().await;
         let run = runs
             .get_mut(run_id)
-            .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
+            .ok_or_else(|| MobStoreError::NotFound(format!("run not found: {run_id}")))?;
         let current = run.frames.get(frame_id);
         match (expected, current) {
             (None, None) => {
@@ -333,11 +333,11 @@ impl MobRunStore for InMemoryMobRunStore {
         frame_id: &FrameId,
         expected_frame: &FrameSnapshot,
         next_frame: FrameSnapshot,
-    ) -> Result<bool, MobError> {
+    ) -> Result<bool, MobStoreError> {
         let mut runs = self.runs.write().await;
         let run = runs
             .get_mut(run_id)
-            .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
+            .ok_or_else(|| MobStoreError::NotFound(format!("run not found: {run_id}")))?;
         // Check all expectations atomically
         if &run.flow_state != expected_run_state {
             return Ok(false);
@@ -360,11 +360,11 @@ impl MobRunStore for InMemoryMobRunStore {
         step_output_key: String,
         step_output: serde_json::Value,
         loop_context: Option<(&LoopId, u64)>,
-    ) -> Result<bool, MobError> {
+    ) -> Result<bool, MobStoreError> {
         let mut runs = self.runs.write().await;
         let run = runs
             .get_mut(run_id)
-            .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
+            .ok_or_else(|| MobStoreError::NotFound(format!("run not found: {run_id}")))?;
         if run.frames.get(frame_id) != Some(expected_frame) {
             return Ok(false);
         }
@@ -378,7 +378,7 @@ impl MobRunStore for InMemoryMobRunStore {
             }
             Some((loop_id, iteration)) => {
                 let iteration_index = usize::try_from(iteration).map_err(|_| {
-                    MobError::Internal(format!(
+                    MobStoreError::Internal(format!(
                         "loop iteration index {iteration} exceeds usize::MAX on this target"
                     ))
                 })?;
@@ -409,11 +409,11 @@ impl MobRunStore for InMemoryMobRunStore {
         expected_frame: &FrameSnapshot,
         next_frame: FrameSnapshot,
         initial_loop: LoopSnapshot,
-    ) -> Result<bool, MobError> {
+    ) -> Result<bool, MobStoreError> {
         let mut runs = self.runs.write().await;
         let run = runs
             .get_mut(run_id)
-            .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
+            .ok_or_else(|| MobStoreError::NotFound(format!("run not found: {run_id}")))?;
         if &run.flow_state != expected_run_state {
             return Ok(false);
         }
@@ -438,11 +438,11 @@ impl MobRunStore for InMemoryMobRunStore {
         next_loop: LoopSnapshot,
         expected_run_state: &KernelState,
         next_run_state: KernelState,
-    ) -> Result<bool, MobError> {
+    ) -> Result<bool, MobStoreError> {
         let mut runs = self.runs.write().await;
         let run = runs
             .get_mut(run_id)
-            .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
+            .ok_or_else(|| MobStoreError::NotFound(format!("run not found: {run_id}")))?;
         if &run.flow_state != expected_run_state {
             return Ok(false);
         }
@@ -466,11 +466,11 @@ impl MobRunStore for InMemoryMobRunStore {
         ledger_entry: LoopIterationLedgerEntry,
         expected_run_state: &KernelState,
         next_run_state: KernelState,
-    ) -> Result<bool, MobError> {
+    ) -> Result<bool, MobStoreError> {
         let mut runs = self.runs.write().await;
         let run = runs
             .get_mut(run_id)
-            .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
+            .ok_or_else(|| MobStoreError::NotFound(format!("run not found: {run_id}")))?;
         if &run.flow_state != expected_run_state {
             return Ok(false);
         }
@@ -506,11 +506,11 @@ impl MobRunStore for InMemoryMobRunStore {
         next_frame: FrameSnapshot,
         expected_run_state: &KernelState,
         next_run_state: KernelState,
-    ) -> Result<bool, MobError> {
+    ) -> Result<bool, MobStoreError> {
         let mut runs = self.runs.write().await;
         let run = runs
             .get_mut(run_id)
-            .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
+            .ok_or_else(|| MobStoreError::NotFound(format!("run not found: {run_id}")))?;
         if &run.flow_state != expected_run_state {
             return Ok(false);
         }
@@ -538,11 +538,11 @@ impl MobRunStore for InMemoryMobRunStore {
         next_frame: FrameSnapshot,
         expected_run_state: &KernelState,
         next_run_state: KernelState,
-    ) -> Result<bool, MobError> {
+    ) -> Result<bool, MobStoreError> {
         let mut runs = self.runs.write().await;
         let run = runs
             .get_mut(run_id)
-            .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
+            .ok_or_else(|| MobStoreError::NotFound(format!("run not found: {run_id}")))?;
         if &run.flow_state != expected_run_state {
             return Ok(false);
         }

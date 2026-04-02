@@ -787,18 +787,18 @@ impl FlowFrameEngine {
                 frame_id,
                 expected_frame,
                 next_frame,
-            } => {
-                self.run_store
-                    .cas_grant_node_slot(
-                        run_id,
-                        expected_run_state,
-                        next_run_state.clone(),
-                        frame_id,
-                        expected_frame,
-                        next_frame.clone(),
-                    )
-                    .await
-            }
+            } => self
+                .run_store
+                .cas_grant_node_slot(
+                    run_id,
+                    expected_run_state,
+                    next_run_state.clone(),
+                    frame_id,
+                    expected_frame,
+                    next_frame.clone(),
+                )
+                .await
+                .map_err(MobError::from),
             FlowFrameLoopStorePlan::StartLoop {
                 loop_instance_id,
                 expected_run_state,
@@ -807,20 +807,20 @@ impl FlowFrameEngine {
                 expected_frame,
                 next_frame,
                 initial_loop,
-            } => {
-                self.run_store
-                    .cas_start_loop(
-                        run_id,
-                        loop_instance_id,
-                        expected_run_state,
-                        next_run_state.clone(),
-                        frame_id,
-                        expected_frame,
-                        next_frame.clone(),
-                        initial_loop.clone(),
-                    )
-                    .await
-            }
+            } => self
+                .run_store
+                .cas_start_loop(
+                    run_id,
+                    loop_instance_id,
+                    expected_run_state,
+                    next_run_state.clone(),
+                    frame_id,
+                    expected_frame,
+                    next_frame.clone(),
+                    initial_loop.clone(),
+                )
+                .await
+                .map_err(MobError::from),
             FlowFrameLoopStorePlan::GrantBodyFrameStart {
                 loop_instance_id,
                 expected_loop,
@@ -830,38 +830,38 @@ impl FlowFrameEngine {
                 ledger_entry,
                 expected_run_state,
                 next_run_state,
-            } => {
-                self.run_store
-                    .cas_grant_body_frame_start(
-                        run_id,
-                        loop_instance_id,
-                        expected_loop,
-                        next_loop.clone(),
-                        frame_id,
-                        initial_frame.clone(),
-                        ledger_entry.clone(),
-                        expected_run_state,
-                        next_run_state.clone(),
-                    )
-                    .await
-            }
+            } => self
+                .run_store
+                .cas_grant_body_frame_start(
+                    run_id,
+                    loop_instance_id,
+                    expected_loop,
+                    next_loop.clone(),
+                    frame_id,
+                    initial_frame.clone(),
+                    ledger_entry.clone(),
+                    expected_run_state,
+                    next_run_state.clone(),
+                )
+                .await
+                .map_err(MobError::from),
             FlowFrameLoopStorePlan::RunStateOnly {
                 expected_run_state,
                 next_run_state,
-            } => {
-                self.run_store
-                    .cas_flow_state(run_id, expected_run_state, next_run_state)
-                    .await
-            }
+            } => self
+                .run_store
+                .cas_flow_state(run_id, expected_run_state, next_run_state)
+                .await
+                .map_err(MobError::from),
             FlowFrameLoopStorePlan::SealFrame {
                 frame_id,
                 expected_frame,
                 next_frame,
-            } => {
-                self.run_store
-                    .cas_frame_state(run_id, frame_id, Some(expected_frame), next_frame.clone())
-                    .await
-            }
+            } => self
+                .run_store
+                .cas_frame_state(run_id, frame_id, Some(expected_frame), next_frame.clone())
+                .await
+                .map_err(MobError::from),
             FlowFrameLoopStorePlan::CompleteBodyFrame {
                 loop_instance_id,
                 expected_loop,
@@ -871,39 +871,39 @@ impl FlowFrameEngine {
                 next_frame,
                 expected_run_state,
                 next_run_state,
-            } => {
-                self.run_store
-                    .cas_complete_body_frame(
-                        run_id,
-                        loop_instance_id,
-                        expected_loop,
-                        next_loop.clone(),
-                        frame_id,
-                        expected_frame,
-                        next_frame.clone(),
-                        expected_run_state,
-                        next_run_state.clone(),
-                    )
-                    .await
-            }
+            } => self
+                .run_store
+                .cas_complete_body_frame(
+                    run_id,
+                    loop_instance_id,
+                    expected_loop,
+                    next_loop.clone(),
+                    frame_id,
+                    expected_frame,
+                    next_frame.clone(),
+                    expected_run_state,
+                    next_run_state.clone(),
+                )
+                .await
+                .map_err(MobError::from),
             FlowFrameLoopStorePlan::LoopRequestBodyFrame {
                 loop_instance_id,
                 expected_loop,
                 next_loop,
                 expected_run_state,
                 next_run_state,
-            } => {
-                self.run_store
-                    .cas_loop_request_body_frame(
-                        run_id,
-                        loop_instance_id,
-                        expected_loop,
-                        next_loop.clone(),
-                        expected_run_state,
-                        next_run_state.clone(),
-                    )
-                    .await
-            }
+            } => self
+                .run_store
+                .cas_loop_request_body_frame(
+                    run_id,
+                    loop_instance_id,
+                    expected_loop,
+                    next_loop.clone(),
+                    expected_run_state,
+                    next_run_state.clone(),
+                )
+                .await
+                .map_err(MobError::from),
             FlowFrameLoopStorePlan::CompleteLoop {
                 loop_instance_id,
                 expected_loop,
@@ -913,21 +913,21 @@ impl FlowFrameEngine {
                 next_frame,
                 expected_run_state,
                 next_run_state,
-            } => {
-                self.run_store
-                    .cas_complete_loop(
-                        run_id,
-                        loop_instance_id,
-                        expected_loop,
-                        next_loop.clone(),
-                        frame_id,
-                        expected_frame,
-                        next_frame.clone(),
-                        expected_run_state,
-                        next_run_state.clone(),
-                    )
-                    .await
-            }
+            } => self
+                .run_store
+                .cas_complete_loop(
+                    run_id,
+                    loop_instance_id,
+                    expected_loop,
+                    next_loop.clone(),
+                    frame_id,
+                    expected_frame,
+                    next_frame.clone(),
+                    expected_run_state,
+                    next_run_state.clone(),
+                )
+                .await
+                .map_err(MobError::from),
         }
     }
 
