@@ -5,12 +5,11 @@
 //! receiver that uses live trusted peers for dynamic registration.
 
 use anyhow::Context as _;
-use meerkat::{AgentFactory, AnthropicClient, GeminiClient, OpenAiClient};
 use meerkat_comms::agent::types::{CommsContent, CommsMessage};
 use meerkat_comms::identity::Keypair;
 use meerkat_comms::router::CommsConfig;
 use meerkat_comms::{Inbox, InboxItem, InboxSender, PeerMeta, Router, TrustedPeer, TrustedPeers};
-use meerkat_core::{AgentEvent, AgentLlmClient};
+use meerkat_core::AgentEvent;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -55,36 +54,6 @@ pub fn api_key_env_var(provider: ProviderKind) -> &'static str {
         ProviderKind::Gemini => "GEMINI_API_KEY",
         ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
     }
-}
-
-/// Build an `Arc<dyn AgentLlmClient>` for the given model + provider.
-pub async fn build_llm_client(
-    factory: &AgentFactory,
-    model: &str,
-    provider: ProviderKind,
-) -> anyhow::Result<Arc<dyn AgentLlmClient>> {
-    let key_var = api_key_env_var(provider);
-    let key = std::env::var(key_var)
-        .with_context(|| format!("{key_var} not set (required for provider '{provider}')"))?;
-
-    let adapter: Arc<dyn AgentLlmClient> = match provider {
-        ProviderKind::Openai => Arc::new(
-            factory
-                .build_llm_adapter(Arc::new(OpenAiClient::new(key)), model)
-                .await,
-        ),
-        ProviderKind::Gemini => Arc::new(
-            factory
-                .build_llm_adapter(Arc::new(GeminiClient::new(key)), model)
-                .await,
-        ),
-        ProviderKind::Anthropic => Arc::new(
-            factory
-                .build_llm_adapter(Arc::new(AnthropicClient::new(key)?), model)
-                .await,
-        ),
-    };
-    Ok(adapter)
 }
 
 // ── Comms node (Router + Inbox, supports dynamic peers) ───────────────────────
