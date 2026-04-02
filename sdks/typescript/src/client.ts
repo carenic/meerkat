@@ -55,6 +55,8 @@ import {
 import { DeferredSession, Session } from "./session.js";
 import {
   Mob,
+  type MemberDeliveryReceipt,
+  type MemberSendOptions,
   type MobKickoffMemberSnapshot,
   type MobKickoffWaitOptions,
   type MobPeerTarget,
@@ -645,6 +647,37 @@ export class MeerkatClient {
           : undefined
         : undefined,
     }));
+  }
+
+  async sendMobMemberContent(
+    mobId: string,
+    meerkatId: string,
+    content: string | ContentBlock[],
+    options?: MemberSendOptions,
+  ): Promise<MemberDeliveryReceipt> {
+    const members = await this.listMobMembers(mobId);
+    const member = members.find((candidate) => candidate.meerkatId === meerkatId);
+    if (!member) {
+      throw new MeerkatError(
+        "NOT_FOUND",
+        `Mob member '${meerkatId}' not found in mob '${mobId}'`,
+      );
+    }
+
+    const sessionId = member.currentSessionId ?? member.sessionId;
+    if (!sessionId) {
+      throw new MeerkatError(
+        "NOT_FOUND",
+        `Mob member '${meerkatId}' in mob '${mobId}' does not have an active session`,
+      );
+    }
+
+    await this._startTurn(sessionId, content);
+    return {
+      memberId: meerkatId,
+      sessionId,
+      handlingMode: options?.handlingMode ?? "queue",
+    };
   }
 
   async spawnMobMember(

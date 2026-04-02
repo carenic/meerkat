@@ -2,6 +2,7 @@ import { EventSubscription } from "./subscription.js";
 import type {
   AgentEventEnvelope,
   AttributedMobEvent,
+  ContentBlock,
   MobFlowStatus,
   MobLifecycleAction,
   MobMember,
@@ -9,6 +10,35 @@ import type {
   SpawnSpec,
 } from "./types.js";
 import type { MeerkatClient } from "./client.js";
+
+export type MobHandlingMode = "queue" | "steer";
+export type MobRenderClass =
+  | "user_prompt"
+  | "peer_message"
+  | "peer_request"
+  | "peer_response"
+  | "external_event"
+  | "flow_step"
+  | "continuation"
+  | "system_notice"
+  | "tool_scope_notice"
+  | "ops_progress";
+
+export interface MobRenderMetadata extends Record<string, unknown> {
+  class: MobRenderClass;
+  salience?: "background" | "normal" | "important" | "urgent";
+}
+
+export interface MemberSendOptions {
+  handlingMode?: MobHandlingMode;
+  renderMetadata?: MobRenderMetadata;
+}
+
+export interface MemberDeliveryReceipt {
+  memberId: string;
+  sessionId: string;
+  handlingMode: MobHandlingMode;
+}
 
 export interface MemberRespawnReceipt {
   memberId: string;
@@ -74,6 +104,13 @@ export class Member {
     this.client = client;
     this.mobId = mobId;
     this.meerkatId = meerkatId;
+  }
+
+  async send(
+    content: string | ContentBlock[],
+    options?: MemberSendOptions,
+  ): Promise<MemberDeliveryReceipt> {
+    return this.client.sendMobMemberContent(this.mobId, this.meerkatId, content, options);
   }
 
   async events(): Promise<EventSubscription<AgentEventEnvelope>> {

@@ -714,6 +714,53 @@ class MeerkatClient:
         result = await self._request("mob/members", {"mob_id": mob_id})
         return result.get("members", [])
 
+    async def send_mob_member_content(
+        self,
+        mob_id: str,
+        meerkat_id: str,
+        content: str | list[dict[str, Any]],
+        *,
+        handling_mode: Literal["queue", "steer"] = "queue",
+        render_metadata: RenderMetadata | None = None,
+    ) -> dict[str, Any]:
+        _ = render_metadata
+        members = await self.list_mob_members(mob_id)
+        member = next(
+            (
+                candidate
+                for candidate in members
+                if str(candidate.get("meerkat_id", candidate.get("meerkatId", ""))) == meerkat_id
+            ),
+            None,
+        )
+        if member is None:
+            raise MeerkatError(
+                "NOT_FOUND",
+                f"Mob member '{meerkat_id}' not found in mob '{mob_id}'",
+            )
+
+        session_id = member.get("current_session_id", member.get("currentSessionId"))
+        if not isinstance(session_id, str) or not session_id:
+            member_ref = member.get("member_ref", member.get("memberRef"))
+            if isinstance(member_ref, dict):
+                raw_session_id = member_ref.get("session_id", member_ref.get("sessionId"))
+                if isinstance(raw_session_id, str) and raw_session_id:
+                    session_id = raw_session_id
+        if not isinstance(session_id, str) or not session_id:
+            session_id = member.get("session_id", member.get("sessionId"))
+        if not isinstance(session_id, str) or not session_id:
+            raise MeerkatError(
+                "NOT_FOUND",
+                f"Mob member '{meerkat_id}' in mob '{mob_id}' does not have an active session",
+            )
+
+        await self._start_turn(session_id, content)
+        return {
+            "member_id": meerkat_id,
+            "session_id": session_id,
+            "handling_mode": handling_mode,
+        }
+
     async def spawn_mob_member(
         self,
         mob_id: str,

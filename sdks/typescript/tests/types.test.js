@@ -754,3 +754,57 @@ describe("Mob kickoff wait wrappers", () => {
     assert.equal(fromHandle[0].meerkatId, "lead");
   });
 });
+
+describe("Mob member host ingress", () => {
+  it("resolves member sessions and starts a turn through the host control plane", async () => {
+    const client = new MeerkatClient();
+    const startTurnCalls = [];
+    client.listMobMembers = async () => [
+      {
+        meerkatId: "reviewer-1",
+        profile: "reviewer",
+        memberRef: { session_id: "session-123" },
+        sessionId: "session-123",
+      },
+    ];
+    client._startTurn = async (sessionId, prompt) => {
+      startTurnCalls.push({ sessionId, prompt });
+      return {
+        sessionId,
+        text: "",
+        turns: 0,
+        toolCalls: 0,
+        usage: { inputTokens: 0, outputTokens: 0 },
+      };
+    };
+
+    const receipt = await new Mob(client, "mob-1").member("reviewer-1").send(
+      "hello reviewer",
+      { handlingMode: "steer" },
+    );
+
+    assert.deepEqual(receipt, {
+      memberId: "reviewer-1",
+      sessionId: "session-123",
+      handlingMode: "steer",
+    });
+    assert.deepEqual(startTurnCalls, [
+      { sessionId: "session-123", prompt: "hello reviewer" },
+    ]);
+  });
+
+  it("rejects sends when the member has no active session", async () => {
+    const client = new MeerkatClient();
+    client.listMobMembers = async () => [
+      {
+        meerkatId: "reviewer-1",
+        profile: "reviewer",
+      },
+    ];
+
+    await assert.rejects(
+      () => new Mob(client, "mob-1").member("reviewer-1").send("hello reviewer"),
+      /does not have an active session/,
+    );
+  });
+});

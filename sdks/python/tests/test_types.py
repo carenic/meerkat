@@ -875,9 +875,52 @@ async def test_client_mob_lifecycle_and_send_methods_use_explicit_rpc_methods():
             }
         },
     }
-    assert calls[11][1] == {
+    assert calls[10][1] == {
         "mob_id": "mob-1",
         "member_ids": ["agent-a"],
         "timeout_ms": 1234,
     }
-    assert calls[12][1] == {"mob_id": "mob-1", "timeout_ms": 99}
+    assert calls[11][1] == {"mob_id": "mob-1", "timeout_ms": 99}
+
+
+@pytest.mark.asyncio
+async def test_send_mob_member_content_uses_host_turn_start_lane() -> None:
+    client = MeerkatClient()
+    start_turn_calls: list[tuple[str, object]] = []
+
+    async def fake_list_mob_members(_mob_id: str) -> list[dict[str, object]]:
+        return [{"meerkat_id": "agent-a", "member_ref": {"session_id": "session-123"}}]
+
+    async def fake_start_turn(session_id: str, prompt, **_kwargs) -> RunResult:
+        start_turn_calls.append((session_id, prompt))
+        return RunResult(session_id=session_id)
+
+    client.list_mob_members = fake_list_mob_members  # type: ignore[method-assign]
+    client._start_turn = fake_start_turn  # type: ignore[method-assign]
+
+    receipt = await client.send_mob_member_content(
+        "mob-1",
+        "agent-a",
+        "hello reviewer",
+        handling_mode="steer",
+    )
+
+    assert receipt == {
+        "member_id": "agent-a",
+        "session_id": "session-123",
+        "handling_mode": "steer",
+    }
+    assert start_turn_calls == [("session-123", "hello reviewer")]
+
+
+@pytest.mark.asyncio
+async def test_send_mob_member_content_rejects_members_without_active_session() -> None:
+    client = MeerkatClient()
+
+    async def fake_list_mob_members(_mob_id: str) -> list[dict[str, object]]:
+        return [{"meerkat_id": "agent-a"}]
+
+    client.list_mob_members = fake_list_mob_members  # type: ignore[method-assign]
+
+    with pytest.raises(MeerkatError, match="does not have an active session"):
+        await client.send_mob_member_content("mob-1", "agent-a", "hello reviewer")
