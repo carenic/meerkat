@@ -128,11 +128,16 @@ impl CompletionFeed for RuntimeCompletionFeed {
     ) -> std::pin::Pin<Box<dyn Future<Output = CompletionSeq> + Send + '_>> {
         Box::pin(async move {
             loop {
+                // Register the waiter BEFORE reading the watermark.
+                // notify_waiters() in push() only wakes already-registered
+                // listeners — if we read first and push() lands between the
+                // read and notified().await, the wake is lost.
+                let notified = self.buffer.notify.notified();
                 let current = self.buffer.watermark_atomic.load(Ordering::Acquire);
                 if current > after_seq {
                     return current;
                 }
-                self.buffer.notify.notified().await;
+                notified.await;
             }
         })
     }

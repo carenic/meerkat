@@ -242,6 +242,19 @@ pub trait AgentToolDispatcher: Send + Sync {
     ) -> Option<Arc<dyn crate::completion_feed::CompletionEnrichmentProvider>> {
         None
     }
+
+    /// Bind a completion feed into this dispatcher's WaitTool (feed-only, no comms).
+    ///
+    /// Called by the factory when no comms runtime is available but a completion
+    /// feed exists. The WaitTool will race sleep against feed advance without
+    /// a comms interrupt channel. Default returns `Err(Unsupported)`.
+    fn bind_completion_feed(
+        self: Arc<Self>,
+        _feed: Arc<dyn crate::completion_feed::CompletionFeed>,
+        _baseline: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Result<Arc<dyn AgentToolDispatcher>, crate::wait_interrupt::WaitInterruptBindError> {
+        Err(crate::wait_interrupt::WaitInterruptBindError::Unsupported)
+    }
 }
 
 /// Error from [`AgentToolDispatcher::bind_ops_lifecycle`].
@@ -331,6 +344,21 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher for Filtered
     ) -> Result<Arc<dyn AgentToolDispatcher>, OpsLifecycleBindError> {
         let owned = Arc::try_unwrap(self).map_err(|_| OpsLifecycleBindError::SharedOwnership)?;
         let rebound_inner = owned.inner.bind_ops_lifecycle(registry, owner_session_id)?;
+        Ok(Arc::new(FilteredToolDispatcher {
+            inner: rebound_inner,
+            allowed_tools: owned.allowed_tools,
+            filtered_tools: owned.filtered_tools,
+        }))
+    }
+
+    fn bind_completion_feed(
+        self: Arc<Self>,
+        feed: Arc<dyn crate::completion_feed::CompletionFeed>,
+        baseline: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Result<Arc<dyn AgentToolDispatcher>, crate::wait_interrupt::WaitInterruptBindError> {
+        let owned = Arc::try_unwrap(self)
+            .map_err(|_| crate::wait_interrupt::WaitInterruptBindError::SharedOwnership)?;
+        let rebound_inner = owned.inner.bind_completion_feed(feed, baseline)?;
         Ok(Arc::new(FilteredToolDispatcher {
             inner: rebound_inner,
             allowed_tools: owned.allowed_tools,

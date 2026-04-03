@@ -64,6 +64,18 @@ impl WaitTool {
         }
     }
 
+    /// Create a WaitTool with a completion feed but no comms interrupt.
+    ///
+    /// Used when no comms runtime is available but a completion feed exists
+    /// (non-comms sessions with background ops or delegate).
+    pub fn with_feed_only(feed: Arc<dyn CompletionFeed>, baseline: Arc<AtomicU64>) -> Self {
+        Self {
+            interrupt_rx: None,
+            completion_feed: Some(feed),
+            interrupt_baseline: Some(baseline),
+        }
+    }
+
     /// Create a WaitTool with both comms interrupt and completion feed.
     ///
     /// The tool races sleep against both the comms interrupt channel and

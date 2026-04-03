@@ -1613,6 +1613,33 @@ impl AgentFactory {
             }
         }
 
+        // 9b. Bind completion feed when comms didn't already wire it.
+        // bind_wait_interrupt (comms path) passes feed+baseline to WaitTool.
+        // When no comms runtime exists, bind the feed directly so WaitTool
+        // can still race sleep against completion events.
+        {
+            let comms_bound_wait = {
+                #[cfg(feature = "comms")]
+                {
+                    comms_runtime.is_some()
+                }
+                #[cfg(not(feature = "comms"))]
+                {
+                    false
+                }
+            };
+            if !comms_bound_wait
+                && tools.supports_wait_interrupt()
+                && Arc::strong_count(&tools) == 1
+                && let (Some(feed), Some(baseline)) =
+                    (completion_feed.clone(), interrupt_baseline.clone())
+            {
+                tools = tools.bind_completion_feed(feed, baseline).map_err(|e| {
+                    BuildAgentError::Config(format!("Completion feed binding failed: {e}"))
+                })?;
+            }
+        }
+
         if tools.supports_ops_lifecycle_binding() {
             tools = tools
                 .bind_ops_lifecycle(Arc::clone(&ops_lifecycle), session.id().clone())

@@ -455,13 +455,22 @@ impl AgentToolDispatcher for CompositeDispatcher {
     }
 
     async fn poll_external_updates(&self) -> ExternalToolUpdate {
-        // Background completions are no longer delivered through poll_external_updates.
-        // The agent boundary drains them via the CompletionFeed.
-        if let Some(ref ext) = self.external {
+        let update = if let Some(ref ext) = self.external {
             ext.poll_external_updates().await
         } else {
             ExternalToolUpdate::default()
+        };
+
+        // Background completions are no longer delivered through poll_external_updates
+        // (the agent boundary drains them via the CompletionFeed). But we still call
+        // drain_completed() for its side effect: flipping completion_notified on
+        // finished jobs so cleanup_old_jobs() can evict them after TTL expiry.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ref mgr) = self.job_manager {
+            let _ = mgr.drain_completed().await;
         }
+
+        update
     }
 
     fn bind_wait_interrupt(
@@ -493,6 +502,31 @@ impl AgentToolDispatcher for CompositeDispatcher {
 
     fn supports_wait_interrupt(&self) -> bool {
         self.builtin_tools.iter().any(|t| t.name() == "wait")
+    }
+
+    fn bind_completion_feed(
+        self: Arc<Self>,
+        feed: std::sync::Arc<dyn meerkat_core::completion_feed::CompletionFeed>,
+        baseline: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Result<Arc<dyn AgentToolDispatcher>, meerkat_core::wait_interrupt::WaitInterruptBindError>
+    {
+        let mut owned = Arc::try_unwrap(self)
+            .map_err(|_| meerkat_core::wait_interrupt::WaitInterruptBindError::SharedOwnership)?;
+        // Swap the wait tool with a feed-aware version (no comms rx).
+        use crate::builtin::utility::WaitTool;
+        let new_wait = Arc::new(WaitTool::with_feed_only(
+            Arc::clone(&feed),
+            Arc::clone(&baseline),
+        ));
+        for tool in &mut owned.builtin_tools {
+            if tool.name() == "wait" {
+                *tool = new_wait;
+                break;
+            }
+        }
+        owned.completion_feed = Some(feed);
+        owned.interrupt_baseline = Some(baseline);
+        Ok(Arc::new(owned))
     }
 
     fn bind_ops_lifecycle(
