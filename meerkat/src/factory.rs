@@ -754,10 +754,16 @@ impl AgentFactory {
         self
     }
 
-    /// Set a pre-built comms runtime shared across all sessions.
+    /// Set a pre-built comms runtime for sessions that don't request their
+    /// own identity.
     ///
     /// When set, `build_agent()` uses this runtime for tool composition and
-    /// agent wiring instead of creating a per-session runtime from config.
+    /// agent wiring — but only when the session's `comms_name` is `None`.
+    /// Sessions that set `comms_name` (e.g., mob-spawned members) get their
+    /// own per-session runtime so each member has a distinct keypair, inbox,
+    /// and trusted-peer set. Sharing the surface runtime with members would
+    /// collapse their `PeerCommsMachine` state into one instance, breaking
+    /// peer-to-peer addressing.
     #[cfg(feature = "comms")]
     pub fn with_comms_runtime(mut self, runtime: Arc<meerkat_comms::CommsRuntime>) -> Self {
         self.comms_runtime = Some(runtime);
@@ -1301,8 +1307,14 @@ impl AgentFactory {
         // If the factory has a pre-built runtime (surface with stable identity),
         // use it directly. Otherwise create a per-session runtime from config.
         #[cfg(all(feature = "comms", not(target_arch = "wasm32")))]
-        let comms_runtime = if let Some(ref runtime) = self.comms_runtime {
-            Some(Arc::clone(runtime))
+        let comms_runtime = if let Some(ref shared) = self.comms_runtime
+            && build_config.comms_name.is_none()
+        {
+            // Use the factory's shared runtime only when no per-session comms_name
+            // is requested. Mob-spawned members set comms_name and need their own
+            // per-session identity — sharing the parent's runtime would make all
+            // members route to the same inbox and break peer-to-peer messaging.
+            Some(Arc::clone(shared))
         } else if build_config.keep_alive || build_config.comms_name.is_some() {
             let comms_name = build_config
                 .comms_name
@@ -1337,8 +1349,10 @@ impl AgentFactory {
             None
         };
         #[cfg(all(feature = "comms", target_arch = "wasm32"))]
-        let comms_runtime = if let Some(ref runtime) = self.comms_runtime {
-            Some(Arc::clone(runtime))
+        let comms_runtime = if let Some(ref shared) = self.comms_runtime
+            && build_config.comms_name.is_none()
+        {
+            Some(Arc::clone(shared))
         } else if build_config.keep_alive || build_config.comms_name.is_some() {
             let comms_name = build_config
                 .comms_name
@@ -1375,10 +1389,23 @@ impl AgentFactory {
         // when the model cannot process image blocks in tool results).
         let image_tool_results = meerkat_models::profile::profile_for(provider.as_str(), &model)
             .is_none_or(|p| p.image_tool_results);
-        let ops_lifecycle: Arc<dyn OpsLifecycleRegistry> = build_config
-            .ops_lifecycle_override
-            .clone()
-            .unwrap_or_else(|| Arc::new(RuntimeOpsLifecycleRegistry::new()));
+        // Create the ops lifecycle registry. Keep the concrete type accessible
+        // for wiring the wait-interrupt sender before trait-erasing.
+        // concrete_ops_lifecycle is kept for future wait-interrupt wiring
+        // (set_wait_interrupt on BackgroundToolOp terminal).
+        #[allow(unused_variables)]
+        let (ops_lifecycle, concrete_ops_lifecycle): (
+            Arc<dyn OpsLifecycleRegistry>,
+            Option<Arc<RuntimeOpsLifecycleRegistry>>,
+        ) = if let Some(overridden) = build_config.ops_lifecycle_override.clone() {
+            (overridden, None)
+        } else {
+            let concrete = Arc::new(RuntimeOpsLifecycleRegistry::new());
+            (
+                Arc::clone(&concrete) as Arc<dyn OpsLifecycleRegistry>,
+                Some(concrete),
+            )
+        };
 
         // Build the tool dispatcher WITHOUT wait interrupt wiring.
         // The interrupt is bound once after full composition (including comms gateway).
