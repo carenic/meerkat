@@ -3315,7 +3315,10 @@ timeout_ms = 1000
     }
 
     #[tokio::test]
-    async fn test_mob_wait_kickoff_timeout_maps_error() {
+    async fn test_mob_wait_kickoff_returns_immediately_without_timeout() {
+        // Autonomous members no longer run a separate kickoff turn — their
+        // runtime is ready immediately after spawn. The barrier returns
+        // member snapshots without waiting.
         let svc = Arc::new(MockSessionSvc::new());
         let state = Arc::new(MobMcpState::new(svc));
         let d = MobMcpDispatcher::new(state);
@@ -3327,12 +3330,13 @@ timeout_ms = 1000
             "meerkat_spawn",
             json!({
                 "mob_id": mob_id,
-                "specs": [{"profile":"lead","meerkat_id":"hung-kickoff"}]
+                "specs": [{"profile":"lead","meerkat_id":"kickoff-member"}]
             }),
         )
         .await;
 
-        let error = call_tool_err(
+        // Should succeed immediately (no kickoff turn to wait for)
+        let waited = call_tool(
             &d,
             "mob_wait_kickoff",
             json!({
@@ -3341,10 +3345,9 @@ timeout_ms = 1000
             }),
         )
         .await;
-        assert!(
-            matches!(error, ToolError::ExecutionFailed { .. }),
-            "kickoff timeout should surface as execution failure on the MCP tool surface"
-        );
+        let members = waited["members"].as_array().expect("members array");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0]["meerkat_id"], "kickoff-member");
     }
 
     #[tokio::test]

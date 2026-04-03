@@ -975,7 +975,6 @@ impl MobBuilder {
             tool_bundles,
             default_llm_client,
             retired_event_index: Arc::new(RwLock::new(HashSet::new())),
-            autonomous_host_loops: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             next_spawn_ticket: 0,
             pending_spawns: PendingSpawnLineage::new(),
             edge_locks: Arc::new(super::edge_locks::EdgeLockRegistry::new()),

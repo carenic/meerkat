@@ -349,6 +349,7 @@ struct MockSessionService {
     /// Sent intents for sessions that were archived and removed.
     archived_sent_intents: RwLock<HashMap<SessionId, Vec<String>>>,
     fail_start_turn: std::sync::atomic::AtomicBool,
+    fail_inject: std::sync::atomic::AtomicBool,
     start_turn_calls: AtomicU64,
     keep_alive_start_turn_calls: AtomicU64,
     keep_alive_turns_complete_immediately: std::sync::atomic::AtomicBool,
@@ -388,6 +389,7 @@ impl MockSessionService {
             archive_fail_comms_names: RwLock::new(HashSet::new()),
             archived_sent_intents: RwLock::new(HashMap::new()),
             fail_start_turn: std::sync::atomic::AtomicBool::new(false),
+            fail_inject: std::sync::atomic::AtomicBool::new(false),
             start_turn_calls: AtomicU64::new(0),
             keep_alive_start_turn_calls: AtomicU64::new(0),
             keep_alive_turns_complete_immediately: std::sync::atomic::AtomicBool::new(false),
@@ -590,6 +592,11 @@ impl MockSessionService {
 
     fn set_fail_start_turn(&self, enabled: bool) {
         self.fail_start_turn
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn set_fail_inject(&self, enabled: bool) {
+        self.fail_inject
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -1129,6 +1136,7 @@ struct CountingInjector {
     delay_ms: u64,
     never_terminal: bool,
     fail: bool,
+    fail_inject: bool,
     completed_result: String,
 }
 
@@ -1140,6 +1148,9 @@ impl EventInjector for CountingInjector {
         _handling_mode: meerkat_core::types::HandlingMode,
         _render_metadata: Option<meerkat_core::types::RenderMetadata>,
     ) -> Result<(), EventInjectorError> {
+        if self.fail_inject {
+            return Err(EventInjectorError::Closed);
+        }
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -1223,11 +1234,13 @@ impl SessionServiceCommsExt for MockSessionService {
                 .await
                 .contains(session_id);
         let completed_result = self.flow_turn_completed_result.read().await.clone();
+        let fail_inject = self.fail_inject.load(std::sync::atomic::Ordering::Relaxed);
         Some(Arc::new(CountingInjector {
             calls: self.inject_calls.clone(),
             delay_ms,
             never_terminal,
             fail,
+            fail_inject,
             completed_result,
         }))
     }
@@ -1252,11 +1265,13 @@ impl SessionServiceCommsExt for MockSessionService {
                 .await
                 .contains(session_id);
         let completed_result = self.flow_turn_completed_result.read().await.clone();
+        let fail_inject = self.fail_inject.load(std::sync::atomic::Ordering::Relaxed);
         Some(Arc::new(CountingInjector {
             calls: self.inject_calls.clone(),
             delay_ms,
             never_terminal,
             fail,
+            fail_inject,
             completed_result,
         }))
     }
@@ -4156,26 +4171,26 @@ async fn test_wait_for_members_kickoff_complete_only_waits_requested_members() {
 }
 
 #[tokio::test]
-async fn test_wait_for_kickoff_complete_times_out_with_pending_member_ids() {
+async fn test_wait_for_kickoff_complete_returns_immediately_without_kickoff_turns() {
     let (handle, _service) = create_test_mob(sample_definition()).await;
 
-    let pending = MeerkatId::from("lead-hung");
+    let member = MeerkatId::from("lead-hung");
     handle
-        .spawn(ProfileName::from("lead"), pending.clone(), None)
+        .spawn(ProfileName::from("lead"), member.clone(), None)
         .await
-        .expect("spawn hung lead");
+        .expect("spawn lead");
 
-    let error = handle
+    // No kickoff turns anymore — autonomous members use prompt injection,
+    // so the barrier returns immediately with member snapshots.
+    let snapshots = handle
         .wait_for_kickoff_complete(Some(Duration::from_millis(50)))
         .await
-        .expect_err("kickoff barrier should time out for hanging kickoff");
+        .expect("barrier should return immediately when no kickoff turns are pending");
 
-    match error {
-        MobError::KickoffWaitTimedOut { pending_member_ids } => {
-            assert_eq!(pending_member_ids, vec![pending]);
-        }
-        other => panic!("expected kickoff timeout, got {other:?}"),
-    }
+    assert!(
+        !snapshots.is_empty(),
+        "barrier should return snapshots for spawned members"
+    );
 }
 
 #[tokio::test]
@@ -9068,15 +9083,16 @@ async fn test_external_turn_autonomous_mode_uses_injector_dispatch() {
         .await
         .expect("external turn should execute");
 
+    // 1 inject from spawn (prompt injection) + 1 inject from send() = 2
     assert_eq!(
         service.inject_call_count(),
-        1,
-        "autonomous dispatch must use event injector"
+        2,
+        "autonomous dispatch must use event injector (1 spawn + 1 send)"
     );
     assert_eq!(
-        service.start_turn_call_count(),
         service.keep_alive_start_turn_call_count(),
-        "autonomous dispatch must not issue additional non-host start_turn calls"
+        0,
+        "no kickoff turns — autonomous members use prompt injection"
     );
 }
 
@@ -9336,10 +9352,11 @@ async fn test_internal_turn_mode_routing_uses_injector_for_autonomous_and_start_
         .await
         .expect("turn-driven internal turn");
 
+    // 1 inject from autonomous spawn (prompt injection) + 1 inject from internal_turn = 2
     assert_eq!(
         service.inject_call_count(),
-        1,
-        "autonomous internal turn should route via injector"
+        2,
+        "autonomous internal turn should route via injector (1 spawn + 1 internal_turn)"
     );
     assert_eq!(
         service.start_turn_call_count(),
@@ -12110,20 +12127,17 @@ async fn test_spawn_with_custom_initial_message() {
         "spawn should use the custom initial_message, not the default"
     );
 
-    let keep_alive_prompts = service.keep_alive_prompts().await;
+    // With prompt injection (no kickoff turn), the initial message is injected
+    // via interaction_event_injector instead of a keep-alive start_turn call.
     assert_eq!(
-        keep_alive_prompts.len(),
+        service.inject_call_count(),
         1,
-        "autonomous spawn must start exactly one host loop"
-    );
-    assert_eq!(
-        keep_alive_prompts[0].1, custom_msg,
-        "first autonomous host-loop prompt must use initial_message when provided"
+        "autonomous spawn must inject exactly one prompt"
     );
     assert_eq!(
         service.keep_alive_start_turn_call_count(),
-        1,
-        "spawn must start exactly one autonomous host loop"
+        0,
+        "no kickoff turn — autonomous members use prompt injection"
     );
 }
 
@@ -12154,43 +12168,32 @@ async fn test_spawn_without_initial_message_uses_default() {
         prompts[0].1
     );
 
-    let keep_alive_prompts = service.keep_alive_prompts().await;
+    // With prompt injection (no kickoff turn), the initial message is injected
+    // via interaction_event_injector instead of a keep-alive start_turn call.
     assert_eq!(
-        keep_alive_prompts.len(),
+        service.inject_call_count(),
         1,
-        "autonomous spawn must start exactly one host loop"
+        "autonomous spawn must inject exactly one prompt"
     );
-    assert!(
-        keep_alive_prompts[0]
-            .1
-            .contains("You have been spawned as 'w-1'"),
-        "host-loop fallback prompt should contain meerkat id, got: '{}'",
-        keep_alive_prompts[0].1
-    );
-    assert!(
-        keep_alive_prompts[0].1.contains("role: worker"),
-        "host-loop fallback prompt should contain role, got: '{}'",
-        keep_alive_prompts[0].1
-    );
-    assert!(
-        keep_alive_prompts[0].1.contains("mob 'test-mob'"),
-        "host-loop fallback prompt should contain mob id, got: '{}'",
-        keep_alive_prompts[0].1
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        0,
+        "no kickoff turn — autonomous members use prompt injection"
     );
 }
 
 #[tokio::test]
 async fn test_spawn_autonomous_surfaces_immediate_host_loop_start_failure() {
     let (handle, service) = create_test_mob(sample_definition()).await;
-    service.set_fail_start_turn(true);
+    service.set_fail_inject(true);
 
     let result = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-fail"), None)
         .await;
 
     assert!(
-        matches!(result, Err(MobError::SessionError(SessionError::Store(_)))),
-        "autonomous spawn must surface immediate host-loop start_turn failures"
+        matches!(result, Err(MobError::Internal(_))),
+        "autonomous spawn must surface immediate prompt injection failures, got: {result:?}"
     );
     assert!(
         handle
@@ -12209,10 +12212,11 @@ async fn test_retire_interrupts_autonomous_host_loop() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker");
+    // No kickoff turns — autonomous spawn uses prompt injection.
     assert_eq!(
-        service.keep_alive_start_turn_call_count(),
+        service.inject_call_count(),
         1,
-        "spawn should start autonomous host loop"
+        "spawn should inject initial prompt via injector"
     );
 
     handle
@@ -12244,10 +12248,11 @@ async fn test_stop_resume_host_loop_lifecycle_is_mode_aware() {
         )
         .await
         .expect("spawn turn-driven worker");
+    // No kickoff turns — only autonomous members inject their initial prompt.
     assert_eq!(
-        service.keep_alive_start_turn_call_count(),
+        service.inject_call_count(),
         1,
-        "only autonomous members should start host loops"
+        "only autonomous members should inject initial prompts"
     );
 
     handle.stop().await.expect("stop");
@@ -12256,12 +12261,22 @@ async fn test_stop_resume_host_loop_lifecycle_is_mode_aware() {
         1,
         "stop should terminate all active autonomous host loops"
     );
+    // Stop notifies the orchestrator (autonomous lead) via inject (+1).
+    // Total inject count: 1 (spawn) + 1 (stop notification) = 2.
+    assert_eq!(
+        service.inject_call_count(),
+        2,
+        "stop should have notified the orchestrator via inject"
+    );
 
     handle.resume().await.expect("resume");
+    // Resume ensures autonomous runtime readiness but does NOT re-inject
+    // prompts — the session already has its conversation history.
+    // Inject count stays at 2 (no new injects from resume).
     assert_eq!(
-        service.keep_alive_start_turn_call_count(),
+        service.inject_call_count(),
         2,
-        "resume should restart autonomous host loops from projected runtime_mode"
+        "resume must not re-inject prompts"
     );
 }
 
@@ -12277,10 +12292,11 @@ async fn test_destroy_interrupts_autonomous_host_loops_before_archive() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker");
+    // No kickoff turns — autonomous members use prompt injection.
     assert_eq!(
-        service.keep_alive_start_turn_call_count(),
+        service.inject_call_count(),
         2,
-        "both autonomous members should start host loops"
+        "both autonomous members should inject initial prompts"
     );
 
     handle.destroy().await.expect("destroy");
@@ -12342,10 +12358,12 @@ async fn test_resume_from_events_restarts_autonomous_host_loops_from_runtime_mod
         "resumed runtime should be Running"
     );
     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    // Resume ensures autonomous runtime readiness but does NOT fire
+    // kickoff start_turn calls.
     assert_eq!(
         service.keep_alive_start_turn_call_count(),
-        2,
-        "resume should restart only autonomous host loops from projected runtime_mode"
+        0,
+        "no kickoff turns — autonomous members use runtime keep-alive"
     );
 }
 

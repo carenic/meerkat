@@ -17,34 +17,6 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use meerkat_core::comms::TrustedPeerSpec;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-pub(super) struct AutonomousHostLoopEntry {
-    handle: tokio::task::JoinHandle<Result<(), MobError>>,
-    completion_tx: tokio::sync::watch::Sender<bool>,
-}
-
-impl AutonomousHostLoopEntry {
-    fn new(
-        handle: tokio::task::JoinHandle<Result<(), MobError>>,
-        completion_tx: tokio::sync::watch::Sender<bool>,
-    ) -> Self {
-        Self {
-            handle,
-            completion_tx,
-        }
-    }
-
-    fn is_finished(&self) -> bool {
-        self.handle.is_finished()
-    }
-
-    fn abort(self) {
-        self.handle.abort();
-    }
-
-    fn completion_receiver(&self) -> tokio::sync::watch::Receiver<bool> {
-        self.completion_tx.subscribe()
-    }
-}
 // Sized for real mob-scale startup/shutdown fan-out (50+ members).
 const MAX_PARALLEL_HOST_LOOP_OPS: usize = 64;
 const MAX_LIFECYCLE_NOTIFICATION_TASKS: usize = 16;
@@ -198,8 +170,6 @@ pub(super) struct MobActor {
     pub(super) tool_bundles: BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
     pub(super) default_llm_client: Option<Arc<dyn LlmClient>>,
     pub(super) retired_event_index: Arc<RwLock<HashSet<String>>>,
-    pub(super) autonomous_host_loops:
-        Arc<tokio::sync::Mutex<BTreeMap<MeerkatId, AutonomousHostLoopEntry>>>,
     pub(super) next_spawn_ticket: u64,
     pub(super) pending_spawns: PendingSpawnLineage,
     pub(super) edge_locks: Arc<super::edge_locks::EdgeLockRegistry>,
@@ -628,102 +598,52 @@ impl MobActor {
         )
     }
 
-    fn resume_host_loop_prompt(
-        &self,
-        profile_name: &ProfileName,
-        meerkat_id: &MeerkatId,
-    ) -> String {
-        format!(
-            "Mob '{}' resumed autonomous host loop for '{}' (role: {}). Continue coordinated execution.",
-            self.definition.id, meerkat_id, profile_name
-        )
-    }
-
-    async fn start_autonomous_host_loop(
+    /// Start the autonomous runtime for a member and deliver its initial prompt.
+    ///
+    /// Sets up the keep-alive infrastructure (comms drain, dispatch capability)
+    /// then injects the prompt through the runtime input path. The session was
+    /// created with `InitialTurnPolicy::Defer` so the prompt hasn't been
+    /// executed yet — this injection is the canonical delivery.
+    async fn start_autonomous_member(
         &self,
         meerkat_id: &MeerkatId,
         member_ref: &MemberRef,
-        prompt: ContentInput,
+        prompt: meerkat_core::types::ContentInput,
     ) -> Result<(), MobError> {
-        {
-            let mut loops = self.autonomous_host_loops.lock().await;
-            if let Some(existing) = loops.get(meerkat_id)
-                && !existing.is_finished()
-            {
-                return Ok(());
-            }
-            loops.remove(meerkat_id);
-        }
-
         self.ensure_autonomous_runtime_ready(meerkat_id, member_ref)
             .await?;
 
-        let member_ref_cloned = member_ref.clone();
-        let provisioner = self.provisioner.clone();
-        let loop_id = meerkat_id.clone();
-        let log_id = meerkat_id.clone();
-        let (completion_tx, _completion_rx) = tokio::sync::watch::channel(false);
-        let completion_tx_for_task = completion_tx.clone();
+        let session_id = member_ref.session_id().ok_or_else(|| {
+            MobError::Internal(format!(
+                "autonomous member '{meerkat_id}' must be session-backed"
+            ))
+        })?;
 
-        let handle = tokio::spawn(async move {
-            let result = provisioner
-                .start_turn(
-                    &member_ref_cloned,
-                    meerkat_core::service::StartTurnRequest {
-                        prompt,
-                        system_prompt: None,
-                        render_metadata: None,
-                        handling_mode: meerkat_core::types::HandlingMode::Queue,
-                        event_tx: None,
+        let injector = self
+            .provisioner
+            .interaction_event_injector(session_id)
+            .await
+            .ok_or_else(|| {
+                MobError::Internal(format!(
+                    "missing event injector for autonomous member '{meerkat_id}'"
+                ))
+            })?;
+        injector
+            .inject(
+                prompt,
+                meerkat_core::PlainEventSource::Rpc,
+                meerkat_core::types::HandlingMode::Queue,
+                None,
+            )
+            .map_err(|error| {
+                MobError::Internal(format!(
+                    "autonomous prompt inject failed for '{meerkat_id}': {error}"
+                ))
+            })?;
 
-                        skill_references: None,
-                        flow_tool_overlay: None,
-                        additional_instructions: None,
-                    },
-                )
-                .await;
-
-            match &result {
-                Ok(()) => tracing::info!(
-                    meerkat_id = %log_id,
-                    "autonomous kickoff turn exited normally"
-                ),
-                Err(error) => tracing::error!(
-                    meerkat_id = %log_id,
-                    error = %error,
-                    "autonomous kickoff turn failed"
-                ),
-            }
-            let _ = completion_tx_for_task.send(true);
-            result
-        });
-
-        tokio::task::yield_now().await;
-        if handle.is_finished() {
-            match handle.await {
-                Ok(Ok(())) => {
-                    tracing::debug!(
-                        meerkat_id = %loop_id,
-                        "autonomous kickoff turn completed immediately; runtime stays ready"
-                    );
-                    return Ok(());
-                }
-                Ok(Err(error)) => {
-                    self.teardown_autonomous_runtime(member_ref).await;
-                    return Err(error);
-                }
-                Err(join_error) => {
-                    self.teardown_autonomous_runtime(member_ref).await;
-                    return Err(MobError::Internal(format!(
-                        "autonomous kickoff task join failed for '{loop_id}': {join_error}"
-                    )));
-                }
-            }
-        }
-
-        self.autonomous_host_loops.lock().await.insert(
-            meerkat_id.clone(),
-            AutonomousHostLoopEntry::new(handle, completion_tx),
+        tracing::debug!(
+            meerkat_id = %meerkat_id,
+            "autonomous member started"
         );
         Ok(())
     }
@@ -772,58 +692,6 @@ impl MobActor {
         }
     }
 
-    async fn start_autonomous_host_loops_from_roster(&self) -> Result<(), MobError> {
-        let broken_members = self
-            .restore_diagnostics
-            .read()
-            .await
-            .keys()
-            .cloned()
-            .collect::<HashSet<_>>();
-        let entries = {
-            let roster = self.roster.read().await;
-            roster.list().cloned().collect::<Vec<_>>()
-        };
-        let autonomous_entries = entries
-            .into_iter()
-            .filter(|entry| {
-                entry.runtime_mode == crate::MobRuntimeMode::AutonomousHost
-                    && !broken_members.contains(&entry.meerkat_id)
-            })
-            .collect::<Vec<_>>();
-        if autonomous_entries.is_empty() {
-            return Ok(());
-        }
-
-        let actor: &MobActor = self;
-        let mut remaining = autonomous_entries.into_iter();
-        let mut in_flight = FuturesUnordered::new();
-        let mut first_error: Option<MobError> = None;
-
-        for _ in 0..MAX_PARALLEL_HOST_LOOP_OPS {
-            let Some(entry) = remaining.next() else {
-                break;
-            };
-            in_flight.push(actor.start_autonomous_host_loop_for_entry(entry));
-        }
-
-        while let Some(result) = in_flight.next().await {
-            if let Err(error) = result
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
-            if let Some(entry) = remaining.next() {
-                in_flight.push(actor.start_autonomous_host_loop_for_entry(entry));
-            }
-        }
-
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(())
-    }
-
     async fn ensure_autonomous_dispatch_capability_for_provisioner(
         provisioner: &Arc<dyn MobProvisioner>,
         meerkat_id: &MeerkatId,
@@ -859,7 +727,8 @@ impl MobActor {
         .await
     }
 
-    async fn stop_autonomous_host_loop_for_member(
+    /// Stop an autonomous member: interrupt, wait for quiescence, teardown.
+    async fn stop_autonomous_member(
         &self,
         meerkat_id: &MeerkatId,
         member_ref: &MemberRef,
@@ -871,9 +740,6 @@ impl MobActor {
             )
         {
             return Err(error);
-        }
-        if let Some(handle) = self.autonomous_host_loops.lock().await.remove(meerkat_id) {
-            handle.abort();
         }
         self.teardown_autonomous_runtime(member_ref).await;
         // Ensure stop semantics are strong: do not report completion while the
@@ -894,13 +760,13 @@ impl MobActor {
             tracing::warn!(
                 mob_id = %self.definition.id,
                 meerkat_id = %meerkat_id,
-                "autonomous host loop stop polling exhausted before member became idle"
+                "autonomous member stop polling exhausted before member became idle"
             );
         }
         Ok(())
     }
 
-    async fn stop_all_autonomous_host_loops(&self) -> Result<(), MobError> {
+    async fn stop_all_autonomous_members(&self) -> Result<(), MobError> {
         let entries = {
             let roster = self.roster.read().await;
             roster
@@ -921,7 +787,7 @@ impl MobActor {
             let Some(entry) = remaining.next() else {
                 break;
             };
-            in_flight.push(actor.stop_autonomous_host_loop_for_entry(entry));
+            in_flight.push(actor.stop_autonomous_member_entry(entry));
         }
 
         while let Some(result) = in_flight.next().await {
@@ -929,63 +795,81 @@ impl MobActor {
                 tracing::warn!(
                     meerkat_id = %meerkat_id,
                     error = %error,
-                    "failed stopping autonomous host loop member"
+                    "failed stopping autonomous member"
                 );
                 if first_error.is_none() {
                     first_error = Some(error);
                 }
             }
             if let Some(entry) = remaining.next() {
-                in_flight.push(actor.stop_autonomous_host_loop_for_entry(entry));
+                in_flight.push(actor.stop_autonomous_member_entry(entry));
             }
         }
 
-        let mut loops = self.autonomous_host_loops.lock().await;
-        for (_, handle) in std::mem::take(&mut *loops) {
-            handle.abort();
-        }
         if let Some(error) = first_error {
             return Err(error);
         }
         Ok(())
     }
 
-    async fn start_autonomous_host_loop_for_entry(
-        &self,
-        entry: RosterEntry,
-    ) -> Result<(), MobError> {
-        self.start_autonomous_host_loop(
-            &entry.meerkat_id,
-            &entry.member_ref,
-            self.resume_host_loop_prompt(&entry.profile, &entry.meerkat_id)
-                .into(),
-        )
-        .await
-    }
-
-    async fn stop_autonomous_host_loop_for_entry(
+    async fn stop_autonomous_member_entry(
         &self,
         entry: RosterEntry,
     ) -> Result<(), (MeerkatId, MobError)> {
-        self.stop_autonomous_host_loop_for_member(&entry.meerkat_id, &entry.member_ref)
+        self.stop_autonomous_member(&entry.meerkat_id, &entry.member_ref)
             .await
             .map_err(|error| (entry.meerkat_id, error))
     }
 
-    async fn snapshot_kickoff_barrier_state(
-        &self,
-        meerkat_ids: &[MeerkatId],
-    ) -> Vec<(MeerkatId, tokio::sync::watch::Receiver<bool>)> {
-        let mut loops = self.autonomous_host_loops.lock().await;
-        loops.retain(|_, entry| !entry.is_finished());
-        meerkat_ids
-            .iter()
-            .filter_map(|id| {
-                loops
-                    .get(id)
-                    .map(|entry| (id.clone(), entry.completion_receiver()))
-            })
-            .collect()
+    /// Ensure all autonomous roster members have their runtime ready.
+    ///
+    /// Called on mob startup and resume. Does NOT fire synthetic kickoff turns —
+    /// the keep-alive runtime infrastructure is sufficient. On resume, the
+    /// member's session already has its conversation history.
+    async fn ensure_autonomous_runtimes_from_roster(&self) -> Result<(), MobError> {
+        let broken_members = self
+            .restore_diagnostics
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let entries = {
+            let roster = self.roster.read().await;
+            roster
+                .list()
+                .filter(|entry| {
+                    entry.runtime_mode == crate::MobRuntimeMode::AutonomousHost
+                        && !broken_members.contains(&entry.meerkat_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut first_error: Option<MobError> = None;
+        for entry in &entries {
+            if let Err(error) = self
+                .ensure_autonomous_runtime_ready(&entry.meerkat_id, &entry.member_ref)
+                .await
+            {
+                tracing::warn!(
+                    meerkat_id = %entry.meerkat_id,
+                    error = %error,
+                    "failed ensuring autonomous runtime ready"
+                );
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Main actor loop: process commands sequentially until Shutdown.
@@ -997,7 +881,7 @@ impl MobActor {
                     error = %error,
                     "failed to start mcp servers during actor startup; entering Stopped"
                 );
-                if let Err(stop_error) = self.stop_all_autonomous_host_loops().await {
+                if let Err(stop_error) = self.stop_all_autonomous_members().await {
                     tracing::warn!(
                         mob_id = %self.definition.id,
                         error = %stop_error,
@@ -1014,13 +898,13 @@ impl MobActor {
                 if let Err(e) = self.lifecycle_authority.apply(MobLifecycleInput::Stop) {
                     tracing::warn!(error = %e, "authority rejected Stop");
                 }
-            } else if let Err(error) = self.start_autonomous_host_loops_from_roster().await {
+            } else if let Err(error) = self.ensure_autonomous_runtimes_from_roster().await {
                 tracing::error!(
                     mob_id = %self.definition.id,
                     error = %error,
                     "failed to start autonomous host loops during actor startup; entering Stopped"
                 );
-                if let Err(stop_error) = self.stop_all_autonomous_host_loops().await {
+                if let Err(stop_error) = self.stop_all_autonomous_members().await {
                     tracing::warn!(
                         mob_id = %self.definition.id,
                         error = %stop_error,
@@ -1193,11 +1077,12 @@ impl MobActor {
                     let _ = reply_tx.send(result);
                 }
                 MobCommand::KickoffBarrierSnapshot {
-                    meerkat_ids,
+                    meerkat_ids: _,
                     reply_tx,
                 } => {
-                    let snapshot = self.snapshot_kickoff_barrier_state(&meerkat_ids).await;
-                    let _ = reply_tx.send(snapshot);
+                    // No kickoff turns — autonomous members use keep-alive
+                    // runtime directly. Return empty so callers proceed immediately.
+                    let _ = reply_tx.send(Vec::new());
                 }
                 MobCommand::RunFlow {
                     flow_id,
@@ -1276,7 +1161,7 @@ impl MobActor {
                             self.provisioner.cancel_all_checkpointers().await;
                             let mut stop_result: Result<(), MobError> = Ok(());
                             let (loop_result, mcp_result) = tokio::join!(
-                                self.stop_all_autonomous_host_loops(),
+                                self.stop_all_autonomous_members(),
                                 self.stop_mcp_servers()
                             );
                             if let Err(error) = loop_result {
@@ -1342,10 +1227,9 @@ impl MobActor {
                                 }
                                 Err(error)
                             } else if let Err(error) =
-                                self.start_autonomous_host_loops_from_roster().await
+                                self.ensure_autonomous_runtimes_from_roster().await
                             {
-                                if let Err(stop_error) = self.stop_all_autonomous_host_loops().await
-                                {
+                                if let Err(stop_error) = self.stop_all_autonomous_members().await {
                                     tracing::warn!(
                                         mob_id = %self.definition.id,
                                         error = %stop_error,
@@ -1380,7 +1264,7 @@ impl MobActor {
                                 }
                                 if let Err(error) = resume_result {
                                     if let Err(stop_error) =
-                                        self.stop_all_autonomous_host_loops().await
+                                        self.stop_all_autonomous_members().await
                                     {
                                         tracing::warn!(
                                             mob_id = %self.definition.id,
@@ -1492,7 +1376,7 @@ impl MobActor {
                             result = Err(error);
                         }
                     }
-                    if let Err(error) = self.stop_all_autonomous_host_loops().await {
+                    if let Err(error) = self.stop_all_autonomous_members().await {
                         tracing::warn!(error = %error, "shutdown loop stop encountered errors");
                         if result.is_ok() {
                             result = Err(error);
@@ -2585,7 +2469,7 @@ impl MobActor {
 
         if runtime_mode == crate::MobRuntimeMode::AutonomousHost
             && let Err(start_error) = self
-                .start_autonomous_host_loop(meerkat_id, &member_ref, prompt)
+                .start_autonomous_member(meerkat_id, &member_ref, prompt)
                 .await
         {
             if let Err(rollback_error) = self
@@ -3188,7 +3072,7 @@ impl MobActor {
     /// Stop the autonomous host loop if the member is in AutonomousHost mode.
     async fn dispose_stop_host_loop(&self, ctx: &DisposalContext) -> Result<(), MobError> {
         if ctx.entry.runtime_mode == crate::MobRuntimeMode::AutonomousHost {
-            self.stop_autonomous_host_loop_for_member(&ctx.meerkat_id, &ctx.entry.member_ref)
+            self.stop_autonomous_member(&ctx.meerkat_id, &ctx.entry.member_ref)
                 .await?;
         }
         Ok(())

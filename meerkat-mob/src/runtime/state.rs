@@ -106,7 +106,10 @@ pub(super) enum MobCommand {
         content: ContentInput,
         reply_tx: oneshot::Sender<Result<SessionId, MobError>>,
     },
+    /// Legacy kickoff barrier — now a no-op (autonomous members use keep-alive
+    /// runtime directly). Kept for API compatibility; always returns empty.
     KickoffBarrierSnapshot {
+        #[allow(dead_code)]
         meerkat_ids: Vec<MeerkatId>,
         reply_tx: oneshot::Sender<Vec<(MeerkatId, tokio::sync::watch::Receiver<bool>)>>,
     },
