@@ -6,6 +6,12 @@ mod request_execution;
 #[cfg(not(target_arch = "wasm32"))]
 mod stdio_json;
 
+pub use meerkat_core::{
+    BUILD_ONLY_RECOVERY_OVERRIDE_ERROR, RecoveredSessionBuild, SurfaceSessionRecoveryContext,
+    SurfaceSessionRecoveryError, SurfaceSessionRecoveryOverrides, build_recovered_session,
+    has_build_only_turn_overrides, has_materialization_overrides,
+    session_allows_first_turn_build_overrides,
+};
 pub use request_execution::{
     PreparedSurfaceSession, RequestAlreadyExists, RequestAsyncAction, RequestContext,
     RequestTerminal, SurfaceRequestExecutor, noop_request_action, prepare_surface_session,
