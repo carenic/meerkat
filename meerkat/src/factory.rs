@@ -1513,6 +1513,13 @@ impl AgentFactory {
                 }
             };
 
+        tracing::debug!(
+            base_tool_count = tools.tools().len(),
+            effective_builtins,
+            effective_shell,
+            "tool composition: base dispatcher built"
+        );
+
         // 7. Create session store adapter (override > factory > feature-flag default)
         let store_adapter: Arc<dyn AgentSessionStore> =
             if let Some(store) = build_config.session_store_override.take() {
@@ -1719,7 +1726,66 @@ impl AgentFactory {
                     BuildAgentError::Config(format!("Ops lifecycle binding failed: {e}"))
                 })?;
             tools = outcome.into_dispatcher();
+            tools = outcome.into_dispatcher();
         }
+
+        tracing::debug!(
+            tool_count_after_comms = tools.tools().len(),
+            "tool composition: after comms gateway"
+        );
+
+        // 9b. Compose tools with mob surface (after comms, so mob gateway wraps the
+        // already-composed comms gateway).
+        let effective_mob = if matches!(build_config.override_mob, Some(false)) {
+            false
+        } else {
+            build_config.override_mob.unwrap_or(self.enable_mob)
+                || build_config.mob_tool_authority_context.is_some()
+        };
+        let mob_factory = build_config
+            .mob_tools
+            .take()
+            .or_else(|| self.mob_tools.clone());
+        if effective_mob && let Some(mob_factory) = mob_factory {
+            // Build comms runtime arg: clone from the comms phase if available.
+            #[cfg(feature = "comms")]
+            let mob_comms: Option<Arc<dyn meerkat_core::agent::CommsRuntime>> = comms_runtime
+                .as_ref()
+                .map(|r| Arc::clone(r) as Arc<dyn meerkat_core::agent::CommsRuntime>);
+            #[cfg(not(feature = "comms"))]
+            let mob_comms: Option<Arc<dyn meerkat_core::agent::CommsRuntime>> = None;
+
+            let mob_args = meerkat_core::service::MobToolsBuildArgs {
+                session_id: session.id().clone(),
+                model: model.clone(),
+                authority_context: build_config.mob_tool_authority_context.clone(),
+                comms_name: build_config.comms_name.clone(),
+                comms_runtime: mob_comms,
+            };
+            let mob_dispatcher = mob_factory
+                .build_mob_tools(mob_args)
+                .await
+                .map_err(|e| BuildAgentError::Config(format!("Mob tool factory: {e}")))?;
+            let mob_usage = render_tool_usage_instructions(mob_dispatcher.tools().as_ref());
+            // Use DynamicToolComposite (not ToolGateway) so dynamic child
+            // dispatchers (e.g. callback tools) can surface additions between turns.
+            tools = Arc::new(meerkat_core::DynamicToolComposite::new(vec![
+                tools,
+                mob_dispatcher,
+            ]));
+            if !mob_usage.is_empty() {
+                if !tool_usage_instructions.is_empty() {
+                    tool_usage_instructions.push_str("\n\n");
+                }
+                tool_usage_instructions.push_str(&mob_usage);
+            }
+        }
+
+        tracing::debug!(
+            final_tool_count = tools.tools().len(),
+            tool_names = %tools.tools().iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "),
+            "tool composition: final dispatcher"
+        );
 
         // 10. Resolve hooks (override > filesystem layered config)
         #[allow(
