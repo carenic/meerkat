@@ -304,19 +304,6 @@ impl CompositeDispatcher {
     pub fn shell_job_manager(&self) -> Option<Arc<JobManager>> {
         self.job_manager.clone()
     }
-
-    /// Set the completion feed and interrupt baseline for the wait tool.
-    ///
-    /// Called by the factory before `bind_wait_interrupt`. Both are carried
-    /// forward across dispatcher rebuilds (bind_ops_lifecycle).
-    pub fn set_completion_feed(
-        &mut self,
-        feed: std::sync::Arc<dyn meerkat_core::completion_feed::CompletionFeed>,
-        baseline: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    ) {
-        self.completion_feed = Some(feed);
-        self.interrupt_baseline = Some(baseline);
-    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -578,8 +565,18 @@ impl AgentToolDispatcher for CompositeDispatcher {
                 return Err(OpsLifecycleBindError::Unsupported);
             }
 
-            // Carry forward interrupt receiver, completion feed, and baseline
-            // so they survive the ops-lifecycle rebuild.
+            // Transplant the fully-configured WaitTool from the old dispatcher
+            // into the rebuild, rather than dismantling it into parts (interrupt_rx,
+            // feed, baseline) and reconstructing. The WaitTool already holds all
+            // three pieces from prior bind_wait_interrupt / bind_completion_feed.
+            let old_wait = owned
+                .builtin_tools
+                .iter()
+                .find(|t| t.name() == "wait")
+                .cloned();
+
+            // Carry forward comms interrupt receiver and feed/baseline for
+            // the struct fields (used by capabilities() and future rebuilds).
             let interrupt_rx = owned.wait_interrupt_rx.take();
             let feed = owned.completion_feed.take();
             let baseline = owned.interrupt_baseline.take();
@@ -597,40 +594,17 @@ impl AgentToolDispatcher for CompositeDispatcher {
             )
             .map_err(|_| OpsLifecycleBindError::Unsupported)?;
 
-            // Carry forward completion feed + baseline.
+            // Restore struct fields for future rebuilds and capabilities().
+            rebound.wait_interrupt_rx = interrupt_rx;
             rebound.completion_feed = feed;
             rebound.interrupt_baseline = baseline;
 
-            // Re-apply wait tool wiring on the rebuilt dispatcher.
-            // Three cases: comms+feed, feed-only, or neither.
-            {
-                use crate::builtin::utility::WaitTool;
-                let new_wait: Option<Arc<dyn crate::builtin::BuiltinTool>> =
-                    if let Some(rx) = interrupt_rx {
-                        // Comms + optional feed
-                        rebound.wait_interrupt_rx = Some(rx.clone());
-                        Some(Arc::new(WaitTool::with_interrupt_and_feed(
-                            rx,
-                            rebound.completion_feed.clone(),
-                            rebound.interrupt_baseline.clone(),
-                        )))
-                    } else if let (Some(feed), Some(baseline)) =
-                        (&rebound.completion_feed, &rebound.interrupt_baseline)
-                    {
-                        // Feed-only (no comms)
-                        Some(Arc::new(WaitTool::with_feed_only(
-                            Arc::clone(feed),
-                            Arc::clone(baseline),
-                        )))
-                    } else {
-                        None
-                    };
-                if let Some(new_wait) = new_wait {
-                    for tool in &mut rebound.builtin_tools {
-                        if tool.name() == "wait" {
-                            *tool = new_wait;
-                            break;
-                        }
+            // Replace the bare WaitTool::new() with the transplanted one.
+            if let Some(configured_wait) = old_wait {
+                for tool in &mut rebound.builtin_tools {
+                    if tool.name() == "wait" {
+                        *tool = configured_wait;
+                        break;
                     }
                 }
             }

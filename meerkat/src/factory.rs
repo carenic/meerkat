@@ -1099,8 +1099,6 @@ impl AgentFactory {
             skill_engine,
             // Public API defaults to true (all tools visible).
             true,
-            None,
-            None,
         )
         .await
     }
@@ -1121,8 +1119,6 @@ impl AgentFactory {
             Arc<meerkat_core::skills::SkillRuntime>,
         >,
         image_tool_results: bool,
-        completion_feed: Option<std::sync::Arc<dyn meerkat_core::completion_feed::CompletionFeed>>,
-        interrupt_baseline: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     ) -> Result<Arc<dyn AgentToolDispatcher>, CompositeDispatcherError> {
         let BuiltinDispatcherConfig {
             store,
@@ -1164,13 +1160,6 @@ impl AgentFactory {
                 .register_skill_tools(meerkat_tools::builtin::skills::SkillToolSet::new(engine));
         }
 
-        // Set completion feed + baseline on the composite so bind_wait_interrupt
-        // can pass them through to WaitTool.
-        if let (Some(feed), Some(baseline)) = (completion_feed, interrupt_baseline) {
-            composite.set_completion_feed(feed, baseline);
-        }
-
-        // (wait binding happens in build_agent via bind_wait_interrupt)
         Ok(Arc::new(composite))
     }
 
@@ -1450,8 +1439,6 @@ impl AgentFactory {
                         _session_id.clone(),
                         Arc::clone(&ops_lifecycle),
                         image_tool_results,
-                        completion_feed.clone(),
-                        interrupt_baseline.clone(),
                     )
                     .await?
                 }
@@ -2106,8 +2093,6 @@ impl AgentFactory {
         session_id: String,
         ops_lifecycle: Arc<dyn OpsLifecycleRegistry>,
         image_tool_results: bool,
-        completion_feed: Option<std::sync::Arc<dyn meerkat_core::completion_feed::CompletionFeed>>,
-        interrupt_baseline: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     ) -> Result<(Arc<dyn AgentToolDispatcher>, String), BuildAgentError> {
         if !effective_builtins {
             // No builtins — return the external tools if provided, otherwise empty.
@@ -2175,8 +2160,6 @@ impl AgentFactory {
                 Some(ops_lifecycle),
                 skill_engine,
                 image_tool_results,
-                completion_feed,
-                interrupt_baseline,
             )
             .await?;
 
