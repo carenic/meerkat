@@ -541,18 +541,72 @@ impl CoreExecutor for MobSessionRuntimeExecutor {
 impl MobProvisioner for SessionBackend {
     async fn provision_member(
         &self,
-        req: ProvisionMemberRequest,
+        mut req: ProvisionMemberRequest,
     ) -> Result<MemberSpawnReceipt, MobError> {
         tracing::debug!(
             backend = ?req.backend,
             peer_name = %req.peer_name,
             "SessionBackend::provision_member start"
         );
-        let created = self
+        // Pre-register with the runtime adapter so the factory receives
+        // epoch-local bindings instead of creating a competing registry.
+        let pre_registered_id = if let Some(adapter) = &self.runtime_adapter {
+            if req.create_session.build.is_none() {
+                req.create_session.build =
+                    Some(meerkat_core::service::SessionBuildOptions::default());
+            }
+            let member_session_id = req
+                .create_session
+                .build
+                .as_ref()
+                .and_then(|b| b.resume_session.as_ref())
+                .map(|s| s.id().clone())
+                .unwrap_or_else(|| {
+                    let id = SessionId::new();
+                    let session = meerkat_core::session::Session::with_id(id.clone());
+                    if let Some(ref mut build) = req.create_session.build {
+                        build.resume_session = Some(session);
+                    }
+                    id
+                });
+            let bindings = adapter
+                .prepare_bindings(member_session_id.clone())
+                .await
+                .map_err(|e| MobError::Internal(format!("prepare_bindings failed: {e}")))?;
+            if let Some(ref mut build) = req.create_session.build {
+                build.runtime_build_mode =
+                    meerkat_core::runtime_epoch::RuntimeBuildMode::SessionOwned(bindings);
+            }
+            Some(member_session_id)
+        } else {
+            None
+        };
+        let created = match self
             .session_service
             .create_session(req.create_session)
-            .await?;
-        if self.runtime_adapter.is_some() {
+            .await
+        {
+            Ok(created) => created,
+            Err(e) => {
+                // Rollback: unregister the pre-registered session on failure
+                if let (Some(adapter), Some(pre_id)) = (&self.runtime_adapter, &pre_registered_id) {
+                    adapter.unregister_session(pre_id).await;
+                }
+                return Err(e.into());
+            }
+        };
+        // Reconcile: if the session service returned a different ID than we
+        // pre-registered (e.g. LocalSessionService mints fresh IDs), unregister
+        // the orphan and re-register with the real ID.
+        if let (Some(adapter), Some(pre_id)) = (&self.runtime_adapter, &pre_registered_id) {
+            if *pre_id != created.session_id {
+                tracing::debug!(
+                    pre_registered = %pre_id,
+                    actual = %created.session_id,
+                    "mob provisioner: session service returned different ID; reconciling runtime registration"
+                );
+                adapter.unregister_session(pre_id).await;
+            }
             let _ = self.runtime_session_state(&created.session_id).await;
         }
         if let (Some(owner_session_id), Some(registry)) = (req.owner_session_id, req.ops_registry) {
@@ -904,7 +958,7 @@ impl MultiBackendProvisioner {
 
     async fn external_member_ref(
         &self,
-        create_session: CreateSessionRequest,
+        mut create_session: CreateSessionRequest,
         peer_name: String,
         owner_session_id: Option<SessionId>,
         ops_registry: Option<Arc<dyn OpsLifecycleRegistry>>,
@@ -922,14 +976,61 @@ impl MultiBackendProvisioner {
             .external
             .as_ref()
             .ok_or_else(|| MobError::WiringError("external backend is not configured".into()))?;
-        let created = external
+        // Pre-register with the runtime adapter (mirrors SessionBackend::provision_member).
+        let pre_registered_id = if let Some(adapter) = &self.session.runtime_adapter {
+            if create_session.build.is_none() {
+                create_session.build = Some(meerkat_core::service::SessionBuildOptions::default());
+            }
+            let member_session_id = create_session
+                .build
+                .as_ref()
+                .and_then(|b| b.resume_session.as_ref())
+                .map(|s| s.id().clone())
+                .unwrap_or_else(|| {
+                    let id = SessionId::new();
+                    let session = meerkat_core::session::Session::with_id(id.clone());
+                    if let Some(ref mut build) = create_session.build {
+                        build.resume_session = Some(session);
+                    }
+                    id
+                });
+            let bindings = adapter
+                .prepare_bindings(member_session_id.clone())
+                .await
+                .map_err(|e| MobError::Internal(format!("prepare_bindings failed: {e}")))?;
+            if let Some(ref mut build) = create_session.build {
+                build.runtime_build_mode =
+                    meerkat_core::runtime_epoch::RuntimeBuildMode::SessionOwned(bindings);
+            }
+            Some(member_session_id)
+        } else {
+            None
+        };
+        let created = match external
             .session_service
             .create_session(create_session)
-            .await?;
-        // Register external backend sessions with the runtime adapter so
-        // that accept_input_with_completion can route autonomous turns.
-        // This mirrors the registration in SessionBackend::provision_member.
-        if self.session.runtime_adapter.is_some() {
+            .await
+        {
+            Ok(created) => created,
+            Err(e) => {
+                if let (Some(adapter), Some(pre_id)) =
+                    (&self.session.runtime_adapter, &pre_registered_id)
+                {
+                    adapter.unregister_session(pre_id).await;
+                }
+                return Err(e.into());
+            }
+        };
+        // Reconcile: unregister orphan if session service returned a different ID.
+        if let (Some(adapter), Some(pre_id)) = (&self.session.runtime_adapter, &pre_registered_id) {
+            if *pre_id != created.session_id {
+                tracing::debug!(
+                    pre_registered = %pre_id,
+                    actual = %created.session_id,
+                    "mob external provisioner: reconciling runtime registration"
+                );
+                adapter.unregister_session(pre_id).await;
+            }
             let _ = self
                 .session
                 .runtime_session_state(&created.session_id)

@@ -327,9 +327,9 @@ impl SessionRuntime {
         }
     }
 
-    /// Build a `PersistentSessionService` with the ops lifecycle provider
+    /// Build a `PersistentSessionService` with the runtime bindings provider
     /// wired to the runtime adapter so lazy session rebuilds use the canonical
-    /// registry instead of an orphaned fallback.
+    /// bindings instead of an orphaned fallback.
     fn build_persistent_service(
         builder: FactoryAgentBuilder,
         max_sessions: usize,
@@ -341,15 +341,9 @@ impl SessionRuntime {
         let mut service =
             PersistentSessionService::new(builder, max_sessions, store, runtime_store, blob_store);
         let adapter = runtime_adapter.clone();
-        service.set_ops_lifecycle_provider(Arc::new(move |session_id| {
+        service.set_runtime_bindings_provider(Arc::new(move |session_id| {
             let adapter = adapter.clone();
-            let session_id = session_id.clone();
-            Box::pin(async move {
-                adapter
-                    .ops_lifecycle_registry(&session_id)
-                    .await
-                    .map(|r| r as Arc<dyn meerkat_core::ops_lifecycle::OpsLifecycleRegistry>)
-            })
+            Box::pin(async move { adapter.prepare_bindings(session_id).await.ok() })
         }));
         service
     }
@@ -1329,17 +1323,15 @@ impl SessionRuntime {
             Some(runtime) => runtime.get().await.ok().map(|snapshot| snapshot.generation),
             None => None,
         };
-        self.runtime_adapter
-            .register_session(session_id.clone())
-            .await;
-        let ops_lifecycle = self
+        let bindings = self
             .runtime_adapter
-            .ops_lifecycle_registry(session_id)
+            .prepare_bindings(session_id.clone())
             .await
-            .map(|registry| registry as Arc<dyn meerkat_core::ops_lifecycle::OpsLifecycleRegistry>)
-            .ok_or_else(|| RpcError {
+            .map_err(|e| RpcError {
                 code: error::INTERNAL_ERROR,
-                message: format!("failed to obtain runtime ops registry for session {session_id}"),
+                message: format!(
+                    "failed to prepare runtime bindings for session {session_id}: {e}"
+                ),
                 data: None,
             })?;
         let build = SessionBuildOptions {
@@ -1364,7 +1356,7 @@ impl SessionRuntime {
                 .default_llm_client
                 .clone()
                 .map(encode_llm_client_override_for_service),
-            ops_lifecycle_override: Some(ops_lifecycle),
+            runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
             override_builtins: tooling.builtins.to_override(),
             override_shell: tooling.shell.to_override(),
             override_memory: tooling.memory.to_override(),
@@ -1510,23 +1502,21 @@ impl SessionRuntime {
         let session_id = session.id().clone();
 
         // Inject the pre-created session so the agent builder will reuse this ID.
-        self.runtime_adapter
-            .register_session(session_id.clone())
-            .await;
-        let ops_lifecycle = self
+        let bindings = self
             .runtime_adapter
-            .ops_lifecycle_registry(&session_id)
+            .prepare_bindings(session_id.clone())
             .await
-            .map(|registry| registry as Arc<dyn meerkat_core::ops_lifecycle::OpsLifecycleRegistry>)
-            .ok_or_else(|| RpcError {
+            .map_err(|e| RpcError {
                 code: error::INTERNAL_ERROR,
-                message: format!("failed to obtain runtime ops registry for session {session_id}"),
+                message: format!(
+                    "failed to prepare runtime bindings for session {session_id}: {e}"
+                ),
                 data: None,
             })?;
 
         let build_config = AgentBuildConfig {
             resume_session: Some(session),
-            ops_lifecycle_override: Some(ops_lifecycle),
+            runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
             ..build_config
         };
 
