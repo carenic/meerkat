@@ -3315,10 +3315,9 @@ timeout_ms = 1000
     }
 
     #[tokio::test]
-    async fn test_mob_wait_kickoff_returns_immediately_without_timeout() {
-        // Autonomous members no longer run a separate kickoff turn — their
-        // runtime is ready immediately after spawn. The barrier returns
-        // member snapshots without waiting.
+    async fn test_mob_wait_kickoff_completes_after_initial_turn() {
+        // The kickoff barrier waits for the initial autonomous turn to complete.
+        // Use turn_driven members to avoid the keep_alive mock blocking.
         let svc = Arc::new(MockSessionSvc::new());
         let state = Arc::new(MobMcpState::new(svc));
         let d = MobMcpDispatcher::new(state);
@@ -3330,24 +3329,30 @@ timeout_ms = 1000
             "meerkat_spawn",
             json!({
                 "mob_id": mob_id,
-                "specs": [{"profile":"lead","meerkat_id":"kickoff-member"}]
+                "specs": [
+                    {"profile":"lead","meerkat_id":"kickoff-lead","runtime_mode":"turn_driven"},
+                    {"profile":"worker","meerkat_id":"kickoff-worker","runtime_mode":"turn_driven"}
+                ]
             }),
         )
         .await;
 
-        // Should succeed immediately (no kickoff turn to wait for)
+        // Turn-driven members don't run an autonomous kickoff turn,
+        // so the barrier returns immediately.
         let waited = call_tool(
             &d,
             "mob_wait_kickoff",
             json!({
                 "mob_id": mob_id,
-                "timeout_ms": 50
+                "member_ids": ["kickoff-lead", "kickoff-worker"],
+                "timeout_ms": 2000
             }),
         )
         .await;
         let members = waited["members"].as_array().expect("members array");
-        assert_eq!(members.len(), 1);
-        assert_eq!(members[0]["meerkat_id"], "kickoff-member");
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0]["meerkat_id"], "kickoff-lead");
+        assert_eq!(members[1]["meerkat_id"], "kickoff-worker");
     }
 
     #[tokio::test]

@@ -347,15 +347,18 @@ pub(crate) fn spawn_runtime_loop_with_completions(
                 () = idle_wake => {
                     // A completion arrived while idle. Check if it's a
                     // BackgroundToolOp that hasn't been injected yet.
+                    // Only BackgroundToolOp triggers idle wake — MobMemberChild
+                    // completions already wake through comms terminal response.
                     if let Some(ref feed) = completion_feed {
                         let batch = feed.list_since(observed_seq);
 
-                        let has_new_completion = batch
-                            .entries
-                            .iter()
-                            .any(|e| e.seq > last_injected_seq);
+                        let has_new_bg_completion = batch.entries.iter().any(|e| {
+                            e.kind
+                                == meerkat_core::ops_lifecycle::OperationKind::BackgroundToolOp
+                                && e.seq > last_injected_seq
+                        });
 
-                        if has_new_completion {
+                        if has_new_bg_completion {
                             // Verify quiescence before injecting. Do NOT advance
                             // observed_seq until injection succeeds.
                             let d = driver.lock().await;
@@ -438,9 +441,12 @@ async fn maybe_inject_feed_wake(
     if let Some(feed) = feed {
         let batch = feed.list_since(*observed_seq);
 
-        let has_new_completion = batch.entries.iter().any(|e| e.seq > *last_injected_seq);
+        let has_new_bg_completion = batch.entries.iter().any(|e| {
+            e.kind == meerkat_core::ops_lifecycle::OperationKind::BackgroundToolOp
+                && e.seq > *last_injected_seq
+        });
 
-        if !has_new_completion {
+        if !has_new_bg_completion {
             // Safe to advance — nothing actionable, just skip past non-matching entries.
             *observed_seq = batch.watermark;
             return false;

@@ -17,6 +17,31 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use meerkat_core::comms::TrustedPeerSpec;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Lightweight handle for a spawned autonomous initial turn.
+///
+/// The `JoinHandle` is for abort on stop/dispose. The `completion_rx` is for
+/// barrier waiters. The `watch::Sender` lives inside the spawned task — when
+/// the task completes (normally or panic), the sender drops, closing the
+/// channel and unblocking all waiters.
+pub(super) struct InitialTurnHandle {
+    handle: tokio::task::JoinHandle<()>,
+    completion_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+impl InitialTurnHandle {
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    fn abort(self) {
+        self.handle.abort();
+    }
+
+    fn completion_receiver(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.completion_rx.clone()
+    }
+}
+
 // Sized for real mob-scale startup/shutdown fan-out (50+ members).
 const MAX_PARALLEL_HOST_LOOP_OPS: usize = 64;
 const MAX_LIFECYCLE_NOTIFICATION_TASKS: usize = 16;
@@ -170,6 +195,8 @@ pub(super) struct MobActor {
     pub(super) tool_bundles: BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
     pub(super) default_llm_client: Option<Arc<dyn LlmClient>>,
     pub(super) retired_event_index: Arc<RwLock<HashSet<String>>>,
+    pub(super) autonomous_initial_turns:
+        Arc<tokio::sync::Mutex<BTreeMap<MeerkatId, InitialTurnHandle>>>,
     pub(super) next_spawn_ticket: u64,
     pub(super) pending_spawns: PendingSpawnLineage,
     pub(super) edge_locks: Arc<super::edge_locks::EdgeLockRegistry>,
@@ -601,9 +628,15 @@ impl MobActor {
     /// Start the autonomous runtime for a member and deliver its initial prompt.
     ///
     /// Sets up the keep-alive infrastructure (comms drain, dispatch capability)
-    /// then injects the prompt through the runtime input path. The session was
-    /// created with `InitialTurnPolicy::Defer` so the prompt hasn't been
-    /// executed yet — this injection is the canonical delivery.
+    /// then delivers the prompt as a normal turn. The session was created with
+    /// `InitialTurnPolicy::Defer` so the prompt hasn't been executed yet.
+    ///
+    /// Two paths:
+    /// - **Runtime-backed (adapter present):** Builds `Input::Prompt` and calls
+    ///   `accept_input_with_completion` for a true admission ack. Spawns a
+    ///   background task for completion wait + barrier signal.
+    /// - **No adapter (test/ephemeral):** Falls back to `provisioner.start_turn()`
+    ///   in a spawned task with yield-check for immediate failure detection.
     async fn start_autonomous_member(
         &self,
         meerkat_id: &MeerkatId,
@@ -619,32 +652,128 @@ impl MobActor {
             ))
         })?;
 
-        let injector = self
-            .provisioner
-            .interaction_event_injector(session_id)
-            .await
-            .ok_or_else(|| {
-                MobError::Internal(format!(
-                    "missing event injector for autonomous member '{meerkat_id}'"
-                ))
-            })?;
-        injector
-            .inject(
-                prompt,
-                meerkat_core::PlainEventSource::Rpc,
-                meerkat_core::types::HandlingMode::Queue,
-                None,
-            )
-            .map_err(|error| {
-                MobError::Internal(format!(
-                    "autonomous prompt inject failed for '{meerkat_id}': {error}"
-                ))
-            })?;
+        if let Some(adapter) = &self.runtime_adapter {
+            // Runtime-backed path: true admission ack via accept_input_with_completion.
+            use meerkat_runtime::{Input, InputHeader, PromptInput};
 
-        tracing::debug!(
-            meerkat_id = %meerkat_id,
-            "autonomous member started"
-        );
+            let input = Input::Prompt(PromptInput {
+                header: InputHeader {
+                    id: meerkat_core::lifecycle::InputId::new(),
+                    timestamp: chrono::Utc::now(),
+                    source: meerkat_runtime::InputOrigin::Operator,
+                    durability: meerkat_runtime::InputDurability::Durable,
+                    visibility: meerkat_runtime::InputVisibility::default(),
+                    idempotency_key: None,
+                    supersession_key: None,
+                    correlation_id: None,
+                },
+                text: prompt.text_content(),
+                blocks: if prompt.has_images() {
+                    Some(prompt.into_blocks())
+                } else {
+                    None
+                },
+                turn_metadata: None,
+            });
+
+            let (_outcome, completion_handle) = adapter
+                .accept_input_with_completion(session_id, input)
+                .await
+                .map_err(|e| {
+                    MobError::Internal(format!(
+                        "autonomous prompt admission failed for '{meerkat_id}': {e}"
+                    ))
+                })?;
+
+            // Spawn background task for completion wait + barrier signal.
+            // The watch::Sender lives inside the task — drops on completion
+            // or panic, closing the channel for barrier waiters.
+            let (completion_tx, completion_rx) = tokio::sync::watch::channel(false);
+            let log_id = meerkat_id.clone();
+            let handle = tokio::spawn(async move {
+                if let Some(h) = completion_handle {
+                    let outcome = h.wait().await;
+                    match outcome {
+                        meerkat_runtime::completion::CompletionOutcome::Completed(_)
+                        | meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult => {
+                        }
+                        other => tracing::warn!(
+                            meerkat_id = %log_id,
+                            outcome = ?other,
+                            "autonomous initial turn completed with non-success outcome"
+                        ),
+                    }
+                }
+                let _ = completion_tx.send(true);
+                // completion_tx drops here (normal) or on panic (unwind).
+            });
+
+            self.autonomous_initial_turns.lock().await.insert(
+                meerkat_id.clone(),
+                InitialTurnHandle {
+                    handle,
+                    completion_rx,
+                },
+            );
+        } else {
+            // No adapter (test/ephemeral): fall back to provisioner.start_turn()
+            // in a spawned task. Uses yield-check for immediate failure detection.
+            let member_ref_cloned = member_ref.clone();
+            let provisioner = self.provisioner.clone();
+            let log_id = meerkat_id.clone();
+            let (completion_tx, completion_rx) = tokio::sync::watch::channel(false);
+
+            let handle = tokio::spawn(async move {
+                let result = provisioner
+                    .start_turn(
+                        &member_ref_cloned,
+                        meerkat_core::service::StartTurnRequest {
+                            prompt,
+                            system_prompt: None,
+                            render_metadata: None,
+                            handling_mode: meerkat_core::types::HandlingMode::Queue,
+                            event_tx: None,
+                            skill_references: None,
+                            flow_tool_overlay: None,
+                            additional_instructions: None,
+                        },
+                    )
+                    .await;
+                let _ = completion_tx.send(true);
+                if let Err(ref error) = result {
+                    tracing::error!(
+                        meerkat_id = %log_id,
+                        error = %error,
+                        "autonomous initial turn failed"
+                    );
+                }
+            });
+
+            // Yield to detect immediate failures (session-not-found, etc.)
+            tokio::task::yield_now().await;
+            if handle.is_finished() {
+                if let Err(join_error) = handle.await {
+                    self.teardown_autonomous_runtime(member_ref).await;
+                    return Err(MobError::Internal(format!(
+                        "autonomous initial turn panicked for '{meerkat_id}': {join_error}"
+                    )));
+                }
+                // Task completed immediately — turn finished or failed.
+                // In either case, the member is in the roster and the session
+                // is alive. No need to store the handle.
+                return Ok(());
+            }
+
+            self.autonomous_initial_turns.lock().await.insert(
+                meerkat_id.clone(),
+                InitialTurnHandle {
+                    handle,
+                    completion_rx,
+                },
+            );
+        }
+
+        tracing::debug!(meerkat_id = %meerkat_id, "autonomous member started");
         Ok(())
     }
 
@@ -726,7 +855,7 @@ impl MobActor {
         .await
     }
 
-    /// Stop an autonomous member: interrupt, abort comms drain, wait for quiescence.
+    /// Stop an autonomous member: abort initial turn, interrupt, abort comms drain.
     ///
     /// Does NOT unregister the session — that happens only on dispose (retire/destroy).
     /// This allows resume to re-spawn the comms drain without re-registering.
@@ -735,6 +864,15 @@ impl MobActor {
         meerkat_id: &MeerkatId,
         member_ref: &MemberRef,
     ) -> Result<(), MobError> {
+        // Abort any in-flight initial turn.
+        if let Some(handle) = self
+            .autonomous_initial_turns
+            .lock()
+            .await
+            .remove(meerkat_id)
+        {
+            handle.abort();
+        }
         if let Err(error) = self.provisioner.interrupt_member(member_ref).await
             && !matches!(
                 error,
@@ -825,6 +963,22 @@ impl MobActor {
         self.stop_autonomous_member(&entry.meerkat_id, &entry.member_ref)
             .await
             .map_err(|error| (entry.meerkat_id, error))
+    }
+
+    async fn snapshot_kickoff_barrier_state(
+        &self,
+        meerkat_ids: &[MeerkatId],
+    ) -> Vec<(MeerkatId, tokio::sync::watch::Receiver<bool>)> {
+        let mut turns = self.autonomous_initial_turns.lock().await;
+        turns.retain(|_, entry| !entry.is_finished());
+        meerkat_ids
+            .iter()
+            .filter_map(|id| {
+                turns
+                    .get(id)
+                    .map(|entry| (id.clone(), entry.completion_receiver()))
+            })
+            .collect()
     }
 
     /// Ensure all autonomous roster members have their runtime ready.
@@ -1083,12 +1237,11 @@ impl MobActor {
                     let _ = reply_tx.send(result);
                 }
                 MobCommand::KickoffBarrierSnapshot {
-                    meerkat_ids: _,
+                    meerkat_ids,
                     reply_tx,
                 } => {
-                    // No kickoff turns — autonomous members use keep-alive
-                    // runtime directly. Return empty so callers proceed immediately.
-                    let _ = reply_tx.send(Vec::new());
+                    let snapshot = self.snapshot_kickoff_barrier_state(&meerkat_ids).await;
+                    let _ = reply_tx.send(snapshot);
                 }
                 MobCommand::RunFlow {
                     flow_id,

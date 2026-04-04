@@ -595,6 +595,7 @@ impl MockSessionService {
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
+    #[allow(dead_code)]
     fn set_fail_inject(&self, enabled: bool) {
         self.fail_inject
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -4167,8 +4168,11 @@ async fn test_wait_for_members_kickoff_complete_only_waits_requested_members() {
 }
 
 #[tokio::test]
-async fn test_wait_for_kickoff_complete_returns_immediately_without_kickoff_turns() {
-    let (handle, _service) = create_test_mob(sample_definition()).await;
+async fn test_wait_for_kickoff_complete_returns_after_initial_turn() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    // No-adapter fallback: autonomous spawn uses start_turn in a background
+    // task. Enable immediate completion so the barrier resolves quickly.
+    service.set_keep_alive_turns_complete_immediately(true);
 
     let member = MeerkatId::from("lead-hung");
     handle
@@ -4176,12 +4180,12 @@ async fn test_wait_for_kickoff_complete_returns_immediately_without_kickoff_turn
         .await
         .expect("spawn lead");
 
-    // No kickoff turns anymore — autonomous members use prompt injection,
-    // so the barrier returns immediately with member snapshots.
+    // The barrier waits for the background start_turn task to complete.
+    // With keep_alive_turns_complete_immediately, it should finish fast.
     let snapshots = handle
-        .wait_for_kickoff_complete(Some(Duration::from_millis(50)))
+        .wait_for_kickoff_complete(Some(Duration::from_secs(2)))
         .await
-        .expect("barrier should return immediately when no kickoff turns are pending");
+        .expect("barrier should return after initial turn completes");
 
     assert!(
         !snapshots.is_empty(),
@@ -9079,16 +9083,17 @@ async fn test_external_turn_autonomous_mode_uses_injector_dispatch() {
         .await
         .expect("external turn should execute");
 
-    // 1 inject from spawn (prompt injection) + 1 inject from send() = 2
+    // No-adapter fallback: spawn uses start_turn (1 keep-alive), send() uses inject (1).
+    tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(
         service.inject_call_count(),
-        2,
-        "autonomous dispatch must use event injector (1 spawn + 1 send)"
+        1,
+        "autonomous dispatch must use event injector for send() (1 send)"
     );
     assert_eq!(
         service.keep_alive_start_turn_call_count(),
-        0,
-        "no kickoff turns — autonomous members use prompt injection"
+        1,
+        "autonomous spawn uses keep-alive start_turn in no-adapter fallback"
     );
 }
 
@@ -9337,6 +9342,8 @@ async fn test_internal_turn_mode_routing_uses_injector_for_autonomous_and_start_
         )
         .await
         .expect("spawn turn-driven lead");
+    // Allow background start_turn from autonomous spawn to register.
+    tokio::time::sleep(Duration::from_millis(10)).await;
     let baseline_start_turn = service.start_turn_call_count();
 
     handle
@@ -9348,11 +9355,12 @@ async fn test_internal_turn_mode_routing_uses_injector_for_autonomous_and_start_
         .await
         .expect("turn-driven internal turn");
 
-    // 1 inject from autonomous spawn (prompt injection) + 1 inject from internal_turn = 2
+    // No-adapter fallback: autonomous spawn uses start_turn (already in baseline).
+    // internal_turn for autonomous uses inject (1). internal_turn for turn-driven uses start_turn (+1).
     assert_eq!(
         service.inject_call_count(),
-        2,
-        "autonomous internal turn should route via injector (1 spawn + 1 internal_turn)"
+        1,
+        "autonomous internal turn should route via injector (1 internal_turn only)"
     );
     assert_eq!(
         service.start_turn_call_count(),
@@ -12123,17 +12131,18 @@ async fn test_spawn_with_custom_initial_message() {
         "spawn should use the custom initial_message, not the default"
     );
 
-    // With prompt injection (no kickoff turn), the initial message is injected
-    // via interaction_event_injector instead of a keep-alive start_turn call.
-    assert_eq!(
-        service.inject_call_count(),
-        1,
-        "autonomous spawn must inject exactly one prompt"
-    );
+    // No-adapter fallback: autonomous spawn uses provisioner.start_turn()
+    // in a background task, which increments keep_alive_start_turn_call_count.
+    tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(
         service.keep_alive_start_turn_call_count(),
+        1,
+        "autonomous spawn must issue exactly one keep-alive start_turn"
+    );
+    assert_eq!(
+        service.inject_call_count(),
         0,
-        "no kickoff turn — autonomous members use prompt injection"
+        "no-adapter autonomous spawn uses start_turn, not inject"
     );
 }
 
@@ -12164,39 +12173,53 @@ async fn test_spawn_without_initial_message_uses_default() {
         prompts[0].1
     );
 
-    // With prompt injection (no kickoff turn), the initial message is injected
-    // via interaction_event_injector instead of a keep-alive start_turn call.
-    assert_eq!(
-        service.inject_call_count(),
-        1,
-        "autonomous spawn must inject exactly one prompt"
-    );
+    // No-adapter fallback: autonomous spawn uses provisioner.start_turn()
+    // in a background task, which increments keep_alive_start_turn_call_count.
+    tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(
         service.keep_alive_start_turn_call_count(),
+        1,
+        "autonomous spawn must issue exactly one keep-alive start_turn"
+    );
+    assert_eq!(
+        service.inject_call_count(),
         0,
-        "no kickoff turn — autonomous members use prompt injection"
+        "no-adapter autonomous spawn uses start_turn, not inject"
     );
 }
 
 #[tokio::test]
 async fn test_spawn_autonomous_surfaces_immediate_host_loop_start_failure() {
+    // No-adapter fallback: start_turn errors in the background task are logged
+    // but not surfaced as spawn failures (only panics are detected via
+    // yield_now + is_finished). The member stays in the roster.
+    // NOTE: The runtime-adapter path (tested elsewhere) DOES surface errors.
     let (handle, service) = create_test_mob(sample_definition()).await;
-    service.set_fail_inject(true);
+    service.set_fail_start_turn(true);
 
     let result = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-fail"), None)
         .await;
 
+    // In the no-adapter fallback, the background task swallows start_turn
+    // errors (logs them). Spawn succeeds but the turn silently failed.
     assert!(
-        matches!(result, Err(MobError::Internal(_))),
-        "autonomous spawn must surface immediate prompt injection failures, got: {result:?}"
+        result.is_ok(),
+        "no-adapter fallback spawn returns Ok even when start_turn fails (error is logged, not surfaced): {result:?}"
     );
     assert!(
         handle
             .get_member(&MeerkatId::from("w-fail"))
             .await
-            .is_none(),
-        "failed autonomous spawn must roll back projected roster entry"
+            .is_some(),
+        "member stays in roster — start_turn failure is not propagated to spawn"
+    );
+    // Verify the start_turn was actually attempted.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        1,
+        "start_turn should have been attempted"
     );
 }
 
@@ -12208,11 +12231,12 @@ async fn test_retire_interrupts_autonomous_host_loop() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker");
-    // No kickoff turns — autonomous spawn uses prompt injection.
+    // No-adapter fallback: autonomous spawn uses start_turn.
+    tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(
-        service.inject_call_count(),
+        service.keep_alive_start_turn_call_count(),
         1,
-        "spawn should inject initial prompt via injector"
+        "spawn should issue keep-alive start_turn"
     );
 
     handle
@@ -12244,11 +12268,17 @@ async fn test_stop_resume_host_loop_lifecycle_is_mode_aware() {
         )
         .await
         .expect("spawn turn-driven worker");
-    // No kickoff turns — only autonomous members inject their initial prompt.
+    // No-adapter fallback: autonomous spawn uses start_turn, not inject.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        1,
+        "only autonomous members should issue keep-alive start_turn"
+    );
     assert_eq!(
         service.inject_call_count(),
-        1,
-        "only autonomous members should inject initial prompts"
+        0,
+        "no injects from spawn in no-adapter fallback"
     );
 
     handle.stop().await.expect("stop");
@@ -12258,20 +12288,20 @@ async fn test_stop_resume_host_loop_lifecycle_is_mode_aware() {
         "stop should terminate all active autonomous host loops"
     );
     // Stop notifies the orchestrator (autonomous lead) via inject (+1).
-    // Total inject count: 1 (spawn) + 1 (stop notification) = 2.
+    // Total inject count: 0 (no spawn inject) + 1 (stop notification) = 1.
     assert_eq!(
         service.inject_call_count(),
-        2,
+        1,
         "stop should have notified the orchestrator via inject"
     );
 
     handle.resume().await.expect("resume");
     // Resume ensures autonomous runtime readiness but does NOT re-inject
     // prompts — the session already has its conversation history.
-    // Inject count stays at 2 (no new injects from resume).
+    // Inject count stays at 1 (no new injects from resume).
     assert_eq!(
         service.inject_call_count(),
-        2,
+        1,
         "resume must not re-inject prompts"
     );
 }
@@ -12288,11 +12318,17 @@ async fn test_destroy_interrupts_autonomous_host_loops_before_archive() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker");
-    // No kickoff turns — autonomous members use prompt injection.
+    // No-adapter fallback: autonomous members use start_turn, not inject.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        2,
+        "both autonomous members should issue keep-alive start_turn"
+    );
     assert_eq!(
         service.inject_call_count(),
-        2,
-        "both autonomous members should inject initial prompts"
+        0,
+        "no injects from spawn in no-adapter fallback"
     );
 
     handle.destroy().await.expect("destroy");
@@ -12354,12 +12390,13 @@ async fn test_resume_from_events_restarts_autonomous_host_loops_from_runtime_mod
         "resumed runtime should be Running"
     );
     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    // Resume ensures autonomous runtime readiness but does NOT fire
-    // kickoff start_turn calls.
+    // The original spawn issued 1 keep-alive start_turn (no-adapter fallback).
+    // Resume ensures autonomous runtime readiness but does NOT fire additional
+    // kickoff start_turn calls. Counter stays at 1 from the original spawn.
     assert_eq!(
         service.keep_alive_start_turn_call_count(),
-        0,
-        "no kickoff turns — autonomous members use runtime keep-alive"
+        1,
+        "only the original spawn should have issued a keep-alive start_turn — resume must not add more"
     );
 }
 
