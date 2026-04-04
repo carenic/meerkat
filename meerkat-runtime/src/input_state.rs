@@ -300,7 +300,7 @@ impl Serialize for InputState {
             terminal_outcome: self.authority.terminal_outcome().cloned(),
             durability: self.durability,
             idempotency_key: self.idempotency_key.clone(),
-            attempt_count: self.attempt_count,
+            attempt_count: self.authority.attempt_count(),
             recovery_count: self.recovery_count,
             history: self.authority.history().to_vec(),
             reconstruction_source: self.reconstruction_source.clone(),

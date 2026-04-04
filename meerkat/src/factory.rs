@@ -1629,7 +1629,7 @@ impl AgentFactory {
                 }
             };
             if !comms_bound_wait
-                && tools.supports_wait_interrupt()
+                && tools.supports_completion_feed_binding()
                 && Arc::strong_count(&tools) == 1
                 && let (Some(feed), Some(baseline)) =
                     (completion_feed.clone(), interrupt_baseline.clone())

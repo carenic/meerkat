@@ -248,6 +248,13 @@ pub trait AgentToolDispatcher: Send + Sync {
     /// Called by the factory when no comms runtime is available but a completion
     /// feed exists. The WaitTool will race sleep against feed advance without
     /// a comms interrupt channel. Default returns `Err(Unsupported)`.
+    /// Whether this dispatcher supports completion feed binding.
+    ///
+    /// Non-consuming probe. Check before calling the consuming `bind_completion_feed`.
+    fn supports_completion_feed_binding(&self) -> bool {
+        false
+    }
+
     fn bind_completion_feed(
         self: Arc<Self>,
         _feed: Arc<dyn crate::completion_feed::CompletionFeed>,
@@ -349,6 +356,10 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher for Filtered
             allowed_tools: owned.allowed_tools,
             filtered_tools: owned.filtered_tools,
         }))
+    }
+
+    fn supports_completion_feed_binding(&self) -> bool {
+        self.inner.supports_completion_feed_binding()
     }
 
     fn bind_completion_feed(

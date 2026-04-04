@@ -511,6 +511,10 @@ impl AgentToolDispatcher for CompositeDispatcher {
         self.builtin_tools.iter().any(|t| t.name() == "wait")
     }
 
+    fn supports_completion_feed_binding(&self) -> bool {
+        self.builtin_tools.iter().any(|t| t.name() == "wait")
+    }
+
     fn bind_completion_feed(
         self: Arc<Self>,
         feed: std::sync::Arc<dyn meerkat_core::completion_feed::CompletionFeed>,
