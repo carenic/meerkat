@@ -1350,7 +1350,7 @@ impl SessionRuntime {
                 ),
                 data: None,
             })?;
-        let build = SessionBuildOptions {
+        let mut build = SessionBuildOptions {
             provider: stored_metadata.as_ref().map(|meta| meta.provider),
             output_schema: None,
             structured_output_retries: 2,
@@ -1377,7 +1377,8 @@ impl SessionRuntime {
             override_builtins: tooling.builtins.to_override(),
             override_shell: tooling.shell.to_override(),
             override_memory: tooling.memory.to_override(),
-            override_mob: tooling.mob.to_override(),
+            override_mob: None,
+            mob_tool_authority_context: None,
             preload_skills: tooling.active_skills.clone(),
             realm_id: stored_metadata
                 .as_ref()
@@ -1409,6 +1410,13 @@ impl SessionRuntime {
             blob_store_override: None,
             mob_tools: None,
         };
+        build.apply_persisted_mob_operator_access(
+            tooling.mob.to_override(),
+            build
+                .resume_session
+                .as_ref()
+                .and_then(Session::mob_tool_authority_context),
+        );
         self.service
             .create_session(CreateSessionRequest {
                 model: stored_metadata
@@ -2008,9 +2016,15 @@ impl SessionRuntime {
             build_config.peer_meta = meta.peer_meta.clone();
             build_config.override_builtins = meta.tooling.builtins.to_override();
             build_config.override_shell = meta.tooling.shell.to_override();
-            build_config.override_mob = meta.tooling.mob.to_override();
             build_config.override_memory = meta.tooling.memory.to_override();
             build_config.preload_skills = meta.tooling.active_skills.clone();
+            build_config.apply_persisted_mob_operator_access(
+                meta.tooling.mob.to_override(),
+                build_config
+                    .resume_session
+                    .as_ref()
+                    .and_then(Session::mob_tool_authority_context),
+            );
         }
 
         // Apply caller-requested keep_alive override unconditionally.

@@ -3,6 +3,7 @@ use meerkat_core::SessionId;
 use meerkat_core::agent::{BindOutcome, DispatcherCapabilities, OpsLifecycleBindError};
 use meerkat_core::ops::AsyncOpRef;
 use meerkat_core::ops_lifecycle::OpsLifecycleRegistry;
+use meerkat_core::service::MobToolAuthorityContext;
 use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
@@ -113,15 +114,15 @@ pub(super) fn compose_external_tools_for_profile(
 ) -> Result<Option<Arc<dyn AgentToolDispatcher>>, MobError> {
     let mut dispatchers: Vec<Arc<dyn AgentToolDispatcher>> = Vec::new();
 
-    if matches!(
-        mob_tool_access_context,
-        crate::build::MobToolAccessContext::OperatorCapabilitiesPresent
-    ) && (profile.tools.mob || profile.tools.mob_tasks)
+    if let crate::build::MobToolAccessContext::InjectedAuthority(authority_context) =
+        mob_tool_access_context
+        && (profile.tools.mob || profile.tools.mob_tasks)
     {
         dispatchers.push(Arc::new(MobOperatorToolDispatcher::new(
             mob_handle,
             profile.tools.mob,
             profile.tools.mob_tasks,
+            authority_context,
         )));
     }
 
@@ -176,13 +177,19 @@ pub(super) fn compose_external_tools_for_profile(
 
 struct MobOperatorToolDispatcher {
     handle: MobHandle,
+    authority_context: MobToolAuthorityContext,
     tools: Arc<[Arc<ToolDef>]>,
     owner_session_id: Option<SessionId>,
     ops_registry: Option<Arc<dyn OpsLifecycleRegistry>>,
 }
 
 impl MobOperatorToolDispatcher {
-    fn new(handle: MobHandle, enable_mob: bool, enable_mob_tasks: bool) -> Self {
+    fn new(
+        handle: MobHandle,
+        enable_mob: bool,
+        enable_mob_tasks: bool,
+        authority_context: MobToolAuthorityContext,
+    ) -> Self {
         let mut defs: Vec<Arc<ToolDef>> = Vec::new();
         if enable_mob {
             defs.push(tool_def(
@@ -390,10 +397,19 @@ impl MobOperatorToolDispatcher {
 
         Self {
             handle,
+            authority_context,
             tools: defs.into(),
             owner_session_id: None,
             ops_registry: None,
         }
+    }
+
+    fn ensure_current_mob_scope(&self, tool_name: &str) -> Result<(), ToolError> {
+        let mob_id = self.handle.definition().id.as_str();
+        if self.authority_context.can_manage_mob(mob_id) {
+            return Ok(());
+        }
+        Err(ToolError::access_denied(tool_name))
     }
 
     fn map_mob_error(call: ToolCallView<'_>, error: MobError) -> ToolError {
@@ -418,6 +434,21 @@ impl MobOperatorToolDispatcher {
             result: ToolResult::new(call.id.to_string(), content, false),
             async_ops,
         })
+    }
+
+    async fn record_successful_operator_action(&self, tool_name: &str) {
+        if let Err(error) = self
+            .handle
+            .record_operator_action_provenance(tool_name, &self.authority_context)
+            .await
+        {
+            tracing::warn!(
+                tool_name,
+                mob_id = %self.handle.definition().id,
+                error = %error,
+                "operator provenance projection append failed"
+            );
+        }
     }
 }
 
@@ -552,6 +583,9 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
         &self,
         call: ToolCallView<'_>,
     ) -> Result<meerkat_core::ToolDispatchOutcome, ToolError> {
+        if self.tools.iter().any(|tool| tool.name == call.name) {
+            self.ensure_current_mob_scope(call.name)?;
+        }
         match call.name {
             TOOL_SPAWN_MEERKAT => {
                 let args: SpawnMeerkatArgs = call
@@ -616,6 +650,7 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                         )
                     }
                 };
+                self.record_successful_operator_action(call.name).await;
                 Self::encode_result_with_async_ops(call, result, async_ops)
             }
             TOOL_SPAWN_MANY_MEERKATS => {
@@ -704,6 +739,7 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                         (results, Vec::new())
                     }
                 };
+                self.record_successful_operator_action(call.name).await;
                 Self::encode_result_with_async_ops(call, json!({ "results": results }), async_ops)
             }
             TOOL_RETIRE_MEERKAT => {
@@ -714,6 +750,7 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                     .retire(MeerkatId::from(args.meerkat_id))
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
+                self.record_successful_operator_action(call.name).await;
                 Self::encode_result(call, json!({"ok": true}))
             }
             TOOL_WIRE_PEERS => {
@@ -724,6 +761,7 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                     .wire(MeerkatId::from(args.a), MeerkatId::from(args.b))
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
+                self.record_successful_operator_action(call.name).await;
                 Self::encode_result(call, json!({"ok": true}))
             }
             TOOL_UNWIRE_PEERS => {
@@ -734,6 +772,7 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                     .unwire(MeerkatId::from(args.a), MeerkatId::from(args.b))
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
+                self.record_successful_operator_action(call.name).await;
                 Self::encode_result(call, json!({"ok": true}))
             }
             TOOL_LIST_MEERKATS => {
@@ -772,6 +811,7 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                     .run_flow(FlowId::from(args.flow_id), args.params)
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
+                self.record_successful_operator_action(call.name).await;
                 Self::encode_result(call, json!({ "run_id": run_id }))
             }
             TOOL_MOB_FLOW_STATUS => {
@@ -799,6 +839,7 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                     .cancel_flow(run_id)
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
+                self.record_successful_operator_action(call.name).await;
                 Self::encode_result(call, json!({"ok": true}))
             }
             TOOL_MOB_TASK_CREATE => {
@@ -810,6 +851,7 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                     .task_create(args.subject, args.description, args.blocked_by)
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
+                self.record_successful_operator_action(call.name).await;
                 Self::encode_result(call, json!({"ok": true, "task_id": task_id}))
             }
             TOOL_MOB_TASK_LIST => {
@@ -828,6 +870,7 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                     .task_update(args.task_id, args.status, args.owner.map(MeerkatId::from))
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
+                self.record_successful_operator_action(call.name).await;
                 Self::encode_result(call, json!({"ok": true}))
             }
             TOOL_MOB_TASK_GET => {
@@ -849,6 +892,7 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                     .force_cancel_member(MeerkatId::from(args.meerkat_id))
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
+                self.record_successful_operator_action(call.name).await;
                 Self::encode_result(call, json!({"ok": true}))
             }
             TOOL_MEERKAT_STATUS => {
@@ -884,6 +928,7 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
         let this = Arc::try_unwrap(self).map_err(|_| OpsLifecycleBindError::SharedOwnership)?;
         Ok(BindOutcome::Bound(Arc::new(Self {
             handle: this.handle,
+            authority_context: this.authority_context,
             tools: this.tools,
             owner_session_id: Some(owner_session_id),
             ops_registry: Some(registry),
