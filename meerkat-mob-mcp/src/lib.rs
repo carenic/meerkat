@@ -2974,48 +2974,52 @@ mod tests {
         );
     }
 
-    fn flow_enabled_definition() -> MobDefinition {
-        MobDefinition::from_toml(
-            r#"
-[mob]
-id = "flow-mob"
-orchestrator = "lead"
-
-[profiles.lead]
-model = "claude-opus-4-6"
-external_addressable = true
-peer_description = "Lead"
-
-[profiles.lead.tools]
-comms = true
-mob = true
-
-[profiles.worker]
-model = "claude-sonnet-4-5"
-external_addressable = false
-peer_description = "Worker"
-
-[profiles.worker.tools]
-comms = true
-mob = true
-
-[wiring]
-auto_wire_orchestrator = false
-role_wiring = []
-
-[backend]
-default = "session"
-
-[flows.demo]
-description = "demo flow"
-
-[flows.demo.steps.start]
-role = "worker"
-message = "run demo"
-timeout_ms = 1000
-"#,
-        )
-        .expect("flow mob definition should parse")
+    fn flow_enabled_definition() -> serde_json::Value {
+        json!({
+            "id": "flow-mob",
+            "orchestrator": {
+                "profile": "lead"
+            },
+            "profiles": {
+                "lead": {
+                    "model": "claude-opus-4-6",
+                    "external_addressable": true,
+                    "peer_description": "Lead",
+                    "tools": {
+                        "comms": true,
+                        "mob": true
+                    }
+                },
+                "worker": {
+                    "model": "claude-sonnet-4-5",
+                    "external_addressable": false,
+                    "peer_description": "Worker",
+                    "tools": {
+                        "comms": true,
+                        "mob": true
+                    }
+                }
+            },
+            "wiring": {
+                "auto_wire_orchestrator": false,
+                "role_wiring": []
+            },
+            "backend": {
+                "default": "session"
+            },
+            "flows": {
+                "demo": {
+                    "description": "demo flow",
+                    "steps": {
+                        "start": {
+                            "role": "worker",
+                            "message": "run demo",
+                            "timeout_ms": 1000
+                        }
+                    }
+                }
+            }
+        })
     }
 
     #[tokio::test]
@@ -3973,6 +3977,7 @@ timeout_ms = 1000
             event_tx: None,
             skill_references: None,
             initial_turn: InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
             build: None,
             labels: None,
         };

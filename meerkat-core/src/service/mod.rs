@@ -582,7 +582,6 @@ impl Default for SessionBuildOptions {
             mob_tools: None,
             runtime_build_mode: crate::runtime_epoch::RuntimeBuildMode::StandaloneEphemeral,
             mob_tool_authority_context: None,
-            runtime_build_mode: crate::runtime_epoch::RuntimeBuildMode::StandaloneEphemeral,
         }
     }
 }
