@@ -826,12 +826,12 @@ fn spawn_heartbeat(
             // loop indefinitely (TCP connect can hang for minutes). Without
             // this, the failure counter never advances and reconnect never fires.
             let send_fut = router.send(
-                &peer,
-                MessageKind::Request {
-                    intent: "heartbeat".into(),
-                    params: serde_json::Value::Null,
-                },
-            );
+                    &peer,
+                    MessageKind::Request {
+                        intent: "heartbeat".into(),
+                        params: serde_json::json!(null),
+                    },
+                );
             let failed =
                 match tokio::time::timeout(std::time::Duration::from_secs(5), send_fut).await {
                     Ok(Ok(_)) => false,

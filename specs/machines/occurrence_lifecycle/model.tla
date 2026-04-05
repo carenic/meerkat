@@ -97,36 +97,28 @@ CompleteFromDispatchingOrAwaiting(receipt_stage, at_utc_ms) ==
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, target_binding_key, due_at_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, failure_class, failure_detail, dispatched_at_utc_ms, attempt_count, superseded_by_revision >>
 
 
-SkipFromLive(detail, arg_failure_class, at_utc_ms) ==
-    /\ phase = "Dispatching" \/ phase = "AwaitingCompletion"
+SkipFromPendingOrLive(detail, arg_failure_class, at_utc_ms) ==
+    /\ phase = "Pending" \/ phase = "Claimed" \/ phase = "Dispatching" \/ phase = "AwaitingCompletion"
     /\ phase' = "Skipped"
     /\ model_step_count' = model_step_count + 1
-    /\ claimed_by' = None
-    /\ lease_expires_at_utc_ms' = None
-    /\ claim_token' = None
-    /\ delivery_correlation_id' = None
     /\ failure_class' = arg_failure_class
     /\ failure_detail' = detail
     /\ completed_at_utc_ms' = Some(at_utc_ms)
-    /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, target_binding_key, due_at_utc_ms, claimed_at_utc_ms, last_receipt_stage, dispatched_at_utc_ms, attempt_count, superseded_by_revision >>
+    /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, target_binding_key, due_at_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, last_receipt_stage, dispatched_at_utc_ms, attempt_count, superseded_by_revision >>
 
 
-MisfireFromLive(detail, arg_failure_class, at_utc_ms) ==
-    /\ phase = "Dispatching" \/ phase = "AwaitingCompletion"
+MisfireFromPendingOrLive(detail, arg_failure_class, at_utc_ms) ==
+    /\ phase = "Pending" \/ phase = "Claimed" \/ phase = "Dispatching" \/ phase = "AwaitingCompletion"
     /\ phase' = "Misfired"
     /\ model_step_count' = model_step_count + 1
-    /\ claimed_by' = None
-    /\ lease_expires_at_utc_ms' = None
-    /\ claim_token' = None
-    /\ delivery_correlation_id' = None
     /\ failure_class' = arg_failure_class
     /\ failure_detail' = detail
     /\ completed_at_utc_ms' = Some(at_utc_ms)
-    /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, target_binding_key, due_at_utc_ms, claimed_at_utc_ms, last_receipt_stage, dispatched_at_utc_ms, attempt_count, superseded_by_revision >>
+    /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, target_binding_key, due_at_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, last_receipt_stage, dispatched_at_utc_ms, attempt_count, superseded_by_revision >>
 
 
-SupersedePending(arg_superseded_by_revision, at_utc_ms) ==
-    /\ phase = "Pending"
+SupersedePendingOrLive(arg_superseded_by_revision, at_utc_ms) ==
+    /\ phase = "Pending" \/ phase = "Claimed" \/ phase = "Dispatching" \/ phase = "AwaitingCompletion"
     /\ phase' = "Superseded"
     /\ model_step_count' = model_step_count + 1
     /\ completed_at_utc_ms' = Some(at_utc_ms)
@@ -134,8 +126,8 @@ SupersedePending(arg_superseded_by_revision, at_utc_ms) ==
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, target_binding_key, due_at_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, last_receipt_stage, failure_class, failure_detail, dispatched_at_utc_ms, attempt_count >>
 
 
-DeliveryFailedFromLive(receipt_stage, arg_failure_class, detail, at_utc_ms) ==
-    /\ phase = "Dispatching" \/ phase = "AwaitingCompletion"
+DeliveryFailedFromClaimedOrLive(receipt_stage, arg_failure_class, detail, at_utc_ms) ==
+    /\ phase = "Claimed" \/ phase = "Dispatching" \/ phase = "AwaitingCompletion"
     /\ phase' = "DeliveryFailed"
     /\ model_step_count' = model_step_count + 1
     /\ last_receipt_stage' = receipt_stage
@@ -189,10 +181,10 @@ Next ==
     \/ \E correlation_id \in OptionStringValues : \E at_utc_ms \in 0..2 : DispatchStartedFromClaimed(correlation_id, at_utc_ms)
     \/ \E at_utc_ms \in 0..2 : AwaitCompletionFromDispatching(at_utc_ms)
     \/ \E receipt_stage \in DeliveryReceiptStageValues : \E at_utc_ms \in 0..2 : CompleteFromDispatchingOrAwaiting(receipt_stage, at_utc_ms)
-    \/ \E detail \in OptionStringValues : \E arg_failure_class \in OptionOccurrenceFailureClassValues : \E at_utc_ms \in 0..2 : SkipFromLive(detail, arg_failure_class, at_utc_ms)
-    \/ \E detail \in OptionStringValues : \E arg_failure_class \in OptionOccurrenceFailureClassValues : \E at_utc_ms \in 0..2 : MisfireFromLive(detail, arg_failure_class, at_utc_ms)
-    \/ \E arg_superseded_by_revision \in 0..2 : \E at_utc_ms \in 0..2 : SupersedePending(arg_superseded_by_revision, at_utc_ms)
-    \/ \E receipt_stage \in OptionDeliveryReceiptStageValues : \E arg_failure_class \in OccurrenceFailureClassValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : DeliveryFailedFromLive(receipt_stage, arg_failure_class, detail, at_utc_ms)
+    \/ \E detail \in OptionStringValues : \E arg_failure_class \in OptionOccurrenceFailureClassValues : \E at_utc_ms \in 0..2 : SkipFromPendingOrLive(detail, arg_failure_class, at_utc_ms)
+    \/ \E detail \in OptionStringValues : \E arg_failure_class \in OptionOccurrenceFailureClassValues : \E at_utc_ms \in 0..2 : MisfireFromPendingOrLive(detail, arg_failure_class, at_utc_ms)
+    \/ \E arg_superseded_by_revision \in 0..2 : \E at_utc_ms \in 0..2 : SupersedePendingOrLive(arg_superseded_by_revision, at_utc_ms)
+    \/ \E receipt_stage \in OptionDeliveryReceiptStageValues : \E arg_failure_class \in OccurrenceFailureClassValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : DeliveryFailedFromClaimedOrLive(receipt_stage, arg_failure_class, detail, at_utc_ms)
     \/ \E at_utc_ms \in 0..2 : LeaseExpiredFromClaimed(at_utc_ms)
     \/ \E at_utc_ms \in 0..2 : LeaseExpiredFromDispatching(at_utc_ms)
     \/ \E at_utc_ms \in 0..2 : LeaseExpiredFromAwaitingCompletion(at_utc_ms)

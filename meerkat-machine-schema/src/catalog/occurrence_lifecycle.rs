@@ -384,11 +384,26 @@ pub fn occurrence_lifecycle_machine() -> MachineSchema {
                 to: "Completed".into(),
                 emit: vec![effect("Completed")],
             },
-            terminal_transition("SkipFromLive", "Skip", "Skipped"),
-            terminal_transition("MisfireFromLive", "Misfire", "Misfired"),
+            terminal_transition(
+                "SkipFromPendingOrLive",
+                &["Pending", "Claimed", "Dispatching", "AwaitingCompletion"],
+                "Skip",
+                "Skipped",
+            ),
+            terminal_transition(
+                "MisfireFromPendingOrLive",
+                &["Pending", "Claimed", "Dispatching", "AwaitingCompletion"],
+                "Misfire",
+                "Misfired",
+            ),
             TransitionSchema {
-                name: "SupersedePending".into(),
-                from: vec!["Pending".into()],
+                name: "SupersedePendingOrLive".into(),
+                from: vec![
+                    "Pending".into(),
+                    "Claimed".into(),
+                    "Dispatching".into(),
+                    "AwaitingCompletion".into(),
+                ],
                 on: InputMatch {
                     variant: "Supersede".into(),
                     bindings: vec!["superseded_by_revision".into(), "at_utc_ms".into()],
@@ -408,8 +423,12 @@ pub fn occurrence_lifecycle_machine() -> MachineSchema {
                 emit: vec![effect("Superseded")],
             },
             TransitionSchema {
-                name: "DeliveryFailedFromLive".into(),
-                from: vec!["Dispatching".into(), "AwaitingCompletion".into()],
+                name: "DeliveryFailedFromClaimedOrLive".into(),
+                from: vec![
+                    "Claimed".into(),
+                    "Dispatching".into(),
+                    "AwaitingCompletion".into(),
+                ],
                 on: InputMatch {
                     variant: "DeliveryFailed".into(),
                     bindings: vec![
@@ -460,10 +479,15 @@ pub fn occurrence_lifecycle_machine() -> MachineSchema {
     }
 }
 
-fn terminal_transition(name: &str, input_variant: &str, to: &str) -> TransitionSchema {
+fn terminal_transition(
+    name: &str,
+    from: &[&str],
+    input_variant: &str,
+    to: &str,
+) -> TransitionSchema {
     TransitionSchema {
         name: name.into(),
-        from: vec!["Dispatching".into(), "AwaitingCompletion".into()],
+        from: from.iter().map(|phase| (*phase).into()).collect(),
         on: InputMatch {
             variant: input_variant.into(),
             bindings: vec!["detail".into(), "failure_class".into(), "at_utc_ms".into()],
@@ -477,22 +501,6 @@ fn terminal_transition(name: &str, input_variant: &str, to: &str) -> TransitionS
             Update::Assign {
                 field: "failure_class".into(),
                 expr: Expr::Binding("failure_class".into()),
-            },
-            Update::Assign {
-                field: "claimed_by".into(),
-                expr: Expr::None,
-            },
-            Update::Assign {
-                field: "lease_expires_at_utc_ms".into(),
-                expr: Expr::None,
-            },
-            Update::Assign {
-                field: "claim_token".into(),
-                expr: Expr::None,
-            },
-            Update::Assign {
-                field: "delivery_correlation_id".into(),
-                expr: Expr::None,
             },
             Update::Assign {
                 field: "completed_at_utc_ms".into(),

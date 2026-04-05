@@ -1,6 +1,7 @@
 //! Mob RPC wire contracts.
 
 use super::session::WireContentInput;
+use meerkat_core::OutputSchema;
 use meerkat_core::{
     HandlingMode, SessionId,
     types::{RenderClass, RenderMetadata, RenderSalience},
@@ -112,7 +113,7 @@ pub struct MobProfileInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_inline_peer_notifications: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_schema: Option<Value>,
+    pub output_schema: Option<OutputSchema>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_params: Option<Value>,
 }

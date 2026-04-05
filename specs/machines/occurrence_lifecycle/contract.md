@@ -81,26 +81,26 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `Completed`
 - To: `Completed`
 
-### `SkipFromLive`
-- From: `Dispatching`, `AwaitingCompletion`
+### `SkipFromPendingOrLive`
+- From: `Pending`, `Claimed`, `Dispatching`, `AwaitingCompletion`
 - On: `Skip`(detail, failure_class, at_utc_ms)
 - Emits: `Skipped`
 - To: `Skipped`
 
-### `MisfireFromLive`
-- From: `Dispatching`, `AwaitingCompletion`
+### `MisfireFromPendingOrLive`
+- From: `Pending`, `Claimed`, `Dispatching`, `AwaitingCompletion`
 - On: `Misfire`(detail, failure_class, at_utc_ms)
 - Emits: `Misfired`
 - To: `Misfired`
 
-### `SupersedePending`
-- From: `Pending`
+### `SupersedePendingOrLive`
+- From: `Pending`, `Claimed`, `Dispatching`, `AwaitingCompletion`
 - On: `Supersede`(superseded_by_revision, at_utc_ms)
 - Emits: `Superseded`
 - To: `Superseded`
 
-### `DeliveryFailedFromLive`
-- From: `Dispatching`, `AwaitingCompletion`
+### `DeliveryFailedFromClaimedOrLive`
+- From: `Claimed`, `Dispatching`, `AwaitingCompletion`
 - On: `DeliveryFailed`(receipt_stage, failure_class, detail, at_utc_ms)
 - Emits: `DeliveryFailed`
 - To: `DeliveryFailed`

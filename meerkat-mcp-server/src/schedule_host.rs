@@ -27,7 +27,7 @@ use meerkat_core::service::{
     CreateSessionRequest, DeferredPromptPolicy, InitialTurnPolicy, SessionBuildOptions,
 };
 use meerkat_core::types::HandlingMode;
-use meerkat_core::{ContentInput, OutputSchema, Session, SessionId};
+use meerkat_core::{ContentInput, Session, SessionId};
 use meerkat_mcp::{McpRouter, McpRouterAdapter};
 #[cfg(feature = "mob")]
 use meerkat_mob::{
@@ -174,14 +174,9 @@ impl McpScheduleContext {
         let session_id = prepared.session_id;
         let runtime_bindings = prepared.bindings;
 
-        let output_schema = create
-            .output_schema_json
-            .clone()
-            .map(OutputSchema::from_json_value)
-            .transpose()
-            .map_err(|error| ScheduleDomainError::InvalidSchedule(error.to_string()))?;
+        let output_schema = create.output_schema.clone();
 
-        let mcp_adapter = Arc::new(McpRouterAdapter::new(McpRouter::new()));
+        let mcp_adapter = self.seed_realm_mcp_adapter().await?;
         let mcp_tools: Arc<dyn AgentToolDispatcher> = mcp_adapter.clone();
         let external_tools = compose_external_tool_dispatchers(None, Some(mcp_tools))
             .map_err(ScheduleDomainError::Internal)?;
@@ -279,6 +274,32 @@ impl McpScheduleContext {
                 Err(ScheduleDomainError::Internal(error.to_string()))
             }
         }
+    }
+
+    async fn seed_realm_mcp_adapter(&self) -> Result<Arc<McpRouterAdapter>, ScheduleDomainError> {
+        let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new()));
+        let server_configs = self
+            .config_runtime
+            .get()
+            .await
+            .ok()
+            .map(|snapshot| snapshot.config.tools.mcp_servers.clone())
+            .unwrap_or_default();
+
+        for config in &server_configs {
+            adapter
+                .stage_add(config.clone())
+                .await
+                .map_err(ScheduleDomainError::Internal)?;
+        }
+        if !server_configs.is_empty() {
+            adapter
+                .apply_staged()
+                .await
+                .map_err(ScheduleDomainError::Internal)?;
+        }
+
+        Ok(adapter)
     }
 }
 
@@ -478,23 +499,31 @@ impl SurfaceScheduleMobHost for McpScheduleTargetAdapter {
                 },
                 MobTargetBinding::Flow {
                     flow_id, params, ..
-                } => match mob_state
-                    .mob_run_flow(&mob_id, FlowId::from(flow_id.as_str()), params.clone())
-                    .await
-                {
-                    Ok(run_id) => Ok(async_completion_dispatch(
-                        occurrence,
-                        Some(run_id.to_string()),
-                        mob_flow_completion_future(mob_state, mob_id, run_id),
-                    )),
-                    Err(error) => Ok(immediate_delivery_failure(
-                        occurrence,
-                        error.to_string(),
-                        OccurrenceFailureClass::MobRejected,
-                        None,
-                        None,
-                    )),
-                },
+                } => {
+                    let params: serde_json::Value =
+                        serde_json::from_str(params.get()).map_err(|error| {
+                            ScheduleDomainError::InvalidSchedule(format!(
+                                "invalid mob flow params: {error}"
+                            ))
+                        })?;
+                    match mob_state
+                        .mob_run_flow(&mob_id, FlowId::from(flow_id.as_str()), params)
+                        .await
+                    {
+                        Ok(run_id) => Ok(async_completion_dispatch(
+                            occurrence,
+                            Some(run_id.to_string()),
+                            mob_flow_completion_future(mob_state, mob_id, run_id),
+                        )),
+                        Err(error) => Ok(immediate_delivery_failure(
+                            occurrence,
+                            error.to_string(),
+                            OccurrenceFailureClass::MobRejected,
+                            None,
+                            None,
+                        )),
+                    }
+                }
                 MobTargetBinding::SpawnHelper {
                     member_id,
                     prompt,

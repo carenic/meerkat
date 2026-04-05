@@ -1,6 +1,6 @@
 use crate::types::{
-    CreateScheduleRequest, DeliveryReceipt, Occurrence, OccurrenceFailureClass, OccurrencePhase,
-    Schedule, SchedulePhase, ScheduleRevision, UpdateScheduleRequest,
+    CreateScheduleRequest, DeliveryReceipt, Occurrence, OccurrenceFailureClass, OccurrenceOrdinal,
+    OccurrencePhase, Schedule, SchedulePhase, ScheduleRevision, UpdateScheduleRequest,
 };
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -9,21 +9,34 @@ use uuid::Uuid;
 pub enum ScheduleLifecycleInput {
     Create(CreateScheduleRequest),
     Update(UpdateScheduleRequest),
-    Pause { at_utc: DateTime<Utc> },
-    Resume { at_utc: DateTime<Utc> },
-    Delete { at_utc: DateTime<Utc> },
+    RecordPlanningWindow {
+        planning_cursor_utc: DateTime<Utc>,
+        next_occurrence_ordinal: OccurrenceOrdinal,
+    },
+    Pause {
+        at_utc: DateTime<Utc>,
+    },
+    Resume {
+        at_utc: DateTime<Utc>,
+    },
+    Delete {
+        at_utc: DateTime<Utc>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduleLifecycleEffect {
-    Created,
-    RevisionBumped {
-        previous_revision: ScheduleRevision,
-        new_revision: ScheduleRevision,
+    EmitScheduleNotice {
+        new_state: SchedulePhase,
+        revision: ScheduleRevision,
     },
-    Paused,
-    Resumed,
-    Deleted,
+    SupersedePendingOccurrences {
+        superseding_revision: ScheduleRevision,
+    },
+    PlanningWindowRecorded {
+        planning_cursor_utc: DateTime<Utc>,
+        next_occurrence_ordinal: OccurrenceOrdinal,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -61,24 +74,55 @@ impl ScheduleLifecycleAuthority {
         match input {
             ScheduleLifecycleInput::Create(request) => Ok(ScheduleLifecycleMutator {
                 schedule: Schedule::new(request),
-                effects: vec![ScheduleLifecycleEffect::Created],
+                effects: vec![ScheduleLifecycleEffect::EmitScheduleNotice {
+                    new_state: SchedulePhase::Active,
+                    revision: ScheduleRevision::initial(),
+                }],
                 revision_bumped: false,
             }),
             ScheduleLifecycleInput::Update(request) => {
                 let mut schedule = schedule.ok_or(ScheduleLifecycleError::MissingSchedule)?;
-                let previous_revision = schedule.revision;
                 let revision_bumped = self.apply_update(&mut schedule, request)?;
-                let mut effects = Vec::new();
+                let mut effects = vec![ScheduleLifecycleEffect::EmitScheduleNotice {
+                    new_state: schedule.phase,
+                    revision: schedule.revision,
+                }];
                 if revision_bumped {
-                    effects.push(ScheduleLifecycleEffect::RevisionBumped {
-                        previous_revision,
-                        new_revision: schedule.revision,
+                    effects.push(ScheduleLifecycleEffect::SupersedePendingOccurrences {
+                        superseding_revision: schedule.revision,
                     });
                 }
                 Ok(ScheduleLifecycleMutator {
                     schedule,
                     effects,
                     revision_bumped,
+                })
+            }
+            ScheduleLifecycleInput::RecordPlanningWindow {
+                planning_cursor_utc,
+                next_occurrence_ordinal,
+            } => {
+                let mut schedule = schedule.ok_or(ScheduleLifecycleError::MissingSchedule)?;
+                if schedule.phase == SchedulePhase::Deleted {
+                    return Err(ScheduleLifecycleError::Deleted);
+                }
+                schedule.planning_cursor_utc = Some(planning_cursor_utc);
+                schedule.next_occurrence_ordinal = next_occurrence_ordinal;
+                let phase = schedule.phase;
+                let revision = schedule.revision;
+                Ok(ScheduleLifecycleMutator {
+                    schedule,
+                    effects: vec![
+                        ScheduleLifecycleEffect::EmitScheduleNotice {
+                            new_state: phase,
+                            revision,
+                        },
+                        ScheduleLifecycleEffect::PlanningWindowRecorded {
+                            planning_cursor_utc,
+                            next_occurrence_ordinal,
+                        },
+                    ],
+                    revision_bumped: false,
                 })
             }
             ScheduleLifecycleInput::Pause { at_utc } => {
@@ -88,9 +132,13 @@ impl ScheduleLifecycleAuthority {
                 }
                 schedule.phase = SchedulePhase::Paused;
                 schedule.updated_at_utc = at_utc;
+                let revision = schedule.revision;
                 Ok(ScheduleLifecycleMutator {
                     schedule,
-                    effects: vec![ScheduleLifecycleEffect::Paused],
+                    effects: vec![ScheduleLifecycleEffect::EmitScheduleNotice {
+                        new_state: SchedulePhase::Paused,
+                        revision,
+                    }],
                     revision_bumped: false,
                 })
             }
@@ -101,29 +149,34 @@ impl ScheduleLifecycleAuthority {
                 }
                 schedule.phase = SchedulePhase::Active;
                 schedule.updated_at_utc = at_utc;
+                let revision = schedule.revision;
                 Ok(ScheduleLifecycleMutator {
                     schedule,
-                    effects: vec![ScheduleLifecycleEffect::Resumed],
+                    effects: vec![ScheduleLifecycleEffect::EmitScheduleNotice {
+                        new_state: SchedulePhase::Active,
+                        revision,
+                    }],
                     revision_bumped: false,
                 })
             }
             ScheduleLifecycleInput::Delete { at_utc } => {
                 let mut schedule = schedule.ok_or(ScheduleLifecycleError::MissingSchedule)?;
-                let previous_revision = schedule.revision;
                 schedule.revision = schedule.revision.next();
-                let new_revision = schedule.revision;
                 schedule.phase = SchedulePhase::Deleted;
                 schedule.planning_cursor_utc = None;
                 schedule.deleted_at_utc = Some(at_utc);
                 schedule.updated_at_utc = at_utc;
+                let revision = schedule.revision;
                 Ok(ScheduleLifecycleMutator {
                     schedule,
                     effects: vec![
-                        ScheduleLifecycleEffect::RevisionBumped {
-                            previous_revision,
-                            new_revision,
+                        ScheduleLifecycleEffect::EmitScheduleNotice {
+                            new_state: SchedulePhase::Deleted,
+                            revision,
                         },
-                        ScheduleLifecycleEffect::Deleted,
+                        ScheduleLifecycleEffect::SupersedePendingOccurrences {
+                            superseding_revision: revision,
+                        },
                     ],
                     revision_bumped: true,
                 })
@@ -273,6 +326,12 @@ pub enum OccurrenceLifecycleError {
     NotPendingForClaim,
     #[error("occurrence must be claimed before dispatching")]
     NotClaimed,
+    #[error("occurrence must be dispatching before awaiting completion")]
+    NotDispatching,
+    #[error("occurrence must be in a live phase for this terminal transition")]
+    NotLiveForTerminal,
+    #[error("occurrence must hold an active lease before it can expire")]
+    NotLeaseHolding,
 }
 
 #[derive(Debug, Default)]
@@ -327,13 +386,19 @@ impl OccurrenceLifecycleAuthority {
             }
             OccurrenceLifecycleInput::AwaitCompletion { at_utc } => {
                 if occurrence.phase != OccurrencePhase::Dispatching {
-                    return Err(OccurrenceLifecycleError::NotClaimed);
+                    return Err(OccurrenceLifecycleError::NotDispatching);
                 }
                 occurrence.phase = OccurrencePhase::AwaitingCompletion;
                 occurrence.dispatched_at_utc = Some(at_utc);
                 effects.push(OccurrenceLifecycleEffect::AwaitingCompletion);
             }
             OccurrenceLifecycleInput::Complete { receipt, at_utc } => {
+                if !matches!(
+                    occurrence.phase,
+                    OccurrencePhase::Dispatching | OccurrencePhase::AwaitingCompletion
+                ) {
+                    return Err(OccurrenceLifecycleError::NotLiveForTerminal);
+                }
                 occurrence.phase = OccurrencePhase::Completed;
                 occurrence.completed_at_utc = Some(at_utc);
                 occurrence.last_receipt = Some(receipt);
@@ -344,6 +409,15 @@ impl OccurrenceLifecycleAuthority {
                 failure_class,
                 at_utc,
             } => {
+                if !matches!(
+                    occurrence.phase,
+                    OccurrencePhase::Pending
+                        | OccurrencePhase::Claimed
+                        | OccurrencePhase::Dispatching
+                        | OccurrencePhase::AwaitingCompletion
+                ) {
+                    return Err(OccurrenceLifecycleError::NotLiveForTerminal);
+                }
                 terminalize(
                     &mut occurrence,
                     OccurrencePhase::Skipped,
@@ -358,6 +432,15 @@ impl OccurrenceLifecycleAuthority {
                 failure_class,
                 at_utc,
             } => {
+                if !matches!(
+                    occurrence.phase,
+                    OccurrencePhase::Pending
+                        | OccurrencePhase::Claimed
+                        | OccurrencePhase::Dispatching
+                        | OccurrencePhase::AwaitingCompletion
+                ) {
+                    return Err(OccurrenceLifecycleError::NotLiveForTerminal);
+                }
                 terminalize(
                     &mut occurrence,
                     OccurrencePhase::Misfired,
@@ -371,6 +454,15 @@ impl OccurrenceLifecycleAuthority {
                 superseded_by_revision,
                 at_utc,
             } => {
+                if !matches!(
+                    occurrence.phase,
+                    OccurrencePhase::Pending
+                        | OccurrencePhase::Claimed
+                        | OccurrencePhase::Dispatching
+                        | OccurrencePhase::AwaitingCompletion
+                ) {
+                    return Err(OccurrenceLifecycleError::NotLiveForTerminal);
+                }
                 occurrence.phase = OccurrencePhase::Superseded;
                 occurrence.completed_at_utc = Some(at_utc);
                 occurrence.superseded_by_revision = Some(superseded_by_revision);
@@ -382,6 +474,14 @@ impl OccurrenceLifecycleAuthority {
                 detail,
                 at_utc,
             } => {
+                if !matches!(
+                    occurrence.phase,
+                    OccurrencePhase::Claimed
+                        | OccurrencePhase::Dispatching
+                        | OccurrencePhase::AwaitingCompletion
+                ) {
+                    return Err(OccurrenceLifecycleError::NotLiveForTerminal);
+                }
                 occurrence.phase = OccurrencePhase::DeliveryFailed;
                 occurrence.completed_at_utc = Some(at_utc);
                 occurrence.failure_class = Some(failure_class);
@@ -390,6 +490,14 @@ impl OccurrenceLifecycleAuthority {
                 effects.push(OccurrenceLifecycleEffect::DeliveryFailed);
             }
             OccurrenceLifecycleInput::LeaseExpired { at_utc: _ } => {
+                if !matches!(
+                    occurrence.phase,
+                    OccurrencePhase::Claimed
+                        | OccurrencePhase::Dispatching
+                        | OccurrencePhase::AwaitingCompletion
+                ) {
+                    return Err(OccurrenceLifecycleError::NotLeaseHolding);
+                }
                 occurrence.phase = OccurrencePhase::Pending;
                 occurrence.claimed_by = None;
                 occurrence.lease_expires_at_utc = None;
@@ -486,5 +594,18 @@ mod tests {
                 "claim should reject occurrences already in phase {phase:?}"
             );
         }
+    }
+
+    #[test]
+    fn await_completion_requires_dispatching_phase() {
+        let authority = OccurrenceLifecycleAuthority;
+        let occurrence = sample_occurrence();
+        let error = authority
+            .apply(
+                occurrence,
+                OccurrenceLifecycleInput::AwaitCompletion { at_utc: Utc::now() },
+            )
+            .expect_err("await completion should reject non-dispatching occurrences");
+        assert!(matches!(error, OccurrenceLifecycleError::NotDispatching));
     }
 }

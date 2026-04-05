@@ -28,7 +28,7 @@ use meerkat_core::service::{
 };
 #[cfg(feature = "mob")]
 use meerkat_core::types::HandlingMode;
-use meerkat_core::{ContentInput, OutputSchema, SessionId};
+use meerkat_core::{ContentInput, SessionId};
 #[cfg(feature = "mob")]
 use meerkat_mob::{
     FlowId, ForkContext, HelperOptions, MeerkatId, MobBackendKind, MobId, MobRunStatus, RunId,
@@ -78,8 +78,7 @@ impl RestScheduleContext {
             .session_service
             .load_persisted(session_id)
             .await
-            .ok()
-            .flatten();
+            .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?;
         if persisted
             .as_ref()
             .is_some_and(session_metadata_marks_archived)
@@ -119,12 +118,8 @@ impl RestScheduleContext {
             return Ok(TargetProbeOutcome::Ready);
         };
 
-        if let Ok(summaries) = self.runtime.session_service.list(Default::default()).await
-            && let Some(summary) = summaries
-                .into_iter()
-                .find(|summary| summary.session_id == *session_id)
-        {
-            return Ok(if summary.is_active {
+        if let Ok(view) = self.runtime.session_service.read(session_id).await {
+            return Ok(if view.state.is_active {
                 TargetProbeOutcome::Busy {
                     detail: Some(format!("session still running: {session_id}")),
                 }
@@ -166,12 +161,7 @@ impl RestScheduleContext {
         build_config.system_prompt = prompt_system_prompt
             .map(str::to_owned)
             .or_else(|| create.system_prompt.clone());
-        if let Some(output_schema_json) = create.output_schema_json.clone() {
-            build_config.output_schema = Some(
-                OutputSchema::from_json_value(output_schema_json)
-                    .map_err(|error| ScheduleDomainError::InvalidSchedule(error.to_string()))?,
-            );
-        }
+        build_config.output_schema = create.output_schema.clone();
         build_config.structured_output_retries = create.structured_output_retries;
         build_config.provider_params = create.provider_params.clone();
         build_config.comms_name = create.comms_name.clone();
@@ -433,23 +423,31 @@ impl SurfaceScheduleMobHost for RestScheduleTargetAdapter {
                 },
                 MobTargetBinding::Flow {
                     flow_id, params, ..
-                } => match mob_state
-                    .mob_run_flow(&mob_id, FlowId::from(flow_id.as_str()), params.clone())
-                    .await
-                {
-                    Ok(run_id) => Ok(async_completion_dispatch(
-                        occurrence,
-                        Some(run_id.to_string()),
-                        mob_flow_completion_future(mob_state, mob_id, run_id),
-                    )),
-                    Err(error) => Ok(immediate_delivery_failure(
-                        occurrence,
-                        error.to_string(),
-                        OccurrenceFailureClass::MobRejected,
-                        None,
-                        None,
-                    )),
-                },
+                } => {
+                    let params: serde_json::Value =
+                        serde_json::from_str(params.get()).map_err(|error| {
+                            ScheduleDomainError::InvalidSchedule(format!(
+                                "invalid mob flow params: {error}"
+                            ))
+                        })?;
+                    match mob_state
+                        .mob_run_flow(&mob_id, FlowId::from(flow_id.as_str()), params)
+                        .await
+                    {
+                        Ok(run_id) => Ok(async_completion_dispatch(
+                            occurrence,
+                            Some(run_id.to_string()),
+                            mob_flow_completion_future(mob_state, mob_id, run_id),
+                        )),
+                        Err(error) => Ok(immediate_delivery_failure(
+                            occurrence,
+                            error.to_string(),
+                            OccurrenceFailureClass::MobRejected,
+                            None,
+                            None,
+                        )),
+                    }
+                }
                 MobTargetBinding::SpawnHelper {
                     member_id,
                     prompt,

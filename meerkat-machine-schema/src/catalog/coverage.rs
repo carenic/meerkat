@@ -1506,6 +1506,37 @@ fn machine_scenario_ids(machine: &str, item_name: &str, all_scenarios: &[String]
                 hints.extend(["spawn", "run", "exit"]);
             }
         }
+        "ScheduleLifecycleMachine" => {
+            if normalized.contains("pause") || normalized.contains("resume") {
+                return select_exact_scenarios(all_scenarios, &["schedule-pause-resume"]);
+            } else if normalized.contains("delete") {
+                return select_exact_scenarios(all_scenarios, &["schedule-delete"]);
+            } else if normalized.contains("planningwindow") {
+                return select_exact_scenarios(
+                    all_scenarios,
+                    &["schedule-revision-supersede", "schedule-pause-resume"],
+                );
+            } else if normalized.contains("supersede") {
+                return select_exact_scenarios(
+                    all_scenarios,
+                    &["schedule-revision-supersede", "schedule-delete"],
+                );
+            } else {
+                return select_exact_scenarios(all_scenarios, &["schedule-revision-supersede"]);
+            }
+        }
+        "OccurrenceLifecycleMachine" => {
+            if normalized.contains("supersede") {
+                return select_exact_scenarios(all_scenarios, &["occurrence-supersede"]);
+            } else if normalized.contains("leaseexpired") {
+                return select_exact_scenarios(all_scenarios, &["occurrence-lease-expiry"]);
+            } else {
+                return select_exact_scenarios(
+                    all_scenarios,
+                    &["occurrence-claim-dispatch-complete"],
+                );
+            }
+        }
         _ => {}
     }
 

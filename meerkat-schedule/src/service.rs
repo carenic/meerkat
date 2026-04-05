@@ -14,11 +14,17 @@ use meerkat_core::SessionId;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+#[cfg(target_arch = "wasm32")]
+use crate::tokio::sync::Mutex;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::sync::Mutex;
+
 #[derive(Clone)]
 pub struct ScheduleService {
     store: Arc<dyn ScheduleStore>,
     schedule_authority: Arc<ScheduleLifecycleAuthority>,
     occurrence_authority: Arc<OccurrenceLifecycleAuthority>,
+    planning_lock: Arc<Mutex<()>>,
 }
 
 impl ScheduleService {
@@ -27,6 +33,7 @@ impl ScheduleService {
             store,
             schedule_authority: Arc::new(ScheduleLifecycleAuthority),
             occurrence_authority: Arc::new(OccurrenceLifecycleAuthority),
+            planning_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -38,6 +45,7 @@ impl ScheduleService {
         &self,
         request: CreateScheduleRequest,
     ) -> Result<Schedule, ScheduleDomainError> {
+        let _planning_guard = self.planning_lock.lock().await;
         let mut mutator = self
             .schedule_authority
             .apply(None, ScheduleLifecycleInput::Create(request))
@@ -76,6 +84,7 @@ impl ScheduleService {
         schedule_id: &ScheduleId,
         request: UpdateScheduleRequest,
     ) -> Result<Schedule, ScheduleDomainError> {
+        let _planning_guard = self.planning_lock.lock().await;
         let current = self.get(schedule_id).await?;
         let mut mutator = self
             .schedule_authority
@@ -83,6 +92,11 @@ impl ScheduleService {
             .map_err(|error| ScheduleDomainError::InvalidSchedule(error.to_string()))?;
         let store_now = self.store.get_store_time_utc().await?;
 
+        let planned = self
+            .plan_schedule_occurrences(&mut mutator.schedule, store_now)
+            .await?;
+        self.store.put_schedule(mutator.schedule.clone()).await?;
+        self.store.put_occurrences(planned).await?;
         if mutator.revision_bumped {
             self.supersede_pending_occurrences(
                 &mutator.schedule,
@@ -91,16 +105,11 @@ impl ScheduleService {
             )
             .await?;
         }
-
-        let planned = self
-            .plan_schedule_occurrences(&mut mutator.schedule, store_now)
-            .await?;
-        self.store.put_schedule(mutator.schedule.clone()).await?;
-        self.store.put_occurrences(planned).await?;
         Ok(mutator.schedule)
     }
 
     pub async fn pause(&self, schedule_id: &ScheduleId) -> Result<Schedule, ScheduleDomainError> {
+        let _planning_guard = self.planning_lock.lock().await;
         let current = self.get(schedule_id).await?;
         let mutator = self
             .schedule_authority
@@ -116,6 +125,7 @@ impl ScheduleService {
     }
 
     pub async fn resume(&self, schedule_id: &ScheduleId) -> Result<Schedule, ScheduleDomainError> {
+        let _planning_guard = self.planning_lock.lock().await;
         let current = self.get(schedule_id).await?;
         let mut mutator = self
             .schedule_authority
@@ -136,6 +146,7 @@ impl ScheduleService {
     }
 
     pub async fn delete(&self, schedule_id: &ScheduleId) -> Result<Schedule, ScheduleDomainError> {
+        let _planning_guard = self.planning_lock.lock().await;
         let current = self.get(schedule_id).await?;
         let store_now = self.store.get_store_time_utc().await?;
         let mutator = self
@@ -170,6 +181,7 @@ impl ScheduleService {
         &self,
         schedule_id: &ScheduleId,
     ) -> Result<Vec<Occurrence>, ScheduleDomainError> {
+        let _planning_guard = self.planning_lock.lock().await;
         let mut schedule = self.get(schedule_id).await?;
         let store_now = self.store.get_store_time_utc().await?;
         let planned = self
@@ -318,7 +330,6 @@ impl ScheduleService {
                 due_at_utc,
             );
             schedule.next_occurrence_ordinal = schedule.next_occurrence_ordinal.next();
-            schedule.planning_cursor_utc = Some(due_at_utc);
             planned.push(occurrence);
             if planned.len() >= remaining {
                 break;
@@ -326,6 +337,21 @@ impl ScheduleService {
         }
 
         if !planned.is_empty() {
+            let planning_cursor_utc = planned
+                .last()
+                .map(|occurrence| occurrence.due_at_utc)
+                .expect("planned is not empty");
+            let mutator = self
+                .schedule_authority
+                .apply(
+                    Some(schedule.clone()),
+                    ScheduleLifecycleInput::RecordPlanningWindow {
+                        planning_cursor_utc,
+                        next_occurrence_ordinal: schedule.next_occurrence_ordinal,
+                    },
+                )
+                .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?;
+            *schedule = mutator.schedule;
             schedule.touch();
         }
 
@@ -582,7 +608,7 @@ mod tests {
                 system_prompt: None,
                 max_tokens: None,
                 provider: None,
-                output_schema_json: None,
+                output_schema: None,
                 structured_output_retries: 0,
                 provider_params: None,
                 comms_name: Some("scheduled-worker".into()),

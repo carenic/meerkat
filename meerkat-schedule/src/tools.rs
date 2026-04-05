@@ -6,10 +6,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-const INVALID_ARGUMENTS: i32 = -32602;
+pub const INVALID_ARGUMENTS: i32 = -32602;
 const INTERNAL_ERROR: i32 = -32000;
-const NOT_FOUND: i32 = -32004;
-const CAPABILITY_UNAVAILABLE: i32 = -32001;
+pub const NOT_FOUND: i32 = -32004;
+pub const CAPABILITY_UNAVAILABLE: i32 = -32001;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScheduleToolError {

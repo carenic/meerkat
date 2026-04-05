@@ -3,6 +3,7 @@ use meerkat_core::ops::ToolAccessPolicy;
 use meerkat_core::types::RenderMetadata;
 use meerkat_core::{ContentInput, OutputSchema, PeerMeta, Provider, SessionId};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
@@ -419,7 +420,7 @@ pub enum ScheduledSessionAction {
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMaterializationSpec {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -428,8 +429,12 @@ pub struct SessionMaterializationSpec {
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<Provider>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_schema_json: Option<serde_json::Value>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "output_schema_json"
+    )]
+    pub output_schema: Option<OutputSchema>,
     #[serde(default)]
     pub structured_output_retries: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -460,13 +465,37 @@ pub struct SessionMaterializationSpec {
 
 impl SessionMaterializationSpec {
     pub fn with_output_schema(mut self, output_schema: OutputSchema) -> Self {
-        self.output_schema_json = serde_json::to_value(output_schema).ok();
+        self.output_schema = Some(output_schema);
         self
     }
 }
 
+impl PartialEq for SessionMaterializationSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.model == other.model
+            && self.system_prompt == other.system_prompt
+            && self.max_tokens == other.max_tokens
+            && self.provider == other.provider
+            && self.output_schema.as_ref().map(output_schema_json)
+                == other.output_schema.as_ref().map(output_schema_json)
+            && self.structured_output_retries == other.structured_output_retries
+            && self.provider_params == other.provider_params
+            && self.comms_name == other.comms_name
+            && self.peer_meta == other.peer_meta
+            && self.labels == other.labels
+            && self.preload_skills == other.preload_skills
+            && self.additional_instructions == other.additional_instructions
+            && self.realm_id == other.realm_id
+            && self.instance_id == other.instance_id
+            && self.backend == other.backend
+            && self.config_generation == other.config_generation
+            && self.keep_alive == other.keep_alive
+            && self.app_context == other.app_context
+    }
+}
+
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MobTargetBinding {
     Member {
@@ -477,8 +506,9 @@ pub enum MobTargetBinding {
     Flow {
         mob_id: String,
         flow_id: String,
-        #[serde(default)]
-        params: serde_json::Value,
+        #[serde(default = "raw_value_null")]
+        #[cfg_attr(feature = "schema", schemars(with = "serde_json::Value"))]
+        params: Box<RawValue>,
     },
     SpawnHelper {
         mob_id: String,
@@ -497,6 +527,90 @@ pub enum MobTargetBinding {
         #[serde(default)]
         options: HelperOptionsSpec,
     },
+}
+
+impl PartialEq for MobTargetBinding {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Member {
+                    mob_id: left_mob_id,
+                    member_id: left_member_id,
+                    action: left_action,
+                },
+                Self::Member {
+                    mob_id: right_mob_id,
+                    member_id: right_member_id,
+                    action: right_action,
+                },
+            ) => {
+                left_mob_id == right_mob_id
+                    && left_member_id == right_member_id
+                    && left_action == right_action
+            }
+            (
+                Self::Flow {
+                    mob_id: left_mob_id,
+                    flow_id: left_flow_id,
+                    params: left_params,
+                },
+                Self::Flow {
+                    mob_id: right_mob_id,
+                    flow_id: right_flow_id,
+                    params: right_params,
+                },
+            ) => {
+                left_mob_id == right_mob_id
+                    && left_flow_id == right_flow_id
+                    && left_params.get() == right_params.get()
+            }
+            (
+                Self::SpawnHelper {
+                    mob_id: left_mob_id,
+                    member_id: left_member_id,
+                    prompt: left_prompt,
+                    options: left_options,
+                },
+                Self::SpawnHelper {
+                    mob_id: right_mob_id,
+                    member_id: right_member_id,
+                    prompt: right_prompt,
+                    options: right_options,
+                },
+            ) => {
+                left_mob_id == right_mob_id
+                    && left_member_id == right_member_id
+                    && left_prompt == right_prompt
+                    && left_options == right_options
+            }
+            (
+                Self::ForkHelper {
+                    mob_id: left_mob_id,
+                    source_member_id: left_source_member_id,
+                    member_id: left_member_id,
+                    prompt: left_prompt,
+                    fork_context: left_fork_context,
+                    options: left_options,
+                },
+                Self::ForkHelper {
+                    mob_id: right_mob_id,
+                    source_member_id: right_source_member_id,
+                    member_id: right_member_id,
+                    prompt: right_prompt,
+                    fork_context: right_fork_context,
+                    options: right_options,
+                },
+            ) => {
+                left_mob_id == right_mob_id
+                    && left_source_member_id == right_source_member_id
+                    && left_member_id == right_member_id
+                    && left_prompt == right_prompt
+                    && left_fork_context == right_fork_context
+                    && left_options == right_options
+            }
+            _ => false,
+        }
+    }
 }
 
 impl MobTargetBinding {
@@ -532,8 +646,6 @@ pub enum ScheduledMobAction {
     },
 }
 
-pub type MobActionSpec = ScheduledMobAction;
-
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HelperOptionsSpec {
@@ -561,6 +673,14 @@ pub enum ScheduledMobRuntimeMode {
 pub enum ScheduledMobBackendKind {
     Session,
     External,
+}
+
+fn raw_value_null() -> Box<RawValue> {
+    RawValue::from_string("null".to_string()).expect("null is valid raw json")
+}
+
+fn output_schema_json(schema: &OutputSchema) -> serde_json::Value {
+    serde_json::to_value(schema).expect("output schema must serialize")
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

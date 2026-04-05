@@ -2,7 +2,7 @@ use indexmap::IndexMap;
 
 use crate::{
     EffectDisposition, EffectDispositionRule, EffectEmit, EnumSchema, Expr, FieldInit, FieldSchema,
-    InitSchema, InputMatch, InvariantSchema, MachineSchema, RustBinding, StateSchema,
+    Guard, InitSchema, InputMatch, InvariantSchema, MachineSchema, RustBinding, StateSchema,
     TransitionSchema, TypeRef, Update, VariantSchema,
 };
 
@@ -131,11 +131,17 @@ pub fn schedule_lifecycle_machine() -> MachineSchema {
                 ]),
             },
             InvariantSchema {
-                name: "planning_cursor_never_exceeds_next_ordinal_fact".into(),
-                expr: Expr::Gte(
-                    Box::new(Expr::Field("next_occurrence_ordinal".into())),
-                    Box::new(Expr::U64(0)),
-                ),
+                name: "planning_cursor_requires_occurrence_progress".into(),
+                expr: Expr::Or(vec![
+                    Expr::Eq(
+                        Box::new(Expr::Field("planning_cursor_utc_ms".into())),
+                        Box::new(Expr::None),
+                    ),
+                    Expr::Gt(
+                        Box::new(Expr::Field("next_occurrence_ordinal".into())),
+                        Box::new(Expr::U64(0)),
+                    ),
+                ]),
             },
         ],
         transitions: vec![
@@ -254,7 +260,13 @@ fn planning_window_transition(name: &str, phase: &str) -> TransitionSchema {
                 "next_occurrence_ordinal".into(),
             ],
         },
-        guards: vec![],
+        guards: vec![Guard {
+            name: "planning_window_advances_ordinal".into(),
+            expr: Expr::Gt(
+                Box::new(Expr::Binding("next_occurrence_ordinal".into())),
+                Box::new(Expr::U64(0)),
+            ),
+        }],
         updates: vec![
             Update::Assign {
                 field: "planning_cursor_utc_ms".into(),

@@ -452,6 +452,7 @@ impl<'a> Iterator for ToolCallIter<'a> {
 /// completing the agentic work, forcing the LLM to output validated JSON that
 /// conforms to the provided schema. The extraction JSON becomes the final
 /// response text (schema-only) in [`RunResult`].
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize)]
 pub struct OutputSchema {
     /// The JSON schema that the output must conform to
@@ -469,6 +470,18 @@ pub struct OutputSchema {
     #[serde(default)]
     pub format: SchemaFormat,
 }
+
+impl PartialEq for OutputSchema {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema == other.schema
+            && self.name == other.name
+            && self.strict == other.strict
+            && self.compat == other.compat
+            && self.format == other.format
+    }
+}
+
+impl Eq for OutputSchema {}
 
 impl OutputSchema {
     /// Create a new output schema

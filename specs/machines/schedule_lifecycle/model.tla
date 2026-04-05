@@ -67,6 +67,7 @@ RevisePaused(arg_trigger_key, arg_target_binding_key, arg_misfire_policy, arg_ov
 
 RecordPlanningWindowActive(arg_planning_cursor_utc_ms, arg_next_occurrence_ordinal) ==
     /\ phase = "Active"
+    /\ (arg_next_occurrence_ordinal > 0)
     /\ phase' = "Active"
     /\ model_step_count' = model_step_count + 1
     /\ planning_cursor_utc_ms' = Some(arg_planning_cursor_utc_ms)
@@ -76,6 +77,7 @@ RecordPlanningWindowActive(arg_planning_cursor_utc_ms, arg_next_occurrence_ordin
 
 RecordPlanningWindowPaused(arg_planning_cursor_utc_ms, arg_next_occurrence_ordinal) ==
     /\ phase = "Paused"
+    /\ (arg_next_occurrence_ordinal > 0)
     /\ phase' = "Paused"
     /\ model_step_count' = model_step_count + 1
     /\ planning_cursor_utc_ms' = Some(arg_planning_cursor_utc_ms)
@@ -128,7 +130,7 @@ Next ==
 
 revision_is_positive == (revision > 0)
 deleted_has_no_planning_cursor == ((phase # "Deleted") \/ (planning_cursor_utc_ms = None))
-planning_cursor_never_exceeds_next_ordinal_fact == (next_occurrence_ordinal >= 0)
+planning_cursor_requires_occurrence_progress == ((planning_cursor_utc_ms = None) \/ (next_occurrence_ordinal > 0))
 
 CiStateConstraint == /\ model_step_count <= 6
 DeepStateConstraint == /\ model_step_count <= 8
@@ -137,6 +139,6 @@ Spec == Init /\ [][Next]_vars
 
 THEOREM Spec => []revision_is_positive
 THEOREM Spec => []deleted_has_no_planning_cursor
-THEOREM Spec => []planning_cursor_never_exceeds_next_ordinal_fact
+THEOREM Spec => []planning_cursor_requires_occurrence_progress
 
 =============================================================================

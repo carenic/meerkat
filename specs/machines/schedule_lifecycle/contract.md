@@ -31,7 +31,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ## Invariants
 - `revision_is_positive`
 - `deleted_has_no_planning_cursor`
-- `planning_cursor_never_exceeds_next_ordinal_fact`
+- `planning_cursor_requires_occurrence_progress`
 
 ## Transitions
 ### `ReviseActive`
@@ -49,12 +49,16 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ### `RecordPlanningWindowActive`
 - From: `Active`
 - On: `RecordPlanningWindow`(planning_cursor_utc_ms, next_occurrence_ordinal)
+- Guards:
+  - `planning_window_advances_ordinal`
 - Emits: `EmitScheduleNotice`, `PlanningWindowRecorded`
 - To: `Active`
 
 ### `RecordPlanningWindowPaused`
 - From: `Paused`
 - On: `RecordPlanningWindow`(planning_cursor_utc_ms, next_occurrence_ordinal)
+- Guards:
+  - `planning_window_advances_ordinal`
 - Emits: `EmitScheduleNotice`, `PlanningWindowRecorded`
 - To: `Paused`
 

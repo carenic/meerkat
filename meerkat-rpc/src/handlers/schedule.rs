@@ -43,7 +43,7 @@ fn parse_schedule_id(id: Option<RpcId>, raw: &str) -> Result<ScheduleId, Box<Rpc
 fn map_schedule_error(id: Option<RpcId>, error: ScheduleDomainError) -> RpcResponse {
     match error {
         ScheduleDomainError::Store(ScheduleStoreError::ScheduleNotFound { .. }) => {
-            RpcResponse::error(id, error::SESSION_NOT_FOUND, "schedule not found")
+            RpcResponse::error(id, error::SCHEDULE_NOT_FOUND, "schedule not found")
         }
         ScheduleDomainError::Store(ScheduleStoreError::UnsupportedBackend { .. }) => {
             RpcResponse::error(
@@ -169,6 +169,10 @@ pub async fn handle_pause(
         Ok(schedule_id) => schedule_id,
         Err(response) => return *response,
     };
+
+    if let Err(error) = runtime.ensure_schedule_host_started().await {
+        return map_schedule_error(id, error);
+    }
 
     match schedule_service(&runtime).pause(&schedule_id).await {
         Ok(schedule) => RpcResponse::success(id, schedule),
@@ -314,6 +318,10 @@ mod tests {
         })
     }
 
+    fn missing_target_schedule_request() -> CreateScheduleRequest {
+        serde_json::from_value(missing_target_schedule_tool_args()).expect("valid schedule request")
+    }
+
     fn test_runtime(temp: &TempDir) -> Arc<SessionRuntime> {
         let factory = AgentFactory::new(temp.path().join("sessions"));
         let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
@@ -356,6 +364,13 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         None
+    }
+
+    fn schedule_id_raw(schedule_id: &ScheduleId) -> Box<serde_json::value::RawValue> {
+        serde_json::value::RawValue::from_string(
+            json!({ "schedule_id": schedule_id.to_string() }).to_string(),
+        )
+        .expect("raw value")
     }
 
     #[tokio::test]
@@ -432,5 +447,97 @@ mod tests {
             return;
         };
         assert_eq!(occurrence.phase, OccurrencePhase::Misfired);
+    }
+
+    #[tokio::test]
+    async fn schedule_get_unknown_id_returns_schedule_not_found_code() {
+        let temp = TempDir::new().expect("temp dir");
+        let runtime = test_runtime(&temp);
+        let raw = schedule_id_raw(&ScheduleId::new());
+
+        let response = handle_get(Some(RpcId::Num(1)), Some(raw.as_ref()), runtime.clone()).await;
+        let error = response.error.expect("unknown schedule should error");
+        assert_eq!(error.code, crate::error::SCHEDULE_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn schedule_pause_and_resume_round_trip() {
+        let temp = TempDir::new().expect("temp dir");
+        let runtime = test_runtime(&temp);
+        let schedule = runtime
+            .schedule_service()
+            .create(missing_target_schedule_request())
+            .await
+            .expect("create schedule");
+
+        let paused_response = handle_pause(
+            Some(RpcId::Num(1)),
+            Some(schedule_id_raw(&schedule.schedule_id).as_ref()),
+            runtime.clone(),
+        )
+        .await;
+        assert!(
+            paused_response.error.is_none(),
+            "pause should succeed: {:?}",
+            paused_response.error
+        );
+        let paused = runtime
+            .schedule_service()
+            .get(&schedule.schedule_id)
+            .await
+            .expect("paused schedule");
+        assert_eq!(paused.phase, meerkat::SchedulePhase::Paused);
+
+        let resumed_response = handle_resume(
+            Some(RpcId::Num(1)),
+            Some(schedule_id_raw(&schedule.schedule_id).as_ref()),
+            runtime.clone(),
+        )
+        .await;
+        assert!(
+            resumed_response.error.is_none(),
+            "resume should succeed: {:?}",
+            resumed_response.error
+        );
+        let resumed = runtime
+            .schedule_service()
+            .get(&schedule.schedule_id)
+            .await
+            .expect("resumed schedule");
+        assert_eq!(resumed.phase, meerkat::SchedulePhase::Active);
+    }
+
+    #[tokio::test]
+    async fn schedule_delete_marks_schedule_deleted() {
+        let temp = TempDir::new().expect("temp dir");
+        let runtime = test_runtime(&temp);
+        let schedule = runtime
+            .schedule_service()
+            .create(missing_target_schedule_request())
+            .await
+            .expect("create schedule");
+
+        let response = handle_delete(
+            Some(RpcId::Num(1)),
+            Some(schedule_id_raw(&schedule.schedule_id).as_ref()),
+            runtime.clone(),
+        )
+        .await;
+        assert!(
+            response.error.is_none(),
+            "delete should succeed: {:?}",
+            response.error
+        );
+
+        let deleted = runtime
+            .schedule_service()
+            .get(&schedule.schedule_id)
+            .await
+            .expect("deleted schedule");
+        assert_eq!(deleted.phase, meerkat::SchedulePhase::Deleted);
+        assert!(
+            deleted.revision > schedule.revision,
+            "delete should advance revision"
+        );
     }
 }

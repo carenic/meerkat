@@ -210,12 +210,38 @@ impl ScheduleDriver {
         occurrence: Occurrence,
         store_now_utc: chrono::DateTime<Utc>,
     ) -> Result<bool, ScheduleDomainError> {
+        let frozen_occurrence = occurrence.clone();
         let mut occurrence = match self
             .reconcile_claimed_occurrence_before_dispatch(occurrence)
             .await?
         {
             ClaimedOccurrenceDispatchState::Ready(occurrence) => occurrence,
-            ClaimedOccurrenceDispatchState::Frozen => return Ok(false),
+            ClaimedOccurrenceDispatchState::Frozen => {
+                let released = self
+                    .store
+                    .transition_occurrence_if_current(
+                        &frozen_occurrence.occurrence_id,
+                        frozen_occurrence.attempt_count,
+                        frozen_occurrence.claim_token(),
+                        OccurrenceLifecycleInput::LeaseExpired {
+                            at_utc: store_now_utc,
+                        },
+                    )
+                    .await?;
+                if let Some(released) = released {
+                    let mut receipt = DeliveryReceipt::new(
+                        released.occurrence_id.clone(),
+                        released.attempt_count,
+                        DeliveryReceiptStage::LeaseExpired,
+                    );
+                    receipt.failure_class = Some(OccurrenceFailureClass::LeaseLost);
+                    receipt.detail = Some(
+                        "lease released because schedule was paused before dispatch".to_string(),
+                    );
+                    self.store.append_receipt(receipt).await?;
+                }
+                return Ok(false);
+            }
             ClaimedOccurrenceDispatchState::Supersede {
                 occurrence,
                 superseded_by_revision,
@@ -434,6 +460,26 @@ async fn complete_dispatched_occurrence(
     terminal: DeliveryTerminal,
 ) -> Result<(), ScheduleDomainError> {
     let store_now_utc = store.get_store_time_utc().await?;
+    let current_schedule = store.get_schedule(&occurrence.schedule_id).await?;
+    if let Some(schedule) = current_schedule
+        && (schedule.phase == SchedulePhase::Deleted
+            || occurrence.schedule_revision < schedule.revision)
+    {
+        let _ = terminalize_occurrence_inner(
+            store,
+            occurrence,
+            OccurrenceLifecycleInput::Supersede {
+                superseded_by_revision: schedule.revision,
+                at_utc: store_now_utc,
+            },
+            DeliveryReceiptStage::Superseded,
+            None,
+            terminal.materialized_session_id,
+        )
+        .await?;
+        return Ok(());
+    }
+
     let completed_receipt = matches!(terminal.phase, OccurrencePhase::Completed).then(|| {
         build_terminal_receipt(
             &occurrence,
@@ -1183,7 +1229,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paused_claimed_occurrence_is_frozen_before_probe_or_delivery()
+    async fn paused_claimed_occurrence_is_released_before_probe_or_delivery()
     -> Result<(), ScheduleDomainError> {
         let store = Arc::new(MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
         let service = ScheduleService::new(store.clone());
@@ -1241,12 +1287,19 @@ mod tests {
             .expect("occurrence should still exist");
 
         assert!(!terminalized, "paused claimed work should be frozen");
-        assert_eq!(current.phase, OccurrencePhase::Claimed);
+        assert_eq!(current.phase, OccurrencePhase::Pending);
         assert_eq!(*probe.calls.lock().await, 0, "pause should block probes");
         assert_eq!(
             *delivery.calls.lock().await,
             0,
             "pause should block delivery"
+        );
+        let receipts = store.list_receipts(&current.occurrence_id).await?;
+        assert!(
+            receipts
+                .iter()
+                .any(|receipt| receipt.stage == DeliveryReceiptStage::LeaseExpired),
+            "pause should release the claim immediately"
         );
         Ok(())
     }
@@ -1411,6 +1464,151 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn awaiting_completion_occurrence_is_superseded_when_schedule_is_deleted()
+    -> Result<(), ScheduleDomainError> {
+        let store = Arc::new(MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store.clone());
+        let schedule = service
+            .create(CreateScheduleRequest {
+                name: Some("delete-awaiting".into()),
+                description: None,
+                trigger: TriggerSpec::Once {
+                    due_at_utc: Utc::now() - Duration::seconds(1),
+                },
+                target: materialize_on_demand_target("scheduled prompt"),
+                misfire_policy: MisfirePolicy::Skip,
+                overlap_policy: OverlapPolicy::SkipIfRunning,
+                missing_target_policy: MissingTargetPolicy::MarkMisfired,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await?;
+        let delivery = Arc::new(ControlledCompletionDelivery::default());
+        let driver = ScheduleDriver::new(
+            service.clone(),
+            store.clone(),
+            Arc::new(ReadyProbe),
+            delivery.clone(),
+            "driver-owner",
+            ScheduleDriverConfig {
+                claim_limit: 8,
+                lease_duration: Duration::seconds(30),
+            },
+        );
+
+        driver.tick_once().await?;
+        wait_for_sender_count(&delivery, 1).await;
+        let awaiting = wait_for_occurrence_phase(
+            &service,
+            &schedule.schedule_id,
+            OccurrencePhase::AwaitingCompletion,
+        )
+        .await?;
+
+        let deleted = service.delete(&schedule.schedule_id).await?;
+        let sender = delivery.senders.lock().await.remove(0);
+        sender
+            .send(DeliveryTerminal::completed(None))
+            .expect("sender should stay open");
+
+        let superseded = loop {
+            let occurrence = service
+                .list_occurrences(&schedule.schedule_id)
+                .await?
+                .into_iter()
+                .find(|item| item.occurrence_id == awaiting.occurrence_id)
+                .expect("occurrence should still exist");
+            if occurrence.phase == OccurrencePhase::Superseded {
+                break occurrence;
+            }
+            sleep(std::time::Duration::from_millis(10)).await;
+        };
+
+        assert_eq!(superseded.superseded_by_revision, Some(deleted.revision));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn awaiting_completion_occurrence_is_superseded_when_schedule_revision_advances()
+    -> Result<(), ScheduleDomainError> {
+        let store = Arc::new(MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store.clone());
+        let schedule = service
+            .create(CreateScheduleRequest {
+                name: Some("update-awaiting".into()),
+                description: None,
+                trigger: TriggerSpec::Once {
+                    due_at_utc: Utc::now() - Duration::seconds(1),
+                },
+                target: materialize_on_demand_target("scheduled prompt"),
+                misfire_policy: MisfirePolicy::Skip,
+                overlap_policy: OverlapPolicy::SkipIfRunning,
+                missing_target_policy: MissingTargetPolicy::MarkMisfired,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await?;
+        let delivery = Arc::new(ControlledCompletionDelivery::default());
+        let driver = ScheduleDriver::new(
+            service.clone(),
+            store.clone(),
+            Arc::new(ReadyProbe),
+            delivery.clone(),
+            "driver-owner",
+            ScheduleDriverConfig {
+                claim_limit: 8,
+                lease_duration: Duration::seconds(30),
+            },
+        );
+
+        driver.tick_once().await?;
+        wait_for_sender_count(&delivery, 1).await;
+        let awaiting = wait_for_occurrence_phase(
+            &service,
+            &schedule.schedule_id,
+            OccurrencePhase::AwaitingCompletion,
+        )
+        .await?;
+
+        let updated = service
+            .update(
+                &schedule.schedule_id,
+                UpdateScheduleRequest {
+                    expected_revision: Some(schedule.revision),
+                    trigger: Some(TriggerSpec::Interval(IntervalTriggerSpec {
+                        start_at_utc: Utc::now() + Duration::minutes(5),
+                        every_seconds: 300,
+                        end_at_utc: None,
+                    })),
+                    ..UpdateScheduleRequest::default()
+                },
+            )
+            .await?;
+        let sender = delivery.senders.lock().await.remove(0);
+        sender
+            .send(DeliveryTerminal::completed(None))
+            .expect("sender should stay open");
+
+        let superseded = loop {
+            let occurrence = service
+                .list_occurrences(&schedule.schedule_id)
+                .await?
+                .into_iter()
+                .find(|item| item.occurrence_id == awaiting.occurrence_id)
+                .expect("occurrence should still exist");
+            if occurrence.phase == OccurrencePhase::Superseded {
+                break occurrence;
+            }
+            sleep(std::time::Duration::from_millis(10)).await;
+        };
+
+        assert_eq!(superseded.superseded_by_revision, Some(updated.revision));
+        Ok(())
+    }
+
     fn materialize_on_demand_target(prompt: &str) -> TargetBinding {
         TargetBinding::session(SessionTargetBinding::materialize_on_demand(
             SessionMaterializationSpec {
@@ -1418,7 +1616,7 @@ mod tests {
                 system_prompt: None,
                 max_tokens: None,
                 provider: None,
-                output_schema_json: None,
+                output_schema: None,
                 structured_output_retries: 0,
                 provider_params: None,
                 comms_name: Some("scheduled-materializer".into()),

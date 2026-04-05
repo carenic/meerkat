@@ -1102,8 +1102,13 @@ async fn ensure_runtime_session_registered(
         .session_service
         .load_persisted(session_id)
         .await
-        .ok()
-        .flatten();
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error.to_string()})),
+            )
+                .into_response()
+        })?;
     if persisted
         .as_ref()
         .is_some_and(session_metadata_marks_archived)
@@ -2276,9 +2281,11 @@ fn schedule_error_to_api(error: meerkat::ScheduleDomainError) -> ApiError {
 
 fn schedule_tool_error_to_api(error: meerkat::ScheduleToolError) -> ApiError {
     match error.code {
-        -32602 => ApiError::BadRequest(error.message),
-        -32004 => ApiError::NotFound(error.message),
-        -32001 => ApiError::ServiceUnavailable(error.message),
+        meerkat::SCHEDULE_TOOL_INVALID_ARGUMENTS => ApiError::BadRequest(error.message),
+        meerkat::SCHEDULE_TOOL_NOT_FOUND => ApiError::NotFound(error.message),
+        meerkat::SCHEDULE_TOOL_CAPABILITY_UNAVAILABLE => {
+            ApiError::ServiceUnavailable(error.message)
+        }
         _ => ApiError::Internal(error.message),
     }
 }
@@ -2743,6 +2750,10 @@ async fn pause_schedule(
     Path(id): Path<String>,
 ) -> Result<Json<meerkat::Schedule>, ApiError> {
     let schedule_id = resolve_schedule_id(&id)?;
+    state
+        .ensure_schedule_host_started()
+        .await
+        .map_err(schedule_error_to_api)?;
     state
         .schedule_service
         .pause(&schedule_id)

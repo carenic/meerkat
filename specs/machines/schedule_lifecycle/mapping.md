@@ -23,25 +23,25 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - scenarios: `schedule-revision-supersede`
 - `RevisePaused`
   - anchors: `schedule_authority`, `schedule_service`, `schedule_schema`
-  - scenarios: `schedule-revision-supersede`
+  - scenarios: `schedule-pause-resume`
 - `RecordPlanningWindowActive`
   - anchors: `schedule_authority`, `schedule_service`, `schedule_schema`
-  - scenarios: `schedule-revision-supersede`
+  - scenarios: `schedule-revision-supersede`, `schedule-pause-resume`
 - `RecordPlanningWindowPaused`
   - anchors: `schedule_authority`, `schedule_service`, `schedule_schema`
-  - scenarios: `schedule-revision-supersede`
+  - scenarios: `schedule-pause-resume`
 - `PauseActive`
   - anchors: `schedule_authority`, `schedule_service`, `schedule_schema`
-  - scenarios: `schedule-revision-supersede`
+  - scenarios: `schedule-pause-resume`
 - `ResumePaused`
   - anchors: `schedule_authority`, `schedule_service`, `schedule_schema`
-  - scenarios: `schedule-revision-supersede`
+  - scenarios: `schedule-pause-resume`
 - `DeleteActive`
   - anchors: `schedule_authority`, `schedule_service`, `schedule_schema`
-  - scenarios: `schedule-revision-supersede`
+  - scenarios: `schedule-delete`
 - `DeletePaused`
   - anchors: `schedule_authority`, `schedule_service`, `schedule_schema`
-  - scenarios: `schedule-revision-supersede`
+  - scenarios: `schedule-pause-resume`
 
 ### Effects
 - `EmitScheduleNotice`
@@ -49,10 +49,10 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - scenarios: `schedule-revision-supersede`
 - `SupersedePendingOccurrences`
   - anchors: `schedule_authority`, `schedule_service`, `schedule_schema`
-  - scenarios: `schedule-revision-supersede`
+  - scenarios: `schedule-revision-supersede`, `schedule-delete`
 - `PlanningWindowRecorded`
   - anchors: `schedule_authority`, `schedule_service`, `schedule_schema`
-  - scenarios: `schedule-revision-supersede`
+  - scenarios: `schedule-revision-supersede`, `schedule-pause-resume`
 
 ### Invariants
 - `revision_is_positive`
@@ -60,8 +60,8 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - scenarios: `schedule-revision-supersede`
 - `deleted_has_no_planning_cursor`
   - anchors: `schedule_authority`, `schedule_service`, `schedule_schema`
-  - scenarios: `schedule-revision-supersede`
-- `planning_cursor_never_exceeds_next_ordinal_fact`
+  - scenarios: `schedule-delete`
+- `planning_cursor_requires_occurrence_progress`
   - anchors: `schedule_authority`, `schedule_service`, `schedule_schema`
   - scenarios: `schedule-revision-supersede`
 

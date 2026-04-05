@@ -31,27 +31,27 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `CompleteFromDispatchingOrAwaiting`
   - anchors: `occurrence_authority`, `schedule_driver`, `schedule_store`, `occurrence_schema`
   - scenarios: `occurrence-claim-dispatch-complete`
-- `SkipFromLive`
+- `SkipFromPendingOrLive`
   - anchors: `occurrence_authority`, `schedule_driver`, `schedule_store`, `occurrence_schema`
   - scenarios: `occurrence-claim-dispatch-complete`
-- `MisfireFromLive`
+- `MisfireFromPendingOrLive`
   - anchors: `occurrence_authority`, `schedule_driver`, `schedule_store`, `occurrence_schema`
   - scenarios: `occurrence-claim-dispatch-complete`
-- `SupersedePending`
+- `SupersedePendingOrLive`
   - anchors: `occurrence_authority`, `schedule_driver`, `schedule_store`, `occurrence_schema`
-  - scenarios: `occurrence-claim-dispatch-complete`
-- `DeliveryFailedFromLive`
+  - scenarios: `occurrence-supersede`
+- `DeliveryFailedFromClaimedOrLive`
   - anchors: `occurrence_authority`, `schedule_driver`, `schedule_store`, `occurrence_schema`
   - scenarios: `occurrence-claim-dispatch-complete`
 - `LeaseExpiredFromClaimed`
   - anchors: `occurrence_authority`, `schedule_driver`, `schedule_store`, `occurrence_schema`
-  - scenarios: `occurrence-claim-dispatch-complete`
+  - scenarios: `occurrence-lease-expiry`
 - `LeaseExpiredFromDispatching`
   - anchors: `occurrence_authority`, `schedule_driver`, `schedule_store`, `occurrence_schema`
-  - scenarios: `occurrence-claim-dispatch-complete`
+  - scenarios: `occurrence-lease-expiry`
 - `LeaseExpiredFromAwaitingCompletion`
   - anchors: `occurrence_authority`, `schedule_driver`, `schedule_store`, `occurrence_schema`
-  - scenarios: `occurrence-claim-dispatch-complete`
+  - scenarios: `occurrence-lease-expiry`
 
 ### Effects
 - `Claimed`
@@ -74,13 +74,13 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - scenarios: `occurrence-claim-dispatch-complete`
 - `Superseded`
   - anchors: `occurrence_authority`, `schedule_driver`, `schedule_store`, `occurrence_schema`
-  - scenarios: `occurrence-claim-dispatch-complete`
+  - scenarios: `occurrence-supersede`
 - `DeliveryFailed`
   - anchors: `occurrence_authority`, `schedule_driver`, `schedule_store`, `occurrence_schema`
   - scenarios: `occurrence-claim-dispatch-complete`
 - `LeaseExpired`
   - anchors: `occurrence_authority`, `schedule_driver`, `schedule_store`, `occurrence_schema`
-  - scenarios: `occurrence-claim-dispatch-complete`
+  - scenarios: `occurrence-lease-expiry`
 
 ### Invariants
 - `live_claim_requires_owner`
@@ -88,7 +88,7 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - scenarios: `occurrence-claim-dispatch-complete`
 - `superseded_records_revision`
   - anchors: `occurrence_authority`, `schedule_driver`, `schedule_store`, `occurrence_schema`
-  - scenarios: `occurrence-claim-dispatch-complete`
+  - scenarios: `occurrence-supersede`
 - `delivery_failed_records_failure_class`
   - anchors: `occurrence_authority`, `schedule_driver`, `schedule_store`, `occurrence_schema`
   - scenarios: `occurrence-claim-dispatch-complete`

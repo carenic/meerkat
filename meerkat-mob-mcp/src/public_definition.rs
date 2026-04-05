@@ -111,7 +111,10 @@ fn decode_profile(
             backend: input.backend.map(decode_backend_kind),
             runtime_mode: decode_runtime_mode(input.runtime_mode),
             max_inline_peer_notifications: input.max_inline_peer_notifications,
-            output_schema: input.output_schema,
+            output_schema: input
+                .output_schema
+                .map(|schema| serde_json::to_value(schema).map_err(|error| error.to_string()))
+                .transpose()?,
             provider_params: input.provider_params,
         },
     ))
@@ -371,7 +374,10 @@ mod tests {
                 backend: Some(WireMobBackendKind::External),
                 runtime_mode: WireMobRuntimeMode::TurnDriven,
                 max_inline_peer_notifications: Some(2),
-                output_schema: Some(serde_json::json!({"type":"object"})),
+                output_schema: Some(
+                    meerkat_core::OutputSchema::new(serde_json::json!({"type":"object"}))
+                        .expect("valid output schema"),
+                ),
                 provider_params: Some(serde_json::json!({"reasoning_effort":"medium"})),
             },
         );
