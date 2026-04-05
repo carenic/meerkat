@@ -73,13 +73,13 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ### `DeleteActive`
 - From: `Active`
 - On: `Delete`()
-- Emits: `EmitScheduleNotice`
+- Emits: `EmitScheduleNotice`, `SupersedePendingOccurrences`
 - To: `Deleted`
 
 ### `DeletePaused`
 - From: `Paused`
 - On: `Delete`()
-- Emits: `EmitScheduleNotice`
+- Emits: `EmitScheduleNotice`, `SupersedePendingOccurrences`
 - To: `Deleted`
 
 ## Coverage

@@ -133,6 +133,15 @@ pub struct ScheduleTickReport {
     pub terminalized_occurrences: usize,
 }
 
+enum ClaimedOccurrenceDispatchState {
+    Ready(Occurrence),
+    Frozen,
+    Supersede {
+        occurrence: Occurrence,
+        superseded_by_revision: crate::ScheduleRevision,
+    },
+}
+
 pub struct ScheduleDriver {
     service: ScheduleService,
     store: Arc<dyn ScheduleStore>,
@@ -201,10 +210,29 @@ impl ScheduleDriver {
         occurrence: Occurrence,
         store_now_utc: chrono::DateTime<Utc>,
     ) -> Result<bool, ScheduleDomainError> {
-        let mut occurrence = self
-            .service
-            .sync_occurrence_target_with_schedule(occurrence)
-            .await?;
+        let mut occurrence = match self
+            .reconcile_claimed_occurrence_before_dispatch(occurrence)
+            .await?
+        {
+            ClaimedOccurrenceDispatchState::Ready(occurrence) => occurrence,
+            ClaimedOccurrenceDispatchState::Frozen => return Ok(false),
+            ClaimedOccurrenceDispatchState::Supersede {
+                occurrence,
+                superseded_by_revision,
+            } => {
+                self.terminalize_occurrence(
+                    occurrence,
+                    OccurrenceLifecycleInput::Supersede {
+                        superseded_by_revision,
+                        at_utc: store_now_utc,
+                    },
+                    DeliveryReceiptStage::Superseded,
+                    None,
+                )
+                .await?;
+                return Ok(true);
+            }
+        };
 
         match self.probe.probe_target(&occurrence).await? {
             TargetProbeOutcome::Ready => {}
@@ -320,6 +348,50 @@ impl ScheduleDriver {
 
         self.spawn_completion_waiter(dispatching, dispatch.completion);
         Ok(false)
+    }
+
+    async fn reconcile_claimed_occurrence_before_dispatch(
+        &self,
+        occurrence: Occurrence,
+    ) -> Result<ClaimedOccurrenceDispatchState, ScheduleDomainError> {
+        let current = match self.service.get(&occurrence.schedule_id).await {
+            Ok(schedule) => schedule,
+            Err(ScheduleDomainError::Store(crate::ScheduleStoreError::ScheduleNotFound {
+                ..
+            })) => {
+                return Err(ScheduleDomainError::Internal(format!(
+                    "claimed occurrence references missing schedule {}",
+                    occurrence.schedule_id
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+
+        if occurrence.schedule_revision > current.revision {
+            return Err(ScheduleDomainError::Internal(format!(
+                "claimed occurrence {} has future revision {} ahead of schedule {}",
+                occurrence.occurrence_id, occurrence.schedule_revision.0, current.revision.0
+            )));
+        }
+
+        if current.phase == SchedulePhase::Paused {
+            return Ok(ClaimedOccurrenceDispatchState::Frozen);
+        }
+
+        if current.phase == SchedulePhase::Deleted
+            || occurrence.schedule_revision < current.revision
+        {
+            return Ok(ClaimedOccurrenceDispatchState::Supersede {
+                occurrence,
+                superseded_by_revision: current.revision,
+            });
+        }
+
+        let occurrence = self
+            .service
+            .sync_occurrence_target_with_schedule(occurrence)
+            .await?;
+        Ok(ClaimedOccurrenceDispatchState::Ready(occurrence))
     }
 
     async fn terminalize_occurrence(
@@ -505,7 +577,9 @@ mod tests {
         CreateScheduleRequest, IntervalTriggerSpec, ScheduledSessionAction,
         SessionMaterializationSpec, SessionTargetBinding, TargetBinding,
     };
-    use crate::{MemoryScheduleStore, MisfirePolicy, MissingTargetPolicy, TriggerSpec};
+    use crate::{
+        MemoryScheduleStore, MisfirePolicy, MissingTargetPolicy, TriggerSpec, UpdateScheduleRequest,
+    };
     use chrono::Duration;
     use meerkat_core::ContentInput;
     use std::collections::BTreeMap;
@@ -608,6 +682,48 @@ mod tests {
                 completion: Box::pin(async move {
                     rx.await.map_err(|_| ScheduleDomainError::DriverStopped)
                 }),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingProbe {
+        calls: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl ScheduleTargetProbe for CountingProbe {
+        async fn probe_target(
+            &self,
+            _occurrence: &Occurrence,
+        ) -> Result<TargetProbeOutcome, ScheduleDomainError> {
+            *self.calls.lock().await += 1;
+            Ok(TargetProbeOutcome::Ready)
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingDelivery {
+        calls: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl ScheduleTargetDelivery for CountingDelivery {
+        async fn deliver_occurrence(
+            &self,
+            occurrence: &Occurrence,
+        ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+            *self.calls.lock().await += 1;
+            let receipt = DeliveryReceipt::new(
+                occurrence.occurrence_id.clone(),
+                occurrence.attempt_count,
+                DeliveryReceiptStage::DispatchStarted,
+            );
+            Ok(DeliveryDispatch {
+                receipt,
+                correlation_id: Some(format!("dispatch-attempt-{}", occurrence.attempt_count)),
+                materialized_session_id: None,
+                completion: Box::pin(async { Ok(DeliveryTerminal::completed(None)) }),
             })
         }
     }
@@ -1066,10 +1182,239 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn paused_claimed_occurrence_is_frozen_before_probe_or_delivery()
+    -> Result<(), ScheduleDomainError> {
+        let store = Arc::new(MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store.clone());
+        let schedule = service
+            .create(CreateScheduleRequest {
+                name: Some("pause-claimed".into()),
+                description: None,
+                trigger: TriggerSpec::Once {
+                    due_at_utc: Utc::now() - Duration::seconds(1),
+                },
+                target: materialize_on_demand_target("scheduled prompt"),
+                misfire_policy: MisfirePolicy::Skip,
+                overlap_policy: OverlapPolicy::SkipIfRunning,
+                missing_target_policy: MissingTargetPolicy::MarkMisfired,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await?;
+        let probe = Arc::new(CountingProbe::default());
+        let delivery = Arc::new(CountingDelivery::default());
+        let driver = ScheduleDriver::new(
+            service.clone(),
+            store.clone(),
+            probe.clone(),
+            delivery.clone(),
+            "driver-owner",
+            ScheduleDriverConfig {
+                claim_limit: 8,
+                lease_duration: Duration::seconds(30),
+            },
+        );
+        let claimed = store
+            .claim_due_occurrences(ClaimDueRequest {
+                owner_id: "driver-owner".into(),
+                limit: 1,
+                lease_duration: Duration::seconds(30),
+            })
+            .await?;
+        let occurrence = claimed
+            .claimed
+            .into_iter()
+            .next()
+            .expect("claimed occurrence");
+        service.pause(&schedule.schedule_id).await?;
+
+        let terminalized = driver
+            .handle_claimed_occurrence(occurrence.clone(), claimed.store_now_utc)
+            .await?;
+        let current = service
+            .list_occurrences(&schedule.schedule_id)
+            .await?
+            .into_iter()
+            .find(|item| item.occurrence_id == occurrence.occurrence_id)
+            .expect("occurrence should still exist");
+
+        assert!(!terminalized, "paused claimed work should be frozen");
+        assert_eq!(current.phase, OccurrencePhase::Claimed);
+        assert_eq!(*probe.calls.lock().await, 0, "pause should block probes");
+        assert_eq!(
+            *delivery.calls.lock().await,
+            0,
+            "pause should block delivery"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleted_claimed_occurrence_is_superseded_before_delivery()
+    -> Result<(), ScheduleDomainError> {
+        let store = Arc::new(MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store.clone());
+        let schedule = service
+            .create(CreateScheduleRequest {
+                name: Some("delete-claimed".into()),
+                description: None,
+                trigger: TriggerSpec::Once {
+                    due_at_utc: Utc::now() - Duration::seconds(1),
+                },
+                target: materialize_on_demand_target("scheduled prompt"),
+                misfire_policy: MisfirePolicy::Skip,
+                overlap_policy: OverlapPolicy::SkipIfRunning,
+                missing_target_policy: MissingTargetPolicy::MarkMisfired,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await?;
+        let probe = Arc::new(CountingProbe::default());
+        let delivery = Arc::new(CountingDelivery::default());
+        let driver = ScheduleDriver::new(
+            service.clone(),
+            store.clone(),
+            probe.clone(),
+            delivery.clone(),
+            "driver-owner",
+            ScheduleDriverConfig {
+                claim_limit: 8,
+                lease_duration: Duration::seconds(30),
+            },
+        );
+        let claimed = store
+            .claim_due_occurrences(ClaimDueRequest {
+                owner_id: "driver-owner".into(),
+                limit: 1,
+                lease_duration: Duration::seconds(30),
+            })
+            .await?;
+        let occurrence = claimed
+            .claimed
+            .into_iter()
+            .next()
+            .expect("claimed occurrence");
+        service.delete(&schedule.schedule_id).await?;
+
+        let terminalized = driver
+            .handle_claimed_occurrence(occurrence.clone(), claimed.store_now_utc)
+            .await?;
+        let current = service
+            .list_occurrences(&schedule.schedule_id)
+            .await?
+            .into_iter()
+            .find(|item| item.occurrence_id == occurrence.occurrence_id)
+            .expect("occurrence should still exist");
+
+        assert!(terminalized, "deleted claimed work should supersede");
+        assert_eq!(current.phase, OccurrencePhase::Superseded);
+        assert_eq!(*probe.calls.lock().await, 0, "delete should block probes");
+        assert_eq!(
+            *delivery.calls.lock().await,
+            0,
+            "delete should block delivery"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_revision_claimed_occurrence_is_superseded_before_delivery()
+    -> Result<(), ScheduleDomainError> {
+        let store = Arc::new(MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store.clone());
+        let schedule = service
+            .create(CreateScheduleRequest {
+                name: Some("stale-claimed".into()),
+                description: None,
+                trigger: TriggerSpec::Once {
+                    due_at_utc: Utc::now() - Duration::seconds(1),
+                },
+                target: materialize_on_demand_target("scheduled prompt"),
+                misfire_policy: MisfirePolicy::Skip,
+                overlap_policy: OverlapPolicy::SkipIfRunning,
+                missing_target_policy: MissingTargetPolicy::MarkMisfired,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await?;
+        let probe = Arc::new(CountingProbe::default());
+        let delivery = Arc::new(CountingDelivery::default());
+        let driver = ScheduleDriver::new(
+            service.clone(),
+            store.clone(),
+            probe.clone(),
+            delivery.clone(),
+            "driver-owner",
+            ScheduleDriverConfig {
+                claim_limit: 8,
+                lease_duration: Duration::seconds(30),
+            },
+        );
+        let claimed = store
+            .claim_due_occurrences(ClaimDueRequest {
+                owner_id: "driver-owner".into(),
+                limit: 1,
+                lease_duration: Duration::seconds(30),
+            })
+            .await?;
+        let occurrence = claimed
+            .claimed
+            .into_iter()
+            .next()
+            .expect("claimed occurrence");
+        let updated = service
+            .update(
+                &schedule.schedule_id,
+                UpdateScheduleRequest {
+                    expected_revision: Some(schedule.revision),
+                    trigger: Some(TriggerSpec::Interval(IntervalTriggerSpec {
+                        start_at_utc: Utc::now() + Duration::minutes(5),
+                        every_seconds: 300,
+                        end_at_utc: None,
+                    })),
+                    ..UpdateScheduleRequest::default()
+                },
+            )
+            .await?;
+
+        let terminalized = driver
+            .handle_claimed_occurrence(occurrence.clone(), claimed.store_now_utc)
+            .await?;
+        let current = service
+            .list_occurrences(&schedule.schedule_id)
+            .await?
+            .into_iter()
+            .find(|item| item.occurrence_id == occurrence.occurrence_id)
+            .expect("occurrence should still exist");
+
+        assert!(terminalized, "stale claimed work should supersede");
+        assert_eq!(current.phase, OccurrencePhase::Superseded);
+        assert_eq!(
+            current.superseded_by_revision,
+            Some(updated.revision),
+            "stale claimed work should record the current schedule revision"
+        );
+        assert_eq!(
+            *probe.calls.lock().await,
+            0,
+            "stale revision should block probes"
+        );
+        assert_eq!(
+            *delivery.calls.lock().await,
+            0,
+            "stale revision should block delivery"
+        );
+        Ok(())
+    }
+
     fn materialize_on_demand_target(prompt: &str) -> TargetBinding {
         TargetBinding::session(SessionTargetBinding::materialize_on_demand(
             SessionMaterializationSpec {
-                model: "gpt-4.1-mini".into(),
+                model: "claude-sonnet-4-6".into(),
                 system_prompt: None,
                 max_tokens: None,
                 provider: None,
@@ -1096,6 +1441,20 @@ mod tests {
                 additional_instructions: Vec::new(),
             },
         ))
+    }
+
+    #[test]
+    fn materialize_on_demand_target_uses_current_fixture_model() {
+        let target = materialize_on_demand_target("scheduled prompt");
+        let spec = match target {
+            TargetBinding::Session(binding) => match *binding {
+                SessionTargetBinding::MaterializeOnDemandSession { create, .. } => create,
+                other => panic!("expected materialize-on-demand target, got {other:?}"),
+            },
+            other => panic!("expected session target, got {other:?}"),
+        };
+
+        assert_eq!(spec.model, "claude-sonnet-4-6");
     }
 
     async fn wait_for_sender_count(delivery: &ControlledCompletionDelivery, expected: usize) {

@@ -137,18 +137,17 @@ impl ScheduleService {
 
     pub async fn delete(&self, schedule_id: &ScheduleId) -> Result<Schedule, ScheduleDomainError> {
         let current = self.get(schedule_id).await?;
+        let store_now = self.store.get_store_time_utc().await?;
         let mutator = self
             .schedule_authority
             .apply(
                 Some(current),
-                ScheduleLifecycleInput::Delete {
-                    at_utc: self.store.get_store_time_utc().await?,
-                },
+                ScheduleLifecycleInput::Delete { at_utc: store_now },
             )
             .map_err(|error| ScheduleDomainError::InvalidSchedule(error.to_string()))?;
         let deleted = mutator.schedule.clone();
         self.store.put_schedule(deleted.clone()).await?;
-        self.supersede_pending_occurrences(&deleted, self.store.get_store_time_utc().await?, None)
+        self.supersede_pending_occurrences(&deleted, store_now, Some(deleted.revision))
             .await?;
         Ok(deleted)
     }
@@ -532,10 +531,54 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn delete_bumps_revision_and_supersedes_pending_occurrences_against_deleted_revision()
+    -> Result<(), ScheduleDomainError> {
+        let store = Arc::new(MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store);
+
+        let created = service
+            .create(CreateScheduleRequest {
+                name: Some("delete-me".into()),
+                description: None,
+                trigger: TriggerSpec::Interval(IntervalTriggerSpec {
+                    start_at_utc: Utc::now() + Duration::minutes(1),
+                    every_seconds: 60,
+                    end_at_utc: None,
+                }),
+                target: materialize_on_demand_target("initial prompt"),
+                misfire_policy: MisfirePolicy::Skip,
+                overlap_policy: OverlapPolicy::SkipIfRunning,
+                missing_target_policy: crate::MissingTargetPolicy::MarkMisfired,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(4),
+            })
+            .await?;
+
+        let deleted = service.delete(&created.schedule_id).await?;
+        let occurrences = service.list_occurrences(&created.schedule_id).await?;
+
+        assert_eq!(
+            deleted.revision,
+            created.revision.next(),
+            "delete should advance the schedule revision"
+        );
+        assert!(
+            occurrences.iter().any(|occurrence| {
+                occurrence.phase == OccurrencePhase::Superseded
+                    && occurrence.schedule_revision == created.revision
+                    && occurrence.superseded_by_revision == Some(deleted.revision)
+            }),
+            "delete should supersede pending occurrences against the new deleted revision"
+        );
+        Ok(())
+    }
+
     fn materialize_on_demand_target(prompt: &str) -> TargetBinding {
         TargetBinding::session(SessionTargetBinding::materialize_on_demand(
             SessionMaterializationSpec {
-                model: "gpt-4.1-mini".into(),
+                model: "claude-sonnet-4-6".into(),
                 system_prompt: None,
                 max_tokens: None,
                 provider: None,
@@ -562,5 +605,19 @@ mod tests {
                 additional_instructions: Vec::new(),
             },
         ))
+    }
+
+    #[test]
+    fn materialize_on_demand_target_uses_current_fixture_model() {
+        let target = materialize_on_demand_target("scheduled prompt");
+        let spec = match target {
+            TargetBinding::Session(binding) => match *binding {
+                SessionTargetBinding::MaterializeOnDemandSession { create, .. } => create,
+                other => panic!("expected materialize-on-demand target, got {other:?}"),
+            },
+            other => panic!("expected session target, got {other:?}"),
+        };
+
+        assert_eq!(spec.model, "claude-sonnet-4-6");
     }
 }

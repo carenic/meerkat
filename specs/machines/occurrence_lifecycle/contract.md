@@ -13,211 +13,124 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `occurrence_ordinal`: `u64`
 - `target_binding_key`: `String`
 - `due_at_utc_ms`: `u64`
-- `lease_held`: `Bool`
-- `lease_owner`: `String`
-- `lease_expiry_utc_ms`: `u64`
+- `claimed_by`: `Option<String>`
+- `lease_expires_at_utc_ms`: `Option<u64>`
+- `claimed_at_utc_ms`: `Option<u64>`
+- `claim_token`: `Option<String>`
 - `delivery_correlation_id`: `Option<String>`
-- `open_delivery_protocol`: `Option<OccurrenceDeliveryProtocol>`
 - `last_receipt_stage`: `Option<DeliveryReceiptStage>`
 - `failure_class`: `Option<OccurrenceFailureClass>`
+- `failure_detail`: `Option<String>`
+- `dispatched_at_utc_ms`: `Option<u64>`
+- `completed_at_utc_ms`: `Option<u64>`
 - `attempt_count`: `u64`
 - `superseded_by_revision`: `Option<u64>`
 
 ## Inputs
-- `Claim`(claim_time_utc_ms: u64, owner_id: String, lease_expiry_utc_ms: u64)
-- `StartRuntimeDispatch`(delivery_correlation_id: String)
-- `StartMobDispatch`(delivery_correlation_id: String)
-- `RuntimeAccepted`(occurrence_id: OccurrenceId, attempt_count: u64)
-- `MobAccepted`(occurrence_id: OccurrenceId, attempt_count: u64)
-- `RuntimeCompleted`(occurrence_id: OccurrenceId, attempt_count: u64)
-- `MobCompleted`(occurrence_id: OccurrenceId, attempt_count: u64)
-- `RuntimeSkipped`(occurrence_id: OccurrenceId, attempt_count: u64, failure_class: OccurrenceFailureClass)
-- `MobSkipped`(occurrence_id: OccurrenceId, attempt_count: u64, failure_class: OccurrenceFailureClass)
-- `RuntimeMisfired`(occurrence_id: OccurrenceId, attempt_count: u64, failure_class: OccurrenceFailureClass)
-- `MobMisfired`(occurrence_id: OccurrenceId, attempt_count: u64, failure_class: OccurrenceFailureClass)
-- `RuntimeDeliveryFailed`(occurrence_id: OccurrenceId, attempt_count: u64, failure_class: OccurrenceFailureClass)
-- `MobDeliveryFailed`(occurrence_id: OccurrenceId, attempt_count: u64, failure_class: OccurrenceFailureClass)
-- `SupersedeByRevision`(superseding_revision: u64)
-- `LeaseExpired`
+- `Claim`(owner_id: String, at_utc_ms: u64, lease_expires_at_utc_ms: u64, claim_token: String)
+- `DispatchStarted`(correlation_id: Option<String>, at_utc_ms: u64)
+- `AwaitCompletion`(at_utc_ms: u64)
+- `Complete`(receipt_stage: DeliveryReceiptStage, at_utc_ms: u64)
+- `Skip`(detail: Option<String>, failure_class: Option<OccurrenceFailureClass>, at_utc_ms: u64)
+- `Misfire`(detail: Option<String>, failure_class: Option<OccurrenceFailureClass>, at_utc_ms: u64)
+- `Supersede`(superseded_by_revision: u64, at_utc_ms: u64)
+- `DeliveryFailed`(receipt_stage: Option<DeliveryReceiptStage>, failure_class: OccurrenceFailureClass, detail: Option<String>, at_utc_ms: u64)
+- `LeaseExpired`(at_utc_ms: u64)
 
 ## Effects
-- `ClaimLeaseGranted`(occurrence_id: OccurrenceId, owner_id: String, lease_expiry_utc_ms: u64, attempt_count: u64)
-- `DispatchToRuntime`(occurrence_id: OccurrenceId, schedule_id: ScheduleId, schedule_revision: u64, occurrence_ordinal: u64, attempt_count: u64, target_binding_key: String, delivery_correlation_id: Option<String>)
-- `DispatchToMob`(occurrence_id: OccurrenceId, schedule_id: ScheduleId, schedule_revision: u64, occurrence_ordinal: u64, attempt_count: u64, target_binding_key: String, delivery_correlation_id: Option<String>)
-- `AppendReceipt`(stage: DeliveryReceiptStage)
-- `EmitOccurrenceNotice`(new_state: OccurrenceLifecycleState)
+- `Claimed`
+- `DispatchStarted`
+- `AwaitingCompletion`
+- `Completed`
+- `Skipped`
+- `Misfired`
+- `Superseded`
+- `DeliveryFailed`
+- `LeaseExpired`
 
 ## Helpers
-- `claimable_at`(store_now_utc_ms: u64) -> `Bool`
-- `phase_is_terminal`(phase: OccurrenceLifecycleState) -> `Bool`
+- `is_live_claim_phase`(phase: OccurrenceLifecycleState) -> `Bool`
 
 ## Invariants
-- `terminal_has_no_open_delivery_protocol`
-- `live_claim_requires_lease_holder`
-- `awaiting_completion_requires_protocol`
+- `live_claim_requires_owner`
 - `superseded_records_revision`
 - `delivery_failed_records_failure_class`
 
 ## Transitions
 ### `ClaimPending`
 - From: `Pending`
-- On: `Claim`(claim_time_utc_ms, owner_id, lease_expiry_utc_ms)
-- Guards:
-  - `claimable_at_store_time`
-- Emits: `ClaimLeaseGranted`, `AppendReceipt`, `EmitOccurrenceNotice`
+- On: `Claim`(owner_id, at_utc_ms, lease_expires_at_utc_ms, claim_token)
+- Emits: `Claimed`
 - To: `Claimed`
 
-### `StartRuntimeDispatchFromClaimed`
+### `DispatchStartedFromClaimed`
 - From: `Claimed`
-- On: `StartRuntimeDispatch`(delivery_correlation_id)
-- Emits: `DispatchToRuntime`, `AppendReceipt`, `EmitOccurrenceNotice`
+- On: `DispatchStarted`(correlation_id, at_utc_ms)
+- Emits: `DispatchStarted`
 - To: `Dispatching`
 
-### `StartMobDispatchFromClaimed`
-- From: `Claimed`
-- On: `StartMobDispatch`(delivery_correlation_id)
-- Emits: `DispatchToMob`, `AppendReceipt`, `EmitOccurrenceNotice`
-- To: `Dispatching`
-
-### `RuntimeAcceptedFromDispatching`
+### `AwaitCompletionFromDispatching`
 - From: `Dispatching`
-- On: `RuntimeAccepted`(occurrence_id, attempt_count)
-- Guards:
-  - `matching_protocol_is_open`
-  - `occurrence_identity_matches`
-  - `attempt_matches`
-- Emits: `AppendReceipt`, `EmitOccurrenceNotice`
+- On: `AwaitCompletion`(at_utc_ms)
+- Emits: `AwaitingCompletion`
 - To: `AwaitingCompletion`
 
-### `MobAcceptedFromDispatching`
-- From: `Dispatching`
-- On: `MobAccepted`(occurrence_id, attempt_count)
-- Guards:
-  - `matching_protocol_is_open`
-  - `occurrence_identity_matches`
-  - `attempt_matches`
-- Emits: `AppendReceipt`, `EmitOccurrenceNotice`
-- To: `AwaitingCompletion`
-
-### `RuntimeCompletedFromDispatchingOrAwaiting`
+### `CompleteFromDispatchingOrAwaiting`
 - From: `Dispatching`, `AwaitingCompletion`
-- On: `RuntimeCompleted`(occurrence_id, attempt_count)
-- Guards:
-  - `matching_protocol_is_open`
-  - `occurrence_identity_matches`
-  - `attempt_matches`
-- Emits: `AppendReceipt`, `EmitOccurrenceNotice`
+- On: `Complete`(receipt_stage, at_utc_ms)
+- Emits: `Completed`
 - To: `Completed`
 
-### `MobCompletedFromDispatchingOrAwaiting`
+### `SkipFromLive`
 - From: `Dispatching`, `AwaitingCompletion`
-- On: `MobCompleted`(occurrence_id, attempt_count)
-- Guards:
-  - `matching_protocol_is_open`
-  - `occurrence_identity_matches`
-  - `attempt_matches`
-- Emits: `AppendReceipt`, `EmitOccurrenceNotice`
-- To: `Completed`
-
-### `RuntimeSkippedFromDispatchingOrAwaiting`
-- From: `Dispatching`, `AwaitingCompletion`
-- On: `RuntimeSkipped`(occurrence_id, attempt_count, failure_class)
-- Guards:
-  - `matching_protocol_is_open`
-  - `occurrence_identity_matches`
-  - `attempt_matches`
-- Emits: `AppendReceipt`, `EmitOccurrenceNotice`
+- On: `Skip`(detail, failure_class, at_utc_ms)
+- Emits: `Skipped`
 - To: `Skipped`
 
-### `MobSkippedFromDispatchingOrAwaiting`
+### `MisfireFromLive`
 - From: `Dispatching`, `AwaitingCompletion`
-- On: `MobSkipped`(occurrence_id, attempt_count, failure_class)
-- Guards:
-  - `matching_protocol_is_open`
-  - `occurrence_identity_matches`
-  - `attempt_matches`
-- Emits: `AppendReceipt`, `EmitOccurrenceNotice`
-- To: `Skipped`
-
-### `RuntimeMisfiredFromDispatchingOrAwaiting`
-- From: `Dispatching`, `AwaitingCompletion`
-- On: `RuntimeMisfired`(occurrence_id, attempt_count, failure_class)
-- Guards:
-  - `matching_protocol_is_open`
-  - `occurrence_identity_matches`
-  - `attempt_matches`
-- Emits: `AppendReceipt`, `EmitOccurrenceNotice`
+- On: `Misfire`(detail, failure_class, at_utc_ms)
+- Emits: `Misfired`
 - To: `Misfired`
-
-### `MobMisfiredFromDispatchingOrAwaiting`
-- From: `Dispatching`, `AwaitingCompletion`
-- On: `MobMisfired`(occurrence_id, attempt_count, failure_class)
-- Guards:
-  - `matching_protocol_is_open`
-  - `occurrence_identity_matches`
-  - `attempt_matches`
-- Emits: `AppendReceipt`, `EmitOccurrenceNotice`
-- To: `Misfired`
-
-### `RuntimeDeliveryFailedFromDispatchingOrAwaiting`
-- From: `Dispatching`, `AwaitingCompletion`
-- On: `RuntimeDeliveryFailed`(occurrence_id, attempt_count, failure_class)
-- Guards:
-  - `matching_protocol_is_open`
-  - `occurrence_identity_matches`
-  - `attempt_matches`
-- Emits: `AppendReceipt`, `EmitOccurrenceNotice`
-- To: `DeliveryFailed`
-
-### `MobDeliveryFailedFromDispatchingOrAwaiting`
-- From: `Dispatching`, `AwaitingCompletion`
-- On: `MobDeliveryFailed`(occurrence_id, attempt_count, failure_class)
-- Guards:
-  - `matching_protocol_is_open`
-  - `occurrence_identity_matches`
-  - `attempt_matches`
-- Emits: `AppendReceipt`, `EmitOccurrenceNotice`
-- To: `DeliveryFailed`
 
 ### `SupersedePending`
 - From: `Pending`
-- On: `SupersedeByRevision`(superseding_revision)
-- Guards:
-  - `superseding_revision_is_newer`
-- Emits: `AppendReceipt`, `EmitOccurrenceNotice`
+- On: `Supersede`(superseded_by_revision, at_utc_ms)
+- Emits: `Superseded`
 - To: `Superseded`
+
+### `DeliveryFailedFromLive`
+- From: `Dispatching`, `AwaitingCompletion`
+- On: `DeliveryFailed`(receipt_stage, failure_class, detail, at_utc_ms)
+- Emits: `DeliveryFailed`
+- To: `DeliveryFailed`
 
 ### `LeaseExpiredFromClaimed`
 - From: `Claimed`
-- On: `LeaseExpired`()
-- Guards:
-  - `lease_was_held`
-- Emits: `AppendReceipt`, `EmitOccurrenceNotice`
+- On: `LeaseExpired`(at_utc_ms)
+- Emits: `LeaseExpired`
 - To: `Pending`
 
 ### `LeaseExpiredFromDispatching`
 - From: `Dispatching`
-- On: `LeaseExpired`()
-- Guards:
-  - `lease_was_held`
-- Emits: `AppendReceipt`, `EmitOccurrenceNotice`
+- On: `LeaseExpired`(at_utc_ms)
+- Emits: `LeaseExpired`
 - To: `Pending`
 
 ### `LeaseExpiredFromAwaitingCompletion`
 - From: `AwaitingCompletion`
-- On: `LeaseExpired`()
-- Guards:
-  - `lease_was_held`
-- Emits: `AppendReceipt`, `EmitOccurrenceNotice`
+- On: `LeaseExpired`(at_utc_ms)
+- Emits: `LeaseExpired`
 - To: `Pending`
 
 ## Coverage
 ### Code Anchors
 - `meerkat-schedule/src/authority.rs` — occurrence lifecycle authority that owns claim, dispatch, lease expiry, and terminal outcomes
 - `meerkat-schedule/src/driver.rs` — mechanical scheduler driver precursor for due claims, probes, dispatch, and feedback
-- `meerkat-store/src/schedule_sqlite_store.rs` — sqlite schedule store precursor for authoritative claim-time and durable lease state
+- `meerkat-schedule/src/store.rs` — durable claim-time and occurrence state precursor
+- `meerkat-machine-schema/src/catalog/occurrence_lifecycle.rs` — formal OccurrenceLifecycleMachine schema
 
 ### Scenarios
-- `claim-dispatch-complete` — pending occurrence claims, dispatches, awaits owner feedback, and completes
-- `lease-expiry-reclaim` — claimed or dispatching occurrence returns to claimable after lease expiry
-- `supersede-and-fail` — occurrence terminalizes as superseded or delivery_failed with explicit failure class
+- `occurrence-claim-dispatch-complete` — occurrences claim, dispatch, and reach a terminal outcome with attempt ownership preserved
+- `occurrence-supersede` — pending occurrences supersede when a newer schedule revision invalidates them
+- `occurrence-lease-expiry` — live claimed work returns to pending when a lease expires before completion

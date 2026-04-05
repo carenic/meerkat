@@ -20,8 +20,6 @@ use meerkat::{
 };
 use meerkat_contracts::SkillsParams;
 #[cfg(feature = "mob")]
-use meerkat_core::ops::ToolAccessPolicy;
-#[cfg(feature = "mob")]
 use meerkat_core::types::HandlingMode;
 use meerkat_core::{ContentInput, OutputSchema, SessionId};
 #[cfg(feature = "mob")]
@@ -746,12 +744,7 @@ fn helper_options_from_spec(
         ScheduledMobBackendKind::Session => MobBackendKind::Session,
         ScheduledMobBackendKind::External => MobBackendKind::External,
     });
-    options.tool_access_policy = spec
-        .tool_access_policy
-        .as_ref()
-        .map(|value| serde_json::from_value::<ToolAccessPolicy>(value.clone()))
-        .transpose()
-        .map_err(|error| ScheduleDomainError::InvalidSchedule(error.to_string()))?;
+    options.tool_access_policy = spec.tool_access_policy.clone();
     Ok(options)
 }
 

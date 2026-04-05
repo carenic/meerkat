@@ -47,6 +47,65 @@
       "name": "session/stream_close"
     },
     {
+      "description": "Create a schedule",
+      "name": "schedule/create",
+      "params_type": "CreateScheduleRequest",
+      "result_type": "Schedule"
+    },
+    {
+      "description": "Get one schedule",
+      "name": "schedule/get",
+      "params_type": "ScheduleIdParams",
+      "result_type": "Schedule"
+    },
+    {
+      "description": "List schedules",
+      "name": "schedule/list",
+      "params_type": "ListSchedulesParams",
+      "result_type": "ScheduleListResult"
+    },
+    {
+      "description": "Update a schedule",
+      "name": "schedule/update",
+      "params_type": "UpdateScheduleParams",
+      "result_type": "Schedule"
+    },
+    {
+      "description": "Pause a schedule",
+      "name": "schedule/pause",
+      "params_type": "ScheduleIdParams",
+      "result_type": "Schedule"
+    },
+    {
+      "description": "Resume a schedule",
+      "name": "schedule/resume",
+      "params_type": "ScheduleIdParams",
+      "result_type": "Schedule"
+    },
+    {
+      "description": "Delete a schedule",
+      "name": "schedule/delete",
+      "params_type": "ScheduleIdParams",
+      "result_type": "Schedule"
+    },
+    {
+      "description": "List schedule occurrences",
+      "name": "schedule/occurrences",
+      "params_type": "ScheduleIdParams",
+      "result_type": "ScheduleOccurrencesResult"
+    },
+    {
+      "description": "List schedule transport tools",
+      "name": "schedule/tools",
+      "result_type": "ScheduleToolsResult"
+    },
+    {
+      "description": "Call a schedule transport tool",
+      "name": "schedule/call",
+      "params_type": "ScheduleToolCallParams",
+      "result_type": "Value"
+    },
+    {
       "description": "Start a new turn on existing session",
       "name": "turn/start"
     },

@@ -1,4 +1,5 @@
 use chrono::{DateTime, Duration, Utc};
+use meerkat_core::ops::ToolAccessPolicy;
 use meerkat_core::types::RenderMetadata;
 use meerkat_core::{ContentInput, OutputSchema, PeerMeta, Provider, SessionId};
 use serde::{Deserialize, Serialize};
@@ -543,7 +544,7 @@ pub struct HelperOptionsSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<ScheduledMobBackendKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_access_policy: Option<serde_json::Value>,
+    pub tool_access_policy: Option<ToolAccessPolicy>,
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -838,6 +839,30 @@ pub struct CreateScheduleRequest {
     pub planning_horizon_days: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planning_horizon_occurrences: Option<u32>,
+}
+
+#[cfg(all(test, feature = "schema"))]
+#[allow(clippy::unwrap_used)]
+mod schema_tests {
+    use super::HelperOptionsSpec;
+
+    #[test]
+    fn helper_options_schema_exposes_typed_tool_access_policy_variants() {
+        let schema_json = serde_json::to_string(&schemars::schema_for!(HelperOptionsSpec)).unwrap();
+
+        assert!(
+            schema_json.contains("allow_list"),
+            "helper options schema should expose ToolAccessPolicy variants"
+        );
+        assert!(
+            schema_json.contains("deny_list"),
+            "helper options schema should expose ToolAccessPolicy variants"
+        );
+        assert!(
+            schema_json.contains("inherit"),
+            "helper options schema should expose ToolAccessPolicy variants"
+        );
+    }
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

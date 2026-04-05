@@ -20,11 +20,13 @@ use super::{
     mob_orchestrator::mob_orchestrator_machine,
     mob_runtime_bridge_anchor::mob_runtime_bridge_anchor_machine,
     mob_wiring_anchor::mob_wiring_anchor_machine,
+    occurrence_lifecycle::occurrence_lifecycle_machine,
     ops_lifecycle::ops_lifecycle_machine,
     peer_comms::peer_comms_machine,
     peer_directory_reachability::peer_directory_reachability_machine,
     runtime_control::runtime_control_machine,
     runtime_ingress::runtime_ingress_machine,
+    schedule_lifecycle::schedule_lifecycle_machine,
     turn_execution::turn_execution_machine,
 };
 
@@ -238,6 +240,79 @@ pub fn canonical_machine_coverage_manifests() -> Vec<MachineCoverageManifest> {
                 scenario(
                     "cancel-and-watch",
                     "async operation cancellation resolves watcher semantics exactly once",
+                ),
+            ],
+        ),
+        machine_manifest_from_schema(
+            &schedule_lifecycle_machine(),
+            &[
+                anchor(
+                    "schedule_authority",
+                    "meerkat-schedule/src/authority.rs",
+                    "schedule lifecycle authority that owns revision, pause/resume, and delete semantics",
+                ),
+                anchor(
+                    "schedule_service",
+                    "meerkat-schedule/src/service.rs",
+                    "schedule service precursor for revision supersession and rolling planning",
+                ),
+                anchor(
+                    "schedule_schema",
+                    "meerkat-machine-schema/src/catalog/schedule_lifecycle.rs",
+                    "formal ScheduleLifecycleMachine schema",
+                ),
+            ],
+            &[
+                scenario(
+                    "schedule-revision-supersede",
+                    "revision-affecting updates bump revision and explicitly supersede pending future occurrences",
+                ),
+                scenario(
+                    "schedule-pause-resume",
+                    "pause freezes claiming and resume re-enables planning without bumping revision",
+                ),
+                scenario(
+                    "schedule-delete",
+                    "delete terminalizes the schedule while preserving occurrence history",
+                ),
+            ],
+        ),
+        machine_manifest_from_schema(
+            &occurrence_lifecycle_machine(),
+            &[
+                anchor(
+                    "occurrence_authority",
+                    "meerkat-schedule/src/authority.rs",
+                    "occurrence lifecycle authority that owns claim, dispatch, lease expiry, and terminal outcomes",
+                ),
+                anchor(
+                    "schedule_driver",
+                    "meerkat-schedule/src/driver.rs",
+                    "mechanical scheduler driver precursor for due claims, probes, dispatch, and feedback",
+                ),
+                anchor(
+                    "schedule_store",
+                    "meerkat-schedule/src/store.rs",
+                    "durable claim-time and occurrence state precursor",
+                ),
+                anchor(
+                    "occurrence_schema",
+                    "meerkat-machine-schema/src/catalog/occurrence_lifecycle.rs",
+                    "formal OccurrenceLifecycleMachine schema",
+                ),
+            ],
+            &[
+                scenario(
+                    "occurrence-claim-dispatch-complete",
+                    "occurrences claim, dispatch, and reach a terminal outcome with attempt ownership preserved",
+                ),
+                scenario(
+                    "occurrence-supersede",
+                    "pending occurrences supersede when a newer schedule revision invalidates them",
+                ),
+                scenario(
+                    "occurrence-lease-expiry",
+                    "live claimed work returns to pending when a lease expires before completion",
                 ),
             ],
         ),

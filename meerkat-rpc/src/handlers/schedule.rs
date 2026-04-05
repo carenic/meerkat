@@ -262,10 +262,135 @@ pub async fn handle_call(
         Err(response) => return response.with_id(id),
     };
 
+    if let Err(error) = runtime.ensure_schedule_host_started().await {
+        return map_schedule_error(id, error);
+    }
+
     match handle_schedule_tools_call(&schedule_service(&runtime), &params.name, &params.arguments)
         .await
     {
         Ok(value) => RpcResponse::success(id, value),
         Err(error) => RpcResponse::error(id, error.code, error.message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use chrono::{Duration, Utc};
+    use meerkat::{
+        AgentFactory, MemoryScheduleStore, MemoryStore, OccurrenceFailureClass, OccurrencePhase,
+        PersistenceBundle, SessionStore,
+    };
+    use meerkat_core::{Config, SessionId};
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn memory_blob_store() -> Arc<dyn meerkat_core::BlobStore> {
+        Arc::new(meerkat_store::MemoryBlobStore::new())
+    }
+
+    fn missing_target_schedule_tool_args() -> Value {
+        json!({
+            "name": "missing-target",
+            "description": "create a due schedule through the tool surface",
+            "trigger": {
+                "type": "once",
+                "due_at_utc": (Utc::now() - Duration::seconds(1)).to_rfc3339(),
+            },
+            "target": {
+                "target_kind": "session",
+                "type": "exact_session",
+                "session_id": SessionId::new(),
+                "action": {
+                    "type": "prompt",
+                    "prompt": "scheduled hello"
+                }
+            },
+            "missing_target_policy": "mark_misfired",
+            "planning_horizon_days": 1,
+            "planning_horizon_occurrences": 1
+        })
+    }
+
+    fn test_runtime(temp: &TempDir) -> Arc<SessionRuntime> {
+        let factory = AgentFactory::new(temp.path().join("sessions"));
+        let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+        Arc::new(SessionRuntime::new(
+            factory,
+            Config::default(),
+            10,
+            PersistenceBundle::new_with_schedule_store(
+                store,
+                None,
+                memory_blob_store(),
+                Arc::new(MemoryScheduleStore::new()),
+            ),
+            crate::router::NotificationSink::noop(),
+        ))
+    }
+
+    async fn wait_for_missing_target_misfire(
+        runtime: &Arc<SessionRuntime>,
+        schedule_id: &ScheduleId,
+    ) -> Option<meerkat::Occurrence> {
+        for _ in 0..40 {
+            let occurrences = runtime
+                .schedule_service()
+                .list_occurrences(schedule_id)
+                .await
+                .expect("list occurrences");
+            if let Some(occurrence) = occurrences.into_iter().find(|occurrence| {
+                occurrence.phase == OccurrencePhase::Misfired
+                    && occurrence.failure_class == Some(OccurrenceFailureClass::TargetMissing)
+            }) {
+                return Some(occurrence);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn schedule_call_starts_host_and_services_due_schedule() {
+        let temp = TempDir::new().unwrap();
+        let runtime = test_runtime(&temp);
+        let params = serde_json::value::RawValue::from_string(
+            serde_json::to_string(&json!({
+                "name": "meerkat_schedule_create",
+                "arguments": missing_target_schedule_tool_args(),
+            }))
+            .expect("serialize params"),
+        )
+        .expect("raw value");
+
+        let response =
+            handle_call(Some(RpcId::Num(1)), Some(params.as_ref()), runtime.clone()).await;
+        assert!(
+            response.error.is_none(),
+            "schedule/call should succeed: {:?}",
+            response.error
+        );
+
+        let created: Value = serde_json::from_str(
+            response
+                .result
+                .as_ref()
+                .expect("schedule/call result")
+                .get(),
+        )
+        .expect("valid JSON result");
+        let schedule_id = ScheduleId::parse(
+            created["schedule_id"]
+                .as_str()
+                .expect("schedule_id should be returned"),
+        )
+        .expect("valid schedule id");
+
+        let occurrence = wait_for_missing_target_misfire(&runtime, &schedule_id)
+            .await
+            .expect("schedule/call should start the host and service due work");
+        assert_eq!(occurrence.phase, OccurrencePhase::Misfired);
     }
 }

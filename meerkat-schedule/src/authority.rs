@@ -109,13 +109,23 @@ impl ScheduleLifecycleAuthority {
             }
             ScheduleLifecycleInput::Delete { at_utc } => {
                 let mut schedule = schedule.ok_or(ScheduleLifecycleError::MissingSchedule)?;
+                let previous_revision = schedule.revision;
+                schedule.revision = schedule.revision.next();
+                let new_revision = schedule.revision;
                 schedule.phase = SchedulePhase::Deleted;
+                schedule.planning_cursor_utc = None;
                 schedule.deleted_at_utc = Some(at_utc);
                 schedule.updated_at_utc = at_utc;
                 Ok(ScheduleLifecycleMutator {
                     schedule,
-                    effects: vec![ScheduleLifecycleEffect::Deleted],
-                    revision_bumped: false,
+                    effects: vec![
+                        ScheduleLifecycleEffect::RevisionBumped {
+                            previous_revision,
+                            new_revision,
+                        },
+                        ScheduleLifecycleEffect::Deleted,
+                    ],
+                    revision_bumped: true,
                 })
             }
         }
@@ -259,6 +269,8 @@ impl OccurrenceLifecycleMutator {
 pub enum OccurrenceLifecycleError {
     #[error("occurrence is already terminal")]
     AlreadyTerminal,
+    #[error("occurrence must be pending before it can be claimed")]
+    NotPendingForClaim,
     #[error("occurrence must be claimed before dispatching")]
     NotClaimed,
 }
@@ -284,6 +296,9 @@ impl OccurrenceLifecycleAuthority {
                 lease_expires_at_utc,
                 claim_token,
             } => {
+                if occurrence.phase != OccurrencePhase::Pending {
+                    return Err(OccurrenceLifecycleError::NotPendingForClaim);
+                }
                 occurrence.phase = OccurrencePhase::Claimed;
                 occurrence.claimed_by = Some(owner_id);
                 occurrence.lease_expires_at_utc = Some(lease_expires_at_utc);
@@ -408,4 +423,68 @@ fn terminalize(
     occurrence.lease_expires_at_utc = None;
     occurrence.claim_token = None;
     occurrence.delivery_correlation_id = None;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::types::{
+        MisfirePolicy, MissingTargetPolicy, OverlapPolicy, ScheduledSessionAction,
+        SessionTargetBinding, TargetBinding, TriggerSpec,
+    };
+    use chrono::Duration;
+    use meerkat_core::ContentInput;
+    use std::collections::BTreeMap;
+
+    fn sample_occurrence() -> Occurrence {
+        let schedule = Schedule::new(CreateScheduleRequest {
+            name: Some("claim-guard".into()),
+            description: None,
+            trigger: TriggerSpec::Once {
+                due_at_utc: Utc::now() + Duration::minutes(1),
+            },
+            target: TargetBinding::session(SessionTargetBinding::ExactSession {
+                session_id: meerkat_core::SessionId::new(),
+                action: ScheduledSessionAction::Prompt {
+                    prompt: ContentInput::from("scheduled hello"),
+                    system_prompt: None,
+                    render_metadata: None,
+                    skill_references: Vec::new(),
+                    additional_instructions: Vec::new(),
+                },
+            }),
+            misfire_policy: MisfirePolicy::Skip,
+            overlap_policy: OverlapPolicy::SkipIfRunning,
+            missing_target_policy: MissingTargetPolicy::MarkMisfired,
+            labels: BTreeMap::new(),
+            planning_horizon_days: Some(1),
+            planning_horizon_occurrences: Some(1),
+        });
+        Occurrence::planned_from_schedule(&schedule, crate::OccurrenceOrdinal(0), Utc::now())
+    }
+
+    #[test]
+    fn claim_rejects_non_pending_occurrences() {
+        let authority = OccurrenceLifecycleAuthority;
+        let input = OccurrenceLifecycleInput::Claim {
+            owner_id: "owner".into(),
+            at_utc: Utc::now(),
+            lease_expires_at_utc: Utc::now() + Duration::seconds(30),
+            claim_token: Uuid::now_v7(),
+        };
+
+        for phase in [
+            OccurrencePhase::Claimed,
+            OccurrencePhase::Dispatching,
+            OccurrencePhase::AwaitingCompletion,
+        ] {
+            let mut occurrence = sample_occurrence();
+            occurrence.phase = phase.clone();
+            assert!(
+                authority.apply(occurrence, input.clone()).is_err(),
+                "claim should reject occurrences already in phase {phase:?}"
+            );
+        }
+    }
 }

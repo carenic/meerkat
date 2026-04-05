@@ -101,16 +101,18 @@ DeleteActive ==
     /\ phase = "Active"
     /\ phase' = "Deleted"
     /\ model_step_count' = model_step_count + 1
+    /\ revision' = (revision) + 1
     /\ planning_cursor_utc_ms' = None
-    /\ UNCHANGED << revision, trigger_key, target_binding_key, misfire_policy, overlap_policy, missing_target_policy, next_occurrence_ordinal >>
+    /\ UNCHANGED << trigger_key, target_binding_key, misfire_policy, overlap_policy, missing_target_policy, next_occurrence_ordinal >>
 
 
 DeletePaused ==
     /\ phase = "Paused"
     /\ phase' = "Deleted"
     /\ model_step_count' = model_step_count + 1
+    /\ revision' = (revision) + 1
     /\ planning_cursor_utc_ms' = None
-    /\ UNCHANGED << revision, trigger_key, target_binding_key, misfire_policy, overlap_policy, missing_target_policy, next_occurrence_ordinal >>
+    /\ UNCHANGED << trigger_key, target_binding_key, misfire_policy, overlap_policy, missing_target_policy, next_occurrence_ordinal >>
 
 
 Next ==

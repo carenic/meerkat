@@ -23,8 +23,6 @@ use meerkat::{
     ForkContextSpec, HelperOptionsSpec, ScheduledMobBackendKind, ScheduledMobRuntimeMode,
 };
 use meerkat_contracts::SkillsParams;
-#[cfg(feature = "mob")]
-use meerkat_core::ops::ToolAccessPolicy;
 use meerkat_core::service::{
     CreateSessionRequest as SvcCreateSessionRequest, DeferredPromptPolicy, InitialTurnPolicy,
 };
@@ -812,12 +810,7 @@ fn helper_options_from_spec(
         ScheduledMobBackendKind::Session => MobBackendKind::Session,
         ScheduledMobBackendKind::External => MobBackendKind::External,
     });
-    options.tool_access_policy = spec
-        .tool_access_policy
-        .as_ref()
-        .map(|value| serde_json::from_value::<ToolAccessPolicy>(value.clone()))
-        .transpose()
-        .map_err(|error| ScheduleDomainError::InvalidSchedule(error.to_string()))?;
+    options.tool_access_policy = spec.tool_access_policy.clone();
     Ok(options)
 }
 

@@ -2686,6 +2686,10 @@ async fn schedule_call(
     State(state): State<AppState>,
     Json(req): Json<ScheduleToolCallRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    state
+        .ensure_schedule_host_started()
+        .await
+        .map_err(schedule_error_to_api)?;
     handle_schedule_tools_call(&state.schedule_service, &req.name, &req.arguments)
         .await
         .map(Json)
@@ -3929,8 +3933,12 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use chrono::{Duration, Utc};
     use futures::stream;
+    use meerkat::{OccurrenceFailureClass, OccurrencePhase, ScheduleId};
     use meerkat_client::{LlmDoneOutcome, LlmError, LlmEvent, LlmRequest};
+    use meerkat_core::SessionId;
+    use serde_json::json;
     use std::path::PathBuf;
     use std::pin::Pin;
     use tempfile::TempDir;
@@ -4079,6 +4087,79 @@ mod tests {
             .unwrap();
         assert!(!state.enable_builtins);
         assert!(!state.enable_shell);
+    }
+
+    fn missing_target_schedule_tool_args() -> Value {
+        json!({
+            "name": "missing-target",
+            "description": "create a due schedule through the tool surface",
+            "trigger": {
+                "type": "once",
+                "due_at_utc": (Utc::now() - Duration::seconds(1)).to_rfc3339(),
+            },
+            "target": {
+                "target_kind": "session",
+                "type": "exact_session",
+                "session_id": SessionId::new(),
+                "action": {
+                    "type": "prompt",
+                    "prompt": "scheduled hello"
+                }
+            },
+            "missing_target_policy": "mark_misfired",
+            "planning_horizon_days": 1,
+            "planning_horizon_occurrences": 1
+        })
+    }
+
+    async fn wait_for_missing_target_misfire(
+        service: &meerkat::ScheduleService,
+        schedule_id: &ScheduleId,
+    ) -> Option<meerkat::Occurrence> {
+        for _ in 0..40 {
+            let occurrences = service
+                .list_occurrences(schedule_id)
+                .await
+                .expect("list occurrences");
+            if let Some(occurrence) = occurrences.into_iter().find(|occurrence| {
+                occurrence.phase == OccurrencePhase::Misfired
+                    && occurrence.failure_class == Some(OccurrenceFailureClass::TargetMissing)
+            }) {
+                return Some(occurrence);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn schedule_call_starts_host_and_services_due_schedule() {
+        let temp = TempDir::new().unwrap();
+        let state = AppState::load_from(temp.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let Json(created) = schedule_call(
+            State(state.clone()),
+            Json(ScheduleToolCallRequest {
+                name: "meerkat_schedule_create".into(),
+                arguments: missing_target_schedule_tool_args(),
+            }),
+        )
+        .await
+        .expect("schedule tool create should succeed");
+
+        let schedule_id = ScheduleId::parse(
+            created["schedule_id"]
+                .as_str()
+                .expect("schedule_id should be returned"),
+        )
+        .expect("valid schedule id");
+
+        let occurrence = wait_for_missing_target_misfire(&state.schedule_service, &schedule_id)
+            .await
+            .expect("schedule/call should start the host and service due work");
+        assert_eq!(occurrence.phase, OccurrencePhase::Misfired);
     }
 
     #[tokio::test]

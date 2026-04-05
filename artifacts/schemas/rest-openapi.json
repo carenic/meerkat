@@ -101,6 +101,50 @@
         "summary": "Get runtime state"
       }
     },
+    "/schedule/call": {
+      "post": {
+        "summary": "Invoke a schedule tool"
+      }
+    },
+    "/schedule/tools": {
+      "get": {
+        "summary": "List schedule tools"
+      }
+    },
+    "/schedules": {
+      "get": {
+        "summary": "List schedules"
+      },
+      "post": {
+        "summary": "Create schedule"
+      }
+    },
+    "/schedules/{id}": {
+      "delete": {
+        "summary": "Delete schedule"
+      },
+      "get": {
+        "summary": "Get schedule"
+      },
+      "patch": {
+        "summary": "Update schedule"
+      }
+    },
+    "/schedules/{id}/occurrences": {
+      "get": {
+        "summary": "List schedule occurrences"
+      }
+    },
+    "/schedules/{id}/pause": {
+      "post": {
+        "summary": "Pause schedule"
+      }
+    },
+    "/schedules/{id}/resume": {
+      "post": {
+        "summary": "Resume schedule"
+      }
+    },
     "/sessions": {
       "get": {
         "summary": "List sessions"
