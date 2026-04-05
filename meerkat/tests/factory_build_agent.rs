@@ -103,6 +103,14 @@ fn create_test_authority() -> MobToolAuthorityContext {
         .with_managed_mob_scope(["mob-a"])
 }
 
+fn assert_generated_create_only_authority(authority: Option<&MobToolAuthorityContext>) {
+    let authority = authority.expect("generated create-only authority");
+    assert!(authority.can_create_mobs());
+    assert!(authority.managed_mob_scope().is_empty());
+    assert!(authority.caller_provenance().is_none());
+    assert!(authority.audit_invocation_id().is_none());
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1264,6 +1272,85 @@ async fn resumed_enable_mob_metadata_does_not_imply_operator_capabilities() {
     let _agent = factory.build_agent(build_config, &config).await.unwrap();
     let observed = observed.lock().expect("recording mutex");
     assert_eq!(observed.as_slice(), &[None]);
+}
+
+#[tokio::test]
+async fn explicit_mob_override_generates_create_only_operator_capabilities() {
+    let temp = tempfile::tempdir().unwrap();
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mob_factory = Arc::new(RecordingMobToolsFactory {
+        observed_authority_context: Arc::clone(&observed),
+    });
+    let factory = temp_factory(&temp)
+        .mob(false)
+        .mob_tools_factory(mob_factory);
+    let config = Config::default();
+
+    let build_config = AgentBuildConfig {
+        override_mob: Some(true),
+        llm_client_override: Some(Arc::new(MockLlmClient)),
+        ..AgentBuildConfig::new("claude-sonnet-4-5")
+    };
+
+    let _agent = factory.build_agent(build_config, &config).await.unwrap();
+    let observed = observed.lock().expect("recording mutex");
+    assert_eq!(observed.len(), 1);
+    assert_generated_create_only_authority(observed[0].as_ref());
+}
+
+#[tokio::test]
+async fn resumed_explicit_mob_override_generates_create_only_operator_capabilities() {
+    let temp = tempfile::tempdir().unwrap();
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mob_factory = Arc::new(RecordingMobToolsFactory {
+        observed_authority_context: Arc::clone(&observed),
+    });
+    let factory = temp_factory(&temp)
+        .mob(false)
+        .mob_tools_factory(mob_factory);
+    let config = Config::default();
+
+    let mut session = Session::new();
+    session
+        .set_session_metadata(SessionMetadata {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 2048,
+            structured_output_retries: 2,
+            provider: Provider::Anthropic,
+            provider_params: None,
+            tooling: SessionTooling {
+                builtins: ToolCategoryOverride::Enable,
+                shell: ToolCategoryOverride::Enable,
+                comms: ToolCategoryOverride::Disable,
+                mob: ToolCategoryOverride::Disable,
+                memory: ToolCategoryOverride::Disable,
+                active_skills: None,
+            },
+            keep_alive: false,
+            comms_name: None,
+            peer_meta: None,
+            realm_id: None,
+            instance_id: None,
+            backend: None,
+            config_generation: None,
+        })
+        .unwrap();
+
+    let build_config = AgentBuildConfig {
+        override_mob: Some(true),
+        resume_session: Some(session),
+        resume_override_mask: meerkat_core::service::ResumeOverrideMask {
+            override_mob: true,
+            ..Default::default()
+        },
+        llm_client_override: Some(Arc::new(MockLlmClient)),
+        ..AgentBuildConfig::new("claude-sonnet-4-5")
+    };
+
+    let _agent = factory.build_agent(build_config, &config).await.unwrap();
+    let observed = observed.lock().expect("recording mutex");
+    assert_eq!(observed.len(), 1);
+    assert_generated_create_only_authority(observed[0].as_ref());
 }
 
 #[tokio::test]

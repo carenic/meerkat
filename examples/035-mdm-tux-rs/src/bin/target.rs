@@ -2666,7 +2666,7 @@ mod tests {
             addr: "tcp://127.0.0.1:9999".into(),
             meta: meerkat_comms::PeerMeta::default(),
         });
-        let surface =
+        let _surface =
             build_target_runtime_surface(temp.path(), Arc::clone(&comms_runtime))
                 .await
                 .unwrap();
@@ -2696,6 +2696,7 @@ mod tests {
             event_tx: None,
             skill_references: None,
             initial_turn: InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
             build: Some(SessionBuildOptions {
                 llm_client_override: Some(encode_llm_client_override_for_service(
                     capture2.clone() as Arc<dyn LlmClient>,
@@ -2819,6 +2820,7 @@ mod tests {
             event_tx: None,
             skill_references: None,
             initial_turn: InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
             build: Some(SessionBuildOptions {
                 llm_client_override: Some(encode_llm_client_override_for_service(
                     capture.clone() as Arc<dyn LlmClient>,

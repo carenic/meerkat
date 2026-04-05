@@ -1220,6 +1220,18 @@ impl AgentFactory {
     ) -> Result<DynAgent, BuildAgentError> {
         let resumed_session_metadata = Self::apply_resumed_session_metadata(&mut build_config);
 
+        // Explicit build-time mob enablement should surface the generated
+        // create-only authority shape when no typed authority was already
+        // supplied or recovered. Ambient factory defaults must not do this,
+        // and resumed metadata alone must not escalate operator capability.
+        if build_config.mob_tool_authority_context.is_none()
+            && matches!(build_config.override_mob, Some(true))
+            && (build_config.resume_session.is_none()
+                || build_config.resume_override_mask.override_mob)
+        {
+            build_config.apply_generated_create_only_mob_operator_access(Some(true));
+        }
+
         if let Some(value) = build_config.max_inline_peer_notifications
             && value < -1
         {
@@ -1561,6 +1573,11 @@ impl AgentFactory {
             tool_usage_instructions = composed.1;
         }
 
+        tracing::debug!(
+            tool_count_after_comms = tools.tools().len(),
+            "tool composition: after comms gateway"
+        );
+
         // 9b. Compose tools with mob surface (after comms, so mob gateway wraps the
         // already-composed comms gateway).
         let effective_mob = if matches!(build_config.override_mob, Some(false)) {
@@ -1617,7 +1634,7 @@ impl AgentFactory {
         //
         // BindOutcome::was_bound() tells the factory whether to wire
         // side effects (e.g. actionable-notify bridge task).
-        #[allow(unused_mut)]
+        #[cfg(feature = "comms")]
         let mut bind_succeeded_wait = false;
         #[cfg(feature = "comms")]
         if let Some(ref runtime) = comms_runtime {
@@ -1726,59 +1743,6 @@ impl AgentFactory {
                     BuildAgentError::Config(format!("Ops lifecycle binding failed: {e}"))
                 })?;
             tools = outcome.into_dispatcher();
-            tools = outcome.into_dispatcher();
-        }
-
-        tracing::debug!(
-            tool_count_after_comms = tools.tools().len(),
-            "tool composition: after comms gateway"
-        );
-
-        // 9b. Compose tools with mob surface (after comms, so mob gateway wraps the
-        // already-composed comms gateway).
-        let effective_mob = if matches!(build_config.override_mob, Some(false)) {
-            false
-        } else {
-            build_config.override_mob.unwrap_or(self.enable_mob)
-                || build_config.mob_tool_authority_context.is_some()
-        };
-        let mob_factory = build_config
-            .mob_tools
-            .take()
-            .or_else(|| self.mob_tools.clone());
-        if effective_mob && let Some(mob_factory) = mob_factory {
-            // Build comms runtime arg: clone from the comms phase if available.
-            #[cfg(feature = "comms")]
-            let mob_comms: Option<Arc<dyn meerkat_core::agent::CommsRuntime>> = comms_runtime
-                .as_ref()
-                .map(|r| Arc::clone(r) as Arc<dyn meerkat_core::agent::CommsRuntime>);
-            #[cfg(not(feature = "comms"))]
-            let mob_comms: Option<Arc<dyn meerkat_core::agent::CommsRuntime>> = None;
-
-            let mob_args = meerkat_core::service::MobToolsBuildArgs {
-                session_id: session.id().clone(),
-                model: model.clone(),
-                authority_context: build_config.mob_tool_authority_context.clone(),
-                comms_name: build_config.comms_name.clone(),
-                comms_runtime: mob_comms,
-            };
-            let mob_dispatcher = mob_factory
-                .build_mob_tools(mob_args)
-                .await
-                .map_err(|e| BuildAgentError::Config(format!("Mob tool factory: {e}")))?;
-            let mob_usage = render_tool_usage_instructions(mob_dispatcher.tools().as_ref());
-            // Use DynamicToolComposite (not ToolGateway) so dynamic child
-            // dispatchers (e.g. callback tools) can surface additions between turns.
-            tools = Arc::new(meerkat_core::DynamicToolComposite::new(vec![
-                tools,
-                mob_dispatcher,
-            ]));
-            if !mob_usage.is_empty() {
-                if !tool_usage_instructions.is_empty() {
-                    tool_usage_instructions.push_str("\n\n");
-                }
-                tool_usage_instructions.push_str(&mob_usage);
-            }
         }
 
         tracing::debug!(
