@@ -360,7 +360,7 @@ pub fn spawn_schedule_host(
         loop {
             tokio_with_wasm::alias::select! {
                 _ = &mut shutdown_rx => break,
-                _ = interval.tick() => {
+                () = interval.tick() => {
                     let _ = driver.tick_once().await;
                 }
             }
