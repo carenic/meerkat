@@ -318,8 +318,8 @@ mod tests {
         })
     }
 
-    fn missing_target_schedule_request() -> CreateScheduleRequest {
-        serde_json::from_value(missing_target_schedule_tool_args()).expect("valid schedule request")
+    fn missing_target_schedule_request() -> Result<CreateScheduleRequest, serde_json::Error> {
+        serde_json::from_value(missing_target_schedule_tool_args())
     }
 
     fn test_runtime(temp: &TempDir) -> Arc<SessionRuntime> {
@@ -366,11 +366,12 @@ mod tests {
         None
     }
 
-    fn schedule_id_raw(schedule_id: &ScheduleId) -> Box<serde_json::value::RawValue> {
+    fn schedule_id_raw(
+        schedule_id: &ScheduleId,
+    ) -> Result<Box<serde_json::value::RawValue>, serde_json::Error> {
         serde_json::value::RawValue::from_string(
             json!({ "schedule_id": schedule_id.to_string() }).to_string(),
         )
-        .expect("raw value")
     }
 
     #[tokio::test]
@@ -451,89 +452,139 @@ mod tests {
 
     #[tokio::test]
     async fn schedule_get_unknown_id_returns_schedule_not_found_code() {
-        let temp = TempDir::new().expect("temp dir");
+        let temp_result = TempDir::new();
+        assert!(temp_result.is_ok(), "temp dir: {temp_result:?}");
+        let Ok(temp) = temp_result else {
+            return;
+        };
         let runtime = test_runtime(&temp);
-        let raw = schedule_id_raw(&ScheduleId::new());
+        let raw_result = schedule_id_raw(&ScheduleId::new());
+        assert!(raw_result.is_ok(), "raw value: {raw_result:?}");
+        let Ok(raw) = raw_result else {
+            return;
+        };
 
         let response = handle_get(Some(RpcId::Num(1)), Some(raw.as_ref()), runtime.clone()).await;
-        let error = response.error.expect("unknown schedule should error");
+        assert!(response.error.is_some(), "unknown schedule should error");
+        let Some(error) = response.error else {
+            return;
+        };
         assert_eq!(error.code, crate::error::SCHEDULE_NOT_FOUND);
     }
 
     #[tokio::test]
     async fn schedule_pause_and_resume_round_trip() {
-        let temp = TempDir::new().expect("temp dir");
+        let temp_result = TempDir::new();
+        assert!(temp_result.is_ok(), "temp dir: {temp_result:?}");
+        let Ok(temp) = temp_result else {
+            return;
+        };
         let runtime = test_runtime(&temp);
-        let schedule = runtime
-            .schedule_service()
-            .create(missing_target_schedule_request())
-            .await
-            .expect("create schedule");
+        let request_result = missing_target_schedule_request();
+        assert!(
+            request_result.is_ok(),
+            "valid schedule request: {request_result:?}"
+        );
+        let Ok(request) = request_result else {
+            return;
+        };
+        let schedule_result = runtime.schedule_service().create(request).await;
+        assert!(
+            schedule_result.is_ok(),
+            "create schedule: {schedule_result:?}"
+        );
+        let Ok(schedule) = schedule_result else {
+            return;
+        };
+        let raw_result = schedule_id_raw(&schedule.schedule_id);
+        assert!(raw_result.is_ok(), "raw value: {raw_result:?}");
+        let Ok(raw) = raw_result else {
+            return;
+        };
 
-        let paused_response = handle_pause(
-            Some(RpcId::Num(1)),
-            Some(schedule_id_raw(&schedule.schedule_id).as_ref()),
-            runtime.clone(),
-        )
-        .await;
+        let paused_response =
+            handle_pause(Some(RpcId::Num(1)), Some(raw.as_ref()), runtime.clone()).await;
         assert!(
             paused_response.error.is_none(),
             "pause should succeed: {:?}",
             paused_response.error
         );
-        let paused = runtime
-            .schedule_service()
-            .get(&schedule.schedule_id)
-            .await
-            .expect("paused schedule");
+        let paused_result = runtime.schedule_service().get(&schedule.schedule_id).await;
+        assert!(paused_result.is_ok(), "paused schedule: {paused_result:?}");
+        let Ok(paused) = paused_result else {
+            return;
+        };
         assert_eq!(paused.phase, meerkat::SchedulePhase::Paused);
 
-        let resumed_response = handle_resume(
-            Some(RpcId::Num(1)),
-            Some(schedule_id_raw(&schedule.schedule_id).as_ref()),
-            runtime.clone(),
-        )
-        .await;
+        let raw_result = schedule_id_raw(&schedule.schedule_id);
+        assert!(raw_result.is_ok(), "raw value: {raw_result:?}");
+        let Ok(raw) = raw_result else {
+            return;
+        };
+        let resumed_response =
+            handle_resume(Some(RpcId::Num(1)), Some(raw.as_ref()), runtime.clone()).await;
         assert!(
             resumed_response.error.is_none(),
             "resume should succeed: {:?}",
             resumed_response.error
         );
-        let resumed = runtime
-            .schedule_service()
-            .get(&schedule.schedule_id)
-            .await
-            .expect("resumed schedule");
+        let resumed_result = runtime.schedule_service().get(&schedule.schedule_id).await;
+        assert!(
+            resumed_result.is_ok(),
+            "resumed schedule: {resumed_result:?}"
+        );
+        let Ok(resumed) = resumed_result else {
+            return;
+        };
         assert_eq!(resumed.phase, meerkat::SchedulePhase::Active);
     }
 
     #[tokio::test]
     async fn schedule_delete_marks_schedule_deleted() {
-        let temp = TempDir::new().expect("temp dir");
+        let temp_result = TempDir::new();
+        assert!(temp_result.is_ok(), "temp dir: {temp_result:?}");
+        let Ok(temp) = temp_result else {
+            return;
+        };
         let runtime = test_runtime(&temp);
-        let schedule = runtime
-            .schedule_service()
-            .create(missing_target_schedule_request())
-            .await
-            .expect("create schedule");
+        let request_result = missing_target_schedule_request();
+        assert!(
+            request_result.is_ok(),
+            "valid schedule request: {request_result:?}"
+        );
+        let Ok(request) = request_result else {
+            return;
+        };
+        let schedule_result = runtime.schedule_service().create(request).await;
+        assert!(
+            schedule_result.is_ok(),
+            "create schedule: {schedule_result:?}"
+        );
+        let Ok(schedule) = schedule_result else {
+            return;
+        };
+        let raw_result = schedule_id_raw(&schedule.schedule_id);
+        assert!(raw_result.is_ok(), "raw value: {raw_result:?}");
+        let Ok(raw) = raw_result else {
+            return;
+        };
 
-        let response = handle_delete(
-            Some(RpcId::Num(1)),
-            Some(schedule_id_raw(&schedule.schedule_id).as_ref()),
-            runtime.clone(),
-        )
-        .await;
+        let response =
+            handle_delete(Some(RpcId::Num(1)), Some(raw.as_ref()), runtime.clone()).await;
         assert!(
             response.error.is_none(),
             "delete should succeed: {:?}",
             response.error
         );
 
-        let deleted = runtime
-            .schedule_service()
-            .get(&schedule.schedule_id)
-            .await
-            .expect("deleted schedule");
+        let deleted_result = runtime.schedule_service().get(&schedule.schedule_id).await;
+        assert!(
+            deleted_result.is_ok(),
+            "deleted schedule: {deleted_result:?}"
+        );
+        let Ok(deleted) = deleted_result else {
+            return;
+        };
         assert_eq!(deleted.phase, meerkat::SchedulePhase::Deleted);
         assert!(
             deleted.revision > schedule.revision,

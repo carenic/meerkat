@@ -283,7 +283,7 @@ impl McpScheduleContext {
             .get()
             .await
             .ok()
-            .map(|snapshot| snapshot.config.tools.mcp_servers.clone())
+            .map(|snapshot| snapshot.config.tools.mcp_servers)
             .unwrap_or_default();
 
         for config in &server_configs {
