@@ -16,8 +16,8 @@ use crate::turn_execution_authority::{
     TurnExecutionTransition,
 };
 use crate::types::{
-    AssistantBlock, BlockAssistantMessage, Message, RunResult, ToolCallView, ToolDef, ToolResult,
-    UserMessage,
+    AssistantBlock, BlockAssistantMessage, Message, RunResult, SystemNoticeKind,
+    SystemNoticeMessage, ToolCallView, ToolDef, ToolResult, UserMessage,
 };
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -35,6 +35,14 @@ enum CallTimeoutSource {
     CallBudget,
     /// Explicit whole-turn time budget fired.
     TurnBudget,
+}
+
+fn synthetic_notice_message(kind: SystemNoticeKind, body: impl Into<String>) -> Message {
+    Message::SystemNotice(SystemNoticeMessage::new(kind, body))
+}
+
+fn is_synthetic_notice(message: &Message, kind: SystemNoticeKind) -> bool {
+    matches!(message, Message::SystemNotice(notice) if notice.kind == kind)
 }
 
 impl<C, T, S> Agent<C, T, S>
@@ -470,23 +478,23 @@ where
                     // 3. Manage [MCP_PENDING] notice lifecycle.
                     //    Always strip prior synthetic notices to avoid stale state.
                     //    Uses starts_with on a strict prefix to avoid matching user text.
-                    const MCP_PENDING_PREFIX: &str = "[SYSTEM NOTICE][MCP_PENDING] ";
-                    self.session.messages_mut().retain(
-                        |m| !matches!(m, Message::User(u) if u.text_content().starts_with(MCP_PENDING_PREFIX)),
-                    );
+                    self.session.messages_mut().retain(|message| {
+                        !is_synthetic_notice(message, SystemNoticeKind::McpPending)
+                    });
                     if !ext.pending.is_empty() {
-                        self.session.push(Message::User(UserMessage::text(format!(
-                            "{MCP_PENDING_PREFIX}Servers connecting: {}. \
-                             Tools will appear when ready.",
-                            ext.pending.join(", ")
-                        ))));
+                        self.session.push(synthetic_notice_message(
+                            SystemNoticeKind::McpPending,
+                            format!(
+                                "Servers connecting: {}. Tools will appear when ready.",
+                                ext.pending.join(", ")
+                            ),
+                        ));
                     }
 
                     // 3b. Background shell job completion notices via CompletionFeed.
-                    const BG_JOB_PREFIX: &str = "[SYSTEM NOTICE][BG_JOB] ";
-                    self.session.messages_mut().retain(
-                        |m| !matches!(m, Message::User(u) if u.text_content().starts_with(BG_JOB_PREFIX)),
-                    );
+                    self.session.messages_mut().retain(|message| {
+                        !is_synthetic_notice(message, SystemNoticeKind::BackgroundJob)
+                    });
                     // Feed path: ops-lifecycle-tracked completions from the runtime.
                     if let Some(ref feed) = self.completion_feed {
                         let batch = feed.list_since(self.applied_cursor);
@@ -516,11 +524,14 @@ where
                             });
 
                             let mut notice = format!(
-                                "{BG_JOB_PREFIX}Background job `{}` (id={}) {}: {}",
+                                "Background job `{}` (id={}) {}: {}",
                                 entry.display_name, job_id, status_str, detail,
                             );
                             notice.push_str("\nUse shell_job_status to get the full output.");
-                            self.session.push(Message::User(UserMessage::text(notice)));
+                            self.session.push(synthetic_notice_message(
+                                SystemNoticeKind::BackgroundJob,
+                                notice,
+                            ));
                         }
                         self.applied_cursor = batch.watermark;
                         if let Some(ref cs) = self.epoch_cursor_state {
@@ -550,14 +561,17 @@ where
                             detail: completion.detail.clone(),
                         });
                         let mut notice = format!(
-                            "{BG_JOB_PREFIX}Background job `{}` (id={}) {}: {}",
+                            "Background job `{}` (id={}) {}: {}",
                             completion.display_name,
                             completion.job_id,
                             completion.status.as_str(),
                             completion.detail,
                         );
                         notice.push_str("\nUse shell_job_status to get the full output.");
-                        self.session.push(Message::User(UserMessage::text(notice)));
+                        self.session.push(synthetic_notice_message(
+                            SystemNoticeKind::BackgroundJob,
+                            notice,
+                        ));
                     }
 
                     // 4. Apply tool scope staged updates atomically at the CallingLlm boundary.
@@ -584,9 +598,12 @@ where
                                     // Represent runtime notices as user-scoped synthetic context
                                     // (same pattern as peer lifecycle updates) so this does not
                                     // mutate or replace the canonical system prompt.
-                                    self.session.push(Message::User(UserMessage::text(format!(
-                                        "[SYSTEM NOTICE][TOOL_SCOPE] Tool configuration changed at turn boundary: {status}"
-                                    ))));
+                                    self.session.push(synthetic_notice_message(
+                                        SystemNoticeKind::ToolScope,
+                                        format!(
+                                            "Tool configuration changed at turn boundary: {status}"
+                                        ),
+                                    ));
                                 }
                                 applied.tools
                             }
@@ -605,9 +622,12 @@ where
                                         applied_at_turn: Some(turn_count),
                                     },
                                 });
-                                self.session.push(Message::User(UserMessage::text(format!(
-                                    "[SYSTEM NOTICE][TOOL_SCOPE][WARNING] Tool scope apply failed ({err}); falling back to full tool set."
-                                ))));
+                                self.session.push(synthetic_notice_message(
+                                    SystemNoticeKind::ToolScopeWarning,
+                                    format!(
+                                        "Tool scope apply failed ({err}); falling back to full tool set."
+                                    ),
+                                ));
                                 dispatcher_tools
                             }
                         }
@@ -1612,7 +1632,7 @@ fn completion_outcome_status_str(
     clippy::manual_async_fn
 )]
 mod tests {
-    use super::rewrite_assistant_text;
+    use super::{SystemNoticeKind, is_synthetic_notice, rewrite_assistant_text};
     use crate::agent::{AgentBuilder, AgentLlmClient, AgentSessionStore, AgentToolDispatcher};
     use crate::blob::{BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError};
     use crate::budget::{Budget, BudgetLimits};
@@ -2853,10 +2873,10 @@ mod tests {
             .messages()
             .iter()
             .filter_map(|msg| match msg {
-                Message::User(user)
-                    if user.text_content().contains("[SYSTEM NOTICE][TOOL_SCOPE]") =>
+                Message::SystemNotice(notice)
+                    if is_synthetic_notice(msg, SystemNoticeKind::ToolScope) =>
                 {
-                    Some(user.text_content())
+                    Some(notice.rendered_text())
                 }
                 _ => None,
             })
@@ -2907,8 +2927,10 @@ mod tests {
             .messages()
             .iter()
             .filter_map(|msg| match msg {
-                Message::User(user) if user.text_content().contains("[TOOL_SCOPE][WARNING]") => {
-                    Some(user.text_content())
+                Message::SystemNotice(notice)
+                    if is_synthetic_notice(msg, SystemNoticeKind::ToolScopeWarning) =>
+                {
+                    Some(notice.rendered_text())
                 }
                 _ => None,
             })

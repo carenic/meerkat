@@ -59,6 +59,17 @@ fn test_message_json_schema() {
     let json = serde_json::to_value(&user).unwrap();
     assert_eq!(json["role"], "user");
     assert_eq!(json["content"], "Hello!");
+    assert!(json.get("render_metadata").is_none());
+
+    // System notice message
+    let notice = Message::SystemNotice(SystemNoticeMessage::new(
+        SystemNoticeKind::BackgroundJob,
+        "Background job still running.",
+    ));
+    let json = serde_json::to_value(&notice).unwrap();
+    assert_eq!(json["role"], "system_notice");
+    assert_eq!(json["kind"], "background_job");
+    assert_eq!(json["body"], "Background job still running.");
 
     // Assistant message
     let assistant = Message::Assistant(AssistantMessage {
@@ -83,6 +94,62 @@ fn test_message_json_schema() {
     let json = serde_json::to_value(&tool_results).unwrap();
     assert_eq!(json["role"], "tool_results");
     assert!(json["results"].is_array());
+}
+
+#[test]
+fn test_user_message_render_metadata_serialization() {
+    let user = Message::User(UserMessage::text_with_render_metadata(
+        "notice",
+        Some(RenderMetadata {
+            class: RenderClass::ToolScopeNotice,
+            salience: RenderSalience::Normal,
+        }),
+    ));
+
+    let json = serde_json::to_value(&user).unwrap();
+    assert_eq!(json["role"], "user");
+    assert_eq!(json["render_metadata"]["class"], "tool_scope_notice");
+    assert_eq!(json["render_metadata"]["salience"], "normal");
+}
+
+#[test]
+fn test_legacy_user_notice_deserializes_to_system_notice() {
+    let parsed: Message = serde_json::from_value(json!({
+        "role": "user",
+        "content": "[SYSTEM NOTICE][TOOL_SCOPE] Tool configuration changed.",
+        "render_metadata": {
+            "class": "tool_scope_notice",
+            "salience": "normal"
+        }
+    }))
+    .unwrap();
+
+    match parsed {
+        Message::SystemNotice(notice) => {
+            assert_eq!(notice.kind, SystemNoticeKind::ToolScope);
+            assert_eq!(notice.body, "Tool configuration changed.");
+        }
+        other => panic!("expected system notice, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_reserved_prefix_user_text_stays_user_without_notice_metadata() {
+    let parsed: Message = serde_json::from_value(json!({
+        "role": "user",
+        "content": "[SYSTEM NOTICE][TOOL_SCOPE] pasted by a real user"
+    }))
+    .unwrap();
+
+    match parsed {
+        Message::User(user) => {
+            assert_eq!(
+                user.text_content(),
+                "[SYSTEM NOTICE][TOOL_SCOPE] pasted by a real user"
+            );
+        }
+        other => panic!("expected user message, got {other:?}"),
+    }
 }
 
 #[test]
