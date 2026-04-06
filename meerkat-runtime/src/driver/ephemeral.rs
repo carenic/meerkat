@@ -972,14 +972,18 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
                 DurabilityError::DerivedForbidden { .. }
                 | DurabilityError::ExternalDerivedForbidden => {
                     return Ok(AcceptOutcome::Rejected {
-                        reason: e.to_string(),
+                        reason: crate::accept::RejectReason::DurabilityViolation {
+                            detail: e.to_string(),
+                        },
                     });
                 }
             }
         }
         if let Err(e) = crate::peer_handling_mode::validate_peer_handling_mode(&input) {
             return Ok(AcceptOutcome::Rejected {
-                reason: e.to_string(),
+                reason: crate::accept::RejectReason::PeerHandlingModeInvalid {
+                    detail: e.to_string(),
+                },
             });
         }
         let input_id = input.id().clone();

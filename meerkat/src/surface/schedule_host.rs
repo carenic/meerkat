@@ -389,7 +389,7 @@ pub fn accepted_scheduled_input_from_runtime_outcome(
         AcceptOutcome::Rejected { reason } => AcceptedScheduledInput {
             correlation_id: "rejected".to_string(),
             handle: Some(CompletionHandle::already_resolved(
-                CompletionOutcome::Abandoned(reason),
+                CompletionOutcome::Abandoned(reason.to_string()),
             )),
         },
         _ => AcceptedScheduledInput {

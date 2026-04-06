@@ -1190,7 +1190,9 @@ async fn runtime_accept(
         Ok(outcome) => outcome,
         Err(meerkat_runtime::RuntimeDriverError::NotReady { state }) => {
             meerkat_runtime::AcceptOutcome::Rejected {
-                reason: format!("runtime not accepting input while in state: {state}"),
+                reason: meerkat_runtime::RejectReason::NotReady {
+                    state: format!("{state}"),
+                },
             }
         }
         Err(e) => {
@@ -1917,9 +1919,11 @@ async fn post_external_event(
             meerkat_runtime::AcceptOutcome::Accepted { .. }
             | meerkat_runtime::AcceptOutcome::Deduplicated { .. },
         ) => Ok((StatusCode::ACCEPTED, Json(json!({"queued": true})))),
-        Ok(meerkat_runtime::AcceptOutcome::Rejected { reason }) => {
-            Err((StatusCode::CONFLICT, Json(json!({"error": reason}))).into_response())
-        }
+        Ok(meerkat_runtime::AcceptOutcome::Rejected { reason }) => Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error": reason.to_string()})),
+        )
+            .into_response()),
         Ok(outcome) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
