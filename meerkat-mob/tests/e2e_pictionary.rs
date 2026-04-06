@@ -599,6 +599,42 @@ async fn e2e_pictionary_multimodal_comms_stress() {
 
         println!("  Images sent [{:.1}s]", t.elapsed().as_secs_f64());
 
+        // Verify: check each guesser's session history for image arrival
+        sleep(Duration::from_secs(15)).await;
+        for guesser_name in ["guesser-a", "guesser-b", "guesser-c"] {
+            let members = handle.list_members().await;
+            if let Some(guesser) = members
+                .iter()
+                .find(|m| m.meerkat_id == MeerkatId::from(guesser_name))
+                && let Some(sid) = guesser.session_id()
+                && let Ok(page) = service
+                    .read_history(
+                        sid,
+                        meerkat_core::SessionHistoryQuery {
+                            offset: 0,
+                            limit: None,
+                        },
+                    )
+                    .await
+            {
+                let has_image = page.messages.iter().any(|msg| match msg {
+                    meerkat_core::types::Message::User(u) => meerkat_core::has_images(&u.content),
+                    _ => false,
+                });
+                let has_drew = page.messages.iter().any(|msg| match msg {
+                    meerkat_core::types::Message::User(u) => {
+                        meerkat_core::types::text_content(&u.content).contains("drew")
+                    }
+                    _ => false,
+                });
+                println!(
+                    "  [DEBUG] {guesser_name}: msgs={} has_image={has_image} has_drew_text={has_drew} status={:?}",
+                    page.messages.len(),
+                    guesser.status
+                );
+            }
+        }
+
         // 4. Wait for verdict
         let t = Instant::now();
         println!("  [4/4] Waiting for discussion + guess + validation (up to 3 min)...");
