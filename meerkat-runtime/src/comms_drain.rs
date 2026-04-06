@@ -87,6 +87,12 @@ pub fn spawn_comms_drain(
         let inbox_notify = comms_runtime.inbox_notify();
 
         loop {
+            // Register BEFORE drain — notify_waiters() guarantees wakeup
+            // from creation, so a message arriving between drain-returns-empty
+            // and the await cannot be lost. No enable() needed.
+            // (Mirrors the pattern in CommsRuntime::recv_message.)
+            let notified = inbox_notify.notified();
+
             // Try classified drain first; fall back to legacy.
             let classified = match comms_runtime.drain_classified_inbox_interactions().await {
                 Ok(v) if !v.is_empty() => v,
@@ -107,14 +113,6 @@ pub fn spawn_comms_drain(
                             .await;
                         return;
                     }
-                    // Register the waiter AFTER confirming the inbox is empty.
-                    // `notify_waiters()` only wakes already-registered listeners,
-                    // so we must register before the next message can arrive.
-                    // `enable()` ensures the future is woken even if
-                    // `notify_waiters()` fires before we reach `.await`.
-                    let notified = inbox_notify.notified();
-                    tokio::pin!(notified);
-                    notified.as_mut().enable();
                     if crate::tokio::time::timeout(timeout_dur, notified)
                         .await
                         .is_err()
@@ -146,9 +144,6 @@ pub fn spawn_comms_drain(
                                 .await;
                             return;
                         }
-                        let notified = inbox_notify.notified();
-                        tokio::pin!(notified);
-                        notified.as_mut().enable();
                         if crate::tokio::time::timeout(timeout_dur, notified)
                             .await
                             .is_err()
