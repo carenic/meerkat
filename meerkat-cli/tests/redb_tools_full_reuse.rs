@@ -1,4 +1,4 @@
-#![cfg(all(feature = "redb-store", not(target_arch = "wasm32")))]
+#![cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use std::path::PathBuf;
