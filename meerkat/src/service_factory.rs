@@ -408,24 +408,42 @@ pub fn build_ephemeral_service(
 
 /// Convenience: build a `PersistentSessionService` backed by `AgentFactory`.
 #[cfg(feature = "session-store")]
+pub fn build_persistent_service_with_runtime_adapter(
+    factory: AgentFactory,
+    config: Config,
+    max_sessions: usize,
+    persistence: PersistenceBundle,
+) -> (
+    meerkat_session::PersistentSessionService<FactoryAgentBuilder>,
+    Arc<meerkat_runtime::RuntimeSessionAdapter>,
+) {
+    let runtime_adapter = persistence.runtime_adapter();
+    let mut builder = FactoryAgentBuilder::new(factory, config);
+    let (store, runtime_store, blob_store) = persistence.into_parts();
+    builder.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(Arc::clone(
+        &store,
+    ))));
+    (
+        meerkat_session::PersistentSessionService::new(
+            builder,
+            max_sessions,
+            store,
+            runtime_store,
+            blob_store,
+        ),
+        runtime_adapter,
+    )
+}
+
+/// Convenience: build a `PersistentSessionService` backed by `AgentFactory`.
+#[cfg(feature = "session-store")]
 pub fn build_persistent_service(
     factory: AgentFactory,
     config: Config,
     max_sessions: usize,
     persistence: PersistenceBundle,
 ) -> meerkat_session::PersistentSessionService<FactoryAgentBuilder> {
-    let mut builder = FactoryAgentBuilder::new(factory, config);
-    let (store, runtime_store, blob_store) = persistence.into_parts();
-    builder.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(Arc::clone(
-        &store,
-    ))));
-    meerkat_session::PersistentSessionService::new(
-        builder,
-        max_sessions,
-        store,
-        runtime_store,
-        blob_store,
-    )
+    build_persistent_service_with_runtime_adapter(factory, config, max_sessions, persistence).0
 }
 
 #[cfg(test)]

@@ -3357,7 +3357,12 @@ async fn run_agent(
     let service = Arc::new(service);
 
     let mut run_mob_tools = if effective_mob {
-        let mob_persistent = get_or_create_mob_persistent_service(scope, config.clone()).await?;
+        let mob_persistent = get_or_create_mob_persistent_service_from_bundle(
+            scope,
+            config.clone(),
+            manifest.clone(),
+            persistence.clone(),
+        )?;
         let run_mob_service: Arc<dyn meerkat_mob::MobSessionService> =
             Arc::new(MobCliSessionService::new(mob_persistent));
         Some(prepare_run_mob_tools(scope, run_mob_service).await?)
@@ -3853,22 +3858,19 @@ async fn resume_session_with_llm_override(
 
     log_stage("build_cli_persistent_service");
     // Build persistent session service for resume — durable runtime semantics.
-    let resume_adapter = persistence.runtime_adapter();
-    let runtime_store = persistence.runtime_store();
-    let blob_store = persistence.blob_store();
-    let builder = FactoryAgentBuilder::new(factory, config.clone());
-    let service = Arc::new(meerkat::PersistentSessionService::new(
-        builder,
-        64,
-        store.clone(),
-        runtime_store,
-        blob_store,
-    ));
+    let (persistent_service, resume_adapter) =
+        meerkat::build_persistent_service_with_runtime_adapter(
+            factory,
+            config.clone(),
+            64,
+            persistence.clone(),
+        );
+    let service = Arc::new(persistent_service);
 
     log_stage("compose_external_tool_dispatchers");
     let mut run_mob_tools = if tooling.mob.resolve(config.tools.mob_enabled) {
         log_stage("get_or_create_mob_persistent_service");
-        let mob_persistent = get_or_create_mob_persistent_service(scope, config.clone()).await?;
+        let mob_persistent = remember_mob_persistent_service(scope, Arc::clone(&service))?;
         let run_mob_service: Arc<dyn meerkat_mob::MobSessionService> =
             Arc::new(MobCliSessionService::new(mob_persistent));
         Some(prepare_run_mob_tools(scope, run_mob_service).await?)
@@ -4109,6 +4111,18 @@ async fn build_cli_persistent_service(
     Arc<meerkat_runtime::RuntimeSessionAdapter>,
 )> {
     let (manifest, persistence) = create_persistence_bundle(scope).await?;
+    build_cli_persistent_service_from_bundle(scope, config, manifest, persistence)
+}
+
+fn build_cli_persistent_service_from_bundle(
+    scope: &RuntimeScope,
+    config: Config,
+    manifest: meerkat_store::RealmManifest,
+    persistence: PersistenceBundle,
+) -> anyhow::Result<(
+    meerkat::PersistentSessionService<FactoryAgentBuilder>,
+    Arc<meerkat_runtime::RuntimeSessionAdapter>,
+)> {
     let store = persistence.session_store();
     let store_path = persistence
         .store_path()
@@ -4134,13 +4148,11 @@ async fn build_cli_persistent_service(
         factory = factory.user_config_root(user_root);
     }
 
-    let runtime_adapter = persistence.runtime_adapter();
-    let runtime_store = persistence.runtime_store();
-    let blob_store = persistence.blob_store();
-    let builder = FactoryAgentBuilder::new(factory, config);
-    Ok((
-        meerkat::PersistentSessionService::new(builder, 64, store, runtime_store, blob_store),
-        runtime_adapter,
+    Ok(meerkat::build_persistent_service_with_runtime_adapter(
+        factory,
+        config,
+        64,
+        persistence,
     ))
 }
 
@@ -4191,23 +4203,22 @@ fn mob_persistent_service_key(scope: &RuntimeScope) -> String {
     )
 }
 
-async fn get_or_create_mob_persistent_service(
+fn cached_mob_persistent_service(
     scope: &RuntimeScope,
-    config: Config,
-) -> anyhow::Result<Arc<CliPersistentService>> {
+) -> anyhow::Result<Option<Arc<CliPersistentService>>> {
     let key = mob_persistent_service_key(scope);
-    if let Some(existing) = mob_persistent_service_cache()
+    Ok(mob_persistent_service_cache()
         .lock()
         .map_err(|_| anyhow::anyhow!("mob persistent service cache poisoned"))?
         .get(&key)
-        .and_then(Weak::upgrade)
-    {
-        return Ok(existing);
-    }
+        .and_then(Weak::upgrade))
+}
 
-    let (persistent_service, _runtime_adapter) =
-        build_cli_persistent_service(scope, config).await?;
-    let created = Arc::new(persistent_service);
+fn remember_mob_persistent_service(
+    scope: &RuntimeScope,
+    created: Arc<CliPersistentService>,
+) -> anyhow::Result<Arc<CliPersistentService>> {
+    let key = mob_persistent_service_key(scope);
     let mut cache = mob_persistent_service_cache()
         .lock()
         .map_err(|_| anyhow::anyhow!("mob persistent service cache poisoned"))?;
@@ -4217,6 +4228,42 @@ async fn get_or_create_mob_persistent_service(
         cache.insert(key, Arc::downgrade(&created));
         Ok(created)
     }
+}
+
+fn build_mob_persistent_service_from_bundle(
+    scope: &RuntimeScope,
+    config: Config,
+    manifest: meerkat_store::RealmManifest,
+    persistence: PersistenceBundle,
+) -> anyhow::Result<Arc<CliPersistentService>> {
+    let (persistent_service, _runtime_adapter) =
+        build_cli_persistent_service_from_bundle(scope, config, manifest, persistence)?;
+    remember_mob_persistent_service(scope, Arc::new(persistent_service))
+}
+
+async fn get_or_create_mob_persistent_service(
+    scope: &RuntimeScope,
+    config: Config,
+) -> anyhow::Result<Arc<CliPersistentService>> {
+    if let Some(existing) = cached_mob_persistent_service(scope)? {
+        return Ok(existing);
+    }
+
+    let (manifest, persistence) = create_persistence_bundle(scope).await?;
+    build_mob_persistent_service_from_bundle(scope, config, manifest, persistence)
+}
+
+fn get_or_create_mob_persistent_service_from_bundle(
+    scope: &RuntimeScope,
+    config: Config,
+    manifest: meerkat_store::RealmManifest,
+    persistence: PersistenceBundle,
+) -> anyhow::Result<Arc<CliPersistentService>> {
+    if let Some(existing) = cached_mob_persistent_service(scope)? {
+        return Ok(existing);
+    }
+
+    build_mob_persistent_service_from_bundle(scope, config, manifest, persistence)
 }
 
 /// Mob-facing session service wrapper for CLI orchestration.
@@ -4566,11 +4613,11 @@ async fn delete_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
 
     let (config, _) = load_config(scope).await?;
     let (service, _runtime_adapter) = build_cli_persistent_service(scope, config.clone()).await?;
+    let service = Arc::new(service);
 
     // Archive and clean up any session-owned mobs.
     if config.tools.mob_enabled
-        && let Ok(mob_persistent) =
-            get_or_create_mob_persistent_service(scope, config.clone()).await
+        && let Ok(mob_persistent) = remember_mob_persistent_service(scope, Arc::clone(&service))
         && let Ok((state, _registry)) = hydrate_mob_state(
             scope,
             Arc::new(MobCliSessionService::new(mob_persistent))
@@ -4582,7 +4629,7 @@ async fn delete_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
         )
         .await
     {
-        meerkat_mob_mcp::archive_session_with_mob_cleanup(&service, &state, &session_id)
+        meerkat_mob_mcp::archive_session_with_mob_cleanup(service.as_ref(), &state, &session_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to delete session: {e}"))?;
     } else {

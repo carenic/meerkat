@@ -191,9 +191,11 @@ pub use persistence::open_realm_persistence_in;
 // Factory-backed SessionService wiring (substrate — testing/embedded use).
 // Production surfaces use runtime-backed paths (see meerkat-rpc, meerkat-rest).
 mod service_factory;
-#[cfg(feature = "session-store")]
-pub use service_factory::build_persistent_service;
 pub use service_factory::{FactoryAgent, FactoryAgentBuilder, build_ephemeral_service};
+#[cfg(feature = "session-store")]
+pub use service_factory::{
+    build_persistent_service, build_persistent_service_with_runtime_adapter,
+};
 
 // Session service
 pub use meerkat_core::{
