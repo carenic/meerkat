@@ -524,6 +524,55 @@ async fn build_agent_with_resume_preserves_persisted_system_prompt() {
     }
 }
 
+#[tokio::test]
+async fn build_agent_with_resume_preserves_explicit_inherit_tool_override() {
+    let temp = tempfile::tempdir().unwrap();
+    let factory = temp_factory(&temp).builtins(false);
+    let config = Config::default();
+
+    let mut session = Session::new();
+    session
+        .set_session_metadata(SessionMetadata {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 4096,
+            structured_output_retries: 2,
+            provider: Provider::Anthropic,
+            provider_params: None,
+            tooling: SessionTooling {
+                builtins: ToolCategoryOverride::Enable,
+                shell: ToolCategoryOverride::Inherit,
+                comms: ToolCategoryOverride::Inherit,
+                mob: ToolCategoryOverride::Inherit,
+                memory: ToolCategoryOverride::Inherit,
+                active_skills: None,
+            },
+            keep_alive: false,
+            comms_name: None,
+            peer_meta: None,
+            realm_id: None,
+            instance_id: None,
+            backend: None,
+            config_generation: None,
+        })
+        .unwrap();
+
+    let mut build_config = AgentBuildConfig {
+        llm_client_override: Some(Arc::new(MockLlmClient)),
+        resume_session: Some(session),
+        override_builtins: ToolCategoryOverride::Inherit,
+        ..AgentBuildConfig::new("gpt-5.2")
+    };
+    build_config.resume_override_mask.override_builtins = true;
+
+    let agent = factory.build_agent(build_config, &config).await.unwrap();
+    let metadata = agent
+        .session()
+        .session_metadata()
+        .expect("session should have metadata");
+
+    assert_eq!(metadata.tooling.builtins, ToolCategoryOverride::Inherit);
+}
+
 #[cfg(feature = "comms")]
 #[tokio::test]
 async fn build_agent_with_resume_preserves_session_scoped_inproc_peer_id() {

@@ -116,7 +116,11 @@ fn test_user_message_render_metadata_serialization() {
 fn test_legacy_user_notice_deserializes_to_system_notice() {
     let parsed: Message = serde_json::from_value(json!({
         "role": "user",
-        "content": "[SYSTEM NOTICE][TOOL_SCOPE] Tool configuration changed."
+        "content": "[SYSTEM NOTICE][TOOL_SCOPE] Tool configuration changed.",
+        "render_metadata": {
+            "class": "tool_scope_notice",
+            "salience": "normal"
+        }
     }))
     .unwrap();
 
@@ -126,6 +130,25 @@ fn test_legacy_user_notice_deserializes_to_system_notice() {
             assert_eq!(notice.body, "Tool configuration changed.");
         }
         other => panic!("expected system notice, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_reserved_prefix_user_text_stays_user_without_notice_metadata() {
+    let parsed: Message = serde_json::from_value(json!({
+        "role": "user",
+        "content": "[SYSTEM NOTICE][TOOL_SCOPE] pasted by a real user"
+    }))
+    .unwrap();
+
+    match parsed {
+        Message::User(user) => {
+            assert_eq!(
+                user.text_content(),
+                "[SYSTEM NOTICE][TOOL_SCOPE] pasted by a real user"
+            );
+        }
+        other => panic!("expected user message, got {other:?}"),
     }
 }
 

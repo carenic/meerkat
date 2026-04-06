@@ -828,8 +828,12 @@ impl SystemNoticeMessage {
     }
 
     fn try_from_legacy_user(user: &UserMessage) -> Option<Self> {
+        let expected_class = user.render_metadata.as_ref().map(|meta| meta.class)?;
         let text = user.text_content();
         let (kind, body) = SystemNoticeKind::parse_legacy(&text)?;
+        if expected_class != kind.render_class() {
+            return None;
+        }
         Some(Self::new(kind, body))
     }
 }

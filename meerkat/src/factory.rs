@@ -912,19 +912,16 @@ impl AgentFactory {
         if !mask.provider_params {
             build_config.provider_params = metadata.provider_params.clone();
         }
-        if matches!(
-            build_config.override_builtins,
-            ToolCategoryOverride::Inherit
-        ) {
+        if !mask.override_builtins {
             build_config.override_builtins = metadata.tooling.builtins;
         }
-        if matches!(build_config.override_shell, ToolCategoryOverride::Inherit) {
+        if !mask.override_shell {
             build_config.override_shell = metadata.tooling.shell;
         }
-        if matches!(build_config.override_memory, ToolCategoryOverride::Inherit) {
+        if !mask.override_memory {
             build_config.override_memory = metadata.tooling.memory;
         }
-        if matches!(build_config.override_mob, ToolCategoryOverride::Inherit) {
+        if !mask.override_mob {
             build_config.override_mob = metadata.tooling.mob;
             build_config.mob_tool_authority_context = build_config
                 .resume_session

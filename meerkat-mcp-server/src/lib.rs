@@ -2820,6 +2820,7 @@ async fn handle_meerkat_resume(
             keep_alive: keep_alive_override.is_some(),
             comms_name: input.comms_name.is_some(),
             peer_meta: input.peer_meta.is_some(),
+            ..Default::default()
         },
         blob_store_override: None,
         mob_tools: None,
