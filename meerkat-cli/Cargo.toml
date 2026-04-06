@@ -78,6 +78,7 @@ gemini = ["meerkat/gemini"]
 
 # Storage backends (forwarded to facade)
 jsonl-store = ["meerkat/jsonl-store"]
+redb-store = ["meerkat/redb-store"]
 
 # Session capabilities (forwarded to facade)
 session-store = ["meerkat/session-store"]
