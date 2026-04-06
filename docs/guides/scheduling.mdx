@@ -1,0 +1,218 @@
+---
+title: Scheduling
+description: Automate agent tasks with cron and interval triggers
+---
+
+# Scheduling
+
+Meerkat's scheduler lets you define recurring agent tasks that run automatically. Schedules are durable, authority-backed, and integrated across all surfaces.
+
+## How it works
+
+A **schedule** defines a trigger (when to fire) and a target (what to run). The scheduler projects **occurrences** from the trigger spec, and a **driver** claims and delivers them at the right time.
+
+```
+Schedule (trigger + target + policies)
+  → Occurrence projection (planning horizon)
+  → Driver tick loop claims due occurrences
+  → Delivery: creates session, runs prompt
+  → Occurrence marked completed/skipped/failed
+```
+
+## Creating a schedule
+
+<Tabs>
+  <Tab title="CLI">
+    Schedules are managed through agent tools. The agent can create, update, and manage schedules using the built-in `schedule_*` tools:
+
+    ```bash
+    rkat run "Create a schedule that runs every hour to check system health"
+    ```
+  </Tab>
+  <Tab title="Rust SDK">
+    ```rust
+    use meerkat_schedule::{
+        ScheduleService, MemoryScheduleStore, CreateScheduleRequest,
+        TriggerSpec, IntervalTriggerSpec, TargetBinding, SessionTargetBinding,
+    };
+    use std::sync::Arc;
+    use chrono::Duration;
+
+    let store = Arc::new(MemoryScheduleStore::new());
+    let service = ScheduleService::new(store);
+
+    let schedule = service.create(CreateScheduleRequest {
+        display_name: "hourly-health-check".into(),
+        trigger: TriggerSpec::Interval(IntervalTriggerSpec {
+            every: Duration::hours(1).to_std().unwrap(),
+        }),
+        target: TargetBinding::Session(SessionTargetBinding {
+            model: "claude-sonnet-4-5".into(),
+            prompt: "Check system health and report anomalies".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }).await?;
+    ```
+  </Tab>
+  <Tab title="RPC">
+    ```json
+    {
+      "method": "tool/call",
+      "params": {
+        "name": "schedule_create",
+        "arguments": {
+          "display_name": "hourly-health-check",
+          "trigger": {
+            "type": "interval",
+            "every_seconds": 3600
+          },
+          "target": {
+            "type": "session",
+            "model": "claude-sonnet-4-5",
+            "prompt": "Check system health and report anomalies"
+          }
+        }
+      }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Triggers
+
+### Cron triggers
+
+Fire at specific calendar times using cron-style field specs:
+
+```json
+{
+  "type": "cron",
+  "minute": { "values": [0] },
+  "hour": { "values": [9, 17] },
+  "day_of_week": { "range": { "from": 1, "to": 5 } },
+  "timezone": "America/New_York"
+}
+```
+
+Each field supports:
+- `"all"` — every value (default)
+- `{ "values": [1, 15, 30] }` — specific values
+- `{ "range": { "from": 0, "to": 59, "step": 5 } }` — range with optional step
+
+### Interval triggers
+
+Fire at fixed intervals:
+
+```json
+{
+  "type": "interval",
+  "every_seconds": 3600
+}
+```
+
+## Targets
+
+### Session target
+
+Creates a new agent session for each occurrence:
+
+```json
+{
+  "type": "session",
+  "model": "claude-sonnet-4-5",
+  "prompt": "Generate the daily report",
+  "system_prompt": "You are a reporting agent.",
+  "provider": "anthropic"
+}
+```
+
+### Mob target
+
+Runs a mob for each occurrence:
+
+```json
+{
+  "type": "mob",
+  "action": "create_and_run",
+  "definition": { ... }
+}
+```
+
+## Policies
+
+### Misfire policy
+
+What to do when an occurrence fires late (e.g., after a restart):
+
+| Policy | Behavior |
+|--------|----------|
+| `execute` | Run anyway (default) |
+| `skip` | Skip the missed occurrence |
+| `skip_if_older_than` | Skip if overdue by more than the specified duration |
+
+### Overlap policy
+
+What to do when a previous occurrence is still running:
+
+| Policy | Behavior |
+|--------|----------|
+| `allow` | Run concurrently (default) |
+| `skip` | Skip until previous completes |
+
+### Missing target policy
+
+What to do when the target doesn't exist:
+
+| Policy | Behavior |
+|--------|----------|
+| `skip` | Skip the occurrence |
+| `fail` | Mark as failed |
+| `create` | Create the target automatically (default) |
+
+## Schedule tools
+
+Agents can manage schedules through built-in tools:
+
+| Tool | Description |
+|------|-------------|
+| `schedule_create` | Create a new schedule |
+| `schedule_list` | List schedules with optional filters |
+| `schedule_read` | Read schedule details and occurrences |
+| `schedule_update` | Update trigger, target, or policies |
+| `schedule_pause` | Pause a schedule |
+| `schedule_resume` | Resume a paused schedule |
+| `schedule_delete` | Delete a schedule |
+
+These tools are available across CLI, REST, RPC, and MCP surfaces. WASM environments use a disabled store and return capability-unavailable errors.
+
+## Schedule lifecycle
+
+```
+Active ──pause──→ Paused ──resume──→ Active
+  │                                    │
+  ├──cancel──→ Cancelled               │
+  │                                    ├──cancel──→ Cancelled
+  └──(max_occurrences reached)──→ Completed
+```
+
+## Occurrence lifecycle
+
+```
+Pending ──claim──→ Claimed ──deliver──→ Delivering
+                                          │
+                                ┌─────────┼─────────┐
+                                ↓         ↓         ↓
+                           Completed   Skipped    Failed
+```
+
+Occurrences can also be **superseded** when a schedule is updated and new occurrences replace planned ones.
+
+## Persistence
+
+Schedule stores are per-realm. Multiple processes can share a store safely through `atomic_plan_mutation()`, which provides store-level atomicity for multi-step planning changes.
+
+Available backends:
+- **SQLite** — durable, multi-process safe (default for persistent realms)
+- **Redb** — single-writer alternative
+- **Memory** — testing and WASM

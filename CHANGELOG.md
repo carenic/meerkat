@@ -7,9 +7,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-04-06
+
+Meerkat 0.5.1 is a feature release adding the scheduler subsystem, flow-frame loops, background job completion notifications, and the runtime epoch model — plus broad correctness fixes across mob orchestration, session recovery, and tool visibility.
+
+### Highlights
+
+- **Scheduler subsystem** (`meerkat-schedule`): cron and interval triggers, occurrence lifecycle, misfire/overlap/missing-target policies, schedule tools, and surface rollout across CLI, REST, RPC, and MCP.
+- **Flow-frame loops**: `repeat_until` loop construct for mob flows, with frame-based execution, loop iteration authority, and durable resume/recovery.
+- **Background job completion**: `CompletionFeed` delivers canonical completion entries to the agent boundary, enabling `[BG_JOB]` notices and idle wake on shell job completion.
+- **Runtime epoch model**: `SessionRuntimeBindings` + `RuntimeBuildMode` eliminate the split-owner ops lifecycle bug class. All runtime-backed surfaces use `prepare_bindings()`.
+- **Mob delegation tools**: Agent-facing tools for delegate, mob_create, mob_spawn_member, mob_send, and mob lifecycle management.
+
 ### Added
-- Typed `handling_mode` override on `PeerInput` for actionable peer conventions (Message, Request). ResponseProgress and ResponseTerminal are validated to reject the field at runtime admission. Built-in comms bridges are unchanged (default to kind-based policy).
+
+#### Scheduler subsystem
+- New `meerkat-schedule` crate with `ScheduleLifecycleAuthority`, `OccurrenceLifecycleAuthority`, `ScheduleDriver`, `ScheduleService`, and `ScheduleStore`.
+- Cron and interval trigger specs with `next_due_after()` and `occurrences_for_horizon()`.
+- Misfire, overlap, and missing-target policies with configurable behavior.
+- Schedule tools (`schedule_create`, `schedule_update`, `schedule_list`, `schedule_read`, `schedule_delete`, `schedule_pause`, `schedule_resume`) exposed across all surfaces.
+- `ScheduleTargetDelivery` and `ScheduleTargetProbe` traits for pluggable delivery backends.
+- Schedule host surface integration with `RuntimeSessionAdapter` for runtime-backed delivery.
+- TLA+ formal specs for schedule and occurrence lifecycle state machines.
+- Atomic planning mutations (`atomic_plan_mutation()`) on `ScheduleStore` for safe multi-step schedule changes.
+
+#### Flow-frame loops
+- `repeat_until` loop construct in mob flow specs via `FlowFrameMachine` and `LoopIterationMachine`.
+- Frame-based execution model replacing flat-step dispatch for loop bodies.
+- Durable loop state: iteration count, evaluation results, and resume context survive restart.
+- Loop body/evaluate seam ownership via `LoopIterationAuthority`.
+
+#### Background job completion and runtime epoch model
+- `CompletionFeed` trait and `RuntimeOpsLifecycleRegistry` integration for canonical completion delivery.
+- Agent boundary `[BG_JOB]` notices when background shell jobs complete.
+- Idle wake fires when all background ops complete and agent is idle.
+- `RuntimeEpochId`, `SessionRuntimeBindings`, `RuntimeBuildMode` types in `meerkat-core`.
+- `prepare_bindings()` on `RuntimeSessionAdapter` — single canonical helper replacing hand-rolled register/extract/pass pattern.
+- Factory validates `SessionOwned` bindings session_id matches build session.
+- `StandaloneEphemeral` is the explicit default for test/standalone/WASM surfaces.
+- `EpochCursorState` with shared atomics for persistence-ready cursor tracking.
+- `PersistedOpsSnapshot` type for durable ops lifecycle recovery (bounded-loss, no invisible completions).
+- `recover_or_create_ops_state()` shared recovery helper on `RuntimeSessionAdapter`.
+- Persistence channel on terminal transitions (capture-and-queue pattern).
+- `persist_ops_lifecycle` / `load_ops_lifecycle` on `RuntimeStore` trait with SQLite, Redb, and in-memory implementations.
+
+#### Mob delegation and orchestration
+- Agent-facing delegation tools: `delegate`, `mob_create`, `mob_spawn_member`, `mob_send`, `mob_list_members`, `mob_read_member`, `mob_finalize` via `AgentMobToolSurface`.
+- `MobMcpState` and `MobMcpDispatcher` for MCP-hosted mob tool exposure.
+- Built-in mob tools wired into example 035 MDM TUX target.
+
+#### Storage and infrastructure
+- `SqliteTaskStore` implementing unified storage trait contracts.
+- SQLite replaces Redb for mob storage (eliminates single-writer lock contention).
+- Session identity claim leak fix in mob storage migration.
+- Unified `StorageTrait` contracts across task, mob, and session stores.
+
+#### Comms and peers
+- Typed `handling_mode` override on `PeerInput` for actionable peer conventions (Message, Request). ResponseProgress and ResponseTerminal are validated to reject the field at runtime admission.
 - `handling_mode` field on MCP `meerkat_comms_send` tool for parity with RPC/REST.
+- Shared `CommsRuntime` replaces per-surface homebrew comms wiring in example 035.
+
+#### Examples
+- Example 035: MDM TUX — ratatui device manager using P2P comms with target and TUX binaries.
+
+#### Other
+- `ToolCategoryOverride` enum (`Inherit | Enable | Disable`) for typed tool category control in `SessionTooling`.
+- Typed `RejectReason` enum on `AcceptOutcome::Rejected` replacing bare `String` (NotReady, DurabilityViolation, PeerHandlingModeInvalid).
+- Callback-pending completion outcome for runtime-backed surfaces.
+- `codemob-mcp` session continuation, skills, and UX improvements.
+
+### Changed
+- `SessionBuildOptions.runtime_build_mode` is now a required field (default: `StandaloneEphemeral`). Replaces `ops_lifecycle_override`.
+- `PreparedSurfaceSession` carries `SessionRuntimeBindings` instead of bare `ops_lifecycle`.
+- All runtime-backed surfaces (CLI, RPC, REST, MCP, example 035) migrated to `prepare_bindings()` + `RuntimeBuildMode::SessionOwned(bindings)`.
+- Mob provisioner pre-registers sessions via `prepare_bindings()` before `create_session()` with orphan reconciliation.
+- `PersistentSessionService` uses `set_runtime_bindings_provider()` instead of `set_ops_lifecycle_provider()`.
+- Prefab enum and all prefab-based mob creation deleted.
+- Redundant `MobActorCoreExecutor` deleted; `ensure_autonomous_runtime_ready` slimmed.
+- Mob operator tool authority boundaries tightened.
+
+### Fixed
+- Background shell job completions now correctly wake the agent in all runtime-backed surfaces (previously silent due to split-owner registry bug).
+- Tool category suppression on session resume: new tool categories (e.g. mob tools added after session creation) now inherit correctly instead of being frozen at creation time.
+- RPC stdout `WouldBlock` crash on high-throughput streaming.
+- Callback tools wired into mob agents (previously missing).
+- 035 target freeze: replaced homebrew comms with `CommsRuntime` for correct lifecycle management.
+- Shared `CommsRuntime` no longer overrides per-session comms identity.
+- Session identity claim leak in mob storage.
+- Version corrected from 0.6.0 to 0.5.1.
 
 ## [0.5.0] - 2026-03-26
 

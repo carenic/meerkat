@@ -434,6 +434,22 @@ dispatcher.
 Composed via `SessionBuildOptions.external_tools` so CLI, REST, RPC, and MCP server surfaces all get mob tool capability through the same path. Agent-facing delegation tools are late-bound via `MobToolsFactory`.
 </Accordion>
 
+<Accordion title="meerkat-schedule">
+Durable scheduler for automated agent task execution:
+
+- **ScheduleService**: CRUD operations + occurrence planning (projection from trigger specs within a planning horizon)
+- **ScheduleDriver**: tick loop that claims due occurrences, dispatches delivery, and monitors completion
+- **ScheduleLifecycleAuthority**: authority-backed schedule state transitions (Active, Paused, Completed, Cancelled)
+- **OccurrenceLifecycleAuthority**: authority-backed occurrence state transitions (Pending, Claimed, Delivering, Completed, Skipped, Failed)
+- **ScheduleStore**: persistence trait with Memory, SQLite, and Redb implementations
+- **Schedule tools**: agent-facing tools (`schedule_create`, `schedule_list`, `schedule_read`, `schedule_update`, `schedule_pause`, `schedule_resume`, `schedule_delete`)
+- **Triggers**: `Cron(CalendarTriggerSpec)` and `Interval(IntervalTriggerSpec)` with `next_due_after()` computation
+- **Policies**: `MisfirePolicy`, `OverlapPolicy`, `MissingTargetPolicy` for configurable delivery behavior
+- **Targets**: `SessionTargetBinding` (single agent session) or `MobTargetBinding` (mob orchestration)
+
+Stores are per-realm (not per-instance). `atomic_plan_mutation()` provides store-level atomicity for multi-step planning changes.
+</Accordion>
+
 <Accordion title="meerkat-rpc">
 JSON-RPC 2.0 stdio server for IDE and desktop app integration:
 

@@ -69,6 +69,7 @@ When reviewing a proposal, ask first:
 | `meerkat-mob` | Multi-agent orchestration, member provisioning, flow runtime, frame/loop execution | `MobSessionService`, `MobProvisioner` |
 | `meerkat-mob-pack` | Mobpack archive format, signing, trust policies, validation | — |
 | `meerkat-mob-mcp` | MCP/operator mob surface plus agent-facing delegation tool surface | `MobMcpState`, `AgentMobToolSurfaceFactory` |
+| `meerkat-schedule` | Scheduler subsystem: cron/interval triggers, occurrence lifecycle, delivery, schedule tools | `ScheduleService`, `ScheduleDriver`, `ScheduleStore` |
 | `meerkat-web-runtime` | WASM browser deployment (wasm_bindgen exports) | — |
 | `meerkat-machine-schema` | Rust-native machine/composition catalog plus seam/handoff protocol metadata — the formal authority | — |
 | `meerkat-machine-kernels` | Generated kernel interpreter for all machines/compositions | `GeneratedMachineKernel` |
@@ -83,7 +84,7 @@ The system is formally modeled as canonical machines plus closed-world compositi
 
 **Design rule:** centralized `meerkat-machine-kernels` is the enforced layout. Owner crates do NOT have `machines/mod.rs` re-export modules. The xtask verification explicitly rejects parallel owner modules.
 
-**Machines:** InputLifecycleMachine, RuntimeControlMachine, RuntimeIngressMachine, OpsLifecycleMachine, PeerCommsMachine, ExternalToolSurfaceMachine, TurnExecutionMachine, MobLifecycleMachine, FlowRunMachine, FlowFrameMachine, LoopIterationMachine, MobOrchestratorMachine, plus seam-focused machines such as CommsDrainLifecycleMachine where an async boundary has its own lifecycle truth.
+**Machines:** InputLifecycleMachine, RuntimeControlMachine, RuntimeIngressMachine, OpsLifecycleMachine, PeerCommsMachine, ExternalToolSurfaceMachine, TurnExecutionMachine, MobLifecycleMachine, FlowRunMachine, FlowFrameMachine, LoopIterationMachine, MobOrchestratorMachine, ScheduleLifecycleMachine, OccurrenceLifecycleMachine, plus seam-focused machines such as CommsDrainLifecycleMachine where an async boundary has its own lifecycle truth.
 
 **Verification:** `cargo xtask machine-codegen --all` (regenerate), `cargo xtask machine-check-drift --all` (detect stale artifacts), `cargo xtask machine-verify --all` (TLC model checking + owner tests).
 

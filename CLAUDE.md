@@ -71,6 +71,7 @@ meerkat-skills    → Skill loading, resolution, rendering (filesystem, git, HTT
 meerkat-hooks     → Hook infrastructure (in-process, command, HTTP runtimes)
 meerkat-mob       → Multi-agent mob orchestration (spawn, provision, finalize, SQLite storage, flow frames/loops)
 meerkat-mob-pack  → Mobpack archive format, signing, trust policies, validation
+meerkat-schedule  → Scheduler: cron/interval triggers, occurrence lifecycle, delivery, schedule tools
 meerkat-mob-mcp   → Expose mob tools as MCP interface + agent-facing delegation tools (MobMcpState, MobMcpDispatcher, AgentMobToolSurface)
 meerkat-cli       → CLI binary (produces `rkat`)
 meerkat           → Facade crate, re-exports, AgentFactory, SDK helpers
@@ -203,6 +204,12 @@ The RPC server speaks JSON-RPC 2.0 over newline-delimited JSON (JSONL) on stdin/
 - `meerkat-mob/src/runtime/loop_iteration_authority.rs` - Loop body/evaluate seam ownership
 - `meerkat-mob-mcp/src/agent_tools.rs` - Agent-facing delegation tools (delegate, mob_create, mob_spawn_member, etc.)
 - `meerkat-mob-pack/src/lib.rs` - Mobpack archive format, signing, trust
+- `meerkat-schedule/src/service.rs` - ScheduleService CRUD + occurrence planning
+- `meerkat-schedule/src/driver.rs` - ScheduleDriver tick loop + delivery
+- `meerkat-schedule/src/authority.rs` - Schedule and occurrence lifecycle authorities
+- `meerkat-schedule/src/store.rs` - ScheduleStore trait + MemoryScheduleStore
+- `meerkat-schedule/src/tools.rs` - Agent-facing schedule tools
+- `meerkat/src/surface/schedule_host.rs` - Runtime-backed schedule delivery surface
 - `meerkat-web-runtime/src/lib.rs` - WASM browser deployment (wasm_bindgen exports)
 - `sdks/web/src/runtime.ts` - @rkat/web MeerkatRuntime class (browser SDK entry point)
 - `sdks/web/src/mob.ts` - @rkat/web Mob class (mob lifecycle wrapper)

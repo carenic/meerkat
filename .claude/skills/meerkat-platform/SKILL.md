@@ -234,6 +234,72 @@ Terminology:
 
 Do not conflate the two: mob tool availability is a surface behavior, backend is a realm storage choice.
 
+## Scheduling
+
+The `meerkat-schedule` crate provides durable, authority-backed scheduling for automated agent task execution.
+
+### Schedule model
+
+A `Schedule` defines when and how agent sessions are materialized:
+- **Trigger**: `Cron(CalendarTriggerSpec)` or `Interval(IntervalTriggerSpec)`
+- **Target**: `Session(SessionTargetBinding)` or `Mob(MobTargetBinding)`
+- **Policies**: `MisfirePolicy` (Execute/Skip/SkipIfOlderThan), `OverlapPolicy` (Allow/Skip/Queue), `MissingTargetPolicy` (Skip/Fail/Create)
+- **Phase**: `Active`, `Paused`, `Completed`, `Cancelled`
+
+Each schedule produces `Occurrence` instances (individual fires) projected within a planning horizon.
+
+### Schedule tools (agent-facing)
+
+| Tool | Description |
+|------|-------------|
+| `schedule_create` | Create a schedule with trigger + target |
+| `schedule_list` | List schedules with optional filters |
+| `schedule_read` | Read a schedule and its occurrences |
+| `schedule_update` | Update trigger, target, or policies |
+| `schedule_pause` / `schedule_resume` | Pause/resume a schedule |
+| `schedule_delete` | Delete a schedule |
+
+Tools are available across all surfaces (CLI, REST, RPC, MCP). WASM uses `DisabledScheduleStore`.
+
+### Architecture
+
+```
+ScheduleService         — CRUD + occurrence planning
+ScheduleDriver          — tick loop, claims due occurrences, dispatches delivery
+ScheduleLifecycleAuthority   — authority-backed schedule state transitions
+OccurrenceLifecycleAuthority — authority-backed occurrence state transitions
+ScheduleStore           — persistence (Memory, SQLite, Redb)
+```
+
+**Delivery**: The driver claims due occurrences, probes target availability, dispatches delivery (creates session + runs prompt), and monitors completion. The schedule host surface (`meerkat/src/surface/schedule_host.rs`) bridges delivery to `RuntimeSessionAdapter`.
+
+**Planning**: On create/update/resume, `ScheduleService` projects occurrences within a horizon (30 days or 64 occurrences). Old occurrences are superseded atomically via `atomic_plan_mutation()`.
+
+**Stores are per-realm, not per-instance** — multiple processes may share a schedule store. Use `atomic_plan_mutation()` for safe multi-step changes.
+
+### Rust SDK usage
+
+```rust
+use meerkat_schedule::{ScheduleService, MemoryScheduleStore, CreateScheduleRequest};
+use std::sync::Arc;
+
+let store = Arc::new(MemoryScheduleStore::new());
+let service = ScheduleService::new(store);
+
+let schedule = service.create(CreateScheduleRequest {
+    display_name: "hourly-report".into(),
+    trigger: TriggerSpec::Interval(IntervalTriggerSpec {
+        every: Duration::from_secs(3600),
+    }),
+    target: TargetBinding::Session(SessionTargetBinding {
+        model: "claude-sonnet-4-5".into(),
+        prompt: ContentInput::Text("Generate hourly report".into()),
+        ..Default::default()
+    }),
+    ..Default::default()
+}).await?;
+```
+
 ## Quick start
 
 ### CLI
