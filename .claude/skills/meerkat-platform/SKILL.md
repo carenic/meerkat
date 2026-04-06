@@ -454,23 +454,30 @@ On materialized sessions, the LLM client is hot-swapped for the remainder of the
 
 ## Core features
 
-### Multimodal content (0.5)
+### Multimodal content
 
-Prompts and tool results support multimodal content (text + images). The `ContentInput` type (`Text(String)` or `Blocks(Vec<ContentBlock>)`) is used for all prompt parameters across surfaces.
+Prompts and tool results support multimodal content (text, images, and video). The `ContentInput` type (`Text(String)` or `Blocks(Vec<ContentBlock>)`) is used for all prompt parameters across surfaces.
+
+**Content block types:**
+- `ContentBlock::Text { text }` — plain text
+- `ContentBlock::Image { media_type, data }` — base64-encoded image with `ImageData::Inline` or `ImageData::Blob`
+- `ContentBlock::Video { media_type, duration_ms, data }` — base64-encoded inline video with `VideoData::Inline`
 
 **SDK prompt types:**
-- Python: `prompt: str | list[dict]` — dicts with `{"type": "text", "text": "..."}` or `{"type": "image", "media_type": "...", "data": "<base64>"}`
-- TypeScript: `prompt: string | ContentBlock[]` — `{type: "text", text: "..."}` or `{type: "image", mediaType: "...", data: "<base64>"}`
+- Python: `prompt: str | list[dict]` — dicts with `{"type": "text", "text": "..."}`, `{"type": "image", "media_type": "...", "data": "<base64>"}`, or `{"type": "video", "media_type": "video/mp4", "duration_ms": 12000, "data": "<base64>"}`
+- TypeScript: `prompt: string | ContentBlock[]` — `{type: "text", text: "..."}`, `{type: "image", mediaType: "...", data: "<base64>"}`, or `{type: "video", media_type: "video/mp4", duration_ms: 12000, data: "<base64>"}`
 - Rust: `prompt: ContentInput` — `ContentInput::Text(s)` or `ContentInput::Blocks(vec![...])`; implements `From<&str>` and `From<String>`
+
+**Video support:** Inline video is Gemini-only. Supported media types: `video/mp4`, `video/webm`, `video/quicktime`. Non-Gemini providers degrade replayed video to `[video: media_type]` text placeholders. Video in tool results is rejected at all providers. Ingress validation rejects video input for non-Gemini models at RPC, REST, and session boundaries.
 
 **view_image builtin tool:** Reads images from disk (PNG/JPEG/GIF/WebP/SVG), returns base64 `ContentBlock::Image`. Path sandboxed to project root. 5 MB limit. Hidden on non-vision-capable models via `ToolScope` based on `ModelProfile.vision` and `ModelProfile.image_tool_results`.
 
 **Provider capabilities:**
-| Provider | `vision` | `image_tool_results` |
-|----------|----------|---------------------|
-| Anthropic | Yes | Yes |
-| OpenAI | Yes | No |
-| Gemini | Yes | Yes |
+| Provider | `vision` | `image_tool_results` | `inline_video` |
+|----------|----------|---------------------|----------------|
+| Anthropic | Yes | Yes | No |
+| OpenAI | Yes | No | No |
+| Gemini | Yes | Yes | Yes |
 
 ### Sessions
 

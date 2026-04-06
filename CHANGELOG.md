@@ -70,6 +70,21 @@ Meerkat 0.5.1 is a feature release adding the scheduler subsystem, flow-frame lo
 #### Examples
 - Example 035: MDM TUX — ratatui device manager using P2P comms with target and TUX binaries.
 
+#### Multimodal content
+- Inline video content blocks (`ContentBlock::Video`) with `VideoData::Inline` for base64-encoded video. Gemini-only native support (`inlineData`); Anthropic and OpenAI degrade replayed video to `[video: media_type]` text placeholders.
+- `duration_ms` field on video blocks for caller-provided clip duration, used in token estimation for compaction.
+- `inline_video: bool` on `ModelProfile` for capability detection (Gemini=true, Anthropic/OpenAI=false).
+- Video ingress validation at RPC, REST, and ephemeral session boundaries — rejects non-Gemini video with typed error.
+- Video in tool results rejected at all three providers and the agent state machine.
+- Compaction strips video blocks to text placeholders alongside images. Token estimation uses `max(data_size/4, duration_ms*300/1000)`.
+
+#### Typed notices and build-seam cleanup
+- `Message::SystemNotice(SystemNoticeMessage)` variant with typed `SystemNoticeKind` enum (`McpPending`, `BackgroundJob`, `ToolScope`, `ToolScopeWarning`, `Generic`). Replaces stringly-typed `Message::User` with `[SYSTEM NOTICE]` prefixes.
+- Backward-compatible deserialization: old `Message::User` with `[SYSTEM NOTICE]` prefixes auto-promote to `Message::SystemNotice` on load.
+- `render_metadata: Option<RenderMetadata>` on `UserMessage` for structured classification.
+- `WireSessionMessage::SystemNotice` variant in wire contracts.
+- All three LLM providers render `SystemNotice` as user-role text with `rendered_text()`.
+
 #### Other
 - `ToolCategoryOverride` enum (`Inherit | Enable | Disable`) for typed tool category control in `SessionTooling`.
 - Typed `RejectReason` enum on `AcceptOutcome::Rejected` replacing bare `String` (NotReady, DurabilityViolation, PeerHandlingModeInvalid).
@@ -85,6 +100,7 @@ Meerkat 0.5.1 is a feature release adding the scheduler subsystem, flow-frame lo
 - Prefab enum and all prefab-based mob creation deleted.
 - Redundant `MobActorCoreExecutor` deleted; `ensure_autonomous_runtime_ready` slimmed.
 - Mob operator tool authority boundaries tightened.
+- Tool override fields on `SessionBuildOptions` and `AgentBuildConfig` migrated from `Option<bool>` to `ToolCategoryOverride`. Tool-specific bits removed from `ResumeOverrideMask`.
 
 ### Fixed
 - Background shell job completions now correctly wake the agent in all runtime-backed surfaces (previously silent due to split-owner registry bug).
