@@ -396,10 +396,13 @@ Mob runtime for multi-agent coordination:
 - **MobBuilder**: construct or resume a mob runtime from a `MobDefinition` and `MobStorage`
 - **MobHandle**: runtime handle for lifecycle, membership, wiring, turns, flows, and tasks
 - **MobDefinition**: declarative mob structure (profiles, wiring, topology, limits, flows)
-- **MobStorage**: event/run/spec storage bundle (in-memory or redb)
+- **MobStorage**: event/run/spec storage bundle (SQLite/WAL persistent or in-memory)
 - **Flow engine**: `run_flow` / `flow_status` / `cancel_flow` for multi-step orchestration
+- **FlowFrameEngine**: frame-based flow execution with `repeat_until` loops (v2 flows)
 - **Task board**: shared `task_create` / `task_update` / `task_list` for structured work assignment
 - **Parallel spawn**: `spawn_many` batches provisioning and wiring concurrently
+
+Prefabs are gone; all mob creation uses `MobDefinition` only.
 
 Feature-gated; depends on `meerkat-core` directly.
 </Accordion>
@@ -426,6 +429,9 @@ Composed via `SessionBuildOptions.external_tools` when a surface wants to grant
 agent-side `mob_*` capability. Public host surfaces use the typed helpers or
 their own canonical typed transport contracts instead of re-exporting the raw
 dispatcher.
+- **AgentMobToolSurface**: agent-facing delegation tools (`delegate`, `mob_create`, `mob_destroy`, `mob_spawn_member`, `mob_retire_member`, `mob_check_member`, `mob_list_members`, `mob_list`)
+
+Composed via `SessionBuildOptions.external_tools` so CLI, REST, RPC, and MCP server surfaces all get mob tool capability through the same path. Agent-facing delegation tools are late-bound via `MobToolsFactory`.
 </Accordion>
 
 <Accordion title="meerkat-rpc">

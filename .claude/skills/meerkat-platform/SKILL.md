@@ -32,7 +32,7 @@ Default persistent backend:
 
 - New persistent realms default to `sqlite` when sqlite support is compiled.
 - `sqlite` is the normal same-realm multi-process backend.
-- `redb` remains explicit for single-owner embedded workflows.
+- `redb` remains explicit for single-owner embedded session workflows.
 - `jsonl` remains explicit for inspectable file-backed persistence.
 
 Default realm behavior:
@@ -85,6 +85,9 @@ For detailed mob behavior across all surfaces, load: `references/mobs.md`.
 - RPC/REST/MCP server/Python SDK/TypeScript SDK expose mob capability via the same dispatcher composition model (`SessionBuildOptions.external_tools`) in host integrations.
 - Member runtime default is `autonomous_host` when `runtime_mode` is omitted; `turn_driven` is explicit opt-in for controlled dispatch paths.
 - Spawned mob members use deferred initial turn semantics; mob actor lifecycle starts autonomous loops explicitly after spawn registration.
+- Mob persistence is SQLite/WAL-backed (`MobStorage::persistent()` opens `SqliteMobStores`). In-memory storage is used for tests and WASM. The redb-backed mob store has been removed.
+- Prefabs are gone. All mob creation uses `MobDefinition` only (CLI, REST, RPC, MCP, SDKs).
+- Agent-facing delegation tools (`delegate`, `mob_create`, `mob_destroy`, `mob_spawn_member`, `mob_retire_member`, `mob_check_member`, `mob_list_members`, `mob_list`) are provided by `AgentMobToolSurface` in `meerkat-mob-mcp`. These tools let agents spawn and manage sub-agents through implicit session-owned mobs.
 - Portable mob artifacts are available through mobpack (`rkat mob pack/deploy/inspect/validate`) and browser deployment (`rkat mob web build`).
 
 ### Mob lifecycle (standard/default usage)
@@ -174,7 +177,7 @@ await mob.spawn([{ profile: 'worker', meerkat_id: 'w1' }]);
 - Agent loop (streaming, retries, error recovery, budget enforcement)
 - All three LLM providers (Anthropic, OpenAI, Gemini) via browser fetch
 - Session lifecycle (EphemeralSessionService)
-- Mob orchestration (MobBuilder, MobActor, FlowEngine, in-memory storage)
+- Mob orchestration (MobBuilder, MobActor, FlowEngine, FlowFrameEngine, in-memory storage)
 - Comms (inproc — InprocRegistry, Ed25519 signing, peer discovery)
 - Tool dispatch (task tools, utility builtins like `wait`/`datetime`/`apply_patch`, comms tools, skill tools — no shell)
 - Skills (embedded + memory sources from mobpack)
@@ -213,7 +216,10 @@ Flow model highlights:
 - branching via `branch` + `condition`,
 - dispatch mode (`one_to_one`, `fan_out`, `fan_in`),
 - topology policy enforcement (`strict|permissive` + role rules including `"*"` wildcard),
-- persisted run snapshots (`MobRun`) with `step_ledger` and `failure_ledger`.
+- persisted run snapshots (`MobRun`) with `step_ledger` and `failure_ledger`,
+- frame-based execution via `FlowSpec.root: FrameSpec` (v2 flows),
+- `repeat_until` loop nodes with `until` condition, `max_iterations` guard, and nested `body: FrameSpec`,
+- `FlowFrameEngine` drives frame execution; `FlowFrameMachine` owns frame-local state; `LoopIterationMachine` owns loop body/evaluate lifecycle.
 
 Operational notes:
 
@@ -415,6 +421,8 @@ Background shell job completions, mob member terminals, and async external tool 
 Key types: `CompletionFeed` trait (meerkat-core), `CompletionEntry`, `CompletionSeq`, `CompletionBatch`. Runtime implementation: `RuntimeCompletionFeed` in meerkat-runtime.
 
 The agent boundary injects `[BG_JOB]` system notices at the `CallingLlm` boundary for each new terminal entry. The runtime loop's idle wake fires on `wait_for_advance()` to inject continuation turns for quiescent sessions.
+
+Background shell jobs (started by the shell tool with `&` or via the `background` parameter) are tracked through the `OpsLifecycleRegistry` as detached operations. When a background job completes, the `CompletionFeed` delivers a `BackgroundJobCompleted` event. The agent receives a `[SYSTEM NOTICE][BG_JOB]` message containing the job name, ID, exit status, and output at the next `CallingLlm` boundary. Idle keep-alive sessions are woken via `DetachedWakeState` to process these completions.
 
 ### Durable runtime epoch recovery
 

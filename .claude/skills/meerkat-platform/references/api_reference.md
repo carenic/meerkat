@@ -215,6 +215,8 @@ Core methods:
 - `mob/events`, `mob/stream_open` / `mob/stream_close` — mob/member observation (feature-gated)
 - `mob/append_system_context`, `mob/flows`, `mob/flow_run`, `mob/flow_status`, `mob/flow_cancel` — advanced mob runtime methods (feature-gated)
 - `mob/tools` / `mob/call` — compatibility and escape-hatch mob tool access (feature-gated)
+- `mob/spawn_helper`, `mob/fork_helper` — convenience mob helpers (feature-gated)
+- `mob/force_cancel` — force-cancel a mob member's in-flight turn (feature-gated)
 - `comms/send` (feature-gated)
 - `comms/peers` (feature-gated)
 
@@ -484,6 +486,9 @@ if let Some(runtime) = factory.build_skill_runtime(&config).await {
 ## Flow spec essentials (mob definition)
 
 Flow declarations live under `[flows.<flow_id>]`.
+
+### v1: flat step declarations
+
 Step declarations live under `[flows.<flow_id>.steps.<step_id>]`.
 
 Key step fields:
@@ -499,8 +504,38 @@ Key step fields:
 - `timeout_ms`
 - `expected_schema_ref` (optional)
 
-Topology contract:
+### v2: frame-based execution root
+
+When `[flows.<flow_id>].root` is present, the flow uses frame-based execution via `FlowFrameEngine`.
+
+Frame root declaration: `[flows.<flow_id>.root]` with `nodes` map of `FlowNodeSpec` entries.
+
+Node types:
+
+- `type = "step"` — a single step within a frame
+- `type = "repeat_until"` — a loop node with `loop_id`, `body` (nested `FrameSpec`), `until` (condition expression), `max_iterations`, and `depends_on`
+
+v2 flows still support flat `steps` for backward compatibility; when `root` is present it takes precedence.
+
+### Topology contract
 
 - `[topology] mode = "strict"|"permissive"`
 - `rules = [{ from_role = "...", to_role = "...", allowed = true|false }]`
 - wildcard `"*"` role matching is supported.
+
+### Agent-facing delegation tools
+
+`AgentMobToolSurface` provides 8 agent-internal mob tools:
+
+| Tool | Purpose |
+|------|---------|
+| `delegate` | Quick helper spawn (implicit mob, auto-wire) |
+| `mob_create` | Create a mob from a definition |
+| `mob_destroy` | Destroy a mob and archive all members |
+| `mob_spawn_member` | Spawn a member into any mob |
+| `mob_retire_member` | Archive a member and its session |
+| `mob_check_member` | Check a member's execution status and output |
+| `mob_list_members` | List members of a mob |
+| `mob_list` | List all mobs |
+
+These tools are composed via `MobToolsFactory` late-binding. Operator capabilities are runtime-injected.
