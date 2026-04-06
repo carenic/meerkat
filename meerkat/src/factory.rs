@@ -1221,6 +1221,17 @@ impl AgentFactory {
         mut build_config: AgentBuildConfig,
         config: &Config,
     ) -> Result<DynAgent, BuildAgentError> {
+        build_config.resume_override_mask.override_builtins |= !matches!(
+            build_config.override_builtins,
+            ToolCategoryOverride::Inherit
+        );
+        build_config.resume_override_mask.override_shell |=
+            !matches!(build_config.override_shell, ToolCategoryOverride::Inherit);
+        build_config.resume_override_mask.override_memory |=
+            !matches!(build_config.override_memory, ToolCategoryOverride::Inherit);
+        build_config.resume_override_mask.override_mob |=
+            !matches!(build_config.override_mob, ToolCategoryOverride::Inherit);
+
         let explicit_mob_override =
             !matches!(build_config.override_mob, ToolCategoryOverride::Inherit);
         let resumed_session_metadata = Self::apply_resumed_session_metadata(&mut build_config);
