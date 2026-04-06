@@ -5,8 +5,8 @@ use chrono::{DateTime, LocalResult, TimeZone, Utc};
 use meerkat_schedule::{
     ClaimDueRequest, ClaimDueResult, DeliveryReceipt, DeliveryReceiptStage, Occurrence,
     OccurrenceFailureClass, OccurrenceFilter, OccurrenceId, OccurrenceLifecycleAuthority,
-    OccurrenceLifecycleError, OccurrenceLifecycleInput, Schedule, ScheduleFilter, ScheduleStore,
-    ScheduleStoreError, ScheduleStoreKind,
+    OccurrenceLifecycleError, OccurrenceLifecycleInput, PendingSupersession, Schedule,
+    ScheduleFilter, ScheduleStore, ScheduleStoreError, ScheduleStoreKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
@@ -446,6 +446,33 @@ impl ScheduleStore for SqliteScheduleStore {
             .map_err(into_schedule_store_error)
     }
 
+    async fn commit_schedule_mutation(
+        &self,
+        schedule: Schedule,
+        occurrences: Vec<Occurrence>,
+        supersession: Option<PendingSupersession>,
+    ) -> Result<(), ScheduleStoreError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = open_connection(&path)?;
+            ensure_schedule_schema(&conn)?;
+            let tx = begin_immediate_transaction(&mut conn)?;
+            write_schedule_in_txn(&tx, &schedule)?;
+            for occurrence in &occurrences {
+                write_occurrence_in_txn(&tx, occurrence)?;
+            }
+            if let Some(supersession) = supersession {
+                supersede_pending_occurrences_in_txn(&tx, &schedule, supersession)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(StoreError::Join)
+        .and_then(|result| result)
+        .map_err(into_schedule_store_error)
+    }
+
     async fn get_occurrence(
         &self,
         occurrence_id: &meerkat_schedule::OccurrenceId,
@@ -652,6 +679,42 @@ fn write_receipt_in_txn(
             receipt_json,
         ],
     )?;
+    Ok(())
+}
+
+fn supersede_pending_occurrences_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    schedule: &Schedule,
+    supersession: PendingSupersession,
+) -> Result<(), StoreError> {
+    let mut stmt = tx.prepare(
+        "SELECT occurrence_json
+         FROM schedule_occurrences
+         WHERE schedule_id = ?1 AND phase = 'pending'
+         ORDER BY due_at_ms ASC, schedule_revision ASC, occurrence_ordinal ASC",
+    )?;
+    let rows = stmt.query_map(params![schedule.schedule_id.to_string()], |row| {
+        row.get::<_, Vec<u8>>(0)
+    })?;
+    for row in rows {
+        let bytes = row?;
+        let occurrence: Occurrence =
+            serde_json::from_slice(&bytes).map_err(StoreError::Serialization)?;
+        if occurrence.schedule_revision >= supersession.superseded_by_revision {
+            continue;
+        }
+        let updated = OccurrenceLifecycleAuthority
+            .apply(
+                occurrence,
+                OccurrenceLifecycleInput::Supersede {
+                    superseded_by_revision: supersession.superseded_by_revision,
+                    at_utc: supersession.at_utc,
+                },
+            )
+            .map_err(|error: OccurrenceLifecycleError| StoreError::Internal(error.to_string()))?
+            .into_occurrence();
+        write_occurrence_in_txn(tx, &updated)?;
+    }
     Ok(())
 }
 

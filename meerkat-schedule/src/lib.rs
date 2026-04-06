@@ -28,7 +28,7 @@ pub use error::{ScheduleDomainError, ScheduleStoreError};
 pub use service::ScheduleService;
 pub use store::{
     ClaimDueRequest, ClaimDueResult, DisabledScheduleStore, MemoryScheduleStore, OccurrenceFilter,
-    ScheduleFilter, ScheduleStore, ScheduleStoreKind,
+    PendingSupersession, ScheduleFilter, ScheduleStore, ScheduleStoreKind,
 };
 pub use tools::{
     CAPABILITY_UNAVAILABLE as SCHEDULE_TOOL_CAPABILITY_UNAVAILABLE,

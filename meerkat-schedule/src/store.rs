@@ -2,7 +2,7 @@ use crate::authority::{OccurrenceLifecycleAuthority, OccurrenceLifecycleInput};
 use crate::error::ScheduleStoreError;
 use crate::types::{
     DeliveryReceipt, DeliveryReceiptStage, Occurrence, OccurrenceFailureClass, OccurrenceId,
-    OccurrencePhase, Schedule, ScheduleId, SchedulePhase,
+    OccurrencePhase, Schedule, ScheduleId, SchedulePhase, ScheduleRevision,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -43,6 +43,12 @@ pub struct OccurrenceFilter {
     pub due_after_utc: Option<DateTime<Utc>>,
     pub due_before_utc: Option<DateTime<Utc>>,
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSupersession {
+    pub at_utc: DateTime<Utc>,
+    pub superseded_by_revision: ScheduleRevision,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +109,13 @@ pub trait ScheduleStore: Send + Sync {
         }
         Ok(())
     }
+
+    async fn commit_schedule_mutation(
+        &self,
+        schedule: Schedule,
+        occurrences: Vec<Occurrence>,
+        supersession: Option<PendingSupersession>,
+    ) -> Result<(), ScheduleStoreError>;
 
     async fn get_occurrence(
         &self,
@@ -167,6 +180,15 @@ impl ScheduleStore for DisabledScheduleStore {
     }
 
     async fn put_occurrence(&self, _occurrence: Occurrence) -> Result<(), ScheduleStoreError> {
+        Err(unsupported(self.kind()))
+    }
+
+    async fn commit_schedule_mutation(
+        &self,
+        _schedule: Schedule,
+        _occurrences: Vec<Occurrence>,
+        _supersession: Option<PendingSupersession>,
+    ) -> Result<(), ScheduleStoreError> {
         Err(unsupported(self.kind()))
     }
 
@@ -286,6 +308,45 @@ impl ScheduleStore for MemoryScheduleStore {
             .await
             .occurrences
             .insert(occurrence.occurrence_id.clone(), occurrence);
+        Ok(())
+    }
+
+    async fn commit_schedule_mutation(
+        &self,
+        schedule: Schedule,
+        occurrences: Vec<Occurrence>,
+        supersession: Option<PendingSupersession>,
+    ) -> Result<(), ScheduleStoreError> {
+        let mut state = self.inner.write().await;
+        state
+            .schedules
+            .insert(schedule.schedule_id.clone(), schedule.clone());
+        for occurrence in occurrences {
+            state
+                .occurrences
+                .insert(occurrence.occurrence_id.clone(), occurrence);
+        }
+        if let Some(supersession) = supersession {
+            for occurrence in state.occurrences.values_mut() {
+                if occurrence.schedule_id != schedule.schedule_id
+                    || occurrence.phase != OccurrencePhase::Pending
+                    || occurrence.schedule_revision >= supersession.superseded_by_revision
+                {
+                    continue;
+                }
+                let updated = OccurrenceLifecycleAuthority
+                    .apply(
+                        occurrence.clone(),
+                        OccurrenceLifecycleInput::Supersede {
+                            superseded_by_revision: supersession.superseded_by_revision,
+                            at_utc: supersession.at_utc,
+                        },
+                    )
+                    .map_err(|error| ScheduleStoreError::Internal(error.to_string()))?
+                    .into_occurrence();
+                *occurrence = updated;
+            }
+        }
         Ok(())
     }
 

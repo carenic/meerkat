@@ -1,9 +1,6 @@
-use crate::authority::{
-    OccurrenceLifecycleAuthority, OccurrenceLifecycleInput, ScheduleLifecycleAuthority,
-    ScheduleLifecycleInput,
-};
+use crate::authority::{ScheduleLifecycleAuthority, ScheduleLifecycleInput};
 use crate::error::{ScheduleDomainError, ScheduleStoreError};
-use crate::store::{OccurrenceFilter, ScheduleFilter, ScheduleStore};
+use crate::store::{OccurrenceFilter, PendingSupersession, ScheduleFilter, ScheduleStore};
 use crate::trigger::occurrences_for_horizon;
 use crate::types::{
     CreateScheduleRequest, Occurrence, OccurrencePhase, Schedule, ScheduleId, SchedulePhase,
@@ -23,7 +20,6 @@ use tokio::sync::Mutex;
 pub struct ScheduleService {
     store: Arc<dyn ScheduleStore>,
     schedule_authority: Arc<ScheduleLifecycleAuthority>,
-    occurrence_authority: Arc<OccurrenceLifecycleAuthority>,
     planning_lock: Arc<Mutex<()>>,
 }
 
@@ -32,7 +28,6 @@ impl ScheduleService {
         Self {
             store,
             schedule_authority: Arc::new(ScheduleLifecycleAuthority),
-            occurrence_authority: Arc::new(OccurrenceLifecycleAuthority),
             planning_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -54,8 +49,9 @@ impl ScheduleService {
         let planned = self
             .plan_schedule_occurrences(&mut mutator.schedule, store_now)
             .await?;
-        self.store.put_schedule(mutator.schedule.clone()).await?;
-        self.store.put_occurrences(planned).await?;
+        self.store
+            .commit_schedule_mutation(mutator.schedule.clone(), planned, None)
+            .await?;
         Ok(mutator.schedule)
     }
 
@@ -95,16 +91,16 @@ impl ScheduleService {
         let planned = self
             .plan_schedule_occurrences(&mut mutator.schedule, store_now)
             .await?;
-        self.store.put_schedule(mutator.schedule.clone()).await?;
-        self.store.put_occurrences(planned).await?;
-        if mutator.revision_bumped {
-            self.supersede_pending_occurrences(
-                &mutator.schedule,
-                store_now,
-                Some(mutator.schedule.revision),
+        self.store
+            .commit_schedule_mutation(
+                mutator.schedule.clone(),
+                planned,
+                mutator.revision_bumped.then_some(PendingSupersession {
+                    at_utc: store_now,
+                    superseded_by_revision: mutator.schedule.revision,
+                }),
             )
             .await?;
-        }
         Ok(mutator.schedule)
     }
 
@@ -140,8 +136,9 @@ impl ScheduleService {
         let planned = self
             .plan_schedule_occurrences(&mut mutator.schedule, store_now)
             .await?;
-        self.store.put_schedule(mutator.schedule.clone()).await?;
-        self.store.put_occurrences(planned).await?;
+        self.store
+            .commit_schedule_mutation(mutator.schedule.clone(), planned, None)
+            .await?;
         Ok(mutator.schedule)
     }
 
@@ -157,8 +154,15 @@ impl ScheduleService {
             )
             .map_err(|error| ScheduleDomainError::InvalidSchedule(error.to_string()))?;
         let deleted = mutator.schedule.clone();
-        self.store.put_schedule(deleted.clone()).await?;
-        self.supersede_pending_occurrences(&deleted, store_now, Some(deleted.revision))
+        self.store
+            .commit_schedule_mutation(
+                deleted.clone(),
+                Vec::new(),
+                Some(PendingSupersession {
+                    at_utc: store_now,
+                    superseded_by_revision: deleted.revision,
+                }),
+            )
             .await?;
         Ok(deleted)
     }
@@ -188,8 +192,9 @@ impl ScheduleService {
             .plan_schedule_occurrences(&mut schedule, store_now)
             .await?;
         if !planned.is_empty() {
-            self.store.put_schedule(schedule).await?;
-            self.store.put_occurrences(planned.clone()).await?;
+            self.store
+                .commit_schedule_mutation(schedule, planned.clone(), None)
+                .await?;
         }
         Ok(planned)
     }
@@ -357,56 +362,140 @@ impl ScheduleService {
 
         Ok(planned)
     }
-
-    async fn supersede_pending_occurrences(
-        &self,
-        schedule: &Schedule,
-        store_now_utc: chrono::DateTime<Utc>,
-        superseding_revision: Option<crate::types::ScheduleRevision>,
-    ) -> Result<(), ScheduleDomainError> {
-        let pending = self
-            .store
-            .list_occurrences(OccurrenceFilter {
-                schedule_id: Some(schedule.schedule_id.clone()),
-                include_terminal: false,
-                phase: Some(OccurrencePhase::Pending),
-                ..OccurrenceFilter::default()
-            })
-            .await?;
-
-        for occurrence in pending {
-            if superseding_revision.is_some_and(|revision| occurrence.schedule_revision >= revision)
-            {
-                continue;
-            }
-            let updated = self
-                .occurrence_authority
-                .apply(
-                    occurrence,
-                    OccurrenceLifecycleInput::Supersede {
-                        superseded_by_revision: superseding_revision.unwrap_or(schedule.revision),
-                        at_utc: store_now_utc,
-                    },
-                )
-                .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?
-                .into_occurrence();
-            self.store.put_occurrence(updated).await?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::OccurrenceLifecycleInput;
     use crate::types::{
-        IntervalTriggerSpec, MisfirePolicy, ScheduledSessionAction, SessionMaterializationSpec,
-        SessionTargetBinding, TargetBinding, TriggerSpec,
+        DeliveryReceipt, IntervalTriggerSpec, MisfirePolicy, OccurrenceId, ScheduledSessionAction,
+        SessionMaterializationSpec, SessionTargetBinding, TargetBinding, TriggerSpec,
     };
     use crate::{MemoryScheduleStore, OverlapPolicy};
     use chrono::Duration;
     use meerkat_core::ContentInput;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use uuid::Uuid;
+
+    struct AtomicMutationProbeStore {
+        inner: Arc<dyn ScheduleStore>,
+        atomic_calls: AtomicUsize,
+        direct_schedule_writes: AtomicUsize,
+    }
+
+    impl AtomicMutationProbeStore {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(MemoryScheduleStore::new()),
+                atomic_calls: AtomicUsize::new(0),
+                direct_schedule_writes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ScheduleStore for AtomicMutationProbeStore {
+        fn kind(&self) -> crate::ScheduleStoreKind {
+            self.inner.kind()
+        }
+
+        async fn get_store_time_utc(&self) -> Result<chrono::DateTime<Utc>, ScheduleStoreError> {
+            self.inner.get_store_time_utc().await
+        }
+
+        async fn put_schedule(&self, schedule: Schedule) -> Result<(), ScheduleStoreError> {
+            self.direct_schedule_writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.put_schedule(schedule).await
+        }
+
+        async fn get_schedule(
+            &self,
+            schedule_id: &ScheduleId,
+        ) -> Result<Option<Schedule>, ScheduleStoreError> {
+            self.inner.get_schedule(schedule_id).await
+        }
+
+        async fn list_schedules(
+            &self,
+            filter: ScheduleFilter,
+        ) -> Result<Vec<Schedule>, ScheduleStoreError> {
+            self.inner.list_schedules(filter).await
+        }
+
+        async fn put_occurrence(&self, occurrence: Occurrence) -> Result<(), ScheduleStoreError> {
+            self.inner.put_occurrence(occurrence).await
+        }
+
+        async fn put_occurrences(
+            &self,
+            occurrences: Vec<Occurrence>,
+        ) -> Result<(), ScheduleStoreError> {
+            self.inner.put_occurrences(occurrences).await
+        }
+
+        async fn commit_schedule_mutation(
+            &self,
+            schedule: Schedule,
+            occurrences: Vec<Occurrence>,
+            supersession: Option<PendingSupersession>,
+        ) -> Result<(), ScheduleStoreError> {
+            self.atomic_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .commit_schedule_mutation(schedule, occurrences, supersession)
+                .await
+        }
+
+        async fn get_occurrence(
+            &self,
+            occurrence_id: &OccurrenceId,
+        ) -> Result<Option<Occurrence>, ScheduleStoreError> {
+            self.inner.get_occurrence(occurrence_id).await
+        }
+
+        async fn list_occurrences(
+            &self,
+            filter: OccurrenceFilter,
+        ) -> Result<Vec<Occurrence>, ScheduleStoreError> {
+            self.inner.list_occurrences(filter).await
+        }
+
+        async fn append_receipt(&self, receipt: DeliveryReceipt) -> Result<(), ScheduleStoreError> {
+            self.inner.append_receipt(receipt).await
+        }
+
+        async fn list_receipts(
+            &self,
+            occurrence_id: &OccurrenceId,
+        ) -> Result<Vec<DeliveryReceipt>, ScheduleStoreError> {
+            self.inner.list_receipts(occurrence_id).await
+        }
+
+        async fn claim_due_occurrences(
+            &self,
+            request: crate::ClaimDueRequest,
+        ) -> Result<crate::ClaimDueResult, ScheduleStoreError> {
+            self.inner.claim_due_occurrences(request).await
+        }
+
+        async fn transition_occurrence_if_current(
+            &self,
+            occurrence_id: &OccurrenceId,
+            expected_attempt: u32,
+            expected_claim_token: Option<Uuid>,
+            transition: OccurrenceLifecycleInput,
+        ) -> Result<Option<Occurrence>, ScheduleStoreError> {
+            self.inner
+                .transition_occurrence_if_current(
+                    occurrence_id,
+                    expected_attempt,
+                    expected_claim_token,
+                    transition,
+                )
+                .await
+        }
+    }
 
     #[tokio::test]
     async fn update_bumps_revision_and_supersedes_pending_future_occurrences()
@@ -597,6 +686,58 @@ mod tests {
                     && occurrence.superseded_by_revision == Some(deleted.revision)
             }),
             "delete should supersede pending occurrences against the new deleted revision"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_uses_atomic_store_mutation_for_replanning() -> Result<(), ScheduleDomainError> {
+        let store = Arc::new(AtomicMutationProbeStore::new());
+        let service = ScheduleService::new(store.clone() as Arc<dyn ScheduleStore>);
+
+        let created = service
+            .create(CreateScheduleRequest {
+                name: Some("atomic-update".into()),
+                description: None,
+                trigger: TriggerSpec::Interval(IntervalTriggerSpec {
+                    start_at_utc: Utc::now() + Duration::minutes(1),
+                    every_seconds: 60,
+                    end_at_utc: None,
+                }),
+                target: materialize_on_demand_target("initial prompt"),
+                misfire_policy: MisfirePolicy::Skip,
+                overlap_policy: OverlapPolicy::SkipIfRunning,
+                missing_target_policy: crate::MissingTargetPolicy::MarkMisfired,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(4),
+            })
+            .await?;
+        let atomic_after_create = store.atomic_calls.load(Ordering::SeqCst);
+
+        service
+            .update(
+                &created.schedule_id,
+                UpdateScheduleRequest {
+                    expected_revision: Some(created.revision),
+                    trigger: Some(TriggerSpec::Interval(IntervalTriggerSpec {
+                        start_at_utc: Utc::now() + Duration::minutes(2),
+                        every_seconds: 120,
+                        end_at_utc: None,
+                    })),
+                    ..UpdateScheduleRequest::default()
+                },
+            )
+            .await?;
+
+        assert!(
+            store.atomic_calls.load(Ordering::SeqCst) > atomic_after_create,
+            "update should route through the atomic schedule mutation seam"
+        );
+        assert_eq!(
+            store.direct_schedule_writes.load(Ordering::SeqCst),
+            0,
+            "update should not fall back to piecemeal put_schedule writes"
         );
         Ok(())
     }

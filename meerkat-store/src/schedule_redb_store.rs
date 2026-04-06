@@ -4,8 +4,8 @@ use chrono::{DateTime, Utc};
 use meerkat_schedule::{
     ClaimDueRequest, ClaimDueResult, DeliveryReceipt, DeliveryReceiptStage, Occurrence,
     OccurrenceFailureClass, OccurrenceFilter, OccurrenceId, OccurrenceLifecycleAuthority,
-    OccurrenceLifecycleError, OccurrenceLifecycleInput, Schedule, ScheduleFilter, ScheduleStore,
-    ScheduleStoreError, ScheduleStoreKind,
+    OccurrenceLifecycleError, OccurrenceLifecycleInput, PendingSupersession, Schedule,
+    ScheduleFilter, ScheduleStore, ScheduleStoreError, ScheduleStoreKind,
 };
 use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
 use std::path::Path;
@@ -449,6 +449,32 @@ impl ScheduleStore for RedbScheduleStore {
             .map_err(into_schedule_store_error)
     }
 
+    async fn commit_schedule_mutation(
+        &self,
+        schedule: Schedule,
+        occurrences: Vec<Occurrence>,
+        supersession: Option<PendingSupersession>,
+    ) -> Result<(), ScheduleStoreError> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let write_txn = db
+                .begin_write()
+                .map_err(|e| StoreError::Database(Box::new(e.into())))?;
+            write_schedule_in_txn(&write_txn, &schedule)?;
+            for occurrence in &occurrences {
+                write_occurrence_in_txn(&write_txn, occurrence)?;
+            }
+            if let Some(supersession) = supersession {
+                supersede_pending_occurrences_in_txn(&write_txn, &schedule, supersession)?;
+            }
+            commit(write_txn)
+        })
+        .await
+        .map_err(StoreError::Join)
+        .and_then(|result| result)
+        .map_err(into_schedule_store_error)
+    }
+
     async fn get_occurrence(
         &self,
         occurrence_id: &meerkat_schedule::OccurrenceId,
@@ -606,6 +632,48 @@ fn write_receipt_in_txn(
     table
         .insert(receipt_key(receipt).as_slice(), json.as_slice())
         .map_err(|e| StoreError::Database(Box::new(e.into())))?;
+    Ok(())
+}
+
+fn supersede_pending_occurrences_in_txn(
+    write_txn: &WriteTransaction,
+    schedule: &Schedule,
+    supersession: PendingSupersession,
+) -> Result<(), StoreError> {
+    let mut updated = Vec::new();
+    {
+        let table = write_txn
+            .open_table(OCCURRENCES_BY_ID)
+            .map_err(|e| StoreError::Database(Box::new(e.into())))?;
+        let iter = table
+            .iter()
+            .map_err(|e| StoreError::Database(Box::new(e.into())))?;
+        for entry in iter {
+            let (_, value) = entry.map_err(|e| StoreError::Database(Box::new(e.into())))?;
+            let occurrence: Occurrence =
+                serde_json::from_slice(value.value()).map_err(StoreError::Serialization)?;
+            if occurrence.schedule_id != schedule.schedule_id
+                || occurrence.phase != meerkat_schedule::OccurrencePhase::Pending
+                || occurrence.schedule_revision >= supersession.superseded_by_revision
+            {
+                continue;
+            }
+            let occurrence = OccurrenceLifecycleAuthority
+                .apply(
+                    occurrence,
+                    OccurrenceLifecycleInput::Supersede {
+                        superseded_by_revision: supersession.superseded_by_revision,
+                        at_utc: supersession.at_utc,
+                    },
+                )
+                .map_err(|error: OccurrenceLifecycleError| StoreError::Internal(error.to_string()))?
+                .into_occurrence();
+            updated.push(occurrence);
+        }
+    }
+    for occurrence in &updated {
+        write_occurrence_in_txn(write_txn, occurrence)?;
+    }
     Ok(())
 }
 
