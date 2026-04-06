@@ -11,7 +11,7 @@ use meerkat_core::Session;
 use meerkat_core::comms::{CommsCommand, PeerDirectoryEntry, SendError, SendReceipt};
 use meerkat_core::event::AgentEvent;
 use meerkat_core::service::{CreateSessionRequest, SessionError, TurnToolOverlay};
-use meerkat_core::types::{HandlingMode, RenderMetadata, RunResult, SessionId};
+use meerkat_core::types::{HandlingMode, Message, RenderMetadata, RunResult, SessionId};
 use meerkat_session::EphemeralSessionService;
 use meerkat_session::ephemeral::{SessionAgent, SessionAgentBuilder, SessionSnapshot};
 use std::sync::Arc;
@@ -101,6 +101,13 @@ impl SessionAgent for FactoryAgent {
         self.agent.run_with_events(prompt, event_tx).await
     }
 
+    async fn run_pending_with_events(
+        &mut self,
+        event_tx: mpsc::Sender<AgentEvent>,
+    ) -> Result<RunResult, meerkat_core::error::AgentError> {
+        self.agent.run_pending_with_events(event_tx).await
+    }
+
     fn set_skill_references(&mut self, refs: Option<Vec<meerkat_core::skills::SkillKey>>) {
         self.agent.pending_skill_references = refs;
     }
@@ -114,6 +121,19 @@ impl SessionAgent for FactoryAgent {
             .map_err(|error| meerkat_core::error::AgentError::ConfigError(error.to_string()))
     }
 
+    fn apply_pending_tool_results(
+        &mut self,
+        results: Vec<meerkat_core::ToolResult>,
+    ) -> Result<(), meerkat_core::error::AgentError> {
+        if results.is_empty() {
+            return Ok(());
+        }
+        self.agent
+            .session_mut()
+            .push(Message::ToolResults { results });
+        Ok(())
+    }
+
     fn replace_client(&mut self, client: std::sync::Arc<dyn meerkat_core::AgentLlmClient>) {
         self.agent.replace_client(client);
     }
@@ -125,6 +145,20 @@ impl SessionAgent for FactoryAgent {
                 tracing::warn!(error = %e, "failed to update keep_alive in session metadata");
             }
         }
+    }
+
+    fn update_mob_tool_authority_context(
+        &mut self,
+        authority_context: Option<meerkat_core::service::MobToolAuthorityContext>,
+    ) -> Result<(), meerkat_core::error::AgentError> {
+        self.agent
+            .session_mut()
+            .set_mob_tool_authority_context(authority_context)
+            .map_err(|err| {
+                meerkat_core::error::AgentError::InternalError(format!(
+                    "failed to update mob tool authority context in session metadata: {err}"
+                ))
+            })
     }
 
     fn update_system_prompt(
@@ -405,7 +439,9 @@ mod tests {
     use meerkat_core::comms::{InputSource, InputStreamMode};
     use meerkat_core::ops_lifecycle::OpsLifecycleRegistry;
     use meerkat_core::service::SessionBuildOptions;
-    use meerkat_core::{ToolCallView, ToolDef, ToolDispatchOutcome, ToolError, ToolResult};
+    use meerkat_core::{
+        Provider, ToolCallView, ToolDef, ToolDispatchOutcome, ToolError, ToolResult,
+    };
     use meerkat_runtime::RuntimeSessionAdapter;
     use meerkat_session::ephemeral::SessionAgent;
     use std::pin::Pin;
@@ -543,6 +579,7 @@ mod tests {
 
             skill_references: None,
             initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
             build: Some(SessionBuildOptions {
                 resume_session: Some(session),
                 runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
@@ -638,6 +675,7 @@ mod tests {
 
             skill_references: None,
             initial_turn: meerkat_core::service::InitialTurnPolicy::RunImmediately,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
             build: Some(build),
             labels: None,
         };
@@ -655,6 +693,37 @@ mod tests {
                 .map_err(|err| format!("{err}"))?;
         assert_eq!(result.text, "override");
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_default_llm_override_allows_unknown_model_names() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|err| format!("tempdir: {err}"))?;
+        let factory = AgentFactory::new(temp.path().join("sessions"));
+        let mut builder = FactoryAgentBuilder::new(factory, Config::default());
+        builder.default_llm_client = Some(Arc::new(MockLlmClient { delta: "override" }));
+
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let agent = builder
+            .build_agent(&make_session_request("mock-model"), event_tx)
+            .await
+            .map_err(|err| format!("{err}"))?;
+
+        let metadata = agent
+            .session()
+            .session_metadata()
+            .ok_or_else(|| "missing session metadata".to_string())?;
+        assert_eq!(metadata.provider, Provider::Other);
+        Ok(())
+    }
+
+    #[test]
+    fn test_session_build_options_preserve_keep_alive_flag() {
+        let mut build = AgentBuildConfig::new("claude-sonnet-4-5");
+        build.apply_session_build_options(&SessionBuildOptions {
+            keep_alive: true,
+            ..SessionBuildOptions::default()
+        });
+        assert!(build.keep_alive);
     }
 
     // ── Per-agent provider resolution via Config.providers.api_keys ──
@@ -675,6 +744,7 @@ mod tests {
 
             skill_references: None,
             initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
             build: None,
             labels: None,
         }

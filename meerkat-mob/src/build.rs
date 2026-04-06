@@ -11,16 +11,25 @@ use crate::profile::Profile;
 use meerkat::AgentBuildConfig;
 use meerkat_core::PeerMeta;
 use meerkat_core::Session;
-use meerkat_core::service::CreateSessionRequest;
+use meerkat_core::service::{CreateSessionRequest, DeferredPromptPolicy, MobToolAuthorityContext};
 use meerkat_core::session::SessionMetadata;
 use meerkat_core::types::SessionId;
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum MobToolAccessContext {
     #[default]
     None,
-    OperatorCapabilitiesPresent,
+    InjectedAuthority(MobToolAuthorityContext),
+}
+
+impl MobToolAccessContext {
+    pub fn authority(&self) -> Option<MobToolAuthorityContext> {
+        match self {
+            Self::None => None,
+            Self::InjectedAuthority(authority) => Some(authority.clone()),
+        }
+    }
 }
 
 /// Parameters for building an agent config from a mob profile.
@@ -128,10 +137,8 @@ pub async fn build_agent_config(
     config.override_builtins = Some(profile.tools.builtins);
     config.override_shell = Some(profile.tools.shell);
     config.override_memory = Some(profile.tools.memory);
-    config.override_mob = Some(matches!(
-        mob_tool_access_context,
-        MobToolAccessContext::OperatorCapabilitiesPresent
-    ));
+    config.override_mob = Some(mob_tool_access_context.authority().is_some());
+    config.mob_tool_authority_context = mob_tool_access_context.authority();
     config.resume_override_mask.override_mob = true;
 
     // External tools (mob tools, task tools, rust bundles composed externally)
@@ -254,8 +261,11 @@ pub fn to_create_session_request(
         skill_references: None,
         // Mob runtime owns lifecycle startup and starts autonomous host loops
         // explicitly after provisioning. Avoid synchronous first-turn execution
-        // during create_session so spawn does not block on LLM latency.
+        // during create_session so spawn does not block on LLM latency, and do
+        // not stage the kickoff prompt here because the runtime will send it
+        // explicitly on the first real turn.
         initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+        deferred_prompt_policy: DeferredPromptPolicy::Discard,
         build: Some(build_options),
         labels: None,
     }
@@ -385,8 +395,19 @@ mod tests {
             spawn_policy: None,
             event_router: None,
             owner_session_id: None,
+            session_cleanup_policy: crate::definition::SessionCleanupPolicy::Manual,
             is_implicit: false,
         }
+    }
+
+    fn injected_authority() -> MobToolAccessContext {
+        MobToolAccessContext::InjectedAuthority(
+            meerkat_core::service::MobToolAuthorityContext::new(
+                meerkat_core::service::OpaquePrincipalToken::new("test-principal"),
+                true,
+            )
+            .with_managed_mob_scope(["test-mob"]),
+        )
     }
 
     #[tokio::test]
@@ -564,12 +585,16 @@ mod tests {
             labels: None,
             additional_instructions: None,
             shell_env: None,
-            mob_tool_access_context: MobToolAccessContext::OperatorCapabilitiesPresent,
+            mob_tool_access_context: injected_authority(),
         })
         .await
         .expect("build_agent_config");
 
         assert_eq!(config.override_mob, Some(true));
+        assert!(
+            config.mob_tool_authority_context.is_some(),
+            "typed injected authority should flow into the build config"
+        );
         assert!(config.resume_override_mask.override_mob);
     }
 
@@ -835,6 +860,11 @@ mod tests {
         assert_eq!(req.model, "claude-opus-4-6");
         assert_eq!(req.prompt.text_content(), "Hello mob");
         assert!(req.system_prompt.is_some());
+        assert_eq!(
+            req.initial_turn,
+            meerkat_core::service::InitialTurnPolicy::Defer
+        );
+        assert_eq!(req.deferred_prompt_policy, DeferredPromptPolicy::Discard);
 
         let build = req.build.expect("build options should be set");
         assert_eq!(build.comms_name.as_deref(), Some("test-mob/lead/lead-1"));
@@ -866,6 +896,7 @@ mod tests {
 
         let req = to_create_session_request(&config, "Start working".to_string().into());
         assert_eq!(req.model, "claude-sonnet-4-5");
+        assert_eq!(req.deferred_prompt_policy, DeferredPromptPolicy::Discard);
         let build = req.build.expect("build options");
         assert_eq!(build.override_shell, Some(false));
     }

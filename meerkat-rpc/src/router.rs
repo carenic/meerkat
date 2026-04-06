@@ -339,6 +339,14 @@ impl MethodRouter {
             .with_default_llm_client_provider(Some(llm_provider))
             .with_external_tools_provider(Some(tools_provider))
         });
+        #[cfg(feature = "mob")]
+        runtime.set_mob_state(mob_state.clone());
+        let schedule_runtime = runtime.clone();
+        tokio::spawn(async move {
+            if let Err(error) = schedule_runtime.ensure_schedule_host_started().await {
+                tracing::warn!("failed to start RPC schedule host: {error}");
+            }
+        });
         Self {
             runtime,
             config_store,
@@ -485,6 +493,13 @@ impl MethodRouter {
         mob_state: Arc<meerkat_mob_mcp::MobMcpState>,
     ) -> Self {
         let runtime_adapter = runtime.runtime_adapter();
+        runtime.set_mob_state(mob_state.clone());
+        let schedule_runtime = runtime.clone();
+        tokio::spawn(async move {
+            if let Err(error) = schedule_runtime.ensure_schedule_host_started().await {
+                tracing::warn!("failed to start RPC schedule host: {error}");
+            }
+        });
         Self {
             runtime,
             config_store,
@@ -638,6 +653,34 @@ impl MethodRouter {
             "session/inject_context" => self.handle_session_inject_context(id, params).await,
             "session/stream_open" => self.handle_session_stream_open(id, params).await,
             "session/stream_close" => self.handle_session_stream_close(id, params).await,
+            "schedule/create" => {
+                handlers::schedule::handle_create(id, params, self.runtime.clone()).await
+            }
+            "schedule/get" => {
+                handlers::schedule::handle_get(id, params, self.runtime.clone()).await
+            }
+            "schedule/list" => {
+                handlers::schedule::handle_list(id, params, self.runtime.clone()).await
+            }
+            "schedule/update" => {
+                handlers::schedule::handle_update(id, params, self.runtime.clone()).await
+            }
+            "schedule/pause" => {
+                handlers::schedule::handle_pause(id, params, self.runtime.clone()).await
+            }
+            "schedule/resume" => {
+                handlers::schedule::handle_resume(id, params, self.runtime.clone()).await
+            }
+            "schedule/delete" => {
+                handlers::schedule::handle_delete(id, params, self.runtime.clone()).await
+            }
+            "schedule/occurrences" => {
+                handlers::schedule::handle_occurrences(id, params, self.runtime.clone()).await
+            }
+            "schedule/tools" => handlers::schedule::handle_tools(id).await,
+            "schedule/call" => {
+                handlers::schedule::handle_call(id, params, self.runtime.clone()).await
+            }
             "turn/start" => {
                 handlers::turn::handle_start(
                     id,
@@ -660,10 +703,6 @@ impl MethodRouter {
                     handlers::turn::handle_interrupt(id, params, &self.runtime).await
                 }
             }
-            #[cfg(feature = "mob")]
-            "mob/tools" => handlers::mob::handle_tools(id).await,
-            #[cfg(feature = "mob")]
-            "mob/call" => handlers::mob::handle_call(id, params, &self.mob_state).await,
             #[cfg(feature = "mob")]
             "mob/create" => handlers::mob::handle_create(id, params, &self.mob_state).await,
             #[cfg(feature = "mob")]
@@ -2427,8 +2466,9 @@ mod tests {
             assert!(method_names.contains(&"mob/fork_helper"));
             assert!(method_names.contains(&"mob/force_cancel"));
             assert!(method_names.contains(&"mob/member_status"));
-            assert!(method_names.contains(&"mob/tools"));
-            assert!(method_names.contains(&"mob/call"));
+            assert!(method_names.contains(&"mob/member_send"));
+            assert!(!method_names.contains(&"mob/tools"));
+            assert!(!method_names.contains(&"mob/call"));
             assert!(method_names.contains(&"mob/stream_open"));
             assert!(method_names.contains(&"mob/stream_close"));
         }
@@ -2445,18 +2485,14 @@ mod tests {
 
     #[cfg(feature = "mob")]
     #[tokio::test]
-    async fn mob_tools_and_call_flow_work() {
+    async fn mob_compatibility_routes_are_not_found() {
         let (router, _notif_rx) = test_router().await;
 
         let tools_resp = router
             .dispatch(make_request_no_params("mob/tools"))
             .await
             .unwrap();
-        let tools_binding = result_value(&tools_resp);
-        let tools = tools_binding["tools"]
-            .as_array()
-            .expect("tools should be array");
-        assert!(tools.iter().any(|tool| tool["name"] == "mob_create"));
+        assert_eq!(error_code(&tools_resp), error::METHOD_NOT_FOUND);
 
         let create_resp = router
             .dispatch(make_request(
@@ -2478,8 +2514,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let created = result_value(&create_resp);
-        assert!(created["mob_id"].as_str().is_some());
+        assert_eq!(error_code(&create_resp), error::METHOD_NOT_FOUND);
     }
 
     #[tokio::test]
@@ -3884,10 +3919,17 @@ mod tests {
 
         let create_resp = router
             .dispatch(make_request(
-                "mob/call",
+                "mob/create",
                 serde_json::json!({
-                    "name": "mob_create",
-                    "arguments": { "definition": { "id": "test_mob", "profiles": { "worker": { "model": "claude-sonnet-4-6", "tools": { "comms": true } } } } }
+                    "definition": {
+                        "id": "test_mob",
+                        "profiles": {
+                            "worker": {
+                                "model": "claude-sonnet-4-6",
+                                "tools": { "comms": true }
+                            }
+                        }
+                    }
                 }),
             ))
             .await
@@ -3940,10 +3982,17 @@ mod tests {
         // Create a mob first.
         let create_resp = router
             .dispatch(make_request(
-                "mob/call",
+                "mob/create",
                 serde_json::json!({
-                    "name": "mob_create",
-                    "arguments": { "definition": { "id": "test_mob", "profiles": { "worker": { "model": "claude-sonnet-4-6", "tools": { "comms": true } } } } }
+                    "definition": {
+                        "id": "test_mob",
+                        "profiles": {
+                            "worker": {
+                                "model": "claude-sonnet-4-6",
+                                "tools": { "comms": true }
+                            }
+                        }
+                    }
                 }),
             ))
             .await

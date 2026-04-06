@@ -1369,6 +1369,7 @@ impl MobSessionService for MockSessionService {
                 sequence: 0,
             },
             session_snapshot: None,
+            terminal: None,
             run_result: None,
         })
     }
@@ -1434,6 +1435,7 @@ impl FaultInjectedMobEventStore {
             MobEventKind::StepSkipped { .. } => "StepSkipped",
             MobEventKind::TopologyViolation { .. } => "TopologyViolation",
             MobEventKind::SupervisorEscalation { .. } => "SupervisorEscalation",
+            MobEventKind::OperatorActionRecorded { .. } => "OperatorActionRecorded",
         }
     }
 }
@@ -1868,6 +1870,7 @@ fn sample_definition() -> MobDefinition {
         spawn_policy: None,
         event_router: None,
         owner_session_id: None,
+        session_cleanup_policy: crate::definition::SessionCleanupPolicy::Manual,
         is_implicit: false,
     }
 }
@@ -3787,6 +3790,88 @@ async fn test_mob_management_tools_hidden_without_operator_context() {
 }
 
 #[tokio::test]
+async fn test_visible_mob_operator_reads_still_require_exact_scope() {
+    let (handle, _service) = create_test_mob(sample_definition_with_mob_tools()).await;
+    let profile = handle
+        .definition()
+        .profiles
+        .get(&ProfileName::from("worker"))
+        .expect("worker profile");
+    let dispatcher = super::tools::compose_external_tools_for_profile(
+        profile,
+        &BTreeMap::new(),
+        handle.clone(),
+        None,
+        crate::build::MobToolAccessContext::InjectedAuthority(
+            meerkat_core::service::MobToolAuthorityContext::new(
+                meerkat_core::service::OpaquePrincipalToken::new("out-of-scope"),
+                false,
+            )
+            .with_managed_mob_scope(["different-mob"]),
+        ),
+    )
+    .expect("compose dispatcher")
+    .expect("operator dispatcher should be visible when authority is injected");
+
+    let tools = dispatcher.tools();
+    let tool_names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        tool_names.contains(&"list_meerkats"),
+        "tool visibility should depend on injected authority presence, not scope success"
+    );
+
+    let args = RawValue::from_string("{}".to_string()).expect("raw args");
+    let error = dispatcher
+        .dispatch(ToolCallView {
+            id: "call-1",
+            name: "list_meerkats",
+            args: &args,
+        })
+        .await
+        .expect_err("out-of-scope operator read should be denied");
+    assert!(matches!(error, ToolError::AccessDenied { .. }));
+}
+
+#[tokio::test]
+async fn test_visible_mob_operator_tools_deny_before_arg_validation_when_scope_missing() {
+    let (handle, _service) = create_test_mob(sample_definition_with_mob_tools()).await;
+    let profile = handle
+        .definition()
+        .profiles
+        .get(&ProfileName::from("worker"))
+        .expect("worker profile");
+    let dispatcher = super::tools::compose_external_tools_for_profile(
+        profile,
+        &BTreeMap::new(),
+        handle.clone(),
+        None,
+        crate::build::MobToolAccessContext::InjectedAuthority(
+            meerkat_core::service::MobToolAuthorityContext::new(
+                meerkat_core::service::OpaquePrincipalToken::new("out-of-scope"),
+                false,
+            )
+            .with_managed_mob_scope(["different-mob"]),
+        ),
+    )
+    .expect("compose dispatcher")
+    .expect("operator dispatcher should be visible when authority is injected");
+
+    let args = RawValue::from_string("{}".to_string()).expect("raw args");
+    let error = dispatcher
+        .dispatch(ToolCallView {
+            id: "call-2",
+            name: "spawn_meerkat",
+            args: &args,
+        })
+        .await
+        .expect_err("out-of-scope operator call should be denied before args are parsed");
+    assert!(matches!(error, ToolError::AccessDenied { .. }));
+}
+
+#[tokio::test]
 async fn test_spawn_helper_contract_aligns_with_retired_terminal_state() {
     let (handle, service) = create_test_mob(sample_definition()).await;
     let helper_id = MeerkatId::from("helper-spawn");
@@ -4759,6 +4844,7 @@ async fn test_resume_reconciles_orphaned_sessions() {
             }),
             skill_references: None,
             initial_turn: meerkat_core::service::InitialTurnPolicy::RunImmediately,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
             labels: None,
         })
         .await
@@ -5623,6 +5709,7 @@ async fn test_attach_existing_session_rejects_comms_name_mismatch() {
             }),
             skill_references: None,
             initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
             labels: None,
         })
         .await
@@ -5748,6 +5835,7 @@ async fn test_attach_existing_session_restores_persisted_inactive_session() {
             }),
             skill_references: None,
             initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
             labels: None,
         })
         .await
@@ -13088,6 +13176,7 @@ impl MobSessionService for RuntimeBackedRealCommsSessionService {
                 sequence: 0,
             },
             session_snapshot: None,
+            terminal: None,
             run_result: None,
         })
     }

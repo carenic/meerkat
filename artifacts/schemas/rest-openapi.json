@@ -46,16 +46,6 @@
         "summary": "Get a runtime input state"
       }
     },
-    "/mob/call": {
-      "post": {
-        "summary": "Invoke a mob tool call"
-      }
-    },
-    "/mob/tools": {
-      "get": {
-        "summary": "List mob tools"
-      }
-    },
     "/mob/{id}/events": {
       "get": {
         "summary": "SSE mob event stream"
@@ -109,6 +99,50 @@
     "/runtime/{id}/state": {
       "get": {
         "summary": "Get runtime state"
+      }
+    },
+    "/schedule/call": {
+      "post": {
+        "summary": "Invoke a schedule tool"
+      }
+    },
+    "/schedule/tools": {
+      "get": {
+        "summary": "List schedule tools"
+      }
+    },
+    "/schedules": {
+      "get": {
+        "summary": "List schedules"
+      },
+      "post": {
+        "summary": "Create schedule"
+      }
+    },
+    "/schedules/{id}": {
+      "delete": {
+        "summary": "Delete schedule"
+      },
+      "get": {
+        "summary": "Get schedule"
+      },
+      "patch": {
+        "summary": "Update schedule"
+      }
+    },
+    "/schedules/{id}/occurrences": {
+      "get": {
+        "summary": "List schedule occurrences"
+      }
+    },
+    "/schedules/{id}/pause": {
+      "post": {
+        "summary": "Pause schedule"
+      }
+    },
+    "/schedules/{id}/resume": {
+      "post": {
+        "summary": "Resume schedule"
       }
     },
     "/sessions": {

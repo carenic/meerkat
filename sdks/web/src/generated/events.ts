@@ -247,6 +247,13 @@ export interface InteractionCompleteEvent {
   type: "interaction_complete";
 }
 
+export interface InteractionCallbackPendingEvent {
+  args: unknown;
+  interaction_id: InteractionId;
+  tool_name: string;
+  type: "interaction_callback_pending";
+}
+
 export interface InteractionFailedEvent {
   error: string;
   interaction_id: InteractionId;
@@ -336,6 +343,7 @@ export type AgentEvent =
   SkillsResolvedEvent |
   SkillResolutionFailedEvent |
   InteractionCompleteEvent |
+  InteractionCallbackPendingEvent |
   InteractionFailedEvent |
   StreamTruncatedEvent |
   ToolConfigChangedEvent |

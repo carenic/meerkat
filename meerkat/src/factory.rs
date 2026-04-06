@@ -213,6 +213,9 @@ pub struct AgentBuildConfig {
     pub provider_params: Option<serde_json::Value>,
     /// External tool dispatcher to compose with builtins (e.g., MCP callback tools).
     pub external_tools: Option<Arc<dyn AgentToolDispatcher>>,
+    /// Serializable tool definitions that can rebuild recoverable
+    /// surface-owned dispatchers after persistence or runtime restart.
+    pub recoverable_tool_defs: Option<Vec<meerkat_core::ToolDef>>,
     /// Optional blob store override used for image externalization/hydration.
     pub blob_store_override: Option<Arc<dyn BlobStore>>,
     /// Per-build override for factory-level `enable_builtins`.
@@ -226,6 +229,12 @@ pub struct AgentBuildConfig {
     pub override_memory: Option<bool>,
     /// Per-build override for factory-level `enable_mob`.
     pub override_mob: Option<bool>,
+    /// Runtime-injected mob operator authority context.
+    ///
+    /// Tool visibility may depend on this context being present, but
+    /// dispatch-time authorization must still re-check the typed create/scope
+    /// fields on every operator tool call.
+    pub mob_tool_authority_context: Option<meerkat_core::service::MobToolAuthorityContext>,
     /// Late-binding mob tool factory, invoked inside `build_agent()` with
     /// session-scoped args (session ID, ops lifecycle, comms runtime) to produce
     /// the mob tool dispatcher. Composed into the tool gateway after comms.
@@ -326,11 +335,16 @@ impl std::fmt::Debug for AgentBuildConfig {
             .field("llm_client_override", &self.llm_client_override.is_some())
             .field("provider_params", &self.provider_params.is_some())
             .field("external_tools", &self.external_tools.is_some())
+            .field("recoverable_tool_defs", &self.recoverable_tool_defs)
             .field("blob_store_override", &self.blob_store_override.is_some())
             .field("override_builtins", &self.override_builtins)
             .field("override_shell", &self.override_shell)
             .field("override_memory", &self.override_memory)
             .field("override_mob", &self.override_mob)
+            .field(
+                "mob_tool_authority_context",
+                &self.mob_tool_authority_context.is_some(),
+            )
             .field("mob_tools", &self.mob_tools.is_some())
             .field("realm_id", &self.realm_id)
             .field("instance_id", &self.instance_id)
@@ -381,11 +395,13 @@ impl AgentBuildConfig {
             llm_client_override: None,
             provider_params: None,
             external_tools: None,
+            recoverable_tool_defs: None,
             blob_store_override: None,
             override_builtins: None,
             override_shell: None,
             override_memory: None,
             override_mob: None,
+            mob_tool_authority_context: None,
             mob_tools: None,
             preload_skills: None,
             realm_id: None,
@@ -424,6 +440,29 @@ impl AgentBuildConfig {
         build
     }
 
+    /// Apply the shared host/runtime default for explicit mob operator
+    /// enablement.
+    ///
+    /// This keeps `override_mob` and the generated create-only authority
+    /// context aligned at the composition seam. Existing-mob scope must be
+    /// injected explicitly elsewhere; this helper never infers it.
+    pub fn apply_persisted_mob_operator_access(
+        &mut self,
+        enable_mob: Option<bool>,
+        persisted_authority_context: Option<meerkat_core::service::MobToolAuthorityContext>,
+    ) {
+        let (override_mob, authority_context) = meerkat_core::service::resolve_mob_operator_access(
+            enable_mob,
+            persisted_authority_context,
+        );
+        self.override_mob = override_mob;
+        self.mob_tool_authority_context = authority_context;
+    }
+
+    pub fn apply_generated_create_only_mob_operator_access(&mut self, enable_mob: Option<bool>) {
+        self.apply_persisted_mob_operator_access(enable_mob, None);
+    }
+
     /// Merge `SessionBuildOptions` into this build config.
     pub fn apply_session_build_options(&mut self, build: &SessionBuildOptions) {
         self.provider = build.provider;
@@ -436,6 +475,7 @@ impl AgentBuildConfig {
         self.budget_limits = build.budget_limits.clone();
         self.provider_params = build.provider_params.clone();
         self.external_tools = build.external_tools.clone();
+        self.recoverable_tool_defs = build.recoverable_tool_defs.clone();
         self.blob_store_override = build.blob_store_override.clone();
         self.llm_client_override = build
             .llm_client_override
@@ -445,12 +485,14 @@ impl AgentBuildConfig {
         self.override_shell = build.override_shell;
         self.override_memory = build.override_memory;
         self.override_mob = build.override_mob;
+        self.mob_tool_authority_context = build.mob_tool_authority_context.clone();
         self.mob_tools = build.mob_tools.clone();
         self.preload_skills = build.preload_skills.clone();
         self.realm_id = build.realm_id.clone();
         self.instance_id = build.instance_id.clone();
         self.backend = build.backend.clone();
         self.config_generation = build.config_generation;
+        self.keep_alive = build.keep_alive;
         self.silent_comms_intents
             .clone_from(&build.silent_comms_intents);
         self.max_inline_peer_notifications = build.max_inline_peer_notifications;
@@ -476,6 +518,7 @@ impl AgentBuildConfig {
             budget_limits: self.budget_limits.clone(),
             provider_params: self.provider_params.clone(),
             external_tools: self.external_tools.clone(),
+            recoverable_tool_defs: self.recoverable_tool_defs.clone(),
             blob_store_override: self.blob_store_override.clone(),
             llm_client_override: self
                 .llm_client_override
@@ -485,6 +528,7 @@ impl AgentBuildConfig {
             override_shell: self.override_shell,
             override_memory: self.override_memory,
             override_mob: self.override_mob,
+            mob_tool_authority_context: self.mob_tool_authority_context.clone(),
             mob_tools: self.mob_tools.clone(),
             preload_skills: self.preload_skills.clone(),
             realm_id: self.realm_id.clone(),
@@ -876,6 +920,10 @@ impl AgentFactory {
         }
         if !mask.override_mob {
             build_config.override_mob = metadata.tooling.mob.to_override();
+            build_config.mob_tool_authority_context = build_config
+                .resume_session
+                .as_ref()
+                .and_then(Session::mob_tool_authority_context);
         }
         if !mask.preload_skills {
             build_config.preload_skills = metadata.tooling.active_skills.clone();
@@ -1172,6 +1220,18 @@ impl AgentFactory {
     ) -> Result<DynAgent, BuildAgentError> {
         let resumed_session_metadata = Self::apply_resumed_session_metadata(&mut build_config);
 
+        // Explicit build-time mob enablement should surface the generated
+        // create-only authority shape when no typed authority was already
+        // supplied or recovered. Ambient factory defaults must not do this,
+        // and resumed metadata alone must not escalate operator capability.
+        if build_config.mob_tool_authority_context.is_none()
+            && matches!(build_config.override_mob, Some(true))
+            && (build_config.resume_session.is_none()
+                || build_config.resume_override_mask.override_mob)
+        {
+            build_config.apply_generated_create_only_mob_operator_access(Some(true));
+        }
+
         if let Some(value) = build_config.max_inline_peer_notifications
             && value < -1
         {
@@ -1191,12 +1251,17 @@ impl AgentFactory {
             Some(p) => p,
             None => {
                 let inferred = ProviderResolver::infer_from_model(&build_config.model);
-                if inferred == Provider::Other {
+                if inferred != Provider::Other {
+                    inferred
+                } else if let Some(client) = build_config.llm_client_override.as_ref() {
+                    // An explicit override is the authoritative execution transport
+                    // when the model name is not recognizable.
+                    Provider::from_name(client.provider())
+                } else {
                     return Err(BuildAgentError::UnknownProvider {
                         model: build_config.model.clone(),
                     });
                 }
-                inferred
             }
         };
 
@@ -1288,6 +1353,7 @@ impl AgentFactory {
         let skill_engine: Option<Arc<meerkat_core::skills::SkillRuntime>> = None;
 
         // 6b. Build tool dispatcher (with optional external tools, per-build overrides, skill tools)
+        let persisted_system_prompt = build_config.system_prompt.clone();
         let per_request_prompt = build_config.system_prompt.take();
         let effective_builtins = build_config
             .override_builtins
@@ -1459,6 +1525,13 @@ impl AgentFactory {
                 }
             };
 
+        tracing::debug!(
+            base_tool_count = tools.tools().len(),
+            effective_builtins,
+            effective_shell,
+            "tool composition: base dispatcher built"
+        );
+
         // 7. Create session store adapter (override > factory > feature-flag default)
         let store_adapter: Arc<dyn AgentSessionStore> =
             if let Some(store) = build_config.session_store_override.take() {
@@ -1500,10 +1573,19 @@ impl AgentFactory {
             tool_usage_instructions = composed.1;
         }
 
+        tracing::debug!(
+            tool_count_after_comms = tools.tools().len(),
+            "tool composition: after comms gateway"
+        );
+
         // 9b. Compose tools with mob surface (after comms, so mob gateway wraps the
         // already-composed comms gateway).
-        let operator_capabilities_present = build_config.override_mob == Some(true);
-        let effective_mob = build_config.override_mob.unwrap_or(self.enable_mob);
+        let effective_mob = if matches!(build_config.override_mob, Some(false)) {
+            false
+        } else {
+            build_config.override_mob.unwrap_or(self.enable_mob)
+                || build_config.mob_tool_authority_context.is_some()
+        };
         let mob_factory = build_config
             .mob_tools
             .take()
@@ -1520,7 +1602,7 @@ impl AgentFactory {
             let mob_args = meerkat_core::service::MobToolsBuildArgs {
                 session_id: session.id().clone(),
                 model: model.clone(),
-                operator_capabilities_present,
+                authority_context: build_config.mob_tool_authority_context.clone(),
                 comms_name: build_config.comms_name.clone(),
                 comms_runtime: mob_comms,
             };
@@ -1552,7 +1634,7 @@ impl AgentFactory {
         //
         // BindOutcome::was_bound() tells the factory whether to wire
         // side effects (e.g. actionable-notify bridge task).
-        #[allow(unused_mut)]
+        #[cfg(feature = "comms")]
         let mut bind_succeeded_wait = false;
         #[cfg(feature = "comms")]
         if let Some(ref runtime) = comms_runtime {
@@ -1662,6 +1744,12 @@ impl AgentFactory {
                 })?;
             tools = outcome.into_dispatcher();
         }
+
+        tracing::debug!(
+            final_tool_count = tools.tools().len(),
+            tool_names = %tools.tools().iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "),
+            "tool composition: final dispatcher"
+        );
 
         // 10. Resolve hooks (override > filesystem layered config)
         #[allow(
@@ -1871,6 +1959,24 @@ impl AgentFactory {
             }
         }
 
+        let persisted_build_state = meerkat_core::SessionBuildState {
+            system_prompt: persisted_system_prompt,
+            output_schema: build_config.output_schema.clone(),
+            hooks_override: build_config.hooks_override.clone(),
+            budget_limits: build_config.budget_limits.clone(),
+            recoverable_tool_defs: build_config
+                .recoverable_tool_defs
+                .clone()
+                .unwrap_or_default(),
+            silent_comms_intents: build_config.silent_comms_intents.clone(),
+            max_inline_peer_notifications: build_config.max_inline_peer_notifications,
+            app_context: build_config.app_context.clone(),
+            additional_instructions: build_config.additional_instructions.clone(),
+            shell_env: build_config.shell_env.clone(),
+            mob_tool_authority_context: build_config.mob_tool_authority_context.clone(),
+            call_timeout_override: build_config.call_timeout_override.clone(),
+        };
+
         // 12. Build AgentBuilder
         let budget_limits = build_config
             .budget_limits
@@ -2044,6 +2150,9 @@ impl AgentFactory {
             metadata.tooling.mob = ToolCategoryOverride::from_override(build_config.override_mob);
             metadata.tooling.memory =
                 ToolCategoryOverride::from_override(build_config.override_memory);
+            if build_config.resume_override_mask.preload_skills {
+                metadata.tooling.active_skills = active_skill_ids;
+            }
             metadata.keep_alive = build_config.keep_alive;
             metadata.comms_name = build_config.comms_name;
             metadata.peer_meta = build_config.peer_meta;
@@ -2078,6 +2187,9 @@ impl AgentFactory {
         };
         if let Err(err) = agent.session_mut().set_session_metadata(metadata) {
             tracing::warn!("Failed to store session metadata: {}", err);
+        }
+        if let Err(err) = agent.session_mut().set_build_state(persisted_build_state) {
+            tracing::warn!("Failed to store session build state: {}", err);
         }
 
         Ok(agent)

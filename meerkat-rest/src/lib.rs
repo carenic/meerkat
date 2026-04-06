@@ -15,6 +15,7 @@
 //! When enabled, the REST instance uses its instance-scoped data directory
 //! as the project root for task storage and shell working directory.
 
+mod schedule_host;
 pub mod webhook;
 
 use axum::{
@@ -30,29 +31,32 @@ use axum::{
 use chrono::{DateTime, Utc};
 use futures::stream::Stream;
 use meerkat::surface::{
-    RequestAlreadyExists, RequestContext, SurfaceRequestExecutor, noop_request_action,
-    request_action,
+    RequestAlreadyExists, RequestContext, SurfaceRequestExecutor, SurfaceSessionRecoveryContext,
+    SurfaceSessionRecoveryOverrides, build_recovered_session, noop_request_action, request_action,
 };
 use meerkat::{
     AgentEvent, AgentFactory, FactoryAgentBuilder, LlmClient, OutputSchema,
-    PersistentSessionService, Session, SessionId, SessionService, SessionServiceControlExt,
-    SessionServiceHistoryExt, encode_llm_client_override_for_service, open_realm_persistence_in,
+    PersistentSessionService, ScheduleService, Session, SessionId, SessionService,
+    SessionServiceControlExt, SessionServiceHistoryExt, encode_llm_client_override_for_service,
+    handle_schedule_tools_call, open_realm_persistence_in, schedule_tools_list,
 };
 use meerkat_contracts::{SessionLocator, SkillsParams, format_session_ref};
 use meerkat_core::EventEnvelope;
 use meerkat_core::lifecycle::core_executor::{CoreApplyOutput, CoreExecutor, CoreExecutorError};
 use meerkat_core::lifecycle::run_control::RunControlCommand;
-use meerkat_core::lifecycle::run_primitive::{CoreRenderable, RunApplyBoundary, RunPrimitive};
+use meerkat_core::lifecycle::run_primitive::{
+    ConversationContextAppend, CoreRenderable, RunApplyBoundary, RunPrimitive,
+};
 use meerkat_core::service::{
     AppendSystemContextRequest as SvcAppendSystemContextRequest,
-    CreateSessionRequest as SvcCreateSessionRequest, InitialTurnPolicy, ResumeOverrideMask,
-    SessionBuildOptions, SessionControlError, SessionError,
+    CreateSessionRequest as SvcCreateSessionRequest, DeferredPromptPolicy, InitialTurnPolicy,
+    ResumeOverrideMask, SessionBuildOptions, SessionControlError, SessionError,
     StartTurnRequest as SvcStartTurnRequest,
 };
 use meerkat_core::{
     Config, ConfigDelta, ConfigEnvelope, ConfigEnvelopePolicy, ConfigStore, ContentInput,
-    FileConfigStore, HookRunOverrides, Provider, RealmSelection, RuntimeBootstrap,
-    agent_event_type, format_verbose_event,
+    FileConfigStore, HookRunOverrides, PendingSystemContextAppend, Provider, RealmSelection,
+    RuntimeBootstrap, agent_event_type, format_verbose_event,
 };
 use meerkat_runtime::SessionServiceRuntimeExt as _;
 use meerkat_store::{RealmBackend, RealmOrigin};
@@ -112,6 +116,7 @@ pub struct AppState {
     pub event_tx: broadcast::Sender<SessionEvent>,
     /// Session service for managing agent lifecycle.
     pub session_service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    pub schedule_service: ScheduleService,
     /// Webhook authentication, resolved once at startup from RKAT_WEBHOOK_SECRET.
     pub webhook_auth: webhook::WebhookAuth,
     pub realm_id: String,
@@ -124,6 +129,7 @@ pub struct AppState {
     pub skill_runtime: Option<Arc<meerkat_core::skills::SkillRuntime>>,
     /// Optional v9 runtime adapter for runtime/input endpoints.
     pub runtime_adapter: Arc<meerkat_runtime::RuntimeSessionAdapter>,
+    pub schedule_host: Arc<schedule_host::ScheduleHostState>,
     /// Shared in-process mob lifecycle state for protocol mob operations.
     #[cfg(feature = "mob")]
     pub mob_state: Arc<meerkat_mob_mcp::MobMcpState>,
@@ -142,8 +148,6 @@ pub struct SessionEvent {
 
 #[derive(Clone)]
 struct RestRuntimeExecutorContext {
-    default_model: Cow<'static, str>,
-    max_tokens: u32,
     llm_client_override: Option<Arc<dyn LlmClient>>,
     event_tx: broadcast::Sender<SessionEvent>,
     session_service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
@@ -204,6 +208,7 @@ impl AppState {
         let (manifest, persistence) =
             open_realm_persistence_in(&realms_root, &realm_id, backend_hint, origin_hint).await?;
         let session_store = persistence.session_store();
+        let schedule_service = ScheduleService::new(persistence.schedule_store());
         let realm_paths = meerkat_store::realm_paths_in(&realms_root, &realm_id);
         let resolved_paths = meerkat_core::ConfigResolvedPaths {
             root: realm_paths.root.display().to_string(),
@@ -315,6 +320,7 @@ impl AppState {
             config_store,
             event_tx,
             session_service,
+            schedule_service,
             webhook_auth: webhook::WebhookAuth::from_env(),
             realm_id,
             instance_id,
@@ -325,6 +331,7 @@ impl AppState {
             realm_lease: Arc::new(tokio::sync::Mutex::new(Some(lease))),
             skill_runtime,
             runtime_adapter,
+            schedule_host: Arc::new(schedule_host::ScheduleHostState::default()),
             #[cfg(feature = "mob")]
             mob_state: {
                 let state = Arc::new(meerkat_mob_mcp::MobMcpState::new(mob_session_service));
@@ -345,8 +352,6 @@ impl AppState {
 
     fn runtime_executor_context(&self) -> RestRuntimeExecutorContext {
         RestRuntimeExecutorContext {
-            default_model: self.default_model.clone(),
-            max_tokens: self.max_tokens,
             llm_client_override: self.llm_client_override.clone(),
             event_tx: self.event_tx.clone(),
             session_service: self.session_service.clone(),
@@ -409,6 +414,36 @@ fn extract_runtime_prompt(primitive: &RunPrimitive) -> ContentInput {
     }
 }
 
+fn render_context_append_text(content: &CoreRenderable) -> String {
+    match content {
+        CoreRenderable::Text { text } => text.clone(),
+        CoreRenderable::Blocks { blocks } => meerkat_core::types::text_content(blocks),
+        CoreRenderable::Json { value } => {
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+        }
+        CoreRenderable::Reference { uri, label } => match label {
+            Some(label) if !label.trim().is_empty() => format!("[Reference] {label} ({uri})"),
+            _ => format!("[Reference] {uri}"),
+        },
+        _ => String::new(),
+    }
+}
+
+fn pending_system_context_appends(
+    appends: &[ConversationContextAppend],
+) -> Vec<PendingSystemContextAppend> {
+    let accepted_at = meerkat_core::time_compat::SystemTime::now();
+    appends
+        .iter()
+        .map(|append| PendingSystemContextAppend {
+            text: render_context_append_text(&append.content),
+            source: Some(append.key.clone()),
+            idempotency_key: Some(append.key.clone()),
+            accepted_at,
+        })
+        .collect()
+}
+
 async fn apply_runtime_turn(
     context: &RestRuntimeExecutorContext,
     session_id: &SessionId,
@@ -426,7 +461,7 @@ async fn apply_runtime_turn(
             .apply_runtime_context_appends(
                 session_id,
                 run_id,
-                staged.context_appends.clone(),
+                pending_system_context_appends(&staged.context_appends),
                 staged.contributing_input_ids.clone(),
             )
             .await;
@@ -502,11 +537,6 @@ async fn apply_runtime_turn(
                 .ok_or(SessionError::NotFound {
                     id: session_id.clone(),
                 })?;
-            let stored_metadata = session.session_metadata();
-            let tooling = stored_metadata
-                .as_ref()
-                .map(|meta| meta.tooling.clone())
-                .unwrap_or_default();
             let current_generation = context
                 .config_runtime
                 .get()
@@ -522,85 +552,43 @@ async fn apply_runtime_turn(
                         "failed to prepare runtime bindings for session {session_id}: {e}"
                     )))
                 })?;
-            let build = SessionBuildOptions {
-                provider: stored_metadata.as_ref().map(|meta| meta.provider),
-                output_schema: None,
-                structured_output_retries: 2,
-                hooks_override: HookRunOverrides::default(),
-                comms_name: stored_metadata
-                    .as_ref()
-                    .and_then(|meta| meta.comms_name.clone()),
-                peer_meta: stored_metadata
-                    .as_ref()
-                    .and_then(|meta| meta.peer_meta.clone()),
-                resume_session: Some(session),
-                budget_limits: None,
-                provider_params: None,
-                external_tools: None,
-                llm_client_override: context
-                    .llm_client_override
-                    .clone()
-                    .map(encode_llm_client_override_for_service),
-                override_builtins: tooling.builtins.to_override(),
-                override_shell: tooling.shell.to_override(),
-                override_memory: tooling.memory.to_override(),
-                override_mob: tooling.mob.to_override(),
-                preload_skills: tooling.active_skills.clone(),
-                realm_id: stored_metadata
-                    .as_ref()
-                    .and_then(|meta| meta.realm_id.clone())
-                    .or_else(|| Some(context.realm_id.clone())),
-                instance_id: stored_metadata
-                    .as_ref()
-                    .and_then(|meta| meta.instance_id.clone())
-                    .or_else(|| context.instance_id.clone()),
-                backend: stored_metadata
-                    .as_ref()
-                    .and_then(|meta| meta.backend.clone())
-                    .or_else(|| Some(context.backend.clone())),
-                config_generation: current_generation,
-                keep_alive,
-                checkpointer: None,
-                silent_comms_intents: Vec::new(),
-                max_inline_peer_notifications: None,
-                app_context: None,
-                additional_instructions: None,
-                shell_env: None,
-                resume_override_mask: Default::default(),
-                call_timeout_override: Default::default(),
-                blob_store_override: None,
-                mob_tools: None,
-                runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
-            };
-            let create_req = SvcCreateSessionRequest {
-                model: stored_metadata.as_ref().map_or_else(
-                    || context.default_model.to_string(),
-                    |meta| meta.model.clone(),
-                ),
-                prompt,
-                render_metadata: None,
-                system_prompt: None,
-                max_tokens: Some(
-                    stored_metadata
-                        .as_ref()
-                        .map_or(context.max_tokens, |meta| meta.max_tokens),
-                ),
-                event_tx: None,
-
-                skill_references: None,
-                initial_turn: InitialTurnPolicy::Defer,
-                build: Some(build),
-                labels: None,
-            };
-
-            context.session_service.create_session(create_req).await?;
-            let (_, output) = context
+            let recovered = build_recovered_session(
+                session,
+                &SurfaceSessionRecoveryOverrides {
+                    keep_alive: Some(keep_alive),
+                    ..Default::default()
+                },
+                SurfaceSessionRecoveryContext {
+                    llm_client_override: context
+                        .llm_client_override
+                        .clone()
+                        .map(encode_llm_client_override_for_service),
+                    external_tools: None,
+                    runtime_build_mode: Some(meerkat_core::RuntimeBuildMode::SessionOwned(
+                        bindings,
+                    )),
+                    realm_id: Some(context.realm_id.clone()),
+                    instance_id: context.instance_id.clone(),
+                    backend: Some(context.backend.clone()),
+                    config_generation: current_generation,
+                },
+            )
+            .map_err(|error| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                    error.to_string(),
+                ))
+            })?;
+            context
                 .session_service
-                .apply_runtime_turn_with_result(
+                .create_session(recovered.into_deferred_create_request())
+                .await?;
+            let output = context
+                .session_service
+                .apply_runtime_turn_outcome(
                     session_id,
                     run_id,
                     SvcStartTurnRequest {
-                        prompt: extract_runtime_prompt(primitive),
+                        prompt,
                         system_prompt: None,
                         render_metadata: None,
                         handling_mode: meerkat_core::types::HandlingMode::Queue,
@@ -935,6 +923,16 @@ pub struct SessionDetailsResponse {
     pub labels: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ScheduleListResponse {
+    pub schedules: Vec<meerkat::Schedule>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ScheduleOccurrencesResponse {
+    pub occurrences: Vec<meerkat::Occurrence>,
+}
+
 /// API error response
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
@@ -998,6 +996,13 @@ fn extract_request_context(
 
 /// Build the REST API router
 pub fn router(state: AppState) -> Router {
+    let schedule_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(error) = schedule_state.ensure_schedule_host_started().await {
+            tracing::warn!("failed to start REST schedule host: {error}");
+        }
+    });
+
     let r = Router::new()
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}", get(get_session).delete(archive_session))
@@ -1007,6 +1012,21 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/messages", post(continue_session))
         .route("/sessions/{id}/external-events", post(post_external_event))
         .route("/sessions/{id}/events", get(session_events))
+        .route("/schedule/tools", get(schedule_tools))
+        .route("/schedule/call", post(schedule_call))
+        .route("/schedules", get(list_schedules).post(create_schedule))
+        .route(
+            "/schedules/{id}",
+            get(get_schedule)
+                .patch(update_schedule)
+                .delete(delete_schedule),
+        )
+        .route("/schedules/{id}/pause", post(pause_schedule))
+        .route("/schedules/{id}/resume", post(resume_schedule))
+        .route(
+            "/schedules/{id}/occurrences",
+            get(list_schedule_occurrences),
+        )
         .route("/requests/{request_id}/cancel", post(cancel_request))
         .route("/comms/send", post(comms_send))
         .route("/comms/peers", get(comms_peers))
@@ -1029,8 +1049,6 @@ pub fn router(state: AppState) -> Router {
 
     #[cfg(feature = "mob")]
     let r = r
-        .route("/mob/tools", get(mob_tools))
-        .route("/mob/call", post(mob_call))
         .route("/mob/{id}/events", get(mob_event_stream))
         .route("/mob/{id}/spawn-helper", post(mob_spawn_helper))
         .route("/mob/{id}/fork-helper", post(mob_fork_helper))
@@ -1084,8 +1102,13 @@ async fn ensure_runtime_session_registered(
         .session_service
         .load_persisted(session_id)
         .await
-        .ok()
-        .flatten();
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error.to_string()})),
+            )
+                .into_response()
+        })?;
     if persisted
         .as_ref()
         .is_some_and(session_metadata_marks_archived)
@@ -1282,32 +1305,6 @@ async fn input_state(
 /// Health check endpoint
 async fn health_check() -> &'static str {
     "ok"
-}
-
-/// GET /mob/tools — list protocol-callable mob lifecycle tools.
-#[cfg(feature = "mob")]
-async fn mob_tools() -> Json<Value> {
-    Json(json!({ "tools": meerkat_mob_mcp::tools_list() }))
-}
-
-#[derive(Debug, Deserialize)]
-#[cfg(feature = "mob")]
-struct MobCallRequest {
-    name: String,
-    #[serde(default)]
-    arguments: Value,
-}
-
-/// POST /mob/call — invoke a mob lifecycle tool.
-#[cfg(feature = "mob")]
-async fn mob_call(
-    State(state): State<AppState>,
-    Json(req): Json<MobCallRequest>,
-) -> Result<Json<Value>, ApiError> {
-    let result = meerkat_mob_mcp::handle_tools_call(&state.mob_state, &req.name, &req.arguments)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.message))?;
-    Ok(Json(result))
 }
 
 /// Query parameters for `GET /mob/{id}/events`.
@@ -2204,6 +2201,50 @@ fn run_result_to_response(
     response
 }
 
+fn callback_pending_api_error(
+    session_id: &SessionId,
+    realm_id: &str,
+    tool_name: String,
+    args: Value,
+    session_created: bool,
+) -> ApiError {
+    ApiError::InternalWithData {
+        message: format!("callback pending for tool '{tool_name}'"),
+        code: "CALLBACK_PENDING".to_string(),
+        details: json!({
+            "session_id": session_id.to_string(),
+            "session_ref": format_session_ref(realm_id, session_id),
+            "session_created": session_created,
+            "resumable": true,
+            "tool_name": tool_name,
+            "args": args,
+        }),
+    }
+}
+
+fn completion_outcome_to_api_result(
+    outcome: meerkat_runtime::completion::CompletionOutcome,
+    session_id: &SessionId,
+    realm_id: &str,
+    session_created: bool,
+) -> Result<meerkat_core::types::RunResult, ApiError> {
+    match outcome {
+        meerkat_runtime::completion::CompletionOutcome::Completed(run_result) => Ok(run_result),
+        meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult => Err(
+            ApiError::Internal("turn completed without result".to_string()),
+        ),
+        meerkat_runtime::completion::CompletionOutcome::CallbackPending { tool_name, args } => Err(
+            callback_pending_api_error(session_id, realm_id, tool_name, args, session_created),
+        ),
+        meerkat_runtime::completion::CompletionOutcome::Abandoned(reason) => {
+            Err(ApiError::Internal(format!("turn abandoned: {reason}")))
+        }
+        meerkat_runtime::completion::CompletionOutcome::RuntimeTerminated(reason) => {
+            Err(ApiError::Internal(format!("runtime terminated: {reason}")))
+        }
+    }
+}
+
 fn resolve_session_id_for_state(input: &str, state: &AppState) -> Result<SessionId, ApiError> {
     let locator = SessionLocator::parse(input)
         .map_err(|e| ApiError::BadRequest(format!("Invalid session locator '{input}': {e}")))?;
@@ -2216,6 +2257,37 @@ fn resolve_session_id_for_state(input: &str, state: &AppState) -> Result<Session
         )));
     }
     Ok(locator.session_id)
+}
+
+fn resolve_schedule_id(input: &str) -> Result<meerkat::ScheduleId, ApiError> {
+    meerkat::ScheduleId::parse(input)
+        .map_err(|e| ApiError::BadRequest(format!("Invalid schedule id '{input}': {e}")))
+}
+
+fn schedule_error_to_api(error: meerkat::ScheduleDomainError) -> ApiError {
+    match error {
+        meerkat::ScheduleDomainError::Store(meerkat::ScheduleStoreError::ScheduleNotFound {
+            schedule_id,
+        }) => ApiError::NotFound(format!("Schedule not found: {schedule_id}")),
+        meerkat::ScheduleDomainError::Store(meerkat::ScheduleStoreError::UnsupportedBackend {
+            ..
+        }) => ApiError::ServiceUnavailable(error.to_string()),
+        meerkat::ScheduleDomainError::InvalidSchedule(_)
+        | meerkat::ScheduleDomainError::InvalidTrigger(_)
+        | meerkat::ScheduleDomainError::InvalidCron(_) => ApiError::BadRequest(error.to_string()),
+        other => ApiError::Internal(other.to_string()),
+    }
+}
+
+fn schedule_tool_error_to_api(error: meerkat::ScheduleToolError) -> ApiError {
+    match error.code {
+        meerkat::SCHEDULE_TOOL_INVALID_ARGUMENTS => ApiError::BadRequest(error.message),
+        meerkat::SCHEDULE_TOOL_NOT_FOUND => ApiError::NotFound(error.message),
+        meerkat::SCHEDULE_TOOL_CAPABILITY_UNAVAILABLE => {
+            ApiError::ServiceUnavailable(error.message)
+        }
+        _ => ApiError::Internal(error.message),
+    }
 }
 
 /// Create and run a new session (outer wrapper with request lifecycle).
@@ -2353,7 +2425,7 @@ async fn create_session_inner(
     }
 
     let current_generation = state.config_runtime.get().await.ok().map(|s| s.generation);
-    let build = SessionBuildOptions {
+    let mut build = SessionBuildOptions {
         provider: req.provider,
         output_schema: req.output_schema,
         structured_output_retries: req
@@ -2366,6 +2438,7 @@ async fn create_session_inner(
         budget_limits: req.budget_limits,
         provider_params: req.provider_params.clone(),
         external_tools: mcp_external_tools,
+        recoverable_tool_defs: None,
         llm_client_override: state
             .llm_client_override
             .clone()
@@ -2373,7 +2446,8 @@ async fn create_session_inner(
         override_builtins: req.enable_builtins,
         override_shell: req.enable_shell,
         override_memory: req.enable_memory,
-        override_mob: req.enable_mob,
+        override_mob: None,
+        mob_tool_authority_context: None,
         preload_skills: req
             .preload_skills
             .clone()
@@ -2409,6 +2483,7 @@ async fn create_session_inner(
         mob_tools: None,
         runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
     };
+    build.apply_generated_create_only_mob_operator_access(req.enable_mob);
 
     let svc_req = SvcCreateSessionRequest {
         model: model.to_string(),
@@ -2420,6 +2495,7 @@ async fn create_session_inner(
 
         skill_references: skill_references.clone(),
         initial_turn: InitialTurnPolicy::Defer,
+        deferred_prompt_policy: DeferredPromptPolicy::Discard,
         build: Some(build),
         labels: req.labels,
     };
@@ -2518,18 +2594,12 @@ async fn create_session_inner(
     };
 
     let result = match handle {
-        Some(handle) => match handle.wait().await {
-            meerkat_runtime::completion::CompletionOutcome::Completed(run_result) => Ok(run_result),
-            meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult => Err(
-                ApiError::Internal("turn completed without result".to_string()),
-            ),
-            meerkat_runtime::completion::CompletionOutcome::Abandoned(reason) => {
-                Err(ApiError::Internal(format!("turn abandoned: {reason}")))
-            }
-            meerkat_runtime::completion::CompletionOutcome::RuntimeTerminated(reason) => {
-                Err(ApiError::Internal(format!("runtime terminated: {reason}")))
-            }
-        },
+        Some(handle) => completion_outcome_to_api_result(
+            handle.wait().await,
+            &session_id,
+            &state.realm_id,
+            true,
+        ),
         None => {
             let existing_id = match &outcome {
                 meerkat_runtime::AcceptOutcome::Deduplicated { existing_id, .. } => {
@@ -2590,6 +2660,149 @@ fn parse_label_filters(
         map.insert(k.to_string(), v.to_string());
     }
     Ok(if map.is_empty() { None } else { Some(map) })
+}
+
+async fn create_schedule(
+    State(state): State<AppState>,
+    Json(request): Json<meerkat::CreateScheduleRequest>,
+) -> Result<Json<meerkat::Schedule>, ApiError> {
+    state
+        .ensure_schedule_host_started()
+        .await
+        .map_err(schedule_error_to_api)?;
+    state
+        .schedule_service
+        .create(request)
+        .await
+        .map(Json)
+        .map_err(schedule_error_to_api)
+}
+
+async fn schedule_tools() -> Json<Value> {
+    Json(json!({ "tools": schedule_tools_list() }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleToolCallRequest {
+    name: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
+async fn schedule_call(
+    State(state): State<AppState>,
+    Json(req): Json<ScheduleToolCallRequest>,
+) -> Result<Json<Value>, ApiError> {
+    state
+        .ensure_schedule_host_started()
+        .await
+        .map_err(schedule_error_to_api)?;
+    handle_schedule_tools_call(&state.schedule_service, &req.name, &req.arguments)
+        .await
+        .map(Json)
+        .map_err(schedule_tool_error_to_api)
+}
+
+async fn list_schedules(
+    State(state): State<AppState>,
+) -> Result<Json<ScheduleListResponse>, ApiError> {
+    state
+        .schedule_service
+        .list()
+        .await
+        .map(|schedules| Json(ScheduleListResponse { schedules }))
+        .map_err(schedule_error_to_api)
+}
+
+async fn get_schedule(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<meerkat::Schedule>, ApiError> {
+    let schedule_id = resolve_schedule_id(&id)?;
+    state
+        .schedule_service
+        .get(&schedule_id)
+        .await
+        .map(Json)
+        .map_err(schedule_error_to_api)
+}
+
+async fn update_schedule(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<meerkat::UpdateScheduleRequest>,
+) -> Result<Json<meerkat::Schedule>, ApiError> {
+    let schedule_id = resolve_schedule_id(&id)?;
+    state
+        .ensure_schedule_host_started()
+        .await
+        .map_err(schedule_error_to_api)?;
+    state
+        .schedule_service
+        .update(&schedule_id, request)
+        .await
+        .map(Json)
+        .map_err(schedule_error_to_api)
+}
+
+async fn pause_schedule(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<meerkat::Schedule>, ApiError> {
+    let schedule_id = resolve_schedule_id(&id)?;
+    state
+        .ensure_schedule_host_started()
+        .await
+        .map_err(schedule_error_to_api)?;
+    state
+        .schedule_service
+        .pause(&schedule_id)
+        .await
+        .map(Json)
+        .map_err(schedule_error_to_api)
+}
+
+async fn resume_schedule(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<meerkat::Schedule>, ApiError> {
+    let schedule_id = resolve_schedule_id(&id)?;
+    state
+        .ensure_schedule_host_started()
+        .await
+        .map_err(schedule_error_to_api)?;
+    state
+        .schedule_service
+        .resume(&schedule_id)
+        .await
+        .map(Json)
+        .map_err(schedule_error_to_api)
+}
+
+async fn delete_schedule(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<meerkat::Schedule>, ApiError> {
+    let schedule_id = resolve_schedule_id(&id)?;
+    state
+        .schedule_service
+        .delete(&schedule_id)
+        .await
+        .map(Json)
+        .map_err(schedule_error_to_api)
+}
+
+async fn list_schedule_occurrences(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ScheduleOccurrencesResponse>, ApiError> {
+    let schedule_id = resolve_schedule_id(&id)?;
+    state
+        .schedule_service
+        .list_occurrences(&schedule_id)
+        .await
+        .map(|occurrences| Json(ScheduleOccurrencesResponse { occurrences }))
+        .map_err(schedule_error_to_api)
 }
 
 /// List sessions in the active realm.
@@ -2945,7 +3158,7 @@ async fn continue_session_inner(
                 return RequestOutcome::Unpublished(Err(ApiError::Internal(message)));
             }
         };
-        let build = SessionBuildOptions {
+        let mut build = SessionBuildOptions {
             provider: req.provider,
             output_schema: req.output_schema,
             structured_output_retries: req
@@ -2958,6 +3171,7 @@ async fn continue_session_inner(
             budget_limits: None,
             provider_params: None,
             external_tools: None,
+            recoverable_tool_defs: None,
             llm_client_override: state
                 .llm_client_override
                 .clone()
@@ -2966,6 +3180,7 @@ async fn continue_session_inner(
             override_shell: None,
             override_memory: None,
             override_mob: None,
+            mob_tool_authority_context: None,
             preload_skills: None,
             realm_id: Some(state.realm_id.clone()),
             instance_id: state.instance_id.clone(),
@@ -2993,6 +3208,7 @@ async fn continue_session_inner(
             mob_tools: None,
             runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
         };
+        build.apply_generated_create_only_mob_operator_access(None);
         let create_req = SvcCreateSessionRequest {
             model: req
                 .model
@@ -3006,6 +3222,7 @@ async fn continue_session_inner(
             event_tx: Some(caller_event_tx.clone()),
             skill_references: skill_references.clone(),
             initial_turn: InitialTurnPolicy::Defer,
+            deferred_prompt_policy: DeferredPromptPolicy::Discard,
             build: Some(build),
             labels: None,
         };
@@ -3096,20 +3313,12 @@ async fn continue_session_inner(
             }
         };
         match handle {
-            Some(handle) => match handle.wait().await {
-                meerkat_runtime::completion::CompletionOutcome::Completed(run_result) => {
-                    Ok(run_result)
-                }
-                meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult => Err(
-                    ApiError::Internal("turn completed without result".to_string()),
-                ),
-                meerkat_runtime::completion::CompletionOutcome::Abandoned(reason) => {
-                    Err(ApiError::Internal(format!("turn abandoned: {reason}")))
-                }
-                meerkat_runtime::completion::CompletionOutcome::RuntimeTerminated(reason) => {
-                    Err(ApiError::Internal(format!("runtime terminated: {reason}")))
-                }
-            },
+            Some(handle) => completion_outcome_to_api_result(
+                handle.wait().await,
+                &session_id,
+                &state.realm_id,
+                false,
+            ),
             None => Err(ApiError::DuplicateInput {
                 existing_id: String::new(),
             }),
@@ -3206,20 +3415,12 @@ async fn continue_session_inner(
         };
 
         match handle {
-            Some(handle) => match handle.wait().await {
-                meerkat_runtime::completion::CompletionOutcome::Completed(run_result) => {
-                    Ok(run_result)
-                }
-                meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult => Err(
-                    ApiError::Internal("turn completed without result".to_string()),
-                ),
-                meerkat_runtime::completion::CompletionOutcome::Abandoned(reason) => {
-                    Err(ApiError::Internal(format!("turn abandoned: {reason}")))
-                }
-                meerkat_runtime::completion::CompletionOutcome::RuntimeTerminated(reason) => {
-                    Err(ApiError::Internal(format!("runtime terminated: {reason}")))
-                }
-            },
+            Some(handle) => completion_outcome_to_api_result(
+                handle.wait().await,
+                &session_id,
+                &state.realm_id,
+                false,
+            ),
             None => {
                 let existing_id = match &outcome {
                     meerkat_runtime::AcceptOutcome::Deduplicated { existing_id, .. } => {
@@ -3743,8 +3944,12 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use chrono::{Duration, Utc};
     use futures::stream;
+    use meerkat::{OccurrenceFailureClass, OccurrencePhase, ScheduleId};
     use meerkat_client::{LlmDoneOutcome, LlmError, LlmEvent, LlmRequest};
+    use meerkat_core::SessionId;
+    use serde_json::json;
     use std::path::PathBuf;
     use std::pin::Pin;
     use tempfile::TempDir;
@@ -3893,6 +4098,79 @@ mod tests {
             .unwrap();
         assert!(!state.enable_builtins);
         assert!(!state.enable_shell);
+    }
+
+    fn missing_target_schedule_tool_args() -> Value {
+        json!({
+            "name": "missing-target",
+            "description": "create a due schedule through the tool surface",
+            "trigger": {
+                "type": "once",
+                "due_at_utc": (Utc::now() - Duration::seconds(1)).to_rfc3339(),
+            },
+            "target": {
+                "target_kind": "session",
+                "type": "exact_session",
+                "session_id": SessionId::new(),
+                "action": {
+                    "type": "prompt",
+                    "prompt": "scheduled hello"
+                }
+            },
+            "missing_target_policy": "mark_misfired",
+            "planning_horizon_days": 1,
+            "planning_horizon_occurrences": 1
+        })
+    }
+
+    async fn wait_for_missing_target_misfire(
+        service: &meerkat::ScheduleService,
+        schedule_id: &ScheduleId,
+    ) -> Option<meerkat::Occurrence> {
+        for _ in 0..40 {
+            let occurrences = service
+                .list_occurrences(schedule_id)
+                .await
+                .expect("list occurrences");
+            if let Some(occurrence) = occurrences.into_iter().find(|occurrence| {
+                occurrence.phase == OccurrencePhase::Misfired
+                    && occurrence.failure_class == Some(OccurrenceFailureClass::TargetMissing)
+            }) {
+                return Some(occurrence);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn schedule_call_starts_host_and_services_due_schedule() {
+        let temp = TempDir::new().unwrap();
+        let state = AppState::load_from(temp.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let Json(created) = schedule_call(
+            State(state.clone()),
+            Json(ScheduleToolCallRequest {
+                name: "meerkat_schedule_create".into(),
+                arguments: missing_target_schedule_tool_args(),
+            }),
+        )
+        .await
+        .expect("schedule tool create should succeed");
+
+        let schedule_id = ScheduleId::parse(
+            created["schedule_id"]
+                .as_str()
+                .expect("schedule_id should be returned"),
+        )
+        .expect("valid schedule id");
+
+        let occurrence = wait_for_missing_target_misfire(&state.schedule_service, &schedule_id)
+            .await
+            .expect("schedule/call should start the host and service due work");
+        assert_eq!(occurrence.phase, OccurrencePhase::Misfired);
     }
 
     #[tokio::test]
@@ -4083,6 +4361,7 @@ mod tests {
 
                 skill_references: None,
                 initial_turn: InitialTurnPolicy::Defer,
+                deferred_prompt_policy: DeferredPromptPolicy::Discard,
                 build: Some(SessionBuildOptions {
                     llm_client_override: state
                         .llm_client_override
@@ -4155,6 +4434,7 @@ mod tests {
 
                 skill_references: None,
                 initial_turn: InitialTurnPolicy::Defer,
+                deferred_prompt_policy: DeferredPromptPolicy::Discard,
                 build: Some(SessionBuildOptions {
                     llm_client_override: state
                         .llm_client_override
@@ -4223,6 +4503,7 @@ mod tests {
 
                 skill_references: None,
                 initial_turn: InitialTurnPolicy::Defer,
+                deferred_prompt_policy: DeferredPromptPolicy::Discard,
                 build: Some(SessionBuildOptions {
                     llm_client_override: state
                         .llm_client_override
@@ -4277,6 +4558,7 @@ mod tests {
 
                 skill_references: None,
                 initial_turn: InitialTurnPolicy::RunImmediately,
+                deferred_prompt_policy: DeferredPromptPolicy::Discard,
                 build: Some(SessionBuildOptions {
                     llm_client_override: state
                         .llm_client_override
@@ -4597,6 +4879,7 @@ mod tests {
                 event_tx: None,
                 skill_references: None,
                 initial_turn: InitialTurnPolicy::Defer,
+                deferred_prompt_policy: DeferredPromptPolicy::Discard,
                 build: Some(SessionBuildOptions {
                     llm_client_override: state
                         .llm_client_override
@@ -4759,11 +5042,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn completion_outcome_to_api_result_surfaces_callback_pending_payload() {
+        let session_id = SessionId::new();
+        let err = completion_outcome_to_api_result(
+            meerkat_runtime::completion::CompletionOutcome::CallbackPending {
+                tool_name: "external_mock".to_string(),
+                args: json!({ "value": "browser" }),
+            },
+            &session_id,
+            "test-realm",
+            false,
+        )
+        .expect_err("callback pending should map to an API error");
+
+        let ApiError::InternalWithData {
+            message,
+            code,
+            details,
+        } = err
+        else {
+            panic!("expected InternalWithData callback error");
+        };
+
+        assert_eq!(message, "callback pending for tool 'external_mock'");
+        assert_eq!(code, "CALLBACK_PENDING");
+        assert_eq!(details["session_id"], session_id.to_string());
+        assert_eq!(
+            details["session_ref"],
+            format_session_ref("test-realm", &session_id)
+        );
+        assert_eq!(details["resumable"], true);
+        assert_eq!(details["tool_name"], "external_mock");
+        assert_eq!(details["args"], json!({ "value": "browser" }));
+    }
+
     #[cfg(feature = "mob")]
     #[tokio::test]
-    async fn test_mob_tools_and_call_routes_work() {
+    async fn test_compatibility_mob_routes_are_not_found() {
         use axum::body::Body;
-        use http_body_util::BodyExt;
         use tower::ServiceExt;
 
         let temp = TempDir::new().unwrap();
@@ -4778,16 +5095,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let tools_resp = app.clone().oneshot(tools_req).await.unwrap();
-        assert_eq!(tools_resp.status(), StatusCode::OK);
-        let tools_bytes = tools_resp.into_body().collect().await.unwrap().to_bytes();
-        let tools_payload: serde_json::Value = serde_json::from_slice(&tools_bytes).unwrap();
-        assert!(
-            tools_payload["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|tool| tool["name"] == "mob_create")
-        );
+        assert_eq!(tools_resp.status(), StatusCode::NOT_FOUND);
 
         let call_req = axum::http::Request::builder()
             .method("POST")
@@ -4802,10 +5110,7 @@ mod tests {
             ))
             .unwrap();
         let call_resp = app.oneshot(call_req).await.unwrap();
-        assert_eq!(call_resp.status(), StatusCode::OK);
-        let call_bytes = call_resp.into_body().collect().await.unwrap().to_bytes();
-        let call_payload: serde_json::Value = serde_json::from_slice(&call_bytes).unwrap();
-        assert!(call_payload["mob_id"].as_str().is_some());
+        assert_eq!(call_resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[cfg(feature = "mob")]
