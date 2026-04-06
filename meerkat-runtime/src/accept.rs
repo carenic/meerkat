@@ -2,9 +2,44 @@
 
 use meerkat_core::lifecycle::InputId;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use crate::input_state::InputState;
 use crate::policy::PolicyDecision;
+
+/// Typed reason why an input was rejected at the accept boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "reject_type", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RejectReason {
+    /// Runtime is not in a state that accepts input (e.g. stopped, destroyed).
+    NotReady {
+        /// The runtime state that caused the rejection.
+        state: String,
+    },
+    /// Input failed durability validation.
+    DurabilityViolation {
+        /// Description of the violation.
+        detail: String,
+    },
+    /// Peer input carried a forbidden handling_mode.
+    PeerHandlingModeInvalid {
+        /// Description of the violation.
+        detail: String,
+    },
+}
+
+impl fmt::Display for RejectReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotReady { state } => {
+                write!(f, "runtime not accepting input while in state: {state}")
+            }
+            Self::DurabilityViolation { detail } => write!(f, "{detail}"),
+            Self::PeerHandlingModeInvalid { detail } => write!(f, "{detail}"),
+        }
+    }
+}
 
 /// Outcome of `RuntimeDriver::accept_input()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,7 +66,7 @@ pub enum AcceptOutcome {
     /// Input was rejected (validation failed, durability violation, etc.).
     Rejected {
         /// Why the input was rejected.
-        reason: String,
+        reason: RejectReason,
     },
 }
 
@@ -103,11 +138,61 @@ mod tests {
     #[test]
     fn rejected_serde() {
         let outcome = AcceptOutcome::Rejected {
-            reason: "durability violation".into(),
+            reason: RejectReason::DurabilityViolation {
+                detail: "durability violation".into(),
+            },
         };
         let json = serde_json::to_value(&outcome).unwrap();
         assert_eq!(json["outcome_type"], "rejected");
+        assert_eq!(json["reason"]["reject_type"], "durability_violation");
         let parsed: AcceptOutcome = serde_json::from_value(json).unwrap();
         assert!(parsed.is_rejected());
+    }
+
+    #[test]
+    fn reject_reason_display() {
+        let not_ready = RejectReason::NotReady {
+            state: "Stopped".into(),
+        };
+        assert_eq!(
+            not_ready.to_string(),
+            "runtime not accepting input while in state: Stopped"
+        );
+
+        let durability = RejectReason::DurabilityViolation {
+            detail: "Derived durability forbidden for prompt".into(),
+        };
+        assert_eq!(
+            durability.to_string(),
+            "Derived durability forbidden for prompt"
+        );
+
+        let peer = RejectReason::PeerHandlingModeInvalid {
+            detail: "handling_mode is forbidden on ResponseProgress peer inputs".into(),
+        };
+        assert_eq!(
+            peer.to_string(),
+            "handling_mode is forbidden on ResponseProgress peer inputs"
+        );
+    }
+
+    #[test]
+    fn reject_reason_serde_round_trip() {
+        let reasons = vec![
+            RejectReason::NotReady {
+                state: "Destroyed".into(),
+            },
+            RejectReason::DurabilityViolation {
+                detail: "external derived".into(),
+            },
+            RejectReason::PeerHandlingModeInvalid {
+                detail: "forbidden".into(),
+            },
+        ];
+        for reason in reasons {
+            let json = serde_json::to_value(&reason).unwrap();
+            let parsed: RejectReason = serde_json::from_value(json).unwrap();
+            assert_eq!(parsed, reason);
+        }
     }
 }

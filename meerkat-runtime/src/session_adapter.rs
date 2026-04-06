@@ -1001,7 +1001,9 @@ impl RuntimeSessionAdapter {
                     });
                 }
                 AcceptOutcome::Rejected { reason } => {
-                    return Err(RuntimeDriverError::ValidationFailed { reason });
+                    return Err(RuntimeDriverError::ValidationFailed {
+                        reason: reason.to_string(),
+                    });
                 }
             };
 
@@ -1170,7 +1172,7 @@ impl RuntimeSessionAdapter {
                 }
                 AcceptOutcome::Rejected { reason } => {
                     return Err(RuntimeDriverError::ValidationFailed {
-                        reason: reason.clone(),
+                        reason: reason.to_string(),
                     });
                 }
             }

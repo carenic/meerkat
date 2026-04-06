@@ -128,7 +128,7 @@ fn to_wire_accept_result(
             outcome_type: RuntimeAcceptOutcomeType::Rejected,
             input_id: None,
             existing_id: None,
-            reason: Some(reason),
+            reason: Some(reason.to_string()),
             policy: None,
             state: None,
         },
@@ -197,7 +197,9 @@ pub async fn handle_runtime_accept(
         },
         Err(meerkat_runtime::RuntimeDriverError::NotReady { state }) => {
             match to_wire_accept_result(meerkat_runtime::AcceptOutcome::Rejected {
-                reason: format!("runtime not accepting input while in state: {state}"),
+                reason: meerkat_runtime::RejectReason::NotReady {
+                    state: format!("{state}"),
+                },
             }) {
                 Ok(result) => RpcResponse::success(id, result),
                 Err(err) => RpcResponse::error(id, crate::error::INTERNAL_ERROR, err),
