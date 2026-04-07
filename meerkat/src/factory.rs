@@ -1667,29 +1667,28 @@ impl AgentFactory {
                 None::<meerkat_core::wait_interrupt::WaitInterrupt>,
             );
 
-            let bind_succeeded_wait = if !tools.capabilities().wait_interrupt {
+            if !tools.capabilities().wait_interrupt {
                 tracing::debug!("Dispatcher does not support wait interrupt binding");
-                false
             } else if Arc::strong_count(&tools) == 1 {
                 let outcome = tools.bind_wait_interrupt(rx).map_err(|e| {
                     BuildAgentError::Config(format!("Wait interrupt binding failed: {e}"))
                 })?;
-                let bound = outcome.was_bound();
+                let was_bound = outcome.was_bound();
                 tools = outcome.into_dispatcher();
-                if bound {
-                    wait_interrupt_sender = Some(tx.clone());
+                if was_bound {
+                    wait_interrupt_sender = Some(tx);
                 }
-                bound
             } else {
                 tracing::debug!(
                     "Shared dispatcher (refcount={}) — wait interrupt not bound",
                     Arc::strong_count(&tools)
                 );
-                false
-            };
+            }
 
             #[cfg(feature = "comms")]
-            if bind_succeeded_wait && let Some(ref runtime) = comms_runtime {
+            if let Some(tx) = wait_interrupt_sender.clone()
+                && let Some(ref runtime) = comms_runtime
+            {
                 use meerkat_core::agent::CommsRuntime as CoreCommsRuntimeTrait;
 
                 let notify = CoreCommsRuntimeTrait::actionable_input_notify(runtime.as_ref())
@@ -1698,36 +1697,30 @@ impl AgentFactory {
 
                 if let Some(actionable_notify) = notify {
                     #[cfg(not(target_arch = "wasm32"))]
-                    tokio::spawn({
-                        let tx = tx.clone();
-                        async move {
-                            loop {
-                                actionable_notify.notified().await;
-                                if tx
-                                    .send(Some(meerkat_core::wait_interrupt::WaitInterrupt {
-                                        reason: "Incoming actionable peer message".to_string(),
-                                    }))
-                                    .is_err()
-                                {
-                                    break;
-                                }
+                    tokio::spawn(async move {
+                        loop {
+                            actionable_notify.notified().await;
+                            if tx
+                                .send(Some(meerkat_core::wait_interrupt::WaitInterrupt {
+                                    reason: "Incoming actionable peer message".to_string(),
+                                }))
+                                .is_err()
+                            {
+                                break;
                             }
                         }
                     });
                     #[cfg(target_arch = "wasm32")]
-                    tokio_with_wasm::alias::task::spawn({
-                        let tx = tx.clone();
-                        async move {
-                            loop {
-                                actionable_notify.notified().await;
-                                if tx
-                                    .send(Some(meerkat_core::wait_interrupt::WaitInterrupt {
-                                        reason: "Incoming actionable peer message".to_string(),
-                                    }))
-                                    .is_err()
-                                {
-                                    break;
-                                }
+                    tokio_with_wasm::alias::task::spawn(async move {
+                        loop {
+                            actionable_notify.notified().await;
+                            if tx
+                                .send(Some(meerkat_core::wait_interrupt::WaitInterrupt {
+                                    reason: "Incoming actionable peer message".to_string(),
+                                }))
+                                .is_err()
+                            {
+                                break;
                             }
                         }
                     });
@@ -2016,10 +2009,6 @@ impl AgentFactory {
         }
         let _is_resumed = build_config.resume_session.is_some();
         builder = builder.resume_session(session);
-        #[cfg(feature = "comms")]
-        let _comms_enabled = comms_runtime.is_some();
-        #[cfg(not(feature = "comms"))]
-        let _comms_enabled = false;
         #[cfg(feature = "comms")]
         if let Some(runtime) = comms_runtime {
             builder =
