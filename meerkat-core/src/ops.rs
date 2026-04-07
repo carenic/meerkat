@@ -71,6 +71,19 @@ impl AsyncOpRef {
 /// what the runtime scheduler sees (barrier/detached classification). This
 /// prevents hooks, persistence, and message serialization from accidentally
 /// owning barrier semantics.
+/// Typed session-level effect produced by tool dispatch.
+///
+/// Tools that need to mutate session-owned durable state (e.g., mob authority)
+/// must NOT call `SessionService` methods from inside dispatch. Instead they
+/// return typed effects here, and the turn owner (agent loop) merges and commits
+/// them after the parallel tool batch completes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "effect_type", rename_all = "snake_case")]
+pub enum SessionEffect {
+    /// Grant management scope for a specific mob.
+    GrantManageMob { mob_id: String },
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolDispatchOutcome {
     /// The tool result for the conversation transcript.
@@ -80,14 +93,21 @@ pub struct ToolDispatchOutcome {
     /// Empty for synchronous tools. Barrier ops block the turn boundary;
     /// detached ops run independently.
     pub async_ops: Vec<AsyncOpRef>,
+    /// Session-level effects to be merged by the turn owner after the batch.
+    ///
+    /// Most tools return an empty vec. Tools that need durable session state
+    /// changes (e.g., mob authority grants) emit typed effects here instead
+    /// of calling `SessionService` from inside dispatch.
+    pub session_effects: Vec<SessionEffect>,
 }
 
 impl ToolDispatchOutcome {
-    /// Create an outcome with no async operations (synchronous tool).
+    /// Create an outcome with no async operations or session effects (synchronous tool).
     pub fn sync_result(result: crate::types::ToolResult) -> Self {
         Self {
             result,
             async_ops: Vec::new(),
+            session_effects: Vec::new(),
         }
     }
 }
@@ -466,5 +486,35 @@ mod tests {
         assert_eq!(limits.max_concurrent_ops, 32);
         assert_eq!(limits.max_concurrent_agents, 8);
         assert_eq!(limits.max_children_per_agent, 5);
+    }
+
+    #[test]
+    fn session_effect_grant_manage_mob_serde_round_trip() {
+        let effect = SessionEffect::GrantManageMob {
+            mob_id: "test-mob".into(),
+        };
+        let json = serde_json::to_value(&effect).unwrap();
+        let parsed: SessionEffect = serde_json::from_value(json).unwrap();
+        assert_eq!(effect, parsed);
+    }
+
+    #[test]
+    fn tool_dispatch_outcome_with_session_effects() {
+        let result = crate::types::ToolResult::new("t1".into(), "ok".into(), false);
+        let outcome = ToolDispatchOutcome {
+            result,
+            async_ops: vec![],
+            session_effects: vec![SessionEffect::GrantManageMob {
+                mob_id: "mob-1".into(),
+            }],
+        };
+        assert_eq!(outcome.session_effects.len(), 1);
+    }
+
+    #[test]
+    fn tool_dispatch_outcome_sync_result_has_empty_effects() {
+        let result = crate::types::ToolResult::new("t1".into(), "ok".into(), false);
+        let outcome = ToolDispatchOutcome::sync_result(result);
+        assert!(outcome.session_effects.is_empty());
     }
 }

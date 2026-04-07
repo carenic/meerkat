@@ -762,6 +762,12 @@ where
     /// Optional enrichment provider for completion display details.
     pub(crate) completion_enrichment:
         Option<Arc<dyn crate::completion_feed::CompletionEnrichmentProvider>>,
+    /// Shared effective mob authority handle. Owned by the agent, passed to
+    /// mob tools at construction for authorization reads. Updated by
+    /// `apply_session_effects` after each tool batch as a derived projection
+    /// of the canonical `session.build_state().mob_tool_authority_context`.
+    pub(crate) mob_authority_handle:
+        Option<Arc<std::sync::RwLock<crate::service::MobToolAuthorityContext>>>,
     /// Machine authority for turn-execution state transitions (RMAT).
     pub(crate) turn_authority: crate::turn_execution_authority::TurnExecutionAuthority,
     /// Optional resolver for model-specific operational defaults (e.g., call timeout).

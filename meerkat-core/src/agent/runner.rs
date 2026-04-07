@@ -77,6 +77,76 @@ where
         Ok(())
     }
 
+    /// Apply accumulated session effects from tool dispatch.
+    ///
+    /// Called by the agent loop after each parallel tool batch completes,
+    /// BEFORE `Message::ToolResults` is appended to the session. This is
+    /// the canonical commit point for tool-produced session mutations
+    /// (e.g., mob authority grants).
+    ///
+    /// The session's `build_state` is the source of truth. The shared
+    /// `mob_authority_handle` (if present) is updated as a derived projection
+    /// after the canonical write succeeds.
+    pub(crate) fn apply_session_effects(
+        &mut self,
+        effects: &[crate::ops::SessionEffect],
+    ) -> Result<(), crate::error::AgentError> {
+        use crate::error::AgentError;
+
+        let mut build_state = self.session.build_state().unwrap_or_default();
+        let authority = build_state
+            .mob_tool_authority_context
+            .as_mut()
+            .ok_or_else(|| {
+                AgentError::InternalError(
+                    "mob authority effect applied without canonical authority context".into(),
+                )
+            })?;
+
+        for effect in effects {
+            match effect {
+                crate::ops::SessionEffect::GrantManageMob { mob_id } => {
+                    authority.grant_manage_mob_in_place(mob_id.clone());
+                }
+            }
+        }
+
+        self.session.set_build_state(build_state).map_err(|e| {
+            AgentError::InternalError(format!(
+                "failed to persist session effects into build state: {e}"
+            ))
+        })?;
+
+        // Update the shared effective-authority handle so mob tools in
+        // subsequent batches see the widened scope. The handle is a derived
+        // projection of the canonical session build_state — it is never
+        // treated as an independent truth source.
+        if let Some(ref handle) = self.mob_authority_handle {
+            let updated = self
+                .session
+                .build_state()
+                .and_then(|bs| bs.mob_tool_authority_context);
+            if let Some(authority) = updated {
+                *handle
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = authority;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Set the shared mob authority handle for session-effect application.
+    ///
+    /// The agent updates this handle after merging `SessionEffect`s from tool
+    /// dispatch. Mob tools read from it for authorization checks.
+    pub fn set_mob_authority_handle(
+        &mut self,
+        handle: Arc<std::sync::RwLock<crate::service::MobToolAuthorityContext>>,
+    ) {
+        self.mob_authority_handle = Some(handle);
+    }
+
     /// Replace the LLM client for subsequent turns.
     ///
     /// Enables hot-swapping the model/provider on a live session without

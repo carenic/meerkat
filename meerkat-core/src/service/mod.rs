@@ -407,6 +407,14 @@ impl MobToolAuthorityContext {
         self
     }
 
+    /// Grant management scope for a mob in-place (mutable borrow).
+    ///
+    /// Used by the turn executor when applying `SessionEffect::GrantManageMob`
+    /// effects from tool dispatch.
+    pub fn grant_manage_mob_in_place(&mut self, mob_id: String) {
+        self.managed_mob_scope.insert(mob_id);
+    }
+
     pub fn with_managed_mob_scope<I, S>(mut self, mob_ids: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -475,6 +483,13 @@ pub struct MobToolsBuildArgs {
     /// dispatch must still re-check the typed create/scope fields on every
     /// call.
     pub authority_context: Option<MobToolAuthorityContext>,
+    /// Shared effective mob authority handle owned by the agent.
+    ///
+    /// Mob tools read from this handle for authorization checks. The agent
+    /// (turn owner) is the sole writer — it updates this handle via
+    /// `apply_session_effects` after merging tool-produced `SessionEffect`s.
+    /// If `None`, mob tools fall back to `authority_context` as a static snapshot.
+    pub effective_authority: Option<Arc<std::sync::RwLock<MobToolAuthorityContext>>>,
     /// Comms name of the owning agent (for building TrustedPeerSpec).
     pub comms_name: Option<String>,
     /// Optional comms runtime for auto-wiring spawned members.
@@ -1119,5 +1134,30 @@ mod tests {
             .await
             .expect_err("default implementation should fail loudly");
         assert!(matches!(err, SessionError::Unsupported(name) if name == "has_live_session"));
+    }
+
+    #[test]
+    fn grant_manage_mob_in_place_adds_mob_id() {
+        let mut ctx = MobToolAuthorityContext::create_only_generated();
+        ctx.grant_manage_mob_in_place("mob-1".into());
+        assert!(ctx.managed_mob_scope.contains("mob-1"));
+    }
+
+    #[test]
+    fn grant_manage_mob_in_place_is_idempotent() {
+        let mut ctx = MobToolAuthorityContext::create_only_generated();
+        ctx.grant_manage_mob_in_place("mob-1".into());
+        ctx.grant_manage_mob_in_place("mob-1".into());
+        assert_eq!(ctx.managed_mob_scope.len(), 1);
+    }
+
+    #[test]
+    fn grant_manage_mob_in_place_accumulates() {
+        let mut ctx = MobToolAuthorityContext::create_only_generated();
+        ctx.grant_manage_mob_in_place("mob-1".into());
+        ctx.grant_manage_mob_in_place("mob-2".into());
+        assert!(ctx.managed_mob_scope.contains("mob-1"));
+        assert!(ctx.managed_mob_scope.contains("mob-2"));
+        assert_eq!(ctx.managed_mob_scope.len(), 2);
     }
 }

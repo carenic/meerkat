@@ -273,6 +273,7 @@ impl AgentBuilder {
             epoch_cursor_state: self.epoch_cursor_state,
             interrupt_baseline: self.interrupt_baseline,
             completion_enrichment: self.completion_enrichment,
+            mob_authority_handle: None,
             turn_authority: crate::turn_execution_authority::TurnExecutionAuthority::new(),
             model_defaults_resolver: self.model_defaults_resolver,
             call_timeout_override: self.call_timeout_override,

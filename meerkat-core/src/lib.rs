@@ -148,8 +148,8 @@ pub use mcp_config::{McpConfig, McpConfigError, McpScope, McpServerConfig, McpSe
 pub use model_defaults::ModelOperationalDefaultsResolver;
 pub use ops::{
     AsyncOpRef, ConcurrencyLimits, ContextStrategy, ForkBranch, ForkBudgetPolicy, OpEvent,
-    OperationId, OperationPolicy, OperationResult, OperationSpec, ResultShape, SpawnSpec,
-    ToolAccessPolicy, ToolDispatchOutcome, WaitPolicy, WorkKind,
+    OperationId, OperationPolicy, OperationResult, OperationSpec, ResultShape, SessionEffect,
+    SpawnSpec, ToolAccessPolicy, ToolDispatchOutcome, WaitPolicy, WorkKind,
 };
 pub use ops_lifecycle::{
     OperationCompletionWatch, OperationKind, OperationLifecycleSnapshot, OperationPeerHandle,

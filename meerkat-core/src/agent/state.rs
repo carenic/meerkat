@@ -1038,10 +1038,13 @@ where
 
                         // Process results and emit events
                         let mut all_async_ops = Vec::<crate::ops::AsyncOpRef>::new();
+                        let mut accumulated_session_effects =
+                            Vec::<crate::ops::SessionEffect>::new();
                         for (tc, dispatch_result, duration_ms) in dispatch_results {
                             let mut tool_result = match dispatch_result {
                                 Ok(outcome) => {
                                     all_async_ops.extend(outcome.async_ops);
+                                    accumulated_session_effects.extend(outcome.session_effects);
                                     outcome.result
                                 }
                                 Err(crate::error::ToolError::CallbackPending {
@@ -1181,6 +1184,15 @@ where
                         let has_barrier_ops = pending_op_refs
                             .iter()
                             .any(|r| r.wait_policy == crate::ops::WaitPolicy::Barrier);
+
+                        // Apply session effects from tool dispatch before
+                        // appending ToolResults. This ensures the canonical
+                        // session state is updated before the next boundary,
+                        // so an invariant failure doesn't occur after
+                        // ToolResults is already in the transcript.
+                        if !accumulated_session_effects.is_empty() {
+                            self.apply_session_effects(&accumulated_session_effects)?;
+                        }
 
                         // Add tool results to session
                         self.session.push(Message::ToolResults {

@@ -50,9 +50,11 @@ pub struct AgentMobToolSurface {
     /// Pre-seeded on resume; otherwise set by first delegate via get_or_create_implicit_mob.
     /// Read-only cache — MobMcpState is the canonical owner.
     cached_implicit_mob_id: RwLock<Option<MobId>>,
-    /// Typed runtime-injected operator authority. This is the only source of
-    /// authorization for agent-facing mob tools.
-    authority_context: RwLock<MobToolAuthorityContext>,
+    /// Effective mob authority — shared handle owned by the agent/turn executor.
+    /// Mob tools read from this for authorization. The agent is the sole writer
+    /// (via apply_session_effects). Falls back to a local RwLock when no shared
+    /// handle is provided (non-runtime test paths).
+    effective_authority: Arc<std::sync::RwLock<MobToolAuthorityContext>>,
     tools: Arc<[Arc<ToolDef>]>,
     owner_session_id: SessionId,
     /// Model name inherited by implicit mob helpers.
@@ -84,10 +86,10 @@ impl AgentMobToolSurface {
         comms_peer_id: Option<String>,
         comms_runtime: Option<Arc<dyn meerkat_core::agent::CommsRuntime>>,
     ) -> Self {
-        Self::new_with_authority(
+        Self::new_with_effective_authority(
             state,
             implicit_mob_id,
-            authority_context,
+            Arc::new(std::sync::RwLock::new(authority_context)),
             model,
             owner_session_id,
             comms_name,
@@ -96,12 +98,15 @@ impl AgentMobToolSurface {
         )
     }
 
-    /// Create with a pre-populated set of owned mob IDs (for resume).
+    /// Create with a shared effective authority handle.
+    ///
+    /// The handle is owned by the agent and updated via `apply_session_effects`.
+    /// Mob tools read from it for authorization checks.
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_authority(
+    pub fn new_with_effective_authority(
         state: Arc<MobMcpState>,
         implicit_mob_id: Option<MobId>,
-        authority_context: MobToolAuthorityContext,
+        effective_authority: Arc<std::sync::RwLock<MobToolAuthorityContext>>,
         model: String,
         owner_session_id: SessionId,
         comms_name: Option<String>,
@@ -112,7 +117,7 @@ impl AgentMobToolSurface {
         Self {
             state,
             cached_implicit_mob_id: RwLock::new(implicit_mob_id),
-            authority_context: RwLock::new(authority_context),
+            effective_authority,
             tools,
             owner_session_id,
             model,
@@ -141,23 +146,36 @@ impl AgentMobToolSurface {
         call: ToolCallView<'_>,
         value: serde_json::Value,
     ) -> Result<meerkat_core::ToolDispatchOutcome, ToolError> {
+        Self::encode_result_with_effects(call, value, vec![])
+    }
+
+    fn encode_result_with_effects(
+        call: ToolCallView<'_>,
+        value: serde_json::Value,
+        session_effects: Vec<meerkat_core::SessionEffect>,
+    ) -> Result<meerkat_core::ToolDispatchOutcome, ToolError> {
         let content = serde_json::to_string(&value)
             .map_err(|e| ToolError::execution_failed(format!("encode tool result: {e}")))?;
-        Ok(meerkat_core::ToolDispatchOutcome::sync_result(
-            ToolResult::new(call.id.to_string(), content, false),
-        ))
+        Ok(meerkat_core::ToolDispatchOutcome {
+            result: ToolResult::new(call.id.to_string(), content, false),
+            async_ops: vec![],
+            session_effects,
+        })
     }
 
     fn map_mob_error(call: ToolCallView<'_>, error: MobError) -> ToolError {
         ToolError::execution_failed(format!("tool '{}' failed: {error}", call.name))
     }
 
-    async fn authority_context_snapshot(&self) -> MobToolAuthorityContext {
-        self.authority_context.read().await.clone()
+    fn authority_context_snapshot(&self) -> MobToolAuthorityContext {
+        self.effective_authority
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     async fn ensure_create_authority(&self, tool_name: &str) -> Result<(), ToolError> {
-        if self.authority_context.read().await.can_create_mobs() {
+        if self.authority_context_snapshot().can_create_mobs() {
             return Ok(());
         }
         Err(ToolError::access_denied(tool_name))
@@ -169,9 +187,7 @@ impl AgentMobToolSurface {
         mob_id: &MobId,
     ) -> Result<(), ToolError> {
         if self
-            .authority_context
-            .read()
-            .await
+            .authority_context_snapshot()
             .can_manage_mob(mob_id.as_str())
         {
             return Ok(());
@@ -184,7 +200,7 @@ impl AgentMobToolSurface {
         handle: &meerkat_mob::MobHandle,
         tool_name: &str,
     ) {
-        let authority_context = self.authority_context_snapshot().await;
+        let authority_context = self.authority_context_snapshot();
         if let Err(error) = handle
             .record_operator_action_provenance(tool_name, &authority_context)
             .await
@@ -198,43 +214,10 @@ impl AgentMobToolSurface {
         }
     }
 
-    async fn grant_exact_mob_scope_after_create(
-        &self,
-        tool_name: &str,
-        mob_id: &MobId,
-    ) -> Result<(), ToolError> {
-        let authority_context = self
-            .authority_context_snapshot()
-            .await
-            .grant_manage_mob(mob_id.to_string());
-
-        match self
-            .state
-            .session_service()
-            .update_session_mob_authority_context(
-                &self.owner_session_id,
-                Some(authority_context.clone()),
-            )
-            .await
-        {
-            Ok(()) => {}
-            Err(SessionError::Unsupported(_)) => {
-                tracing::debug!(
-                    session_id = %self.owner_session_id,
-                    mob_id = %mob_id,
-                    "session service does not persist mob authority updates; keeping in-memory scope only"
-                );
-            }
-            Err(error) => {
-                return Err(ToolError::execution_failed(format!(
-                    "tool '{tool_name}' failed: unable to persist exact mob scope for {mob_id}: {error}"
-                )));
-            }
-        }
-
-        *self.authority_context.write().await = authority_context;
-        Ok(())
-    }
+    // grant_exact_mob_scope_after_create removed — mob authority grants are
+    // now returned as typed SessionEffect::GrantManageMob effects. The turn
+    // owner (agent loop) merges and commits them to session build_state.
+    // No re-entrant session service call from inside tool dispatch.
 
     /// Get or create the implicit mob for this agent's session.
     ///
@@ -270,19 +253,20 @@ impl AgentMobToolSurface {
             .ensure_implicit_mob()
             .await
             .map_err(|e| Self::map_mob_error(call, e))?;
-        if first_delegate
-            && let Err(error) = self
-                .grant_exact_mob_scope_after_create(call.name, &mob_id)
-                .await
+
+        // Authority grant is returned as a typed effect for the turn owner
+        // to merge and commit — no re-entrant session service call.
+        // Emit the grant whenever the mob isn't already in scope, not just
+        // on first_delegate — a prior failed delegate may have created the
+        // implicit mob without the grant effect being applied.
+        let mut session_effects = Vec::new();
+        if !self
+            .authority_context_snapshot()
+            .can_manage_mob(mob_id.as_str())
         {
-            if let Err(cleanup_error) = self.state.mob_destroy(&mob_id).await {
-                tracing::warn!(
-                    mob_id = %mob_id,
-                    error = %cleanup_error,
-                    "failed to roll back implicit mob after authority persistence error"
-                );
-            }
-            return Err(error);
+            session_effects.push(meerkat_core::SessionEffect::GrantManageMob {
+                mob_id: mob_id.to_string(),
+            });
         }
 
         // Build spawn spec
@@ -389,7 +373,7 @@ impl AgentMobToolSurface {
                 .await;
         }
 
-        Self::encode_result(call, result)
+        Self::encode_result_with_effects(call, result, session_effects)
     }
 
     async fn dispatch_mob_create(
@@ -415,26 +399,17 @@ impl AgentMobToolSurface {
             .await
             .map_err(|e| Self::map_mob_error(call, e))?;
 
-        if let Err(error) = self
-            .grant_exact_mob_scope_after_create(call.name, &mob_id)
-            .await
-        {
-            if let Err(cleanup_error) = self.state.mob_destroy(&mob_id).await {
-                tracing::warn!(
-                    mob_id = %mob_id,
-                    error = %cleanup_error,
-                    "failed to roll back explicit mob after authority persistence error"
-                );
-            }
-            return Err(error);
-        }
+        // Authority grant as typed effect — no re-entrant session service call.
+        let session_effects = vec![meerkat_core::SessionEffect::GrantManageMob {
+            mob_id: mob_id.to_string(),
+        }];
 
         if let Ok(handle) = self.state.handle_for(&mob_id).await {
             self.record_successful_operator_action(&handle, call.name)
                 .await;
         }
 
-        Self::encode_result(call, json!({"mob_id": mob_id}))
+        Self::encode_result_with_effects(call, json!({"mob_id": mob_id}), session_effects)
     }
 
     async fn dispatch_mob_destroy(
@@ -578,7 +553,7 @@ impl AgentMobToolSurface {
         &self,
         call: ToolCallView<'_>,
     ) -> Result<meerkat_core::ToolDispatchOutcome, ToolError> {
-        let authority_context = self.authority_context_snapshot().await;
+        let authority_context = self.authority_context_snapshot();
         let mobs = self.state.mob_list().await;
         let mob_list: Vec<serde_json::Value> = mobs
             .into_iter()
@@ -629,10 +604,17 @@ impl meerkat_core::service::MobToolsFactory for AgentMobToolSurfaceFactory {
 
         // Extract parent comms identity for wiring helpers.
         let comms_peer_id = args.comms_runtime.as_ref().and_then(|r| r.public_key());
-        let surface = AgentMobToolSurface::new_with_authority(
+        // Use the shared effective-authority handle if provided (runtime-backed
+        // sessions). The agent/turn owner updates this handle via
+        // apply_session_effects; mob tools read from it for authorization.
+        // Falls back to a local handle for non-runtime paths.
+        let effective_authority_handle = args
+            .effective_authority
+            .unwrap_or_else(|| Arc::new(std::sync::RwLock::new(authority_context)));
+        let surface = AgentMobToolSurface::new_with_effective_authority(
             Arc::clone(&self.state),
             implicit_mob_id,
-            authority_context,
+            effective_authority_handle,
             args.model,
             args.session_id,
             args.comms_name,
@@ -1048,6 +1030,7 @@ mod tests {
                 session_id: SessionId::new(),
                 model: "claude-sonnet-4-5".to_string(),
                 authority_context: None,
+                effective_authority: None,
                 comms_name: None,
                 comms_runtime: None,
             })
@@ -1077,6 +1060,7 @@ mod tests {
                 session_id,
                 model: "claude-sonnet-4-5".to_string(),
                 authority_context: Some(create_only_authority()),
+                effective_authority: None,
                 comms_name: None,
                 comms_runtime: None,
             })
@@ -1130,6 +1114,7 @@ mod tests {
                 session_id,
                 model: "gpt-5.4".to_string(),
                 authority_context: Some(create_only_authority()),
+                effective_authority: None,
                 comms_name: None,
                 comms_runtime: None,
             })
@@ -1294,38 +1279,20 @@ mod tests {
             "mob_create must not allow callers to mint faux implicit mobs"
         );
 
-        let list_args = serde_json::value::RawValue::from_string("{}".to_string()).unwrap();
-        let list_result = surface
-            .dispatch(ToolCallView {
-                id: "list-1",
-                name: "mob_list",
-                args: &list_args,
-            })
-            .await
-            .expect("mob_list should still be callable");
-        let listed: serde_json::Value =
-            serde_json::from_str(&list_result.result.text_content()).unwrap();
+        // mob_create should return a GrantManageMob effect for the turn owner
+        // to merge into canonical session authority.
         assert_eq!(
-            listed["mobs"].as_array().map(Vec::len),
-            Some(1),
-            "mob_create should grant exact scope for the new explicit mob"
+            create_result.session_effects.len(),
+            1,
+            "mob_create should emit exactly one session effect"
         );
-        assert_eq!(listed["mobs"][0]["mob_id"], json!(mob_id));
-
-        let destroy_args =
-            serde_json::value::RawValue::from_string(json!({ "mob_id": mob_id }).to_string())
-                .unwrap();
-        let destroy_result = surface
-            .dispatch(ToolCallView {
-                id: "destroy-1",
-                name: "mob_destroy",
-                args: &destroy_args,
-            })
-            .await
-            .expect("newly-created explicit mob should be immediately manageable");
-        let destroyed: serde_json::Value =
-            serde_json::from_str(&destroy_result.result.text_content()).unwrap();
-        assert_eq!(destroyed, json!({ "ok": true }));
+        assert_eq!(
+            create_result.session_effects[0],
+            meerkat_core::SessionEffect::GrantManageMob {
+                mob_id: mob_id.clone()
+            },
+            "mob_create effect should carry the created mob_id"
+        );
     }
 
     #[tokio::test]
@@ -1359,44 +1326,16 @@ mod tests {
             matches!(delegate_error, ToolError::ExecutionFailed { .. }),
             "unexpected delegate error: {delegate_error:?}"
         );
-        let mob_id = state
+        // The implicit mob should still be created even though spawn failed.
+        let _mob_id = state
             .find_implicit_mob(&session_key)
             .await
-            .expect("delegate should still create an implicit mob")
-            .to_string();
+            .expect("delegate should still create an implicit mob");
 
-        let list_args = serde_json::value::RawValue::from_string("{}".to_string()).unwrap();
-        let list_result = surface
-            .dispatch(ToolCallView {
-                id: "list-1",
-                name: "mob_list",
-                args: &list_args,
-            })
-            .await
-            .expect("delegate-created implicit mob should become manageable");
-        let listed: serde_json::Value =
-            serde_json::from_str(&list_result.result.text_content()).unwrap();
-        assert_eq!(
-            listed["mobs"].as_array().map(Vec::len),
-            Some(1),
-            "delegate should grant exact scope for the new implicit mob"
-        );
-        assert_eq!(listed["mobs"][0]["mob_id"], json!(mob_id));
-
-        let list_members_args =
-            serde_json::value::RawValue::from_string(json!({ "mob_id": mob_id }).to_string())
-                .unwrap();
-        let list_members_result = surface
-            .dispatch(ToolCallView {
-                id: "members-1",
-                name: "mob_list_members",
-                args: &list_members_args,
-            })
-            .await
-            .expect("delegate-created implicit mob should allow follow-up scoped tools");
-        let members: serde_json::Value =
-            serde_json::from_str(&list_members_result.result.text_content()).unwrap();
-        assert_eq!(members["members"].as_array().map(Vec::len), Some(0));
+        // No session effect is returned when delegate errors — the effect
+        // is part of the ToolDispatchOutcome which is only produced on success.
+        // This is correct: the turn owner should not widen authority for a
+        // failed tool call.
     }
 
     #[tokio::test]
