@@ -810,6 +810,11 @@ impl RuntimeIngressAuthority {
                 }
             }
             crate::WakeMode::InterruptYielding => {
+                // Queue-mode inputs still need a wake so the runtime loop
+                // processes them after the current turn completes. Without
+                // this, the input sits in the queue with no pending wake
+                // signal and the runtime idles forever.
+                effects.push(RuntimeIngressEffect::WakeRuntime);
                 if handling_mode == HandlingMode::Steer {
                     effects.push(RuntimeIngressEffect::RequestImmediateProcessing);
                 }

@@ -416,10 +416,10 @@ async fn no_input_no_wake() {
 }
 
 // ---------------------------------------------------------------------------
-// Additional: Message while running — checkpoint policy, no wake
+// Additional: Message while running — checkpoint policy, wake buffered
 // ---------------------------------------------------------------------------
 #[tokio::test]
-async fn message_while_running_checkpoint_no_wake() {
+async fn message_while_running_checkpoint_wake_buffered() {
     let mut driver = EphemeralRuntimeDriver::new(rid());
 
     // Start a run
@@ -440,7 +440,10 @@ async fn message_while_running_checkpoint_no_wake() {
 
     let outcome = driver.accept_input(input).await.unwrap();
     assert!(outcome.is_accepted());
-    assert!(!driver.take_wake_requested()); // Running → no wake
+    // InterruptYielding emits WakeRuntime so the runtime loop processes the
+    // queued input after the current turn completes. Without this wake, the
+    // input would sit in the queue indefinitely.
+    assert!(driver.take_wake_requested()); // Running → wake buffered
 }
 
 // ---------------------------------------------------------------------------
