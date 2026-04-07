@@ -125,19 +125,21 @@ impl DriverEntry {
         }
     }
 
-    /// Check and clear the wake flag.
+    /// Drain and return the typed post-admission signal.
+    pub(crate) fn take_post_admission_signal(
+        &mut self,
+    ) -> crate::driver::ephemeral::PostAdmissionSignal {
+        match self {
+            DriverEntry::Ephemeral(d) => d.take_post_admission_signal(),
+            DriverEntry::Persistent(d) => d.take_post_admission_signal(),
+        }
+    }
+
+    /// Check and clear the wake flag (backward-compat wrapper).
     pub(crate) fn take_wake_requested(&mut self) -> bool {
         match self {
             DriverEntry::Ephemeral(d) => d.take_wake_requested(),
             DriverEntry::Persistent(d) => d.take_wake_requested(),
-        }
-    }
-
-    /// Check and clear the immediate processing flag.
-    pub(crate) fn take_process_requested(&mut self) -> bool {
-        match self {
-            DriverEntry::Ephemeral(d) => d.take_process_requested(),
-            DriverEntry::Persistent(d) => d.take_process_requested(),
         }
     }
 
@@ -1128,7 +1130,7 @@ impl RuntimeSessionAdapter {
             )
         };
 
-        let (outcome, should_wake, should_process, handle) = {
+        let (outcome, signal, handle) = {
             let mut driver = driver.lock().await;
             let result = driver.as_driver_mut().accept_input(input).await?;
 
@@ -1147,9 +1149,8 @@ impl RuntimeSessionAdapter {
                             completions.register(input_id.clone())
                         })
                     };
-                    let wake = driver.take_wake_requested();
-                    let process_now = driver.take_process_requested();
-                    (result, wake, process_now, handle)
+                    let signal = driver.take_post_admission_signal();
+                    (result, signal, handle)
                 }
                 AcceptOutcome::Deduplicated { existing_id, .. } => {
                     // Check if the existing input is already terminal
@@ -1160,14 +1161,22 @@ impl RuntimeSessionAdapter {
 
                     if is_terminal {
                         // Input already processed — no handle, no waiter
-                        (result, false, false, None)
+                        (
+                            result,
+                            crate::driver::ephemeral::PostAdmissionSignal::None,
+                            None,
+                        )
                     } else {
                         // In-flight — join existing waiters via multi-waiter Vec
                         let handle = {
                             let mut completions = completions.lock().await;
                             completions.register(existing_id.clone())
                         };
-                        (result, false, false, Some(handle))
+                        (
+                            result,
+                            crate::driver::ephemeral::PostAdmissionSignal::None,
+                            Some(handle),
+                        )
                     }
                 }
                 AcceptOutcome::Rejected { reason } => {
@@ -1178,7 +1187,7 @@ impl RuntimeSessionAdapter {
             }
         };
 
-        if (should_wake || should_process)
+        if signal.should_wake()
             && let Some(ref wake_tx) = wake_tx
         {
             let _ = wake_tx.try_send(());
@@ -1210,12 +1219,12 @@ impl RuntimeSessionAdapter {
         let outcome = {
             let mut driver = driver.lock().await;
             let result = driver.as_driver_mut().accept_input(input).await?;
-            let _ = driver.take_wake_requested();
-            let process_requested = driver.take_process_requested();
+            let signal = driver.take_post_admission_signal();
             debug_assert!(
-                !process_requested,
+                !signal.should_process_immediately(),
                 "queue-only admission unexpectedly requested immediate processing"
             );
+            // Intentionally discard the signal — this is the no-wake path.
             result
         };
 
@@ -1452,17 +1461,16 @@ impl SessionServiceRuntimeExt for RuntimeSessionAdapter {
             (entry.driver.clone(), entry.wake_sender())
         };
 
-        // Accept input and check wake under the driver lock
-        let (outcome, should_wake, should_process) = {
+        // Accept input and drain the typed post-admission signal under the driver lock.
+        let (outcome, signal) = {
             let mut driver = driver.lock().await;
             let result = driver.as_driver_mut().accept_input(input).await?;
-            let wake = driver.take_wake_requested();
-            let process_now = driver.take_process_requested();
-            (result, wake, process_now)
+            let signal = driver.take_post_admission_signal();
+            (result, signal)
         };
 
-        // Signal the RuntimeLoop if wake or immediate processing was requested.
-        if should_wake || should_process {
+        // Signal the RuntimeLoop if the typed signal requests it.
+        if signal.should_wake() {
             match wake_tx {
                 Some(ref wake_tx) => {
                     // Non-blocking: if the channel is full, the loop is already processing
@@ -1679,19 +1687,18 @@ impl crate::traits::RuntimeControlPlane for RuntimeSessionAdapter {
         let (session_id, driver, _completions, wake_tx) = self.lookup_entry(runtime_id).await?;
         let _ = session_id;
 
-        let (outcome, should_wake, should_process) = {
+        let (outcome, signal) = {
             let mut drv = driver.lock().await;
             let result = drv
                 .as_driver_mut()
                 .accept_input(input)
                 .await
                 .map_err(|e| RuntimeControlPlaneError::Internal(e.to_string()))?;
-            let wake = drv.take_wake_requested();
-            let process_now = drv.take_process_requested();
-            (result, wake, process_now)
+            let signal = drv.take_post_admission_signal();
+            (result, signal)
         };
 
-        if (should_wake || should_process)
+        if signal.should_wake()
             && let Some(ref tx) = wake_tx
         {
             let _ = tx.try_send(());

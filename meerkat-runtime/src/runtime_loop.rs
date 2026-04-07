@@ -264,11 +264,19 @@ pub(crate) fn inputs_to_primitive_with_boundary(
     // Later inputs override scalar fields; collection fields accumulate.
     let turn_metadata = merge_batch_turn_metadata(inputs);
 
-    // Stamp typed execution intent from the first input in the batch.
-    // Batch homogeneity is enforced by debug_assert in process_queue.
-    let execution_kind = inputs
-        .first()
-        .map(|(_, input)| crate::input::classify_execution_kind(input));
+    // Derive typed execution intent from the full batch.
+    // If ANY input is ContentTurn, the whole batch is ContentTurn (safe default).
+    // Only a fully-homogeneous ResumePending batch becomes ResumePending.
+    let execution_kind = if inputs.is_empty() {
+        None
+    } else if inputs.iter().all(|(_, input)| {
+        crate::input::classify_execution_kind(input)
+            == meerkat_core::lifecycle::RuntimeExecutionKind::ResumePending
+    }) {
+        Some(meerkat_core::lifecycle::RuntimeExecutionKind::ResumePending)
+    } else {
+        Some(meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn)
+    };
     let turn_metadata = {
         let mut meta = turn_metadata.unwrap_or_default();
         meta.execution_kind = execution_kind;
@@ -1411,6 +1419,46 @@ mod tests {
         assert_eq!(
             meta.execution_kind,
             Some(meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn)
+        );
+    }
+
+    #[test]
+    fn mixed_batch_defaults_to_content_turn() {
+        // If a batch contains both ContentTurn and ResumePending inputs,
+        // the whole batch must be ContentTurn (safe default).
+        let peer = Input::Peer(PeerInput {
+            header: InputHeader {
+                id: InputId::new(),
+                timestamp: Utc::now(),
+                source: InputOrigin::Peer {
+                    peer_id: "p".into(),
+                    runtime_id: None,
+                },
+                durability: InputDurability::Durable,
+                visibility: InputVisibility::default(),
+                idempotency_key: None,
+                supersession_key: None,
+                correlation_id: None,
+            },
+            convention: Some(PeerConvention::Message),
+            body: "msg".into(),
+            blocks: None,
+            handling_mode: None,
+        });
+        let continuation =
+            Input::Continuation(ContinuationInput::detached_background_op_completed());
+        let inputs = vec![
+            (peer.id().clone(), peer),
+            (continuation.id().clone(), continuation),
+        ];
+        let primitive = inputs_to_primitive_with_boundary(&inputs, RunApplyBoundary::RunCheckpoint);
+        let meta = primitive
+            .turn_metadata()
+            .expect("should have turn_metadata");
+        assert_eq!(
+            meta.execution_kind,
+            Some(meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn),
+            "mixed batch must default to ContentTurn"
         );
     }
 }

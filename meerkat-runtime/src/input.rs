@@ -962,4 +962,20 @@ mod tests {
             meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn
         );
     }
+
+    #[test]
+    fn classify_operation_is_content_turn() {
+        let input = Input::Operation(OperationInput {
+            header: make_header(),
+            operation_id: OperationId::new(),
+            event: OpEvent::Started {
+                id: OperationId::new(),
+                kind: meerkat_core::ops::WorkKind::ToolCall,
+            },
+        });
+        assert_eq!(
+            classify_execution_kind(&input),
+            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn
+        );
+    }
 }

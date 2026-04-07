@@ -500,7 +500,9 @@ async fn apply_runtime_turn(
                         additional_instructions: primitive
                             .turn_metadata()
                             .and_then(|meta| meta.additional_instructions.clone()),
-                        execution_kind: None,
+                        execution_kind: primitive
+                            .turn_metadata()
+                            .and_then(|meta| meta.execution_kind),
                     },
                     boundary,
                     contributing_input_ids,
