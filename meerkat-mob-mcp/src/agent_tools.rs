@@ -27,6 +27,7 @@ use ::tokio::sync::RwLock;
 use tokio_with_wasm::alias::sync::RwLock;
 
 use crate::MobMcpState;
+use meerkat_core::comms::{CommsCommand, InputStreamMode, PeerName};
 
 // ─── Tool name constants ─────────────────────────────────────────────────
 
@@ -68,6 +69,47 @@ pub struct AgentMobToolSurface {
 }
 
 impl AgentMobToolSurface {
+    fn synthetic_parent_peer_added_fields(parent_name: &str) -> (String, String, String) {
+        let mut parts = parent_name.split('/');
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(_mob_id), Some(role), Some(meerkat_id), None) => (
+                meerkat_id.to_string(),
+                role.to_string(),
+                format!("peer {role}"),
+            ),
+            _ => (
+                parent_name.to_string(),
+                "external".to_string(),
+                "external peer".to_string(),
+            ),
+        }
+    }
+
+    async fn notify_peer_added(
+        sender: &Arc<dyn meerkat_core::agent::CommsRuntime>,
+        recipient_comms_name: &str,
+        peer: &str,
+        role: &str,
+        description: &str,
+    ) -> bool {
+        let Ok(to) = PeerName::new(recipient_comms_name) else {
+            return false;
+        };
+        sender
+            .send(CommsCommand::PeerRequest {
+                to,
+                intent: "mob.peer_added".to_string(),
+                params: serde_json::json!({
+                    "peer": peer,
+                    "role": role,
+                    "description": description,
+                }),
+                stream: InputStreamMode::None,
+            })
+            .await
+            .is_ok()
+    }
+
     /// Create a new agent mob tool surface.
     ///
     /// # Arguments
@@ -240,6 +282,108 @@ impl AgentMobToolSurface {
         Ok((mob_id, first_delegate))
     }
 
+    async fn wire_delegate_helper_to_creator(
+        &self,
+        mob_id: &MobId,
+        meerkat_id: &MeerkatId,
+    ) -> bool {
+        let Some(name) = self.comms_name.as_ref() else {
+            return false;
+        };
+        let Some(peer_id) = self.comms_peer_id.as_ref() else {
+            return false;
+        };
+        let Some(comms_rt) = self.comms_runtime.as_ref() else {
+            return false;
+        };
+
+        let Ok(parent_spec) = meerkat_core::comms::TrustedPeerSpec::new(
+            name.as_str(),
+            peer_id.as_str(),
+            format!("inproc://{name}"),
+        ) else {
+            return false;
+        };
+
+        let helper_trusts_parent = self
+            .state
+            .mob_wire(
+                mob_id,
+                meerkat_id.clone(),
+                meerkat_mob::PeerTarget::External(parent_spec),
+            )
+            .await
+            .is_ok();
+        if !helper_trusts_parent {
+            return false;
+        }
+
+        let Ok(handle) = self.state.handle_for(mob_id).await else {
+            return false;
+        };
+        let roster = handle.roster().await;
+        let Some(entry) = roster.get(meerkat_id) else {
+            return false;
+        };
+        let Some(helper_peer_id) = entry.peer_id.as_ref() else {
+            return false;
+        };
+        let helper_comms_name = format!("{}/{}/{}", mob_id, entry.profile, meerkat_id);
+        if helper_comms_name == *name {
+            return false;
+        }
+        let Ok(helper_spec) = meerkat_core::comms::TrustedPeerSpec::new(
+            &helper_comms_name,
+            helper_peer_id.as_str(),
+            format!("inproc://{helper_comms_name}"),
+        ) else {
+            return false;
+        };
+
+        if comms_rt.add_trusted_peer(helper_spec).await.is_err() {
+            return false;
+        }
+
+        let peer_description = handle
+            .definition()
+            .profiles
+            .get(&entry.profile)
+            .map(|profile| profile.peer_description.as_str())
+            .unwrap_or("delegate helper");
+        let Some(helper_session_id) = entry.member_ref.session_id() else {
+            return false;
+        };
+        let helper_runtime = meerkat_core::service::SessionServiceCommsExt::comms_runtime(
+            self.state.session_service().as_ref(),
+            helper_session_id,
+        )
+        .await;
+        let Some(helper_runtime) = helper_runtime else {
+            return false;
+        };
+
+        let notify_parent = Self::notify_peer_added(
+            &helper_runtime,
+            name,
+            meerkat_id.as_str(),
+            entry.profile.as_str(),
+            peer_description,
+        )
+        .await;
+        let (parent_peer, parent_role, parent_description) =
+            Self::synthetic_parent_peer_added_fields(name);
+        let notify_helper = Self::notify_peer_added(
+            comms_rt,
+            &helper_comms_name,
+            &parent_peer,
+            &parent_role,
+            &parent_description,
+        )
+        .await;
+
+        notify_parent && notify_helper
+    }
+
     async fn dispatch_delegate(
         &self,
         call: ToolCallView<'_>,
@@ -295,59 +439,9 @@ impl AgentMobToolSurface {
         // Bidirectional comms wiring:
         // 1. Wire helper → parent: helper trusts parent as external peer
         // 2. Wire parent → helper: parent trusts helper so it can receive messages
-        let wired = if let (Some(name), Some(peer_id)) = (&self.comms_name, &self.comms_peer_id)
-            && let Ok(parent_spec) = meerkat_core::comms::TrustedPeerSpec::new(
-                name.as_str(),
-                peer_id.as_str(),
-                format!("inproc://{name}"),
-            ) {
-            // Direction 1: helper trusts parent
-            let helper_trusts_parent = self
-                .state
-                .mob_wire(
-                    &mob_id,
-                    meerkat_id.clone(),
-                    meerkat_mob::PeerTarget::External(parent_spec),
-                )
-                .await
-                .is_ok();
-
-            // Direction 2: parent trusts helper
-            // Get helper's comms identity from the mob roster.
-            let parent_trusts_helper = if let Some(ref comms_rt) = self.comms_runtime {
-                let handle = self.state.handle_for(&mob_id).await;
-                if let Ok(handle) = handle {
-                    let roster = handle.roster().await;
-                    if let Some(entry) = roster.get(&meerkat_id) {
-                        if let Some(ref helper_peer_id) = entry.peer_id {
-                            let helper_comms_name =
-                                format!("{}/{}/{}", mob_id, entry.profile, meerkat_id);
-                            if let Ok(helper_spec) = meerkat_core::comms::TrustedPeerSpec::new(
-                                &helper_comms_name,
-                                helper_peer_id.as_str(),
-                                format!("inproc://{helper_comms_name}"),
-                            ) {
-                                comms_rt.add_trusted_peer(helper_spec).await.is_ok()
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            helper_trusts_parent && parent_trusts_helper
-        } else {
-            false
-        };
+        let wired = self
+            .wire_delegate_helper_to_creator(&mob_id, &meerkat_id)
+            .await;
 
         let mut result = json!({
             "mob_id": mob_id,
@@ -875,7 +969,436 @@ pub async fn archive_session_with_mob_cleanup(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use meerkat_core::service::{MobToolAuthorityContext, MobToolsFactory, OpaquePrincipalToken};
+    use async_trait::async_trait;
+    use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
+    use meerkat_core::comms::{
+        CommsCommand, PeerDirectoryEntry, PeerDirectorySource, PeerReachability, SendError,
+        SendReceipt, TrustedPeerSpec,
+    };
+    use meerkat_core::event::AgentEvent;
+    use meerkat_core::event_injector::{InteractionSubscription, SubscribableInjector};
+    use meerkat_core::interaction::{InboxInteraction, InteractionContent, InteractionId};
+    use meerkat_core::service::{
+        AppendSystemContextRequest, AppendSystemContextResult, MobToolAuthorityContext,
+        MobToolsFactory, OpaquePrincipalToken, SessionControlError, SessionHistoryPage,
+        SessionHistoryQuery, SessionInfo, SessionQuery, SessionServiceCommsExt,
+        SessionServiceControlExt, SessionServiceHistoryExt, SessionSummary, SessionUsage,
+        SessionView, StartTurnRequest,
+    };
+    use meerkat_core::time_compat::SystemTime;
+    use meerkat_core::types::{ContentInput, HandlingMode, RenderMetadata, RunResult, Usage};
+    use meerkat_core::{
+        AppendSystemContextStatus, EventInjector, EventStream, Provider, StreamError,
+    };
+    use meerkat_core::{EventInjectorError, PlainEventSource};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Default)]
+    struct TestCommsRegistry {
+        runtimes: tokio::sync::RwLock<HashMap<String, Arc<TestCommsRuntime>>>,
+    }
+
+    struct TestInjector;
+
+    impl meerkat_core::EventInjector for TestInjector {
+        fn inject(
+            &self,
+            _body: ContentInput,
+            _source: PlainEventSource,
+            _handling_mode: HandlingMode,
+            _render_metadata: Option<RenderMetadata>,
+        ) -> Result<(), EventInjectorError> {
+            Ok(())
+        }
+    }
+
+    impl SubscribableInjector for TestInjector {
+        fn inject_with_subscription(
+            &self,
+            body: ContentInput,
+            source: PlainEventSource,
+            handling_mode: HandlingMode,
+            render_metadata: Option<RenderMetadata>,
+        ) -> Result<InteractionSubscription, EventInjectorError> {
+            self.inject(body, source, handling_mode, render_metadata)?;
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let interaction_id = InteractionId(uuid::Uuid::new_v4());
+            let interaction_id_for_task = interaction_id;
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(AgentEvent::InteractionComplete {
+                        interaction_id: interaction_id_for_task,
+                        result: "ok".to_string(),
+                    })
+                    .await;
+            });
+            Ok(InteractionSubscription {
+                id: interaction_id,
+                events: rx,
+            })
+        }
+    }
+
+    impl TestCommsRegistry {
+        async fn insert(&self, runtime: Arc<TestCommsRuntime>) {
+            self.runtimes
+                .write()
+                .await
+                .insert(runtime.name.clone(), runtime);
+        }
+
+        async fn get(&self, name: &str) -> Option<Arc<TestCommsRuntime>> {
+            self.runtimes.read().await.get(name).cloned()
+        }
+    }
+
+    struct TestCommsRuntime {
+        name: String,
+        key: String,
+        trusted: tokio::sync::RwLock<HashMap<String, TrustedPeerSpec>>,
+        inbox: tokio::sync::RwLock<Vec<InboxInteraction>>,
+        notify: Arc<tokio::sync::Notify>,
+        registry: Arc<TestCommsRegistry>,
+    }
+
+    impl TestCommsRuntime {
+        async fn new(name: &str, registry: Arc<TestCommsRegistry>) -> Arc<Self> {
+            let runtime = Arc::new(Self {
+                name: name.to_string(),
+                key: format!("ed25519:{name}"),
+                trusted: tokio::sync::RwLock::new(HashMap::new()),
+                inbox: tokio::sync::RwLock::new(Vec::new()),
+                notify: Arc::new(tokio::sync::Notify::new()),
+                registry,
+            });
+            runtime.registry.insert(runtime.clone()).await;
+            runtime
+        }
+    }
+
+    #[async_trait]
+    impl CoreCommsRuntime for TestCommsRuntime {
+        fn public_key(&self) -> Option<String> {
+            Some(self.key.clone())
+        }
+
+        async fn add_trusted_peer(&self, peer: TrustedPeerSpec) -> Result<(), SendError> {
+            self.trusted
+                .write()
+                .await
+                .insert(peer.peer_id.clone(), peer);
+            Ok(())
+        }
+
+        async fn remove_trusted_peer(&self, peer_id: &str) -> Result<bool, SendError> {
+            Ok(self.trusted.write().await.remove(peer_id).is_some())
+        }
+
+        async fn send(&self, cmd: CommsCommand) -> Result<SendReceipt, SendError> {
+            match cmd {
+                CommsCommand::PeerRequest {
+                    to,
+                    intent,
+                    params,
+                    stream,
+                } => {
+                    let trusted = self.trusted.read().await;
+                    if !trusted.values().any(|peer| peer.name == to.as_str()) {
+                        return Err(SendError::PeerNotFound(to.as_string()));
+                    }
+                    drop(trusted);
+                    let recipient = self
+                        .registry
+                        .get(to.as_str())
+                        .await
+                        .ok_or_else(|| SendError::PeerNotFound(to.as_string()))?;
+                    recipient.inbox.write().await.push(InboxInteraction {
+                        id: InteractionId(uuid::Uuid::new_v4()),
+                        from: self.name.clone(),
+                        content: InteractionContent::Request { intent, params },
+                        rendered_text: String::new(),
+                        handling_mode: HandlingMode::Queue,
+                        render_metadata: None,
+                    });
+                    recipient.notify.notify_waiters();
+                    Ok(SendReceipt::PeerRequestSent {
+                        envelope_id: uuid::Uuid::new_v4(),
+                        interaction_id: InteractionId(uuid::Uuid::new_v4()),
+                        stream_reserved: !matches!(
+                            stream,
+                            meerkat_core::comms::InputStreamMode::None
+                        ),
+                    })
+                }
+                unsupported => Err(SendError::Unsupported(format!(
+                    "unsupported test comms command: {unsupported:?}"
+                ))),
+            }
+        }
+
+        async fn peers(&self) -> Vec<PeerDirectoryEntry> {
+            self.trusted
+                .read()
+                .await
+                .values()
+                .filter_map(|peer| {
+                    Some(PeerDirectoryEntry {
+                        name: meerkat_core::comms::PeerName::new(&peer.name).ok()?,
+                        peer_id: peer.peer_id.clone(),
+                        address: peer.address.clone(),
+                        source: PeerDirectorySource::Trusted,
+                        sendable_kinds: vec!["peer_request".to_string()],
+                        capabilities: serde_json::json!({}),
+                        reachability: PeerReachability::Reachable,
+                        last_unreachable_reason: None,
+                        meta: Default::default(),
+                    })
+                })
+                .collect()
+        }
+
+        async fn drain_messages(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
+            self.notify.clone()
+        }
+
+        async fn drain_inbox_interactions(&self) -> Vec<InboxInteraction> {
+            let mut inbox = self.inbox.write().await;
+            std::mem::take(&mut *inbox)
+        }
+    }
+
+    struct RealCommsSessionSvc {
+        sessions: tokio::sync::RwLock<HashMap<SessionId, Arc<TestCommsRuntime>>>,
+        counter: AtomicU64,
+        runtime_adapter: Arc<meerkat_runtime::RuntimeSessionAdapter>,
+        registry: Arc<TestCommsRegistry>,
+        injector: Arc<TestInjector>,
+    }
+
+    impl RealCommsSessionSvc {
+        fn new() -> Self {
+            Self {
+                sessions: tokio::sync::RwLock::new(HashMap::new()),
+                counter: AtomicU64::new(0),
+                runtime_adapter: Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral()),
+                registry: Arc::new(TestCommsRegistry::default()),
+                injector: Arc::new(TestInjector),
+            }
+        }
+
+        async fn real_comms(&self, session_id: &SessionId) -> Option<Arc<TestCommsRuntime>> {
+            self.sessions.read().await.get(session_id).cloned()
+        }
+
+        async fn register_external_comms(&self, name: &str) -> Arc<TestCommsRuntime> {
+            TestCommsRuntime::new(name, Arc::clone(&self.registry)).await
+        }
+    }
+
+    #[async_trait]
+    impl SessionService for RealCommsSessionSvc {
+        async fn create_session(
+            &self,
+            req: meerkat_core::service::CreateSessionRequest,
+        ) -> Result<RunResult, SessionError> {
+            let sid = SessionId::new();
+            let n = self.counter.fetch_add(1, Ordering::Relaxed);
+            let name = req
+                .build
+                .as_ref()
+                .and_then(|b| b.comms_name.clone())
+                .unwrap_or_else(|| format!("real-comms-session-{n}"));
+            let comms = TestCommsRuntime::new(&name, Arc::clone(&self.registry)).await;
+            self.sessions.write().await.insert(sid.clone(), comms);
+            Ok(RunResult {
+                text: "ok".to_string(),
+                session_id: sid,
+                usage: Usage::default(),
+                turns: 1,
+                tool_calls: 0,
+                structured_output: None,
+                schema_warnings: None,
+                skill_diagnostics: None,
+            })
+        }
+
+        async fn start_turn(
+            &self,
+            id: &SessionId,
+            _req: StartTurnRequest,
+        ) -> Result<RunResult, SessionError> {
+            if !self.sessions.read().await.contains_key(id) {
+                return Err(SessionError::NotFound { id: id.clone() });
+            }
+            Ok(RunResult {
+                text: "ok".to_string(),
+                session_id: id.clone(),
+                usage: Usage::default(),
+                turns: 1,
+                tool_calls: 0,
+                structured_output: None,
+                schema_warnings: None,
+                skill_diagnostics: None,
+            })
+        }
+
+        async fn interrupt(&self, id: &SessionId) -> Result<(), SessionError> {
+            if !self.sessions.read().await.contains_key(id) {
+                return Err(SessionError::NotFound { id: id.clone() });
+            }
+            Ok(())
+        }
+
+        async fn read(&self, id: &SessionId) -> Result<SessionView, SessionError> {
+            if !self.sessions.read().await.contains_key(id) {
+                return Err(SessionError::NotFound { id: id.clone() });
+            }
+            Ok(SessionView {
+                state: SessionInfo {
+                    session_id: id.clone(),
+                    created_at: SystemTime::now(),
+                    updated_at: SystemTime::now(),
+                    message_count: 0,
+                    is_active: true,
+                    model: "claude-sonnet-4-5".to_string(),
+                    provider: Provider::Anthropic,
+                    last_assistant_text: None,
+                    labels: Default::default(),
+                },
+                billing: SessionUsage {
+                    total_tokens: 0,
+                    usage: Usage::default(),
+                },
+            })
+        }
+
+        async fn list(&self, _query: SessionQuery) -> Result<Vec<SessionSummary>, SessionError> {
+            Ok(Vec::new())
+        }
+
+        async fn archive(&self, id: &SessionId) -> Result<(), SessionError> {
+            let removed = self.sessions.write().await.remove(id).is_some();
+            if removed {
+                Ok(())
+            } else {
+                Err(SessionError::NotFound { id: id.clone() })
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SessionServiceCommsExt for RealCommsSessionSvc {
+        async fn comms_runtime(&self, session_id: &SessionId) -> Option<Arc<dyn CoreCommsRuntime>> {
+            self.sessions
+                .read()
+                .await
+                .get(session_id)
+                .map(|runtime| runtime.clone() as Arc<dyn CoreCommsRuntime>)
+        }
+
+        async fn event_injector(
+            &self,
+            _session_id: &SessionId,
+        ) -> Option<Arc<dyn meerkat_core::EventInjector>> {
+            Some(self.injector.clone() as Arc<dyn meerkat_core::EventInjector>)
+        }
+
+        async fn interaction_event_injector(
+            &self,
+            _session_id: &SessionId,
+        ) -> Option<Arc<dyn meerkat_core::event_injector::SubscribableInjector>> {
+            Some(self.injector.clone() as Arc<dyn SubscribableInjector>)
+        }
+    }
+
+    #[async_trait]
+    impl SessionServiceControlExt for RealCommsSessionSvc {
+        async fn append_system_context(
+            &self,
+            id: &SessionId,
+            _req: AppendSystemContextRequest,
+        ) -> Result<AppendSystemContextResult, SessionControlError> {
+            if !self.sessions.read().await.contains_key(id) {
+                return Err(SessionError::NotFound { id: id.clone() }.into());
+            }
+            Ok(AppendSystemContextResult {
+                status: AppendSystemContextStatus::Staged,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl SessionServiceHistoryExt for RealCommsSessionSvc {
+        async fn read_history(
+            &self,
+            id: &SessionId,
+            query: SessionHistoryQuery,
+        ) -> Result<SessionHistoryPage, SessionError> {
+            if !self.sessions.read().await.contains_key(id) {
+                return Err(SessionError::NotFound { id: id.clone() });
+            }
+            Ok(SessionHistoryPage::from_messages(id.clone(), &[], query))
+        }
+    }
+
+    #[async_trait]
+    impl meerkat_mob::MobSessionService for RealCommsSessionSvc {
+        async fn subscribe_session_events(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<EventStream, StreamError> {
+            Err(StreamError::NotFound(format!("session {session_id}")))
+        }
+
+        fn supports_persistent_sessions(&self) -> bool {
+            true
+        }
+
+        fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::RuntimeSessionAdapter>> {
+            Some(self.runtime_adapter.clone())
+        }
+
+        async fn session_belongs_to_mob(&self, session_id: &SessionId, mob_id: &MobId) -> bool {
+            self.sessions.read().await.contains_key(session_id) && !mob_id.as_str().is_empty()
+        }
+
+        async fn load_persisted_session(
+            &self,
+            _session_id: &SessionId,
+        ) -> Result<Option<meerkat_core::Session>, SessionError> {
+            Ok(None)
+        }
+
+        async fn apply_runtime_turn(
+            &self,
+            session_id: &SessionId,
+            run_id: meerkat_core::RunId,
+            req: StartTurnRequest,
+            boundary: meerkat_core::lifecycle::run_primitive::RunApplyBoundary,
+            contributing_input_ids: Vec<meerkat_core::InputId>,
+        ) -> Result<meerkat_core::lifecycle::core_executor::CoreApplyOutput, SessionError> {
+            <Self as SessionService>::start_turn(self, session_id, req).await?;
+            Ok(meerkat_core::lifecycle::core_executor::CoreApplyOutput {
+                receipt: meerkat_core::lifecycle::run_receipt::RunBoundaryReceipt {
+                    run_id,
+                    boundary,
+                    contributing_input_ids,
+                    conversation_digest: None,
+                    message_count: 0,
+                    sequence: 0,
+                },
+                session_snapshot: None,
+                terminal: None,
+                run_result: None,
+            })
+        }
+    }
 
     fn create_only_authority() -> MobToolAuthorityContext {
         MobToolAuthorityContext::new(OpaquePrincipalToken::new("create-only"), true)
@@ -1530,5 +2053,91 @@ mod tests {
         assert_eq!(audit_events[0].0, "mob_spawn_member");
         assert_eq!(audit_events[0].1.as_str(), "scope-principal");
         assert_eq!(audit_events[0].2.as_deref(), Some("audit-scope"));
+    }
+
+    #[tokio::test]
+    async fn test_delegate_wiring_links_parent_and_helper_peers_and_emits_peer_added_lifecycle() {
+        let service = Arc::new(RealCommsSessionSvc::new());
+        let state = Arc::new(MobMcpState::new(service.clone()));
+        let parent_name = "parent/lead/l-1".to_string();
+        let parent_comms = service.register_external_comms(&parent_name).await;
+        let parent_peer_id = parent_comms.public_key().expect("parent public key");
+        let session_id = SessionId::new();
+        let surface = AgentMobToolSurface::new(
+            Arc::clone(&state),
+            None,
+            create_only_authority(),
+            "claude-sonnet-4-5".to_string(),
+            session_id.clone(),
+            Some(parent_name.clone()),
+            Some(parent_peer_id.clone()),
+            Some(parent_comms.clone() as Arc<dyn CoreCommsRuntime>),
+        );
+
+        let (mob_id, _created) = surface
+            .ensure_implicit_mob()
+            .await
+            .expect("create implicit mob");
+        let helper_id = MeerkatId::from("helper-1");
+        let mut spec = SpawnMemberSpec::new(ProfileName::from("delegate"), helper_id.clone());
+        spec.runtime_mode = Some(MobRuntimeMode::TurnDriven);
+        let member_ref = state
+            .mob_spawn_spec(&mob_id, spec)
+            .await
+            .expect("spawn helper for delegate wiring test");
+        let wired = surface
+            .wire_delegate_helper_to_creator(&mob_id, &helper_id)
+            .await;
+        assert!(
+            wired,
+            "delegate wiring should succeed when creator comms are present"
+        );
+
+        let helper_session_id = member_ref.session_id().cloned().expect("helper session id");
+        let helper_comms = service
+            .real_comms(&helper_session_id)
+            .await
+            .expect("helper comms");
+        let helper_name = format!("{}/{}/{}", mob_id, "delegate", helper_id);
+
+        let parent_peers = CoreCommsRuntime::peers(&*parent_comms).await;
+        assert!(
+            parent_peers
+                .iter()
+                .any(|entry| entry.name.as_str() == helper_name),
+            "delegate should expose helper in parent peers()"
+        );
+
+        let helper_peers = CoreCommsRuntime::peers(&*helper_comms).await;
+        assert!(
+            helper_peers
+                .iter()
+                .any(|entry| entry.name.as_str() == parent_name),
+            "delegate should expose the creating meerkat in helper peers()"
+        );
+
+        let parent_inbox = CoreCommsRuntime::drain_inbox_interactions(&*parent_comms).await;
+        assert!(
+            parent_inbox.iter().any(|interaction| {
+                matches!(
+                    &interaction.content,
+                    meerkat_core::InteractionContent::Request { intent, .. }
+                        if intent == "mob.peer_added"
+                )
+            }),
+            "delegate wiring must emit mob.peer_added to the creating meerkat"
+        );
+
+        let helper_inbox = CoreCommsRuntime::drain_inbox_interactions(&*helper_comms).await;
+        assert!(
+            helper_inbox.iter().any(|interaction| {
+                matches!(
+                    &interaction.content,
+                    meerkat_core::InteractionContent::Request { intent, .. }
+                        if intent == "mob.peer_added"
+                )
+            }),
+            "delegate wiring must emit mob.peer_added to the helper"
+        );
     }
 }

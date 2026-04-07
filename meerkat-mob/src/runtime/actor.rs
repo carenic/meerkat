@@ -138,6 +138,7 @@ pub(super) struct PendingSpawn {
     pub(super) prompt: ContentInput,
     pub(super) runtime_mode: crate::MobRuntimeMode,
     pub(super) labels: std::collections::BTreeMap<String, String>,
+    pub(super) owner_session_id: Option<SessionId>,
     pub(super) auto_wire_parent: bool,
     /// Peer wiring to restore after respawn completes.
     pub(super) restore_wiring: Option<RestoreWiringPlan>,
@@ -1814,6 +1815,7 @@ impl MobActor {
                         resolved_labels,
                         Some(member_ref),
                         None,
+                        owner_session_id.clone(),
                         auto_wire_parent,
                     ));
                 }
@@ -1881,6 +1883,7 @@ impl MobActor {
                         resolved_labels,
                         None::<MemberRef>,
                         Some(provision_request),
+                        owner_session_id.clone(),
                         auto_wire_parent,
                     ));
                 }
@@ -2007,6 +2010,7 @@ impl MobActor {
                 resolved_labels,
                 None::<MemberRef>,
                 Some(provision_request),
+                owner_session_id.clone(),
                 auto_wire_parent,
             ))
         }
@@ -2020,6 +2024,7 @@ impl MobActor {
             resolved_labels,
             resume_member_ref,
             maybe_provision_request,
+            spawn_owner_session_id,
             auto_wire_parent,
         ) = match prepare_result {
             Ok(prepared) => prepared,
@@ -2069,6 +2074,7 @@ impl MobActor {
                     resolved_labels,
                     provision,
                     operation_id,
+                    spawn_owner_session_id,
                     auto_wire_parent,
                     None,
                 )
@@ -2104,6 +2110,7 @@ impl MobActor {
             prompt,
             runtime_mode: selected_runtime_mode,
             labels: resolved_labels,
+            owner_session_id: spawn_owner_session_id,
             auto_wire_parent,
             restore_wiring: None,
             progress: pending_progress.clone(),
@@ -2250,6 +2257,7 @@ impl MobActor {
                 prompt,
                 runtime_mode,
                 labels,
+                owner_session_id,
                 auto_wire_parent,
                 restore_wiring,
                 progress: _,
@@ -2282,6 +2290,7 @@ impl MobActor {
                                 labels,
                                 provision,
                                 spawn_receipt.operation_id,
+                                owner_session_id,
                                 auto_wire_parent,
                                 restore_wiring,
                             )
@@ -2393,6 +2402,7 @@ impl MobActor {
             prompt: prompt.clone(),
             runtime_mode,
             labels: labels.clone(),
+            owner_session_id: None,
             auto_wire_parent: false,
             restore_wiring: None,
             progress: Arc::new(std::sync::Mutex::new(PendingSpawnProgress::default())),
@@ -2460,6 +2470,7 @@ impl MobActor {
                 labels,
                 provision,
                 spawn_receipt.operation_id,
+                None,
                 false,
                 None,
             )
@@ -2501,6 +2512,7 @@ impl MobActor {
         labels: std::collections::BTreeMap<String, String>,
         provision: PendingProvision,
         operation_id: meerkat_core::ops::OperationId,
+        owner_session_id: Option<SessionId>,
         auto_wire_parent: bool,
         restore_wiring: Option<RestoreWiringPlan>,
     ) -> Result<FinalizeSpawnOutcome, MobError> {
@@ -2602,35 +2614,19 @@ impl MobActor {
             return Err(start_error);
         }
 
-        // auto_wire_parent: wire to the orchestrator profile members.
-        if auto_wire_parent && let Some(ref orchestrator) = self.definition.orchestrator {
-            let broken_members = self
-                .restore_diagnostics
-                .read()
+        // auto_wire_parent: wire to the actual spawner member when the spawn
+        // request came from a session-owned mob tool call.
+        if auto_wire_parent
+            && let Some(parent_id) = self
+                .resolve_auto_wire_parent_target(owner_session_id.as_ref(), meerkat_id)
                 .await
-                .keys()
-                .cloned()
-                .collect::<HashSet<_>>();
-            let orchestrator_ids = {
-                let roster = self.roster.read().await;
-                roster
-                    .by_profile(&orchestrator.profile)
-                    .filter(|entry| {
-                        entry.state == crate::roster::MemberState::Active
-                            && !broken_members.contains(&entry.meerkat_id)
-                            && entry.meerkat_id != *meerkat_id
-                    })
-                    .map(|entry| entry.meerkat_id.clone())
-                    .collect::<Vec<_>>()
-            };
-            for orch_id in &orchestrator_ids {
-                if let Err(e) = self.do_wire(meerkat_id, orch_id).await {
-                    tracing::warn!(
-                        error = %e,
-                        peer = %orch_id,
-                        "auto_wire_parent: failed to wire to orchestrator"
-                    );
-                }
+        {
+            if let Err(error) = self.do_wire(meerkat_id, &parent_id).await {
+                tracing::warn!(
+                    error = %error,
+                    peer = %parent_id,
+                    "auto_wire_parent: failed to wire to spawning member"
+                );
             }
         }
 
@@ -2752,6 +2748,31 @@ impl MobActor {
         }
 
         targets
+    }
+
+    async fn resolve_auto_wire_parent_target(
+        &self,
+        owner_session_id: Option<&SessionId>,
+        spawned_meerkat_id: &MeerkatId,
+    ) -> Option<MeerkatId> {
+        let owner_session_id = owner_session_id?;
+        let broken_members = self
+            .restore_diagnostics
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let roster = self.roster.read().await;
+        roster
+            .list()
+            .find(|entry| {
+                entry.state == crate::roster::MemberState::Active
+                    && entry.meerkat_id != *spawned_meerkat_id
+                    && !broken_members.contains(&entry.meerkat_id)
+                    && entry.member_ref.session_id() == Some(owner_session_id)
+            })
+            .map(|entry| entry.meerkat_id.clone())
     }
 
     /// P1-T05: retire() removes a meerkat.
@@ -2962,6 +2983,7 @@ impl MobActor {
             prompt: prompt.clone(),
             runtime_mode: snapshot.runtime_mode,
             labels: snapshot.labels.clone(),
+            owner_session_id: None,
             auto_wire_parent: false,
             restore_wiring: (!snapshot.restore_wiring.local_peers.is_empty()
                 || !snapshot.restore_wiring.external_peers.is_empty())
@@ -3068,6 +3090,7 @@ impl MobActor {
                 snapshot.labels.clone(),
                 provision,
                 spawn_receipt.operation_id,
+                None,
                 false,
                 (!snapshot.restore_wiring.local_peers.is_empty()
                     || !snapshot.restore_wiring.external_peers.is_empty())
@@ -3346,12 +3369,6 @@ impl MobActor {
         spec: &TrustedPeerSpec,
     ) -> Result<(), MobError> {
         let external_name = MeerkatId::from(spec.name.clone());
-        if local == &external_name {
-            return Err(MobError::WiringError(format!(
-                "wire requires distinct peers (got '{local}')"
-            )));
-        }
-
         let _edge_guard = self
             .edge_locks
             .acquire(local.as_str(), external_name.as_str())
@@ -3373,6 +3390,13 @@ impl MobActor {
                 stored_spec,
             )
         };
+
+        let local_comms_name = self.comms_name_for(&entry);
+        if local == &external_name || spec.name == local_comms_name {
+            return Err(MobError::WiringError(format!(
+                "wire requires distinct peers (got '{local_comms_name}')"
+            )));
+        }
 
         if collides_with_local_member {
             return Err(MobError::WiringError(format!(

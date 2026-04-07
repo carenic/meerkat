@@ -8368,6 +8368,109 @@ async fn test_auto_wire_orchestrator_not_wired_to_self() {
 }
 
 #[tokio::test]
+async fn test_auto_wire_orchestrator_real_comms_does_not_surface_self_peer() {
+    let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
+    let (handle, service) =
+        create_test_mob_with_real_comms(sample_definition_with_auto_wire()).await;
+
+    let sid_l = handle
+        .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
+        .await
+        .expect("spawn lead")
+        .session_id()
+        .expect("session-backed")
+        .clone();
+
+    let comms_l = service.real_comms(&sid_l).await.expect("comms for l-1");
+    let peers_l = CoreCommsRuntime::peers(&*comms_l).await;
+    assert!(
+        !peers_l
+            .iter()
+            .any(|entry| entry.name.as_str() == test_comms_name("lead", "l-1")),
+        "auto-wire must not surface the spawned member itself in peers()"
+    );
+}
+
+#[tokio::test]
+async fn test_auto_wire_parent_uses_spawning_member_not_orchestrator() {
+    let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
+    let (handle, service) = create_test_mob_with_real_comms(sample_definition()).await;
+
+    let sid_l = handle
+        .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
+        .await
+        .expect("spawn lead")
+        .session_id()
+        .expect("session-backed")
+        .clone();
+    let sid_w1 = handle
+        .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
+        .await
+        .expect("spawn first worker")
+        .session_id()
+        .expect("session-backed")
+        .clone();
+
+    let mut spec = super::handle::SpawnMemberSpec::new("worker", "w-2");
+    spec.auto_wire_parent = true;
+    let receipt = handle
+        .spawn_spec_receipt_with_owner_context(
+            spec,
+            super::handle::CanonicalOpsOwnerContext {
+                owner_session_id: sid_w1.clone(),
+                ops_registry: Arc::new(meerkat_runtime::RuntimeOpsLifecycleRegistry::new()),
+            },
+        )
+        .await
+        .expect("spawn second worker from worker owner context");
+    let sid_w2 = receipt
+        .member_ref
+        .session_id()
+        .expect("session-backed")
+        .clone();
+
+    let comms_l = service.real_comms(&sid_l).await.expect("comms for l-1");
+    let comms_w1 = service.real_comms(&sid_w1).await.expect("comms for w-1");
+    let comms_w2 = service.real_comms(&sid_w2).await.expect("comms for w-2");
+
+    let peers_w2 = CoreCommsRuntime::peers(&*comms_w2).await;
+    assert!(
+        peers_w2
+            .iter()
+            .any(|entry| entry.name.as_str() == test_comms_name("worker", "w-1")),
+        "auto_wire_parent should wire the spawned member to its actual spawner"
+    );
+    assert!(
+        !peers_w2
+            .iter()
+            .any(|entry| entry.name.as_str() == test_comms_name("lead", "l-1")),
+        "auto_wire_parent must not fall back to wiring the orchestrator"
+    );
+    assert!(
+        !peers_w2
+            .iter()
+            .any(|entry| entry.name.as_str() == test_comms_name("worker", "w-2")),
+        "auto_wire_parent must not surface the spawned member itself in peers()"
+    );
+
+    let peers_w1 = CoreCommsRuntime::peers(&*comms_w1).await;
+    assert!(
+        peers_w1
+            .iter()
+            .any(|entry| entry.name.as_str() == test_comms_name("worker", "w-2")),
+        "spawner should see the newly spawned member as a peer"
+    );
+
+    let peers_l = CoreCommsRuntime::peers(&*comms_l).await;
+    assert!(
+        !peers_l
+            .iter()
+            .any(|entry| entry.name.as_str() == test_comms_name("worker", "w-2")),
+        "orchestrator should stay uninvolved when a non-orchestrator member spawns with auto_wire_parent"
+    );
+}
+
+#[tokio::test]
 async fn test_spawn_skips_broken_orchestrator_in_auto_wire_selection() {
     let service = Arc::new(MockSessionService::new());
     let mut definition = sample_definition_with_auto_wire();

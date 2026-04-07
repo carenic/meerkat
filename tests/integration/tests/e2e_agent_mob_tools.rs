@@ -830,39 +830,58 @@ async fn e2e_resume_model_override_recreates_implicit_mob() {
         .expect("build_mob_tools with model B");
 
     // After build_mob_tools with model B:
-    // - The old implicit mob was destroyed
-    // - No new one exists yet (created on next delegate)
+    // - The existing implicit mob is untouched
+    // - Reconciliation stays with the surface/runtime on the next delegate
+    //   or explicit ensure_implicit_mob_for_model call
     assert!(
         mob_state
             .find_implicit_mob(&session_id.to_string())
             .await
-            .is_none(),
-        "old implicit mob should be destroyed after model override rebuild"
+            .as_ref()
+            == Some(&mob_id_a),
+        "build_mob_tools must not destroy or replace the implicit mob during rebuild"
     );
-    assert!(
-        mob_state.handle_for(&mob_id_a).await.is_err(),
-        "old mob handle should be gone"
+    let unchanged_handle = mob_state
+        .handle_for(&mob_id_a)
+        .await
+        .expect("old mob handle");
+    let unchanged_model = unchanged_handle
+        .definition()
+        .profiles
+        .get(&meerkat_mob::ProfileName::from("delegate"))
+        .map(|p| p.model.clone())
+        .expect("delegate profile after build");
+    assert_eq!(
+        unchanged_model, model_a,
+        "factory rebuild must not mutate the existing implicit mob in place"
     );
 
-    // The dispatcher returned from build_mob_tools has the correct model.
-    // But the EXISTING session's agent still has the old surface.
-    // The new surface is only active if a new agent is built (CLI resume path).
-    //
-    // For this test, we verify the factory output is correct by creating a
-    // SECOND session — which goes through build_agent → build_mob_tools with
-    // model B (because the factory will be called for the new session).
-    //
-    // Actually, the second session gets its own session_id. The implicit mob
-    // from session 1 was destroyed. Session 2's build_mob_tools won't find
-    // a stale mob (different session_id). So this tests the destroy path only.
-    //
-    // Verify: old mob destroyed, factory output has correct model.
-    // The factory's returned dispatcher has model B baked in, which means
-    // any agent built with it will create helpers with model B. We already
-    // verified the old mob was destroyed. That's the contract.
-    //
-    // To fully verify, we'd need the CLI resume path, which is not available
-    // through the RPC surface. This test proves the factory-level behavior.
+    let (reconciled_mob_id, created) = mob_state
+        .ensure_implicit_mob_for_model(&session_id.to_string(), &model_b, Some(&mob_id_a))
+        .await
+        .expect("reconcile implicit mob after model override");
+    assert!(
+        created,
+        "model mismatch should force on-demand implicit mob reconciliation"
+    );
+    assert_eq!(
+        reconciled_mob_id, mob_id_a,
+        "implicit mob IDs stay canonical per session across model reconciliation"
+    );
+    let reconciled_handle = mob_state
+        .handle_for(&reconciled_mob_id)
+        .await
+        .expect("reconciled mob handle");
+    let reconciled_model = reconciled_handle
+        .definition()
+        .profiles
+        .get(&meerkat_mob::ProfileName::from("delegate"))
+        .map(|p| p.model.clone())
+        .expect("delegate profile after reconciliation");
+    assert_eq!(
+        reconciled_model, model_b,
+        "on-demand reconciliation should refresh the implicit mob model"
+    );
 }
 
 /// 8. Bidirectional comms: helper sends message, parent receives it.
