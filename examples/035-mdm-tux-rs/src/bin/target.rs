@@ -70,7 +70,7 @@ Your responses stream directly to the controller — do not use the 'send' comms
 struct TargetRuntimeSurface {
     service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
     runtime_adapter: Arc<RuntimeSessionAdapter>,
-    jsonl_store: JsonlStore,
+    jsonl_store: Arc<JsonlStore>,
     mob_state: Arc<MobMcpState>,
 }
 
@@ -86,14 +86,11 @@ async fn build_target_runtime_surface(
     let builder = FactoryAgentBuilder::new(factory, Config::default());
     let mob_tools_slot = Arc::clone(&builder.default_mob_tools);
 
-    let jsonl_store = JsonlStore::new(session_dir.to_path_buf());
+    let jsonl_store = Arc::new(JsonlStore::new(session_dir.to_path_buf()));
     jsonl_store.init().await?;
 
-    let bundle_store = JsonlStore::new(session_dir.to_path_buf());
-    bundle_store.init().await?;
-
     let persistence = PersistenceBundle::new(
-        Arc::new(bundle_store) as Arc<dyn SessionStore>,
+        Arc::clone(&jsonl_store) as Arc<dyn SessionStore>,
         None,
         Arc::new(MemoryBlobStore::new()),
     );
