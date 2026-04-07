@@ -822,6 +822,7 @@ async fn e2e_resume_model_override_recreates_implicit_mob() {
                 meerkat_core::service::OpaquePrincipalToken::new("e2e-resume-override"),
                 true,
             )),
+            effective_authority: None,
             comms_name: None,
             comms_runtime: None,
         })

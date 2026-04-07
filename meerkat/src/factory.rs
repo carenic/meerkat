@@ -1600,6 +1600,11 @@ impl AgentFactory {
             .mob_tools
             .take()
             .or_else(|| self.mob_tools.clone());
+        // Shared mob authority handle — created inside the mob block, hoisted
+        // out so the agent builder can reference it after the block.
+        let mut hoisted_mob_authority_handle: Option<
+            Arc<std::sync::RwLock<meerkat_core::service::MobToolAuthorityContext>>,
+        > = None;
         if effective_mob && let Some(mob_factory) = mob_factory {
             // Build comms runtime arg: clone from the comms phase if available.
             #[cfg(feature = "comms")]
@@ -1609,10 +1614,19 @@ impl AgentFactory {
             #[cfg(not(feature = "comms"))]
             let mob_comms: Option<Arc<dyn meerkat_core::agent::CommsRuntime>> = None;
 
+            // Create the shared effective-authority handle. The agent owns the
+            // write side (via apply_session_effects); mob tools get a read view.
+            let mob_authority_handle = build_config
+                .mob_tool_authority_context
+                .as_ref()
+                .map(|ctx| Arc::new(std::sync::RwLock::new(ctx.clone())));
+            hoisted_mob_authority_handle = mob_authority_handle.clone();
+
             let mob_args = meerkat_core::service::MobToolsBuildArgs {
                 session_id: session.id().clone(),
                 model: model.clone(),
                 authority_context: build_config.mob_tool_authority_context.clone(),
+                effective_authority: mob_authority_handle.clone(),
                 comms_name: build_config.comms_name.clone(),
                 comms_runtime: mob_comms,
             };
@@ -2110,6 +2124,11 @@ impl AgentFactory {
 
         // 13. Build agent
         let mut agent = builder.build(llm_adapter, tools, store_adapter).await;
+
+        // Wire mob authority handle into agent for session-effect application.
+        if let Some(handle) = hoisted_mob_authority_handle {
+            agent.set_mob_authority_handle(handle);
+        }
 
         // 13b. Stage initial external filter to hide view_image when the model
         // cannot process image blocks in tool results. For resumed sessions,

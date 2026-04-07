@@ -391,7 +391,11 @@ impl AgentToolDispatcher for CompositeDispatcher {
                         ToolResult::with_blocks(call.id.to_string(), blocks, false)
                     }
                 };
-                return Ok(ToolDispatchOutcome { result, async_ops });
+                return Ok(ToolDispatchOutcome {
+                    result,
+                    async_ops,
+                    session_effects: vec![],
+                });
             }
         }
 
@@ -425,7 +429,11 @@ impl AgentToolDispatcher for CompositeDispatcher {
                             ToolResult::with_blocks(call.id.to_string(), blocks, false)
                         }
                     };
-                    return Ok(ToolDispatchOutcome { result, async_ops });
+                    return Ok(ToolDispatchOutcome {
+                        result,
+                        async_ops,
+                        session_effects: vec![],
+                    });
                 }
             }
         }

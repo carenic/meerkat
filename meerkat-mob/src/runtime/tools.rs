@@ -433,6 +433,7 @@ impl MobOperatorToolDispatcher {
         Ok(meerkat_core::ToolDispatchOutcome {
             result: ToolResult::new(call.id.to_string(), content, false),
             async_ops,
+            session_effects: vec![],
         })
     }
 
