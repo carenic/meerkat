@@ -1116,7 +1116,7 @@ impl RuntimeSessionAdapter {
         input: Input,
     ) -> Result<(AcceptOutcome, Option<crate::completion::CompletionHandle>), RuntimeDriverError>
     {
-        let (driver, completions, wake_tx) = {
+        let (driver, completions, wake_tx, control_tx) = {
             let sessions = self.sessions.read().await;
             let entry = sessions
                 .get(session_id)
@@ -1127,6 +1127,7 @@ impl RuntimeSessionAdapter {
                 entry.driver.clone(),
                 entry.completions.clone(),
                 entry.wake_sender(),
+                entry.control_sender(),
             )
         };
 
@@ -1191,6 +1192,13 @@ impl RuntimeSessionAdapter {
             && let Some(ref wake_tx) = wake_tx
         {
             let _ = wake_tx.try_send(());
+        }
+        if signal.should_interrupt_yielding()
+            && let Some(ref tx) = control_tx
+        {
+            let _ = tx.try_send(
+                meerkat_core::lifecycle::run_control::RunControlCommand::InterruptYielding,
+            );
         }
 
         Ok((outcome, handle))
@@ -1451,14 +1459,18 @@ impl SessionServiceRuntimeExt for RuntimeSessionAdapter {
         session_id: &SessionId,
         input: Input,
     ) -> Result<AcceptOutcome, RuntimeDriverError> {
-        let (driver, wake_tx) = {
+        let (driver, wake_tx, control_tx) = {
             let sessions = self.sessions.read().await;
             let entry = sessions
                 .get(session_id)
                 .ok_or(RuntimeDriverError::NotReady {
                     state: RuntimeState::Destroyed,
                 })?;
-            (entry.driver.clone(), entry.wake_sender())
+            (
+                entry.driver.clone(),
+                entry.wake_sender(),
+                entry.control_sender(),
+            )
         };
 
         // Accept input and drain the typed post-admission signal under the driver lock.
@@ -1469,11 +1481,10 @@ impl SessionServiceRuntimeExt for RuntimeSessionAdapter {
             (result, signal)
         };
 
-        // Signal the RuntimeLoop if the typed signal requests it.
+        // Deliver typed post-admission signals.
         if signal.should_wake() {
             match wake_tx {
                 Some(ref wake_tx) => {
-                    // Non-blocking: if the channel is full, the loop is already processing
                     let _ = wake_tx.try_send(());
                 }
                 None => {
@@ -1485,6 +1496,15 @@ impl SessionServiceRuntimeExt for RuntimeSessionAdapter {
                     );
                 }
             }
+        }
+        // InterruptYielding: deliver through the per-session control channel
+        // so the running agent can break out of cooperative yield points.
+        if signal.should_interrupt_yielding()
+            && let Some(ref tx) = control_tx
+        {
+            let _ = tx.try_send(
+                meerkat_core::lifecycle::run_control::RunControlCommand::InterruptYielding,
+            );
         }
 
         Ok(outcome)
@@ -1684,7 +1704,16 @@ impl crate::traits::RuntimeControlPlane for RuntimeSessionAdapter {
         runtime_id: &LogicalRuntimeId,
         input: Input,
     ) -> Result<AcceptOutcome, RuntimeControlPlaneError> {
-        let (session_id, driver, _completions, wake_tx) = self.lookup_entry(runtime_id).await?;
+        let (session_id, driver, _completions, wake_tx, control_tx) = {
+            let (sid, d, c, w) = self.lookup_entry(runtime_id).await?;
+            let ctrl = {
+                let sessions = self.sessions.read().await;
+                sessions
+                    .get(&sid)
+                    .and_then(RuntimeSessionEntry::control_sender)
+            };
+            (sid, d, c, w, ctrl)
+        };
         let _ = session_id;
 
         let (outcome, signal) = {
@@ -1702,6 +1731,13 @@ impl crate::traits::RuntimeControlPlane for RuntimeSessionAdapter {
             && let Some(ref tx) = wake_tx
         {
             let _ = tx.try_send(());
+        }
+        if signal.should_interrupt_yielding()
+            && let Some(ref tx) = control_tx
+        {
+            let _ = tx.try_send(
+                meerkat_core::lifecycle::run_control::RunControlCommand::InterruptYielding,
+            );
         }
 
         Ok(outcome)
