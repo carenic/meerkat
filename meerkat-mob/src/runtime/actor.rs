@@ -2620,14 +2620,13 @@ impl MobActor {
             && let Some(parent_id) = self
                 .resolve_auto_wire_parent_target(owner_session_id.as_ref(), meerkat_id)
                 .await
+            && let Err(error) = self.do_wire(meerkat_id, &parent_id).await
         {
-            if let Err(error) = self.do_wire(meerkat_id, &parent_id).await {
-                tracing::warn!(
-                    error = %error,
-                    peer = %parent_id,
-                    "auto_wire_parent: failed to wire to spawning member"
-                );
-            }
+            tracing::warn!(
+                error = %error,
+                peer = %parent_id,
+                "auto_wire_parent: failed to wire to spawning member"
+            );
         }
 
         // Restore peer wiring from a prior respawn.
