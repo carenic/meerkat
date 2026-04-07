@@ -367,18 +367,18 @@ async fn apply_runtime_turn(
     run_id: meerkat_core::lifecycle::RunId,
     primitive: &RunPrimitive,
 ) -> Result<CoreApplyOutput, SessionError> {
-    if primitive.is_context_only_immediate() {
-        if let RunPrimitive::StagedInput(staged) = primitive {
-            return context
-                .service
-                .apply_runtime_context_appends(
-                    session_id,
-                    run_id,
-                    pending_system_context_appends(&staged.context_appends),
-                    staged.contributing_input_ids.clone(),
-                )
-                .await;
-        }
+    if primitive.is_context_only_immediate()
+        && let RunPrimitive::StagedInput(staged) = primitive
+    {
+        return context
+            .service
+            .apply_runtime_context_appends(
+                session_id,
+                run_id,
+                pending_system_context_appends(&staged.context_appends),
+                staged.contributing_input_ids.clone(),
+            )
+            .await;
     }
 
     let prompt = primitive.extract_content_input();

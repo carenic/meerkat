@@ -315,10 +315,11 @@ mod tests {
                 ],
             },
         }]);
-        match p.extract_content_input() {
-            crate::types::ContentInput::Blocks(blocks) => assert_eq!(blocks.len(), 2),
-            other => panic!("expected Blocks, got {other:?}"),
-        }
+        let result = p.extract_content_input();
+        assert!(
+            matches!(&result, crate::types::ContentInput::Blocks(blocks) if blocks.len() == 2),
+            "expected Blocks with 2 elements, got {result:?}"
+        );
     }
 
     #[test]
@@ -446,8 +447,10 @@ mod tests {
 
     #[test]
     fn turn_metadata_execution_kind_round_trips() {
-        let mut meta = RuntimeTurnMetadata::default();
-        meta.execution_kind = Some(RuntimeExecutionKind::ContentTurn);
+        let meta = RuntimeTurnMetadata {
+            execution_kind: Some(RuntimeExecutionKind::ContentTurn),
+            ..Default::default()
+        };
         let json = serde_json::to_value(&meta).unwrap();
         assert_eq!(json["execution_kind"], "content_turn");
         let parsed: RuntimeTurnMetadata = serde_json::from_value(json).unwrap();

@@ -441,18 +441,18 @@ async fn apply_runtime_turn(
     primitive: &RunPrimitive,
     prompt: ContentInput,
 ) -> Result<CoreApplyOutput, SessionError> {
-    if primitive.is_context_only_immediate() {
-        if let RunPrimitive::StagedInput(staged) = primitive {
-            return context
-                .session_service
-                .apply_runtime_context_appends(
-                    session_id,
-                    run_id,
-                    pending_system_context_appends(&staged.context_appends),
-                    staged.contributing_input_ids.clone(),
-                )
-                .await;
-        }
+    if primitive.is_context_only_immediate()
+        && let RunPrimitive::StagedInput(staged) = primitive
+    {
+        return context
+            .session_service
+            .apply_runtime_context_appends(
+                session_id,
+                run_id,
+                pending_system_context_appends(&staged.context_appends),
+                staged.contributing_input_ids.clone(),
+            )
+            .await;
     }
 
     let (event_tx, event_rx) = mpsc::channel::<EventEnvelope<AgentEvent>>(100);
