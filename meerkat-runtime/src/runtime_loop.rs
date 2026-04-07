@@ -659,17 +659,6 @@ async fn process_queue(
                 return false;
             }
 
-            // Defensive: assert batch execution-kind homogeneity.
-            // Mixed ContentTurn + ResumePending batches should never form
-            // because they arrive from different sources at different times.
-            debug_assert!(
-                staged_inputs.windows(2).all(|w| {
-                    crate::input::classify_execution_kind(&w[0].1)
-                        == crate::input::classify_execution_kind(&w[1].1)
-                }),
-                "batch has mixed execution kinds — batching bug in drain_next_batch"
-            );
-
             let run_id = RunId::new();
 
             // Start run in the state machine

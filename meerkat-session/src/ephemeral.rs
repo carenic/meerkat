@@ -1692,10 +1692,15 @@ async fn session_task<A: SessionAgent>(
                 // mutation (set_skill_references, set_flow_tool_overlay,
                 // apply_pending_tool_results). These three calls mutate session
                 // state and cannot be rolled back.
+                //
+                // Staged tool results (flattened_tool_results) will create a
+                // ToolResults boundary once applied, so they count as a pending
+                // boundary even if the session's current last message is Assistant.
                 if matches!(
                     execution_kind,
                     Some(meerkat_core::lifecycle::RuntimeExecutionKind::ResumePending)
                 ) && !agent.has_pending_boundary()
+                    && flattened_tool_results.is_empty()
                 {
                     restore_deferred_turn_inputs(
                         &deferred_turn_state,
