@@ -724,7 +724,7 @@ impl SessionAgent for InterruptibleYieldAgent {
             tokio::pin!(changed_fut);
 
             tokio::select! {
-                _ = &mut sleep_fut => WakeReason::Sleep,
+                () = &mut sleep_fut => WakeReason::Sleep,
                 changed = &mut changed_fut => WakeReason::Interrupt(changed.is_ok()),
             }
         };
