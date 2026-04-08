@@ -459,7 +459,7 @@ async fn print_conversation(
 // The test
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "lane:e2e-smoke"]
 async fn e2e_pictionary_multimodal_comms_stress() {
     // Init tracing so RUST_LOG output is visible.
