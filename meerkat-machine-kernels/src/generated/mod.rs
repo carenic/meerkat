@@ -18,6 +18,7 @@ pub mod peer_directory_reachability;
 pub mod runtime_control;
 pub mod runtime_ingress;
 pub mod schedule_lifecycle;
+pub mod session_turn_admission;
 pub mod turn_execution;
 
 use crate::runtime::GeneratedMachineKernel;
@@ -32,6 +33,7 @@ pub fn all_kernels() -> Vec<GeneratedMachineKernel> {
         occurrence_lifecycle::kernel(),
         peer_comms::kernel(),
         peer_directory_reachability::kernel(),
+        session_turn_admission::kernel(),
         external_tool_surface::kernel(),
         turn_execution::kernel(),
         mob_lifecycle::kernel(),

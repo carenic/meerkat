@@ -10,9 +10,10 @@ use crate::tokio;
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
 
-use crate::classify::IngressClassificationContext;
+use crate::classify::{ClassificationDecision, IngressClassificationContext};
 use crate::types::InboxItem;
 use meerkat_core::PeerInputClass;
+use meerkat_core::types::HandlingMode;
 
 const DEFAULT_INBOX_CAPACITY: usize = 1024;
 
@@ -22,6 +23,7 @@ pub(crate) struct ClassifiedInboxEntry {
     pub(crate) class: PeerInputClass,
     pub(crate) from_peer: Option<String>,
     pub(crate) lifecycle_peer: Option<String>,
+    pub(crate) normalized_handling_mode: HandlingMode,
 }
 
 /// The receiving end of the inbox, held by the agent loop.
@@ -161,9 +163,8 @@ impl InboxSender {
 
     /// Send an item with classification through the classified channel.
     ///
-    /// Classifies the item using the ingress context. Items that classify
-    /// as `None` (e.g., untrusted senders with `require_peer_auth`) are
-    /// silently dropped — snapshot semantics, no resurrection.
+    /// Classifies the item using the ingress context and applies the
+    /// authority-decided enqueue/drop/dismiss effects.
     ///
     /// Classified items are enqueued on both the raw channel (backward compat)
     /// and the classified channel, then the appropriate notify is fired.
@@ -172,18 +173,17 @@ impl InboxSender {
             (&self.classification_context, &self.classified_tx)
         {
             let result = match ctx.classify(&item) {
-                Some(r) => r,
-                None => {
-                    // Dropped at ingress — untrusted or otherwise rejected.
-                    // Do not enqueue, do not notify.
+                ClassificationDecision::Drop | ClassificationDecision::SetDismissFlag => {
                     return Ok(());
                 }
+                ClassificationDecision::Enqueue(result) => result,
             };
             let entry = ClassifiedInboxEntry {
                 item,
                 class: result.class,
                 from_peer: result.from_peer,
                 lifecycle_peer: result.lifecycle_peer,
+                normalized_handling_mode: result.normalized_handling_mode,
             };
             // Enqueue only on the candidate channel (no raw double-enqueue).
             // drain_peer_input_candidates() is the sole consumer.
@@ -391,6 +391,7 @@ mod tests {
 
     use crate::classify::IngressClassificationContext;
     use crate::trust::{TrustedPeer, TrustedPeers};
+    use std::sync::atomic::AtomicBool;
 
     fn make_classification_context(
         trusted: TrustedPeers,
@@ -400,6 +401,7 @@ mod tests {
             require_peer_auth: require_auth,
             trusted_peers: Arc::new(parking_lot::RwLock::new(trusted)),
             silent_intents: Arc::new(std::collections::HashSet::new()),
+            dismiss_flag: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -432,6 +434,10 @@ mod tests {
             entries[0].class,
             meerkat_core::PeerInputClass::ActionableMessage
         );
+        assert_eq!(
+            entries[0].normalized_handling_mode,
+            meerkat_core::types::HandlingMode::Queue
+        );
     }
 
     #[tokio::test]
@@ -458,5 +464,33 @@ mod tests {
         // Classified channel should have the item
         let classified = inbox.try_drain_classified();
         assert_eq!(classified.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_classified_dismiss_sets_flag_and_does_not_enqueue() {
+        let sender_pubkey = PubKey::new([1u8; 32]);
+        let ctx = make_classification_context(make_trusted("peer", &sender_pubkey), false);
+        let dismiss_flag = ctx.dismiss_flag.clone();
+        let (mut inbox, sender) = Inbox::new_classified(ctx);
+
+        sender
+            .send_classified(InboxItem::External {
+                envelope: Envelope {
+                    id: Uuid::new_v4(),
+                    from: sender_pubkey,
+                    to: PubKey::new([2u8; 32]),
+                    kind: MessageKind::Message {
+                        blocks: None,
+                        body: "DISMISS".to_string(),
+                        handling_mode: None,
+                    },
+                    sig: crate::identity::Signature::new([0u8; 64]),
+                },
+            })
+            .unwrap();
+
+        assert!(dismiss_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(inbox.try_drain_classified().is_empty());
+        assert!(inbox.try_drain().is_empty());
     }
 }

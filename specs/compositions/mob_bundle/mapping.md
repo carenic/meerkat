@@ -122,9 +122,6 @@ This section is generated from the Rust composition catalog. Do not edit it by h
 - `mob_cleanup_destroys_orchestrator`
   - anchors: `mob_runtime_actor`, `mob_member_handle`, `flow_runtime`, `peer_runtime`, `wasm_example_031`, `wasm_example_032`, `wasm_example_033`
   - scenarios: `mob-peer-orchestration`, `wasm-mob-examples`
-- `mob_ops_peer_ready_trusts_peer_comms`
-  - anchors: `mob_runtime_actor`, `mob_member_handle`, `flow_runtime`, `peer_runtime`, `wasm_example_031`, `wasm_example_032`, `wasm_example_033`
-  - scenarios: `mob-peer-orchestration`, `wasm-mob-examples`
 - `mob_ops_peer_ready_tracks_member_lifecycle`
   - anchors: `mob_runtime_actor`, `mob_member_handle`, `flow_runtime`, `peer_runtime`, `wasm_example_031`, `wasm_example_032`, `wasm_example_033`
   - scenarios: `mob-peer-orchestration`, `wasm-mob-examples`
@@ -186,9 +183,6 @@ This section is generated from the Rust composition catalog. Do not edit it by h
 - `control_preempts_mob_ingress`
   - anchors: `mob_runtime_actor`, `mob_member_handle`, `flow_runtime`, `peer_runtime`, `wasm_example_031`, `wasm_example_032`, `wasm_example_033`
   - scenarios: `mob-peer-orchestration`
-- `mob_ops_peer_ready_trusts_peer_comms`
-  - anchors: `mob_runtime_actor`, `mob_member_handle`, `flow_runtime`, `peer_runtime`, `wasm_example_031`, `wasm_example_032`, `wasm_example_033`
-  - scenarios: `mob-peer-orchestration`, `wasm-mob-examples`
 - `mob_member_lifecycle_terminal_events_are_observed`
   - anchors: `mob_runtime_actor`, `mob_member_handle`, `flow_runtime`, `peer_runtime`, `wasm_example_031`, `wasm_example_032`, `wasm_example_033`
   - scenarios: `mob-peer-orchestration`, `wasm-mob-examples`

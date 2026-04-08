@@ -22,8 +22,8 @@ _Generated from the Rust composition catalog. Do not edit by hand._
 - `mob_flow_activation_starts_flow_run`: `mob_orchestrator`.`FlowActivated` -> `flow_run`.`StartRun` [Immediate]
 - `mob_flow_activation_marks_lifecycle_run`: `mob_orchestrator`.`FlowActivated` -> `mob_lifecycle`.`StartRun` [Immediate]
 - `mob_async_op_event_enters_runtime_admission`: `ops_lifecycle`.`SubmitOpEvent` -> `runtime_control`.`SubmitWork` [Immediate]
-- `mob_peer_candidate_enters_runtime_admission`: `peer_comms`.`SubmitPeerInputCandidate` -> `runtime_control`.`SubmitWork` [Immediate]
-- `mob_peer_candidate_tracks_wiring`: `peer_comms`.`SubmitPeerInputCandidate` -> `mob_wiring`.`PeerInputAdmitted` [Immediate]
+- `mob_peer_candidate_enters_runtime_admission`: `peer_comms`.`EnqueueClassifiedEntry` -> `runtime_control`.`SubmitWork` [Immediate]
+- `mob_peer_candidate_tracks_wiring`: `peer_comms`.`EnqueueClassifiedEntry` -> `mob_wiring`.`PeerInputAdmitted` [Immediate]
 - `mob_admitted_work_enters_ingress`: `runtime_control`.`SubmitAdmittedIngressEffect` -> `runtime_ingress`.`AdmitQueued` [Immediate]
 - `mob_runtime_admission_tracks_wiring`: `runtime_control`.`SubmitAdmittedIngressEffect` -> `mob_wiring`.`RuntimeWorkAdmitted` [Immediate]
 - `mob_ingress_ready_starts_runtime_control`: `runtime_ingress`.`ReadyForRun` -> `runtime_control`.`BeginRun` [Immediate]
@@ -50,7 +50,6 @@ _Generated from the Rust composition catalog. Do not edit by hand._
 - `mob_member_force_cancel_updates_bootstrap`: `mob_orchestrator`.`MemberForceCancelled` -> `mob_member_bootstrap`.`KickoffForceCancelled` [Immediate]
 - `mob_escalate_supervisor_stops_orchestrator`: `flow_run`.`EscalateSupervisor` -> `mob_orchestrator`.`StopOrchestrator` [Immediate]
 - `mob_cleanup_destroys_orchestrator`: `mob_lifecycle`.`RequestCleanup` -> `mob_orchestrator`.`DestroyOrchestrator` [Immediate]
-- `mob_ops_peer_ready_trusts_peer_comms`: `ops_lifecycle`.`ExposeOperationPeer` -> `peer_comms`.`TrustPeer` [Immediate]
 - `mob_ops_peer_ready_tracks_member_lifecycle`: `ops_lifecycle`.`ExposeOperationPeer` -> `mob_member_lifecycle`.`MemberPeerExposed` [Immediate]
 - `mob_ops_peer_ready_tracks_wiring`: `ops_lifecycle`.`ExposeOperationPeer` -> `mob_wiring`.`OperationPeerTrusted` [Immediate]
 - `mob_ops_terminal_tracks_member_lifecycle`: `ops_lifecycle`.`NotifyOpWatcher` -> `mob_member_lifecycle`.`MemberTerminalized` [Immediate]
@@ -85,7 +84,6 @@ _Generated from the Rust composition catalog. Do not edit by hand._
 - `mob_execution_failure_is_handled` — mob turn-execution failure is handled by ingress/runtime control and recorded in runtime-bridge and member-bootstrap owner and runtime-bridge owner
 - `mob_execution_cancel_is_handled` — mob turn-execution cancellation is handled by ingress/runtime control and recorded in runtime-bridge and member-bootstrap owner and runtime-bridge owner
 - `mob_execution_completion_is_handled` — mob turn-execution completion is handled by ingress/runtime control and recorded in runtime-bridge and member-bootstrap owner and runtime-bridge owner
-- `mob_ops_peer_ready_trusts_peer_comms` — trust handoff assumes the exposed operation peer is identified by the operation_id alias mapping
 - `mob_member_lifecycle_terminal_events_are_observed` — mob member lifecycle terminal events are mirrored from ops lifecycle into the member lifecycle owner
 - `mob_wiring_tracks_peer_candidates` — mob peer candidate admission is recorded in the wiring owner through an explicit route
 

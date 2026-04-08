@@ -16,6 +16,7 @@ pub mod tokio {
 }
 
 pub mod ephemeral;
+pub mod session_turn_admission_authority;
 
 #[cfg(feature = "session-compaction")]
 pub mod compactor;

@@ -1291,6 +1291,14 @@ async fn setup_session(
         .ensure_session_with_executor(session_id.clone(), executor)
         .await;
 
+    // Configure peer ingress so the comms drain runs for this session.
+    // Without this, peer messages from delegate helpers sit in the inbox
+    // and the parent never processes them.
+    let comms_rt = service.comms_runtime(&session_id).await;
+    runtime_adapter
+        .update_peer_ingress_context(&session_id, true, comms_rt)
+        .await;
+
     Ok(session_id)
 }
 

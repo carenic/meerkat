@@ -319,36 +319,13 @@ impl CoreCommsRuntime for CommsRuntime {
         classified_entries
             .into_iter()
             .filter_map(|entry| {
-                let from_peer = entry.from_peer.unwrap_or_else(|| "unknown".to_string());
+                let from_peer = entry
+                    .from_peer
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
 
                 match entry.item {
                     crate::types::InboxItem::External { envelope } => {
-                        // Check for DISMISS
-                        if let MessageKind::Message { blocks: None, ref body, .. } = envelope.kind
-                            && body.trim().eq_ignore_ascii_case("DISMISS") {
-                                self.dismiss_flag.store(true, Ordering::SeqCst);
-                                return None;
-                            }
-
-                        // Preserve the sender's explicit handling_mode across the
-                        // candidate drain for all peer input kinds. Older peers may
-                        // omit the field, which normalizes to Queue.
-                        let envelope_handling_mode = match &envelope.kind {
-                            MessageKind::Message {
-                                handling_mode: Some(mode),
-                                ..
-                            }
-                            | MessageKind::Request {
-                                handling_mode: Some(mode),
-                                ..
-                            }
-                            | MessageKind::Response {
-                                handling_mode: Some(mode),
-                                ..
-                            } => *mode,
-                            _ => meerkat_core::types::HandlingMode::Queue,
-                        };
-
                         let (content, rendered_text) = match envelope.kind {
                             MessageKind::Message {
                                 body,
@@ -452,7 +429,7 @@ impl CoreCommsRuntime for CommsRuntime {
                                 from: from_peer,
                                 content,
                                 rendered_text,
-                                handling_mode: envelope_handling_mode,
+                                handling_mode: entry.normalized_handling_mode,
                                 render_metadata: None,
                             },
                             class: entry.class,
@@ -462,7 +439,6 @@ impl CoreCommsRuntime for CommsRuntime {
                     crate::types::InboxItem::PlainEvent {
                         body,
                         source,
-                        handling_mode,
                         interaction_id,
                         blocks,
                         render_metadata,
@@ -477,10 +453,10 @@ impl CoreCommsRuntime for CommsRuntime {
                                 id: meerkat_core::InteractionId(
                                     interaction_id.unwrap_or_else(uuid::Uuid::new_v4),
                                 ),
-                                from: format!("event:{source}"),
+                                from: entry.from_peer.unwrap_or_else(|| format!("event:{source}")),
                                 content: meerkat_core::InteractionContent::Message { body, blocks },
                                 rendered_text: rendered,
-                                handling_mode,
+                                handling_mode: entry.normalized_handling_mode,
                                 render_metadata,
                             },
                             class: entry.class,
@@ -576,7 +552,7 @@ pub struct CommsRuntime {
     _session_identity_claim: Option<SessionIdentityClaim>,
     keypair: Arc<Keypair>,
     require_peer_auth: bool,
-    dismiss_flag: AtomicBool,
+    dismiss_flag: Arc<AtomicBool>,
     subscriber_registry: crate::event_injector::SubscriberRegistry,
     peer_directory_reachability: Arc<Mutex<PeerDirectoryReachabilityAuthority>>,
     #[allow(dead_code)] // Kept alive — shared with IngressClassificationContext via Arc
@@ -607,12 +583,14 @@ impl CommsRuntime {
         // Single source of truth for trust state — shared by the Router,
         // IngressClassificationContext, and callers of trusted_peers_shared().
         let trusted_peers = Arc::new(parking_lot::RwLock::new(trusted_peers));
+        let dismiss_flag = Arc::new(AtomicBool::new(false));
 
         // Build classified inbox using the same trusted_peers Arc
         let classification_context = Arc::new(crate::classify::IngressClassificationContext {
             require_peer_auth: config.require_peer_auth,
             trusted_peers: trusted_peers.clone(),
             silent_intents: silent_intents.clone(),
+            dismiss_flag: dismiss_flag.clone(),
         });
         let (inbox, inbox_sender) = crate::Inbox::new_classified(classification_context);
         let inbox_notify = inbox.notify();
@@ -638,7 +616,7 @@ impl CommsRuntime {
             _session_identity_claim: None,
             keypair: Arc::new(keypair),
             require_peer_auth: config.require_peer_auth,
-            dismiss_flag: AtomicBool::new(false),
+            dismiss_flag,
             subscriber_registry: crate::event_injector::new_subscriber_registry(),
             peer_directory_reachability: Arc::new(Mutex::new(
                 PeerDirectoryReachabilityAuthority::new(),
@@ -676,11 +654,13 @@ impl CommsRuntime {
         let public_key = keypair.public_key();
         // Single source of truth — same Arc shared by Router, classification, and callers.
         let trusted_peers = Arc::new(parking_lot::RwLock::new(TrustedPeers::new()));
+        let dismiss_flag = Arc::new(AtomicBool::new(false));
 
         let classification_context = Arc::new(crate::classify::IngressClassificationContext {
             require_peer_auth: true,
             trusted_peers: trusted_peers.clone(),
             silent_intents: silent_intents.clone(),
+            dismiss_flag: dismiss_flag.clone(),
         });
         let (inbox, inbox_sender) = crate::Inbox::new_classified(classification_context);
         let inbox_notify = inbox.notify();
@@ -730,7 +710,7 @@ impl CommsRuntime {
             _session_identity_claim: None,
             keypair: Arc::new(keypair),
             require_peer_auth: true,
-            dismiss_flag: AtomicBool::new(false),
+            dismiss_flag,
             subscriber_registry: crate::event_injector::new_subscriber_registry(),
             peer_directory_reachability: Arc::new(Mutex::new(
                 PeerDirectoryReachabilityAuthority::new(),
@@ -763,11 +743,13 @@ impl CommsRuntime {
             .map_err(|e| CommsRuntimeError::IdentityError(e.to_string()))?;
         let public_key = keypair.public_key();
         let trusted_peers = Arc::new(parking_lot::RwLock::new(TrustedPeers::new()));
+        let dismiss_flag = Arc::new(AtomicBool::new(false));
 
         let classification_context = Arc::new(crate::classify::IngressClassificationContext {
             require_peer_auth: true,
             trusted_peers: trusted_peers.clone(),
             silent_intents: silent_intents.clone(),
+            dismiss_flag: dismiss_flag.clone(),
         });
         let (inbox, inbox_sender) = crate::Inbox::new_classified(classification_context);
         let inbox_notify = inbox.notify();
@@ -808,7 +790,7 @@ impl CommsRuntime {
             _session_identity_claim: Some(claim),
             keypair: Arc::new(keypair),
             require_peer_auth: true,
-            dismiss_flag: AtomicBool::new(false),
+            dismiss_flag,
             subscriber_registry: crate::event_injector::new_subscriber_registry(),
             peer_directory_reachability: Arc::new(Mutex::new(
                 PeerDirectoryReachabilityAuthority::new(),

@@ -1433,7 +1433,10 @@ pub fn ops_lifecycle_machine() -> MachineSchema {
             disposition(
                 "ExposeOperationPeer",
                 EffectDisposition::Routed {
-                    consumer_machines: vec!["PeerCommsMachine".into()],
+                    consumer_machines: vec![
+                        "MobMemberLifecycleMachine".into(),
+                        "MobWiringMachine".into(),
+                    ],
                 },
             ),
             disposition("RetainTerminalRecord", EffectDisposition::Local),

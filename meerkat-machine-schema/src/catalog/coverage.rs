@@ -27,6 +27,7 @@ use super::{
     runtime_control::runtime_control_machine,
     runtime_ingress::runtime_ingress_machine,
     schedule_lifecycle::schedule_lifecycle_machine,
+    session_turn_admission::session_turn_admission_machine,
     turn_execution::turn_execution_machine,
 };
 
@@ -322,31 +323,65 @@ pub fn canonical_machine_coverage_manifests() -> Vec<MachineCoverageManifest> {
                 anchor(
                     "peer_classify",
                     "meerkat-comms/src/classify.rs",
-                    "peer classification precursor",
+                    "canonical ingress classification adapter over PeerCommsAuthority",
                 ),
                 anchor(
                     "peer_inbox",
                     "meerkat-comms/src/inbox.rs",
-                    "peer inbox and request/reservation registry precursor",
+                    "classified inbox enqueue/drop/dismiss shell executor",
                 ),
                 anchor(
                     "peer_runtime",
                     "meerkat-comms/src/runtime/comms_runtime.rs",
-                    "runtime comms owner precursor",
+                    "candidate drain projects stored ingress metadata without reclassification",
+                ),
+                anchor(
+                    "peer_authority",
+                    "meerkat-comms/src/peer_comms_authority.rs",
+                    "canonical peer ingress authority",
                 ),
             ],
             &[
                 scenario(
-                    "trust-normalize-submit",
-                    "trusted peer envelope is normalized and submitted exactly once",
+                    "trusted-ingress-classification",
+                    "trusted peer envelope is classified and normalized at ingress before enqueue",
                 ),
                 scenario(
                     "untrusted-drop",
                     "untrusted or invalid peer work is dropped before runtime admission",
                 ),
                 scenario(
-                    "request-response-correlation",
-                    "reservation/request state remains consistent across peer traffic",
+                    "dismiss-at-ingress",
+                    "dismiss messages set the dismiss flag without becoming peer input candidates",
+                ),
+            ],
+        ),
+        machine_manifest_from_schema(
+            &session_turn_admission_machine(),
+            &[
+                anchor(
+                    "session_ephemeral",
+                    "meerkat-session/src/ephemeral.rs",
+                    "session task shell executing admission authority effects and projections",
+                ),
+                anchor(
+                    "session_turn_admission_authority",
+                    "meerkat-session/src/session_turn_admission_authority.rs",
+                    "canonical session turn admission authority",
+                ),
+            ],
+            &[
+                scenario(
+                    "admit-begin-resolve-finalize",
+                    "a single turn claims the session slot, runs, resolves, and releases admission canonically",
+                ),
+                scenario(
+                    "abort-admitted-pre_run-failure",
+                    "pre-run failures after admission release the slot without leaving a busy session behind",
+                ),
+                scenario(
+                    "graceful-shutdown-drain",
+                    "shutdown drains running turns and blocks new admissions once shutting down",
                 ),
             ],
         ),
