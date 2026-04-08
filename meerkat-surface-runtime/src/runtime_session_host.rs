@@ -191,6 +191,7 @@ impl RuntimeSessionHostBuilder {
 }
 
 pub struct RuntimeSessionHost {
+    config: Config,
     service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
     persistence: PersistenceBundle,
     runtime_adapter: Arc<RuntimeSessionAdapter>,
@@ -220,6 +221,7 @@ impl RuntimeSessionHost {
         max_sessions: usize,
         persistence: PersistenceBundle,
     ) -> Self {
+        let config = builder.config().clone();
         let runtime_adapter = persistence.runtime_adapter();
         if builder.default_session_store.is_none() {
             builder.default_session_store =
@@ -248,6 +250,7 @@ impl RuntimeSessionHost {
         };
 
         Self {
+            config,
             service,
             persistence,
             runtime_adapter,
@@ -259,6 +262,10 @@ impl RuntimeSessionHost {
 
     pub fn service(&self) -> Arc<PersistentSessionService<FactoryAgentBuilder>> {
         self.service.clone()
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     pub fn persistence(&self) -> PersistenceBundle {
@@ -579,6 +586,41 @@ impl RuntimeSessionHost {
             .await;
     }
 
+    pub async fn ensure_default_runtime_executor(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), RuntimeSessionHostError> {
+        let session_exists = if let Some(session) = self.load_persisted(session_id).await? {
+            !session_metadata_marks_archived(&session)
+        } else {
+            self.service.read(session_id).await.is_ok()
+        };
+        if !session_exists {
+            return Err(RuntimeSessionHostError::PersistedSessionNotFound(
+                session_id.clone(),
+            ));
+        }
+
+        let service = Arc::clone(&self.service);
+        #[cfg(feature = "mob")]
+        let mob_state = self.mob_state();
+        let executor: Box<dyn CoreExecutor> = {
+            #[cfg(feature = "mob")]
+            {
+                Box::new(
+                    RuntimeSessionHostExecutor::new(service, session_id.clone())
+                        .with_mob_state(mob_state),
+                )
+            }
+            #[cfg(not(feature = "mob"))]
+            {
+                Box::new(RuntimeSessionHostExecutor::new(service, session_id.clone()))
+            }
+        };
+        self.attach_executor(session_id, executor).await;
+        Ok(())
+    }
+
     pub async fn configure_peer_ingress(&self, session_id: &SessionId, keep_alive: bool) -> bool {
         let comms_rt = self.service.comms_runtime(session_id).await;
         self.runtime_adapter
@@ -731,6 +773,14 @@ fn build_persistent_service(
         Box::pin(async move { adapter.prepare_bindings(session_id).await.ok() })
     }));
     service
+}
+
+fn session_metadata_marks_archived(session: &Session) -> bool {
+    session
+        .metadata()
+        .get("session_archived")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

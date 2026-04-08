@@ -26,8 +26,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use futures::StreamExt;
-use meerkat::FactoryAgentBuilder;
-use meerkat::PersistentSessionService;
+use meerkat::{FactoryAgentBuilder, PersistentSessionService, ScheduleService, ScheduleToolSurface};
 use meerkat_comms::MessageKind;
 use meerkat_comms::{CommsRuntime, PeerMeta, ResolvedCommsConfig, TrustedPeer};
 use meerkat_core::agent::CommsRuntime as _;
@@ -39,14 +38,13 @@ use meerkat_core::types::{ContentInput, SessionId};
 use meerkat_core::{AgentEvent, AgentToolDispatcher, Config};
 use meerkat_mob_mcp::MobMcpState;
 use meerkat_runtime::RuntimeSessionAdapter;
-use meerkat_surface_runtime::RuntimeSessionHost;
+use meerkat_surface_runtime::{RuntimeSessionHost, spawn_runtime_schedule_host};
 use meerkat_store::{MemoryBlobStore, SessionFilter};
 
 use mdm_tux::{
     DirectControlPayload, KennelPayload, ProviderKind, RegResponse, auto_detect,
     build_signed_envelope, direct_control_request, read_envelope, register_with_backoff,
-    schedule_tools::open_schedule_tool_dispatcher, verify_envelope, write_envelope,
-    DIRECT_CONTROL_INTENT,
+    open_example_runtime_persistence, verify_envelope, write_envelope, DIRECT_CONTROL_INTENT,
 };
 use tokio::io::BufReader;
 use tokio::net::TcpStream;
@@ -67,16 +65,31 @@ struct TargetRuntimeSurface {
     runtime_adapter: Arc<RuntimeSessionAdapter>,
     comms_runtime: Arc<CommsRuntime>,
     schedule_tools: Arc<dyn AgentToolDispatcher>,
-    jsonl_store: Arc<dyn meerkat::SessionStore>,
+    session_store: Arc<dyn meerkat::SessionStore>,
     mob_state: Arc<MobMcpState>,
+    _schedule_host: Option<meerkat::surface::ScheduleHostHandle>,
+}
+
+fn target_session_build_template(
+    schedule_tools: Arc<dyn AgentToolDispatcher>,
+) -> SessionBuildOptions {
+    SessionBuildOptions {
+        external_tools: Some(schedule_tools),
+        override_builtins: meerkat_core::ToolCategoryOverride::Enable,
+        override_shell: meerkat_core::ToolCategoryOverride::Enable,
+        override_mob: meerkat_core::ToolCategoryOverride::Enable,
+        ..Default::default()
+    }
 }
 
 async fn build_target_runtime_surface(
     session_dir: &Path,
     comms_runtime: Arc<CommsRuntime>,
 ) -> anyhow::Result<TargetRuntimeSurface> {
+    let persistence = open_example_runtime_persistence(session_dir).await?;
     let host = Arc::new(
         RuntimeSessionHost::builder(session_dir.to_path_buf())
+            .persistence(persistence)
             .shell(true)
             .builtins(true)
             .mob(true)
@@ -88,8 +101,16 @@ async fn build_target_runtime_surface(
     );
     let service = host.service();
     let runtime_adapter = host.runtime_adapter();
-    let schedule_tools = open_schedule_tool_dispatcher(session_dir)?;
-    let jsonl_store = host.session_store();
+    let schedule_service = ScheduleService::new(host.persistence().schedule_store());
+    let schedule_tools: Arc<dyn AgentToolDispatcher> =
+        Arc::new(ScheduleToolSurface::new(schedule_service.clone()));
+    let schedule_host = spawn_runtime_schedule_host(
+        Arc::clone(&host),
+        schedule_service.clone(),
+        target_session_build_template(Arc::clone(&schedule_tools)),
+        format!("mdm-target:{}", session_dir.display()),
+    );
+    let session_store = host.session_store();
     let mob_state = host.mob_state();
 
     Ok(TargetRuntimeSurface {
@@ -98,8 +119,9 @@ async fn build_target_runtime_surface(
         runtime_adapter,
         comms_runtime,
         schedule_tools,
-        jsonl_store,
+        session_store,
         mob_state,
+        _schedule_host: schedule_host,
     })
 }
 
@@ -908,7 +930,7 @@ async fn handle_command(
             Err(e) => format!("Failed to create session: {e}"),
         }
     } else if cmd == "LIST_SESSIONS" {
-        match surface.jsonl_store.list(SessionFilter::default()).await {
+        match surface.session_store.list(SessionFilter::default()).await {
             Ok(mut sessions) => {
                 sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
                 if sessions.is_empty() {
@@ -947,7 +969,7 @@ async fn handle_command(
             Ok(n) if n >= 1 => n - 1,
             _ => return format!("Invalid session number: {arg}"),
         };
-        match surface.jsonl_store.list(SessionFilter::default()).await {
+        match surface.session_store.list(SessionFilter::default()).await {
             Ok(mut sessions) => {
                 sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
                 if idx >= sessions.len() {
@@ -1003,7 +1025,7 @@ async fn create_or_resume_session(
     provider: &str,
 ) -> anyhow::Result<SessionId> {
     // Try to auto-resume the most recent session. On failure, warn and start fresh.
-    if let Ok(mut sessions) = surface.jsonl_store.list(SessionFilter::default()).await {
+    if let Ok(mut sessions) = surface.session_store.list(SessionFilter::default()).await {
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         if let Some(latest) = sessions.first() {
             eprintln!(
@@ -1218,16 +1240,10 @@ async fn setup_session(
 ) -> anyhow::Result<SessionId> {
     // No external_tools needed — the factory composes comms tools automatically
     // from the CommsRuntime set via AgentFactory::with_comms_runtime().
-    let build_opts = SessionBuildOptions {
-        provider: Some(meerkat_core::Provider::from_name(provider)),
-        external_tools: Some(Arc::clone(&surface.schedule_tools)),
-        override_builtins: meerkat_core::ToolCategoryOverride::Enable,
-        override_shell: meerkat_core::ToolCategoryOverride::Enable,
-        override_mob: meerkat_core::ToolCategoryOverride::Enable,
-        comms_name: resume_id.is_none().then(|| format!("target/{}", SessionId::new())),
-        keep_alive: true,
-        ..Default::default()
-    };
+    let mut build_opts = target_session_build_template(Arc::clone(&surface.schedule_tools));
+    build_opts.provider = Some(meerkat_core::Provider::from_name(provider));
+    build_opts.comms_name = resume_id.is_none().then(|| format!("target/{}", SessionId::new()));
+    build_opts.keep_alive = true;
 
     let req = CreateSessionRequest {
         model: model.to_string(),
@@ -2019,12 +2035,15 @@ mod tests {
     use super::{
         TargetRuntimeSurface, build_target_runtime_surface, create_target_comms_runtime,
         discard_live_session_with_mob_cleanup, parse_provider_override, setup_session,
+        target_session_build_template,
     };
     use anyhow::Context as _;
-    use mdm_tux::{ProviderKind, schedule_tools::open_schedule_tool_dispatcher};
+    use mdm_tux::{ProviderKind, open_example_runtime_persistence};
     use meerkat::{
-        AgentFactory, FactoryAgentBuilder, LlmClient, SessionAgentBuilder, SessionService,
-        encode_llm_client_override_for_service,
+        AgentFactory, CreateScheduleRequest, FactoryAgentBuilder, LlmClient, MisfirePolicy,
+        MissingTargetPolicy, OverlapPolicy, ScheduleService, ScheduleToolSurface,
+        ScheduledSessionAction, SessionAgentBuilder, SessionService, SessionTargetBinding,
+        TargetBinding, TriggerSpec, encode_llm_client_override_for_service,
     };
     use meerkat_client::types::LlmStream;
     use meerkat_client::{LlmDoneOutcome, LlmError, LlmEvent, LlmRequest, TestClient};
@@ -2036,7 +2055,7 @@ mod tests {
     };
     use meerkat_core::types::{ContentInput, HandlingMode};
     use meerkat_mob_mcp::{AgentMobToolSurfaceFactory, MobMcpState};
-    use meerkat_surface_runtime::RuntimeSessionHost;
+    use meerkat_surface_runtime::{RuntimeSessionHost, spawn_runtime_schedule_host};
     use std::collections::{HashSet, VecDeque};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -2089,8 +2108,10 @@ mod tests {
         comms_runtime: Arc<CommsRuntime>,
         llm_client: Arc<dyn LlmClient>,
     ) -> anyhow::Result<TargetRuntimeSurface> {
+        let persistence = open_example_runtime_persistence(session_dir).await?;
         let host = Arc::new(
             RuntimeSessionHost::builder(session_dir.to_path_buf())
+                .persistence(persistence)
                 .shell(true)
                 .builtins(true)
                 .mob(true)
@@ -2103,8 +2124,16 @@ mod tests {
         );
         let service = host.service();
         let runtime_adapter = host.runtime_adapter();
-        let schedule_tools = open_schedule_tool_dispatcher(session_dir)?;
-        let jsonl_store = host.session_store();
+        let schedule_service = ScheduleService::new(host.persistence().schedule_store());
+        let schedule_tools: Arc<dyn meerkat_core::AgentToolDispatcher> =
+            Arc::new(ScheduleToolSurface::new(schedule_service.clone()));
+        let schedule_host = spawn_runtime_schedule_host(
+            Arc::clone(&host),
+            schedule_service.clone(),
+            target_session_build_template(Arc::clone(&schedule_tools)),
+            format!("mdm-target:test:{}", session_dir.display()),
+        );
+        let session_store = host.session_store();
         let mob_state = host.mob_state();
 
         Ok(TargetRuntimeSurface {
@@ -2113,8 +2142,9 @@ mod tests {
             runtime_adapter,
             comms_runtime,
             schedule_tools,
-            jsonl_store,
+            session_store,
             mob_state,
+            _schedule_host: schedule_host,
         })
     }
 
@@ -2189,7 +2219,13 @@ mod tests {
         ));
 
         let capture: Arc<CaptureClient> = Arc::new(CaptureClient::default());
-        let schedule_tools = open_schedule_tool_dispatcher(temp.path()).unwrap();
+        let schedule_tools: Arc<dyn meerkat_core::AgentToolDispatcher> =
+            Arc::new(ScheduleToolSurface::new(ScheduleService::new(
+                open_example_runtime_persistence(temp.path())
+                    .await
+                    .unwrap()
+                    .schedule_store(),
+            )));
 
         let req = CreateSessionRequest {
             model: "gpt-5.2".to_string(),
@@ -2235,6 +2271,98 @@ mod tests {
         assert!(tool_names.iter().any(|name| name == "mob_check_member"));
         assert!(tool_names.iter().any(|name| name == "meerkat_schedule_create"));
         assert!(tool_names.iter().any(|name| name == "meerkat_schedule_list"));
+    }
+
+    #[tokio::test]
+    async fn target_schedule_host_delivers_due_prompt_to_runtime_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let comms_runtime = create_target_comms_runtime("test-schedule", temp.path())
+            .await
+            .unwrap();
+        comms_runtime.upsert_trusted_peer(meerkat_comms::TrustedPeer {
+            name: "tux".into(),
+            pubkey: meerkat_comms::identity::Keypair::generate().public_key(),
+            addr: "tcp://127.0.0.1:9999".into(),
+            meta: meerkat_comms::PeerMeta::default(),
+        });
+
+        let capture: Arc<CaptureClient> = Arc::new(CaptureClient::default());
+        let session_dir = temp.path().join("sessions");
+        let surface = build_target_runtime_surface_with_client(
+            &session_dir,
+            Arc::clone(&comms_runtime),
+            capture.clone() as Arc<dyn LlmClient>,
+        )
+        .await
+        .unwrap();
+        let session_id = setup_session(&surface, None, "gpt-5.2", "test", "openai")
+            .await
+            .unwrap();
+
+        let schedule_service = ScheduleService::new(surface.host.persistence().schedule_store());
+        let schedule = schedule_service
+            .create(CreateScheduleRequest {
+                name: Some("scheduled-target-prompt".into()),
+                description: None,
+                trigger: TriggerSpec::Once {
+                    due_at_utc: chrono::Utc::now() - chrono::Duration::seconds(1),
+                },
+                target: TargetBinding::session(SessionTargetBinding::ExactSession {
+                    session_id: session_id.clone(),
+                    action: ScheduledSessionAction::Prompt {
+                        prompt: ContentInput::Text("scheduled hello".into()),
+                        system_prompt: None,
+                        render_metadata: None,
+                        skill_references: Vec::new(),
+                        additional_instructions: Vec::new(),
+                    },
+                }),
+                misfire_policy: MisfirePolicy::Skip,
+                overlap_policy: OverlapPolicy::SkipIfRunning,
+                missing_target_policy: MissingTargetPolicy::MarkMisfired,
+                labels: std::collections::BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if capture
+                    .user_messages()
+                    .iter()
+                    .any(|message| message.contains("scheduled hello"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("scheduled prompt should reach the target session");
+
+        let occurrences = schedule_service
+            .list_occurrences(&schedule.schedule_id)
+            .await
+            .unwrap();
+        assert!(
+            occurrences.iter().any(|occurrence| {
+                matches!(
+                    &occurrence.target_snapshot,
+                    TargetBinding::Session(binding)
+                        if binding.resolved_session_id() == Some(&session_id)
+                )
+            }),
+            "scheduled occurrence should stay bound to the target session target"
+        );
+
+        surface.runtime_adapter.abort_comms_drain(&session_id).await;
+        surface.runtime_adapter.wait_comms_drain(&session_id).await;
+        discard_live_session_with_mob_cleanup(&surface.service, &surface.mob_state, &session_id)
+            .await
+            .unwrap();
+        surface.runtime_adapter.unregister_session(&session_id).await;
     }
 
     #[tokio::test]
@@ -2468,7 +2596,13 @@ mod tests {
         ));
 
         let capture2: Arc<CaptureClient> = Arc::new(CaptureClient::default());
-        let schedule_tools = open_schedule_tool_dispatcher(temp.path()).unwrap();
+        let schedule_tools: Arc<dyn meerkat_core::AgentToolDispatcher> =
+            Arc::new(ScheduleToolSurface::new(ScheduleService::new(
+                open_example_runtime_persistence(temp.path())
+                    .await
+                    .unwrap()
+                    .schedule_store(),
+            )));
         let req2 = CreateSessionRequest {
             model: "gpt-5.2".to_string(),
             prompt: ContentInput::Text("list tools".into()),

@@ -166,10 +166,10 @@ pub use meerkat_schedule::{
     SCHEDULE_TOOL_NOT_FOUND, Schedule, ScheduleDomainError, ScheduleDriver, ScheduleDriverConfig,
     ScheduleFilter, ScheduleId, SchedulePhase, ScheduleRevision, ScheduleService, ScheduleStore,
     ScheduleStoreError, ScheduleStoreKind, ScheduleTargetDelivery, ScheduleTargetProbe,
-    ScheduleToolError, ScheduledMobAction, ScheduledMobBackendKind, ScheduledMobRuntimeMode,
-    ScheduledSessionAction, SessionMaterializationSpec, SessionTargetBinding, TargetBinding,
-    TargetProbeOutcome, TriggerSpec, UpdateScheduleRequest, handle_schedule_tools_call,
-    schedule_tools_list,
+    ScheduleToolError, ScheduleToolSurface, ScheduledMobAction, ScheduledMobBackendKind,
+    ScheduledMobRuntimeMode, ScheduledSessionAction, SessionMaterializationSpec,
+    SessionTargetBinding, TargetBinding, TargetProbeOutcome, TriggerSpec, UpdateScheduleRequest,
+    handle_schedule_tools_call, schedule_tools_list,
 };
 pub use meerkat_tools::ToolError;
 

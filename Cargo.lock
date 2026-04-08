@@ -3011,12 +3011,15 @@ name = "meerkat-surface-runtime"
 version = "0.5.1"
 dependencies = [
  "async-trait",
+ "chrono",
  "meerkat",
  "meerkat-client",
+ "meerkat-contracts",
  "meerkat-core",
  "meerkat-mob-mcp",
  "meerkat-runtime",
  "meerkat-store",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
