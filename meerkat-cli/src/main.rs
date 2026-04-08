@@ -3515,15 +3515,6 @@ async fn run_agent(
             .await
             .map_err(|err| anyhow::anyhow!("runtime accept failed: {err}"))?;
 
-        // Spawn the comms drain in keep-alive mode so inbound peer interactions are
-        // routed through the runtime adapter and automatically trigger new turns.
-        #[cfg(feature = "comms")]
-        {
-            runtime_host
-                .configure_peer_ingress(&session_id, keep_alive)
-                .await;
-        }
-
         match handle {
             Some(handle) => completion_outcome_to_cli_runtime_turn_result(
                 handle.wait().await,
@@ -4003,15 +3994,6 @@ async fn resume_session_with_llm_override(
             .accept_input_with_completion(&session_id, input)
             .await
             .map_err(|err| anyhow::anyhow!("runtime accept failed: {err}"))?;
-
-        // Spawn the comms drain in keep-alive mode so inbound peer interactions are
-        // routed through the runtime adapter and automatically trigger new turns.
-        #[cfg(feature = "comms")]
-        {
-            runtime_host
-                .configure_peer_ingress(&session_id, keep_alive)
-                .await;
-        }
 
         match handle {
             Some(handle) => completion_outcome_to_cli_runtime_turn_result(

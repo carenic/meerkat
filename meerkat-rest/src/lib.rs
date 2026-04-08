@@ -2516,16 +2516,6 @@ async fn create_session_inner(
         }
     };
 
-    // Update peer-ingress context so live sessions always get attached ingress
-    // and idle keep_alive sessions retain a persistent host drain.
-    #[cfg(feature = "comms")]
-    {
-        state
-            .runtime_host
-            .configure_peer_ingress(&session_id, keep_alive)
-            .await;
-    }
-
     // Create input and route through runtime
     let input = meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::from_content_input(
         req.prompt,
@@ -3261,13 +3251,6 @@ async fn continue_session_inner(
             }
         }
 
-        #[cfg(feature = "comms")]
-        {
-            state
-                .runtime_host
-                .configure_peer_ingress(&session_id, keep_alive)
-                .await;
-        }
         let input =
             meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::from_content_input(
                 turn_prompt.clone(),

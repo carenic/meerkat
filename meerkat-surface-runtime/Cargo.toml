@@ -13,6 +13,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 meerkat = { workspace = true, features = ["jsonl-store", "session-store", "memory-store"] }
 meerkat-core = { workspace = true }
 meerkat-runtime = { workspace = true }
@@ -25,6 +26,11 @@ tracing = { workspace = true }
 default = []
 comms = ["meerkat/comms"]
 mob = ["dep:meerkat-mob-mcp"]
+
+[dev-dependencies]
+meerkat-client = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros"] }
 
 [package.metadata.cargo-machete]
 ignored = ["meerkat-mob-mcp", "thiserror"]  # optional / proc macro

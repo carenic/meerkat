@@ -3010,12 +3010,16 @@ dependencies = [
 name = "meerkat-surface-runtime"
 version = "0.5.1"
 dependencies = [
+ "async-trait",
  "meerkat",
+ "meerkat-client",
  "meerkat-core",
  "meerkat-mob-mcp",
  "meerkat-runtime",
  "meerkat-store",
+ "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 

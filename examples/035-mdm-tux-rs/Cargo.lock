@@ -2898,6 +2898,7 @@ dependencies = [
 name = "meerkat-surface-runtime"
 version = "0.5.1"
 dependencies = [
+ "async-trait",
  "meerkat",
  "meerkat-core",
  "meerkat-mob-mcp",

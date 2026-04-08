@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use futures::StreamExt;
-use meerkat::PersistentSessionService;
 use meerkat::FactoryAgentBuilder;
+use meerkat::PersistentSessionService;
 use meerkat_comms::MessageKind;
 use meerkat_comms::{CommsRuntime, PeerMeta, ResolvedCommsConfig, TrustedPeer};
 use meerkat_core::agent::CommsRuntime as _;
@@ -38,7 +38,6 @@ use meerkat_core::service::{
 use meerkat_core::types::{ContentInput, SessionId};
 use meerkat_core::{AgentEvent, Config};
 use meerkat_mob_mcp::MobMcpState;
-use meerkat_rpc::session_executor::{PersistentSessionServiceExecutor, SessionStopCleanup};
 use meerkat_runtime::RuntimeSessionAdapter;
 use meerkat_surface_runtime::RuntimeSessionHost;
 use meerkat_store::{MemoryBlobStore, SessionFilter};
@@ -65,6 +64,7 @@ struct TargetRuntimeSurface {
     host: Arc<RuntimeSessionHost>,
     service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
     runtime_adapter: Arc<RuntimeSessionAdapter>,
+    comms_runtime: Arc<CommsRuntime>,
     jsonl_store: Arc<dyn meerkat::SessionStore>,
     mob_state: Arc<MobMcpState>,
 }
@@ -78,8 +78,7 @@ async fn build_target_runtime_surface(
             .shell(true)
             .builtins(true)
             .mob(true)
-            .session_comms_name_prefix("target")
-            .comms_runtime(comms_runtime)
+            .comms_runtime(Arc::clone(&comms_runtime))
             .config(Config::default())
             .max_sessions(10)
             .build()
@@ -94,6 +93,7 @@ async fn build_target_runtime_surface(
         host,
         service,
         runtime_adapter,
+        comms_runtime,
         jsonl_store,
         mob_state,
     })
@@ -112,6 +112,64 @@ async fn discard_live_session_with_mob_cleanup(
         eprintln!("[target] warning: cleanup mobs for session {session_id}: {error}");
     }
     discard_result
+}
+
+async fn sync_session_trusted_peers_from_surface(
+    surface: &TargetRuntimeSurface,
+    session_id: &SessionId,
+    source_runtime: &Arc<CommsRuntime>,
+) -> anyhow::Result<()> {
+    let Some(session_runtime) = surface.service.comms_runtime(session_id).await else {
+        return Ok(());
+    };
+
+    let desired_peers = source_runtime.peers().await;
+    let existing_peers = session_runtime.peers().await;
+
+    for peer in &existing_peers {
+        if desired_peers
+            .iter()
+            .all(|desired| desired.peer_id != peer.peer_id)
+        {
+            session_runtime
+                .remove_trusted_peer(&peer.peer_id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "remove stale session peer {} ({})",
+                        peer.name.as_str(),
+                        peer.peer_id
+                    )
+                })?;
+        }
+    }
+
+    for peer in desired_peers {
+        if existing_peers
+            .iter()
+            .all(|existing| existing.peer_id != peer.peer_id)
+        {
+            let spec = meerkat_core::comms::TrustedPeerSpec::new(
+                peer.name.as_str(),
+                peer.peer_id.clone(),
+                peer.address.clone(),
+            )
+            .map_err(anyhow::Error::msg)
+            .context("build session trusted peer spec")?;
+            session_runtime
+                .add_trusted_peer(spec)
+                .await
+                .with_context(|| {
+                    format!(
+                        "add session peer {} ({})",
+                        peer.name.as_str(),
+                        peer.peer_id
+                    )
+                })?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Build a `ResolvedCommsConfig` for the target's stable identity.
@@ -334,6 +392,14 @@ async fn main() -> anyhow::Result<()> {
             addr: format!("tcp://{host_addr}"),
             meta: PeerMeta::default(),
         });
+        if let Err(error) =
+            sync_session_trusted_peers_from_surface(&surface, &current_session_id, &comms_runtime)
+                .await
+        {
+            eprintln!(
+                "[target] warning: sync trusted peers into session {current_session_id}: {error}"
+            );
+        }
 
         // Disconnect signal: heartbeat + event forwarder can trigger reconnect
         let (disconnect_tx, disconnect_rx) = tokio::sync::watch::channel(false);
@@ -1153,6 +1219,7 @@ async fn setup_session(
         override_builtins: meerkat_core::ToolCategoryOverride::Enable,
         override_shell: meerkat_core::ToolCategoryOverride::Enable,
         override_mob: meerkat_core::ToolCategoryOverride::Enable,
+        comms_name: resume_id.is_none().then(|| format!("target/{}", SessionId::new())),
         keep_alive: true,
         ..Default::default()
     };
@@ -1171,30 +1238,12 @@ async fn setup_session(
         labels: None,
     };
 
-    let service = Arc::clone(&surface.service);
-    let mob_state = Arc::clone(&surface.mob_state);
     let session_id = surface
         .host
-        .create_or_resume_session(resume_id, req, move |session_id| {
-            let cleanup: SessionStopCleanup = Arc::new({
-                let service = Arc::clone(&service);
-                let mob_state = Arc::clone(&mob_state);
-                move |session_id| {
-                    let service = Arc::clone(&service);
-                    let mob_state = Arc::clone(&mob_state);
-                    Box::pin(async move {
-                        discard_live_session_with_mob_cleanup(&service, &mob_state, &session_id)
-                            .await
-                    })
-                }
-            });
-            Box::new(
-                PersistentSessionServiceExecutor::new(Arc::clone(&service), session_id)
-                    .with_stop_cleanup(cleanup),
-            )
-        })
+        .create_or_resume_session(resume_id, req)
         .await
         .map_err(|error| anyhow::anyhow!("create session: {error}"))?;
+    sync_session_trusted_peers_from_surface(surface, &session_id, &surface.comms_runtime).await?;
     eprintln!("[target] session ready: {session_id}");
 
     Ok(session_id)
@@ -2040,8 +2089,7 @@ mod tests {
                 .shell(true)
                 .builtins(true)
                 .mob(true)
-                .session_comms_name_prefix("target")
-                .comms_runtime(comms_runtime)
+                .comms_runtime(Arc::clone(&comms_runtime))
                 .default_llm_client(llm_client)
                 .config(Config::default())
                 .max_sessions(10)
@@ -2057,6 +2105,7 @@ mod tests {
             host,
             service,
             runtime_adapter,
+            comms_runtime,
             jsonl_store,
             mob_state,
         })
