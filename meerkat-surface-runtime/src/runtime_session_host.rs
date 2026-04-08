@@ -345,8 +345,13 @@ impl RuntimeSessionHost {
         let recovered = build_recovered_session(session.clone(), overrides, recovery_context)
             .map_err(|error| SessionError::Agent(AgentError::InternalError(error.to_string())))?;
         let materialized_id = self
-            .materialize_session(session, recovered.into_deferred_create_request())
-            .await?;
+            .materialize_session_with_result_inner(
+                session,
+                recovered.into_deferred_create_request(),
+                Some(|session_id| self.default_executor(session_id)),
+            )
+            .await?
+            .session_id;
         Ok(materialized_id)
     }
 
@@ -406,29 +411,10 @@ impl RuntimeSessionHost {
             )?,
             None => Session::new(),
         };
-        let service = Arc::clone(&self.service);
-        #[cfg(feature = "mob")]
-        let mob_state = self.mob_state();
         self.materialize_session_with_result_inner(
             session,
             request,
-            Some(move |session_id| {
-                #[cfg(feature = "mob")]
-                {
-                    let executor: Box<dyn CoreExecutor> = Box::new(
-                        RuntimeSessionHostExecutor::new(Arc::clone(&service), session_id)
-                            .with_mob_state(Arc::clone(&mob_state)),
-                    );
-                    executor
-                }
-                #[cfg(not(feature = "mob"))]
-                {
-                    let executor: Box<dyn CoreExecutor> = Box::new(
-                        RuntimeSessionHostExecutor::new(Arc::clone(&service), session_id),
-                    );
-                    executor
-                }
-            }),
+            Some(|session_id| self.default_executor(session_id)),
         )
         .await
     }
@@ -535,6 +521,8 @@ impl RuntimeSessionHost {
         let mut build = request.build.unwrap_or_default();
         build.resume_session = Some(session);
         build.runtime_build_mode = meerkat_core::RuntimeBuildMode::SessionOwned(bindings);
+        #[cfg(feature = "comms")]
+        let keep_alive = build.keep_alive;
         request.build = Some(build);
 
         let result = match self.service.create_session(request).await {
@@ -547,14 +535,13 @@ impl RuntimeSessionHost {
             }
         };
 
-        if result.session_id != prepared_session_id {
+        if let Err(error) =
+            ensure_materialized_session_id_matches(&prepared_session_id, &result.session_id)
+        {
             self.runtime_adapter
                 .unregister_session(&prepared_session_id)
                 .await;
-            return Err(RuntimeSessionHostError::SessionIdMismatch {
-                expected: prepared_session_id,
-                actual: result.session_id,
-            });
+            return Err(error);
         }
 
         if let Some(executor_factory) = executor_factory {
@@ -567,7 +554,7 @@ impl RuntimeSessionHost {
 
         #[cfg(feature = "comms")]
         if let Err(error) = self
-            .configure_materialized_peer_ingress(&result.session_id)
+            .configure_materialized_peer_ingress(&result.session_id, keep_alive)
             .await
         {
             let _ = self.service.discard_live_session(&result.session_id).await;
@@ -601,22 +588,7 @@ impl RuntimeSessionHost {
             ));
         }
 
-        let service = Arc::clone(&self.service);
-        #[cfg(feature = "mob")]
-        let mob_state = self.mob_state();
-        let executor: Box<dyn CoreExecutor> = {
-            #[cfg(feature = "mob")]
-            {
-                Box::new(
-                    RuntimeSessionHostExecutor::new(service, session_id.clone())
-                        .with_mob_state(mob_state),
-                )
-            }
-            #[cfg(not(feature = "mob"))]
-            {
-                Box::new(RuntimeSessionHostExecutor::new(service, session_id.clone()))
-            }
-        };
+        let executor = self.default_executor(session_id.clone());
         self.attach_executor(session_id, executor).await;
         Ok(())
     }
@@ -643,16 +615,27 @@ impl RuntimeSessionHost {
     async fn configure_materialized_peer_ingress(
         &self,
         session_id: &SessionId,
+        keep_alive: bool,
     ) -> Result<(), RuntimeSessionHostError> {
-        let keep_alive = self
-            .service
-            .load_persisted(session_id)
-            .await?
-            .ok_or_else(|| RuntimeSessionHostError::PersistedSessionNotFound(session_id.clone()))?
-            .session_metadata()
-            .is_some_and(|metadata| metadata.keep_alive);
         self.configure_peer_ingress(session_id, keep_alive).await;
         Ok(())
+    }
+
+    fn default_executor(&self, session_id: SessionId) -> Box<dyn CoreExecutor> {
+        #[cfg(feature = "mob")]
+        {
+            Box::new(
+                RuntimeSessionHostExecutor::new(Arc::clone(&self.service), session_id)
+                    .with_mob_state(self.mob_state()),
+            )
+        }
+        #[cfg(not(feature = "mob"))]
+        {
+            Box::new(RuntimeSessionHostExecutor::new(
+                Arc::clone(&self.service),
+                session_id,
+            ))
+        }
     }
 }
 
@@ -783,6 +766,20 @@ fn session_metadata_marks_archived(session: &Session) -> bool {
         .unwrap_or(false)
 }
 
+fn ensure_materialized_session_id_matches(
+    expected: &SessionId,
+    actual: &SessionId,
+) -> Result<(), RuntimeSessionHostError> {
+    if actual == expected {
+        return Ok(());
+    }
+
+    Err(RuntimeSessionHostError::SessionIdMismatch {
+        expected: expected.clone(),
+        actual: actual.clone(),
+    })
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 async fn build_default_persistence(
     session_dir: PathBuf,
@@ -806,32 +803,46 @@ async fn build_default_persistence(
     Err(RuntimeSessionHostError::MissingPersistence)
 }
 
-#[cfg(all(test, feature = "comms", not(target_arch = "wasm32")))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use async_trait::async_trait;
-    use meerkat::CommsCommand;
     use meerkat_client::TestClient;
     use meerkat_core::SessionBuildOptions;
+    use meerkat_runtime::completion::CompletionOutcome;
+    use meerkat_runtime::{Input, PromptInput, RuntimeDriverError, RuntimeState};
+    use tempfile::TempDir;
+    use tokio::time::Duration;
+
+    #[cfg(feature = "comms")]
+    use async_trait::async_trait;
+    #[cfg(feature = "comms")]
+    use meerkat::{CommsCommand, CommsRuntime};
+    #[cfg(feature = "comms")]
     use meerkat_core::agent::CommsRuntime as _;
+    #[cfg(feature = "comms")]
     use meerkat_core::comms::{InputSource, TrustedPeerSpec};
+    #[cfg(feature = "comms")]
     use meerkat_core::lifecycle::RunId;
+    #[cfg(feature = "comms")]
     use meerkat_core::lifecycle::core_executor::{
         CoreApplyOutput, CoreExecutor, CoreExecutorError,
     };
+    #[cfg(feature = "comms")]
     use meerkat_core::lifecycle::run_control::RunControlCommand;
+    #[cfg(feature = "comms")]
     use meerkat_core::lifecycle::run_primitive::{RunApplyBoundary, RunPrimitive};
+    #[cfg(feature = "comms")]
     use meerkat_core::lifecycle::run_receipt::RunBoundaryReceipt;
+    #[cfg(feature = "comms")]
     use meerkat_core::types::HandlingMode;
-    use meerkat_runtime::completion::CompletionOutcome;
-    use meerkat_runtime::{Input, PromptInput};
-    use tempfile::TempDir;
-    use tokio::time::{Duration, Instant, sleep};
+    #[cfg(feature = "comms")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(feature = "comms")]
+    use tokio::time::{Instant, sleep};
 
     fn make_request(build: SessionBuildOptions) -> CreateSessionRequest {
         CreateSessionRequest {
@@ -849,29 +860,67 @@ mod tests {
         }
     }
 
-    async fn build_test_host(
-        temp: &TempDir,
-        shared_runtime: Option<Arc<CommsRuntime>>,
-    ) -> RuntimeSessionHost {
-        let builder = RuntimeSessionHost::builder(temp.path().join("sessions"))
+    async fn build_test_host(temp: &TempDir) -> RuntimeSessionHost {
+        RuntimeSessionHost::builder(temp.path().join("sessions"))
             .default_llm_client(Arc::new(TestClient::default()))
-            .max_sessions(4);
-        let builder = if let Some(runtime) = shared_runtime {
-            builder.comms_runtime(runtime)
-        } else {
-            builder
-        };
-        builder.build().await.expect("build runtime host")
+            .max_sessions(4)
+            .build()
+            .await
+            .expect("build runtime host")
     }
 
+    #[cfg(feature = "comms")]
+    async fn build_test_host_with_runtime(
+        temp: &TempDir,
+        shared_runtime: Arc<CommsRuntime>,
+    ) -> RuntimeSessionHost {
+        RuntimeSessionHost::builder(temp.path().join("sessions"))
+            .default_llm_client(Arc::new(TestClient::default()))
+            .max_sessions(4)
+            .comms_runtime(shared_runtime)
+            .build()
+            .await
+            .expect("build runtime host")
+    }
+
+    async fn expect_prompt_completion(
+        host: &RuntimeSessionHost,
+        session_id: &SessionId,
+        prompt: &str,
+    ) {
+        let (_outcome, handle) = host
+            .runtime_adapter()
+            .accept_input_with_completion(session_id, Input::Prompt(PromptInput::new(prompt, None)))
+            .await
+            .expect("accept prompt input");
+        let handle = handle.expect("completion handle");
+        let outcome = tokio::time::timeout(Duration::from_secs(2), handle.wait())
+            .await
+            .expect("prompt should complete");
+        assert!(
+            matches!(outcome, CompletionOutcome::Completed(ref run) if run.text == "ok"),
+            "unexpected completion outcome: {outcome:?}"
+        );
+    }
+
+    async fn discard_and_unregister(host: &RuntimeSessionHost, session_id: &SessionId) {
+        host.discard_live_session(session_id)
+            .await
+            .expect("discard live session");
+        host.runtime_adapter().unregister_session(session_id).await;
+    }
+
+    #[cfg(feature = "comms")]
     fn make_inproc_runtime(name: &str) -> Arc<CommsRuntime> {
         Arc::new(CommsRuntime::inproc_only(name).expect("create inproc comms runtime"))
     }
 
+    #[cfg(feature = "comms")]
     struct CountingExecutor {
         apply_count: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "comms")]
     #[async_trait]
     impl CoreExecutor for CountingExecutor {
         async fn apply(
@@ -901,74 +950,183 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keep_alive_without_comms_name_is_rejected() {
+    async fn materialize_session_unregisters_prepared_runtime_on_create_failure() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let host = build_test_host(&temp, None).await;
+        let host = build_test_host(&temp).await;
+        let session = Session::new();
+        let session_id = session.id().clone();
 
         let error = host
             .materialize_session_with_result(
-                Session::new(),
+                session,
                 make_request(SessionBuildOptions {
-                    keep_alive: true,
+                    max_inline_peer_notifications: Some(-2),
                     ..Default::default()
                 }),
             )
             .await
-            .expect_err("keep_alive without comms_name must fail");
+            .expect_err("invalid build settings must fail");
 
         assert!(
-            error.to_string().contains("keep_alive requires comms_name"),
+            error
+                .to_string()
+                .contains("max_inline_peer_notifications=-2 is invalid"),
             "unexpected error: {error}"
         );
+
+        let result = host
+            .runtime_adapter()
+            .accept_input_with_completion(
+                &session_id,
+                Input::Prompt(PromptInput::new("must stay unregistered", None)),
+            )
+            .await;
+        match result {
+            Err(RuntimeDriverError::NotReady {
+                state: RuntimeState::Destroyed,
+            }) => {}
+            Err(error) => panic!("unexpected runtime error after failed materialization: {error}"),
+            Ok(_) => panic!("failed materialization must unregister prepared runtime session"),
+        }
     }
 
     #[tokio::test]
     async fn create_or_resume_session_uses_host_default_executor() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let host = build_test_host(&temp, None).await;
+        let host = build_test_host(&temp).await;
 
         let session_id = host
-            .create_or_resume_session(
-                None,
-                make_request(SessionBuildOptions {
-                    comms_name: Some(format!("default-executor-{}", SessionId::new())),
-                    keep_alive: true,
-                    ..Default::default()
-                }),
-            )
+            .create_or_resume_session(None, make_request(SessionBuildOptions::default()))
             .await
             .expect("create session with host default executor");
 
-        let (_outcome, handle) = host
-            .runtime_adapter()
-            .accept_input_with_completion(
-                &session_id,
-                Input::Prompt(PromptInput::new("host default executor prompt", None)),
-            )
-            .await
-            .expect("accept prompt input");
-        let handle = handle.expect("completion handle");
-        let outcome = tokio::time::timeout(Duration::from_secs(2), handle.wait())
-            .await
-            .expect("prompt should complete");
-        assert!(
-            matches!(outcome, CompletionOutcome::Completed(ref run) if run.text == "ok"),
-            "unexpected completion outcome: {outcome:?}"
-        );
-
-        host.runtime_adapter().abort_comms_drain(&session_id).await;
-        host.runtime_adapter().wait_comms_drain(&session_id).await;
-        host.discard_live_session(&session_id)
-            .await
-            .expect("discard live session");
-        host.runtime_adapter().unregister_session(&session_id).await;
+        expect_prompt_completion(&host, &session_id, "host default executor prompt").await;
+        discard_and_unregister(&host, &session_id).await;
     }
 
+    #[tokio::test]
+    async fn create_or_resume_session_resume_path_returns_same_session_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let host = build_test_host(&temp).await;
+        let session_id = host
+            .create_or_resume_session(None, make_request(SessionBuildOptions::default()))
+            .await
+            .expect("create seed session");
+        discard_and_unregister(&host, &session_id).await;
+
+        let resumed_id = host
+            .create_or_resume_session(
+                Some(session_id.clone()),
+                make_request(SessionBuildOptions::default()),
+            )
+            .await
+            .expect("resume persisted session through host");
+
+        assert_eq!(
+            resumed_id, session_id,
+            "create_or_resume_session must preserve the persisted session id"
+        );
+        expect_prompt_completion(&host, &resumed_id, "resume path prompt").await;
+        discard_and_unregister(&host, &resumed_id).await;
+    }
+
+    #[tokio::test]
+    async fn materialize_persisted_session_recovers_and_attaches_default_executor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let host = build_test_host(&temp).await;
+        let session_id = host
+            .create_or_resume_session(None, make_request(SessionBuildOptions::default()))
+            .await
+            .expect("create seed session");
+        discard_and_unregister(&host, &session_id).await;
+
+        let recovered_id = host
+            .materialize_persisted_session(
+                &session_id,
+                &SurfaceSessionRecoveryOverrides::default(),
+                SurfaceSessionRecoveryContext::default(),
+            )
+            .await
+            .expect("recover persisted session");
+
+        assert_eq!(
+            recovered_id, session_id,
+            "recovered session must reuse the persisted session id"
+        );
+        expect_prompt_completion(&host, &recovered_id, "recovered prompt").await;
+        discard_and_unregister(&host, &recovered_id).await;
+    }
+
+    #[tokio::test]
+    async fn materialize_persisted_session_missing_session_returns_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let host = build_test_host(&temp).await;
+        let missing = SessionId::new();
+
+        let error = host
+            .materialize_persisted_session(
+                &missing,
+                &SurfaceSessionRecoveryOverrides::default(),
+                SurfaceSessionRecoveryContext::default(),
+            )
+            .await
+            .expect_err("missing persisted session must fail");
+
+        assert!(matches!(
+            error,
+            RuntimeSessionHostError::PersistedSessionNotFound(ref session_id)
+                if *session_id == missing
+        ));
+    }
+
+    #[tokio::test]
+    async fn ensure_default_runtime_executor_rejects_missing_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let host = build_test_host(&temp).await;
+        let missing = SessionId::new();
+
+        let error = host
+            .ensure_default_runtime_executor(&missing)
+            .await
+            .expect_err("missing session must not get a default executor");
+
+        assert!(matches!(
+            error,
+            RuntimeSessionHostError::PersistedSessionNotFound(ref session_id)
+                if *session_id == missing
+        ));
+    }
+
+    #[test]
+    fn ensure_materialized_session_id_matches_accepts_match() {
+        let session_id = SessionId::new();
+        ensure_materialized_session_id_matches(&session_id, &session_id)
+            .expect("matching session ids must succeed");
+    }
+
+    #[test]
+    fn ensure_materialized_session_id_matches_reports_mismatch() {
+        let expected = SessionId::new();
+        let actual = SessionId::new();
+
+        let error = ensure_materialized_session_id_matches(&expected, &actual)
+            .expect_err("mismatched session ids must error");
+
+        assert!(matches!(
+            error,
+            RuntimeSessionHostError::SessionIdMismatch {
+                expected: ref actual_expected,
+                actual: ref actual_actual,
+            } if *actual_expected == expected && *actual_actual == actual
+        ));
+    }
+
+    #[cfg(feature = "comms")]
     #[tokio::test]
     async fn materialize_session_with_executor_configures_peer_ingress() {
         let temp = tempfile::tempdir().expect("tempdir");
         let shared_runtime = make_inproc_runtime(&format!("surface-shared-{}", SessionId::new()));
-        let host = build_test_host(&temp, Some(shared_runtime)).await;
+        let host = build_test_host_with_runtime(&temp, shared_runtime).await;
         let apply_count = Arc::new(AtomicUsize::new(0));
 
         let result = host
@@ -1016,12 +1174,10 @@ mod tests {
 
         host.runtime_adapter().abort_comms_drain(&session_id).await;
         host.runtime_adapter().wait_comms_drain(&session_id).await;
-        host.discard_live_session(&session_id)
-            .await
-            .expect("discard live session");
-        host.runtime_adapter().unregister_session(&session_id).await;
+        discard_and_unregister(&host, &session_id).await;
     }
 
+    #[cfg(feature = "comms")]
     #[tokio::test]
     async fn materialize_session_does_not_copy_shared_runtime_trust() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1039,7 +1195,7 @@ mod tests {
             )
             .await
             .expect("add trusted peer to shared runtime");
-        let host = build_test_host(&temp, Some(shared_runtime.clone())).await;
+        let host = build_test_host_with_runtime(&temp, shared_runtime.clone()).await;
 
         let shared_peer_names: Vec<_> = shared_runtime
             .peers()
@@ -1079,9 +1235,6 @@ mod tests {
             "session-scoped runtime must not inherit shared runtime trust entries"
         );
 
-        host.discard_live_session(&session_id)
-            .await
-            .expect("discard live session");
-        host.runtime_adapter().unregister_session(&session_id).await;
+        discard_and_unregister(&host, &session_id).await;
     }
 }
