@@ -70,7 +70,16 @@ impl CommsToolSurface {
 
     /// Usage instructions for comms tools to be added to the system prompt
     pub fn usage_instructions() -> &'static str {
-        "# Inter-agent Communication\n\nYou can communicate with other agents using these tools:\n\n- send: Send a message, request, or response to a peer (use `kind` to select type)\n- peers: List all visible peers and their connection info\n\nAlways check peers first to see who is available."
+        r#"# Inter-agent Communication
+
+You can communicate with other agents using these tools:
+
+- **send_message**: Send a message to a peer. Always include `handling_mode` — use `"steer"` for normal collaboration.
+- **send_request**: Send a structured request (intent + params) and expect a correlated response. Always include `handling_mode`.
+- **send_response**: Reply to a previous request using its ID.
+- **peers**: List all visible peers. Always check peers first to see who is available.
+
+Use `send_message` for ordinary collaboration. Use `send_request` only when you need structured intent/params with a correlated reply."#
     }
 }
 

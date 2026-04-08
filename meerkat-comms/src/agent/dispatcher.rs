@@ -90,12 +90,11 @@ impl AgentToolDispatcher for NoOpDispatcher {
     }
 }
 
-fn normalize_comms_call(name: &str, args: Value) -> Option<(&'static str, Value)> {
-    match name {
-        "send" => Some(("send", args)),
-        "peers" => Some(("peers", args)),
-        _ => None,
-    }
+fn is_comms_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "send" | "send_message" | "send_request" | "send_response" | "peers"
+    )
 }
 
 /// Canonical JSON-to-ToolDef conversion for comms tools.
@@ -122,8 +121,8 @@ impl<T: AgentToolDispatcher + 'static> AgentToolDispatcher for CommsToolDispatch
     async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
         let args: Value = serde_json::from_str(call.args.get())
             .unwrap_or_else(|_| Value::String(call.args.get().to_string()));
-        if let Some((normalized_name, normalized_args)) = normalize_comms_call(call.name, args) {
-            let result = handle_tools_call(&self.tool_context, normalized_name, &normalized_args)
+        if is_comms_tool(call.name) {
+            let result = handle_tools_call(&self.tool_context, call.name, &args)
                 .await
                 .map_err(|e| ToolError::ExecutionFailed { message: e })?;
             Ok(ToolResult::new(call.id.to_string(), result.to_string(), false).into())
@@ -196,8 +195,8 @@ impl AgentToolDispatcher for DynCommsToolDispatcher {
     async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
         let args: Value = serde_json::from_str(call.args.get())
             .unwrap_or_else(|_| Value::String(call.args.get().to_string()));
-        if let Some((normalized_name, normalized_args)) = normalize_comms_call(call.name, args) {
-            let result = handle_tools_call(&self.tool_context, normalized_name, &normalized_args)
+        if is_comms_tool(call.name) {
+            let result = handle_tools_call(&self.tool_context, call.name, &args)
                 .await
                 .map_err(|e| ToolError::ExecutionFailed { message: e })?;
             Ok(ToolResult::new(call.id.to_string(), result.to_string(), false).into())

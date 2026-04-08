@@ -1,6 +1,7 @@
 //! MCP tool implementations for Meerkat comms.
 //!
-//! Exposes exactly two tools: `send` and `peers`.
+//! Exposes agent-facing comms tools: `send_message`, `send_request`,
+//! `send_response`, and `peers`.
 
 use parking_lot::RwLock;
 use schemars::JsonSchema;
@@ -30,38 +31,54 @@ fn schema_for<T: JsonSchema>() -> Value {
     value
 }
 
-/// Input schema for the unified `send` tool.
+// ---------------------------------------------------------------------------
+// Per-tool input schemas
+// ---------------------------------------------------------------------------
+
+/// Send a message to a peer.
 ///
-/// Uses a flat `kind` discriminator with dispatch-time validation.
+/// Example: `{"to": "helper-1", "body": "What is the current time?", "handling_mode": "steer"}`
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct SendInput {
-    /// Command kind: "peer_message", "peer_request", or "peer_response"
-    pub kind: String,
+pub struct SendMessageInput {
     /// Peer name to send to
     pub to: String,
-    /// Message body (required for peer_message)
-    #[serde(default)]
-    pub body: Option<String>,
-    /// Optional multimodal content blocks
-    #[serde(default)]
-    #[schemars(skip)]
-    pub blocks: Option<Vec<meerkat_core::types::ContentBlock>>,
-    /// Request intent (required for peer_request)
-    #[serde(default)]
-    pub intent: Option<String>,
+    /// Message body
+    pub body: String,
+    /// "steer" for immediate processing (normal), "queue" for next turn boundary
+    pub handling_mode: String,
+}
+
+/// Send a structured request to a peer and expect a correlated response.
+///
+/// Example: `{"to": "analyzer", "intent": "review", "params": {"file": "main.rs"}, "handling_mode": "steer"}`
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SendRequestInput {
+    /// Peer name to send to
+    pub to: String,
+    /// Request intent (e.g. "review", "analyze")
+    pub intent: String,
+    /// "steer" for immediate processing (normal), "queue" for next turn boundary
+    pub handling_mode: String,
     /// Request parameters (optional, defaults to {})
     #[serde(default)]
     pub params: Option<Value>,
-    /// ID of the request being responded to (required for peer_response)
-    #[serde(default)]
-    pub in_reply_to: Option<String>,
-    /// Response status: "accepted", "completed", or "failed" (for peer_response)
-    #[serde(default)]
-    pub status: Option<String>,
-    /// Response result data (optional for peer_response)
+}
+
+/// Send a response to a previous peer request.
+///
+/// Example: `{"to": "requester", "in_reply_to": "<request-id>", "status": "completed", "result": {"answer": 42}}`
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SendResponseInput {
+    /// Peer name to send to
+    pub to: String,
+    /// ID of the request being responded to (from the original request)
+    pub in_reply_to: String,
+    /// Response status: "accepted", "completed", or "failed"
+    pub status: String,
+    /// Response result data (optional)
     #[serde(default)]
     pub result: Option<Value>,
-    /// Handling mode override: "queue" or "steer" (optional for peer_response)
+    /// Handling mode override for terminal responses: "steer" or "queue" (optional)
     #[serde(default)]
     pub handling_mode: Option<String>,
 }
@@ -69,6 +86,29 @@ pub struct SendInput {
 /// Input schema for `peers` tool
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PeersInput {}
+
+/// Backward-compatible unified send input (used by `normalize_comms_call`).
+#[derive(Debug, Deserialize)]
+pub struct SendInput {
+    pub kind: String,
+    pub to: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub blocks: Option<Vec<meerkat_core::types::ContentBlock>>,
+    #[serde(default)]
+    pub intent: Option<String>,
+    #[serde(default)]
+    pub params: Option<Value>,
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub result: Option<Value>,
+    #[serde(default)]
+    pub handling_mode: Option<String>,
+}
 
 /// Context for comms tool execution
 #[derive(Clone)]
@@ -78,33 +118,112 @@ pub struct ToolContext {
     pub runtime: Option<Arc<dyn CoreCommsRuntime>>,
 }
 
-/// Returns the list of comms tools: exactly `send` and `peers`.
+/// Returns the list of comms tools.
 pub fn tools_list() -> Vec<Value> {
     vec![
         json!({
-            "name": "send",
-            "description": "Send a message, request, or response to a peer. Use `kind` to select the command type.",
-            "inputSchema": schema_for::<SendInput>()
+            "name": "send_message",
+            "description": "Send a message to a peer. Use \"steer\" handling_mode for normal collaboration.\n\nExample: {\"to\": \"helper-1\", \"body\": \"What time is it?\", \"handling_mode\": \"steer\"}",
+            "inputSchema": schema_for::<SendMessageInput>()
+        }),
+        json!({
+            "name": "send_request",
+            "description": "Send a structured request to a peer and expect a correlated response later. Use \"steer\" handling_mode for normal collaboration.\n\nExample: {\"to\": \"analyzer\", \"intent\": \"review\", \"params\": {\"file\": \"main.rs\"}, \"handling_mode\": \"steer\"}",
+            "inputSchema": schema_for::<SendRequestInput>()
+        }),
+        json!({
+            "name": "send_response",
+            "description": "Send a response to a previous peer request. Use the request ID from the original request as in_reply_to.\n\nExample: {\"to\": \"requester\", \"in_reply_to\": \"<id>\", \"status\": \"completed\", \"result\": {\"answer\": 42}}",
+            "inputSchema": schema_for::<SendResponseInput>()
         }),
         json!({
             "name": "peers",
-            "description": "List all visible peers with connection info and optional metadata (description, labels)",
+            "description": "List all visible peers with connection info and optional metadata (description, labels). Always check peers first to see who is available before sending.",
             "inputSchema": schema_for::<PeersInput>()
         }),
     ]
 }
 
-/// Handle a comms tool call. Only `send` and `peers` are valid.
+/// Handle a comms tool call.
 pub async fn handle_tools_call(
     ctx: &ToolContext,
     name: &str,
     args: &Value,
 ) -> Result<Value, String> {
     match name {
+        "send_message" => {
+            let input: SendMessageInput = serde_json::from_value(args.clone())
+                .map_err(|e| format!("Invalid arguments: {e}"))?;
+            handle_send_unified(
+                ctx,
+                "peer_message",
+                input.to,
+                Some(input.body),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(input.handling_mode),
+                None,
+            )
+            .await
+        }
+        "send_request" => {
+            let input: SendRequestInput = serde_json::from_value(args.clone())
+                .map_err(|e| format!("Invalid arguments: {e}"))?;
+            handle_send_unified(
+                ctx,
+                "peer_request",
+                input.to,
+                None,
+                None,
+                Some(input.intent),
+                input.params,
+                None,
+                None,
+                Some(input.handling_mode),
+                None,
+            )
+            .await
+        }
+        "send_response" => {
+            let input: SendResponseInput = serde_json::from_value(args.clone())
+                .map_err(|e| format!("Invalid arguments: {e}"))?;
+            handle_send_unified(
+                ctx,
+                "peer_response",
+                input.to,
+                None,
+                None,
+                None,
+                None,
+                Some(input.in_reply_to),
+                Some(input.status),
+                input.handling_mode,
+                input.result,
+            )
+            .await
+        }
+        // Backward compatibility: the old unified "send" tool still works
+        // for programmatic callers that use the kind discriminator.
         "send" => {
             let input: SendInput = serde_json::from_value(args.clone())
                 .map_err(|e| format!("Invalid arguments: {e}"))?;
-            handle_send(ctx, input).await
+            handle_send_unified(
+                ctx,
+                &input.kind,
+                input.to,
+                input.body,
+                input.blocks,
+                input.intent,
+                input.params,
+                input.in_reply_to,
+                input.status,
+                input.handling_mode,
+                input.result,
+            )
+            .await
         }
         "peers" => {
             let _input: PeersInput = serde_json::from_value(args.clone())
@@ -115,27 +234,40 @@ pub async fn handle_tools_call(
     }
 }
 
-async fn handle_send(ctx: &ToolContext, input: SendInput) -> Result<Value, String> {
+#[allow(clippy::too_many_arguments)]
+async fn handle_send_unified(
+    ctx: &ToolContext,
+    kind: &str,
+    to: String,
+    body: Option<String>,
+    blocks: Option<Vec<meerkat_core::types::ContentBlock>>,
+    intent: Option<String>,
+    params: Option<Value>,
+    in_reply_to: Option<String>,
+    status: Option<String>,
+    handling_mode: Option<String>,
+    result: Option<Value>,
+) -> Result<Value, String> {
     let request = meerkat_core::comms::CommsCommandRequest {
-        kind: input.kind,
-        to: Some(input.to),
-        body: input.body,
-        blocks: input.blocks,
-        intent: input.intent,
-        params: input.params,
-        in_reply_to: input.in_reply_to,
-        status: input.status,
-        result: input.result,
+        kind: kind.to_string(),
+        to: Some(to),
+        body,
+        blocks,
+        intent,
+        params,
+        in_reply_to,
+        status,
+        result,
         source: None,
         stream: None,
         allow_self_session: None,
-        handling_mode: input.handling_mode,
+        handling_mode,
     };
     let command = request
         .parse(&meerkat_core::SessionId::new())
         .map_err(format_comms_command_error)?;
 
-    let kind = command.command_kind().to_string();
+    let cmd_kind = command.command_kind().to_string();
     if let Some(runtime) = &ctx.runtime {
         runtime.send(command).await.map_err(|error| match error {
             meerkat_core::comms::SendError::PeerNotFound(peer_name) => {
@@ -155,7 +287,7 @@ async fn handle_send(ctx: &ToolContext, input: SendInput) -> Result<Value, Strin
             }
             other => other.to_string(),
         })?;
-        return Ok(json!({ "status": "sent", "kind": kind }));
+        return Ok(json!({ "status": "sent", "kind": cmd_kind }));
     }
 
     match command {
@@ -179,7 +311,7 @@ async fn handle_send(ctx: &ToolContext, input: SendInput) -> Result<Value, Strin
                 )
                 .await
                 .map_err(|e| format_router_send_error(to.as_str(), e))?;
-            Ok(json!({ "status": "sent", "kind": kind }))
+            Ok(json!({ "status": "sent", "kind": cmd_kind }))
         }
         meerkat_core::comms::CommsCommand::PeerRequest {
             to,
@@ -199,7 +331,7 @@ async fn handle_send(ctx: &ToolContext, input: SendInput) -> Result<Value, Strin
                 )
                 .await
                 .map_err(|e| format_router_send_error(to.as_str(), e))?;
-            Ok(json!({ "status": "sent", "kind": kind }))
+            Ok(json!({ "status": "sent", "kind": cmd_kind }))
         }
         meerkat_core::comms::CommsCommand::PeerResponse {
             to,
@@ -225,7 +357,7 @@ async fn handle_send(ctx: &ToolContext, input: SendInput) -> Result<Value, Strin
                 )
                 .await
                 .map_err(|e| format_router_send_error(to.as_str(), e))?;
-            Ok(json!({ "status": "sent", "kind": kind }))
+            Ok(json!({ "status": "sent", "kind": cmd_kind }))
         }
     }
 }
@@ -284,14 +416,17 @@ fn format_comms_command_error(
                 || "invalid source".to_string(),
                 |value| format!("invalid source: {value}"),
             ),
-            ("stream", "invalid_value") => got.map_or_else(
-                || "invalid stream".to_string(),
-                |value| format!("invalid stream: {value}"),
+            ("stream", "removed_unsupported_field") => got.map_or_else(
+                || "stream field has been removed".to_string(),
+                |value| format!("stream field has been removed (got: {value})"),
             ),
             ("kind", "unknown_kind") => got.map_or_else(
                 || "unknown kind".to_string(),
                 |value| format!("unknown kind: {value}"),
             ),
+            ("handling_mode", "required_field") => {
+                "handling_mode is required: use \"steer\" for normal collaboration or \"queue\" for next-turn processing".to_string()
+            }
             _ => issue.to_string(),
         }
     } else {
@@ -356,19 +491,54 @@ mod tests {
     use crate::{PubKey, TrustedPeer};
 
     #[test]
-    fn test_tools_list_is_exactly_send_and_peers() {
+    fn test_tools_list_has_four_tools() {
         let tools = tools_list();
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0]["name"], "send");
-        assert_eq!(tools[1]["name"], "peers");
+        assert_eq!(tools.len(), 4);
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"send_message"));
+        assert!(names.contains(&"send_request"));
+        assert!(names.contains(&"send_response"));
+        assert!(names.contains(&"peers"));
     }
 
     #[test]
-    fn test_send_schema_has_kind_field() {
-        let schema = schema_for::<SendInput>();
-        assert_eq!(schema["type"], "object");
-        assert!(schema["properties"]["kind"].is_object());
-        assert!(schema["properties"]["to"].is_object());
+    fn test_send_message_schema_requires_handling_mode() {
+        let schema = schema_for::<SendMessageInput>();
+        let required = schema["required"].as_array().unwrap();
+        let required_names: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(
+            required_names.contains(&"handling_mode"),
+            "send_message must require handling_mode, got required: {required_names:?}"
+        );
+        assert!(required_names.contains(&"to"));
+        assert!(required_names.contains(&"body"));
+    }
+
+    #[test]
+    fn test_send_request_schema_requires_handling_mode() {
+        let schema = schema_for::<SendRequestInput>();
+        let required = schema["required"].as_array().unwrap();
+        let required_names: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(
+            required_names.contains(&"handling_mode"),
+            "send_request must require handling_mode, got required: {required_names:?}"
+        );
+        assert!(required_names.contains(&"to"));
+        assert!(required_names.contains(&"intent"));
+    }
+
+    #[test]
+    fn test_send_response_schema_does_not_require_handling_mode() {
+        let schema = schema_for::<SendResponseInput>();
+        let required = schema["required"].as_array().unwrap();
+        let required_names: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(
+            !required_names.contains(&"handling_mode"),
+            "send_response must not require handling_mode"
+        );
+        assert!(required_names.contains(&"to"));
+        assert!(required_names.contains(&"in_reply_to"));
+        assert!(required_names.contains(&"status"));
     }
 
     #[tokio::test]
@@ -406,7 +576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_fails_when_recipient_is_not_trusted() {
+    async fn test_send_message_fails_when_recipient_is_not_trusted() {
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let receiver_name = format!("receiver-{suffix}");
         let sender_keypair = Keypair::generate();
@@ -429,12 +599,11 @@ mod tests {
 
         let result = handle_tools_call(
             &ctx,
-            "send",
+            "send_message",
             &json!({
-                "kind": "peer_message",
                 "to": receiver_name,
                 "body": "hello",
-                "handling_mode": "queue"
+                "handling_mode": "steer"
             }),
         )
         .await;
@@ -444,10 +613,43 @@ mod tests {
             error.starts_with("peer_not_found_or_not_trusted:"),
             "expected stable sender-facing code, got: {error}"
         );
-        assert!(
-            error.contains("not found or not trusted"),
-            "expected sender-facing reason, got: {error}"
-        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_send_still_works() {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let receiver_name = format!("receiver-{suffix}");
+        let sender_keypair = Keypair::generate();
+        let trusted_peers = Arc::new(RwLock::new(TrustedPeers::new()));
+        let (_, router_inbox_sender) = crate::Inbox::new();
+        let router = Arc::new(Router::with_shared_peers(
+            sender_keypair,
+            trusted_peers.clone(),
+            CommsConfig::default(),
+            router_inbox_sender,
+            true,
+        ));
+        let ctx = ToolContext {
+            router,
+            trusted_peers,
+            runtime: None,
+        };
+
+        // The old "send" tool with kind discriminator still works
+        let result = handle_tools_call(
+            &ctx,
+            "send",
+            &json!({
+                "kind": "peer_message",
+                "to": receiver_name,
+                "body": "hello",
+                "handling_mode": "steer"
+            }),
+        )
+        .await;
+        // Will fail because peer is not trusted, but the parsing should succeed
+        let error = result.expect_err("send should fail for an unreachable peer");
+        assert!(error.contains("not found or not trusted"));
     }
 
     #[tokio::test]
@@ -468,14 +670,8 @@ mod tests {
             runtime: None,
         };
 
-        // Non-canonical tool names should not be recognized.
         assert!(
-            handle_tools_call(&ctx, "send_request", &json!({}))
-                .await
-                .is_err()
-        );
-        assert!(
-            handle_tools_call(&ctx, "peer_list", &json!({}))
+            handle_tools_call(&ctx, "nonexistent", &json!({}))
                 .await
                 .is_err()
         );
