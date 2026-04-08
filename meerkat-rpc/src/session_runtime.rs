@@ -1143,24 +1143,6 @@ impl SessionRuntime {
             }
         };
 
-        let persisted_keep_alive = if pending_session.is_none() {
-            self.load_persisted_session(session_id)
-                .await?
-                .and_then(|session| session.session_metadata().map(|meta| meta.keep_alive))
-        } else {
-            None
-        };
-        let keep_alive = overrides
-            .as_ref()
-            .and_then(|ov| ov.keep_alive)
-            .or_else(|| {
-                pending_session
-                    .as_ref()
-                    .map(|(build_config, _, _, _, _)| build_config.keep_alive)
-            })
-            .or(persisted_keep_alive)
-            .unwrap_or(false);
-
         if pending_session.is_none() && !self.live_session_is_stale(session_id).await? {
             // Hot-swap LLM client if model/provider overrides are present.
             if let Some(ref ov) = overrides
@@ -1489,6 +1471,8 @@ impl SessionRuntime {
                 .as_ref()
                 .and_then(Session::mob_tool_authority_context),
         );
+        #[cfg(feature = "comms")]
+        let keep_alive = build.keep_alive;
         self.service
             .create_session(CreateSessionRequest {
                 model: stored_metadata

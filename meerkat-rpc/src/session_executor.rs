@@ -32,6 +32,7 @@ pub struct SessionRuntimeExecutor {
     notification_sink: NotificationSink,
 }
 
+#[cfg(feature = "mob")]
 /// Implements `CoreExecutor` directly against a mob-capable session service.
 pub struct MobRpcRuntimeExecutor {
     session_service: Arc<dyn MobSessionService>,
