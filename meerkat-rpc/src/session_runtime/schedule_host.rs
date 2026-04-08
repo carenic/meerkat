@@ -607,7 +607,7 @@ impl SessionRuntime {
         self.ensure_runtime_executor(session_id)
             .await
             .map_err(rpc_to_schedule)?;
-        maybe_spawn_comms_drain(self, session_id).await;
+        update_peer_ingress_context(self, session_id).await;
 
         let (outcome, handle) = self
             .runtime_adapter
@@ -639,7 +639,7 @@ impl SessionRuntime {
         self.ensure_runtime_executor(session_id)
             .await
             .map_err(rpc_to_schedule)?;
-        maybe_spawn_comms_drain(self, session_id).await;
+        update_peer_ingress_context(self, session_id).await;
 
         let input = Input::ExternalEvent(meerkat_runtime::ExternalEventInput {
             header: InputHeader {
@@ -681,7 +681,7 @@ impl SessionRuntime {
 }
 
 #[cfg(feature = "comms")]
-async fn maybe_spawn_comms_drain(runtime: &Arc<SessionRuntime>, session_id: &SessionId) {
+async fn update_peer_ingress_context(runtime: &Arc<SessionRuntime>, session_id: &SessionId) {
     let keep_alive = runtime
         .load_persisted_session(session_id)
         .await
@@ -696,12 +696,12 @@ async fn maybe_spawn_comms_drain(runtime: &Arc<SessionRuntime>, session_id: &Ses
     let comms_rt = runtime.service.comms_runtime(session_id).await;
     runtime
         .runtime_adapter
-        .maybe_spawn_comms_drain(session_id, keep_alive, comms_rt)
+        .update_peer_ingress_context(session_id, keep_alive, comms_rt)
         .await;
 }
 
 #[cfg(not(feature = "comms"))]
-async fn maybe_spawn_comms_drain(_runtime: &Arc<SessionRuntime>, _session_id: &SessionId) {}
+async fn update_peer_ingress_context(_runtime: &Arc<SessionRuntime>, _session_id: &SessionId) {}
 
 fn canonical_skill_keys(
     runtime: &SessionRuntime,

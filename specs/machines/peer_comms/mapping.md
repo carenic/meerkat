@@ -67,50 +67,70 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `PeerCommsMachine`
 
 ### Code Anchors
-- `peer_classify`: `meerkat-comms/src/classify.rs` — peer classification precursor
-- `peer_inbox`: `meerkat-comms/src/inbox.rs` — peer inbox and request/reservation registry precursor
-- `peer_runtime`: `meerkat-comms/src/runtime/comms_runtime.rs` — runtime comms owner precursor
+- `peer_classify`: `meerkat-comms/src/classify.rs` — canonical ingress classification adapter over PeerCommsAuthority
+- `peer_inbox`: `meerkat-comms/src/inbox.rs` — classified inbox enqueue/drop/dismiss shell executor
+- `peer_runtime`: `meerkat-comms/src/runtime/comms_runtime.rs` — candidate drain projects stored ingress metadata without reclassification
+- `peer_authority`: `meerkat-comms/src/peer_comms_authority.rs` — canonical peer ingress authority
 
 ### Scenarios
-- `trust-normalize-submit` — trusted peer envelope is normalized and submitted exactly once
+- `trusted-ingress-classification` — trusted peer envelope is classified and normalized at ingress before enqueue
 - `untrusted-drop` — untrusted or invalid peer work is dropped before runtime admission
-- `request-response-correlation` — reservation/request state remains consistent across peer traffic
+- `dismiss-at-ingress` — dismiss messages set the dismiss flag without becoming peer input candidates
 
 ### Transitions
-- `TrustPeer`
-  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`
-  - scenarios: `trust-normalize-submit`, `untrusted-drop`
-- `ReceiveTrustedPeerEnvelope`
-  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`
-  - scenarios: `trust-normalize-submit`, `untrusted-drop`
-- `DropUntrustedPeerEnvelope`
-  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`
-  - scenarios: `trust-normalize-submit`, `untrusted-drop`
-- `SubmitTypedPeerInputDelivered`
-  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`
-  - scenarios: `trust-normalize-submit`
-- `SubmitTypedPeerInputContinue`
-  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`
-  - scenarios: `trust-normalize-submit`
+- `DropUntrustedExternal`
+  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`, `peer_authority`
+  - scenarios: `trusted-ingress-classification`, `untrusted-drop`
+- `DropAckExternal`
+  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`, `peer_authority`
+  - scenarios: `trusted-ingress-classification`, `untrusted-drop`
+- `DismissExternalMessage`
+  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`, `peer_authority`
+  - scenarios: `trusted-ingress-classification`, `untrusted-drop`
+- `EnqueueLifecycleAdded`
+  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`, `peer_authority`
+  - scenarios: `trusted-ingress-classification`, `untrusted-drop`
+- `EnqueueLifecycleRetired`
+  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`, `peer_authority`
+  - scenarios: `trusted-ingress-classification`, `untrusted-drop`
+- `EnqueueLifecycleUnwired`
+  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`, `peer_authority`
+  - scenarios: `trusted-ingress-classification`, `untrusted-drop`
+- `EnqueueLifecycleKickoffFailed`
+  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`, `peer_authority`
+  - scenarios: `trusted-ingress-classification`, `untrusted-drop`
+- `EnqueueLifecycleKickoffCancelled`
+  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`, `peer_authority`
+  - scenarios: `trusted-ingress-classification`, `untrusted-drop`
+- `EnqueueSilentRequest`
+  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`, `peer_authority`
+  - scenarios: `trusted-ingress-classification`, `untrusted-drop`
+- `EnqueueActionableRequest`
+  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`, `peer_authority`
+  - scenarios: `trusted-ingress-classification`, `untrusted-drop`
+- `EnqueueActionableMessage`
+  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`, `peer_authority`
+  - scenarios: `trusted-ingress-classification`, `untrusted-drop`
+- `EnqueueResponse`
+  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`, `peer_authority`
+  - scenarios: `trusted-ingress-classification`, `untrusted-drop`
+- `EnqueuePlainEvent`
+  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`, `peer_authority`
+  - scenarios: `trusted-ingress-classification`, `untrusted-drop`
 
 ### Effects
-- `SubmitPeerInputCandidate`
-  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`
-  - scenarios: `trust-normalize-submit`
+- `DropIngress`
+  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`, `peer_authority`
+  - scenarios: `trusted-ingress-classification`, `untrusted-drop`
+- `SetDismissFlag`
+  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`, `peer_authority`
+  - scenarios: `trusted-ingress-classification`, `untrusted-drop`
+- `EnqueueClassifiedEntry`
+  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`, `peer_authority`
+  - scenarios: `trusted-ingress-classification`, `untrusted-drop`
 
 ### Invariants
-- `queued_items_are_classified`
-  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`
-  - scenarios: `trust-normalize-submit`, `untrusted-drop`
-- `queued_items_preserve_content_shape`
-  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`
-  - scenarios: `trust-normalize-submit`, `untrusted-drop`
-- `queued_items_preserve_text_projection`
-  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`
-  - scenarios: `trust-normalize-submit`, `untrusted-drop`
-- `queued_items_preserve_correlation_slots`
-  - anchors: `peer_classify`, `peer_inbox`, `peer_runtime`
-  - scenarios: `trust-normalize-submit`, `untrusted-drop`
+- `(none)`
 
 
 <!-- GENERATED_COVERAGE_END -->

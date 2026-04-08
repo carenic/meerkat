@@ -259,10 +259,6 @@ impl SessionAgent for FactoryAgent {
     fn comms_runtime(&self) -> Option<Arc<dyn meerkat_core::agent::CommsRuntime>> {
         self.agent.comms_arc()
     }
-
-    fn wait_interrupt_sender(&self) -> Option<meerkat_core::WaitInterruptSender> {
-        self.agent.wait_interrupt_sender()
-    }
 }
 
 /// Implements [`SessionAgentBuilder`] by delegating to [`AgentFactory::build_agent()`].
@@ -462,7 +458,7 @@ mod tests {
     use futures::stream;
     use meerkat_client::{LlmClient, LlmDoneOutcome, LlmEvent, LlmRequest};
     use meerkat_core::Config;
-    use meerkat_core::comms::{InputSource, InputStreamMode};
+    use meerkat_core::comms::InputSource;
     use meerkat_core::ops_lifecycle::OpsLifecycleRegistry;
     use meerkat_core::service::SessionBuildOptions;
     use meerkat_core::{
@@ -537,7 +533,6 @@ mod tests {
         fn capabilities(&self) -> meerkat_core::agent::DispatcherCapabilities {
             meerkat_core::agent::DispatcherCapabilities {
                 ops_lifecycle: true,
-                ..meerkat_core::agent::DispatcherCapabilities::default()
             }
         }
 
@@ -647,14 +642,13 @@ mod tests {
         Ok(())
     }
 
-    fn mock_input_cmd(session_id: &SessionId, stream: InputStreamMode) -> CommsCommand {
+    fn mock_input_cmd(session_id: &SessionId) -> CommsCommand {
         CommsCommand::Input {
             session_id: session_id.clone(),
             body: "hello".to_string(),
             blocks: None,
             source: InputSource::Rpc,
             handling_mode: meerkat_core::types::HandlingMode::Queue,
-            stream,
             allow_self_session: true,
         }
     }
@@ -670,9 +664,7 @@ mod tests {
         )
         .await?;
         let session_id = agent.session().id().clone();
-        let result = agent
-            .send(mock_input_cmd(&session_id, InputStreamMode::None))
-            .await;
+        let result = agent.send(mock_input_cmd(&session_id)).await;
         assert!(matches!(result, Err(SendError::Unsupported(_))));
 
         Ok(())

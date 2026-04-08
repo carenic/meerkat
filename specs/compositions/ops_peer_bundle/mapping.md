@@ -15,17 +15,13 @@ This section is generated from the Rust composition catalog. Do not edit it by h
 - `peer-ready-handoff` — ops-lifecycle PeerReady triggers peer-comms trust establishment
 
 ### Routes
-- `ops_peer_ready_trusts_peer_comms`
-  - anchors: `ops_lifecycle_shell`, `comms_runtime`
-  - scenarios: `peer-ready-handoff`
+- `(none)`
 
 ### Scheduler Rules
 - `(none)`
 
 ### Invariants
-- `ops_peer_ready_trusts_peer_comms`
-  - anchors: `ops_lifecycle_shell`, `comms_runtime`
-  - scenarios: `peer-ready-handoff`
+- `(none)`
 
 
 <!-- GENERATED_COVERAGE_END -->

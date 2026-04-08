@@ -644,7 +644,7 @@ async fn accept_scheduled_prompt_with_completion(
     context
         .ensure_runtime_session_registered(session_id)
         .await?;
-    maybe_spawn_comms_drain(context, session_id).await;
+    update_peer_ingress_context(context, session_id).await;
     let skill_keys = canonical_skill_keys(context, skill_references).await?;
 
     let turn_metadata = Some(
@@ -691,7 +691,7 @@ async fn accept_scheduled_event_with_completion(
     context
         .ensure_runtime_session_registered(session_id)
         .await?;
-    maybe_spawn_comms_drain(context, session_id).await;
+    update_peer_ingress_context(context, session_id).await;
 
     let input = Input::ExternalEvent(meerkat_runtime::ExternalEventInput {
         header: InputHeader {
@@ -727,7 +727,7 @@ async fn accept_scheduled_event_with_completion(
 }
 
 #[cfg(feature = "comms")]
-async fn maybe_spawn_comms_drain(context: &RestScheduleContext, session_id: &SessionId) {
+async fn update_peer_ingress_context(context: &RestScheduleContext, session_id: &SessionId) {
     let keep_alive = context
         .runtime
         .session_service
@@ -749,12 +749,12 @@ async fn maybe_spawn_comms_drain(context: &RestScheduleContext, session_id: &Ses
     context
         .runtime
         .runtime_adapter
-        .maybe_spawn_comms_drain(session_id, keep_alive, comms_rt)
+        .update_peer_ingress_context(session_id, keep_alive, comms_rt)
         .await;
 }
 
 #[cfg(not(feature = "comms"))]
-async fn maybe_spawn_comms_drain(_context: &RestScheduleContext, _session_id: &SessionId) {}
+async fn update_peer_ingress_context(_context: &RestScheduleContext, _session_id: &SessionId) {}
 
 async fn canonical_skill_keys(
     context: &RestScheduleContext,

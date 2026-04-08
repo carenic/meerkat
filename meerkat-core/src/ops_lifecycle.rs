@@ -294,7 +294,7 @@ pub trait OpsLifecycleRegistry: Send + Sync {
     /// Return the canonical completion feed, if this registry supports it.
     ///
     /// Runtime-backed registries return a feed handle that consumers (agent
-    /// boundary, idle wake, wait tool) use for cursor-based completion delivery.
+    /// boundary, idle wake) use for cursor-based completion delivery.
     /// Returns `None` for registries that don't support the feed protocol.
     fn completion_feed(
         &self,

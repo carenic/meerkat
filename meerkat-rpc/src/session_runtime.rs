@@ -1016,7 +1016,7 @@ impl SessionRuntime {
                     .map_err(session_error_to_rpc)?;
             }
             self.runtime_adapter
-                .maybe_spawn_comms_drain(session_id, keep_alive, comms_rt)
+                .update_peer_ingress_context(session_id, keep_alive, comms_rt)
                 .await;
         }
 
@@ -1357,7 +1357,11 @@ impl SessionRuntime {
                     {
                         let comms_rt = self.service.comms_runtime(session_id).await;
                         self.runtime_adapter
-                            .maybe_spawn_comms_drain(session_id, build_config.keep_alive, comms_rt)
+                            .update_peer_ingress_context(
+                                session_id,
+                                build_config.keep_alive,
+                                comms_rt,
+                            )
                             .await;
                     }
                 }
@@ -1547,7 +1551,7 @@ impl SessionRuntime {
         {
             let comms_rt = self.service.comms_runtime(session_id).await;
             self.runtime_adapter
-                .maybe_spawn_comms_drain(session_id, keep_alive, comms_rt)
+                .update_peer_ingress_context(session_id, keep_alive, comms_rt)
                 .await;
         }
         let (_, output) = self
@@ -1997,7 +2001,7 @@ impl SessionRuntime {
                 .map_err(session_error_to_rpc)?;
             #[cfg(feature = "comms")]
             self.runtime_adapter
-                .maybe_spawn_comms_drain(session_id, keep_alive, comms_rt)
+                .update_peer_ingress_context(session_id, keep_alive, comms_rt)
                 .await;
         }
 
@@ -2259,24 +2263,6 @@ impl SessionRuntime {
         match self.service.interrupt(session_id).await {
             Ok(()) => Ok(()),
             // The service returns NotRunning when no turn is active — map to no-op.
-            Err(SessionError::NotRunning { .. }) => Ok(()),
-            Err(e) => Err(session_error_to_rpc(e)),
-        }
-    }
-
-    /// Cooperatively interrupt wait/yield points within a running turn.
-    ///
-    /// If the session is idle, this is a no-op.
-    pub async fn interrupt_yielding(&self, session_id: &SessionId) -> Result<(), RpcError> {
-        {
-            let pending = self.pending.read().await;
-            if pending.contains_key(session_id) {
-                return Ok(());
-            }
-        }
-
-        match self.service.interrupt_yielding(session_id).await {
-            Ok(()) => Ok(()),
             Err(SessionError::NotRunning { .. }) => Ok(()),
             Err(e) => Err(session_error_to_rpc(e)),
         }

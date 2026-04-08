@@ -2618,19 +2618,14 @@ pub fn peer_runtime_bundle_composition() -> CompositionSchema {
                 input_variant: "Initialize".into(),
             },
             EntryInput {
-                name: "trust_peer".into(),
+                name: "classify_peer_envelope".into(),
                 machine: "peer_comms".into(),
-                input_variant: "TrustPeer".into(),
+                input_variant: "ClassifyExternalEnvelope".into(),
             },
             EntryInput {
-                name: "receive_peer_envelope".into(),
+                name: "classify_plain_event".into(),
                 machine: "peer_comms".into(),
-                input_variant: "ReceivePeerEnvelope".into(),
-            },
-            EntryInput {
-                name: "submit_typed_peer_input".into(),
-                machine: "peer_comms".into(),
-                input_variant: "SubmitTypedPeerInput".into(),
+                input_variant: "ClassifyPlainEvent".into(),
             },
             EntryInput {
                 name: "runtime_admission_accepted".into(),
@@ -2647,7 +2642,7 @@ pub fn peer_runtime_bundle_composition() -> CompositionSchema {
             Route {
                 name: "peer_candidate_enters_runtime_admission".into(),
                 from_machine: "peer_comms".into(),
-                effect_variant: "SubmitPeerInputCandidate".into(),
+                effect_variant: "EnqueueClassifiedEntry".into(),
                 to: RouteTarget {
                     machine: "runtime_control".into(),
                     input_variant: "SubmitWork".into(),
@@ -2662,28 +2657,22 @@ pub fn peer_runtime_bundle_composition() -> CompositionSchema {
                     },
                     RouteFieldBinding {
                         to_field: "content_shape".into(),
-                        source: RouteBindingSource::Field {
-                            from_field: "content_shape".into(),
-                            allow_named_alias: false,
-                        },
+                        source: RouteBindingSource::Literal(Expr::String("text".into())),
                     },
                     RouteFieldBinding {
                         to_field: "request_id".into(),
-                        source: RouteBindingSource::Field {
-                            from_field: "request_id".into(),
-                            allow_named_alias: false,
-                        },
+                        source: RouteBindingSource::Literal(Expr::None),
                     },
                     RouteFieldBinding {
                         to_field: "reservation_key".into(),
-                        source: RouteBindingSource::Field {
-                            from_field: "reservation_key".into(),
-                            allow_named_alias: false,
-                        },
+                        source: RouteBindingSource::Literal(Expr::None),
                     },
                     RouteFieldBinding {
                         to_field: "handling_mode".into(),
-                        source: RouteBindingSource::Literal(Expr::String("Steer".into())),
+                        source: RouteBindingSource::Field {
+                            from_field: "normalized_handling_mode".into(),
+                            allow_named_alias: false,
+                        },
                     },
                 ],
                 delivery: RouteDelivery::Immediate,
@@ -2776,10 +2765,10 @@ pub fn peer_runtime_bundle_composition() -> CompositionSchema {
                     to_machine: "runtime_control".into(),
                     input_variant: "SubmitWork".into(),
                     from_machine: "peer_comms".into(),
-                    effect_variant: "SubmitPeerInputCandidate".into(),
+                    effect_variant: "EnqueueClassifiedEntry".into(),
                 },
                 statement:
-                    "peer-classified work enters the runtime through the runtime-control admission surface"
+                        "peer-classified work enters the runtime through the runtime-control admission surface"
                         .into(),
                 references_machines: vec!["peer_comms".into(), "runtime_control".into()],
                 references_actors: vec!["peer_plane".into(), "control_plane".into()],
@@ -2830,15 +2819,7 @@ pub fn peer_runtime_bundle_composition() -> CompositionSchema {
                     },
                     CompositionWitnessInput {
                         machine: "peer_comms".into(),
-                        input_variant: "TrustPeer".into(),
-                        fields: vec![CompositionWitnessField {
-                            field: "peer_id".into(),
-                            expr: Expr::String("peer_1".into()),
-                        }],
-                    },
-                    CompositionWitnessInput {
-                        machine: "peer_comms".into(),
-                        input_variant: "ReceivePeerEnvelope".into(),
+                        input_variant: "ClassifyExternalEnvelope".into(),
                         fields: peer_envelope_fields(
                             "raw_1",
                             "peer_1",
@@ -2849,32 +2830,22 @@ pub fn peer_runtime_bundle_composition() -> CompositionSchema {
                             None,
                         ),
                     },
-                    CompositionWitnessInput {
-                        machine: "peer_comms".into(),
-                        input_variant: "SubmitTypedPeerInput".into(),
-                        fields: vec![CompositionWitnessField {
-                            field: "raw_item_id".into(),
-                            expr: Expr::String("raw_1".into()),
-                        }],
-                    },
                 ],
                 expected_routes: vec!["peer_candidate_enters_runtime_admission".into()],
                 expected_scheduler_rules: vec![],
                 expected_states: vec![
-                    witness_state("peer_comms", Some("Delivered"), vec![]),
+                    witness_state("peer_comms", Some("Ready"), vec![]),
                     witness_state("runtime_control", Some("Idle"), vec![]),
                 ],
                 expected_transitions: vec![
                     witness_transition("runtime_control", "Initialize"),
-                    witness_transition("peer_comms", "TrustPeer"),
-                    witness_transition("peer_comms", "ReceiveTrustedPeerEnvelope"),
-                    witness_transition("peer_comms", "SubmitTypedPeerInputDelivered"),
+                    witness_transition("peer_comms", "EnqueueActionableMessage"),
                 ],
                 expected_transition_order: vec![witness_transition_order(
+                    "runtime_control",
+                    "Initialize",
                     "peer_comms",
-                    "ReceiveTrustedPeerEnvelope",
-                    "peer_comms",
-                    "SubmitTypedPeerInputDelivered",
+                    "EnqueueActionableMessage",
                 )],
                 state_limits: CompositionStateLimits {
                     step_limit: 5,
@@ -2897,15 +2868,7 @@ pub fn peer_runtime_bundle_composition() -> CompositionSchema {
                     },
                     CompositionWitnessInput {
                         machine: "peer_comms".into(),
-                        input_variant: "TrustPeer".into(),
-                        fields: vec![CompositionWitnessField {
-                            field: "peer_id".into(),
-                            expr: Expr::String("peer_1".into()),
-                        }],
-                    },
-                    CompositionWitnessInput {
-                        machine: "peer_comms".into(),
-                        input_variant: "ReceivePeerEnvelope".into(),
+                        input_variant: "ClassifyExternalEnvelope".into(),
                         fields: peer_envelope_fields(
                             "raw_1",
                             "peer_1",
@@ -2915,14 +2878,6 @@ pub fn peer_runtime_bundle_composition() -> CompositionSchema {
                             Some("req_1"),
                             Some("resv_1"),
                         ),
-                    },
-                    CompositionWitnessInput {
-                        machine: "peer_comms".into(),
-                        input_variant: "SubmitTypedPeerInput".into(),
-                        fields: vec![CompositionWitnessField {
-                            field: "raw_item_id".into(),
-                            expr: Expr::String("raw_1".into()),
-                        }],
                     },
                     CompositionWitnessInput {
                         machine: "runtime_control".into(),
@@ -2946,14 +2901,14 @@ pub fn peer_runtime_bundle_composition() -> CompositionSchema {
                     witness_state("runtime_ingress", Some("Active"), vec![]),
                 ],
                 expected_transitions: vec![
-                    witness_transition("peer_comms", "SubmitTypedPeerInputDelivered"),
+                    witness_transition("peer_comms", "EnqueueActionableRequest"),
                     witness_transition("runtime_control", "AdmissionAcceptedIdleSteer"),
                     witness_transition("runtime_ingress", "AdmitQueuedSteer"),
                 ],
                 expected_transition_order: vec![
                     witness_transition_order(
                         "peer_comms",
-                        "SubmitTypedPeerInputDelivered",
+                        "EnqueueActionableRequest",
                         "runtime_control",
                         "AdmissionAcceptedIdleSteer",
                     ),
@@ -2985,15 +2940,7 @@ pub fn peer_runtime_bundle_composition() -> CompositionSchema {
                     },
                     CompositionWitnessInput {
                         machine: "peer_comms".into(),
-                        input_variant: "TrustPeer".into(),
-                        fields: vec![CompositionWitnessField {
-                            field: "peer_id".into(),
-                            expr: Expr::String("peer_1".into()),
-                        }],
-                    },
-                    CompositionWitnessInput {
-                        machine: "peer_comms".into(),
-                        input_variant: "ReceivePeerEnvelope".into(),
+                        input_variant: "ClassifyExternalEnvelope".into(),
                         fields: peer_envelope_fields(
                             "raw_1",
                             "peer_1",
@@ -3003,14 +2950,6 @@ pub fn peer_runtime_bundle_composition() -> CompositionSchema {
                             Some("req_1"),
                             Some("resv_1"),
                         ),
-                    },
-                    CompositionWitnessInput {
-                        machine: "peer_comms".into(),
-                        input_variant: "SubmitTypedPeerInput".into(),
-                        fields: vec![CompositionWitnessField {
-                            field: "raw_item_id".into(),
-                            expr: Expr::String("raw_1".into()),
-                        }],
                     },
                     CompositionWitnessInput {
                         machine: "runtime_control".into(),
@@ -3049,7 +2988,7 @@ pub fn peer_runtime_bundle_composition() -> CompositionSchema {
                     witness_state("runtime_ingress", Some("Active"), vec![]),
                 ],
                 expected_transitions: vec![
-                    witness_transition("peer_comms", "SubmitTypedPeerInputDelivered"),
+                    witness_transition("peer_comms", "EnqueueActionableRequest"),
                     witness_transition("runtime_control", "AdmissionAcceptedIdleSteer"),
                     witness_transition("runtime_ingress", "AdmitQueuedSteer"),
                     witness_transition("runtime_ingress", "StageDrainSnapshotFromActive"),
@@ -3090,15 +3029,7 @@ pub fn peer_runtime_bundle_composition() -> CompositionSchema {
                     },
                     CompositionWitnessInput {
                         machine: "peer_comms".into(),
-                        input_variant: "TrustPeer".into(),
-                        fields: vec![CompositionWitnessField {
-                            field: "peer_id".into(),
-                            expr: Expr::String("peer_1".into()),
-                        }],
-                    },
-                    CompositionWitnessInput {
-                        machine: "peer_comms".into(),
-                        input_variant: "ReceivePeerEnvelope".into(),
+                        input_variant: "ClassifyExternalEnvelope".into(),
                         fields: peer_envelope_fields(
                             "raw_1",
                             "peer_1",
@@ -3118,13 +3049,13 @@ pub fn peer_runtime_bundle_composition() -> CompositionSchema {
                 expected_states: vec![witness_state("runtime_control", Some("Idle"), vec![])],
                 expected_transitions: vec![
                     witness_transition("runtime_control", "Initialize"),
-                    witness_transition("peer_comms", "TrustPeer"),
+                    witness_transition("peer_comms", "EnqueueActionableMessage"),
                 ],
                 expected_transition_order: vec![witness_transition_order(
                     "runtime_control",
                     "Initialize",
                     "peer_comms",
-                    "TrustPeer",
+                    "EnqueueActionableMessage",
                 )],
                 state_limits: CompositionStateLimits {
                     step_limit: 3,
@@ -6500,24 +6431,24 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 actor: "mob_orchestrator_actor".into(),
             },
             MachineInstance {
-                instance_id: "mob_member_lifecycle_anchor".into(),
-                machine_name: "MobMemberLifecycleAnchorMachine".into(),
-                actor: "mob_member_lifecycle_anchor_actor".into(),
+                instance_id: "mob_member_lifecycle".into(),
+                machine_name: "MobMemberLifecycleMachine".into(),
+                actor: "mob_member_lifecycle_actor".into(),
             },
             MachineInstance {
-                instance_id: "mob_runtime_bridge_anchor".into(),
-                machine_name: "MobRuntimeBridgeAnchorMachine".into(),
-                actor: "mob_runtime_bridge_anchor_actor".into(),
+                instance_id: "mob_runtime_bridge".into(),
+                machine_name: "MobRuntimeBridgeMachine".into(),
+                actor: "mob_runtime_bridge_actor".into(),
             },
             MachineInstance {
-                instance_id: "mob_wiring_anchor".into(),
-                machine_name: "MobWiringAnchorMachine".into(),
-                actor: "mob_wiring_anchor_actor".into(),
+                instance_id: "mob_wiring".into(),
+                machine_name: "MobWiringMachine".into(),
+                actor: "mob_wiring_actor".into(),
             },
             MachineInstance {
-                instance_id: "mob_helper_result_anchor".into(),
-                machine_name: "MobHelperResultAnchorMachine".into(),
-                actor: "mob_helper_result_anchor_actor".into(),
+                instance_id: "mob_member_bootstrap".into(),
+                machine_name: "MobMemberBootstrapMachine".into(),
+                actor: "mob_member_bootstrap_actor".into(),
             },
             MachineInstance {
                 instance_id: "flow_run".into(),
@@ -6553,10 +6484,10 @@ pub fn mob_bundle_composition() -> CompositionSchema {
         actors: vec![
             machine_actor("mob_lifecycle_actor"),
             machine_actor("mob_orchestrator_actor"),
-            machine_actor("mob_member_lifecycle_anchor_actor"),
-            machine_actor("mob_runtime_bridge_anchor_actor"),
-            machine_actor("mob_wiring_anchor_actor"),
-            machine_actor("mob_helper_result_anchor_actor"),
+            machine_actor("mob_member_lifecycle_actor"),
+            machine_actor("mob_runtime_bridge_actor"),
+            machine_actor("mob_wiring_actor"),
+            machine_actor("mob_member_bootstrap_actor"),
             machine_actor("flow_engine"),
             machine_actor("ops_plane"),
             machine_actor("peer_plane"),
@@ -6628,9 +6559,8 @@ pub fn mob_bundle_composition() -> CompositionSchema {
             EntryInput { name: "ops_complete_operation".into(), machine: "ops_lifecycle".into(), input_variant: "CompleteOperation".into() },
             EntryInput { name: "ops_fail_operation".into(), machine: "ops_lifecycle".into(), input_variant: "FailOperation".into() },
             EntryInput { name: "ops_cancel_operation".into(), machine: "ops_lifecycle".into(), input_variant: "CancelOperation".into() },
-            EntryInput { name: "peer_trust".into(), machine: "peer_comms".into(), input_variant: "TrustPeer".into() },
-            EntryInput { name: "peer_receive".into(), machine: "peer_comms".into(), input_variant: "ReceivePeerEnvelope".into() },
-            EntryInput { name: "peer_submit".into(), machine: "peer_comms".into(), input_variant: "SubmitTypedPeerInput".into() },
+            EntryInput { name: "peer_classify_envelope".into(), machine: "peer_comms".into(), input_variant: "ClassifyExternalEnvelope".into() },
+            EntryInput { name: "peer_classify_plain_event".into(), machine: "peer_comms".into(), input_variant: "ClassifyPlainEvent".into() },
             EntryInput { name: "runtime_admission_accepted".into(), machine: "runtime_control".into(), input_variant: "AdmissionAccepted".into() },
             EntryInput { name: "ingress_stage_drain_snapshot".into(), machine: "runtime_ingress".into(), input_variant: "StageDrainSnapshot".into() },
             EntryInput { name: "runtime_begin_run".into(), machine: "runtime_control".into(), input_variant: "BeginRun".into() },
@@ -6702,20 +6632,23 @@ pub fn mob_bundle_composition() -> CompositionSchema {
             Route {
                 name: "mob_peer_candidate_enters_runtime_admission".into(),
                 from_machine: "peer_comms".into(),
-                effect_variant: "SubmitPeerInputCandidate".into(),
+                effect_variant: "EnqueueClassifiedEntry".into(),
                 to: RouteTarget { machine: "runtime_control".into(), input_variant: "SubmitWork".into() },
                 bindings: vec![
                     RouteFieldBinding { to_field: "work_id".into(), source: RouteBindingSource::Field { from_field: "raw_item_id".into(), allow_named_alias: true } },
-                    RouteFieldBinding { to_field: "handling_mode".into(), source: RouteBindingSource::Literal(Expr::String("Steer".into())) },
+                    RouteFieldBinding { to_field: "content_shape".into(), source: RouteBindingSource::Literal(Expr::String("text".into())) },
+                    RouteFieldBinding { to_field: "request_id".into(), source: RouteBindingSource::Literal(Expr::None) },
+                    RouteFieldBinding { to_field: "reservation_key".into(), source: RouteBindingSource::Literal(Expr::None) },
+                    RouteFieldBinding { to_field: "handling_mode".into(), source: RouteBindingSource::Field { from_field: "normalized_handling_mode".into(), allow_named_alias: false } },
                 ],
                 delivery: RouteDelivery::Immediate,
             },
             Route {
                 name: "mob_peer_candidate_tracks_wiring".into(),
                 from_machine: "peer_comms".into(),
-                effect_variant: "SubmitPeerInputCandidate".into(),
+                effect_variant: "EnqueueClassifiedEntry".into(),
                 to: RouteTarget {
-                    machine: "mob_wiring_anchor".into(),
+                    machine: "mob_wiring".into(),
                     input_variant: "PeerInputAdmitted".into(),
                 },
                 bindings: vec![
@@ -6729,7 +6662,7 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                     RouteFieldBinding {
                         to_field: "peer_input_class".into(),
                         source: RouteBindingSource::Field {
-                            from_field: "peer_input_class".into(),
+                            from_field: "class".into(),
                             allow_named_alias: false,
                         },
                     },
@@ -6753,7 +6686,7 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 from_machine: "runtime_control".into(),
                 effect_variant: "SubmitAdmittedIngressEffect".into(),
                 to: RouteTarget {
-                    machine: "mob_wiring_anchor".into(),
+                    machine: "mob_wiring".into(),
                     input_variant: "RuntimeWorkAdmitted".into(),
                 },
                 bindings: vec![
@@ -6795,7 +6728,7 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 from_machine: "runtime_control".into(),
                 effect_variant: "SubmitRunPrimitive".into(),
                 to: RouteTarget {
-                    machine: "mob_runtime_bridge_anchor".into(),
+                    machine: "mob_runtime_bridge".into(),
                     input_variant: "RuntimeRunSubmitted".into(),
                 },
                 bindings: vec![RouteFieldBinding {
@@ -6861,7 +6794,7 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 from_machine: "turn_execution".into(),
                 effect_variant: "RunCompleted".into(),
                 to: RouteTarget {
-                    machine: "mob_runtime_bridge_anchor".into(),
+                    machine: "mob_runtime_bridge".into(),
                     input_variant: "RuntimeRunCompleted".into(),
                 },
                 bindings: vec![RouteFieldBinding {
@@ -6874,12 +6807,12 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 delivery: RouteDelivery::Immediate,
             },
             Route {
-                name: "mob_execution_completion_anchors_helper_result".into(),
+                name: "mob_execution_completion_updates_bootstrap".into(),
                 from_machine: "turn_execution".into(),
                 effect_variant: "RunCompleted".into(),
                 to: RouteTarget {
-                    machine: "mob_helper_result_anchor".into(),
-                    input_variant: "AnchorCompleted".into(),
+                    machine: "mob_member_bootstrap".into(),
+                    input_variant: "KickoffStarted".into(),
                 },
                 bindings: vec![RouteFieldBinding {
                     to_field: "run_id".into(),
@@ -6911,7 +6844,7 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 from_machine: "turn_execution".into(),
                 effect_variant: "RunFailed".into(),
                 to: RouteTarget {
-                    machine: "mob_runtime_bridge_anchor".into(),
+                    machine: "mob_runtime_bridge".into(),
                     input_variant: "RuntimeRunFailed".into(),
                 },
                 bindings: vec![RouteFieldBinding {
@@ -6924,12 +6857,12 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 delivery: RouteDelivery::Immediate,
             },
             Route {
-                name: "mob_execution_failure_anchors_helper_result".into(),
+                name: "mob_execution_failure_updates_bootstrap".into(),
                 from_machine: "turn_execution".into(),
                 effect_variant: "RunFailed".into(),
                 to: RouteTarget {
-                    machine: "mob_helper_result_anchor".into(),
-                    input_variant: "AnchorFailed".into(),
+                    machine: "mob_member_bootstrap".into(),
+                    input_variant: "KickoffFailed".into(),
                 },
                 bindings: vec![RouteFieldBinding {
                     to_field: "run_id".into(),
@@ -6961,7 +6894,7 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 from_machine: "turn_execution".into(),
                 effect_variant: "RunCancelled".into(),
                 to: RouteTarget {
-                    machine: "mob_runtime_bridge_anchor".into(),
+                    machine: "mob_runtime_bridge".into(),
                     input_variant: "RuntimeRunCancelled".into(),
                 },
                 bindings: vec![RouteFieldBinding {
@@ -6974,12 +6907,12 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 delivery: RouteDelivery::Immediate,
             },
             Route {
-                name: "mob_execution_cancel_anchors_helper_result".into(),
+                name: "mob_execution_cancel_updates_bootstrap".into(),
                 from_machine: "turn_execution".into(),
                 effect_variant: "RunCancelled".into(),
                 to: RouteTarget {
-                    machine: "mob_helper_result_anchor".into(),
-                    input_variant: "AnchorCancelled".into(),
+                    machine: "mob_member_bootstrap".into(),
+                    input_variant: "KickoffCancelled".into(),
                 },
                 bindings: vec![RouteFieldBinding {
                     to_field: "run_id".into(),
@@ -7011,19 +6944,19 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 from_machine: "mob_orchestrator".into(),
                 effect_variant: "MemberForceCancelled".into(),
                 to: RouteTarget {
-                    machine: "mob_runtime_bridge_anchor".into(),
+                    machine: "mob_runtime_bridge".into(),
                     input_variant: "RuntimeStopRequested".into(),
                 },
                 bindings: vec![],
                 delivery: RouteDelivery::Immediate,
             },
             Route {
-                name: "mob_member_force_cancel_anchors_helper_result".into(),
+                name: "mob_member_force_cancel_updates_bootstrap".into(),
                 from_machine: "mob_orchestrator".into(),
                 effect_variant: "MemberForceCancelled".into(),
                 to: RouteTarget {
-                    machine: "mob_helper_result_anchor".into(),
-                    input_variant: "AnchorForceCancelled".into(),
+                    machine: "mob_member_bootstrap".into(),
+                    input_variant: "KickoffForceCancelled".into(),
                 },
                 bindings: vec![],
                 delivery: RouteDelivery::Immediate,
@@ -7045,28 +6978,11 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 delivery: RouteDelivery::Immediate,
             },
             Route {
-                name: "mob_ops_peer_ready_trusts_peer_comms".into(),
-                from_machine: "ops_lifecycle".into(),
-                effect_variant: "ExposeOperationPeer".into(),
-                to: RouteTarget {
-                    machine: "peer_comms".into(),
-                    input_variant: "TrustPeer".into(),
-                },
-                bindings: vec![RouteFieldBinding {
-                    to_field: "peer_id".into(),
-                    source: RouteBindingSource::Field {
-                        from_field: "operation_id".into(),
-                        allow_named_alias: true,
-                    },
-                }],
-                delivery: RouteDelivery::Immediate,
-            },
-            Route {
                 name: "mob_ops_peer_ready_tracks_member_lifecycle".into(),
                 from_machine: "ops_lifecycle".into(),
                 effect_variant: "ExposeOperationPeer".into(),
                 to: RouteTarget {
-                    machine: "mob_member_lifecycle_anchor".into(),
+                    machine: "mob_member_lifecycle".into(),
                     input_variant: "MemberPeerExposed".into(),
                 },
                 bindings: vec![RouteFieldBinding {
@@ -7083,7 +6999,7 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 from_machine: "ops_lifecycle".into(),
                 effect_variant: "ExposeOperationPeer".into(),
                 to: RouteTarget {
-                    machine: "mob_wiring_anchor".into(),
+                    machine: "mob_wiring".into(),
                     input_variant: "OperationPeerTrusted".into(),
                 },
                 bindings: vec![RouteFieldBinding {
@@ -7100,7 +7016,7 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 from_machine: "ops_lifecycle".into(),
                 effect_variant: "NotifyOpWatcher".into(),
                 to: RouteTarget {
-                    machine: "mob_member_lifecycle_anchor".into(),
+                    machine: "mob_member_lifecycle".into(),
                     input_variant: "MemberTerminalized".into(),
                 },
                 bindings: vec![
@@ -7212,7 +7128,7 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                     to_machine: "runtime_control".into(),
                     input_variant: "SubmitWork".into(),
                     from_machine: "peer_comms".into(),
-                    effect_variant: "SubmitPeerInputCandidate".into(),
+                    effect_variant: "EnqueueClassifiedEntry".into(),
                 },
                 statement:
                     "member peer communication enters runtime only through canonical admission".into(),
@@ -7246,39 +7162,39 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 ],
             },
             CompositionInvariant {
-                name: "mob_runtime_admission_is_observed_by_wiring_anchor".into(),
+                name: "mob_runtime_admission_updates_wiring".into(),
                 kind: CompositionInvariantKind::ObservedRouteInputOriginatesFromEffect {
                     route_name: "mob_runtime_admission_tracks_wiring".into(),
-                    to_machine: "mob_wiring_anchor".into(),
+                    to_machine: "mob_wiring".into(),
                     input_variant: "RuntimeWorkAdmitted".into(),
                     from_machine: "runtime_control".into(),
                     effect_variant: "SubmitAdmittedIngressEffect".into(),
                 },
                 statement:
-                    "mob runtime admission effects are mirrored into the wiring observation anchor".into(),
-                references_machines: vec!["runtime_control".into(), "mob_wiring_anchor".into()],
-                references_actors: vec!["control_plane".into(), "mob_wiring_anchor_actor".into()],
+                    "mob runtime admission effects are recorded in the wiring owner".into(),
+                references_machines: vec!["runtime_control".into(), "mob_wiring".into()],
+                references_actors: vec!["control_plane".into(), "mob_wiring_actor".into()],
             },
             CompositionInvariant {
-                name: "mob_runtime_start_is_observed_by_bridge_anchor".into(),
+                name: "mob_runtime_start_updates_bridge".into(),
                 kind: CompositionInvariantKind::ObservedRouteInputOriginatesFromEffect {
                     route_name: "mob_runtime_start_tracks_bridge".into(),
-                    to_machine: "mob_runtime_bridge_anchor".into(),
+                    to_machine: "mob_runtime_bridge".into(),
                     input_variant: "RuntimeRunSubmitted".into(),
                     from_machine: "runtime_control".into(),
                     effect_variant: "SubmitRunPrimitive".into(),
                 },
                 statement:
-                    "mob run handoff into turn execution is mirrored into the runtime-bridge observation anchor".into(),
+                    "mob run handoff into turn execution is recorded in the runtime bridge owner".into(),
                 references_machines: vec![
                     "runtime_control".into(),
                     "turn_execution".into(),
-                    "mob_runtime_bridge_anchor".into(),
+                    "mob_runtime_bridge".into(),
                 ],
                 references_actors: vec![
                     "control_plane".into(),
                     "turn_executor".into(),
-                    "mob_runtime_bridge_anchor_actor".into(),
+                    "mob_runtime_bridge_actor".into(),
                 ],
             },
             CompositionInvariant {
@@ -7317,25 +7233,25 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                     required_targets: vec![
                         RouteTarget { machine: "runtime_ingress".into(), input_variant: "RunFailed".into() },
                         RouteTarget { machine: "runtime_control".into(), input_variant: "RunFailed".into() },
-                        RouteTarget { machine: "mob_runtime_bridge_anchor".into(), input_variant: "RuntimeRunFailed".into() },
-                        RouteTarget { machine: "mob_helper_result_anchor".into(), input_variant: "AnchorFailed".into() },
+                        RouteTarget { machine: "mob_runtime_bridge".into(), input_variant: "RuntimeRunFailed".into() },
+                        RouteTarget { machine: "mob_member_bootstrap".into(), input_variant: "KickoffFailed".into() },
                     ],
                 },
                 statement:
-                    "mob turn-execution failure is handled by ingress/runtime control and mirrored into runtime-bridge and helper-result observation anchors".into(),
+                    "mob turn-execution failure is handled by ingress/runtime control and recorded in runtime-bridge and member-bootstrap owner and runtime-bridge owner".into(),
                 references_machines: vec![
                     "turn_execution".into(),
                     "runtime_ingress".into(),
                     "runtime_control".into(),
-                    "mob_runtime_bridge_anchor".into(),
-                    "mob_helper_result_anchor".into(),
+                    "mob_runtime_bridge".into(),
+                    "mob_member_bootstrap".into(),
                 ],
                 references_actors: vec![
                     "turn_executor".into(),
                     "ordinary_ingress".into(),
                     "control_plane".into(),
-                    "mob_runtime_bridge_anchor_actor".into(),
-                    "mob_helper_result_anchor_actor".into(),
+                    "mob_runtime_bridge_actor".into(),
+                    "mob_member_bootstrap_actor".into(),
                 ],
             },
             CompositionInvariant {
@@ -7346,25 +7262,25 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                     required_targets: vec![
                         RouteTarget { machine: "runtime_ingress".into(), input_variant: "RunCancelled".into() },
                         RouteTarget { machine: "runtime_control".into(), input_variant: "RunCancelled".into() },
-                        RouteTarget { machine: "mob_runtime_bridge_anchor".into(), input_variant: "RuntimeRunCancelled".into() },
-                        RouteTarget { machine: "mob_helper_result_anchor".into(), input_variant: "AnchorCancelled".into() },
+                        RouteTarget { machine: "mob_runtime_bridge".into(), input_variant: "RuntimeRunCancelled".into() },
+                        RouteTarget { machine: "mob_member_bootstrap".into(), input_variant: "KickoffCancelled".into() },
                     ],
                 },
                 statement:
-                    "mob turn-execution cancellation is handled by ingress/runtime control and mirrored into runtime-bridge and helper-result observation anchors".into(),
+                    "mob turn-execution cancellation is handled by ingress/runtime control and recorded in runtime-bridge and member-bootstrap owner and runtime-bridge owner".into(),
                 references_machines: vec![
                     "turn_execution".into(),
                     "runtime_ingress".into(),
                     "runtime_control".into(),
-                    "mob_runtime_bridge_anchor".into(),
-                    "mob_helper_result_anchor".into(),
+                    "mob_runtime_bridge".into(),
+                    "mob_member_bootstrap".into(),
                 ],
                 references_actors: vec![
                     "turn_executor".into(),
                     "ordinary_ingress".into(),
                     "control_plane".into(),
-                    "mob_runtime_bridge_anchor_actor".into(),
-                    "mob_helper_result_anchor_actor".into(),
+                    "mob_runtime_bridge_actor".into(),
+                    "mob_member_bootstrap_actor".into(),
                 ],
             },
             CompositionInvariant {
@@ -7375,25 +7291,25 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                     required_targets: vec![
                         RouteTarget { machine: "runtime_ingress".into(), input_variant: "RunCompleted".into() },
                         RouteTarget { machine: "runtime_control".into(), input_variant: "RunCompleted".into() },
-                        RouteTarget { machine: "mob_runtime_bridge_anchor".into(), input_variant: "RuntimeRunCompleted".into() },
-                        RouteTarget { machine: "mob_helper_result_anchor".into(), input_variant: "AnchorCompleted".into() },
+                        RouteTarget { machine: "mob_runtime_bridge".into(), input_variant: "RuntimeRunCompleted".into() },
+                        RouteTarget { machine: "mob_member_bootstrap".into(), input_variant: "KickoffStarted".into() },
                     ],
                 },
                 statement:
-                    "mob turn-execution completion is handled by ingress/runtime control and mirrored into runtime-bridge and helper-result observation anchors".into(),
+                    "mob turn-execution completion is handled by ingress/runtime control and recorded in runtime-bridge and member-bootstrap owner and runtime-bridge owner".into(),
                 references_machines: vec![
                     "turn_execution".into(),
                     "runtime_ingress".into(),
                     "runtime_control".into(),
-                    "mob_runtime_bridge_anchor".into(),
-                    "mob_helper_result_anchor".into(),
+                    "mob_runtime_bridge".into(),
+                    "mob_member_bootstrap".into(),
                 ],
                 references_actors: vec![
                     "turn_executor".into(),
                     "ordinary_ingress".into(),
                     "control_plane".into(),
-                    "mob_runtime_bridge_anchor_actor".into(),
-                    "mob_helper_result_anchor_actor".into(),
+                    "mob_runtime_bridge_actor".into(),
+                    "mob_member_bootstrap_actor".into(),
                 ],
             },
             CompositionInvariant {
@@ -7409,52 +7325,38 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 references_actors: vec!["control_plane".into(), "ordinary_ingress".into()],
             },
             CompositionInvariant {
-                name: "mob_ops_peer_ready_trusts_peer_comms".into(),
-                kind: CompositionInvariantKind::ObservedRouteInputOriginatesFromEffect {
-                    route_name: "mob_ops_peer_ready_trusts_peer_comms".into(),
-                    to_machine: "peer_comms".into(),
-                    input_variant: "TrustPeer".into(),
-                    from_machine: "ops_lifecycle".into(),
-                    effect_variant: "ExposeOperationPeer".into(),
-                },
-                statement:
-                    "trust handoff assumes the exposed operation peer is identified by the operation_id alias mapping".into(),
-                references_machines: vec!["ops_lifecycle".into(), "peer_comms".into()],
-                references_actors: vec!["ops_plane".into(), "peer_plane".into()],
-            },
-            CompositionInvariant {
                 name: "mob_member_lifecycle_terminal_events_are_observed".into(),
                 kind: CompositionInvariantKind::ObservedRouteInputOriginatesFromEffect {
                     route_name: "mob_ops_terminal_tracks_member_lifecycle".into(),
-                    to_machine: "mob_member_lifecycle_anchor".into(),
+                    to_machine: "mob_member_lifecycle".into(),
                     input_variant: "MemberTerminalized".into(),
                     from_machine: "ops_lifecycle".into(),
                     effect_variant: "NotifyOpWatcher".into(),
                 },
                 statement:
-                    "mob member lifecycle terminal events are mirrored from ops lifecycle into the member-lifecycle observation anchor".into(),
+                    "mob member lifecycle terminal events are mirrored from ops lifecycle into the member lifecycle owner".into(),
                 references_machines: vec![
                     "ops_lifecycle".into(),
-                    "mob_member_lifecycle_anchor".into(),
+                    "mob_member_lifecycle".into(),
                 ],
                 references_actors: vec![
                     "ops_plane".into(),
-                    "mob_member_lifecycle_anchor_actor".into(),
+                    "mob_member_lifecycle_actor".into(),
                 ],
             },
             CompositionInvariant {
-                name: "mob_wiring_anchor_tracks_peer_candidates".into(),
+                name: "mob_wiring_tracks_peer_candidates".into(),
                 kind: CompositionInvariantKind::ObservedRouteInputOriginatesFromEffect {
                     route_name: "mob_peer_candidate_tracks_wiring".into(),
-                    to_machine: "mob_wiring_anchor".into(),
+                    to_machine: "mob_wiring".into(),
                     input_variant: "PeerInputAdmitted".into(),
                     from_machine: "peer_comms".into(),
-                    effect_variant: "SubmitPeerInputCandidate".into(),
+                    effect_variant: "EnqueueClassifiedEntry".into(),
                 },
                 statement:
-                    "mob peer candidate admission is mirrored into the wiring observation anchor through an explicit route".into(),
-                references_machines: vec!["peer_comms".into(), "mob_wiring_anchor".into()],
-                references_actors: vec!["peer_plane".into(), "mob_wiring_anchor_actor".into()],
+                    "mob peer candidate admission is recorded in the wiring owner through an explicit route".into(),
+                references_machines: vec!["peer_comms".into(), "mob_wiring".into()],
+                references_actors: vec!["peer_plane".into(), "mob_wiring_actor".into()],
             },
         ],
         witnesses: vec![
@@ -7634,7 +7536,7 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                     "mob_execution_completion_updates_ingress".into(),
                     "mob_execution_completion_notifies_control".into(),
                     "mob_execution_completion_tracks_bridge".into(),
-                    "mob_execution_completion_anchors_helper_result".into(),
+                    "mob_execution_completion_updates_bootstrap".into(),
                     "mob_flow_terminalization_completes_orchestrator".into(),
                     "mob_flow_deactivation_finishes_lifecycle_run".into(),
                 ],
@@ -7826,14 +7728,6 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                         }],
                     },
                     CompositionWitnessInput {
-                        machine: "peer_comms".into(),
-                        input_variant: "TrustPeer".into(),
-                        fields: vec![CompositionWitnessField {
-                            field: "peer_id".into(),
-                            expr: Expr::String("peer_ready".into()),
-                        }],
-                    },
-                    CompositionWitnessInput {
                         machine: "runtime_control".into(),
                         input_variant: "AdmissionAccepted".into(),
                         fields: admission_accepted_fields(
@@ -7848,7 +7742,6 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 expected_routes: vec![
                     "mob_async_op_event_enters_runtime_admission".into(),
                     "mob_admitted_work_enters_ingress".into(),
-                    "mob_ops_peer_ready_trusts_peer_comms".into(),
                     "mob_ops_peer_ready_tracks_member_lifecycle".into(),
                     "mob_ops_peer_ready_tracks_wiring".into(),
                     "mob_ops_terminal_tracks_member_lifecycle".into(),
@@ -7900,15 +7793,7 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                     },
                     CompositionWitnessInput {
                         machine: "peer_comms".into(),
-                        input_variant: "TrustPeer".into(),
-                        fields: vec![CompositionWitnessField {
-                            field: "peer_id".into(),
-                            expr: Expr::String("peer_1".into()),
-                        }],
-                    },
-                    CompositionWitnessInput {
-                        machine: "peer_comms".into(),
-                        input_variant: "ReceivePeerEnvelope".into(),
+                        input_variant: "ClassifyExternalEnvelope".into(),
                         fields: peer_envelope_fields(
                             "raw_1",
                             "peer_1",
@@ -7918,14 +7803,6 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                             None,
                             None,
                         ),
-                    },
-                    CompositionWitnessInput {
-                        machine: "peer_comms".into(),
-                        input_variant: "SubmitTypedPeerInput".into(),
-                        fields: vec![CompositionWitnessField {
-                            field: "raw_item_id".into(),
-                            expr: Expr::String("raw_1".into()),
-                        }],
                     },
                     CompositionWitnessInput {
                         machine: "runtime_control".into(),
@@ -7947,27 +7824,19 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 ],
                 expected_scheduler_rules: vec![],
                 expected_states: vec![
-                    witness_state("peer_comms", Some("Delivered"), vec![]),
+                    witness_state("peer_comms", Some("Ready"), vec![]),
                     witness_state("runtime_control", Some("Idle"), vec![]),
                     witness_state("runtime_ingress", Some("Active"), vec![]),
                 ],
                 expected_transitions: vec![
-                    witness_transition("peer_comms", "TrustPeer"),
-                    witness_transition("peer_comms", "ReceiveTrustedPeerEnvelope"),
-                    witness_transition("peer_comms", "SubmitTypedPeerInputDelivered"),
+                    witness_transition("peer_comms", "EnqueueActionableMessage"),
                     witness_transition("runtime_control", "AdmissionAcceptedIdleSteer"),
                     witness_transition("runtime_ingress", "AdmitQueuedSteer"),
                 ],
                 expected_transition_order: vec![
                     witness_transition_order(
                         "peer_comms",
-                        "ReceiveTrustedPeerEnvelope",
-                        "peer_comms",
-                        "SubmitTypedPeerInputDelivered",
-                    ),
-                    witness_transition_order(
-                        "peer_comms",
-                        "SubmitTypedPeerInputDelivered",
+                        "EnqueueActionableMessage",
                         "runtime_control",
                         "AdmissionAcceptedIdleSteer",
                     ),
@@ -8111,7 +7980,7 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                     "mob_execution_failure_updates_ingress".into(),
                     "mob_execution_failure_notifies_control".into(),
                     "mob_execution_failure_tracks_bridge".into(),
-                    "mob_execution_failure_anchors_helper_result".into(),
+                    "mob_execution_failure_updates_bootstrap".into(),
                 ],
                 expected_scheduler_rules: vec![],
                 expected_states: vec![
@@ -8316,7 +8185,7 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                     "mob_execution_cancel_updates_ingress".into(),
                     "mob_execution_cancel_notifies_control".into(),
                     "mob_execution_cancel_tracks_bridge".into(),
-                    "mob_execution_cancel_anchors_helper_result".into(),
+                    "mob_execution_cancel_updates_bootstrap".into(),
                 ],
                 expected_scheduler_rules: vec![],
                 expected_states: vec![
@@ -8523,7 +8392,7 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                     "mob_supervisor_activation_starts_lifecycle".into(),
                     "mob_member_force_cancelled_stops_runtime".into(),
                     "mob_member_force_cancel_tracks_bridge".into(),
-                    "mob_member_force_cancel_anchors_helper_result".into(),
+                    "mob_member_force_cancel_updates_bootstrap".into(),
                 ],
                 expected_scheduler_rules: vec![],
                 expected_states: vec![
@@ -9492,15 +9361,9 @@ pub fn ops_peer_bundle_composition() -> CompositionSchema {
                 machine_name: "OpsLifecycleMachine".into(),
                 actor: "ops_plane".into(),
             },
-            MachineInstance {
-                instance_id: "peer_comms".into(),
-                machine_name: "PeerCommsMachine".into(),
-                actor: "peer_plane".into(),
-            },
         ],
         actors: vec![
             machine_actor("ops_plane"),
-            machine_actor("peer_plane"),
             owner_actor("agent_loop"),
         ],
         handoff_protocols: vec![EffectHandoffProtocol {
@@ -9558,57 +9421,14 @@ pub fn ops_peer_bundle_composition() -> CompositionSchema {
                 machine: "ops_lifecycle".into(),
                 input_variant: "CompleteOperation".into(),
             },
-            EntryInput {
-                name: "peer_trust".into(),
-                machine: "peer_comms".into(),
-                input_variant: "TrustPeer".into(),
-            },
-            EntryInput {
-                name: "peer_receive".into(),
-                machine: "peer_comms".into(),
-                input_variant: "ReceivePeerEnvelope".into(),
-            },
         ],
-        routes: vec![
-            Route {
-                name: "ops_peer_ready_trusts_peer_comms".into(),
-                from_machine: "ops_lifecycle".into(),
-                effect_variant: "ExposeOperationPeer".into(),
-                to: RouteTarget {
-                    machine: "peer_comms".into(),
-                    input_variant: "TrustPeer".into(),
-                },
-                bindings: vec![RouteFieldBinding {
-                    to_field: "peer_id".into(),
-                    source: RouteBindingSource::Field {
-                        from_field: "operation_id".into(),
-                        allow_named_alias: true,
-                    },
-                }],
-                delivery: RouteDelivery::Immediate,
-            },
-        ],
+        routes: vec![],
         route_target_selectors: vec![],
         driver: None,
         transaction_plans: vec![],
         actor_priorities: vec![],
         scheduler_rules: vec![],
-        invariants: vec![
-            CompositionInvariant {
-                name: "ops_peer_ready_trusts_peer_comms".into(),
-                kind: CompositionInvariantKind::ObservedRouteInputOriginatesFromEffect {
-                    route_name: "ops_peer_ready_trusts_peer_comms".into(),
-                    to_machine: "peer_comms".into(),
-                    input_variant: "TrustPeer".into(),
-                    from_machine: "ops_lifecycle".into(),
-                    effect_variant: "ExposeOperationPeer".into(),
-                },
-                statement:
-                    "ops-lifecycle peer-ready effect triggers peer-comms trust establishment through an explicit route".into(),
-                references_machines: vec!["ops_lifecycle".into(), "peer_comms".into()],
-                references_actors: vec!["ops_plane".into(), "peer_plane".into()],
-            },
-        ],
+        invariants: vec![],
         witnesses: vec![
             CompositionWitness {
                 name: "ops_peer_ready_trusts_peer_comms_path".into(),
@@ -9644,19 +9464,15 @@ pub fn ops_peer_bundle_composition() -> CompositionSchema {
                         }],
                     },
                 ],
-                expected_routes: vec![
-                    "ops_peer_ready_trusts_peer_comms".into(),
-                ],
+                expected_routes: vec![],
                 expected_scheduler_rules: vec![],
                 expected_states: vec![
                     witness_state("ops_lifecycle", Some("Active"), vec![]),
-                    witness_state("peer_comms", Some("Absent"), vec![]),
                 ],
                 expected_transitions: vec![
                     witness_transition("ops_lifecycle", "RegisterOperation"),
                     witness_transition("ops_lifecycle", "ProvisioningSucceeded"),
                     witness_transition("ops_lifecycle", "PeerReady"),
-                    witness_transition("peer_comms", "TrustPeer"),
                 ],
                 expected_transition_order: vec![
                     witness_transition_order(
@@ -9671,19 +9487,13 @@ pub fn ops_peer_bundle_composition() -> CompositionSchema {
                         "ops_lifecycle",
                         "PeerReady",
                     ),
-                    witness_transition_order(
-                        "ops_lifecycle",
-                        "PeerReady",
-                        "peer_comms",
-                        "TrustPeer",
-                    ),
                 ],
                 state_limits: CompositionStateLimits {
                     step_limit: 5,
                     pending_input_limit: 4,
-                    pending_route_limit: 2,
-                    delivered_route_limit: 2,
-                    emitted_effect_limit: 4,
+                    pending_route_limit: 1,
+                    delivered_route_limit: 1,
+                    emitted_effect_limit: 3,
                     seq_limit: 4,
                     set_limit: 4,
                     map_limit: 4,
@@ -9861,43 +9671,74 @@ fn peer_envelope_fields(
     raw_item_id: &str,
     peer_id: &str,
     raw_kind: &str,
-    text_projection: &str,
-    content_shape: &str,
-    request_id: Option<&str>,
-    reservation_key: Option<&str>,
+    _text_projection: &str,
+    _content_shape: &str,
+    _request_id: Option<&str>,
+    _reservation_key: Option<&str>,
 ) -> Vec<CompositionWitnessField> {
+    let kind_variant = match raw_kind.to_ascii_lowercase().as_str() {
+        "message" => "Message".to_string(),
+        "request" => "Request".to_string(),
+        "response" => "Response".to_string(),
+        "ack" => "Ack".to_string(),
+        other => other.to_string(),
+    };
+
     vec![
         CompositionWitnessField {
             field: "raw_item_id".into(),
             expr: Expr::String(raw_item_id.into()),
         },
         CompositionWitnessField {
-            field: "peer_id".into(),
+            field: "require_peer_auth".into(),
+            expr: Expr::Bool(false),
+        },
+        CompositionWitnessField {
+            field: "sender_name_known".into(),
+            expr: Expr::Bool(true),
+        },
+        CompositionWitnessField {
+            field: "sender_name".into(),
             expr: Expr::String(peer_id.into()),
         },
         CompositionWitnessField {
-            field: "raw_kind".into(),
-            expr: Expr::String(raw_kind.into()),
+            field: "fallback_sender_name".into(),
+            expr: Expr::String(peer_id.into()),
         },
         CompositionWitnessField {
-            field: "text_projection".into(),
-            expr: Expr::String(text_projection.into()),
+            field: "kind".into(),
+            expr: Expr::NamedVariant {
+                enum_name: "PeerEnvelopeKind".into(),
+                variant: kind_variant,
+            },
         },
         CompositionWitnessField {
-            field: "content_shape".into(),
-            expr: Expr::String(content_shape.into()),
+            field: "intent".into(),
+            expr: Expr::String("review".into()),
         },
         CompositionWitnessField {
-            field: "request_id".into(),
-            expr: request_id
-                .map(|value| Expr::Some(Box::new(Expr::String(value.into()))))
-                .unwrap_or(Expr::None),
+            field: "lifecycle_peer_present".into(),
+            expr: Expr::Bool(false),
         },
         CompositionWitnessField {
-            field: "reservation_key".into(),
-            expr: reservation_key
-                .map(|value| Expr::Some(Box::new(Expr::String(value.into()))))
-                .unwrap_or(Expr::None),
+            field: "lifecycle_peer".into(),
+            expr: Expr::String(String::new()),
+        },
+        CompositionWitnessField {
+            field: "handling_mode_present".into(),
+            expr: Expr::Bool(true),
+        },
+        CompositionWitnessField {
+            field: "handling_mode".into(),
+            expr: Expr::String("Steer".into()),
+        },
+        CompositionWitnessField {
+            field: "silent_intent".into(),
+            expr: Expr::Bool(false),
+        },
+        CompositionWitnessField {
+            field: "dismiss_message".into(),
+            expr: Expr::Bool(false),
         },
     ]
 }

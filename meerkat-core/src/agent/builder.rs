@@ -41,13 +41,11 @@ pub struct AgentBuilder {
     pub(super) silent_comms_intents: Vec<String>,
     pub(super) ops_lifecycle: Option<Arc<dyn crate::ops_lifecycle::OpsLifecycleRegistry>>,
     pub(super) completion_feed: Option<Arc<dyn crate::completion_feed::CompletionFeed>>,
-    pub(super) interrupt_baseline: Option<Arc<std::sync::atomic::AtomicU64>>,
     pub(super) completion_enrichment:
         Option<Arc<dyn crate::completion_feed::CompletionEnrichmentProvider>>,
     pub(super) max_inline_peer_notifications: Option<i32>,
     pub(super) event_tap: Option<crate::event_tap::EventTap>,
     pub(super) default_event_tx: Option<mpsc::Sender<crate::event::AgentEvent>>,
-    pub(super) wait_interrupt_sender: Option<crate::wait_interrupt::WaitInterruptSender>,
     pub(super) model_defaults_resolver: Option<Arc<dyn ModelOperationalDefaultsResolver>>,
     pub(super) call_timeout_override: CallTimeoutOverride,
     pub(super) epoch_cursor_state: Option<Arc<crate::runtime_epoch::EpochCursorState>>,
@@ -75,12 +73,10 @@ impl AgentBuilder {
             silent_comms_intents: Vec::new(),
             ops_lifecycle: None,
             completion_feed: None,
-            interrupt_baseline: None,
             completion_enrichment: None,
             max_inline_peer_notifications: None,
             event_tap: None,
             default_event_tx: None,
-            wait_interrupt_sender: None,
             model_defaults_resolver: None,
             call_timeout_override: CallTimeoutOverride::default(),
             epoch_cursor_state: None,
@@ -255,7 +251,6 @@ impl AgentBuilder {
                 .unwrap_or_else(crate::event_tap::new_event_tap),
             system_context_state,
             default_event_tx: self.default_event_tx,
-            wait_interrupt_sender: self.wait_interrupt_sender,
             ops_lifecycle: self.ops_lifecycle,
             // Seed from epoch cursor state if available (runtime-backed surfaces),
             // otherwise fall back to the feed watermark to avoid replaying retained
@@ -271,7 +266,6 @@ impl AgentBuilder {
                 .unwrap_or_else(|| self.completion_feed.as_ref().map_or(0, |f| f.watermark())),
             completion_feed: self.completion_feed,
             epoch_cursor_state: self.epoch_cursor_state,
-            interrupt_baseline: self.interrupt_baseline,
             completion_enrichment: self.completion_enrichment,
             mob_authority_handle: None,
             turn_authority: crate::turn_execution_authority::TurnExecutionAuthority::new(),
@@ -345,15 +339,6 @@ impl AgentBuilder {
         self
     }
 
-    /// Set the out-of-band sender for cooperative wait/yield interrupts.
-    pub fn with_wait_interrupt_sender(
-        mut self,
-        sender: crate::wait_interrupt::WaitInterruptSender,
-    ) -> Self {
-        self.wait_interrupt_sender = Some(sender);
-        self
-    }
-
     /// Set the ops lifecycle registry for async operation tracking.
     pub fn with_ops_lifecycle(
         mut self,
@@ -369,12 +354,6 @@ impl AgentBuilder {
         feed: Arc<dyn crate::completion_feed::CompletionFeed>,
     ) -> Self {
         self.completion_feed = Some(feed);
-        self
-    }
-
-    /// Set the shared interrupt baseline for the wait tool.
-    pub fn with_interrupt_baseline(mut self, baseline: Arc<std::sync::atomic::AtomicU64>) -> Self {
-        self.interrupt_baseline = Some(baseline);
         self
     }
 

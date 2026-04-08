@@ -2,86 +2,161 @@
 
 _Generated from the Rust machine catalog. Do not edit by hand._
 
-- Version: `1`
+- Version: `2`
 - Rust owner: `meerkat-comms` / `generated::peer_comms`
 
 ## State
-- Phase enum: `Absent | Received | Dropped | Delivered`
-- `trusted_peers`: `Set<PeerId>`
-- `raw_item_peer`: `Map<RawItemId, PeerId>`
-- `raw_item_kind`: `Map<RawItemId, RawPeerKind>`
-- `classified_as`: `Map<RawItemId, PeerInputClass>`
-- `text_projection`: `Map<RawItemId, String>`
-- `content_shape`: `Map<RawItemId, ContentShape>`
-- `request_id`: `Map<RawItemId, Option<RequestId>>`
-- `reservation_key`: `Map<RawItemId, Option<ReservationKey>>`
-- `trusted_snapshot`: `Map<RawItemId, Bool>`
-- `submission_queue`: `Seq<RawItemId>`
+- Phase enum: `Ready`
 
 ## Inputs
-- `TrustPeer`(peer_id: PeerId)
-- `ReceivePeerEnvelope`(raw_item_id: RawItemId, peer_id: PeerId, raw_kind: RawPeerKind, text_projection: String, content_shape: ContentShape, request_id: Option<RequestId>, reservation_key: Option<ReservationKey>)
-- `SubmitTypedPeerInput`(raw_item_id: RawItemId)
+- `ClassifyExternalEnvelope`(raw_item_id: RawItemId, require_peer_auth: Bool, sender_name_known: Bool, sender_name: String, fallback_sender_name: String, kind: PeerEnvelopeKind, intent: String, lifecycle_peer_present: Bool, lifecycle_peer: String, handling_mode_present: Bool, handling_mode: HandlingMode, silent_intent: Bool, dismiss_message: Bool)
+- `ClassifyPlainEvent`(raw_item_id: RawItemId, source_name: String, handling_mode: HandlingMode)
 
 ## Effects
-- `SubmitPeerInputCandidate`(raw_item_id: RawItemId, peer_input_class: PeerInputClass, text_projection: String, content_shape: ContentShape, request_id: Option<RequestId>, reservation_key: Option<ReservationKey>)
+- `DropIngress`
+- `SetDismissFlag`
+- `EnqueueClassifiedEntry`(raw_item_id: RawItemId, class: PeerInputClass, from_peer: Option<String>, lifecycle_peer: Option<String>, normalized_handling_mode: HandlingMode)
 
 ## Helpers
-- `ClassFor`(raw_kind: RawPeerKind) -> `PeerInputClass`
+- `EffectiveSender`(sender_name_known: Bool, sender_name: String, fallback_sender_name: String) -> `Option<String>`
+- `EffectiveLifecyclePeer`(lifecycle_peer_present: Bool, lifecycle_peer: String, sender_name_known: Bool, sender_name: String, fallback_sender_name: String) -> `Option<String>`
+- `NormalizedHandlingMode`(handling_mode_present: Bool, handling_mode: HandlingMode) -> `HandlingMode`
 
 ## Invariants
-- `queued_items_are_classified`
-- `queued_items_preserve_content_shape`
-- `queued_items_preserve_text_projection`
-- `queued_items_preserve_correlation_slots`
 
 ## Transitions
-### `TrustPeer`
-- From: `Absent`, `Received`
-- On: `TrustPeer`(peer_id)
-- To: `Absent`
-
-### `ReceiveTrustedPeerEnvelope`
-- From: `Absent`, `Received`
-- On: `ReceivePeerEnvelope`(raw_item_id, peer_id, raw_kind, text_projection, content_shape, request_id, reservation_key)
+### `DropUntrustedExternal`
+- From: `Ready`
+- On: `ClassifyExternalEnvelope`(require_peer_auth, raw_item_id, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
 - Guards:
-  - `peer_is_trusted`
-- To: `Received`
+  - `require_peer_auth_matches`
+  - `sender_name_known_matches`
+- Emits: `DropIngress`
+- To: `Ready`
 
-### `DropUntrustedPeerEnvelope`
-- From: `Absent`, `Received`
-- On: `ReceivePeerEnvelope`(raw_item_id, peer_id, raw_kind, text_projection, content_shape, request_id, reservation_key)
+### `DropAckExternal`
+- From: `Ready`
+- On: `ClassifyExternalEnvelope`(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
 - Guards:
-  - `peer_is_not_trusted`
-- To: `Dropped`
+  - `kind_matches`
+- Emits: `DropIngress`
+- To: `Ready`
 
-### `SubmitTypedPeerInputDelivered`
-- From: `Received`
-- On: `SubmitTypedPeerInput`(raw_item_id)
+### `DismissExternalMessage`
+- From: `Ready`
+- On: `ClassifyExternalEnvelope`(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
 - Guards:
-  - `item_was_queued`
-  - `item_was_classified`
-  - `delivery_drains_queue`
-- Emits: `SubmitPeerInputCandidate`
-- To: `Delivered`
+  - `not_untrusted_external`
+  - `kind_matches`
+  - `dismiss_message_matches`
+- Emits: `SetDismissFlag`
+- To: `Ready`
 
-### `SubmitTypedPeerInputContinue`
-- From: `Received`
-- On: `SubmitTypedPeerInput`(raw_item_id)
+### `EnqueueLifecycleAdded`
+- From: `Ready`
+- On: `ClassifyExternalEnvelope`(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
 - Guards:
-  - `item_was_queued`
-  - `item_was_classified`
-  - `delivery_leaves_more_work`
-- Emits: `SubmitPeerInputCandidate`
-- To: `Received`
+  - `not_untrusted_external`
+  - `kind_matches`
+  - `intent_matches`
+- Emits: `EnqueueClassifiedEntry`
+- To: `Ready`
+
+### `EnqueueLifecycleRetired`
+- From: `Ready`
+- On: `ClassifyExternalEnvelope`(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+- Guards:
+  - `not_untrusted_external`
+  - `kind_matches`
+  - `intent_matches`
+- Emits: `EnqueueClassifiedEntry`
+- To: `Ready`
+
+### `EnqueueLifecycleUnwired`
+- From: `Ready`
+- On: `ClassifyExternalEnvelope`(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+- Guards:
+  - `not_untrusted_external`
+  - `kind_matches`
+  - `intent_matches`
+- Emits: `EnqueueClassifiedEntry`
+- To: `Ready`
+
+### `EnqueueLifecycleKickoffFailed`
+- From: `Ready`
+- On: `ClassifyExternalEnvelope`(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+- Guards:
+  - `not_untrusted_external`
+  - `kind_matches`
+  - `intent_matches`
+- Emits: `EnqueueClassifiedEntry`
+- To: `Ready`
+
+### `EnqueueLifecycleKickoffCancelled`
+- From: `Ready`
+- On: `ClassifyExternalEnvelope`(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+- Guards:
+  - `not_untrusted_external`
+  - `kind_matches`
+  - `intent_matches`
+- Emits: `EnqueueClassifiedEntry`
+- To: `Ready`
+
+### `EnqueueSilentRequest`
+- From: `Ready`
+- On: `ClassifyExternalEnvelope`(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+- Guards:
+  - `not_untrusted_external`
+  - `kind_matches`
+  - `silent_intent_matches`
+  - `not_mob_lifecycle_intent`
+- Emits: `EnqueueClassifiedEntry`
+- To: `Ready`
+
+### `EnqueueActionableRequest`
+- From: `Ready`
+- On: `ClassifyExternalEnvelope`(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+- Guards:
+  - `not_untrusted_external`
+  - `kind_matches`
+  - `silent_intent_matches`
+  - `not_mob_lifecycle_intent`
+- Emits: `EnqueueClassifiedEntry`
+- To: `Ready`
+
+### `EnqueueActionableMessage`
+- From: `Ready`
+- On: `ClassifyExternalEnvelope`(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+- Guards:
+  - `not_untrusted_external`
+  - `kind_matches`
+  - `dismiss_message_matches`
+- Emits: `EnqueueClassifiedEntry`
+- To: `Ready`
+
+### `EnqueueResponse`
+- From: `Ready`
+- On: `ClassifyExternalEnvelope`(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+- Guards:
+  - `not_untrusted_external`
+  - `kind_matches`
+- Emits: `EnqueueClassifiedEntry`
+- To: `Ready`
+
+### `EnqueuePlainEvent`
+- From: `Ready`
+- On: `ClassifyPlainEvent`(raw_item_id, source_name, handling_mode)
+- Emits: `EnqueueClassifiedEntry`
+- To: `Ready`
 
 ## Coverage
 ### Code Anchors
-- `meerkat-comms/src/classify.rs` — peer classification precursor
-- `meerkat-comms/src/inbox.rs` — peer inbox and request/reservation registry precursor
-- `meerkat-comms/src/runtime/comms_runtime.rs` — runtime comms owner precursor
+- `meerkat-comms/src/classify.rs` — canonical ingress classification adapter over PeerCommsAuthority
+- `meerkat-comms/src/inbox.rs` — classified inbox enqueue/drop/dismiss shell executor
+- `meerkat-comms/src/runtime/comms_runtime.rs` — candidate drain projects stored ingress metadata without reclassification
+- `meerkat-comms/src/peer_comms_authority.rs` — canonical peer ingress authority
 
 ### Scenarios
-- `trust-normalize-submit` — trusted peer envelope is normalized and submitted exactly once
+- `trusted-ingress-classification` — trusted peer envelope is classified and normalized at ingress before enqueue
 - `untrusted-drop` — untrusted or invalid peer work is dropped before runtime admission
-- `request-response-correlation` — reservation/request state remains consistent across peer traffic
+- `dismiss-at-ingress` — dismiss messages set the dismiss flag without becoming peer input candidates

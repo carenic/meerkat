@@ -24,12 +24,11 @@ use meerkat_core::time_compat::SystemTime;
 use meerkat_core::types::{ContentInput, RunResult, SessionId, ToolResult, Usage};
 use meerkat_core::{
     InputId, PendingDeferredPrompt, PendingSystemContextAppend, PendingToolResultsMessage, RunId,
-    SessionDeferredTurnState, SessionLlmIdentity, SessionSystemContextState, WaitInterrupt,
+    SessionDeferredTurnState, SessionLlmIdentity, SessionSystemContextState,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 // Tokio re-exports: on wasm32, use the crate-level alias (tokio_with_wasm).
 #[cfg(target_arch = "wasm32")]
@@ -38,6 +37,11 @@ use crate::tokio;
 use crate::tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, mpsc, oneshot, watch};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, mpsc, oneshot, watch};
+
+use crate::session_turn_admission_authority::{
+    SessionTurnAdmissionAuthority, SessionTurnAdmissionEffect, SessionTurnAdmissionInput,
+    SessionTurnAdmissionPhase,
+};
 
 /// Capacity for the internal agent event channel.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -53,7 +57,9 @@ const COMMAND_CHANNEL_CAPACITY: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionState {
     Idle,
+    Admitted,
     Running,
+    Completing,
     ShuttingDown,
 }
 
@@ -134,13 +140,12 @@ struct SessionSummaryCache {
 /// Handle stored in the sessions map.
 struct SessionHandle {
     command_tx: mpsc::Sender<SessionCommand>,
+    state_tx: watch::Sender<SessionState>,
     state_rx: watch::Receiver<SessionState>,
     summary_rx: watch::Receiver<SessionSummaryCache>,
     llm_identity_rx: watch::Receiver<SessionLlmIdentity>,
-    /// Atomic turn-admission lock. Set to `true` by the caller before sending
-    /// `StartTurn`, guaranteeing that only one turn is admitted at a time.
-    /// Reset to `false` by the session task after the turn completes.
-    turn_lock: Arc<AtomicBool>,
+    /// Canonical owner for session turn admission lifecycle.
+    turn_admission: Arc<std::sync::Mutex<SessionTurnAdmissionAuthority>>,
     _capacity_permit: OwnedSemaphorePermit,
     created_at: SystemTime,
     /// Key-value labels attached at session creation.
@@ -156,10 +161,6 @@ struct SessionHandle {
     system_context_state: Arc<std::sync::Mutex<SessionSystemContextState>>,
     /// Shared control state for deferred first-turn prompt and staged tool results.
     deferred_turn_state: Arc<std::sync::Mutex<SessionDeferredTurnState>>,
-    /// Out-of-band sender for cooperative wait/yield interrupts.
-    wait_interrupt_sender: Option<meerkat_core::WaitInterruptSender>,
-    /// Out-of-band interrupt signal consumed by the running turn loop.
-    interrupt_requested: Arc<AtomicBool>,
     /// Wakes the running turn loop when an interrupt is requested.
     interrupt_notify: Arc<tokio::sync::Notify>,
     /// Broadcast channel for session-wide event subscription.
@@ -170,8 +171,7 @@ struct SessionTaskControl {
     state_tx: watch::Sender<SessionState>,
     summary_tx: watch::Sender<SessionSummaryCache>,
     llm_identity_tx: watch::Sender<SessionLlmIdentity>,
-    turn_lock: Arc<AtomicBool>,
-    interrupt_requested: Arc<AtomicBool>,
+    turn_admission: Arc<std::sync::Mutex<SessionTurnAdmissionAuthority>>,
     interrupt_notify: Arc<tokio::sync::Notify>,
     session_event_tx: tokio::sync::broadcast::Sender<EventEnvelope<AgentEvent>>,
 }
@@ -373,15 +373,6 @@ pub trait SessionAgent: Send {
     /// runtime is stored in the session handle for surfaces that need comms
     /// command execution and stream attachment.
     fn comms_runtime(&self) -> Option<Arc<dyn meerkat_core::agent::CommsRuntime>> {
-        None
-    }
-
-    /// Get the cooperative wait-interrupt sender used by this agent, if any.
-    ///
-    /// Called once before the agent moves into its dedicated task. The sender
-    /// is stored in the session handle for out-of-band cooperative-yield
-    /// interrupts from runtime-backed control paths.
-    fn wait_interrupt_sender(&self) -> Option<meerkat_core::WaitInterruptSender> {
         None
     }
 }
@@ -627,6 +618,12 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             .swap_remove(id)
             .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
         drop(sessions);
+        let _ = Self::apply_turn_admission_input(
+            &handle.turn_admission,
+            &handle.state_tx,
+            &handle.interrupt_notify,
+            SessionTurnAdmissionInput::RequestShutdown,
+        );
         let _ = handle.command_tx.send(SessionCommand::Shutdown).await;
         Ok(())
     }
@@ -791,6 +788,12 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
     pub async fn shutdown(&self) {
         let mut sessions = self.sessions.write().await;
         for (_id, handle) in sessions.drain(..) {
+            let _ = Self::apply_turn_admission_input(
+                &handle.turn_admission,
+                &handle.state_tx,
+                &handle.interrupt_notify,
+                SessionTurnAdmissionInput::RequestShutdown,
+            );
             let _ = handle.command_tx.send(SessionCommand::Shutdown).await;
         }
     }
@@ -840,15 +843,43 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         Ok(handle.session_event_tx.subscribe())
     }
 
-    /// Acquire the turn lock atomically. Returns Err(Busy) if already locked.
-    fn try_acquire_turn(id: &SessionId, handle: &SessionHandle) -> Result<(), SessionError> {
-        match handle
-            .turn_lock
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => Ok(()),
-            Err(_) => Err(SessionError::Busy { id: id.clone() }),
-        }
+    fn is_session_state_active(state: SessionState) -> bool {
+        matches!(
+            state,
+            SessionState::Admitted | SessionState::Running | SessionState::Completing
+        )
+    }
+
+    fn apply_turn_admission_input(
+        authority: &Arc<std::sync::Mutex<SessionTurnAdmissionAuthority>>,
+        state_tx: &watch::Sender<SessionState>,
+        interrupt_notify: &tokio::sync::Notify,
+        input: SessionTurnAdmissionInput,
+    ) -> Result<
+        crate::session_turn_admission_authority::SessionTurnAdmissionTransition,
+        crate::session_turn_admission_authority::SessionTurnAdmissionError,
+    > {
+        apply_turn_admission_input(authority, state_tx, interrupt_notify, input)
+    }
+
+    fn request_start_turn(id: &SessionId, handle: &SessionHandle) -> Result<(), SessionError> {
+        Self::apply_turn_admission_input(
+            &handle.turn_admission,
+            &handle.state_tx,
+            &handle.interrupt_notify,
+            SessionTurnAdmissionInput::RequestStartTurn,
+        )
+        .map(|_| ())
+        .map_err(|_| SessionError::Busy { id: id.clone() })
+    }
+
+    fn try_abort_admitted_turn(handle: &SessionHandle) {
+        let _ = Self::apply_turn_admission_input(
+            &handle.turn_admission,
+            &handle.state_tx,
+            &handle.interrupt_notify,
+            SessionTurnAdmissionInput::AbortAdmittedTurn,
+        );
     }
 }
 
@@ -924,18 +955,17 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
             .await?;
         let session_id = agent.session_id();
         let created_at = SystemTime::now();
-        let turn_lock = Arc::new(AtomicBool::new(false));
+        let turn_admission = Arc::new(std::sync::Mutex::new(SessionTurnAdmissionAuthority::new()));
 
         // Extract the event injector before the agent moves into its task.
         let event_injector = agent.event_injector();
         let interaction_event_injector = agent.interaction_event_injector();
         let comms_runtime = agent.comms_runtime();
         let system_context_state = agent.system_context_state();
-        let wait_interrupt_sender = agent.wait_interrupt_sender();
-
         // Create session task channels
         let (command_tx, command_rx) = mpsc::channel::<SessionCommand>(COMMAND_CHANNEL_CAPACITY);
         let (state_tx, state_rx) = watch::channel(SessionState::Idle);
+        let state_tx_handle = state_tx.clone();
         let (summary_tx, summary_rx) = watch::channel(SessionSummaryCache {
             updated_at: created_at,
             message_count: 0,
@@ -947,11 +977,9 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
         let (session_event_tx, session_event_rx) =
             tokio::sync::broadcast::channel::<EventEnvelope<AgentEvent>>(EVENT_CHANNEL_CAPACITY);
         drop(session_event_rx);
-        let interrupt_requested = Arc::new(AtomicBool::new(false));
         let interrupt_notify = Arc::new(tokio::sync::Notify::new());
 
         // Spawn the session task
-        let task_turn_lock = turn_lock.clone();
         tokio::spawn(session_task(
             agent,
             agent_event_tx,
@@ -962,8 +990,7 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
                 state_tx,
                 summary_tx,
                 llm_identity_tx,
-                turn_lock: task_turn_lock,
-                interrupt_requested: interrupt_requested.clone(),
+                turn_admission: Arc::clone(&turn_admission),
                 interrupt_notify: interrupt_notify.clone(),
                 session_event_tx: session_event_tx.clone(),
             },
@@ -972,10 +999,11 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
         // Store the handle
         let handle = SessionHandle {
             command_tx: command_tx.clone(),
+            state_tx: state_tx_handle,
             state_rx,
             summary_rx,
             llm_identity_rx,
-            turn_lock: turn_lock.clone(),
+            turn_admission: Arc::clone(&turn_admission),
             _capacity_permit: capacity_permit,
             created_at,
             labels,
@@ -984,8 +1012,6 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
             comms_runtime,
             system_context_state,
             deferred_turn_state,
-            wait_interrupt_sender,
-            interrupt_requested,
             interrupt_notify,
             session_event_tx,
         };
@@ -1025,8 +1051,20 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
             });
         }
 
-        // Acquire turn lock for the first turn (cannot fail — fresh session)
-        turn_lock.store(true, Ordering::Release);
+        // Claim the canonical turn slot for the eager first turn.
+        {
+            let sessions = self.sessions.read().await;
+            let handle = sessions.get(&session_id).ok_or_else(|| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+                    "fresh session handle missing for eager first turn: {session_id}"
+                )))
+            })?;
+            Self::request_start_turn(&session_id, handle).map_err(|error| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+                    "fresh session failed to admit eager first turn: {error}"
+                )))
+            })?;
+        }
 
         // Run the first turn
         let (result_tx, result_rx) = oneshot::channel();
@@ -1044,7 +1082,11 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
             .await
             .is_err()
         {
-            turn_lock.store(false, Ordering::Release);
+            let sessions = self.sessions.read().await;
+            if let Some(handle) = sessions.get(&session_id) {
+                Self::try_abort_admitted_turn(handle);
+            }
+            drop(sessions);
             let mut sessions = self.sessions.write().await;
             sessions.swap_remove(&session_id);
             return Err(SessionError::Agent(
@@ -1109,7 +1151,7 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
 
             // Atomic busy check via compare-and-swap. This is the single
             // point of admission — if two callers race, exactly one wins.
-            Self::try_acquire_turn(id, handle)?;
+            Self::request_start_turn(id, handle)?;
 
             if let Some(system_prompt) = req.system_prompt {
                 let allows_override = {
@@ -1117,7 +1159,7 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
                     guard.allows_initial_turn_overrides()
                 };
                 if !allows_override {
-                    handle.turn_lock.store(false, Ordering::Release);
+                    Self::try_abort_admitted_turn(handle);
                     return Err(SessionError::Unsupported(
                         "system_prompt override is only allowed on a deferred session's first turn"
                             .to_string(),
@@ -1132,19 +1174,19 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
                     })
                     .await
                     .map_err(|_| {
-                        handle.turn_lock.store(false, Ordering::Release);
+                        Self::try_abort_admitted_turn(handle);
                         SessionError::Agent(meerkat_core::error::AgentError::InternalError(
                             "Session task has exited".to_string(),
                         ))
                     })?;
                 let update_result = reply_rx.await.map_err(|_| {
-                    handle.turn_lock.store(false, Ordering::Release);
+                    Self::try_abort_admitted_turn(handle);
                     SessionError::Agent(meerkat_core::error::AgentError::InternalError(
                         "Session task dropped reply channel".to_string(),
                     ))
                 })?;
                 update_result.map_err(|error| {
-                    handle.turn_lock.store(false, Ordering::Release);
+                    Self::try_abort_admitted_turn(handle);
                     SessionError::Agent(error)
                 })?;
             }
@@ -1163,7 +1205,7 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
                 })
                 .await
                 .map_err(|_| {
-                    handle.turn_lock.store(false, Ordering::Release);
+                    Self::try_abort_admitted_turn(handle);
                     SessionError::Agent(meerkat_core::error::AgentError::InternalError(
                         "Session task has exited".to_string(),
                     ))
@@ -1273,37 +1315,14 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
         let handle = sessions
             .get(id)
             .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
-
-        // Check turn_lock atomically — if false, no turn is running.
-        // This avoids the TOCTOU race of checking state_rx then sending.
-        if !handle.turn_lock.load(Ordering::Acquire) {
-            return Err(SessionError::NotRunning { id: id.clone() });
-        }
-
-        // Signal interrupt out-of-band so a running turn can observe it
-        // immediately (without waiting for command-channel polling).
-        handle.interrupt_requested.store(true, Ordering::Release);
-        handle.interrupt_notify.notify_waiters();
-        Ok(())
-    }
-
-    async fn interrupt_yielding(&self, id: &SessionId) -> Result<(), SessionError> {
-        let sessions = self.sessions.read().await;
-        let handle = sessions
-            .get(id)
-            .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
-
-        if !handle.turn_lock.load(Ordering::Acquire) {
-            return Err(SessionError::NotRunning { id: id.clone() });
-        }
-
-        if let Some(sender) = &handle.wait_interrupt_sender {
-            let _ = sender.send(Some(WaitInterrupt {
-                reason: "Runtime requested cooperative yield interrupt".to_string(),
-            }));
-        }
-
-        Ok(())
+        Self::apply_turn_admission_input(
+            &handle.turn_admission,
+            &handle.state_tx,
+            &handle.interrupt_notify,
+            SessionTurnAdmissionInput::RequestInterrupt,
+        )
+        .map(|_| ())
+        .map_err(|_| SessionError::NotRunning { id: id.clone() })
     }
 
     async fn read(&self, id: &SessionId) -> Result<SessionView, SessionError> {
@@ -1333,7 +1352,7 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
                 created_at: handle.created_at,
                 updated_at: summary.updated_at,
                 message_count: summary.message_count,
-                is_active: state == SessionState::Running,
+                is_active: Self::is_session_state_active(state),
                 model: handle.llm_identity_rx.borrow().model.clone(),
                 provider: handle.llm_identity_rx.borrow().provider,
                 last_assistant_text: summary.last_assistant_text,
@@ -1359,7 +1378,7 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
                     updated_at: cache.updated_at,
                     message_count: cache.message_count,
                     total_tokens: cache.total_tokens,
-                    is_active: state == SessionState::Running,
+                    is_active: Self::is_session_state_active(state),
                     labels: h.labels.clone(),
                 }
             })
@@ -1404,6 +1423,12 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
             .await
             .insert(id.clone(), archived_view);
 
+        let _ = Self::apply_turn_admission_input(
+            &handle.turn_admission,
+            &handle.state_tx,
+            &handle.interrupt_notify,
+            SessionTurnAdmissionInput::RequestShutdown,
+        );
         let _ = handle.command_tx.send(SessionCommand::Shutdown).await;
         Ok(())
     }
@@ -1585,9 +1610,6 @@ impl<B: SessionAgentBuilder + 'static> SessionServiceHistoryExt for EphemeralSes
 // ---------------------------------------------------------------------------
 
 /// Long-lived task that exclusively owns a session agent and processes commands.
-///
-/// The `turn_lock` is released after each turn completes, allowing the next
-/// `start_turn` call to proceed.
 fn stamp_event_envelope(
     next_seq: &mut u64,
     source_id: &str,
@@ -1608,6 +1630,38 @@ fn lock_deferred_turn_state(
             poisoned.into_inner()
         }
     }
+}
+
+fn map_turn_phase_to_session_state(phase: SessionTurnAdmissionPhase) -> SessionState {
+    match phase {
+        SessionTurnAdmissionPhase::Idle => SessionState::Idle,
+        SessionTurnAdmissionPhase::Admitted => SessionState::Admitted,
+        SessionTurnAdmissionPhase::Running => SessionState::Running,
+        SessionTurnAdmissionPhase::Completing => SessionState::Completing,
+        SessionTurnAdmissionPhase::ShuttingDown => SessionState::ShuttingDown,
+    }
+}
+
+fn apply_turn_admission_input(
+    authority: &Arc<std::sync::Mutex<SessionTurnAdmissionAuthority>>,
+    state_tx: &watch::Sender<SessionState>,
+    interrupt_notify: &tokio::sync::Notify,
+    input: SessionTurnAdmissionInput,
+) -> Result<
+    crate::session_turn_admission_authority::SessionTurnAdmissionTransition,
+    crate::session_turn_admission_authority::SessionTurnAdmissionError,
+> {
+    let mut authority = authority
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let transition = authority.apply(input)?;
+    state_tx.send_replace(map_turn_phase_to_session_state(transition.next_phase));
+    for effect in &transition.effects {
+        match effect {
+            SessionTurnAdmissionEffect::WakeInterrupt => interrupt_notify.notify_waiters(),
+        }
+    }
+    Ok(transition)
 }
 
 /// Canonical turn-admissibility disposition.
@@ -1762,6 +1816,18 @@ async fn session_task<A: SessionAgent>(
                 flow_tool_overlay,
                 execution_kind,
             } => {
+                let current_phase = {
+                    let guard = control.turn_admission.lock().unwrap_or_else(|poisoned| {
+                        tracing::warn!("session turn admission lock poisoned while reading phase");
+                        poisoned.into_inner()
+                    });
+                    guard.phase()
+                };
+                if current_phase == SessionTurnAdmissionPhase::ShuttingDown {
+                    let _ = result_tx.send(Err(meerkat_core::error::AgentError::Cancelled));
+                    continue;
+                }
+
                 let (restore_first_turn_pending, pending_initial_prompt, pending_tool_results) = {
                     let mut guard = lock_deferred_turn_state(&deferred_turn_state);
                     (
@@ -1798,8 +1864,12 @@ async fn session_task<A: SessionAgent>(
                         pending_initial_prompt,
                         pending_tool_results,
                     );
-                    control.turn_lock.store(false, Ordering::Release);
-                    control.interrupt_requested.store(false, Ordering::Release);
+                    let _ = apply_turn_admission_input(
+                        &control.turn_admission,
+                        &control.state_tx,
+                        &control.interrupt_notify,
+                        SessionTurnAdmissionInput::AbortAdmittedTurn,
+                    );
                     let _ = result_tx.send(Err(meerkat_core::error::AgentError::NoPendingBoundary));
                     continue;
                 }
@@ -1812,8 +1882,12 @@ async fn session_task<A: SessionAgent>(
                         pending_initial_prompt,
                         pending_tool_results,
                     );
-                    control.turn_lock.store(false, Ordering::Release);
-                    control.interrupt_requested.store(false, Ordering::Release);
+                    let _ = apply_turn_admission_input(
+                        &control.turn_admission,
+                        &control.state_tx,
+                        &control.interrupt_notify,
+                        SessionTurnAdmissionInput::AbortAdmittedTurn,
+                    );
                     let _ = result_tx.send(Err(error));
                     continue;
                 }
@@ -1825,12 +1899,33 @@ async fn session_task<A: SessionAgent>(
                         pending_initial_prompt,
                         pending_tool_results,
                     );
-                    control.turn_lock.store(false, Ordering::Release);
-                    control.interrupt_requested.store(false, Ordering::Release);
+                    let _ = apply_turn_admission_input(
+                        &control.turn_admission,
+                        &control.state_tx,
+                        &control.interrupt_notify,
+                        SessionTurnAdmissionInput::AbortAdmittedTurn,
+                    );
                     let _ = result_tx.send(Err(error));
                     continue;
                 }
-                control.state_tx.send_replace(SessionState::Running);
+                if let Err(error) = apply_turn_admission_input(
+                    &control.turn_admission,
+                    &control.state_tx,
+                    &control.interrupt_notify,
+                    SessionTurnAdmissionInput::BeginRun,
+                ) {
+                    let _ = agent.set_flow_tool_overlay(None);
+                    restore_deferred_turn_inputs(
+                        &deferred_turn_state,
+                        restore_first_turn_pending,
+                        pending_initial_prompt,
+                        pending_tool_results,
+                    );
+                    let _ = result_tx.send(Err(meerkat_core::error::AgentError::InternalError(
+                        format!("illegal begin-run transition: {error}"),
+                    )));
+                    continue;
+                }
                 let mut event_stream_open = true;
 
                 // Scope the pinned future so its mutable borrow of `agent` is
@@ -1881,7 +1976,16 @@ async fn session_task<A: SessionAgent>(
                         tokio::select! {
                             result = &mut run_fut => break result,
                             () = interrupt_wait => {
-                                if control.interrupt_requested.swap(false, Ordering::AcqRel) {
+                                let interrupt_pending = {
+                                    let guard = control.turn_admission.lock().unwrap_or_else(|poisoned| {
+                                        tracing::warn!(
+                                            "session turn admission lock poisoned while checking interrupt"
+                                        );
+                                        poisoned.into_inner()
+                                    });
+                                    guard.interrupt_pending()
+                                };
+                                if interrupt_pending {
                                     interrupted = true;
                                     break Err(meerkat_core::error::AgentError::Cancelled);
                                 }
@@ -1922,6 +2026,13 @@ async fn session_task<A: SessionAgent>(
                     r
                 }; // run_fut dropped here
 
+                let _ = apply_turn_admission_input(
+                    &control.turn_admission,
+                    &control.state_tx,
+                    &control.interrupt_notify,
+                    SessionTurnAdmissionInput::ResolveRun,
+                );
+
                 // Update cached summary
                 let snap = agent.snapshot();
                 control.summary_tx.send_replace(SessionSummaryCache {
@@ -1932,7 +2043,6 @@ async fn session_task<A: SessionAgent>(
                     last_assistant_text: snap.last_assistant_text,
                 });
 
-                control.state_tx.send_replace(SessionState::Idle);
                 // Release the turn lock AFTER setting state to Idle and
                 // updating the summary, so the next caller sees consistent state.
                 let result = if let Err(error) = agent.set_flow_tool_overlay(None) {
@@ -1944,9 +2054,28 @@ async fn session_task<A: SessionAgent>(
                 } else {
                     result
                 };
-                control.turn_lock.store(false, Ordering::Release);
-                control.interrupt_requested.store(false, Ordering::Release);
+                let finalize = apply_turn_admission_input(
+                    &control.turn_admission,
+                    &control.state_tx,
+                    &control.interrupt_notify,
+                    SessionTurnAdmissionInput::FinalizeTurn,
+                );
+                let shutting_down = match finalize {
+                    Ok(transition) => {
+                        transition.next_phase == SessionTurnAdmissionPhase::ShuttingDown
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            "failed to finalize session turn admission state"
+                        );
+                        false
+                    }
+                };
                 let _ = result_tx.send(result);
+                if shutting_down {
+                    break;
+                }
             }
             SessionCommand::ExportSession { reply_tx } => {
                 let _ = reply_tx.send(agent.session_clone());
@@ -1983,7 +2112,21 @@ async fn session_task<A: SessionAgent>(
                 let _ = reply_tx.send(agent.update_system_prompt(system_prompt));
             }
             SessionCommand::Shutdown => {
-                control.state_tx.send_replace(SessionState::ShuttingDown);
+                let phase = {
+                    let guard = control.turn_admission.lock().unwrap_or_else(|poisoned| {
+                        tracing::warn!("session turn admission lock poisoned while shutting down");
+                        poisoned.into_inner()
+                    });
+                    guard.phase()
+                };
+                if phase != SessionTurnAdmissionPhase::ShuttingDown {
+                    let _ = apply_turn_admission_input(
+                        &control.turn_admission,
+                        &control.state_tx,
+                        &control.interrupt_notify,
+                        SessionTurnAdmissionInput::RequestShutdown,
+                    );
+                }
                 break;
             }
         }

@@ -228,7 +228,7 @@ Professional, concise, action-oriented. Always provide next steps.
 │  Budget:    50K tokens / 50 tool calls                      │
 │                                                            │
 │  Tools:                                                    │
-│  ├── Built-in: task_create, task_list, task_update, wait   │
+│  ├── Built-in: task_create, task_list, task_update, datetime │
 │  ├── Domain:   search_docs, create_ticket                  │
 │  └── (Optional: shell, MCP, comms, delegated work)        │
 │                                                            │

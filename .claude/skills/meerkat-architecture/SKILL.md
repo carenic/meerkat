@@ -170,13 +170,15 @@ should opt into `RuntimeBuildMode::StandaloneEphemeral` explicitly.
 - `destroy` — terminal state, no recovery
 - `runtime_state` — query current state (Initializing/Idle/Running/Recovering/Retired/Stopped/Destroyed)
 
-**Policy engine:** `DefaultPolicyTable` resolves `PolicyDecision` per input kind × runtime state. 9 input kinds (prompt, peer_message, peer_request, peer_response_progress, peer_response_terminal, flow_step, external_event, continuation, operation) × 2 states (idle, running). Each cell specifies ApplyMode, WakeMode, QueueMode, ConsumePoint, InterruptPolicy, DrainPolicy, RoutingDisposition.
+**Policy engine:** `DefaultPolicyTable` resolves `PolicyDecision` per input kind × runtime state. 9 input kinds (prompt, peer_message, peer_request, peer_response_progress, peer_response_terminal, flow_step, external_event, continuation, operation) × 2 states (idle, running). Each cell specifies ApplyMode, WakeMode, QueueMode, ConsumePoint, DrainPolicy, RoutingDisposition.
 
 **Peer handling_mode override:** `PeerInput` with `Message`, `Request`, or no convention may carry an explicit `handling_mode` (`Queue` or `Steer`) that overrides kind-based policy defaults. `ResponseProgress` and `ResponseTerminal` MUST NOT carry `handling_mode` — enforced by `validate_peer_handling_mode` at runtime admission. Built-in comms bridges default to `None` (kind-based policy).
 
-**Silent intent override:** If an incoming peer intent matches the session's `silent_comms_intents` list, the policy is overridden to `ApplyMode::Ignore`, `WakeMode::None` — no LLM turn triggered. This is canonical runtime-owned behavior.
+**Silent intent override:** `silent_comms_intents` still exists as a generic runtime feature, but mob lifecycle must not depend on string matching for canonical routing. `mob.peer_added`, `mob.peer_retired`, and `mob.peer_unwired` are typed silent lifecycle inputs; `mob.kickoff_failed` and `mob.kickoff_cancelled` are typed visible lifecycle inputs.
 
-**Keep-alive drain ownership:** The runtime owns the comms drain lifecycle via `CommsDrainLifecycleAuthority`. `maybe_spawn_comms_drain` spawns on `keep_alive=true` and aborts on `keep_alive=false`. The direct session-service path (substrate) does not support keep-alive — only runtime-backed surfaces can.
+**Peer ingress ownership:** The runtime owns the comms drain lifecycle via `CommsDrainLifecycleAuthority`. Surfaces provide `keep_alive` + comms context through `update_peer_ingress_context()`, and the adapter reconciles the canonical mode: `AttachedSession` while runtime-backed sessions are live, `PersistentHost` only for idle `keep_alive=true`. The direct session-service path (substrate) does not support keep-alive — only runtime-backed surfaces can.
+
+**Delegate semantics:** `delegate()` is communication-first. It spawns and auto-wires a helper, delivers the opening prompt via the existing initial-message path, and then parent/helper communicate via ordinary comms. There is no hidden task contract or peer reservation stream. If the helper fails during bootstrap before it can reliably report for itself, the bridge emits a typed lifecycle notice and durable kickoff state records the failure.
 
 **Detached-op wake:** idle keep-alive wake from background shell completions is runtime-owned. `DetachedWakeState` (`pending`, `signaled`, `notify`) sits beside the runtime loop; terminal detached ops fire `notify`, and the runtime injects `ContinuationInput::detached_background_op_completed()`. Do not spawn surface-local waker tasks or side channels for this.
 

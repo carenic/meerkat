@@ -903,7 +903,6 @@ impl CoreCommsRuntime for LocalCommsRuntime {
     async fn send(&self, _cmd: CommsCommand) -> Result<SendReceipt, SendError> {
         Ok(SendReceipt::InputAccepted {
             interaction_id: InteractionId(uuid::Uuid::nil()),
-            stream_reserved: false,
         })
     }
 
@@ -913,6 +912,10 @@ impl CoreCommsRuntime for LocalCommsRuntime {
 
     fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
         self.notify.clone()
+    }
+
+    async fn drain_peer_input_candidates(&self) -> Vec<meerkat_core::PeerInputCandidate> {
+        Vec::new()
     }
 }
 
@@ -2189,7 +2192,6 @@ mod tests {
         async fn send(&self, _cmd: CommsCommand) -> Result<SendReceipt, SendError> {
             Ok(SendReceipt::InputAccepted {
                 interaction_id: meerkat_core::interaction::InteractionId(uuid::Uuid::nil()),
-                stream_reserved: false,
             })
         }
 
@@ -2199,6 +2201,10 @@ mod tests {
 
         fn inbox_notify(&self) -> Arc<Notify> {
             self.notify.clone()
+        }
+
+        async fn drain_peer_input_candidates(&self) -> Vec<meerkat_core::PeerInputCandidate> {
+            Vec::new()
         }
     }
 

@@ -252,7 +252,7 @@ Standard strings are parsed into their enum variants; unknown strings become `Cu
 Two tools are exposed to the LLM when comms is enabled.
 
 <Accordion title="send (kind=peer_message)">
-Send a fire-and-forget text message to a peer.
+Send the normal collaboration message to a peer.
 
 <ParamField path="to" type="string" required>
   Peer name to send message to.
@@ -266,11 +266,15 @@ Send a fire-and-forget text message to a peer.
   Message content.
 </ParamField>
 
+<ParamField path="handling_mode" type="string" required>
+  Delivery mode. Use `"queue"` for ordinary delivery or `"steer"` for immediate steer processing on runtime-backed sessions.
+</ParamField>
+
 **Response**: `{"status": "sent"}`
 </Accordion>
 
 <Accordion title="send (kind=peer_request)">
-Send a request to a peer. The sender waits for an ACK (not the response itself).
+Send a structured ask to a peer when you want explicit `intent + params` and a correlated `peer_response`.
 
 <ParamField path="to" type="string" required>
   Peer name to send request to.
@@ -288,7 +292,15 @@ Send a request to a peer. The sender waits for an ACK (not the response itself).
   Request parameters. Defaults to `null`.
 </ParamField>
 
+<ParamField path="handling_mode" type="string" required>
+  Delivery mode. Use `"queue"` for ordinary delivery or `"steer"` for immediate steer processing on runtime-backed sessions.
+</ParamField>
+
 **Response**: `{"status": "sent"}`
+
+<Note>
+Use `peer_message` by default for ordinary collaboration. `peer_request` is for structured ask/reply semantics only. It is not task tracking, a stronger delivery mode, or a reserved response channel.
+</Note>
 </Accordion>
 
 <Accordion title="send (kind=peer_response)">
@@ -555,7 +567,9 @@ let agent = AgentBuilder::new()
 let mut comms_agent = CommsAgent::new(agent, comms_manager);
 
 // Run with comms inbox draining
-let result = comms_agent.run("Use send with kind=peer_message to greet agent-b".to_string()).await?;
+let result = comms_agent
+    .run("Use send with kind=peer_message and handling_mode=queue to greet agent-b".to_string())
+    .await?;
 
 // Or run in stay-alive mode
 let result = comms_agent.run_stay_alive("You are a coordinator.".to_string(), None).await?;
@@ -606,27 +620,24 @@ Incoming messages are formatted as text for the LLM:
 - **Request**: `[COMMS REQUEST from <peer> (id: <uuid>)]\nIntent: <intent>\nParams: <json>\n\nTo respond, use send with kind=peer_response, peer="<peer>", request_id="<uuid>"`
 - **Response**: `[COMMS RESPONSE from <peer> (to request: <uuid>)]\nStatus: <status>\nResult: <json>`
 
-## Silent comms intents
+## Typed peer lifecycle notices
 
-Some comms intents are informational and should not trigger an LLM turn. For example, `mob.peer_added` and `mob.peer_retired` notifications tell the agent about peer lifecycle changes but don't require a response.
+Some peer lifecycle notices are informational and should not trigger an LLM turn. Mob lifecycle routing is now typed at peer ingress instead of relying on `silent_comms_intents` folklore:
 
-Silent comms intents are configured via `AgentBuildConfig.silent_comms_intents`. When a `Request` arrives whose `intent` matches a silent intent, it is injected into the session context (like a response) instead of being processed through the LLM. This avoids wasting an LLM turn on a notification that the prompt already says to ignore.
+- `mob.peer_added`
+- `mob.peer_retired`
+- `mob.peer_unwired`
 
-```rust
-let mut config = AgentBuildConfig::new("claude-sonnet-4-5");
-config.silent_comms_intents = vec![
-    "mob.peer_added".into(),
-    "mob.peer_retired".into(),
-];
-```
+These are injected as lifecycle context, not ordinary actionable requests.
 
-Mob meerkats have `mob.peer_added` and `mob.peer_retired` configured as silent intents by default.
+Kickoff anomalies are different:
 
-<Note>
-Silent intents are only checked in the host-mode classification phase. Non-matching intents are processed normally through the LLM.
-</Note>
+- `mob.kickoff_failed`
+- `mob.kickoff_cancelled`
 
-Peer lifecycle notifications (`mob.peer_added`, `mob.peer_retired`) are compacted per inbox drain cycle into a single `[PEER UPDATE]` session entry. This compaction is presentation-only: the underlying comms request stream remains one event per peer change.
+These are visible lifecycle notices because they tell the parent or wired peers that a helper's initial autonomous turn failed before it could reliably report for itself.
+
+Peer lifecycle notifications are compacted per inbox drain cycle into a single `[PEER UPDATE]` session entry. This compaction is presentation-only: the underlying comms request stream remains one event per peer change.
 
 You can also control whether these peer lifecycle updates are inlined by peer-count threshold using `max_inline_peer_notifications`:
 

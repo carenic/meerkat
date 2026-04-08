@@ -636,7 +636,13 @@ async fn main() -> anyhow::Result<()> {
                                     event_tx.clone(),
                                 )
                             });
-                        let _ = tx.send(MessageKind::Message { body, blocks: None }).await;
+                        let _ = tx
+                            .send(MessageKind::Message {
+                                body,
+                                blocks: None,
+                                handling_mode: None,
+                            })
+                            .await;
                     }
                     AppCommand::SlashCmd {
                         target_peer,
@@ -658,6 +664,7 @@ async fn main() -> anyhow::Result<()> {
                             .send(MessageKind::Request {
                                 intent: "command".into(),
                                 params,
+                                handling_mode: None,
                             })
                             .await;
                     }
@@ -1121,7 +1128,13 @@ async fn spawn_command_processor(
                             event_tx.clone(),
                         )
                     });
-                let _ = tx.send(MessageKind::Message { body, blocks: None }).await;
+                let _ = tx
+                    .send(MessageKind::Message {
+                        body,
+                        blocks: None,
+                        handling_mode: None,
+                    })
+                    .await;
             }
             AppCommand::SlashCmd {
                 target_peer,
@@ -1143,6 +1156,7 @@ async fn spawn_command_processor(
                     .send(MessageKind::Request {
                         intent: "command".into(),
                         params,
+                        handling_mode: None,
                     })
                     .await;
             }

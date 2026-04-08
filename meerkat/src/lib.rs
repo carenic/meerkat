@@ -150,9 +150,8 @@ pub use meerkat_core::SessionServiceControlExt;
 pub use meerkat_core::SessionServiceHistoryExt;
 #[cfg(feature = "comms")]
 pub use meerkat_core::{
-    CommsCommand, EventStream, InputSource, InputStreamMode, PeerDirectoryEntry,
-    PeerDirectorySource, PeerName, SendAndStreamError, SendError, SendReceipt, StreamError,
-    StreamScope,
+    CommsCommand, EventStream, InputSource, PeerDirectoryEntry, PeerDirectorySource, PeerName,
+    SendError, SendReceipt, StreamError, StreamScope,
 };
 
 // Re-export client types

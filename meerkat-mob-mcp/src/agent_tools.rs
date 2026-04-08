@@ -27,7 +27,7 @@ use ::tokio::sync::RwLock;
 use tokio_with_wasm::alias::sync::RwLock;
 
 use crate::MobMcpState;
-use meerkat_core::comms::{CommsCommand, InputStreamMode, PeerName};
+use meerkat_core::comms::{CommsCommand, PeerName};
 
 // ─── Tool name constants ─────────────────────────────────────────────────
 
@@ -104,7 +104,7 @@ impl AgentMobToolSurface {
                     "role": role,
                     "description": description,
                 }),
-                stream: InputStreamMode::None,
+                handling_mode: meerkat_core::types::HandlingMode::Queue,
             })
             .await
             .is_ok()
@@ -1102,7 +1102,7 @@ mod tests {
                     to,
                     intent,
                     params,
-                    stream,
+                    handling_mode: _,
                 } => {
                     let trusted = self.trusted.read().await;
                     if !trusted.values().any(|peer| peer.name == to.as_str()) {
@@ -1124,12 +1124,8 @@ mod tests {
                     });
                     recipient.notify.notify_waiters();
                     Ok(SendReceipt::PeerRequestSent {
+                        request_id: InteractionId(uuid::Uuid::new_v4()),
                         envelope_id: uuid::Uuid::new_v4(),
-                        interaction_id: InteractionId(uuid::Uuid::new_v4()),
-                        stream_reserved: !matches!(
-                            stream,
-                            meerkat_core::comms::InputStreamMode::None
-                        ),
                     })
                 }
                 unsupported => Err(SendError::Unsupported(format!(
@@ -1165,6 +1161,18 @@ mod tests {
 
         fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
             self.notify.clone()
+        }
+
+        async fn drain_peer_input_candidates(&self) -> Vec<meerkat_core::PeerInputCandidate> {
+            self.drain_inbox_interactions()
+                .await
+                .into_iter()
+                .map(|interaction| meerkat_core::PeerInputCandidate {
+                    interaction,
+                    class: meerkat_core::PeerInputClass::ActionableRequest,
+                    lifecycle_peer: None,
+                })
+                .collect()
         }
 
         async fn drain_inbox_interactions(&self) -> Vec<InboxInteraction> {

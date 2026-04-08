@@ -335,7 +335,12 @@ async peers(): Promise<Array<Record<string, unknown>>>
 Scope comms operations to this session. Requires the `comms` capability.
 
 ```typescript
-await session.send({ kind: "peer_message", to: "agent-b", body: "Hello!" });
+await session.send({
+  kind: "peer_message",
+  to: "agent-b",
+  body: "Hello!",
+  handling_mode: "queue",
+});
 const peers = await session.peers();
 ```
 
@@ -368,7 +373,12 @@ console.log(client.capabilities);
 
 // Check a single capability
 if (client.hasCapability("comms")) {
-  await session.send({ kind: "peer_message", to: "agent-b", body: "Hi" });
+  await session.send({
+    kind: "peer_message",
+    to: "agent-b",
+    body: "Hi",
+    handling_mode: "queue",
+  });
 }
 
 // Assert and throw if unavailable

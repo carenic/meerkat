@@ -477,7 +477,7 @@ async fn apply_runtime_turn(
                 let comms_rt = context.service.comms_runtime(session_id).await;
                 context
                     .runtime_adapter
-                    .maybe_spawn_comms_drain(session_id, keep_alive, comms_rt)
+                    .update_peer_ingress_context(session_id, keep_alive, comms_rt)
                     .await;
             }
             context
@@ -539,14 +539,6 @@ impl CoreExecutor for McpSessionRuntimeExecutor {
                 .context
                 .service
                 .interrupt(&self.session_id)
-                .await
-                .map_err(|error| CoreExecutorError::ControlFailed {
-                    reason: error.to_string(),
-                }),
-            RunControlCommand::InterruptYielding => self
-                .context
-                .service
-                .interrupt_yielding(&self.session_id)
                 .await
                 .map_err(|error| CoreExecutorError::ControlFailed {
                     reason: error.to_string(),

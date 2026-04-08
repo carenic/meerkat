@@ -1,5 +1,10 @@
 use super::*;
 use crate::MobRuntimeMode;
+use crate::roster::MobMemberKickoffSnapshot;
+use crate::runtime::mob_member_lifecycle_authority::{
+    CanonicalMemberSnapshotMaterial, CanonicalMemberStatus, CanonicalSessionObservation,
+    MobMemberLifecycleAuthority, MobMemberLifecycleInput, MobMemberTerminalClass,
+};
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -38,6 +43,9 @@ pub struct MobMemberSnapshot {
     /// Live comms connectivity for currently wired peers, when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_connectivity: Option<MobPeerConnectivitySnapshot>,
+    /// Initial autonomous-turn kickoff state, when this member has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kickoff: Option<MobMemberKickoffSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +70,8 @@ pub struct MobMemberListEntry {
     pub is_final: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kickoff: Option<MobMemberKickoffSnapshot>,
 }
 
 impl MobMemberListEntry {
@@ -238,31 +248,6 @@ impl From<MeerkatId> for PeerTarget {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CanonicalMemberStatus {
-    Unknown,
-    Active,
-    Retiring,
-    Broken,
-    Completed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CanonicalSessionObservation {
-    Active,
-    Inactive,
-    Missing,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MobMemberTerminalClass {
-    Running,
-    TerminalFailure,
-    TerminalUnknown,
-    TerminalCompleted,
-}
-
 struct MobMemberTerminalClassifier;
 
 impl MobMemberTerminalClassifier {
@@ -297,48 +282,6 @@ impl MobMemberTerminalClassifier {
 
     fn has_canonical_member(material: &CanonicalMemberSnapshotMaterial) -> bool {
         material.member_present
-    }
-}
-
-#[derive(Debug, Clone)]
-struct CanonicalMemberSnapshotMaterial {
-    member_present: bool,
-    status: CanonicalMemberStatus,
-    session_observation: CanonicalSessionObservation,
-    error: Option<String>,
-    output_preview: Option<String>,
-    tokens_used: u64,
-    current_session_id: Option<SessionId>,
-    peer_connectivity: Option<MobPeerConnectivitySnapshot>,
-}
-
-impl CanonicalMemberSnapshotMaterial {
-    fn to_snapshot(&self) -> MobMemberSnapshot {
-        let status = match self.status {
-            CanonicalMemberStatus::Unknown => MobMemberStatus::Unknown,
-            CanonicalMemberStatus::Active => MobMemberStatus::Active,
-            CanonicalMemberStatus::Retiring => MobMemberStatus::Retiring,
-            CanonicalMemberStatus::Broken => MobMemberStatus::Broken,
-            CanonicalMemberStatus::Completed => MobMemberStatus::Completed,
-        };
-        let is_final = MobMemberTerminalClassifier::is_terminal(self);
-        MobMemberSnapshot {
-            status,
-            output_preview: self.output_preview.clone(),
-            error: self.error.clone(),
-            tokens_used: self.tokens_used,
-            is_final,
-            current_session_id: self.current_session_id.clone(),
-            peer_connectivity: self.peer_connectivity.clone(),
-        }
-    }
-
-    fn to_helper_result(&self) -> HelperResult {
-        HelperResult {
-            output: self.output_preview.clone(),
-            tokens_used: self.tokens_used,
-            session_id: self.current_session_id.clone(),
-        }
     }
 }
 
@@ -699,18 +642,20 @@ impl MobHandle {
         let mut projected = Vec::with_capacity(entries.len());
         for entry in entries {
             let snapshot = self.member_status(&entry.meerkat_id).await.ok();
-            let (status, error, is_final, current_session_id) = match snapshot {
+            let (status, error, is_final, current_session_id, kickoff) = match snapshot {
                 Some(snapshot) => (
                     snapshot.status,
                     snapshot.error,
                     snapshot.is_final,
                     snapshot.current_session_id,
+                    snapshot.kickoff,
                 ),
                 None => (
                     MobMemberStatus::Unknown,
                     None,
                     true,
                     entry.session_id().cloned(),
+                    None,
                 ),
             };
             projected.push(MobMemberListEntry {
@@ -727,6 +672,7 @@ impl MobHandle {
                 error,
                 is_final,
                 current_session_id,
+                kickoff,
             });
         }
         projected
@@ -1505,56 +1451,49 @@ impl MobHandle {
                 .get(meerkat_id)
                 .cloned()
         };
-
         if let Some(diag) = restore_failure {
-            let member_present = roster_state.is_some();
-            return CanonicalMemberSnapshotMaterial {
-                member_present,
-                status: if member_present {
-                    CanonicalMemberStatus::Broken
-                } else {
-                    CanonicalMemberStatus::Unknown
-                },
+            return MobMemberLifecycleAuthority::materialize(MobMemberLifecycleInput {
+                member_present: roster_state.is_some(),
+                roster_state,
                 session_observation: CanonicalSessionObservation::Missing,
-                error: Some(diag.reason),
+                restore_failure: Some(diag.reason),
                 output_preview: None,
                 tokens_used: 0,
                 current_session_id: Some(diag.session_id),
                 peer_connectivity: None,
-            };
+                kickoff: roster_entry
+                    .as_ref()
+                    .and_then(|entry| entry.kickoff.clone()),
+            });
         }
 
         match (roster_state, current_session_id) {
-            (None, _) => CanonicalMemberSnapshotMaterial {
+            (None, _) => MobMemberLifecycleAuthority::materialize(MobMemberLifecycleInput {
                 member_present: false,
-                status: CanonicalMemberStatus::Unknown,
+                roster_state: None,
                 session_observation: CanonicalSessionObservation::Missing,
-                error: None,
+                restore_failure: None,
                 output_preview: None,
                 tokens_used: 0,
                 current_session_id: None,
                 peer_connectivity: None,
-            },
-            (Some(crate::roster::MemberState::Retiring), None) => CanonicalMemberSnapshotMaterial {
-                member_present: true,
-                status: CanonicalMemberStatus::Retiring,
-                session_observation: CanonicalSessionObservation::Missing,
-                error: None,
-                output_preview: None,
-                tokens_used: 0,
-                current_session_id: None,
-                peer_connectivity: None,
-            },
-            (Some(crate::roster::MemberState::Active), None) => CanonicalMemberSnapshotMaterial {
-                member_present: true,
-                status: CanonicalMemberStatus::Completed,
-                session_observation: CanonicalSessionObservation::Missing,
-                error: None,
-                output_preview: None,
-                tokens_used: 0,
-                current_session_id: None,
-                peer_connectivity: None,
-            },
+                kickoff: None,
+            }),
+            (Some(roster_state), None) => {
+                MobMemberLifecycleAuthority::materialize(MobMemberLifecycleInput {
+                    member_present: true,
+                    roster_state: Some(roster_state),
+                    session_observation: CanonicalSessionObservation::Missing,
+                    restore_failure: None,
+                    output_preview: None,
+                    tokens_used: 0,
+                    current_session_id: None,
+                    peer_connectivity: None,
+                    kickoff: roster_entry
+                        .as_ref()
+                        .and_then(|entry| entry.kickoff.clone()),
+                })
+            }
             (Some(roster_state), Some(session_id)) => {
                 let (output_preview, tokens_used, observation) =
                     match self.session_service.read(&session_id).await {
@@ -1572,25 +1511,6 @@ impl MobHandle {
                         }
                         Err(_) => (None, 0, CanonicalSessionObservation::Unknown),
                     };
-                let status = match observation {
-                    CanonicalSessionObservation::Active => match roster_state {
-                        crate::roster::MemberState::Active => CanonicalMemberStatus::Active,
-                        crate::roster::MemberState::Retiring => CanonicalMemberStatus::Retiring,
-                    },
-                    CanonicalSessionObservation::Inactive => match roster_state {
-                        crate::roster::MemberState::Active => CanonicalMemberStatus::Active,
-                        crate::roster::MemberState::Retiring => CanonicalMemberStatus::Retiring,
-                    },
-                    CanonicalSessionObservation::Missing => match roster_state {
-                        crate::roster::MemberState::Active => CanonicalMemberStatus::Completed,
-                        crate::roster::MemberState::Retiring => CanonicalMemberStatus::Retiring,
-                    },
-                    // Transport/read faults are not terminal truth.
-                    CanonicalSessionObservation::Unknown => match roster_state {
-                        crate::roster::MemberState::Active => CanonicalMemberStatus::Active,
-                        crate::roster::MemberState::Retiring => CanonicalMemberStatus::Retiring,
-                    },
-                };
                 let peer_connectivity = match roster_entry.as_ref() {
                     Some(entry) => {
                         self.resolve_peer_connectivity(entry, &session_id, &roster_snapshot)
@@ -1598,16 +1518,17 @@ impl MobHandle {
                     }
                     None => None,
                 };
-                CanonicalMemberSnapshotMaterial {
+                MobMemberLifecycleAuthority::materialize(MobMemberLifecycleInput {
                     member_present: true,
-                    status,
+                    roster_state: Some(roster_state),
                     session_observation: observation,
-                    error: None,
+                    restore_failure: None,
                     output_preview,
                     tokens_used,
                     current_session_id: Some(session_id),
                     peer_connectivity,
-                }
+                    kickoff: roster_entry.and_then(|entry| entry.kickoff),
+                })
             }
         }
     }

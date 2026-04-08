@@ -30,9 +30,6 @@ pub enum ApplyMode {
 pub enum WakeMode {
     /// Wake the runtime if idle.
     WakeIfIdle,
-    /// Interrupt cooperative yielding points (e.g., wait tool) but don't
-    /// cancel active work or wake an idle runtime.
-    InterruptYielding,
     /// Do not wake (input will be processed at next natural run).
     None,
 }
@@ -71,16 +68,6 @@ pub enum ConsumePoint {
     ExplicitAck,
 }
 
-/// Whether admitted work may interrupt a yielding runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum InterruptPolicy {
-    #[default]
-    None,
-    InterruptYielding,
-}
-
 /// How the runtime should drain admitted work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -116,9 +103,6 @@ pub struct PolicyDecision {
     pub queue_mode: QueueMode,
     /// When the input is consumed.
     pub consume_point: ConsumePoint,
-    /// Whether yielding work may be interrupted.
-    #[serde(default)]
-    pub interrupt_policy: InterruptPolicy,
     /// How runtime drain ownership should handle this work.
     #[serde(default)]
     pub drain_policy: DrainPolicy,
@@ -160,11 +144,7 @@ mod tests {
 
     #[test]
     fn wake_mode_serde() {
-        for mode in [
-            WakeMode::WakeIfIdle,
-            WakeMode::InterruptYielding,
-            WakeMode::None,
-        ] {
+        for mode in [WakeMode::WakeIfIdle, WakeMode::None] {
             let json = serde_json::to_value(mode).unwrap();
             let parsed: WakeMode = serde_json::from_value(json).unwrap();
             assert_eq!(mode, parsed);
@@ -198,15 +178,6 @@ mod tests {
             let json = serde_json::to_value(point).unwrap();
             let parsed: ConsumePoint = serde_json::from_value(json).unwrap();
             assert_eq!(point, parsed);
-        }
-    }
-
-    #[test]
-    fn interrupt_policy_serde() {
-        for policy in [InterruptPolicy::None, InterruptPolicy::InterruptYielding] {
-            let json = serde_json::to_value(policy).unwrap();
-            let parsed: InterruptPolicy = serde_json::from_value(json).unwrap();
-            assert_eq!(policy, parsed);
         }
     }
 
@@ -245,7 +216,6 @@ mod tests {
             wake_mode: WakeMode::WakeIfIdle,
             queue_mode: QueueMode::Fifo,
             consume_point: ConsumePoint::OnRunComplete,
-            interrupt_policy: InterruptPolicy::None,
             drain_policy: DrainPolicy::QueueNextTurn,
             routing_disposition: RoutingDisposition::Queue,
             record_transcript: true,
@@ -264,7 +234,6 @@ mod tests {
             wake_mode: WakeMode::None,
             queue_mode: QueueMode::None,
             consume_point: ConsumePoint::OnAccept,
-            interrupt_policy: InterruptPolicy::None,
             drain_policy: DrainPolicy::Ignore,
             routing_disposition: RoutingDisposition::Drop,
             record_transcript: false,

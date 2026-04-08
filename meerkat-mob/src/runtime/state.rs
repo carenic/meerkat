@@ -110,6 +110,11 @@ pub(super) enum MobCommand {
         meerkat_ids: Vec<MeerkatId>,
         reply_tx: oneshot::Sender<Vec<(MeerkatId, tokio::sync::watch::Receiver<bool>)>>,
     },
+    KickoffOutcomeResolved {
+        meerkat_id: MeerkatId,
+        outcome: meerkat_runtime::completion::CompletionOutcome,
+        ack_tx: oneshot::Sender<()>,
+    },
     RunFlow {
         flow_id: FlowId,
         activation_params: serde_json::Value,

@@ -2,13 +2,17 @@
 //!
 //! Runs synchronously in the sending task using receiver-owned trust/auth state.
 
-use crate::agent::types::MessageIntent;
 use crate::inproc::InprocRegistry;
+use crate::peer_comms_authority::{
+    PeerCommsAuthority, PeerCommsEffect, PeerCommsInput, PeerCommsMutator,
+};
 use crate::trust::TrustedPeers;
-use crate::types::{InboxItem, MessageKind};
+use crate::types::InboxItem;
 use meerkat_core::PeerInputClass;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::error;
 
 /// Receiver-owned context for synchronous ingress classification.
 ///
@@ -18,108 +22,77 @@ pub(crate) struct IngressClassificationContext {
     pub(crate) require_peer_auth: bool,
     pub(crate) trusted_peers: Arc<parking_lot::RwLock<TrustedPeers>>,
     pub(crate) silent_intents: Arc<HashSet<String>>,
+    pub(crate) dismiss_flag: Arc<AtomicBool>,
 }
 
-/// Result of classifying an inbox item.
-///
-/// `None` from `classify()` means the item should be dropped at ingress
-/// (e.g., untrusted sender when `require_peer_auth` is enabled).
+/// Result of classifying an inbox item for enqueue.
 pub(crate) struct ClassificationResult {
     pub(crate) class: PeerInputClass,
     pub(crate) from_peer: Option<String>,
     pub(crate) lifecycle_peer: Option<String>,
+    pub(crate) normalized_handling_mode: meerkat_core::types::HandlingMode,
+}
+
+pub(crate) enum ClassificationDecision {
+    Drop,
+    SetDismissFlag,
+    Enqueue(ClassificationResult),
 }
 
 impl IngressClassificationContext {
-    /// Classify an inbox item. Returns `None` when the item should be dropped
-    /// at ingress (untrusted sender with `require_peer_auth` enabled).
-    pub(crate) fn classify(&self, item: &InboxItem) -> Option<ClassificationResult> {
-        match item {
+    /// Classify an inbox item through the canonical PeerComms authority.
+    pub(crate) fn classify(&self, item: &InboxItem) -> ClassificationDecision {
+        let mut authority = PeerCommsAuthority::new();
+        let transition = match item {
             InboxItem::External { envelope } => {
                 let trusted = self.trusted_peers.read();
-                let from_peer = trusted.get_peer(&envelope.from).map(|p| p.name.clone());
-
-                if self.require_peer_auth && from_peer.is_none() {
-                    // Drop untrusted input at ingress. Snapshot semantics:
-                    // later trust additions do not resurrect this item.
-                    return None;
-                }
-
-                let from_name = from_peer.unwrap_or_else(|| {
+                let trusted_sender_name = trusted.get_peer(&envelope.from).map(|p| p.name.clone());
+                let fallback_sender_name = trusted_sender_name.clone().unwrap_or_else(|| {
                     InprocRegistry::global()
                         .get_name_by_pubkey(&envelope.from)
                         .unwrap_or_else(|| envelope.from.to_peer_id())
                 });
-
-                Some(match &envelope.kind {
-                    MessageKind::Message { .. } => ClassificationResult {
-                        class: PeerInputClass::ActionableMessage,
-                        from_peer: Some(from_name),
-                        lifecycle_peer: None,
-                    },
-                    MessageKind::Request { intent, params } => {
-                        let typed_intent = MessageIntent::from(intent.as_str());
-                        match typed_intent {
-                            MessageIntent::PeerAdded => {
-                                let peer = params
-                                    .get("peer")
-                                    .and_then(|v| v.as_str())
-                                    .filter(|s| !s.is_empty())
-                                    .unwrap_or(from_name.as_str())
-                                    .to_string();
-                                ClassificationResult {
-                                    class: PeerInputClass::PeerLifecycleAdded,
-                                    from_peer: Some(from_name),
-                                    lifecycle_peer: Some(peer),
-                                }
-                            }
-                            MessageIntent::PeerRetired => {
-                                let peer = params
-                                    .get("peer")
-                                    .and_then(|v| v.as_str())
-                                    .filter(|s| !s.is_empty())
-                                    .unwrap_or(from_name.as_str())
-                                    .to_string();
-                                ClassificationResult {
-                                    class: PeerInputClass::PeerLifecycleRetired,
-                                    from_peer: Some(from_name),
-                                    lifecycle_peer: Some(peer),
-                                }
-                            }
-                            // Check silent intents against the wire string, not
-                            // just the Custom variant. This preserves the pre-0.4.10
-                            // behavior where silent_comms_intents matched built-in
-                            // intent names like "review", "status", etc.
-                            _ if self.silent_intents.contains(intent.as_str()) => {
-                                ClassificationResult {
-                                    class: PeerInputClass::SilentRequest,
-                                    from_peer: Some(from_name),
-                                    lifecycle_peer: None,
-                                }
-                            }
-                            _ => ClassificationResult {
-                                class: PeerInputClass::ActionableRequest,
-                                from_peer: Some(from_name),
-                                lifecycle_peer: None,
-                            },
-                        }
-                    }
-                    MessageKind::Response { .. } => ClassificationResult {
-                        class: PeerInputClass::Response,
-                        from_peer: Some(from_name),
-                        lifecycle_peer: None,
-                    },
-                    MessageKind::Ack { .. } => ClassificationResult {
-                        class: PeerInputClass::Ack,
-                        from_peer: Some(from_name),
-                        lifecycle_peer: None,
-                    },
+                authority.apply(PeerCommsInput::ClassifyExternalEnvelope {
+                    require_peer_auth: self.require_peer_auth,
+                    trusted_sender_name,
+                    fallback_sender_name,
+                    message_kind: envelope.kind.clone(),
+                    silent_intents: (*self.silent_intents).clone(),
                 })
             }
-            InboxItem::PlainEvent { .. } => Some(ClassificationResult {
-                class: PeerInputClass::PlainEvent,
-                from_peer: None,
-                lifecycle_peer: None,
+            InboxItem::PlainEvent {
+                source,
+                handling_mode,
+                ..
+            } => authority.apply(PeerCommsInput::ClassifyPlainEvent {
+                source_name: source.to_string(),
+                handling_mode: *handling_mode,
+            }),
+        };
+        let transition = match transition {
+            Ok(transition) => transition,
+            Err(err) => {
+                error!(?err, "peer comms authority rejected ingress classification");
+                return ClassificationDecision::Drop;
+            }
+        };
+
+        match transition.effects.into_iter().next() {
+            Some(PeerCommsEffect::DropIngress) | None => ClassificationDecision::Drop,
+            Some(PeerCommsEffect::SetDismissFlag) => {
+                self.dismiss_flag.store(true, Ordering::SeqCst);
+                ClassificationDecision::SetDismissFlag
+            }
+            Some(PeerCommsEffect::EnqueueClassifiedEntry {
+                class,
+                from_peer,
+                lifecycle_peer,
+                normalized_handling_mode,
+            }) => ClassificationDecision::Enqueue(ClassificationResult {
+                class,
+                from_peer,
+                lifecycle_peer,
+                normalized_handling_mode,
             }),
         }
     }
@@ -129,9 +102,12 @@ impl IngressClassificationContext {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::agent::types::MessageIntent;
     use crate::identity::{Keypair, PubKey, Signature};
     use crate::trust::TrustedPeer;
-    use crate::types::Envelope;
+    use crate::types::{Envelope, MessageKind};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     use uuid::Uuid;
 
     fn make_keypair() -> Keypair {
@@ -147,6 +123,15 @@ mod tests {
             require_peer_auth,
             trusted_peers: Arc::new(parking_lot::RwLock::new(trusted_peers)),
             silent_intents: Arc::new(silent_intents.into_iter().map(String::from).collect()),
+            dismiss_flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn expect_enqueue(result: ClassificationDecision) -> ClassificationResult {
+        match result {
+            ClassificationDecision::Enqueue(result) => result,
+            ClassificationDecision::Drop => panic!("expected enqueue, got drop"),
+            ClassificationDecision::SetDismissFlag => panic!("expected enqueue, got dismiss"),
         }
     }
 
@@ -181,10 +166,11 @@ mod tests {
             MessageKind::Message {
                 blocks: None,
                 body: "hello".to_string(),
+                handling_mode: None,
             },
         );
         let item = InboxItem::External { envelope };
-        let result = ctx.classify(&item).expect("should classify");
+        let result = expect_enqueue(ctx.classify(&item));
         assert_eq!(result.class, PeerInputClass::ActionableMessage);
         assert_eq!(result.from_peer.as_deref(), Some("sender-agent"));
         assert!(result.lifecycle_peer.is_none());
@@ -200,10 +186,11 @@ mod tests {
             MessageKind::Request {
                 intent: "review".to_string(),
                 params: serde_json::json!({}),
+                handling_mode: None,
             },
         );
         let item = InboxItem::External { envelope };
-        let result = ctx.classify(&item).expect("should classify");
+        let result = expect_enqueue(ctx.classify(&item));
         assert_eq!(result.class, PeerInputClass::ActionableRequest);
         assert_eq!(result.from_peer.as_deref(), Some("sender-agent"));
     }
@@ -223,12 +210,12 @@ mod tests {
             },
         );
         let item = InboxItem::External { envelope };
-        let result = ctx.classify(&item).expect("should classify");
+        let result = expect_enqueue(ctx.classify(&item));
         assert_eq!(result.class, PeerInputClass::Response);
     }
 
     #[test]
-    fn classify_ack_as_ack() {
+    fn classify_ack_drops() {
         let sender = make_keypair();
         let trusted = make_trusted_peers("sender-agent", &sender.public_key());
         let ctx = make_context(true, trusted, vec![]);
@@ -239,8 +226,8 @@ mod tests {
             },
         );
         let item = InboxItem::External { envelope };
-        let result = ctx.classify(&item).expect("should classify");
-        assert_eq!(result.class, PeerInputClass::Ack);
+        let result = ctx.classify(&item);
+        assert!(matches!(result, ClassificationDecision::Drop));
     }
 
     #[test]
@@ -253,10 +240,11 @@ mod tests {
             MessageKind::Request {
                 intent: "mob.peer_added".to_string(),
                 params: serde_json::json!({"peer": "new-agent"}),
+                handling_mode: None,
             },
         );
         let item = InboxItem::External { envelope };
-        let result = ctx.classify(&item).expect("should classify");
+        let result = expect_enqueue(ctx.classify(&item));
         assert_eq!(result.class, PeerInputClass::PeerLifecycleAdded);
         assert_eq!(result.lifecycle_peer.as_deref(), Some("new-agent"));
     }
@@ -271,12 +259,51 @@ mod tests {
             MessageKind::Request {
                 intent: "mob.peer_retired".to_string(),
                 params: serde_json::json!({"peer": "old-agent"}),
+                handling_mode: None,
             },
         );
         let item = InboxItem::External { envelope };
-        let result = ctx.classify(&item).expect("should classify");
+        let result = expect_enqueue(ctx.classify(&item));
         assert_eq!(result.class, PeerInputClass::PeerLifecycleRetired);
         assert_eq!(result.lifecycle_peer.as_deref(), Some("old-agent"));
+    }
+
+    #[test]
+    fn classify_peer_unwired_lifecycle() {
+        let sender = make_keypair();
+        let trusted = make_trusted_peers("orchestrator", &sender.public_key());
+        let ctx = make_context(true, trusted, vec![]);
+        let envelope = make_envelope(
+            &sender,
+            MessageKind::Request {
+                intent: "mob.peer_unwired".to_string(),
+                params: serde_json::json!({"peer": "other-agent"}),
+                handling_mode: None,
+            },
+        );
+        let item = InboxItem::External { envelope };
+        let result = expect_enqueue(ctx.classify(&item));
+        assert_eq!(result.class, PeerInputClass::PeerLifecycleUnwired);
+        assert_eq!(result.lifecycle_peer.as_deref(), Some("other-agent"));
+    }
+
+    #[test]
+    fn classify_kickoff_failed_lifecycle() {
+        let sender = make_keypair();
+        let trusted = make_trusted_peers("orchestrator", &sender.public_key());
+        let ctx = make_context(true, trusted, vec![]);
+        let envelope = make_envelope(
+            &sender,
+            MessageKind::Request {
+                intent: "mob.kickoff_failed".to_string(),
+                params: serde_json::json!({"peer": "worker-1", "role": "worker"}),
+                handling_mode: None,
+            },
+        );
+        let item = InboxItem::External { envelope };
+        let result = expect_enqueue(ctx.classify(&item));
+        assert_eq!(result.class, PeerInputClass::PeerLifecycleKickoffFailed);
+        assert_eq!(result.lifecycle_peer.as_deref(), Some("worker-1"));
     }
 
     #[test]
@@ -289,10 +316,11 @@ mod tests {
             MessageKind::Request {
                 intent: "my-silent-intent".to_string(),
                 params: serde_json::json!({}),
+                handling_mode: None,
             },
         );
         let item = InboxItem::External { envelope };
-        let result = ctx.classify(&item).expect("should classify");
+        let result = expect_enqueue(ctx.classify(&item));
         assert_eq!(result.class, PeerInputClass::SilentRequest);
     }
 
@@ -308,10 +336,11 @@ mod tests {
             MessageKind::Request {
                 intent: "review".to_string(),
                 params: serde_json::json!({}),
+                handling_mode: None,
             },
         );
         let item = InboxItem::External { envelope };
-        let result = ctx.classify(&item).expect("should classify");
+        let result = expect_enqueue(ctx.classify(&item));
         assert_eq!(result.class, PeerInputClass::SilentRequest);
     }
 
@@ -325,14 +354,12 @@ mod tests {
             MessageKind::Message {
                 blocks: None,
                 body: "hello".to_string(),
+                handling_mode: None,
             },
         );
         let item = InboxItem::External { envelope };
         let result = ctx.classify(&item);
-        assert!(
-            result.is_none(),
-            "untrusted input must be dropped at ingress"
-        );
+        assert!(matches!(result, ClassificationDecision::Drop));
     }
 
     #[test]
@@ -346,9 +373,9 @@ mod tests {
             interaction_id: None,
             render_metadata: None,
         };
-        let result = ctx.classify(&item).expect("should classify");
+        let result = expect_enqueue(ctx.classify(&item));
         assert_eq!(result.class, PeerInputClass::PlainEvent);
-        assert!(result.from_peer.is_none());
+        assert_eq!(result.from_peer.as_deref(), Some("event:tcp"));
     }
 
     #[test]
@@ -362,7 +389,7 @@ mod tests {
             blocks: None,
             render_metadata: None,
         };
-        let result = ctx.classify(&item).expect("should classify");
+        let result = expect_enqueue(ctx.classify(&item));
         assert_eq!(result.class, PeerInputClass::PlainEvent);
     }
 
@@ -376,12 +403,32 @@ mod tests {
             MessageKind::Request {
                 intent: "mob.peer_added".to_string(),
                 params: serde_json::json!({}),
+                handling_mode: None,
             },
         );
         let item = InboxItem::External { envelope };
-        let result = ctx.classify(&item).expect("should classify");
+        let result = expect_enqueue(ctx.classify(&item));
         assert_eq!(result.class, PeerInputClass::PeerLifecycleAdded);
         assert_eq!(result.lifecycle_peer.as_deref(), Some("orchestrator"));
+    }
+
+    #[test]
+    fn classify_dismiss_sets_flag() {
+        let sender = make_keypair();
+        let trusted = make_trusted_peers("sender-agent", &sender.public_key());
+        let ctx = make_context(true, trusted, vec![]);
+        let envelope = make_envelope(
+            &sender,
+            MessageKind::Message {
+                blocks: None,
+                body: "DISMISS".to_string(),
+                handling_mode: None,
+            },
+        );
+        let item = InboxItem::External { envelope };
+        let result = ctx.classify(&item);
+        assert!(matches!(result, ClassificationDecision::SetDismissFlag));
+        assert!(ctx.dismiss_flag.load(Ordering::SeqCst));
     }
 
     #[test]

@@ -110,6 +110,15 @@ pub enum MessageIntent {
     /// Peer retired lifecycle event (mob.peer_retired)
     #[serde(rename = "mob.peer_retired")]
     PeerRetired,
+    /// Peer unwired lifecycle event (mob.peer_unwired)
+    #[serde(rename = "mob.peer_unwired")]
+    PeerUnwired,
+    /// Helper kickoff failed lifecycle event (mob.kickoff_failed)
+    #[serde(rename = "mob.kickoff_failed")]
+    KickoffFailed,
+    /// Helper kickoff cancelled lifecycle event (mob.kickoff_cancelled)
+    #[serde(rename = "mob.kickoff_cancelled")]
+    KickoffCancelled,
     /// Custom intent for user-defined operations
     #[serde(untagged)]
     Custom(String),
@@ -133,6 +142,9 @@ impl MessageIntent {
             Self::Query => "query",
             Self::PeerAdded => "mob.peer_added",
             Self::PeerRetired => "mob.peer_retired",
+            Self::PeerUnwired => "mob.peer_unwired",
+            Self::KickoffFailed => "mob.kickoff_failed",
+            Self::KickoffCancelled => "mob.kickoff_cancelled",
             Self::Custom(s) => s.as_str(),
         }
     }
@@ -150,6 +162,9 @@ impl From<String> for MessageIntent {
             "query" => Self::Query,
             "mob.peer_added" => Self::PeerAdded,
             "mob.peer_retired" => Self::PeerRetired,
+            "mob.peer_unwired" => Self::PeerUnwired,
+            "mob.kickoff_failed" => Self::KickoffFailed,
+            "mob.kickoff_cancelled" => Self::KickoffCancelled,
             _ => Self::Custom(s),
         }
     }
@@ -276,11 +291,11 @@ impl CommsMessage {
 
         // Convert MessageKind to CommsContent
         let content = match &envelope.kind {
-            MessageKind::Message { body, blocks } => CommsContent::Message {
+            MessageKind::Message { body, blocks, .. } => CommsContent::Message {
                 body: body.clone(),
                 blocks: blocks.clone(),
             },
-            MessageKind::Request { intent, params } => CommsContent::Request {
+            MessageKind::Request { intent, params, .. } => CommsContent::Request {
                 request_id: envelope.id,
                 intent: MessageIntent::from(intent.as_str()),
                 params: params.clone(),
@@ -329,11 +344,11 @@ impl CommsMessage {
         });
 
         let content = match &envelope.kind {
-            MessageKind::Message { body, blocks } => CommsContent::Message {
+            MessageKind::Message { body, blocks, .. } => CommsContent::Message {
                 body: body.clone(),
                 blocks: blocks.clone(),
             },
-            MessageKind::Request { intent, params } => CommsContent::Request {
+            MessageKind::Request { intent, params, .. } => CommsContent::Request {
                 request_id: envelope.id,
                 intent: MessageIntent::from(intent.as_str()),
                 params: params.clone(),
@@ -529,6 +544,7 @@ mod tests {
             MessageKind::Message {
                 body: "hello world".to_string(),
                 blocks: None,
+                handling_mode: None,
             },
         );
 
@@ -560,6 +576,7 @@ mod tests {
             MessageKind::Request {
                 intent: "review".to_string(),
                 params: serde_json::json!({"pr": 123}),
+                handling_mode: None,
             },
         );
         let request_id = envelope.id;
@@ -594,6 +611,7 @@ mod tests {
             MessageKind::Request {
                 intent: "review-pr".to_string(),
                 params: serde_json::json!({"pr": 456}),
+                handling_mode: None,
             },
         );
 
@@ -680,6 +698,7 @@ mod tests {
             MessageKind::Message {
                 body: "hello".to_string(),
                 blocks: None,
+                handling_mode: None,
             },
         );
 
@@ -709,6 +728,7 @@ mod tests {
             MessageKind::Message {
                 body: "hello".to_string(),
                 blocks: None,
+                handling_mode: None,
             },
         );
         let item = InboxItem::External { envelope };
@@ -879,6 +899,7 @@ mod tests {
             MessageKind::Message {
                 body: "hello".to_string(),
                 blocks: None,
+                handling_mode: None,
             },
         );
         let item = InboxItem::External { envelope };

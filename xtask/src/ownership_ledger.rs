@@ -1568,7 +1568,7 @@ fn boundary_manifest() -> BoundaryDiscoveryManifest {
                     "stop_runtime_executor",
                     "accept_input_and_run",
                     "accept_input_with_completion",
-                    "maybe_spawn_comms_drain",
+                    "update_peer_ingress_context",
                     "abort_comms_drains",
                     "abort_comms_drain",
                     "wait_comms_drain",
@@ -2282,7 +2282,7 @@ fn semantic_operations() -> Vec<SemanticOperationEntry> {
         ),
         semantic_operation_entry!(
             "meerkat-runtime/src/session_adapter.rs",
-            "maybe_spawn_comms_drain",
+            "update_peer_ingress_context",
             BoundaryKind::PublicInherent,
             "RuntimeSessionAdapter",
             &["comms_drain_slots"],

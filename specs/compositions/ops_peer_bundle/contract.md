@@ -4,10 +4,8 @@ _Generated from the Rust composition catalog. Do not edit by hand._
 
 ## Machines
 - `ops_lifecycle`: `OpsLifecycleMachine` @ actor `ops_plane`
-- `peer_comms`: `PeerCommsMachine` @ actor `peer_plane`
 
 ## Routes
-- `ops_peer_ready_trusts_peer_comms`: `ops_lifecycle`.`ExposeOperationPeer` -> `peer_comms`.`TrustPeer` [Immediate]
 
 ## Target Selectors
 - `(none)`
@@ -25,7 +23,7 @@ _Generated from the Rust composition catalog. Do not edit by hand._
 - `(none)`
 
 ## Behavioral Invariants
-- `ops_peer_ready_trusts_peer_comms` — ops-lifecycle peer-ready effect triggers peer-comms trust establishment through an explicit route
+- `(none)`
 
 ## Coverage
 ### Code Anchors

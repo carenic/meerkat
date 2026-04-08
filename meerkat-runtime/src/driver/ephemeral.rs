@@ -49,16 +49,8 @@ pub enum PostAdmissionSignal {
     None,
     /// Wake the runtime loop to process queued work (idle → running).
     WakeLoop,
-    /// Interrupt cooperative yielding points within an active turn.
-    ///
-    /// Sent when an input arrives while a turn is running and the policy
-    /// specifies `WakeMode::InterruptYielding`. The runtime delivers this
-    /// through the per-session `RunControlCommand` channel so the agent
-    /// can break out of a wait-tool yield and process the queued input.
-    /// Also wakes the loop (implies WakeLoop).
-    InterruptYielding,
     /// Request immediate steer/checkpoint processing within the current turn.
-    /// Implies WakeLoop and InterruptYielding — strictly strongest.
+    /// Implies WakeLoop — strictly strongest.
     RequestImmediateProcessing,
 }
 
@@ -66,11 +58,6 @@ impl PostAdmissionSignal {
     /// Whether the runtime loop should be woken.
     pub fn should_wake(self) -> bool {
         self >= Self::WakeLoop
-    }
-
-    /// Whether cooperative yield points should be interrupted.
-    pub fn should_interrupt_yielding(self) -> bool {
-        self >= Self::InterruptYielding
     }
 
     /// Whether immediate in-turn processing was requested.
@@ -85,6 +72,15 @@ pub(crate) fn handling_mode_from_policy(policy: &crate::policy::PolicyDecision) 
         RoutingDisposition::Steer => HandlingMode::Steer,
         _ => HandlingMode::Queue,
     }
+}
+
+/// Whether this input should request immediate processing after admission.
+///
+/// This is intentionally narrower than "routes through the steer lane".
+/// `ResponseProgress` uses checkpoint routing for boundary batching, but it
+/// must remain passive unless the input kind explicitly carries steer intent.
+pub(crate) fn requests_immediate_processing(input: &Input) -> bool {
+    matches!(input.handling_mode(), Some(HandlingMode::Steer))
 }
 
 /// Ephemeral runtime driver -- all state in-memory.
@@ -250,11 +246,6 @@ impl EphemeralRuntimeDriver {
                 RuntimeIngressEffect::WakeRuntime => {
                     if self.post_admission_signal < PostAdmissionSignal::WakeLoop {
                         self.post_admission_signal = PostAdmissionSignal::WakeLoop;
-                    }
-                }
-                RuntimeIngressEffect::InterruptYielding => {
-                    if self.post_admission_signal < PostAdmissionSignal::InterruptYielding {
-                        self.post_admission_signal = PostAdmissionSignal::InterruptYielding;
                     }
                 }
                 RuntimeIngressEffect::RequestImmediateProcessing => {
@@ -1117,6 +1108,7 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
         // the admission path (queued vs consumed-on-accept) based on the policy.
         // Zero policy branching in shell code.
         let handling_mode = handling_mode_from_policy(&policy);
+        let request_immediate_processing = requests_immediate_processing(&input);
         let content_shape = ContentShape(input.kind_id().to_string());
         let is_prompt = matches!(input, Input::Prompt(_));
         let existing_superseded_id = self.existing_superseded_input(&input).map(|(id, _)| id);
@@ -1124,6 +1116,7 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
             input_id.clone(),
             content_shape,
             handling_mode,
+            request_immediate_processing,
             is_prompt,
             None, // request_id
             None, // reservation_key

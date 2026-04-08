@@ -5,8 +5,8 @@ use meerkat_core::lifecycle::{InputId, RunEvent, RunId};
 use meerkat_runtime::{
     ContinuationInput, EphemeralRuntimeDriver, Input, InputDurability, InputHeader,
     InputLifecycleEvent, InputLifecycleState, InputOrigin, InputVisibility, LogicalRuntimeId,
-    PeerConvention, PeerInput, PromptInput, ResponseProgressPhase, ResponseTerminalStatus,
-    RuntimeControlCommand, RuntimeDriver, RuntimeEvent, RuntimeState,
+    PeerConvention, PeerInput, PostAdmissionSignal, PromptInput, ResponseProgressPhase,
+    ResponseTerminalStatus, RuntimeControlCommand, RuntimeDriver, RuntimeEvent, RuntimeState,
 };
 
 fn make_prompt_input(text: &str) -> Input {
@@ -144,7 +144,13 @@ async fn accept_progress_no_wake() {
     let result = driver.accept_input(input).await.unwrap();
 
     assert!(result.is_accepted());
-    assert!(!driver.take_wake_requested()); // Progress never wakes
+    let signal = driver.take_post_admission_signal();
+    assert_eq!(
+        signal,
+        PostAdmissionSignal::None,
+        "ResponseProgress should stage on the checkpoint lane without requesting immediate processing"
+    );
+    assert!(!signal.should_wake()); // Progress never wakes
 }
 
 #[tokio::test]
@@ -501,7 +507,13 @@ async fn progress_peer_staged_boundary() {
     // Per §17: ResponseProgress → StageRunBoundary + NoWake + Coalesce + OnRunComplete
     let state = driver.input_state(&input_id).unwrap();
     assert_eq!(state.current_state(), InputLifecycleState::Queued);
-    assert!(!driver.take_wake_requested()); // Progress never wakes
+    let signal = driver.take_post_admission_signal();
+    assert_eq!(
+        signal,
+        PostAdmissionSignal::None,
+        "ResponseProgress should remain passive even though it uses the checkpoint lane"
+    );
+    assert!(!signal.should_wake()); // Progress never wakes
 }
 
 #[tokio::test]
@@ -729,14 +741,12 @@ async fn accept_peer_message_with_steer_handling_mode_returns_accepted() {
 
 #[test]
 fn post_admission_signal_ordering() {
-    use meerkat_runtime::PostAdmissionSignal;
     assert!(PostAdmissionSignal::None < PostAdmissionSignal::WakeLoop);
     assert!(PostAdmissionSignal::WakeLoop < PostAdmissionSignal::RequestImmediateProcessing);
 }
 
 #[test]
 fn post_admission_signal_should_wake() {
-    use meerkat_runtime::PostAdmissionSignal;
     assert!(!PostAdmissionSignal::None.should_wake());
     assert!(PostAdmissionSignal::WakeLoop.should_wake());
     assert!(PostAdmissionSignal::RequestImmediateProcessing.should_wake());
@@ -744,7 +754,6 @@ fn post_admission_signal_should_wake() {
 
 #[test]
 fn post_admission_signal_should_process_immediately() {
-    use meerkat_runtime::PostAdmissionSignal;
     assert!(!PostAdmissionSignal::None.should_process_immediately());
     assert!(!PostAdmissionSignal::WakeLoop.should_process_immediately());
     assert!(PostAdmissionSignal::RequestImmediateProcessing.should_process_immediately());
@@ -752,8 +761,6 @@ fn post_admission_signal_should_process_immediately() {
 
 #[tokio::test]
 async fn post_admission_signal_accumulates_strongest() {
-    use meerkat_runtime::PostAdmissionSignal;
-
     let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new("test"));
 
     // Accept a queue-mode input (WakeLoop signal)
@@ -775,8 +782,6 @@ async fn post_admission_signal_accumulates_strongest() {
 
 #[tokio::test]
 async fn post_admission_signal_steer_is_request_immediate() {
-    use meerkat_runtime::PostAdmissionSignal;
-
     let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new("test"));
 
     // Accept a steer-mode input (RequestImmediateProcessing signal)
@@ -808,7 +813,7 @@ async fn post_admission_signal_steer_is_request_immediate() {
 }
 
 #[tokio::test]
-async fn post_admission_signal_interrupt_yielding_for_peer_message_while_running() {
+async fn post_admission_signal_queue_peer_message_while_running_stays_passive() {
     let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new("test"));
 
     // Admit a prompt to start a run
@@ -819,7 +824,7 @@ async fn post_admission_signal_interrupt_yielding_for_peer_message_while_running
     // Start a run so the runtime is in Running state
     driver.start_run(RunId::new()).unwrap();
 
-    // Now admit a peer message while running (InterruptYielding policy)
+    // Now admit a default queue-mode peer message while running.
     let peer = Input::Peer(PeerInput {
         header: InputHeader {
             id: InputId::new(),
@@ -842,25 +847,17 @@ async fn post_admission_signal_interrupt_yielding_for_peer_message_while_running
     let _ = driver.accept_input(peer).await.unwrap();
     let signal = driver.take_post_admission_signal();
 
-    // Peer message while running has WakeMode::InterruptYielding
-    // which should produce InterruptYielding (not just WakeLoop)
-    assert!(
-        signal.should_interrupt_yielding(),
-        "peer message while running should produce InterruptYielding signal, got {signal:?}"
-    );
-    assert!(
-        signal.should_wake(),
-        "InterruptYielding must also imply wake"
+    assert_eq!(
+        signal,
+        PostAdmissionSignal::None,
+        "queue-mode peer message while running should not request wake/process, got {signal:?}"
     );
 }
 
 #[test]
-fn post_admission_signal_interrupt_yielding_ordering() {
-    use meerkat_runtime::PostAdmissionSignal;
-    assert!(PostAdmissionSignal::WakeLoop < PostAdmissionSignal::InterruptYielding);
-    assert!(
-        PostAdmissionSignal::InterruptYielding < PostAdmissionSignal::RequestImmediateProcessing
-    );
-    assert!(PostAdmissionSignal::InterruptYielding.should_interrupt_yielding());
-    assert!(!PostAdmissionSignal::WakeLoop.should_interrupt_yielding());
+fn post_admission_signal_request_immediate_ordering() {
+    assert!(PostAdmissionSignal::None < PostAdmissionSignal::WakeLoop);
+    assert!(PostAdmissionSignal::WakeLoop < PostAdmissionSignal::RequestImmediateProcessing);
+    assert!(!PostAdmissionSignal::WakeLoop.should_process_immediately());
+    assert!(PostAdmissionSignal::RequestImmediateProcessing.should_process_immediately());
 }

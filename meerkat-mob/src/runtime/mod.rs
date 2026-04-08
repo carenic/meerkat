@@ -20,7 +20,7 @@ use crate::tasks::{MobTask, TaskBoard, TaskStatus};
 use crate::tokio;
 use meerkat_client::LlmClient;
 use meerkat_core::agent::{AgentToolDispatcher, CommsRuntime as CoreCommsRuntime};
-use meerkat_core::comms::{CommsCommand, EventStream, InputStreamMode, PeerName, StreamError};
+use meerkat_core::comms::{CommsCommand, EventStream, PeerName, StreamError};
 use meerkat_core::error::ToolError;
 use meerkat_core::service::SessionService;
 use meerkat_core::types::{ContentInput, SessionId, ToolCallView, ToolDef, ToolResult};
@@ -60,7 +60,11 @@ mod flow_run_kernel;
 mod handle;
 pub(crate) mod loop_iteration_authority;
 mod mob_lifecycle_authority;
+mod mob_member_bootstrap_authority;
+mod mob_member_lifecycle_authority;
 mod mob_orchestrator_authority;
+mod mob_runtime_bridge_authority;
+mod mob_wiring_authority;
 mod ops_adapter;
 mod orchestrator_kernel;
 pub mod path;
@@ -91,6 +95,7 @@ use provisioner::{MobProvisioner, MultiBackendProvisioner, ProvisionMemberReques
 use state::MobCommand;
 use tools::compose_external_tools_for_profile;
 
+pub use crate::roster::{MobMemberKickoffPhase, MobMemberKickoffSnapshot};
 pub use builder::MobBuilder;
 pub use event_router::{MobEventRouterConfig, MobEventRouterHandle};
 pub use flow_frame_kernel::{FlowFrameKernel, FlowFrameMutator};

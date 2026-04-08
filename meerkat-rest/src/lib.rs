@@ -656,14 +656,6 @@ impl CoreExecutor for RestSessionRuntimeExecutor {
                 .map_err(|err| CoreExecutorError::ControlFailed {
                     reason: err.to_string(),
                 }),
-            RunControlCommand::InterruptYielding => self
-                .context
-                .session_service
-                .interrupt_yielding(&self.session_id)
-                .await
-                .map_err(|err| CoreExecutorError::ControlFailed {
-                    reason: err.to_string(),
-                }),
             RunControlCommand::StopRuntimeExecutor { .. } => {
                 let discard_result = self
                     .context
@@ -1682,13 +1674,9 @@ async fn comms_send(
     match comms.send(cmd).await {
         Ok(receipt) => {
             let result = match receipt {
-                SendReceipt::InputAccepted {
-                    interaction_id,
-                    stream_reserved,
-                } => json!({
+                SendReceipt::InputAccepted { interaction_id } => json!({
                     "kind": "input_accepted",
                     "interaction_id": interaction_id.0.to_string(),
-                    "stream_reserved": stream_reserved,
                 }),
                 SendReceipt::PeerMessageSent { envelope_id, acked } => json!({
                     "kind": "peer_message_sent",
@@ -1696,14 +1684,12 @@ async fn comms_send(
                     "acked": acked,
                 }),
                 SendReceipt::PeerRequestSent {
+                    request_id,
                     envelope_id,
-                    interaction_id,
-                    stream_reserved,
                 } => json!({
                     "kind": "peer_request_sent",
                     "envelope_id": envelope_id.to_string(),
-                    "interaction_id": interaction_id.0.to_string(),
-                    "stream_reserved": stream_reserved,
+                    "request_id": request_id.0.to_string(),
                 }),
                 SendReceipt::PeerResponseSent {
                     envelope_id,
@@ -2569,12 +2555,13 @@ async fn create_session_inner(
         }));
     }
 
-    // Spawn comms drain for keep_alive sessions.
+    // Update peer-ingress context so live sessions always get attached ingress
+    // and idle keep_alive sessions retain a persistent host drain.
     #[cfg(feature = "comms")]
     {
         let comms_rt = state.session_service.comms_runtime(&session_id).await;
         adapter
-            .maybe_spawn_comms_drain(&session_id, keep_alive, comms_rt)
+            .update_peer_ingress_context(&session_id, keep_alive, comms_rt)
             .await;
     }
 
@@ -3316,7 +3303,7 @@ async fn continue_session_inner(
         {
             let comms_rt = state.session_service.comms_runtime(&session_id).await;
             adapter
-                .maybe_spawn_comms_drain(&session_id, keep_alive, comms_rt)
+                .update_peer_ingress_context(&session_id, keep_alive, comms_rt)
                 .await;
         }
         let input =
@@ -3394,7 +3381,7 @@ async fn continue_session_inner(
                 ))));
             }
             adapter
-                .maybe_spawn_comms_drain(&session_id, keep_alive, comms_rt)
+                .update_peer_ingress_context(&session_id, keep_alive, comms_rt)
                 .await;
         }
 
@@ -4763,7 +4750,7 @@ mod tests {
         let ApiError::BadRequest(msg) = err else {
             unreachable!("expected bad request");
         };
-        assert_eq!(msg, "invalid stream: invalid");
+        assert_eq!(msg, "removed_unsupported_field");
     }
 
     #[test]

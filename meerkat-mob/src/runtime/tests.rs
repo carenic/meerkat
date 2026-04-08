@@ -247,9 +247,8 @@ impl CoreCommsRuntime for MockCommsRuntime {
 
                 self.sent_intents.write().await.push(intent);
                 Ok(SendReceipt::PeerRequestSent {
+                    request_id: InteractionId(uuid::Uuid::new_v4()),
                     envelope_id: uuid::Uuid::new_v4(),
-                    interaction_id: InteractionId(uuid::Uuid::new_v4()),
-                    stream_reserved: false,
                 })
             }
             unsupported => Err(SendError::Unsupported(format!(
@@ -296,6 +295,10 @@ impl CoreCommsRuntime for MockCommsRuntime {
     fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
         self.inbox_notify.clone()
     }
+
+    async fn drain_peer_input_candidates(&self) -> Vec<meerkat_core::PeerInputCandidate> {
+        Vec::new()
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -320,6 +323,17 @@ struct CreateSessionRecord {
     initial_turn: meerkat_core::service::InitialTurnPolicy,
     comms_name: Option<String>,
     peer_meta_labels: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+enum MockKeepAliveTurnMode {
+    WaitForNotifier,
+    CompleteImmediately,
+    CallbackPending {
+        tool_name: String,
+        args: serde_json::Value,
+    },
+    Fail(String),
 }
 
 /// A mock session service that creates sessions with mock comms runtimes.
@@ -352,7 +366,7 @@ struct MockSessionService {
     fail_inject: std::sync::atomic::AtomicBool,
     start_turn_calls: AtomicU64,
     keep_alive_start_turn_calls: AtomicU64,
-    keep_alive_turns_complete_immediately: std::sync::atomic::AtomicBool,
+    keep_alive_turn_mode: std::sync::Mutex<MockKeepAliveTurnMode>,
     keep_alive_prompts: RwLock<Vec<(SessionId, String)>>,
     interrupt_calls: AtomicU64,
     inject_calls: Arc<AtomicU64>,
@@ -392,7 +406,7 @@ impl MockSessionService {
             fail_inject: std::sync::atomic::AtomicBool::new(false),
             start_turn_calls: AtomicU64::new(0),
             keep_alive_start_turn_calls: AtomicU64::new(0),
-            keep_alive_turns_complete_immediately: std::sync::atomic::AtomicBool::new(false),
+            keep_alive_turn_mode: std::sync::Mutex::new(MockKeepAliveTurnMode::WaitForNotifier),
             keep_alive_prompts: RwLock::new(Vec::new()),
             interrupt_calls: AtomicU64::new(0),
             inject_calls: Arc::new(AtomicU64::new(0)),
@@ -610,8 +624,38 @@ impl MockSessionService {
     }
 
     fn set_keep_alive_turns_complete_immediately(&self, enabled: bool) {
-        self.keep_alive_turns_complete_immediately
-            .store(enabled, Ordering::Relaxed);
+        let mut guard = self
+            .keep_alive_turn_mode
+            .lock()
+            .expect("keep_alive_turn_mode mutex");
+        *guard = if enabled {
+            MockKeepAliveTurnMode::CompleteImmediately
+        } else {
+            MockKeepAliveTurnMode::WaitForNotifier
+        };
+    }
+
+    fn set_keep_alive_turn_callback_pending(
+        &self,
+        tool_name: impl Into<String>,
+        args: serde_json::Value,
+    ) {
+        let mut guard = self
+            .keep_alive_turn_mode
+            .lock()
+            .expect("keep_alive_turn_mode mutex");
+        *guard = MockKeepAliveTurnMode::CallbackPending {
+            tool_name: tool_name.into(),
+            args,
+        };
+    }
+
+    fn set_keep_alive_turn_failure(&self, reason: impl Into<String>) {
+        let mut guard = self
+            .keep_alive_turn_mode
+            .lock()
+            .expect("keep_alive_turn_mode mutex");
+        *guard = MockKeepAliveTurnMode::Fail(reason.into());
     }
 
     fn interrupt_call_count(&self) -> u64 {
@@ -957,14 +1001,27 @@ impl SessionService for MockSessionService {
         drop(sessions);
 
         if is_keep_alive {
-            let complete_immediately = self
-                .keep_alive_turns_complete_immediately
-                .load(Ordering::Relaxed);
-            if complete_immediately {
-                return Ok(mock_run_result(
-                    id.clone(),
-                    "Autonomous kickoff completed".to_string(),
-                ));
+            let mode = self
+                .keep_alive_turn_mode
+                .lock()
+                .expect("keep_alive_turn_mode mutex")
+                .clone();
+            match mode {
+                MockKeepAliveTurnMode::CompleteImmediately => {
+                    return Ok(mock_run_result(
+                        id.clone(),
+                        "Autonomous kickoff completed".to_string(),
+                    ));
+                }
+                MockKeepAliveTurnMode::CallbackPending { tool_name, args } => {
+                    return Err(SessionError::Agent(
+                        meerkat_core::error::AgentError::CallbackPending { tool_name, args },
+                    ));
+                }
+                MockKeepAliveTurnMode::Fail(reason) => {
+                    return Err(SessionError::Store(Box::new(std::io::Error::other(reason))));
+                }
+                MockKeepAliveTurnMode::WaitForNotifier => {}
             }
             let notifier = self
                 .keep_alive_notifiers
@@ -1358,20 +1415,30 @@ impl MobSessionService for MockSessionService {
         boundary: meerkat_core::lifecycle::run_primitive::RunApplyBoundary,
         contributing_input_ids: Vec<meerkat_core::InputId>,
     ) -> Result<meerkat_core::lifecycle::core_executor::CoreApplyOutput, SessionError> {
-        <Self as SessionService>::start_turn(self, session_id, req).await?;
-        Ok(meerkat_core::lifecycle::core_executor::CoreApplyOutput {
-            receipt: meerkat_core::lifecycle::run_receipt::RunBoundaryReceipt {
-                run_id,
-                boundary,
-                contributing_input_ids,
-                conversation_digest: None,
-                message_count: 0,
-                sequence: 0,
-            },
-            session_snapshot: None,
-            terminal: None,
-            run_result: None,
-        })
+        let receipt = meerkat_core::lifecycle::run_receipt::RunBoundaryReceipt {
+            run_id,
+            boundary,
+            contributing_input_ids,
+            conversation_digest: None,
+            message_count: 0,
+            sequence: 0,
+        };
+        match <Self as SessionService>::start_turn(self, session_id, req).await {
+            Ok(_) => Ok(
+                meerkat_core::lifecycle::core_executor::CoreApplyOutput::without_terminal(
+                    receipt, None,
+                ),
+            ),
+            Err(SessionError::Agent(meerkat_core::error::AgentError::CallbackPending {
+                tool_name,
+                args,
+            })) => Ok(
+                meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_callback_pending(
+                    receipt, None, tool_name, args,
+                ),
+            ),
+            Err(error) => Err(error),
+        }
     }
 
     async fn discard_live_session(&self, session_id: &SessionId) -> Result<(), SessionError> {
@@ -1417,6 +1484,7 @@ impl FaultInjectedMobEventStore {
             MobEventKind::MobReset => "MobReset",
             MobEventKind::MeerkatSpawned { .. } => "MeerkatSpawned",
             MobEventKind::MeerkatRetired { .. } => "MeerkatRetired",
+            MobEventKind::MeerkatKickoffUpdated { .. } => "MeerkatKickoffUpdated",
             MobEventKind::PeersWired { .. } => "PeersWired",
             MobEventKind::ExternalPeerWired { .. } => "ExternalPeerWired",
             MobEventKind::ExternalPeerUnwired { .. } => "ExternalPeerUnwired",
@@ -3649,10 +3717,15 @@ async fn test_lifecycle_updates_mcp_server_states() {
 #[tokio::test]
 async fn test_stop_persists_all_state_and_rejects_mutations() {
     let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_keep_alive_turns_complete_immediately(true);
     handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn");
+    handle
+        .wait_for_kickoff_complete(Some(Duration::from_secs(2)))
+        .await
+        .expect("kickoff should settle before counting persisted events");
     let event_count_before = handle.events().replay_all().await.expect("replay").len();
 
     handle.stop().await.expect("stop");
@@ -4303,6 +4376,16 @@ async fn test_wait_for_kickoff_complete_returns_after_initial_turn() {
         !snapshots.is_empty(),
         "barrier should return snapshots for spawned members"
     );
+    let kickoff = snapshots[0]
+        .1
+        .kickoff
+        .clone()
+        .expect("successful autonomous kickoff should be recorded");
+    assert_eq!(
+        kickoff.phase,
+        crate::roster::MobMemberKickoffPhase::Started,
+        "successful initial autonomous turn should mark kickoff as started"
+    );
 }
 
 #[tokio::test]
@@ -4390,6 +4473,254 @@ async fn test_wait_for_kickoff_complete_returns_broken_snapshot_without_hanging(
         crate::runtime::handle::MobMemberStatus::Broken
     );
     assert!(broken_snapshot.1.error.is_some());
+}
+
+#[tokio::test]
+async fn test_wait_for_kickoff_complete_exposes_failed_kickoff_without_marking_member_broken() {
+    let (handle, service) = create_test_mob_with_runtime_adapter(sample_definition()).await;
+    service.set_keep_alive_turn_failure("provider overloaded");
+
+    let member = MeerkatId::from("lead-kickoff-failed");
+    handle
+        .spawn(ProfileName::from("lead"), member.clone(), None)
+        .await
+        .expect("spawn lead");
+
+    let snapshots = handle
+        .wait_for_members_kickoff_complete(
+            std::slice::from_ref(&member),
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .expect("kickoff barrier succeeds");
+
+    let snapshot = &snapshots[0].1;
+    assert_eq!(
+        snapshot.status,
+        crate::runtime::handle::MobMemberStatus::Active
+    );
+    let kickoff = snapshot.kickoff.clone().expect("kickoff snapshot");
+    assert_eq!(kickoff.phase, crate::roster::MobMemberKickoffPhase::Failed);
+    assert!(
+        kickoff
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("provider overloaded")),
+        "kickoff failure should preserve the underlying reason: {kickoff:?}"
+    );
+    assert!(
+        snapshot.error.is_none(),
+        "kickoff failure should not overload canonical member corruption error state"
+    );
+}
+
+#[tokio::test]
+async fn test_resume_restores_persisted_kickoff_failure_state() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+
+    let handle = MobBuilder::new(sample_definition(), storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    service.set_keep_alive_turn_failure("provider overloaded");
+
+    let member = MeerkatId::from("lead-kickoff-resume");
+    handle
+        .spawn(ProfileName::from("lead"), member.clone(), None)
+        .await
+        .expect("spawn lead");
+    handle
+        .wait_for_members_kickoff_complete(
+            std::slice::from_ref(&member),
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .expect("kickoff barrier succeeds");
+    handle.stop().await.expect("stop mob before resume");
+
+    let resumed = MobBuilder::for_resume(MobStorage::with_events(events))
+        .with_session_service(service.clone())
+        .resume()
+        .await
+        .expect("resume mob");
+
+    let snapshot = resumed.member_status(&member).await.expect("member status");
+    assert_eq!(
+        snapshot.status,
+        crate::runtime::handle::MobMemberStatus::Active
+    );
+    let kickoff = snapshot.kickoff.expect("kickoff snapshot");
+    assert_eq!(kickoff.phase, crate::roster::MobMemberKickoffPhase::Failed);
+    assert!(
+        kickoff
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("provider overloaded")),
+        "resumed kickoff state should preserve persisted failure reason: {kickoff:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_callback_pending_kickoff_does_not_block_follow_up_messages() {
+    let (handle, service) = create_test_mob_with_runtime_adapter(sample_definition()).await;
+    service.set_keep_alive_turn_callback_pending(
+        "browser.open",
+        serde_json::json!({ "url": "https://example.test" }),
+    );
+
+    let member = MeerkatId::from("lead-kickoff-callback");
+    handle
+        .spawn(ProfileName::from("lead"), member.clone(), None)
+        .await
+        .expect("spawn lead");
+
+    let snapshots = handle
+        .wait_for_members_kickoff_complete(
+            std::slice::from_ref(&member),
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .expect("kickoff barrier succeeds");
+    let snapshot = &snapshots[0].1;
+    assert_eq!(
+        snapshot.status,
+        crate::runtime::handle::MobMemberStatus::Active
+    );
+    assert_eq!(
+        snapshot.kickoff.as_ref().expect("kickoff snapshot").phase,
+        crate::roster::MobMemberKickoffPhase::CallbackPending
+    );
+
+    let baseline_injects = service.inject_call_count();
+    handle
+        .member(&member)
+        .await
+        .expect("member handle")
+        .send(
+            "follow-up while callback pending",
+            meerkat_core::types::HandlingMode::Queue,
+        )
+        .await
+        .expect("member should remain sendable while kickoff is callback pending");
+    assert!(
+        service.inject_call_count() > baseline_injects,
+        "follow-up messaging should still route through the live injector"
+    );
+
+    let post_snapshot = handle.member_status(&member).await.expect("member status");
+    assert_eq!(
+        post_snapshot
+            .kickoff
+            .as_ref()
+            .expect("kickoff snapshot")
+            .phase,
+        crate::roster::MobMemberKickoffPhase::CallbackPending
+    );
+}
+
+#[tokio::test]
+async fn test_failed_kickoff_emits_lifecycle_notice_to_wired_peer() {
+    let (handle, service) =
+        create_test_mob_with_runtime_adapter(sample_definition_with_auto_wire()).await;
+    service.set_keep_alive_turns_complete_immediately(true);
+
+    let parent_sid = handle
+        .spawn(
+            ProfileName::from("lead"),
+            MeerkatId::from("lead-parent"),
+            None,
+        )
+        .await
+        .expect("spawn lead")
+        .session_id()
+        .expect("session-backed lead")
+        .clone();
+
+    service.set_keep_alive_turn_failure("provider overloaded");
+    let helper = MeerkatId::from("worker-failing");
+    let helper_sid = handle
+        .spawn(ProfileName::from("worker"), helper.clone(), None)
+        .await
+        .expect("spawn worker")
+        .session_id()
+        .expect("session-backed worker")
+        .clone();
+
+    let snapshots = handle
+        .wait_for_members_kickoff_complete(
+            std::slice::from_ref(&helper),
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .expect("worker kickoff barrier succeeds");
+    assert_eq!(
+        snapshots[0]
+            .1
+            .kickoff
+            .as_ref()
+            .expect("kickoff snapshot")
+            .phase,
+        crate::roster::MobMemberKickoffPhase::Failed
+    );
+
+    let helper_intents = service.sent_intents(&helper_sid).await;
+    assert!(
+        helper_intents
+            .iter()
+            .any(|intent| intent == "mob.kickoff_failed"),
+        "helper should emit a kickoff failure lifecycle notice"
+    );
+
+    let parent_sent = service.sent_intents(&parent_sid).await;
+    assert!(
+        !parent_sent
+            .iter()
+            .any(|intent| intent == "mob.kickoff_failed"),
+        "kickoff failure notice should originate from the helper bridge side"
+    );
+}
+
+#[tokio::test]
+async fn test_retire_during_bootstrap_emits_kickoff_cancelled_notice() {
+    let (handle, service) =
+        create_test_mob_with_runtime_adapter(sample_definition_with_auto_wire()).await;
+    service.set_keep_alive_turns_complete_immediately(true);
+
+    handle
+        .spawn(
+            ProfileName::from("lead"),
+            MeerkatId::from("lead-parent"),
+            None,
+        )
+        .await
+        .expect("spawn lead");
+
+    service.set_start_turn_delay_ms(600_000);
+    let helper = MeerkatId::from("worker-cancelled");
+    let helper_sid = handle
+        .spawn(ProfileName::from("worker"), helper.clone(), None)
+        .await
+        .expect("spawn worker")
+        .session_id()
+        .expect("session-backed worker")
+        .clone();
+
+    handle
+        .retire(helper.clone())
+        .await
+        .expect("retire during bootstrap should succeed");
+
+    let helper_intents = service.sent_intents(&helper_sid).await;
+    assert!(
+        helper_intents
+            .iter()
+            .any(|intent| intent == "mob.kickoff_cancelled"),
+        "helper should emit a kickoff cancellation lifecycle notice"
+    );
 }
 
 #[tokio::test]
@@ -13360,6 +13691,7 @@ async fn test_peer_message_reaches_idle_autonomous_member_after_kickoff_completi
                     data: "aGVsbG8=".into(),
                 },
             ]),
+            handling_mode: meerkat_core::types::HandlingMode::Queue,
         },
     )
     .await
@@ -13610,7 +13942,7 @@ async fn test_wire_enables_peer_request_delivery() {
         to: peer_name,
         intent: "mob.test_ping".to_string(),
         params: serde_json::json!({"test": true}),
-        stream: meerkat_core::comms::InputStreamMode::None,
+        handling_mode: meerkat_core::types::HandlingMode::Queue,
     };
     let receipt = CoreCommsRuntime::send(&*comms_a, cmd)
         .await
@@ -14387,8 +14719,7 @@ impl AgentToolDispatcher for MultiToolDispatcher {
 
     fn capabilities(&self) -> meerkat_core::agent::DispatcherCapabilities {
         meerkat_core::agent::DispatcherCapabilities {
-            wait_interrupt: true,
-            ..meerkat_core::agent::DispatcherCapabilities::default()
+            ops_lifecycle: true,
         }
     }
 }
@@ -14431,8 +14762,8 @@ async fn test_name_filtered_dispatcher() {
 
     // capabilities delegates
     assert!(
-        filtered.capabilities().wait_interrupt,
-        "should delegate capabilities().wait_interrupt to inner"
+        filtered.capabilities().ops_lifecycle,
+        "should delegate capabilities().ops_lifecycle to inner"
     );
 }
 

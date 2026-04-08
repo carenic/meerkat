@@ -62,7 +62,6 @@ pub mod tool_scope;
 pub mod turn_boundary;
 pub mod turn_execution_authority;
 pub mod types;
-pub mod wait_interrupt;
 
 // Re-export main types at crate root
 pub use agent::{
@@ -74,9 +73,8 @@ pub use blob::{BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError};
 pub use budget::{Budget, BudgetLimits, BudgetPool};
 pub use checkpoint::SessionCheckpointer;
 pub use comms::{
-    CommsCommand, EventStream, InputSource, InputStreamMode, PeerDirectoryEntry,
-    PeerDirectorySource, PeerName, PeerReachability, PeerReachabilityReason, SendAndStreamError,
-    SendError, SendReceipt, StreamError, StreamScope,
+    CommsCommand, EventStream, InputSource, PeerDirectoryEntry, PeerDirectorySource, PeerName,
+    PeerReachability, PeerReachabilityReason, SendError, SendReceipt, StreamError, StreamScope,
 };
 pub use comms_drain_lifecycle_authority::{
     CommsDrainLifecycleAuthority, CommsDrainLifecycleEffect, CommsDrainLifecycleError,
@@ -136,8 +134,8 @@ pub use image_content::{
     hydrate_content_blocks, hydrate_content_input, hydrate_messages_for_execution,
 };
 pub use interaction::{
-    ClassifiedInboxInteraction, InboxInteraction, InteractionContent, InteractionId,
-    PeerInputClass, ResponseStatus,
+    InboxInteraction, InteractionContent, InteractionId, PeerInputCandidate, PeerInputClass,
+    ResponseStatus,
 };
 pub use lifecycle::{
     ConversationAppend, ConversationAppendRole, ConversationContextAppend, CoreExecutor,
@@ -211,7 +209,4 @@ pub use types::{
     SystemNoticeKind, SystemNoticeMessage, ToolCall, ToolCallIter, ToolCallView, ToolDef,
     ToolResult, Usage, UserMessage, VideoData, has_images, has_non_text_content, has_video,
     is_supported_video_media_type, validate_inline_video_blocks,
-};
-pub use wait_interrupt::{
-    WaitInterrupt, WaitInterruptBindError, WaitInterruptReceiver, WaitInterruptSender,
 };

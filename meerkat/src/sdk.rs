@@ -746,7 +746,8 @@ mod tests {
 
         let tools = dispatcher.tools();
         assert!(tools.iter().any(|t| t.name == "task_create"));
-        assert!(tools.iter().any(|t| t.name == "wait"));
+        assert!(tools.iter().any(|t| t.name == "datetime"));
+        assert!(!tools.iter().any(|t| t.name == "wait"));
 
         let _ = dispatch_json(
             dispatcher.as_ref(),

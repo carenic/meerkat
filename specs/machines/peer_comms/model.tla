@@ -3,13 +3,10 @@ EXTENDS TLC, Naturals, Sequences, FiniteSets
 
 \* Generated semantic machine model for PeerCommsMachine.
 
-CONSTANTS ContentShapeValues, PeerIdValues, RawItemIdValues, RawPeerKindValues, RequestIdValues, ReservationKeyValues, StringValues
+CONSTANTS BooleanValues, HandlingModeValues, PeerEnvelopeKindValues, RawItemIdValues, StringValues
 
 None == [tag |-> "none", value |-> "none"]
 Some(v) == [tag |-> "some", value |-> v]
-
-OptionRequestIdValues == {None} \cup {Some(x) : x \in RequestIdValues}
-OptionReservationKeyValues == {None} \cup {Some(x) : x \in ReservationKeyValues}
 
 MapLookup(map, key) == IF key \in DOMAIN map THEN map[key] ELSE None
 MapSet(map, key, value) == [x \in DOMAIN map \cup {key} |-> IF x = key THEN value ELSE map[x]]
@@ -20,113 +17,150 @@ SeqRemove(seq, value) == IF Len(seq) = 0 THEN <<>> ELSE IF Head(seq) = value THE
 RECURSIVE SeqRemoveAll(_, _)
 SeqRemoveAll(seq, values) == IF Len(values) = 0 THEN seq ELSE SeqRemoveAll(SeqRemove(seq, Head(values)), Tail(values))
 
-VARIABLES phase, model_step_count, trusted_peers, raw_item_peer, raw_item_kind, classified_as, text_projection, content_shape, request_id, reservation_key, trusted_snapshot, submission_queue
+VARIABLES phase, model_step_count
 
-vars == << phase, model_step_count, trusted_peers, raw_item_peer, raw_item_kind, classified_as, text_projection, content_shape, request_id, reservation_key, trusted_snapshot, submission_queue >>
+vars == << phase, model_step_count >>
 
-ClassFor(raw_kind) == (IF (raw_kind = "request") THEN "ActionableRequest" ELSE (IF (raw_kind = "response_terminal") THEN "Response" ELSE (IF (raw_kind = "response_progress") THEN "Response" ELSE (IF (raw_kind = "plain_event") THEN "PlainEvent" ELSE (IF (raw_kind = "silent_request") THEN "SilentRequest" ELSE "ActionableMessage")))))
+NormalizedHandlingMode(handling_mode_present, handling_mode) == (IF handling_mode_present THEN handling_mode ELSE "Queue")
+EffectiveSender(sender_name_known, sender_name, fallback_sender_name) == (IF sender_name_known THEN Some(sender_name) ELSE Some(fallback_sender_name))
+EffectiveLifecyclePeer(lifecycle_peer_present, lifecycle_peer, sender_name_known, sender_name, fallback_sender_name) == (IF lifecycle_peer_present THEN Some(lifecycle_peer) ELSE EffectiveSender(sender_name_known, sender_name, fallback_sender_name))
 
 Init ==
-    /\ phase = "Absent"
+    /\ phase = "Ready"
     /\ model_step_count = 0
-    /\ trusted_peers = {}
-    /\ raw_item_peer = [x \in {} |-> None]
-    /\ raw_item_kind = [x \in {} |-> None]
-    /\ classified_as = [x \in {} |-> None]
-    /\ text_projection = [x \in {} |-> None]
-    /\ content_shape = [x \in {} |-> None]
-    /\ request_id = [x \in {} |-> None]
-    /\ reservation_key = [x \in {} |-> None]
-    /\ trusted_snapshot = [x \in {} |-> None]
-    /\ submission_queue = <<>>
 
-TerminalStutter ==
-    /\ phase = "Dropped" \/ phase = "Delivered"
-    /\ UNCHANGED vars
-
-TrustPeer(peer_id) ==
-    /\ phase = "Absent" \/ phase = "Received"
-    /\ phase' = "Absent"
+DropUntrustedExternal(require_peer_auth, raw_item_id, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message) ==
+    /\ phase = "Ready"
+    /\ (require_peer_auth = TRUE)
+    /\ (sender_name_known = FALSE)
+    /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ trusted_peers' = (trusted_peers \cup {peer_id})
-    /\ UNCHANGED << raw_item_peer, raw_item_kind, classified_as, text_projection, content_shape, request_id, reservation_key, trusted_snapshot, submission_queue >>
 
 
-ReceiveTrustedPeerEnvelope(raw_item_id, peer_id, raw_kind, arg_text_projection, arg_content_shape, arg_request_id, arg_reservation_key) ==
-    /\ phase = "Absent" \/ phase = "Received"
-    /\ (peer_id \in trusted_peers)
-    /\ phase' = "Received"
+DropAckExternal(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message) ==
+    /\ phase = "Ready"
+    /\ (kind = "Ack")
+    /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ raw_item_peer' = MapSet(raw_item_peer, raw_item_id, peer_id)
-    /\ raw_item_kind' = MapSet(raw_item_kind, raw_item_id, raw_kind)
-    /\ classified_as' = MapSet(classified_as, raw_item_id, ClassFor(raw_kind))
-    /\ text_projection' = MapSet(text_projection, raw_item_id, arg_text_projection)
-    /\ content_shape' = MapSet(content_shape, raw_item_id, arg_content_shape)
-    /\ request_id' = MapSet(request_id, raw_item_id, arg_request_id)
-    /\ reservation_key' = MapSet(reservation_key, raw_item_id, arg_reservation_key)
-    /\ trusted_snapshot' = MapSet(trusted_snapshot, raw_item_id, TRUE)
-    /\ submission_queue' = Append(submission_queue, raw_item_id)
-    /\ UNCHANGED << trusted_peers >>
 
 
-DropUntrustedPeerEnvelope(raw_item_id, peer_id, raw_kind, arg_text_projection, arg_content_shape, arg_request_id, arg_reservation_key) ==
-    /\ phase = "Absent" \/ phase = "Received"
-    /\ ~((peer_id \in trusted_peers))
-    /\ phase' = "Dropped"
+DismissExternalMessage(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message) ==
+    /\ phase = "Ready"
+    /\ ~(((require_peer_auth = TRUE) /\ (sender_name_known = FALSE)))
+    /\ (kind = "Message")
+    /\ (dismiss_message = TRUE)
+    /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ raw_item_peer' = MapSet(raw_item_peer, raw_item_id, peer_id)
-    /\ raw_item_kind' = MapSet(raw_item_kind, raw_item_id, raw_kind)
-    /\ text_projection' = MapSet(text_projection, raw_item_id, arg_text_projection)
-    /\ content_shape' = MapSet(content_shape, raw_item_id, arg_content_shape)
-    /\ request_id' = MapSet(request_id, raw_item_id, arg_request_id)
-    /\ reservation_key' = MapSet(reservation_key, raw_item_id, arg_reservation_key)
-    /\ trusted_snapshot' = MapSet(trusted_snapshot, raw_item_id, FALSE)
-    /\ UNCHANGED << trusted_peers, classified_as, submission_queue >>
 
 
-SubmitTypedPeerInputDelivered(raw_item_id) ==
-    /\ phase = "Received"
-    /\ (raw_item_id \in SeqElements(submission_queue))
-    /\ (raw_item_id \in DOMAIN classified_as)
-    /\ (Len(submission_queue) = 1)
-    /\ phase' = "Delivered"
+EnqueueLifecycleAdded(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message) ==
+    /\ phase = "Ready"
+    /\ ~(((require_peer_auth = TRUE) /\ (sender_name_known = FALSE)))
+    /\ (kind = "Request")
+    /\ (intent = "mob.peer_added")
+    /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ submission_queue' = SeqRemove(submission_queue, raw_item_id)
-    /\ UNCHANGED << trusted_peers, raw_item_peer, raw_item_kind, classified_as, text_projection, content_shape, request_id, reservation_key, trusted_snapshot >>
 
 
-SubmitTypedPeerInputContinue(raw_item_id) ==
-    /\ phase = "Received"
-    /\ (raw_item_id \in SeqElements(submission_queue))
-    /\ (raw_item_id \in DOMAIN classified_as)
-    /\ (Len(submission_queue) > 1)
-    /\ phase' = "Received"
+EnqueueLifecycleRetired(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message) ==
+    /\ phase = "Ready"
+    /\ ~(((require_peer_auth = TRUE) /\ (sender_name_known = FALSE)))
+    /\ (kind = "Request")
+    /\ (intent = "mob.peer_retired")
+    /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
-    /\ submission_queue' = SeqRemove(submission_queue, raw_item_id)
-    /\ UNCHANGED << trusted_peers, raw_item_peer, raw_item_kind, classified_as, text_projection, content_shape, request_id, reservation_key, trusted_snapshot >>
+
+
+EnqueueLifecycleUnwired(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message) ==
+    /\ phase = "Ready"
+    /\ ~(((require_peer_auth = TRUE) /\ (sender_name_known = FALSE)))
+    /\ (kind = "Request")
+    /\ (intent = "mob.peer_unwired")
+    /\ phase' = "Ready"
+    /\ model_step_count' = model_step_count + 1
+
+
+EnqueueLifecycleKickoffFailed(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message) ==
+    /\ phase = "Ready"
+    /\ ~(((require_peer_auth = TRUE) /\ (sender_name_known = FALSE)))
+    /\ (kind = "Request")
+    /\ (intent = "mob.kickoff_failed")
+    /\ phase' = "Ready"
+    /\ model_step_count' = model_step_count + 1
+
+
+EnqueueLifecycleKickoffCancelled(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message) ==
+    /\ phase = "Ready"
+    /\ ~(((require_peer_auth = TRUE) /\ (sender_name_known = FALSE)))
+    /\ (kind = "Request")
+    /\ (intent = "mob.kickoff_cancelled")
+    /\ phase' = "Ready"
+    /\ model_step_count' = model_step_count + 1
+
+
+EnqueueSilentRequest(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message) ==
+    /\ phase = "Ready"
+    /\ ~(((require_peer_auth = TRUE) /\ (sender_name_known = FALSE)))
+    /\ (kind = "Request")
+    /\ (silent_intent = TRUE)
+    /\ ((intent # "mob.peer_added") /\ (intent # "mob.peer_retired") /\ (intent # "mob.peer_unwired") /\ (intent # "mob.kickoff_failed") /\ (intent # "mob.kickoff_cancelled"))
+    /\ phase' = "Ready"
+    /\ model_step_count' = model_step_count + 1
+
+
+EnqueueActionableRequest(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message) ==
+    /\ phase = "Ready"
+    /\ ~(((require_peer_auth = TRUE) /\ (sender_name_known = FALSE)))
+    /\ (kind = "Request")
+    /\ (silent_intent = FALSE)
+    /\ ((intent # "mob.peer_added") /\ (intent # "mob.peer_retired") /\ (intent # "mob.peer_unwired") /\ (intent # "mob.kickoff_failed") /\ (intent # "mob.kickoff_cancelled"))
+    /\ phase' = "Ready"
+    /\ model_step_count' = model_step_count + 1
+
+
+EnqueueActionableMessage(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message) ==
+    /\ phase = "Ready"
+    /\ ~(((require_peer_auth = TRUE) /\ (sender_name_known = FALSE)))
+    /\ (kind = "Message")
+    /\ (dismiss_message = FALSE)
+    /\ phase' = "Ready"
+    /\ model_step_count' = model_step_count + 1
+
+
+EnqueueResponse(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message) ==
+    /\ phase = "Ready"
+    /\ ~(((require_peer_auth = TRUE) /\ (sender_name_known = FALSE)))
+    /\ (kind = "Response")
+    /\ phase' = "Ready"
+    /\ model_step_count' = model_step_count + 1
+
+
+EnqueuePlainEvent(raw_item_id, source_name, handling_mode) ==
+    /\ phase = "Ready"
+    /\ phase' = "Ready"
+    /\ model_step_count' = model_step_count + 1
 
 
 Next ==
-    \/ \E peer_id \in PeerIdValues : TrustPeer(peer_id)
-    \/ \E raw_item_id \in RawItemIdValues : \E peer_id \in PeerIdValues : \E raw_kind \in RawPeerKindValues : \E arg_text_projection \in {"alpha", "beta"} : \E arg_content_shape \in ContentShapeValues : \E arg_request_id \in OptionRequestIdValues : \E arg_reservation_key \in OptionReservationKeyValues : ReceiveTrustedPeerEnvelope(raw_item_id, peer_id, raw_kind, arg_text_projection, arg_content_shape, arg_request_id, arg_reservation_key)
-    \/ \E raw_item_id \in RawItemIdValues : \E peer_id \in PeerIdValues : \E raw_kind \in RawPeerKindValues : \E arg_text_projection \in {"alpha", "beta"} : \E arg_content_shape \in ContentShapeValues : \E arg_request_id \in OptionRequestIdValues : \E arg_reservation_key \in OptionReservationKeyValues : DropUntrustedPeerEnvelope(raw_item_id, peer_id, raw_kind, arg_text_projection, arg_content_shape, arg_request_id, arg_reservation_key)
-    \/ \E raw_item_id \in RawItemIdValues : SubmitTypedPeerInputDelivered(raw_item_id)
-    \/ \E raw_item_id \in RawItemIdValues : SubmitTypedPeerInputContinue(raw_item_id)
-    \/ TerminalStutter
+    \/ \E require_peer_auth \in BOOLEAN : \E raw_item_id \in RawItemIdValues : \E sender_name_known \in BOOLEAN : \E sender_name \in {"alpha", "beta"} : \E fallback_sender_name \in {"alpha", "beta"} : \E kind \in PeerEnvelopeKindValues : \E intent \in {"alpha", "beta"} : \E lifecycle_peer_present \in BOOLEAN : \E lifecycle_peer \in {"alpha", "beta"} : \E handling_mode_present \in BOOLEAN : \E handling_mode \in HandlingModeValues : \E silent_intent \in BOOLEAN : \E dismiss_message \in BOOLEAN : DropUntrustedExternal(require_peer_auth, raw_item_id, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+    \/ \E raw_item_id \in RawItemIdValues : \E require_peer_auth \in BOOLEAN : \E sender_name_known \in BOOLEAN : \E sender_name \in {"alpha", "beta"} : \E fallback_sender_name \in {"alpha", "beta"} : \E kind \in PeerEnvelopeKindValues : \E intent \in {"alpha", "beta"} : \E lifecycle_peer_present \in BOOLEAN : \E lifecycle_peer \in {"alpha", "beta"} : \E handling_mode_present \in BOOLEAN : \E handling_mode \in HandlingModeValues : \E silent_intent \in BOOLEAN : \E dismiss_message \in BOOLEAN : DropAckExternal(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+    \/ \E raw_item_id \in RawItemIdValues : \E require_peer_auth \in BOOLEAN : \E sender_name_known \in BOOLEAN : \E sender_name \in {"alpha", "beta"} : \E fallback_sender_name \in {"alpha", "beta"} : \E kind \in PeerEnvelopeKindValues : \E intent \in {"alpha", "beta"} : \E lifecycle_peer_present \in BOOLEAN : \E lifecycle_peer \in {"alpha", "beta"} : \E handling_mode_present \in BOOLEAN : \E handling_mode \in HandlingModeValues : \E silent_intent \in BOOLEAN : \E dismiss_message \in BOOLEAN : DismissExternalMessage(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+    \/ \E raw_item_id \in RawItemIdValues : \E require_peer_auth \in BOOLEAN : \E sender_name_known \in BOOLEAN : \E sender_name \in {"alpha", "beta"} : \E fallback_sender_name \in {"alpha", "beta"} : \E kind \in PeerEnvelopeKindValues : \E intent \in {"alpha", "beta"} : \E lifecycle_peer_present \in BOOLEAN : \E lifecycle_peer \in {"alpha", "beta"} : \E handling_mode_present \in BOOLEAN : \E handling_mode \in HandlingModeValues : \E silent_intent \in BOOLEAN : \E dismiss_message \in BOOLEAN : EnqueueLifecycleAdded(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+    \/ \E raw_item_id \in RawItemIdValues : \E require_peer_auth \in BOOLEAN : \E sender_name_known \in BOOLEAN : \E sender_name \in {"alpha", "beta"} : \E fallback_sender_name \in {"alpha", "beta"} : \E kind \in PeerEnvelopeKindValues : \E intent \in {"alpha", "beta"} : \E lifecycle_peer_present \in BOOLEAN : \E lifecycle_peer \in {"alpha", "beta"} : \E handling_mode_present \in BOOLEAN : \E handling_mode \in HandlingModeValues : \E silent_intent \in BOOLEAN : \E dismiss_message \in BOOLEAN : EnqueueLifecycleRetired(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+    \/ \E raw_item_id \in RawItemIdValues : \E require_peer_auth \in BOOLEAN : \E sender_name_known \in BOOLEAN : \E sender_name \in {"alpha", "beta"} : \E fallback_sender_name \in {"alpha", "beta"} : \E kind \in PeerEnvelopeKindValues : \E intent \in {"alpha", "beta"} : \E lifecycle_peer_present \in BOOLEAN : \E lifecycle_peer \in {"alpha", "beta"} : \E handling_mode_present \in BOOLEAN : \E handling_mode \in HandlingModeValues : \E silent_intent \in BOOLEAN : \E dismiss_message \in BOOLEAN : EnqueueLifecycleUnwired(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+    \/ \E raw_item_id \in RawItemIdValues : \E require_peer_auth \in BOOLEAN : \E sender_name_known \in BOOLEAN : \E sender_name \in {"alpha", "beta"} : \E fallback_sender_name \in {"alpha", "beta"} : \E kind \in PeerEnvelopeKindValues : \E intent \in {"alpha", "beta"} : \E lifecycle_peer_present \in BOOLEAN : \E lifecycle_peer \in {"alpha", "beta"} : \E handling_mode_present \in BOOLEAN : \E handling_mode \in HandlingModeValues : \E silent_intent \in BOOLEAN : \E dismiss_message \in BOOLEAN : EnqueueLifecycleKickoffFailed(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+    \/ \E raw_item_id \in RawItemIdValues : \E require_peer_auth \in BOOLEAN : \E sender_name_known \in BOOLEAN : \E sender_name \in {"alpha", "beta"} : \E fallback_sender_name \in {"alpha", "beta"} : \E kind \in PeerEnvelopeKindValues : \E intent \in {"alpha", "beta"} : \E lifecycle_peer_present \in BOOLEAN : \E lifecycle_peer \in {"alpha", "beta"} : \E handling_mode_present \in BOOLEAN : \E handling_mode \in HandlingModeValues : \E silent_intent \in BOOLEAN : \E dismiss_message \in BOOLEAN : EnqueueLifecycleKickoffCancelled(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+    \/ \E raw_item_id \in RawItemIdValues : \E require_peer_auth \in BOOLEAN : \E sender_name_known \in BOOLEAN : \E sender_name \in {"alpha", "beta"} : \E fallback_sender_name \in {"alpha", "beta"} : \E kind \in PeerEnvelopeKindValues : \E intent \in {"alpha", "beta"} : \E lifecycle_peer_present \in BOOLEAN : \E lifecycle_peer \in {"alpha", "beta"} : \E handling_mode_present \in BOOLEAN : \E handling_mode \in HandlingModeValues : \E silent_intent \in BOOLEAN : \E dismiss_message \in BOOLEAN : EnqueueSilentRequest(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+    \/ \E raw_item_id \in RawItemIdValues : \E require_peer_auth \in BOOLEAN : \E sender_name_known \in BOOLEAN : \E sender_name \in {"alpha", "beta"} : \E fallback_sender_name \in {"alpha", "beta"} : \E kind \in PeerEnvelopeKindValues : \E intent \in {"alpha", "beta"} : \E lifecycle_peer_present \in BOOLEAN : \E lifecycle_peer \in {"alpha", "beta"} : \E handling_mode_present \in BOOLEAN : \E handling_mode \in HandlingModeValues : \E silent_intent \in BOOLEAN : \E dismiss_message \in BOOLEAN : EnqueueActionableRequest(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+    \/ \E raw_item_id \in RawItemIdValues : \E require_peer_auth \in BOOLEAN : \E sender_name_known \in BOOLEAN : \E sender_name \in {"alpha", "beta"} : \E fallback_sender_name \in {"alpha", "beta"} : \E kind \in PeerEnvelopeKindValues : \E intent \in {"alpha", "beta"} : \E lifecycle_peer_present \in BOOLEAN : \E lifecycle_peer \in {"alpha", "beta"} : \E handling_mode_present \in BOOLEAN : \E handling_mode \in HandlingModeValues : \E silent_intent \in BOOLEAN : \E dismiss_message \in BOOLEAN : EnqueueActionableMessage(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+    \/ \E raw_item_id \in RawItemIdValues : \E require_peer_auth \in BOOLEAN : \E sender_name_known \in BOOLEAN : \E sender_name \in {"alpha", "beta"} : \E fallback_sender_name \in {"alpha", "beta"} : \E kind \in PeerEnvelopeKindValues : \E intent \in {"alpha", "beta"} : \E lifecycle_peer_present \in BOOLEAN : \E lifecycle_peer \in {"alpha", "beta"} : \E handling_mode_present \in BOOLEAN : \E handling_mode \in HandlingModeValues : \E silent_intent \in BOOLEAN : \E dismiss_message \in BOOLEAN : EnqueueResponse(raw_item_id, require_peer_auth, sender_name_known, sender_name, fallback_sender_name, kind, intent, lifecycle_peer_present, lifecycle_peer, handling_mode_present, handling_mode, silent_intent, dismiss_message)
+    \/ \E raw_item_id \in RawItemIdValues : \E source_name \in {"alpha", "beta"} : \E handling_mode \in HandlingModeValues : EnqueuePlainEvent(raw_item_id, source_name, handling_mode)
 
-queued_items_are_classified == (\A raw_item_id \in SeqElements(submission_queue) : (raw_item_id \in DOMAIN classified_as))
-queued_items_preserve_content_shape == (\A raw_item_id \in SeqElements(submission_queue) : (raw_item_id \in DOMAIN content_shape))
-queued_items_preserve_text_projection == (\A raw_item_id \in SeqElements(submission_queue) : (raw_item_id \in DOMAIN text_projection))
-queued_items_preserve_correlation_slots == (\A raw_item_id \in SeqElements(submission_queue) : ((raw_item_id \in DOMAIN request_id) /\ (raw_item_id \in DOMAIN reservation_key)))
 
-CiStateConstraint == /\ model_step_count <= 6 /\ Cardinality(trusted_peers) <= 1 /\ Cardinality(DOMAIN raw_item_peer) <= 1 /\ Cardinality(DOMAIN raw_item_kind) <= 1 /\ Cardinality(DOMAIN classified_as) <= 1 /\ Cardinality(DOMAIN text_projection) <= 1 /\ Cardinality(DOMAIN content_shape) <= 1 /\ Cardinality(DOMAIN request_id) <= 1 /\ Cardinality(DOMAIN reservation_key) <= 1 /\ Cardinality(DOMAIN trusted_snapshot) <= 1 /\ Len(submission_queue) <= 1
-DeepStateConstraint == /\ model_step_count <= 8 /\ Cardinality(trusted_peers) <= 2 /\ Cardinality(DOMAIN raw_item_peer) <= 2 /\ Cardinality(DOMAIN raw_item_kind) <= 2 /\ Cardinality(DOMAIN classified_as) <= 2 /\ Cardinality(DOMAIN text_projection) <= 2 /\ Cardinality(DOMAIN content_shape) <= 2 /\ Cardinality(DOMAIN request_id) <= 2 /\ Cardinality(DOMAIN reservation_key) <= 2 /\ Cardinality(DOMAIN trusted_snapshot) <= 2 /\ Len(submission_queue) <= 2
+CiStateConstraint == /\ model_step_count <= 6
+DeepStateConstraint == /\ model_step_count <= 8
 
 Spec == Init /\ [][Next]_vars
 
-THEOREM Spec => []queued_items_are_classified
-THEOREM Spec => []queued_items_preserve_content_shape
-THEOREM Spec => []queued_items_preserve_text_projection
-THEOREM Spec => []queued_items_preserve_correlation_slots
 
 =============================================================================

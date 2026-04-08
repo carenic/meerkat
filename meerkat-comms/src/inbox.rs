@@ -10,9 +10,10 @@ use crate::tokio;
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
 
-use crate::classify::IngressClassificationContext;
+use crate::classify::{ClassificationDecision, IngressClassificationContext};
 use crate::types::InboxItem;
 use meerkat_core::PeerInputClass;
+use meerkat_core::types::HandlingMode;
 
 const DEFAULT_INBOX_CAPACITY: usize = 1024;
 
@@ -22,6 +23,7 @@ pub(crate) struct ClassifiedInboxEntry {
     pub(crate) class: PeerInputClass,
     pub(crate) from_peer: Option<String>,
     pub(crate) lifecycle_peer: Option<String>,
+    pub(crate) normalized_handling_mode: HandlingMode,
 }
 
 /// The receiving end of the inbox, held by the agent loop.
@@ -31,8 +33,6 @@ pub struct Inbox {
     notify: Arc<Notify>,
     /// Classified entries channel (parallel to raw channel).
     classified_rx: Option<mpsc::Receiver<ClassifiedInboxEntry>>,
-    /// Notifier that fires only for actionable inputs.
-    actionable_notify: Option<Arc<Notify>>,
 }
 
 /// The sending end of the inbox, cloned to IO tasks.
@@ -45,8 +45,6 @@ pub struct InboxSender {
     classification_context: Option<Arc<IngressClassificationContext>>,
     /// Classified entries sender (parallel to raw channel).
     classified_tx: Option<mpsc::Sender<ClassifiedInboxEntry>>,
-    /// Notifier that fires only for actionable inputs.
-    actionable_notify: Option<Arc<Notify>>,
 }
 
 impl Inbox {
@@ -64,14 +62,12 @@ impl Inbox {
                 rx,
                 notify: notify.clone(),
                 classified_rx: None,
-                actionable_notify: None,
             },
             InboxSender {
                 tx,
                 notify,
                 classification_context: None,
                 classified_tx: None,
-                actionable_notify: None,
             },
         )
     }
@@ -89,20 +85,17 @@ impl Inbox {
         let (tx, rx) = mpsc::channel(DEFAULT_INBOX_CAPACITY);
         let (classified_tx, classified_rx) = mpsc::channel(DEFAULT_INBOX_CAPACITY);
         let notify = Arc::new(Notify::new());
-        let actionable_notify = Arc::new(Notify::new());
         (
             Inbox {
                 rx,
                 notify: notify.clone(),
                 classified_rx: Some(classified_rx),
-                actionable_notify: Some(actionable_notify.clone()),
             },
             InboxSender {
                 tx,
                 notify,
                 classification_context: Some(context),
                 classified_tx: Some(classified_tx),
-                actionable_notify: Some(actionable_notify),
             },
         )
     }
@@ -144,11 +137,6 @@ impl Inbox {
     pub(crate) fn try_recv_one_classified(&mut self) -> Option<ClassifiedInboxEntry> {
         self.classified_rx.as_mut()?.try_recv().ok()
     }
-
-    /// Get the actionable-input notifier (fires only for actionable classes).
-    pub(crate) fn classified_actionable_notify(&self) -> Option<Arc<Notify>> {
-        self.actionable_notify.clone()
-    }
 }
 
 impl InboxSender {
@@ -175,9 +163,8 @@ impl InboxSender {
 
     /// Send an item with classification through the classified channel.
     ///
-    /// Classifies the item using the ingress context. Items that classify
-    /// as `None` (e.g., untrusted senders with `require_peer_auth`) are
-    /// silently dropped — snapshot semantics, no resurrection.
+    /// Classifies the item using the ingress context and applies the
+    /// authority-decided enqueue/drop/dismiss effects.
     ///
     /// Classified items are enqueued on both the raw channel (backward compat)
     /// and the classified channel, then the appropriate notify is fired.
@@ -186,30 +173,24 @@ impl InboxSender {
             (&self.classification_context, &self.classified_tx)
         {
             let result = match ctx.classify(&item) {
-                Some(r) => r,
-                None => {
-                    // Dropped at ingress — untrusted or otherwise rejected.
-                    // Do not enqueue, do not notify.
+                ClassificationDecision::Drop | ClassificationDecision::SetDismissFlag => {
                     return Ok(());
                 }
+                ClassificationDecision::Enqueue(result) => result,
             };
             let entry = ClassifiedInboxEntry {
                 item,
                 class: result.class,
                 from_peer: result.from_peer,
                 lifecycle_peer: result.lifecycle_peer,
+                normalized_handling_mode: result.normalized_handling_mode,
             };
-            // Enqueue only on classified channel (no raw double-enqueue).
-            // drain_classified_inbox_interactions() is the sole consumer.
-            let is_actionable = entry.class.is_actionable();
+            // Enqueue only on the candidate channel (no raw double-enqueue).
+            // drain_peer_input_candidates() is the sole consumer.
             classified_tx.try_send(entry).map_err(|err| match err {
                 mpsc::error::TrySendError::Closed(_) => InboxError::Closed,
                 mpsc::error::TrySendError::Full(_) => InboxError::Full,
             })?;
-            // Fire actionable notify only for actionable classes
-            if is_actionable && let Some(ref actionable) = self.actionable_notify {
-                actionable.notify_waiters();
-            }
             // Always fire broad notify
             self.notify.notify_waiters();
             Ok(())
@@ -245,6 +226,7 @@ mod tests {
             kind: MessageKind::Message {
                 blocks: None,
                 body: "test".to_string(),
+                handling_mode: None,
             },
             sig: crate::identity::Signature::new([0u8; 64]),
         }
@@ -409,6 +391,7 @@ mod tests {
 
     use crate::classify::IngressClassificationContext;
     use crate::trust::{TrustedPeer, TrustedPeers};
+    use std::sync::atomic::AtomicBool;
 
     fn make_classification_context(
         trusted: TrustedPeers,
@@ -418,6 +401,7 @@ mod tests {
             require_peer_auth: require_auth,
             trusted_peers: Arc::new(parking_lot::RwLock::new(trusted)),
             silent_intents: Arc::new(std::collections::HashSet::new()),
+            dismiss_flag: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -430,147 +414,6 @@ mod tests {
                 meta: crate::PeerMeta::default(),
             }],
         }
-    }
-
-    #[tokio::test]
-    async fn test_classified_inbox_actionable_notify_fires_for_message() {
-        let sender_pubkey = PubKey::new([1u8; 32]);
-        let ctx = make_classification_context(make_trusted("peer", &sender_pubkey), false);
-        let (inbox, sender) = Inbox::new_classified(ctx);
-        let actionable = inbox.classified_actionable_notify().unwrap();
-        let notified = actionable.notified();
-
-        sender
-            .send_classified(InboxItem::External {
-                envelope: make_test_envelope(),
-            })
-            .unwrap();
-
-        let result = tokio::time::timeout(std::time::Duration::from_millis(100), notified).await;
-        assert!(result.is_ok(), "Actionable notify should fire for messages");
-    }
-
-    #[tokio::test]
-    async fn test_classified_inbox_actionable_notify_fires_for_request() {
-        let sender_pubkey = PubKey::new([1u8; 32]);
-        let ctx = make_classification_context(make_trusted("peer", &sender_pubkey), false);
-        let (inbox, sender) = Inbox::new_classified(ctx);
-        let actionable = inbox.classified_actionable_notify().unwrap();
-        let notified = actionable.notified();
-
-        let mut envelope = make_test_envelope();
-        envelope.kind = MessageKind::Request {
-            intent: "review".to_string(),
-            params: serde_json::json!({}),
-        };
-
-        sender
-            .send_classified(InboxItem::External { envelope })
-            .unwrap();
-
-        let result = tokio::time::timeout(std::time::Duration::from_millis(100), notified).await;
-        assert!(result.is_ok(), "Actionable notify should fire for requests");
-    }
-
-    #[tokio::test]
-    async fn test_classified_inbox_no_actionable_notify_for_response() {
-        let sender_pubkey = PubKey::new([1u8; 32]);
-        let ctx = make_classification_context(make_trusted("peer", &sender_pubkey), false);
-        let (inbox, sender) = Inbox::new_classified(ctx);
-        let actionable = inbox.classified_actionable_notify().unwrap();
-
-        let mut envelope = make_test_envelope();
-        envelope.kind = MessageKind::Response {
-            in_reply_to: Uuid::new_v4(),
-            status: crate::types::Status::Completed,
-            result: serde_json::json!({}),
-            handling_mode: None,
-        };
-
-        sender
-            .send_classified(InboxItem::External { envelope })
-            .unwrap();
-
-        let notified = actionable.notified();
-        let result = tokio::time::timeout(std::time::Duration::from_millis(50), notified).await;
-        assert!(
-            result.is_err(),
-            "Actionable notify should NOT fire for responses"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_classified_inbox_no_actionable_notify_for_ack() {
-        let sender_pubkey = PubKey::new([1u8; 32]);
-        let ctx = make_classification_context(make_trusted("peer", &sender_pubkey), false);
-        let (inbox, sender) = Inbox::new_classified(ctx);
-        let actionable = inbox.classified_actionable_notify().unwrap();
-
-        let mut envelope = make_test_envelope();
-        envelope.kind = MessageKind::Ack {
-            in_reply_to: Uuid::new_v4(),
-        };
-
-        sender
-            .send_classified(InboxItem::External { envelope })
-            .unwrap();
-
-        let notified = actionable.notified();
-        let result = tokio::time::timeout(std::time::Duration::from_millis(50), notified).await;
-        assert!(
-            result.is_err(),
-            "Actionable notify should NOT fire for acks"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_classified_inbox_no_actionable_notify_for_plain_event() {
-        let ctx = make_classification_context(TrustedPeers::new(), false);
-        let (inbox, sender) = Inbox::new_classified(ctx);
-        let actionable = inbox.classified_actionable_notify().unwrap();
-
-        sender
-            .send_classified(InboxItem::PlainEvent {
-                body: "event".to_string(),
-                source: meerkat_core::PlainEventSource::Tcp,
-                handling_mode: meerkat_core::types::HandlingMode::Queue,
-                interaction_id: None,
-                blocks: None,
-                render_metadata: None,
-            })
-            .unwrap();
-
-        let notified = actionable.notified();
-        let result = tokio::time::timeout(std::time::Duration::from_millis(50), notified).await;
-        assert!(
-            result.is_err(),
-            "Actionable notify should NOT fire for plain events"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_classified_inbox_no_actionable_notify_for_lifecycle() {
-        let sender_pubkey = PubKey::new([1u8; 32]);
-        let ctx = make_classification_context(make_trusted("peer", &sender_pubkey), false);
-        let (inbox, sender) = Inbox::new_classified(ctx);
-        let actionable = inbox.classified_actionable_notify().unwrap();
-
-        let mut envelope = make_test_envelope();
-        envelope.kind = MessageKind::Request {
-            intent: "mob.peer_added".to_string(),
-            params: serde_json::json!({"peer": "new-agent"}),
-        };
-
-        sender
-            .send_classified(InboxItem::External { envelope })
-            .unwrap();
-
-        let notified = actionable.notified();
-        let result = tokio::time::timeout(std::time::Duration::from_millis(50), notified).await;
-        assert!(
-            result.is_err(),
-            "Actionable notify should NOT fire for lifecycle events"
-        );
     }
 
     #[tokio::test]
@@ -591,12 +434,16 @@ mod tests {
             entries[0].class,
             meerkat_core::PeerInputClass::ActionableMessage
         );
+        assert_eq!(
+            entries[0].normalized_handling_mode,
+            meerkat_core::types::HandlingMode::Queue
+        );
     }
 
     #[tokio::test]
     async fn test_classified_send_does_not_populate_raw_channel() {
-        // Classified send only enqueues on the classified channel.
-        // No raw double-enqueue; drain_classified_inbox_interactions() is the sole consumer.
+        // Classified send only enqueues on the candidate channel.
+        // No raw double-enqueue; drain_peer_input_candidates() is the sole consumer.
         let sender_pubkey = PubKey::new([1u8; 32]);
         let ctx = make_classification_context(make_trusted("peer", &sender_pubkey), false);
         let (mut inbox, sender) = Inbox::new_classified(ctx);
@@ -617,5 +464,33 @@ mod tests {
         // Classified channel should have the item
         let classified = inbox.try_drain_classified();
         assert_eq!(classified.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_classified_dismiss_sets_flag_and_does_not_enqueue() {
+        let sender_pubkey = PubKey::new([1u8; 32]);
+        let ctx = make_classification_context(make_trusted("peer", &sender_pubkey), false);
+        let dismiss_flag = ctx.dismiss_flag.clone();
+        let (mut inbox, sender) = Inbox::new_classified(ctx);
+
+        sender
+            .send_classified(InboxItem::External {
+                envelope: Envelope {
+                    id: Uuid::new_v4(),
+                    from: sender_pubkey,
+                    to: PubKey::new([2u8; 32]),
+                    kind: MessageKind::Message {
+                        blocks: None,
+                        body: "DISMISS".to_string(),
+                        handling_mode: None,
+                    },
+                    sig: crate::identity::Signature::new([0u8; 64]),
+                },
+            })
+            .unwrap();
+
+        assert!(dismiss_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(inbox.try_drain_classified().is_empty());
+        assert!(inbox.try_drain().is_empty());
     }
 }

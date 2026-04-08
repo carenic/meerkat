@@ -689,6 +689,42 @@ async fn read_during_active_turn_returns_cached_view() {
     turn.await.unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn archive_during_running_turn_gracefully_drains_current_turn() {
+    let service = make_slow_service(150);
+
+    let created = service
+        .create_session(create_req_deferred("archive during run"))
+        .await
+        .unwrap();
+    let sid = created.session_id;
+
+    let svc = service.clone();
+    let sid2 = sid.clone();
+    let turn = tokio::spawn(async move { svc.start_turn(&sid2, turn_req("Slow")).await });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    service.archive(&sid).await.unwrap();
+
+    let turn_result = turn.await.unwrap();
+    assert!(
+        turn_result.is_ok(),
+        "archive should gracefully drain the admitted/running turn"
+    );
+
+    let archived = service.read(&sid).await.unwrap();
+    assert!(
+        !archived.state.is_active,
+        "archived session must be inactive"
+    );
+
+    let err = service
+        .start_turn(&sid, turn_req("after archive"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "SESSION_NOT_FOUND");
+}
+
 // ---------------------------------------------------------------------------
 // 8. Event stream emits RunStarted and RunCompleted
 // ---------------------------------------------------------------------------

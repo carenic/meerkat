@@ -5,8 +5,7 @@
 use crate::identifiers::{KindId, PolicyVersion};
 use crate::input::Input;
 use crate::policy::{
-    ApplyMode, ConsumePoint, DrainPolicy, InterruptPolicy, PolicyDecision, QueueMode,
-    RoutingDisposition, WakeMode,
+    ApplyMode, ConsumePoint, DrainPolicy, PolicyDecision, QueueMode, RoutingDisposition, WakeMode,
 };
 
 /// The default policy version for the built-in table.
@@ -19,7 +18,6 @@ fn pd(
     wake_mode: WakeMode,
     queue_mode: QueueMode,
     consume_point: ConsumePoint,
-    interrupt_policy: InterruptPolicy,
     drain_policy: DrainPolicy,
     routing_disposition: RoutingDisposition,
     record_transcript: bool,
@@ -29,7 +27,6 @@ fn pd(
         wake_mode,
         queue_mode,
         consume_point,
-        interrupt_policy,
         drain_policy,
         routing_disposition,
         record_transcript,
@@ -68,7 +65,6 @@ impl DefaultPolicyTable {
                     },
                     QueueMode::Fifo,
                     ConsumePoint::OnRunComplete,
-                    InterruptPolicy::None,
                     DrainPolicy::QueueNextTurn,
                     RoutingDisposition::Queue,
                     !matches!(input, Input::Continuation(_)),
@@ -78,11 +74,10 @@ impl DefaultPolicyTable {
                     if runtime_idle {
                         WakeMode::WakeIfIdle
                     } else {
-                        WakeMode::InterruptYielding
+                        WakeMode::None
                     },
                     QueueMode::Fifo,
                     ConsumePoint::OnRunComplete,
-                    InterruptPolicy::InterruptYielding,
                     DrainPolicy::SteerBatch,
                     RoutingDisposition::Steer,
                     !matches!(input, Input::Continuation(_)),
@@ -103,7 +98,6 @@ impl DefaultPolicyTable {
                 WakeMode::WakeIfIdle,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -113,31 +107,26 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
             ),
 
-            // PeerInput(Message) — StageRunStart, WakeIfIdle (idle) /
-            // InterruptYielding (running) so cooperative yielding points
-            // (e.g., `wait` tool) are interrupted when a peer message arrives.
+            // PeerInput(Message) — StageRunStart, WakeIfIdle (idle) / None (running)
             ("peer_message", true) => pd(
                 ApplyMode::StageRunStart,
                 WakeMode::WakeIfIdle,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
             ),
             ("peer_message", false) => pd(
                 ApplyMode::StageRunStart,
-                WakeMode::InterruptYielding,
+                WakeMode::None,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::InterruptYielding,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -149,17 +138,15 @@ impl DefaultPolicyTable {
                 WakeMode::WakeIfIdle,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
             ),
             ("peer_request", false) => pd(
                 ApplyMode::StageRunStart,
-                WakeMode::InterruptYielding,
+                WakeMode::None,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::InterruptYielding,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -171,7 +158,6 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Coalesce,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::SteerBatch,
                 RoutingDisposition::Steer,
                 true,
@@ -181,7 +167,6 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Coalesce,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::SteerBatch,
                 RoutingDisposition::Steer,
                 true,
@@ -193,7 +178,6 @@ impl DefaultPolicyTable {
                 WakeMode::WakeIfIdle,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -203,7 +187,6 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -215,7 +198,6 @@ impl DefaultPolicyTable {
                 WakeMode::WakeIfIdle,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -225,7 +207,6 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -237,7 +218,6 @@ impl DefaultPolicyTable {
                 WakeMode::WakeIfIdle,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -247,7 +227,6 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -259,17 +238,15 @@ impl DefaultPolicyTable {
                 WakeMode::WakeIfIdle,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::InterruptYielding,
                 DrainPolicy::SteerBatch,
                 RoutingDisposition::Steer,
                 false,
             ),
             ("continuation", false) => pd(
                 ApplyMode::StageRunBoundary,
-                WakeMode::InterruptYielding,
+                WakeMode::None,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::InterruptYielding,
                 DrainPolicy::SteerBatch,
                 RoutingDisposition::Steer,
                 false,
@@ -282,7 +259,6 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Priority,
                 ConsumePoint::OnAccept,
-                InterruptPolicy::None,
                 DrainPolicy::Ignore,
                 RoutingDisposition::Drop,
                 false,
@@ -294,7 +270,6 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -382,7 +357,7 @@ mod tests {
             "peer_message",
             false,
             ApplyMode::StageRunStart,
-            WakeMode::InterruptYielding,
+            WakeMode::None,
             QueueMode::Fifo,
             ConsumePoint::OnRunComplete,
             true,
@@ -406,7 +381,7 @@ mod tests {
             "peer_request",
             false,
             ApplyMode::StageRunStart,
-            WakeMode::InterruptYielding,
+            WakeMode::None,
             QueueMode::Fifo,
             ConsumePoint::OnRunComplete,
             true,
@@ -526,7 +501,7 @@ mod tests {
             "continuation",
             false,
             ApplyMode::StageRunBoundary,
-            WakeMode::InterruptYielding,
+            WakeMode::None,
             QueueMode::Fifo,
             ConsumePoint::OnRunComplete,
             false,
@@ -616,16 +591,13 @@ mod tests {
     }
 
     #[test]
-    fn peer_message_running_interrupts_yielding() {
-        // Peer messages arriving while running should use InterruptYielding
-        // so cooperative yielding points (e.g., wait tool) are interrupted.
+    fn peer_message_running_stays_queued_without_wake() {
         let decision = DefaultPolicyTable::resolve_by_kind(&KindId::new("peer_message"), false);
         assert_eq!(
             decision.wake_mode,
-            WakeMode::InterruptYielding,
-            "peer_message while running must use InterruptYielding"
+            WakeMode::None,
+            "peer_message while running must not request a wake"
         );
-        // Must not set wake (only interrupt yielding points)
         assert_ne!(
             decision.wake_mode,
             WakeMode::WakeIfIdle,
@@ -634,13 +606,12 @@ mod tests {
     }
 
     #[test]
-    fn peer_request_running_interrupts_yielding() {
-        // Peer requests arriving while running should use InterruptYielding.
+    fn peer_request_running_stays_queued_without_wake() {
         let decision = DefaultPolicyTable::resolve_by_kind(&KindId::new("peer_request"), false);
         assert_eq!(
             decision.wake_mode,
-            WakeMode::InterruptYielding,
-            "peer_request while running must use InterruptYielding"
+            WakeMode::None,
+            "peer_request while running must not request a wake"
         );
     }
 
@@ -716,10 +687,6 @@ mod tests {
         let decision = DefaultPolicyTable::resolve(&input, true);
         assert_eq!(decision.routing_disposition, RoutingDisposition::Steer);
         assert_eq!(decision.apply_mode, ApplyMode::StageRunBoundary);
-        assert_eq!(
-            decision.interrupt_policy,
-            InterruptPolicy::InterruptYielding
-        );
     }
 
     #[test]
@@ -733,10 +700,6 @@ mod tests {
         );
         let decision = DefaultPolicyTable::resolve(&input, false);
         assert_eq!(decision.routing_disposition, RoutingDisposition::Steer);
-        assert_eq!(
-            decision.interrupt_policy,
-            InterruptPolicy::InterruptYielding
-        );
     }
 
     #[test]
@@ -791,10 +754,6 @@ mod tests {
         let decision = DefaultPolicyTable::resolve(&input, true);
         assert_eq!(decision.routing_disposition, RoutingDisposition::Steer);
         assert_eq!(decision.apply_mode, ApplyMode::StageRunBoundary);
-        assert_eq!(
-            decision.interrupt_policy,
-            InterruptPolicy::InterruptYielding
-        );
         assert!(decision.record_transcript);
     }
 

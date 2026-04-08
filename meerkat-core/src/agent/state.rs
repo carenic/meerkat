@@ -538,12 +538,6 @@ where
                             cs.agent_applied_cursor
                                 .store(batch.watermark, std::sync::atomic::Ordering::Release);
                         }
-
-                        // Stamp the interrupt baseline so the wait tool only
-                        // reacts to completions that arrive AFTER this point.
-                        if let Some(ref baseline) = self.interrupt_baseline {
-                            baseline.store(batch.watermark, std::sync::atomic::Ordering::Release);
-                        }
                     }
 
                     // Legacy path: completions from custom/override dispatchers that
@@ -2350,6 +2344,28 @@ mod tests {
 
         fn inbox_notify(&self) -> Arc<Notify> {
             self.notify.clone()
+        }
+
+        async fn drain_peer_input_candidates(&self) -> Vec<crate::interaction::PeerInputCandidate> {
+            self.drain_messages()
+                .await
+                .into_iter()
+                .map(|text| crate::interaction::PeerInputCandidate {
+                    interaction: crate::interaction::InboxInteraction {
+                        id: crate::interaction::InteractionId(uuid::Uuid::new_v4()),
+                        from: "unknown".into(),
+                        content: crate::interaction::InteractionContent::Message {
+                            body: text.clone(),
+                            blocks: None,
+                        },
+                        rendered_text: text,
+                        handling_mode: crate::types::HandlingMode::Queue,
+                        render_metadata: None,
+                    },
+                    class: crate::interaction::PeerInputClass::ActionableMessage,
+                    lifecycle_peer: None,
+                })
+                .collect()
         }
     }
 

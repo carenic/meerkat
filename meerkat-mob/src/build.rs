@@ -128,9 +128,9 @@ pub async fn build_agent_config(
         "mob-communication",
     )]);
 
-    // Silent comms intents: peer lifecycle notifications are injected
-    // into context without triggering an LLM turn.
-    config.silent_comms_intents = vec!["mob.peer_added".into(), "mob.peer_retired".into()];
+    // Mob lifecycle notifications are typed at peer ingress. Do not rely on
+    // silent_comms_intents string matching for canonical routing.
+    config.silent_comms_intents = Vec::new();
     config.max_inline_peer_notifications = profile.max_inline_peer_notifications;
 
     // Map ToolConfig booleans to typed override intent.
@@ -781,7 +781,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_build_agent_config_sets_silent_comms_intents() {
+    async fn test_build_agent_config_does_not_rely_on_silent_comms_intents_for_mob_lifecycle() {
         let def = sample_definition();
         let lead = &def.profiles[&ProfileName::from("lead")];
         let config = build_agent_config(BuildAgentConfigParams {
@@ -801,16 +801,8 @@ mod tests {
         .expect("build_agent_config");
 
         assert!(
-            config
-                .silent_comms_intents
-                .contains(&"mob.peer_added".to_string()),
-            "silent_comms_intents should include mob.peer_added"
-        );
-        assert!(
-            config
-                .silent_comms_intents
-                .contains(&"mob.peer_retired".to_string()),
-            "silent_comms_intents should include mob.peer_retired"
+            config.silent_comms_intents.is_empty(),
+            "mob lifecycle routing should no longer depend on silent_comms_intents"
         );
         assert_eq!(config.max_inline_peer_notifications, None);
     }
