@@ -324,7 +324,7 @@ pub struct PeerInput {
     /// Optional handling-mode override for actionable peer inputs.
     /// When present on Message/Request/no-convention, overrides kind-based
     /// policy defaults with explicit Queue or Steer semantics.
-    /// Forbidden on ResponseProgress and ResponseTerminal
+    /// Forbidden on ResponseProgress
     /// (enforced by `validate_peer_handling_mode` at runtime admission).
     pub handling_mode: Option<HandlingMode>,
 }
@@ -467,7 +467,7 @@ External/public ingress MUST NOT directly submit `Input` with `durability = Deri
 
 `PeerInput` with `Message`, `Request`, or no convention MAY carry an explicit `handling_mode` override (`Queue` or `Steer`) that overrides kind-based policy defaults.
 
-`PeerInput` with `ResponseProgress` or `ResponseTerminal` MUST NOT carry `handling_mode`. This is enforced by `validate_peer_handling_mode` at runtime admission, alongside durability validation.
+`PeerInput` with `ResponseProgress` MUST NOT carry `handling_mode`. `ResponseTerminal` MAY carry it. This is enforced by `validate_peer_handling_mode` at runtime admission, alongside durability validation.
 
 ## 11. Input Scope
 
@@ -706,14 +706,14 @@ These defaults are normative.
 |---|---|---|
 | `PromptInput` | `StageRunStart`, `WakeIfIdle`, `Fifo`, `OnRunComplete`, transcript=true | `StageRunStart`, `None`, `Fifo`, `OnRunComplete`, transcript=true |
 | `ExternalEventInput` | `StageRunStart`, `WakeIfIdle`, `Fifo`, `OnRunComplete`, transcript=true | `StageRunStart`, `None`, `Fifo`, `OnRunComplete`, transcript=true |
-| `PeerInput` with no convention, `Message`, or `Request` | `StageRunStart`, `WakeIfIdle`, `Fifo`, `OnRunComplete`, transcript=true | `StageRunStart`, `InterruptYielding`, `Fifo`, `OnRunComplete`, transcript=true |
+| `PeerInput` with no convention, `Message`, or `Request` | `StageRunStart`, `WakeIfIdle`, `Fifo`, `OnRunComplete`, transcript=true | `StageRunStart`, `None`, `Fifo`, `OnRunComplete`, transcript=true |
 | `PeerInput` with `ResponseProgress` | `StageRunBoundary`, `None`, `Coalesce`, `OnRunComplete`, transcript=true | `StageRunBoundary`, `None`, `Coalesce`, `OnRunComplete`, transcript=true |
 | `PeerInput` with `ResponseTerminal` | `StageRunStart`, `WakeIfIdle`, `Fifo`, `OnRunComplete`, transcript=true | `StageRunBoundary`, `None`, `Fifo`, `OnRunComplete`, transcript=true |
 | `FlowStepInput` | `StageRunStart`, `WakeIfIdle`, `Fifo`, `OnRunComplete`, transcript=true | `StageRunStart`, `None`, `Fifo`, `OnRunComplete`, transcript=true |
 | `ProjectedInput` | `Ignore`, `None`, `None`, `OnAccept`, transcript=false | `Ignore`, `None`, `Coalesce`, `OnAccept`, transcript=false |
 | `ToolCallbackInput` | `StageRunBoundary`, `WakeIfIdle`, `Fifo`, `OnRunComplete`, transcript=true | `StageRunBoundary`, `None`, `Fifo`, `OnRunComplete`, transcript=true |
 
-**Note:** `PeerInput` with `Message`, `Request`, or no convention may carry an explicit `handling_mode` (`Queue` or `Steer`) that overrides the kind-based defaults in the table above. `ResponseProgress` and `ResponseTerminal` MUST NOT carry `handling_mode` (see §10.4).
+**Note:** `PeerInput` with `Message`, `Request`, `ResponseTerminal`, or no convention may carry an explicit `handling_mode` (`Queue` or `Steer`) that overrides the kind-based defaults in the table above. `ResponseProgress` MUST NOT carry `handling_mode` (see §10.4).
 
 Profile overrides MAY change:
 
@@ -888,7 +888,7 @@ Required transitions:
 Driver/runtime rules:
 
 - while `Running`, newly accepted input MAY be queued or staged but MUST NOT cancel active work
-- peer messages and requests arriving while `Running` use `InterruptYielding` — they interrupt cooperative yielding points (e.g., `wait` tool) but do not cancel active LLM calls or tool executions
+- peer messages and requests arriving while `Running` stage for the next boundary by default; explicit steer routes through canonical ingress without a separate cooperative-interrupt path
 - terminal peer responses arriving while `Running` MUST stage at `RunBoundary`
 - terminal peer responses arriving while `Idle` MUST wake
 - progress peer responses MUST NOT wake by default

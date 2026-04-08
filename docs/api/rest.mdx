@@ -757,6 +757,7 @@ Push a canonical comms command into a running session. Requires the `comms` feat
   "kind": "peer_message",
   "to": "reviewer",
   "body": "Please review the latest diff",
+  "handling_mode": "queue",
   "source": "ci-pipeline"
 }
 ```
@@ -780,6 +781,10 @@ Push a canonical comms command into a running session. Requires the `comms` feat
 
 <ParamField body="body" type="string | null">
   Message body (required for `peer_message`).
+</ParamField>
+
+<ParamField body="handling_mode" type="string | null">
+  Handling mode for `peer_message` and `peer_request`. Local callers must provide `"queue"` or `"steer"`.
 </ParamField>
 
 <ParamField body="intent" type="string | null">

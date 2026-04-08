@@ -1492,21 +1492,13 @@ impl AgentFactory {
             }
         };
 
-        // Create the completion feed + interrupt baseline for cursor-based
-        // completion delivery. The feed is obtained from the ops lifecycle
-        // registry; the baseline is a shared atomic stamped by the agent
-        // before each tool dispatch.
+        // Create the completion feed for cursor-based completion delivery.
+        // The feed is obtained from the ops lifecycle registry and consumed
+        // directly by the agent boundary for background completion notices.
         let completion_feed = ops_lifecycle.completion_feed();
-        let interrupt_baseline: Option<Arc<std::sync::atomic::AtomicU64>> =
-            if completion_feed.is_some() {
-                Some(Arc::new(std::sync::atomic::AtomicU64::new(0)))
-            } else {
-                None
-            };
 
-        // Build the tool dispatcher WITHOUT wait interrupt wiring.
-        // The interrupt is bound once after full composition (including comms gateway).
-        // This ensures all dispatcher paths (builtin, override, WASM, composed) are covered.
+        // Build the tool dispatcher. Wait-tool-specific binding was removed
+        // along with the generic wait tool.
         #[allow(unused_mut)]
         let (mut tools, mut tool_usage_instructions) =
             if let Some(dispatcher) = build_config.tool_dispatcher_override.take() {
@@ -1655,17 +1647,6 @@ impl AgentFactory {
         // Binding now happens once on the final shape. Gateway wrappers
         // forward bind_* calls to inner entries that support them, with
         // Arc::strong_count guards for shared overrides.
-        if tools.capabilities().completion_feed
-            && Arc::strong_count(&tools) == 1
-            && let (Some(feed), Some(baseline)) =
-                (completion_feed.clone(), interrupt_baseline.clone())
-        {
-            let outcome = tools.bind_completion_feed(feed, baseline).map_err(|e| {
-                BuildAgentError::Config(format!("Completion feed binding failed: {e}"))
-            })?;
-            tools = outcome.into_dispatcher();
-        }
-
         if tools.capabilities().ops_lifecycle {
             let outcome = tools
                 .bind_ops_lifecycle(Arc::clone(&ops_lifecycle), session.id().clone())
@@ -2024,12 +2005,9 @@ impl AgentFactory {
             builder = builder.with_epoch_cursor_state(Arc::clone(&bindings.cursor_state));
         }
 
-        // 12h. Wire completion feed + baseline + enrichment for cursor-based delivery
+        // 12h. Wire completion feed + enrichment for cursor-based delivery
         if let Some(feed) = completion_feed {
             builder = builder.with_completion_feed(feed);
-        }
-        if let Some(baseline) = interrupt_baseline {
-            builder = builder.with_interrupt_baseline(baseline);
         }
         // Extract enrichment provider from the tool dispatcher (if the dispatcher
         // has a shell job manager, it implements CompletionEnrichmentProvider).

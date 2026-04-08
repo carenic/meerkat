@@ -533,7 +533,6 @@ mod tests {
         fn capabilities(&self) -> meerkat_core::agent::DispatcherCapabilities {
             meerkat_core::agent::DispatcherCapabilities {
                 ops_lifecycle: true,
-                ..meerkat_core::agent::DispatcherCapabilities::default()
             }
         }
 

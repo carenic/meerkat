@@ -84,6 +84,9 @@ pub enum RuntimeIngressInput {
         work_id: InputId,
         content_shape: ContentShape,
         handling_mode: HandlingMode,
+        /// Whether this admitted input should request immediate processing
+        /// in addition to routing through the steer lane.
+        request_immediate_processing: bool,
         is_prompt: bool,
         request_id: Option<RequestId>,
         reservation_key: Option<ReservationKey>,
@@ -560,6 +563,7 @@ impl RuntimeIngressAuthority {
         work_id: InputId,
         content_shape: ContentShape,
         handling_mode: HandlingMode,
+        request_immediate_processing: bool,
         is_prompt: bool,
         request_id: Option<RequestId>,
         reservation_key: Option<ReservationKey>,
@@ -582,6 +586,7 @@ impl RuntimeIngressAuthority {
                 work_id,
                 content_shape,
                 handling_mode,
+                request_immediate_processing,
                 is_prompt,
                 request_id,
                 reservation_key,
@@ -625,6 +630,7 @@ impl RuntimeIngressAuthority {
                 work_id,
                 content_shape,
                 handling_mode,
+                request_immediate_processing,
                 is_prompt,
                 request_id,
                 reservation_key,
@@ -635,6 +641,7 @@ impl RuntimeIngressAuthority {
                 work_id,
                 content_shape,
                 *handling_mode,
+                *request_immediate_processing,
                 *is_prompt,
                 request_id,
                 reservation_key,
@@ -727,6 +734,7 @@ impl RuntimeIngressAuthority {
         work_id: &InputId,
         content_shape: &ContentShape,
         handling_mode: HandlingMode,
+        request_immediate_processing: bool,
         is_prompt: bool,
         request_id: &Option<RequestId>,
         reservation_key: &Option<ReservationKey>,
@@ -788,11 +796,16 @@ impl RuntimeIngressAuthority {
             HandlingMode::Steer => fields.steer_queue.push(work_id.clone()),
         }
 
-        // Wake/process flags
-        fields.wake_requested = true;
-        if handling_mode == HandlingMode::Steer {
-            fields.process_requested = true;
-        }
+        // Wake/process flags.
+        //
+        // Routing through the steer lane and requesting immediate processing are
+        // different facts. ResponseProgress uses the steer lane for checkpoint
+        // batching, but must remain passive unless the input kind explicitly
+        // requests immediate processing (for example a steer override or a
+        // continuation wake).
+        fields.wake_requested =
+            matches!(policy.wake_mode, crate::WakeMode::WakeIfIdle) || request_immediate_processing;
+        fields.process_requested = request_immediate_processing;
 
         effects.push(RuntimeIngressEffect::IngressAccepted {
             work_id: work_id.clone(),
@@ -808,7 +821,7 @@ impl RuntimeIngressAuthority {
             }
             crate::WakeMode::None => {}
         }
-        if handling_mode == HandlingMode::Steer {
+        if request_immediate_processing {
             effects.push(RuntimeIngressEffect::RequestImmediateProcessing);
         }
 
@@ -2003,19 +2016,21 @@ mod tests {
         work_id: InputId,
         mode: HandlingMode,
     ) -> RuntimeIngressTransition {
-        admit_queued_with_prompt(auth, work_id, mode, false)
+        admit_queued_with_options(auth, work_id, mode, mode == HandlingMode::Steer, false)
     }
 
-    fn admit_queued_with_prompt(
+    fn admit_queued_with_options(
         auth: &mut RuntimeIngressAuthority,
         work_id: InputId,
         mode: HandlingMode,
+        request_immediate_processing: bool,
         is_prompt: bool,
     ) -> RuntimeIngressTransition {
         auth.apply(RuntimeIngressInput::AdmitQueued {
             work_id,
             content_shape: ContentShape("text".into()),
             handling_mode: mode,
+            request_immediate_processing,
             is_prompt,
             request_id: None,
             reservation_key: None,
@@ -2141,6 +2156,51 @@ mod tests {
     }
 
     #[test]
+    fn admit_queued_steer_lane_can_remain_passive() {
+        let mut auth = RuntimeIngressAuthority::new();
+        let wid = InputId::new();
+        let t = auth
+            .apply(RuntimeIngressInput::AdmitQueued {
+                work_id: wid.clone(),
+                content_shape: ContentShape("text".into()),
+                handling_mode: HandlingMode::Steer,
+                request_immediate_processing: false,
+                is_prompt: false,
+                request_id: None,
+                reservation_key: None,
+                policy: PolicyDecision {
+                    apply_mode: ApplyMode::StageRunBoundary,
+                    wake_mode: WakeMode::None,
+                    queue_mode: QueueMode::Coalesce,
+                    consume_point: ConsumePoint::OnRunComplete,
+                    interrupt_policy: InterruptPolicy::None,
+                    drain_policy: DrainPolicy::SteerBatch,
+                    routing_disposition: RoutingDisposition::Steer,
+                    record_transcript: true,
+                    emit_operator_content: true,
+                    policy_version: PolicyVersion(1),
+                },
+                existing_superseded_id: None,
+            })
+            .expect("admit should succeed");
+
+        assert!(auth.queue().is_empty());
+        assert_eq!(auth.steer_queue(), &[wid]);
+        assert!(!auth.wake_requested());
+        assert!(!auth.process_requested());
+        assert!(
+            !t.effects
+                .iter()
+                .any(|e| matches!(e, RuntimeIngressEffect::RequestImmediateProcessing))
+        );
+        assert!(
+            !t.effects
+                .iter()
+                .any(|e| matches!(e, RuntimeIngressEffect::WakeRuntime))
+        );
+    }
+
+    #[test]
     fn admit_queued_duplicate_rejected() {
         let mut auth = RuntimeIngressAuthority::new();
         let wid = InputId::new();
@@ -2150,6 +2210,7 @@ mod tests {
             work_id: wid,
             content_shape: ContentShape("text".into()),
             handling_mode: HandlingMode::Queue,
+            request_immediate_processing: false,
             is_prompt: false,
             request_id: None,
             reservation_key: None,
@@ -2171,6 +2232,7 @@ mod tests {
             work_id: InputId::new(),
             content_shape: ContentShape("text".into()),
             handling_mode: HandlingMode::Queue,
+            request_immediate_processing: false,
             is_prompt: false,
             request_id: None,
             reservation_key: None,

@@ -91,12 +91,12 @@ pub fn format_external_event_projection(source_name: &str, body: Option<&str>) -
 /// Classification result for incoming peer/event traffic.
 ///
 /// Stored with each inbox entry at ingress time. Downstream consumers
-/// (host loop, wait interrupt) switch on this enum instead of re-classifying.
+/// switch on this enum instead of re-classifying.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerInputClass {
-    /// A peer message that should wake `wait` and trigger an LLM turn.
+    /// A peer message that should route through canonical runtime admission.
     ActionableMessage,
-    /// A peer request that should wake `wait` and trigger an LLM turn.
+    /// A peer request that should route through canonical runtime admission.
     ActionableRequest,
     /// A response to a previous outbound request (non-interrupting context).
     Response,
@@ -113,10 +113,7 @@ pub enum PeerInputClass {
 }
 
 impl PeerInputClass {
-    /// Returns true if this class should interrupt an in-flight `wait`.
-    ///
-    /// Includes responses: a `send_request` + `wait` workflow needs the
-    /// peer's response to interrupt the wait immediately, not after timeout.
+    /// Returns true if this class is actionable runtime ingress.
     pub fn is_actionable(&self) -> bool {
         matches!(
             self,

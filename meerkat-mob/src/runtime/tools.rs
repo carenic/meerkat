@@ -60,26 +60,6 @@ impl AgentToolDispatcher for NameFilteredDispatcher {
         self.inner.capabilities()
     }
 
-    fn bind_wait_interrupt(
-        self: Arc<Self>,
-        rx: meerkat_core::wait_interrupt::WaitInterruptReceiver,
-    ) -> Result<BindOutcome, meerkat_core::wait_interrupt::WaitInterruptBindError> {
-        let owned = Arc::try_unwrap(self)
-            .map_err(|_| meerkat_core::wait_interrupt::WaitInterruptBindError::SharedOwnership)?;
-        let outcome = owned.inner.bind_wait_interrupt(rx)?;
-        let bound = outcome.was_bound();
-        let inner = outcome.into_dispatcher();
-        let wrapper = Arc::new(NameFilteredDispatcher {
-            inner,
-            excluded: owned.excluded,
-        });
-        Ok(if bound {
-            BindOutcome::Bound(wrapper)
-        } else {
-            BindOutcome::Skipped(wrapper)
-        })
-    }
-
     fn bind_ops_lifecycle(
         self: Arc<Self>,
         registry: Arc<dyn OpsLifecycleRegistry>,
@@ -914,7 +894,6 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
     fn capabilities(&self) -> DispatcherCapabilities {
         DispatcherCapabilities {
             ops_lifecycle: true,
-            ..DispatcherCapabilities::default()
         }
     }
 

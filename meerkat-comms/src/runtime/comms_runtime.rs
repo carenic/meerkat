@@ -661,10 +661,22 @@ impl CoreCommsRuntime for CommsRuntime {
                                 return None;
                             }
 
-                        // Extract handling_mode from Response envelopes before
-                        // consuming the kind in the content match.
+                        // Preserve the sender's explicit handling_mode across the
+                        // candidate drain for all peer input kinds. Older peers may
+                        // omit the field, which normalizes to Queue.
                         let envelope_handling_mode = match &envelope.kind {
-                            MessageKind::Response { handling_mode: Some(mode), .. } => *mode,
+                            MessageKind::Message {
+                                handling_mode: Some(mode),
+                                ..
+                            }
+                            | MessageKind::Request {
+                                handling_mode: Some(mode),
+                                ..
+                            }
+                            | MessageKind::Response {
+                                handling_mode: Some(mode),
+                                ..
+                            } => *mode,
                             _ => meerkat_core::types::HandlingMode::Queue,
                         };
 
@@ -2406,6 +2418,79 @@ mod tests {
             meerkat_core::types::HandlingMode::Steer
         );
         assert_eq!(interaction.render_metadata, Some(render_metadata));
+    }
+
+    #[tokio::test]
+    async fn test_external_message_and_request_preserve_handling_mode_in_candidate_drain() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = test_runtime_config("external-handling-mode", &tmp);
+        let runtime = CommsRuntime::new(config).await.unwrap();
+
+        let sender = Keypair::generate();
+        runtime.router.add_trusted_peer(crate::TrustedPeer {
+            name: "sender".to_string(),
+            pubkey: sender.public_key(),
+            addr: "tcp://127.0.0.1:4200".to_string(),
+            meta: crate::PeerMeta::default(),
+        });
+
+        let msg = signed_envelope(
+            &sender,
+            runtime.public_key(),
+            MessageKind::Message {
+                body: "hello".to_string(),
+                blocks: None,
+                handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+            },
+        );
+        let req = signed_envelope(
+            &sender,
+            runtime.public_key(),
+            MessageKind::Request {
+                intent: "review".to_string(),
+                params: serde_json::json!({"pr": 42}),
+                handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+            },
+        );
+
+        runtime
+            .router
+            .inbox_sender()
+            .send_classified(InboxItem::External { envelope: msg })
+            .unwrap();
+        runtime
+            .router
+            .inbox_sender()
+            .send_classified(InboxItem::External { envelope: req })
+            .unwrap();
+
+        let candidates = runtime.drain_peer_input_candidates().await;
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates.iter().any(|candidate| {
+                matches!(
+                    &candidate.interaction.content,
+                    meerkat_core::InteractionContent::Message { body, .. }
+                        if body == "hello"
+                            && candidate.interaction.handling_mode
+                                == meerkat_core::types::HandlingMode::Steer
+                )
+            }),
+            "message candidates must preserve explicit steer handling_mode"
+        );
+        assert!(
+            candidates.iter().any(|candidate| {
+                matches!(
+                    &candidate.interaction.content,
+                    meerkat_core::InteractionContent::Request { intent, params }
+                        if intent == "review"
+                            && params["pr"] == 42
+                            && candidate.interaction.handling_mode
+                                == meerkat_core::types::HandlingMode::Steer
+                )
+            }),
+            "request candidates must preserve explicit steer handling_mode"
+        );
     }
 
     #[test]

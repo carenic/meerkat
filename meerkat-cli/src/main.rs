@@ -4663,6 +4663,8 @@ struct CliCommsSendRequest {
     stream: Option<String>,
     #[serde(default)]
     allow_self_session: Option<bool>,
+    #[serde(default)]
+    handling_mode: Option<String>,
 }
 
 #[cfg(all(feature = "comms", test))]
@@ -4685,7 +4687,7 @@ fn parse_comms_send_payload(
         source: req.source,
         stream: req.stream,
         allow_self_session: req.allow_self_session,
-        handling_mode: None,
+        handling_mode: req.handling_mode,
     };
 
     request.parse(session_id).map_err(|errors| {

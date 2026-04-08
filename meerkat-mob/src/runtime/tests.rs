@@ -14393,8 +14393,7 @@ impl AgentToolDispatcher for MultiToolDispatcher {
 
     fn capabilities(&self) -> meerkat_core::agent::DispatcherCapabilities {
         meerkat_core::agent::DispatcherCapabilities {
-            wait_interrupt: true,
-            ..meerkat_core::agent::DispatcherCapabilities::default()
+            ops_lifecycle: true,
         }
     }
 }
@@ -14437,8 +14436,8 @@ async fn test_name_filtered_dispatcher() {
 
     // capabilities delegates
     assert!(
-        filtered.capabilities().wait_interrupt,
-        "should delegate capabilities().wait_interrupt to inner"
+        filtered.capabilities().ops_lifecycle,
+        "should delegate capabilities().ops_lifecycle to inner"
     );
 }
 

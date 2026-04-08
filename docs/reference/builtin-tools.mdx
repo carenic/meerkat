@@ -17,7 +17,6 @@ icon: "wrench"
 | `shell_job_status` | Shell | No | -- | Check background job status |
 | `shell_job_cancel` | Shell | No | -- | Cancel a background job |
 | `memory_search` | Memory | N/A | `memory-store-session` | Search semantic memory |
-| `wait` | Utility | Yes | -- | Pause execution |
 | `datetime` | Utility | Yes | -- | Get current date/time |
 | `apply_patch` | Utility | Yes | -- | Apply structured file patches inside the project root |
 | `view_image` | Utility | Yes | vision | Read an image file and return base64 content |
@@ -38,7 +37,7 @@ icon: "wrench"
 
 | Flag | Builder Method | Default | Controls |
 |------|---------------|---------|----------|
-| `enable_builtins` | `.builtins(bool)` | `false` | Task tools, utility tools (`wait`, `datetime`, `apply_patch`) |
+| `enable_builtins` | `.builtins(bool)` | `false` | Task tools, utility tools (`datetime`, `apply_patch`, `view_image`) |
 | `enable_shell` | `.shell(bool)` | `false` | All shell tools (`shell`, `shell_jobs`, `shell_job_status`, `shell_job_cancel`) |
 | `enable_memory` | `.memory(bool)` | `false` | `memory_search` (requires `memory-store-session` feature) |
 | `enable_comms` | `.comms(bool)` | `false` | All comms tools (requires `comms` feature) |
@@ -71,7 +70,7 @@ Individual tools can be enabled or disabled via `ToolPolicyLayer` in `BuiltinToo
 <Accordion title="Capability registrations">
 Capabilities are registered via the `inventory` crate in `meerkat-tools/src/lib.rs`:
 
-- **Builtins** (`CapabilityId::Builtins`): `task_list`, `task_create`, `task_get`, `task_update`, `wait`, `datetime`, `apply_patch`, `view_image`. Controlled by `config.tools.builtins_enabled`.
+- **Builtins** (`CapabilityId::Builtins`): `task_list`, `task_create`, `task_get`, `task_update`, `datetime`, `apply_patch`, `view_image`. Controlled by `config.tools.builtins_enabled`.
 - **Shell** (`CapabilityId::Shell`): `shell`, `shell_jobs`, `shell_job_status`, `shell_job_cancel`. Controlled by `config.tools.shell_enabled`.
 </Accordion>
 
@@ -490,38 +489,6 @@ Returns an empty array if no matches are found.
 
 Utility tools are general-purpose helpers enabled by default when builtins are on.
 
-<Accordion title="wait">
-Pause execution for the specified number of seconds. Supports fractional seconds. Useful for polling loops or rate limiting.
-
-**Default enabled:** Yes
-
-<ParamField body="seconds" type="f64" required>
-  Duration to wait in seconds (clamped to 0.0 to 60.0).
-</ParamField>
-
-Maximum wait time is 60 seconds (1 minute). Values are clamped to the range 0.0 to 60.0.
-
-<CodeGroup>
-```json Returns (completed)
-{
-  "waited_seconds": 5.0,
-  "status": "complete"
-}
-```
-
-```json Returns (interrupted)
-{
-  "waited_seconds": 2.3,
-  "requested_seconds": 5.0,
-  "status": "interrupted",
-  "reason": "Wait interrupted after 2.3s: incoming message from peer"
-}
-```
-</CodeGroup>
-
-**Source:** `meerkat-tools/src/builtin/utility/wait.rs`
-</Accordion>
-
 <Accordion title="datetime">
 Get the current date and time. Returns ISO 8601 formatted datetime and Unix timestamp.
 
@@ -599,6 +566,10 @@ Send a message, request, or response to a trusted peer. The `kind` parameter det
 
 <ParamField body="params" type="any" default="null">
   Request parameters (for `kind="peer_request"`).
+</ParamField>
+
+<ParamField body="handling_mode" type="String">
+  Required for `kind="peer_message"` and `kind="peer_request"`. Use `"queue"` for ordinary delivery or `"steer"` for immediate steer processing on runtime-backed sessions.
 </ParamField>
 
 <ParamField body="in_reply_to" type="String (UUID)">

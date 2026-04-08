@@ -50,9 +50,8 @@ use meerkat_store::{JsonlStore, MemoryBlobStore, SessionFilter, SessionStore};
 
 use mdm_tux::{
     DirectControlPayload, KennelPayload, ProviderKind, RegResponse, auto_detect,
-    build_signed_envelope, direct_control_request,
-    parse_direct_control_message, read_envelope, register_with_backoff,
-    verify_envelope, write_envelope,
+    build_signed_envelope, direct_control_request, parse_direct_control_message, read_envelope,
+    register_with_backoff, verify_envelope, write_envelope,
 };
 use tokio::io::BufReader;
 use tokio::net::TcpStream;
@@ -103,9 +102,7 @@ async fn build_target_runtime_surface(
         let adapter = runtime_adapter.clone();
         session_service.set_runtime_bindings_provider(Arc::new(move |session_id| {
             let adapter = adapter.clone();
-            Box::pin(async move {
-                adapter.prepare_bindings(session_id).await.ok()
-            })
+            Box::pin(async move { adapter.prepare_bindings(session_id).await.ok() })
         }));
     }
     let service = Arc::new(session_service);
@@ -725,6 +722,7 @@ async fn handle_target_message(
                 MessageKind::Message {
                     body: response,
                     blocks: None,
+                    handling_mode: None,
                 },
             );
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), reply_fut).await;
@@ -824,12 +822,13 @@ fn spawn_heartbeat(
             // loop indefinitely (TCP connect can hang for minutes). Without
             // this, the failure counter never advances and reconnect never fires.
             let send_fut = router.send(
-                    &peer,
-                    MessageKind::Request {
-                        intent: "heartbeat".into(),
-                        params: serde_json::json!(null),
-                    },
-                );
+                &peer,
+                MessageKind::Request {
+                    intent: "heartbeat".into(),
+                    params: serde_json::json!(null),
+                    handling_mode: None,
+                },
+            );
             let failed =
                 match tokio::time::timeout(std::time::Duration::from_secs(5), send_fut).await {
                     Ok(Ok(_)) => false,
@@ -1108,7 +1107,14 @@ async fn switch_session(
                 if let Some(old) = event_forwarder.take() {
                     old.abort();
                 }
-                match spawn_event_forwarder(service, &session_id, Arc::clone(comms_runtime), disconnect_tx.clone()).await {
+                match spawn_event_forwarder(
+                    service,
+                    &session_id,
+                    Arc::clone(comms_runtime),
+                    disconnect_tx.clone(),
+                )
+                .await
+                {
                     Ok(handle) => new_forwarder = Some(handle),
                     Err(e) => {
                         let (rolled_back, cleanup_effects) = target_session_binding::transition(
@@ -1231,7 +1237,9 @@ async fn setup_session(
     let prepared_session_id = prepared_session.id().clone();
 
     // Prepare canonical runtime bindings (registers + allocates epoch in one shot).
-    let bindings = runtime_adapter.prepare_bindings(prepared_session_id.clone()).await
+    let bindings = runtime_adapter
+        .prepare_bindings(prepared_session_id.clone())
+        .await
         .map_err(|e| anyhow::anyhow!("runtime bindings: {e}"))?;
 
     // No external_tools needed — the factory composes comms tools automatically
@@ -1263,7 +1271,9 @@ async fn setup_session(
     let result = match service.create_session(req).await {
         Ok(result) => result,
         Err(error) => {
-            runtime_adapter.unregister_session(&prepared_session_id).await;
+            runtime_adapter
+                .unregister_session(&prepared_session_id)
+                .await;
             return Err(anyhow::anyhow!("create session: {error}"));
         }
     };
@@ -2208,15 +2218,14 @@ mod tests {
     use anyhow::Context as _;
     use mdm_tux::ProviderKind;
     use meerkat::{
-        AgentFactory, FactoryAgentBuilder, LlmClient, PersistenceBundle,
-        PersistentSessionService, SessionAgentBuilder, SessionService,
-        encode_llm_client_override_for_service,
+        AgentFactory, FactoryAgentBuilder, LlmClient, PersistenceBundle, PersistentSessionService,
+        SessionAgentBuilder, SessionService, encode_llm_client_override_for_service,
     };
     use meerkat_client::types::LlmStream;
     use meerkat_client::{LlmDoneOutcome, LlmError, LlmEvent, LlmRequest, TestClient};
     use meerkat_comms::{CommsRuntime, ResolvedCommsConfig};
-    use meerkat_core::ops_lifecycle::OperationKind;
     use meerkat_core::Config;
+    use meerkat_core::ops_lifecycle::OperationKind;
     use meerkat_core::service::{
         CreateSessionRequest, InitialTurnPolicy, SessionBuildOptions, StartTurnRequest,
     };
@@ -2284,7 +2293,7 @@ mod tests {
         builder.default_llm_client = Some(llm_client);
         let mob_tools_slot = Arc::clone(&builder.default_mob_tools);
 
-        let jsonl_store = JsonlStore::new(session_dir.to_path_buf());
+        let jsonl_store = Arc::new(JsonlStore::new(session_dir.to_path_buf()));
         jsonl_store.init().await?;
 
         let bundle_store = JsonlStore::new(session_dir.to_path_buf());
@@ -2429,7 +2438,8 @@ mod tests {
             .unwrap();
 
         let tool_names = capture.tool_names();
-        assert!(tool_names.iter().any(|name| name == "wait"));
+        assert!(tool_names.iter().any(|name| name == "datetime"));
+        assert!(!tool_names.iter().any(|name| name == "wait"));
         assert!(tool_names.iter().any(|name| name == "shell"));
         assert!(tool_names.iter().any(|name| name == "send"));
         assert!(tool_names.iter().any(|name| name == "peers"));
@@ -2465,7 +2475,9 @@ mod tests {
             .await
             .unwrap(),
         );
-        let surface = build_target_runtime_surface(temp.path(), comms_runtime).await.unwrap();
+        let surface = build_target_runtime_surface(temp.path(), comms_runtime)
+            .await
+            .unwrap();
         let req = CreateSessionRequest {
             model: "gpt-5.2".to_string(),
             prompt: ContentInput::Text(String::new()),
@@ -2515,7 +2527,7 @@ mod tests {
                 .mob_state
                 .find_implicit_mob(&session_id.to_string())
                 .await
-            .is_none()
+                .is_none()
         );
     }
 
@@ -2656,10 +2668,9 @@ mod tests {
             addr: "tcp://127.0.0.1:9999".into(),
             meta: meerkat_comms::PeerMeta::default(),
         });
-        let _surface =
-            build_target_runtime_surface(temp.path(), Arc::clone(&comms_runtime))
-                .await
-                .unwrap();
+        let _surface = build_target_runtime_surface(temp.path(), Arc::clone(&comms_runtime))
+            .await
+            .unwrap();
 
         // Build an agent through the full pipeline and check tool visibility.
         let factory = AgentFactory::new(temp.path().join("sessions2"))
@@ -2671,10 +2682,9 @@ mod tests {
         *builder
             .default_mob_tools
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(Arc::new(AgentMobToolSurfaceFactory::new(
-                MobMcpState::new_in_memory(),
-            )));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+            AgentMobToolSurfaceFactory::new(MobMcpState::new_in_memory()),
+        ));
 
         let capture2: Arc<CaptureClient> = Arc::new(CaptureClient::default());
         let req2 = CreateSessionRequest {
@@ -2689,7 +2699,7 @@ mod tests {
             deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
             build: Some(SessionBuildOptions {
                 llm_client_override: Some(encode_llm_client_override_for_service(
-                    capture2.clone() as Arc<dyn LlmClient>,
+                    capture2.clone() as Arc<dyn LlmClient>
                 )),
                 override_builtins: meerkat_core::ToolCategoryOverride::Enable,
                 override_shell: meerkat_core::ToolCategoryOverride::Enable,
@@ -2710,8 +2720,12 @@ mod tests {
         let tool_names = capture2.tool_names();
         // Builtins
         assert!(
-            tool_names.iter().any(|n| n == "wait"),
-            "missing builtin 'wait', got: {tool_names:?}"
+            tool_names.iter().any(|n| n == "datetime"),
+            "missing builtin 'datetime', got: {tool_names:?}"
+        );
+        assert!(
+            !tool_names.iter().any(|n| n == "wait"),
+            "unexpected removed builtin 'wait', got: {tool_names:?}"
         );
         // Shell
         assert!(
@@ -2756,10 +2770,9 @@ mod tests {
         let session_dir = temp.path().join("sessions");
 
         // 1. Create a fresh session via the full pipeline, persist it.
-        let surface =
-            build_target_runtime_surface(&session_dir, Arc::clone(&comms_runtime))
-                .await
-                .unwrap();
+        let surface = build_target_runtime_surface(&session_dir, Arc::clone(&comms_runtime))
+            .await
+            .unwrap();
         let fresh_id = setup_session(
             &surface.service,
             &surface.runtime_adapter,
@@ -2790,10 +2803,9 @@ mod tests {
         *builder
             .default_mob_tools
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(Arc::new(AgentMobToolSurfaceFactory::new(
-                MobMcpState::new_in_memory(),
-            )));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+            AgentMobToolSurfaceFactory::new(MobMcpState::new_in_memory()),
+        ));
 
         let req = CreateSessionRequest {
             model: "gpt-5.2".to_string(),
@@ -2807,7 +2819,7 @@ mod tests {
             deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
             build: Some(SessionBuildOptions {
                 llm_client_override: Some(encode_llm_client_override_for_service(
-                    capture.clone() as Arc<dyn LlmClient>,
+                    capture.clone() as Arc<dyn LlmClient>
                 )),
                 override_builtins: meerkat_core::ToolCategoryOverride::Enable,
                 override_shell: meerkat_core::ToolCategoryOverride::Enable,
@@ -2828,8 +2840,12 @@ mod tests {
 
         let tool_names = capture.tool_names();
         assert!(
-            tool_names.iter().any(|n| n == "wait"),
-            "resumed session missing builtin 'wait', got: {tool_names:?}"
+            tool_names.iter().any(|n| n == "datetime"),
+            "resumed session missing builtin 'datetime', got: {tool_names:?}"
+        );
+        assert!(
+            !tool_names.iter().any(|n| n == "wait"),
+            "resumed session unexpectedly includes removed builtin 'wait', got: {tool_names:?}"
         );
         assert!(
             tool_names.iter().any(|n| n == "shell"),

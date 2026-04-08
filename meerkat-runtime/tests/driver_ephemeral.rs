@@ -144,7 +144,13 @@ async fn accept_progress_no_wake() {
     let result = driver.accept_input(input).await.unwrap();
 
     assert!(result.is_accepted());
-    assert!(!driver.take_wake_requested()); // Progress never wakes
+    let signal = driver.take_post_admission_signal();
+    assert_eq!(
+        signal,
+        PostAdmissionSignal::None,
+        "ResponseProgress should stage on the checkpoint lane without requesting immediate processing"
+    );
+    assert!(!signal.should_wake()); // Progress never wakes
 }
 
 #[tokio::test]
@@ -501,7 +507,13 @@ async fn progress_peer_staged_boundary() {
     // Per §17: ResponseProgress → StageRunBoundary + NoWake + Coalesce + OnRunComplete
     let state = driver.input_state(&input_id).unwrap();
     assert_eq!(state.current_state(), InputLifecycleState::Queued);
-    assert!(!driver.take_wake_requested()); // Progress never wakes
+    let signal = driver.take_post_admission_signal();
+    assert_eq!(
+        signal,
+        PostAdmissionSignal::None,
+        "ResponseProgress should remain passive even though it uses the checkpoint lane"
+    );
+    assert!(!signal.should_wake()); // Progress never wakes
 }
 
 #[tokio::test]

@@ -538,12 +538,6 @@ where
                             cs.agent_applied_cursor
                                 .store(batch.watermark, std::sync::atomic::Ordering::Release);
                         }
-
-                        // Stamp the interrupt baseline so the wait tool only
-                        // reacts to completions that arrive AFTER this point.
-                        if let Some(ref baseline) = self.interrupt_baseline {
-                            baseline.store(batch.watermark, std::sync::atomic::Ordering::Release);
-                        }
                     }
 
                     // Legacy path: completions from custom/override dispatchers that

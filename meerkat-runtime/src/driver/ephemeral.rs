@@ -74,6 +74,15 @@ pub(crate) fn handling_mode_from_policy(policy: &crate::policy::PolicyDecision) 
     }
 }
 
+/// Whether this input should request immediate processing after admission.
+///
+/// This is intentionally narrower than "routes through the steer lane".
+/// `ResponseProgress` uses checkpoint routing for boundary batching, but it
+/// must remain passive unless the input kind explicitly carries steer intent.
+pub(crate) fn requests_immediate_processing(input: &Input) -> bool {
+    matches!(input.handling_mode(), Some(HandlingMode::Steer))
+}
+
 /// Ephemeral runtime driver -- all state in-memory.
 #[derive(Clone)]
 pub struct EphemeralRuntimeDriver {
@@ -1099,6 +1108,7 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
         // the admission path (queued vs consumed-on-accept) based on the policy.
         // Zero policy branching in shell code.
         let handling_mode = handling_mode_from_policy(&policy);
+        let request_immediate_processing = requests_immediate_processing(&input);
         let content_shape = ContentShape(input.kind_id().to_string());
         let is_prompt = matches!(input, Input::Prompt(_));
         let existing_superseded_id = self.existing_superseded_input(&input).map(|(id, _)| id);
@@ -1106,6 +1116,7 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
             input_id.clone(),
             content_shape,
             handling_mode,
+            request_immediate_processing,
             is_prompt,
             None, // request_id
             None, // reservation_key

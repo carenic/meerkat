@@ -41,7 +41,6 @@ pub struct AgentBuilder {
     pub(super) silent_comms_intents: Vec<String>,
     pub(super) ops_lifecycle: Option<Arc<dyn crate::ops_lifecycle::OpsLifecycleRegistry>>,
     pub(super) completion_feed: Option<Arc<dyn crate::completion_feed::CompletionFeed>>,
-    pub(super) interrupt_baseline: Option<Arc<std::sync::atomic::AtomicU64>>,
     pub(super) completion_enrichment:
         Option<Arc<dyn crate::completion_feed::CompletionEnrichmentProvider>>,
     pub(super) max_inline_peer_notifications: Option<i32>,
@@ -74,7 +73,6 @@ impl AgentBuilder {
             silent_comms_intents: Vec::new(),
             ops_lifecycle: None,
             completion_feed: None,
-            interrupt_baseline: None,
             completion_enrichment: None,
             max_inline_peer_notifications: None,
             event_tap: None,
@@ -268,7 +266,6 @@ impl AgentBuilder {
                 .unwrap_or_else(|| self.completion_feed.as_ref().map_or(0, |f| f.watermark())),
             completion_feed: self.completion_feed,
             epoch_cursor_state: self.epoch_cursor_state,
-            interrupt_baseline: self.interrupt_baseline,
             completion_enrichment: self.completion_enrichment,
             mob_authority_handle: None,
             turn_authority: crate::turn_execution_authority::TurnExecutionAuthority::new(),
@@ -357,12 +354,6 @@ impl AgentBuilder {
         feed: Arc<dyn crate::completion_feed::CompletionFeed>,
     ) -> Self {
         self.completion_feed = Some(feed);
-        self
-    }
-
-    /// Set the shared interrupt baseline for the wait tool.
-    pub fn with_interrupt_baseline(mut self, baseline: Arc<std::sync::atomic::AtomicU64>) -> Self {
-        self.interrupt_baseline = Some(baseline);
         self
     }
 

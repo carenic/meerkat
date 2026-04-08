@@ -433,7 +433,8 @@ mod tests {
             &json!({
                 "kind": "peer_message",
                 "to": receiver_name,
-                "body": "hello"
+                "body": "hello",
+                "handling_mode": "queue"
             }),
         )
         .await;

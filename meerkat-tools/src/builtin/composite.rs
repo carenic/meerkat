@@ -463,26 +463,7 @@ impl AgentToolDispatcher for CompositeDispatcher {
                 .as_ref()
                 .is_some_and(|ext| ext.capabilities().ops_lifecycle);
         }
-        DispatcherCapabilities {
-            wait_interrupt: false,
-            ops_lifecycle,
-            completion_feed: false,
-        }
-    }
-
-    fn bind_wait_interrupt(
-        self: Arc<Self>,
-        _rx: meerkat_core::wait_interrupt::WaitInterruptReceiver,
-    ) -> Result<BindOutcome, meerkat_core::wait_interrupt::WaitInterruptBindError> {
-        Err(meerkat_core::wait_interrupt::WaitInterruptBindError::Unsupported)
-    }
-
-    fn bind_completion_feed(
-        self: Arc<Self>,
-        _feed: std::sync::Arc<dyn meerkat_core::completion_feed::CompletionFeed>,
-        _baseline: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    ) -> Result<BindOutcome, meerkat_core::wait_interrupt::WaitInterruptBindError> {
-        Err(meerkat_core::wait_interrupt::WaitInterruptBindError::Unsupported)
+        DispatcherCapabilities { ops_lifecycle }
     }
 
     fn bind_ops_lifecycle(
@@ -621,86 +602,6 @@ mod tests {
         assert!(usage.contains("External tools"));
         assert!(usage.contains("mob_list"));
         assert!(usage.contains("List active mobs"));
-    }
-
-    #[test]
-    #[allow(clippy::panic)]
-    fn bind_wait_interrupt_is_unsupported_without_wait_tool() {
-        let store = Arc::new(MemoryTaskStore::new());
-        let dispatcher = Arc::new(
-            CompositeDispatcher::new(
-                store,
-                &BuiltinToolConfig::default(),
-                None,
-                None,
-                None,
-                None,
-                true,
-            )
-            .expect("composite dispatcher should build"),
-        );
-        let _clone = Arc::clone(&dispatcher);
-
-        let (_tx, rx) =
-            tokio::sync::watch::channel(None::<meerkat_core::wait_interrupt::WaitInterrupt>);
-        match dispatcher.bind_wait_interrupt(rx) {
-            Err(meerkat_core::wait_interrupt::WaitInterruptBindError::Unsupported) => {}
-            Ok(_) => panic!("expected Unsupported error, got Ok"),
-            Err(e) => panic!("expected Unsupported, got {e:?}"),
-        }
-    }
-
-    #[test]
-    #[allow(clippy::panic)]
-    fn bind_completion_feed_is_unsupported_without_wait_tool() {
-        use meerkat_core::completion_feed::{CompletionBatch, CompletionFeed, CompletionSeq};
-
-        #[derive(Debug)]
-        struct EmptyFeed;
-
-        impl CompletionFeed for EmptyFeed {
-            fn watermark(&self) -> CompletionSeq {
-                0
-            }
-
-            fn list_since(&self, _after_seq: CompletionSeq) -> CompletionBatch {
-                CompletionBatch {
-                    entries: Vec::new(),
-                    watermark: 0,
-                }
-            }
-
-            fn wait_for_advance(
-                &self,
-                _after_seq: CompletionSeq,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CompletionSeq> + Send + '_>>
-            {
-                Box::pin(async { futures::future::pending::<CompletionSeq>().await })
-            }
-        }
-
-        let store = Arc::new(MemoryTaskStore::new());
-        let dispatcher = Arc::new(
-            CompositeDispatcher::new(
-                store,
-                &BuiltinToolConfig::default(),
-                None,
-                None,
-                None,
-                None,
-                true,
-            )
-            .expect("composite dispatcher should build"),
-        );
-
-        match dispatcher.bind_completion_feed(
-            Arc::new(EmptyFeed),
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        ) {
-            Err(meerkat_core::wait_interrupt::WaitInterruptBindError::Unsupported) => {}
-            Ok(_) => panic!("expected Unsupported error, got Ok"),
-            Err(e) => panic!("expected Unsupported, got {e:?}"),
-        }
     }
 
     #[tokio::test]

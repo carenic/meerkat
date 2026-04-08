@@ -2,7 +2,7 @@
 //!
 //! The [`CompletionFeed`] trait provides a monotonic, append-only read handle
 //! over operation terminal events. The runtime registry is the sole writer;
-//! consumers (agent boundary, idle wake, wait tool) are read-only.
+//! consumers (agent boundary, idle wake) are read-only.
 //!
 //! This replaces the prior parallel-truth paths (shell job projection,
 //! detached wake booleans, poll_external_updates background_completions).
