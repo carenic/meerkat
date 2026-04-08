@@ -515,7 +515,7 @@ impl RuntimeSessionHost {
         let prepared_session_id = session.id().clone();
         let stored_comms_name = session
             .session_metadata()
-            .and_then(|metadata| metadata.comms_name.clone());
+            .and_then(|metadata| metadata.comms_name);
         let bindings = self
             .runtime_adapter
             .prepare_bindings(prepared_session_id.clone())

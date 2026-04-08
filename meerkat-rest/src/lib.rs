@@ -2485,7 +2485,7 @@ async fn create_session_inner(
             svc_req,
             move |runtime_session_id| {
                 Box::new(RestSessionRuntimeExecutor::new(
-                    runtime_context.clone(),
+                    runtime_context,
                     runtime_session_id,
                 ))
             },
@@ -3208,7 +3208,7 @@ async fn continue_session_inner(
                 create_req,
                 move |runtime_session_id| {
                     Box::new(RestSessionRuntimeExecutor::new(
-                        runtime_context.clone(),
+                        runtime_context,
                         runtime_session_id,
                     ))
                 },
