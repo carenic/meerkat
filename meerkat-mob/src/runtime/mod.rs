@@ -20,7 +20,7 @@ use crate::tasks::{MobTask, TaskBoard, TaskStatus};
 use crate::tokio;
 use meerkat_client::LlmClient;
 use meerkat_core::agent::{AgentToolDispatcher, CommsRuntime as CoreCommsRuntime};
-use meerkat_core::comms::{CommsCommand, EventStream, InputStreamMode, PeerName, StreamError};
+use meerkat_core::comms::{CommsCommand, EventStream, PeerName, StreamError};
 use meerkat_core::error::ToolError;
 use meerkat_core::service::SessionService;
 use meerkat_core::types::{ContentInput, SessionId, ToolCallView, ToolDef, ToolResult};

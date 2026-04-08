@@ -572,6 +572,10 @@ Send a message, request, or response to a trusted peer. The `kind` parameter det
   Required for `kind="peer_message"` and `kind="peer_request"`. Use `"queue"` for ordinary delivery or `"steer"` for immediate steer processing on runtime-backed sessions.
 </ParamField>
 
+<Note>
+Use `peer_message` for normal agent collaboration. Use `peer_request` only when you want an explicit structured ask and later `peer_response` correlated by `in_reply_to`.
+</Note>
+
 <ParamField body="in_reply_to" type="String (UUID)">
   ID of the request being responded to (required when `kind="peer_response"`).
 </ParamField>

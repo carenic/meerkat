@@ -1305,7 +1305,7 @@ impl RuntimeSessionAdapter {
     ///
     /// Surfaces may call this when they learn or change keep_alive/comms
     /// context, but the adapter owns the actual drain-mode decision.
-    pub async fn maybe_spawn_comms_drain(
+    pub async fn update_peer_ingress_context(
         self: &Arc<Self>,
         session_id: &SessionId,
         keep_alive: bool,
@@ -1323,10 +1323,10 @@ impl RuntimeSessionAdapter {
             entry.keep_alive = keep_alive;
             entry.comms_runtime = comms_runtime;
         }
-        self.reconcile_comms_drain(session_id).await
+        self.reconcile_peer_ingress(session_id).await
     }
 
-    async fn reconcile_comms_drain(self: &Arc<Self>, session_id: &SessionId) -> bool {
+    async fn reconcile_peer_ingress(self: &Arc<Self>, session_id: &SessionId) -> bool {
         let (keep_alive, comms_runtime) = {
             let mut sessions = self.sessions.write().await;
             let Some(entry) = sessions.get_mut(session_id) else {
@@ -1428,7 +1428,7 @@ impl RuntimeSessionAdapter {
                 }
             }
         }
-        let _ = self.reconcile_comms_drain(session_id).await;
+        let _ = self.reconcile_peer_ingress(session_id).await;
     }
 
     /// Abort all active comms drain tasks.

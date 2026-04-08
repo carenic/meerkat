@@ -72,7 +72,9 @@ pub fn spawn_comms_drain(
                     PeerInputClass::Ack => {
                         // Ack envelopes are filtered at ingress. Skip here.
                     }
-                    PeerInputClass::PeerLifecycleAdded | PeerInputClass::PeerLifecycleRetired => {
+                    PeerInputClass::PeerLifecycleAdded
+                    | PeerInputClass::PeerLifecycleRetired
+                    | PeerInputClass::PeerLifecycleUnwired => {
                         // Lifecycle events must be injected as session context
                         // so the LLM knows when peers connect/disconnect.
                         // comms_drain is the sole keep-alive inbox consumer.
@@ -145,6 +147,8 @@ pub fn spawn_comms_drain(
                         }
                     }
                     PeerInputClass::SilentRequest
+                    | PeerInputClass::PeerLifecycleKickoffFailed
+                    | PeerInputClass::PeerLifecycleKickoffCancelled
                     | PeerInputClass::ActionableMessage
                     | PeerInputClass::ActionableRequest
                     | PeerInputClass::PlainEvent => {

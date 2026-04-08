@@ -1016,7 +1016,7 @@ impl SessionRuntime {
                     .map_err(session_error_to_rpc)?;
             }
             self.runtime_adapter
-                .maybe_spawn_comms_drain(session_id, keep_alive, comms_rt)
+                .update_peer_ingress_context(session_id, keep_alive, comms_rt)
                 .await;
         }
 
@@ -1357,7 +1357,11 @@ impl SessionRuntime {
                     {
                         let comms_rt = self.service.comms_runtime(session_id).await;
                         self.runtime_adapter
-                            .maybe_spawn_comms_drain(session_id, build_config.keep_alive, comms_rt)
+                            .update_peer_ingress_context(
+                                session_id,
+                                build_config.keep_alive,
+                                comms_rt,
+                            )
                             .await;
                     }
                 }
@@ -1547,7 +1551,7 @@ impl SessionRuntime {
         {
             let comms_rt = self.service.comms_runtime(session_id).await;
             self.runtime_adapter
-                .maybe_spawn_comms_drain(session_id, keep_alive, comms_rt)
+                .update_peer_ingress_context(session_id, keep_alive, comms_rt)
                 .await;
         }
         let (_, output) = self
@@ -1997,7 +2001,7 @@ impl SessionRuntime {
                 .map_err(session_error_to_rpc)?;
             #[cfg(feature = "comms")]
             self.runtime_adapter
-                .maybe_spawn_comms_drain(session_id, keep_alive, comms_rt)
+                .update_peer_ingress_context(session_id, keep_alive, comms_rt)
                 .await;
         }
 

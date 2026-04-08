@@ -86,6 +86,45 @@ impl IngressClassificationContext {
                                     lifecycle_peer: Some(peer),
                                 }
                             }
+                            MessageIntent::PeerUnwired => {
+                                let peer = params
+                                    .get("peer")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or(from_name.as_str())
+                                    .to_string();
+                                ClassificationResult {
+                                    class: PeerInputClass::PeerLifecycleUnwired,
+                                    from_peer: Some(from_name),
+                                    lifecycle_peer: Some(peer),
+                                }
+                            }
+                            MessageIntent::KickoffFailed => {
+                                let peer = params
+                                    .get("peer")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or(from_name.as_str())
+                                    .to_string();
+                                ClassificationResult {
+                                    class: PeerInputClass::PeerLifecycleKickoffFailed,
+                                    from_peer: Some(from_name),
+                                    lifecycle_peer: Some(peer),
+                                }
+                            }
+                            MessageIntent::KickoffCancelled => {
+                                let peer = params
+                                    .get("peer")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or(from_name.as_str())
+                                    .to_string();
+                                ClassificationResult {
+                                    class: PeerInputClass::PeerLifecycleKickoffCancelled,
+                                    from_peer: Some(from_name),
+                                    lifecycle_peer: Some(peer),
+                                }
+                            }
                             // Check silent intents against the wire string, not
                             // just the Custom variant. This preserves the pre-0.4.10
                             // behavior where silent_comms_intents matched built-in
@@ -281,6 +320,44 @@ mod tests {
         let result = ctx.classify(&item).expect("should classify");
         assert_eq!(result.class, PeerInputClass::PeerLifecycleRetired);
         assert_eq!(result.lifecycle_peer.as_deref(), Some("old-agent"));
+    }
+
+    #[test]
+    fn classify_peer_unwired_lifecycle() {
+        let sender = make_keypair();
+        let trusted = make_trusted_peers("orchestrator", &sender.public_key());
+        let ctx = make_context(true, trusted, vec![]);
+        let envelope = make_envelope(
+            &sender,
+            MessageKind::Request {
+                intent: "mob.peer_unwired".to_string(),
+                params: serde_json::json!({"peer": "other-agent"}),
+                handling_mode: None,
+            },
+        );
+        let item = InboxItem::External { envelope };
+        let result = ctx.classify(&item).expect("should classify");
+        assert_eq!(result.class, PeerInputClass::PeerLifecycleUnwired);
+        assert_eq!(result.lifecycle_peer.as_deref(), Some("other-agent"));
+    }
+
+    #[test]
+    fn classify_kickoff_failed_lifecycle() {
+        let sender = make_keypair();
+        let trusted = make_trusted_peers("orchestrator", &sender.public_key());
+        let ctx = make_context(true, trusted, vec![]);
+        let envelope = make_envelope(
+            &sender,
+            MessageKind::Request {
+                intent: "mob.kickoff_failed".to_string(),
+                params: serde_json::json!({"peer": "worker-1", "role": "worker"}),
+                handling_mode: None,
+            },
+        );
+        let item = InboxItem::External { envelope };
+        let result = ctx.classify(&item).expect("should classify");
+        assert_eq!(result.class, PeerInputClass::PeerLifecycleKickoffFailed);
+        assert_eq!(result.lifecycle_peer.as_deref(), Some("worker-1"));
     }
 
     #[test]

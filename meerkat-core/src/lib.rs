@@ -73,9 +73,8 @@ pub use blob::{BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError};
 pub use budget::{Budget, BudgetLimits, BudgetPool};
 pub use checkpoint::SessionCheckpointer;
 pub use comms::{
-    CommsCommand, EventStream, InputSource, InputStreamMode, PeerDirectoryEntry,
-    PeerDirectorySource, PeerName, PeerReachability, PeerReachabilityReason, SendAndStreamError,
-    SendError, SendReceipt, StreamError, StreamScope,
+    CommsCommand, EventStream, InputSource, PeerDirectoryEntry, PeerDirectorySource, PeerName,
+    PeerReachability, PeerReachabilityReason, SendError, SendReceipt, StreamError, StreamScope,
 };
 pub use comms_drain_lifecycle_authority::{
     CommsDrainLifecycleAuthority, CommsDrainLifecycleEffect, CommsDrainLifecycleError,
@@ -135,8 +134,8 @@ pub use image_content::{
     hydrate_content_blocks, hydrate_content_input, hydrate_messages_for_execution,
 };
 pub use interaction::{
-    ClassifiedInboxInteraction, InboxInteraction, InteractionContent, InteractionId,
-    PeerInputCandidate, PeerInputClass, ResponseStatus,
+    InboxInteraction, InteractionContent, InteractionId, PeerInputCandidate, PeerInputClass,
+    ResponseStatus,
 };
 pub use lifecycle::{
     ConversationAppend, ConversationAppendRole, ConversationContextAppend, CoreExecutor,

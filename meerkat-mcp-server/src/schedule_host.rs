@@ -261,7 +261,7 @@ impl McpScheduleContext {
             self.ingress_context()
                 .configure_session(&session_id, None, false)
                 .await;
-            maybe_spawn_comms_drain(self, &session_id).await;
+            update_peer_ingress_context(self, &session_id).await;
         }
 
         match result {
@@ -758,7 +758,7 @@ async fn accept_scheduled_prompt_with_completion(
     context
         .ensure_runtime_session_registered(session_id)
         .await?;
-    maybe_spawn_comms_drain(context, session_id).await;
+    update_peer_ingress_context(context, session_id).await;
 
     let (outcome, handle) = context
         .ingress_context()
@@ -781,7 +781,7 @@ async fn accept_scheduled_event_with_completion(
     context
         .ensure_runtime_session_registered(session_id)
         .await?;
-    maybe_spawn_comms_drain(context, session_id).await;
+    update_peer_ingress_context(context, session_id).await;
 
     let input = Input::ExternalEvent(meerkat_runtime::ExternalEventInput {
         header: InputHeader {
@@ -815,7 +815,7 @@ async fn accept_scheduled_event_with_completion(
     ))
 }
 
-async fn maybe_spawn_comms_drain(context: &McpScheduleContext, session_id: &SessionId) {
+async fn update_peer_ingress_context(context: &McpScheduleContext, session_id: &SessionId) {
     #[cfg(feature = "comms")]
     {
         let keep_alive = context
@@ -833,7 +833,7 @@ async fn maybe_spawn_comms_drain(context: &McpScheduleContext, session_id: &Sess
         let comms_rt = context.service.comms_runtime(session_id).await;
         context
             .runtime_adapter
-            .maybe_spawn_comms_drain(session_id, keep_alive, comms_rt)
+            .update_peer_ingress_context(session_id, keep_alive, comms_rt)
             .await;
     }
 }

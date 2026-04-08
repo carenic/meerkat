@@ -27,7 +27,7 @@ use ::tokio::sync::RwLock;
 use tokio_with_wasm::alias::sync::RwLock;
 
 use crate::MobMcpState;
-use meerkat_core::comms::{CommsCommand, InputStreamMode, PeerName};
+use meerkat_core::comms::{CommsCommand, PeerName};
 
 // ─── Tool name constants ─────────────────────────────────────────────────
 
@@ -105,7 +105,6 @@ impl AgentMobToolSurface {
                     "description": description,
                 }),
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
-                stream: InputStreamMode::None,
             })
             .await
             .is_ok()
@@ -1104,7 +1103,6 @@ mod tests {
                     intent,
                     params,
                     handling_mode: _,
-                    stream,
                 } => {
                     let trusted = self.trusted.read().await;
                     if !trusted.values().any(|peer| peer.name == to.as_str()) {
@@ -1126,12 +1124,8 @@ mod tests {
                     });
                     recipient.notify.notify_waiters();
                     Ok(SendReceipt::PeerRequestSent {
+                        request_id: InteractionId(uuid::Uuid::new_v4()),
                         envelope_id: uuid::Uuid::new_v4(),
-                        interaction_id: InteractionId(uuid::Uuid::new_v4()),
-                        stream_reserved: !matches!(
-                            stream,
-                            meerkat_core::comms::InputStreamMode::None
-                        ),
                     })
                 }
                 unsupported => Err(SendError::Unsupported(format!(

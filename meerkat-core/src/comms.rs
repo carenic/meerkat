@@ -140,19 +140,6 @@ impl CommsCommandRequest {
                     }
                 };
 
-                let stream = match self.stream.as_deref() {
-                    Some("reserve_interaction") => InputStreamMode::ReserveInteraction,
-                    Some("none") | None => InputStreamMode::None,
-                    Some(other) => {
-                        errors.push(CommsCommandValidationError::new(
-                            "stream",
-                            "invalid_value",
-                            Some(other.to_string()),
-                        ));
-                        return Err(errors);
-                    }
-                };
-
                 Ok(CommsCommand::Input {
                     session_id: session_id.clone(),
                     body,
@@ -170,7 +157,6 @@ impl CommsCommandRequest {
                         }
                     },
                     source,
-                    stream,
                     allow_self_session: self.allow_self_session.unwrap_or(false),
                 })
             }
@@ -220,18 +206,14 @@ impl CommsCommandRequest {
                     ));
                     return Err(errors);
                 };
-                let stream = match self.stream.as_deref() {
-                    Some("reserve_interaction") => InputStreamMode::ReserveInteraction,
-                    Some("none") | None => InputStreamMode::None,
-                    Some(other) => {
-                        errors.push(CommsCommandValidationError::new(
-                            "stream",
-                            "invalid_value",
-                            Some(other.to_string()),
-                        ));
-                        return Err(errors);
-                    }
-                };
+                if let Some(stream) = &self.stream {
+                    errors.push(CommsCommandValidationError::new(
+                        "stream",
+                        "removed_unsupported_field",
+                        Some(stream.clone()),
+                    ));
+                    return Err(errors);
+                }
                 let handling_mode = match self.handling_mode.as_deref() {
                     Some("steer") => Some(HandlingMode::Steer),
                     Some("queue") => Some(HandlingMode::Queue),
@@ -267,7 +249,6 @@ impl CommsCommandRequest {
                             (None, Some(body)) => serde_json::json!({ "body": body }),
                             (None, None) => serde_json::Value::Object(Default::default()),
                         },
-                        stream,
                         handling_mode,
                     })
                 } else {
@@ -432,16 +413,6 @@ impl From<InputSource> for crate::config::PlainEventSource {
     }
 }
 
-/// Whether this input/peer command should reserve a local interaction stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InputStreamMode {
-    /// Do not reserve any stream.
-    None,
-    /// Reserve an interaction stream for the command.
-    ReserveInteraction,
-}
-
 /// Transport-independent comms command envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommsCommand {
@@ -452,7 +423,6 @@ pub enum CommsCommand {
         blocks: Option<Vec<ContentBlock>>,
         handling_mode: HandlingMode,
         source: InputSource,
-        stream: InputStreamMode,
         allow_self_session: bool,
     },
     /// Send a one-way peer message.
@@ -467,7 +437,6 @@ pub enum CommsCommand {
         to: PeerName,
         intent: String,
         params: serde_json::Value,
-        stream: InputStreamMode,
         handling_mode: HandlingMode,
     },
     /// Send a response to a prior peer request.
@@ -496,16 +465,14 @@ impl CommsCommand {
 pub enum SendReceipt {
     InputAccepted {
         interaction_id: InteractionId,
-        stream_reserved: bool,
     },
     PeerMessageSent {
         envelope_id: uuid::Uuid,
         acked: bool,
     },
     PeerRequestSent {
+        request_id: InteractionId,
         envelope_id: uuid::Uuid,
-        interaction_id: InteractionId,
-        stream_reserved: bool,
     },
     PeerResponseSent {
         envelope_id: uuid::Uuid,
@@ -577,7 +544,6 @@ impl TrustedPeerSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StreamScope {
     Session(crate::types::SessionId),
-    Interaction(InteractionId),
 }
 
 /// Typed stream over enveloped agent events.
@@ -586,12 +552,8 @@ pub type EventStream = Pin<Box<dyn Stream<Item = EventEnvelope<AgentEvent>> + Se
 /// Errors for stream attachment and lookup.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum StreamError {
-    #[error("interaction not reserved: {0}")]
-    NotReserved(InteractionId),
     #[error("stream not found: {0}")]
     NotFound(String),
-    #[error("already attached: {0}")]
-    AlreadyAttached(InteractionId),
     #[error("stream closed")]
     Closed,
     #[error("permission denied: {0}")]
@@ -620,17 +582,6 @@ pub enum SendError {
     Internal(String),
 }
 
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum SendAndStreamError {
-    #[error("send failed: {0}")]
-    Send(#[from] SendError),
-    #[error("stream attach failed: receipt={receipt:?}, error={error}")]
-    StreamAttach {
-        receipt: SendReceipt,
-        error: StreamError,
-    },
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -642,15 +593,6 @@ mod tests {
         assert!(PeerName::new("alice").is_ok());
         assert!(PeerName::new("".to_string()).is_err());
         assert!(PeerName::new("bad\x00name").is_err());
-    }
-
-    #[test]
-    fn input_stream_mode_roundtrip() -> Result<(), serde_json::Error> {
-        let mode = InputStreamMode::ReserveInteraction;
-        let serialized = serde_json::to_value(mode)?;
-        assert_eq!(serialized.as_str(), Some("reserve_interaction"));
-        assert_eq!(serde_json::from_value::<InputStreamMode>(serialized)?, mode);
-        Ok(())
     }
 
     #[test]

@@ -248,7 +248,6 @@ async fn runtime_ingress_control_closed_taxonomy_uses_explicit_continuation_and_
             wake_mode: WakeMode::None,
             queue_mode: QueueMode::Priority,
             consume_point: meerkat_runtime::ConsumePoint::OnAccept,
-            interrupt_policy: meerkat_runtime::InterruptPolicy::None,
             drain_policy: DrainPolicy::Ignore,
             routing_disposition: RoutingDisposition::Drop,
             record_transcript: false,

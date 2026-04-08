@@ -110,6 +110,15 @@ pub enum MessageIntent {
     /// Peer retired lifecycle event (mob.peer_retired)
     #[serde(rename = "mob.peer_retired")]
     PeerRetired,
+    /// Peer unwired lifecycle event (mob.peer_unwired)
+    #[serde(rename = "mob.peer_unwired")]
+    PeerUnwired,
+    /// Helper kickoff failed lifecycle event (mob.kickoff_failed)
+    #[serde(rename = "mob.kickoff_failed")]
+    KickoffFailed,
+    /// Helper kickoff cancelled lifecycle event (mob.kickoff_cancelled)
+    #[serde(rename = "mob.kickoff_cancelled")]
+    KickoffCancelled,
     /// Custom intent for user-defined operations
     #[serde(untagged)]
     Custom(String),
@@ -133,6 +142,9 @@ impl MessageIntent {
             Self::Query => "query",
             Self::PeerAdded => "mob.peer_added",
             Self::PeerRetired => "mob.peer_retired",
+            Self::PeerUnwired => "mob.peer_unwired",
+            Self::KickoffFailed => "mob.kickoff_failed",
+            Self::KickoffCancelled => "mob.kickoff_cancelled",
             Self::Custom(s) => s.as_str(),
         }
     }
@@ -150,6 +162,9 @@ impl From<String> for MessageIntent {
             "query" => Self::Query,
             "mob.peer_added" => Self::PeerAdded,
             "mob.peer_retired" => Self::PeerRetired,
+            "mob.peer_unwired" => Self::PeerUnwired,
+            "mob.kickoff_failed" => Self::KickoffFailed,
+            "mob.kickoff_cancelled" => Self::KickoffCancelled,
             _ => Self::Custom(s),
         }
     }

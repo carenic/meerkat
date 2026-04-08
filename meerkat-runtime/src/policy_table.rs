@@ -5,8 +5,7 @@
 use crate::identifiers::{KindId, PolicyVersion};
 use crate::input::Input;
 use crate::policy::{
-    ApplyMode, ConsumePoint, DrainPolicy, InterruptPolicy, PolicyDecision, QueueMode,
-    RoutingDisposition, WakeMode,
+    ApplyMode, ConsumePoint, DrainPolicy, PolicyDecision, QueueMode, RoutingDisposition, WakeMode,
 };
 
 /// The default policy version for the built-in table.
@@ -19,7 +18,6 @@ fn pd(
     wake_mode: WakeMode,
     queue_mode: QueueMode,
     consume_point: ConsumePoint,
-    interrupt_policy: InterruptPolicy,
     drain_policy: DrainPolicy,
     routing_disposition: RoutingDisposition,
     record_transcript: bool,
@@ -29,7 +27,6 @@ fn pd(
         wake_mode,
         queue_mode,
         consume_point,
-        interrupt_policy,
         drain_policy,
         routing_disposition,
         record_transcript,
@@ -68,7 +65,6 @@ impl DefaultPolicyTable {
                     },
                     QueueMode::Fifo,
                     ConsumePoint::OnRunComplete,
-                    InterruptPolicy::None,
                     DrainPolicy::QueueNextTurn,
                     RoutingDisposition::Queue,
                     !matches!(input, Input::Continuation(_)),
@@ -82,7 +78,6 @@ impl DefaultPolicyTable {
                     },
                     QueueMode::Fifo,
                     ConsumePoint::OnRunComplete,
-                    InterruptPolicy::None,
                     DrainPolicy::SteerBatch,
                     RoutingDisposition::Steer,
                     !matches!(input, Input::Continuation(_)),
@@ -103,7 +98,6 @@ impl DefaultPolicyTable {
                 WakeMode::WakeIfIdle,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -113,7 +107,6 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -125,7 +118,6 @@ impl DefaultPolicyTable {
                 WakeMode::WakeIfIdle,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -135,7 +127,6 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -147,7 +138,6 @@ impl DefaultPolicyTable {
                 WakeMode::WakeIfIdle,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -157,7 +147,6 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -169,7 +158,6 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Coalesce,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::SteerBatch,
                 RoutingDisposition::Steer,
                 true,
@@ -179,7 +167,6 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Coalesce,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::SteerBatch,
                 RoutingDisposition::Steer,
                 true,
@@ -191,7 +178,6 @@ impl DefaultPolicyTable {
                 WakeMode::WakeIfIdle,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -201,7 +187,6 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -213,7 +198,6 @@ impl DefaultPolicyTable {
                 WakeMode::WakeIfIdle,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -223,7 +207,6 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -235,7 +218,6 @@ impl DefaultPolicyTable {
                 WakeMode::WakeIfIdle,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -245,7 +227,6 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -257,7 +238,6 @@ impl DefaultPolicyTable {
                 WakeMode::WakeIfIdle,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::SteerBatch,
                 RoutingDisposition::Steer,
                 false,
@@ -267,7 +247,6 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::SteerBatch,
                 RoutingDisposition::Steer,
                 false,
@@ -280,7 +259,6 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Priority,
                 ConsumePoint::OnAccept,
-                InterruptPolicy::None,
                 DrainPolicy::Ignore,
                 RoutingDisposition::Drop,
                 false,
@@ -292,7 +270,6 @@ impl DefaultPolicyTable {
                 WakeMode::None,
                 QueueMode::Fifo,
                 ConsumePoint::OnRunComplete,
-                InterruptPolicy::None,
                 DrainPolicy::QueueNextTurn,
                 RoutingDisposition::Queue,
                 true,
@@ -710,7 +687,6 @@ mod tests {
         let decision = DefaultPolicyTable::resolve(&input, true);
         assert_eq!(decision.routing_disposition, RoutingDisposition::Steer);
         assert_eq!(decision.apply_mode, ApplyMode::StageRunBoundary);
-        assert_eq!(decision.interrupt_policy, InterruptPolicy::None);
     }
 
     #[test]
@@ -724,7 +700,6 @@ mod tests {
         );
         let decision = DefaultPolicyTable::resolve(&input, false);
         assert_eq!(decision.routing_disposition, RoutingDisposition::Steer);
-        assert_eq!(decision.interrupt_policy, InterruptPolicy::None);
     }
 
     #[test]
@@ -779,7 +754,6 @@ mod tests {
         let decision = DefaultPolicyTable::resolve(&input, true);
         assert_eq!(decision.routing_disposition, RoutingDisposition::Steer);
         assert_eq!(decision.apply_mode, ApplyMode::StageRunBoundary);
-        assert_eq!(decision.interrupt_policy, InterruptPolicy::None);
         assert!(decision.record_transcript);
     }
 

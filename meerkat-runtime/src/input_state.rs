@@ -349,8 +349,7 @@ impl<'de> Deserialize<'de> for InputState {
 mod tests {
     use super::*;
     use crate::policy::{
-        ApplyMode, ConsumePoint, DrainPolicy, InterruptPolicy, QueueMode, RoutingDisposition,
-        WakeMode,
+        ApplyMode, ConsumePoint, DrainPolicy, QueueMode, RoutingDisposition, WakeMode,
     };
     use meerkat_core::ops::{OpEvent, OperationId};
 
@@ -415,7 +414,6 @@ mod tests {
                 wake_mode: WakeMode::WakeIfIdle,
                 queue_mode: QueueMode::Fifo,
                 consume_point: ConsumePoint::OnRunComplete,
-                interrupt_policy: InterruptPolicy::None,
                 drain_policy: DrainPolicy::QueueNextTurn,
                 routing_disposition: RoutingDisposition::Queue,
                 record_transcript: true,

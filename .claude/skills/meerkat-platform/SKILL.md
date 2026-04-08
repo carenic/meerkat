@@ -489,7 +489,7 @@ Real-time events include `text_delta`, tool lifecycle events, hook events, and t
 
 ### Background completion delivery (CompletionFeed)
 
-Background shell job completions, mob member terminals, and async external tool results are delivered through the `CompletionFeed` seam. The feed is a monotonic append-only event log owned by the runtime epoch. Consumers (agent boundary, idle wake, wait tool) read through cursor-based `list_since()`.
+Background shell job completions, mob member terminals, and async external tool results are delivered through the `CompletionFeed` seam. The feed is a monotonic append-only event log owned by the runtime epoch. Consumers (agent boundary, idle wake) read through cursor-based `list_since()`.
 
 Key types: `CompletionFeed` trait (meerkat-core), `CompletionEntry`, `CompletionSeq`, `CompletionBatch`. Runtime implementation: `RuntimeCompletionFeed` in meerkat-runtime.
 
@@ -533,7 +533,9 @@ Comms supports `inproc`, TCP, and UDS. Inproc registry is namespace-segmented; M
 
 **Peer handling_mode override**: `PeerInput` with `Message`, `Request`, or no convention supports an explicit `handling_mode` field (`Queue` or `Steer`) that overrides kind-based policy defaults. `ResponseProgress` and `ResponseTerminal` reject the field at runtime admission. Built-in comms bridges leave it `None` (kind-based policy). The override is available on RPC `comms/send`, REST, and MCP `meerkat_comms_send` surfaces.
 
-**Silent comms intents**: `AgentBuildConfig.silent_comms_intents` configures request intents that are injected into session context without triggering an LLM turn. Mob meerkats default to `["mob.peer_added", "mob.peer_retired"]`.
+**Peer lifecycle typing**: mob lifecycle notices are typed at peer ingress. `mob.peer_added`, `mob.peer_retired`, and `mob.peer_unwired` are silent lifecycle context; `mob.kickoff_failed` and `mob.kickoff_cancelled` are visible lifecycle notices. Do not rely on mob defaults in `silent_comms_intents` for canonical behavior.
+
+**Comms choice**: use `peer_message` for ordinary collaboration. Use `peer_request` only for structured ask/reply semantics (`intent + params` plus later `peer_response`). Peer-side reservation streams were removed.
 
 #### Structured output with comms (autonomous agents)
 

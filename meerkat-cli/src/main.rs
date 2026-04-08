@@ -3521,7 +3521,7 @@ async fn run_agent(
         {
             let comms_rt = service.comms_runtime(&session_id).await;
             runtime_adapter
-                .maybe_spawn_comms_drain(&session_id, keep_alive, comms_rt)
+                .update_peer_ingress_context(&session_id, keep_alive, comms_rt)
                 .await;
         }
 
@@ -4007,7 +4007,7 @@ async fn resume_session_with_llm_override(
         {
             let comms_rt = service.comms_runtime(&session_id).await;
             resume_adapter
-                .maybe_spawn_comms_drain(&session_id, keep_alive, comms_rt)
+                .update_peer_ingress_context(&session_id, keep_alive, comms_rt)
                 .await;
         }
 
@@ -7178,10 +7178,7 @@ mod tests {
             let interaction_id: InteractionId =
                 serde_json::from_str("\"00000000-0000-0000-0000-000000000000\"")
                     .expect("interaction id literal should parse");
-            Ok(SendReceipt::InputAccepted {
-                interaction_id,
-                stream_reserved: false,
-            })
+            Ok(SendReceipt::InputAccepted { interaction_id })
         }
 
         async fn drain_messages(&self) -> Vec<String> {
@@ -7821,7 +7818,6 @@ mod tests {
             session_id: parsed_id,
             body,
             source,
-            stream,
             allow_self_session,
             blocks: _,
             handling_mode: _,
@@ -7832,40 +7828,20 @@ mod tests {
         assert_eq!(parsed_id, session_id);
         assert_eq!(body, "hello");
         assert_eq!(source, meerkat_core::comms::InputSource::Rpc);
-        assert_eq!(stream, meerkat_core::comms::InputStreamMode::None);
         assert!(!allow_self_session);
         Ok(())
     }
 
     #[cfg(feature = "comms")]
     #[test]
-    fn test_parse_comms_send_payload_peer_request_reserve_interaction()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn test_parse_comms_send_payload_peer_request_rejects_removed_stream_field() {
         let session_id = SessionId::new();
-        let cmd = parse_comms_send_payload(
+        let err = parse_comms_send_payload(
             r#"{"kind":"peer_request","to":"agent-b","intent":"help","params":{"topic":"x"},"handling_mode":"queue","stream":"reserve_interaction"}"#,
             &session_id,
         )
-        .expect("peer request payload should parse");
-        let CommsCommand::PeerRequest {
-            to,
-            intent,
-            params,
-            handling_mode,
-            stream,
-        } = cmd
-        else {
-            return Err("unexpected command parsed for peer_request payload".into());
-        };
-        assert_eq!(to.to_string(), "agent-b");
-        assert_eq!(intent, "help");
-        assert_eq!(params["topic"], "x");
-        assert_eq!(handling_mode, meerkat_core::types::HandlingMode::Queue);
-        assert_eq!(
-            stream,
-            meerkat_core::comms::InputStreamMode::ReserveInteraction
-        );
-        Ok(())
+        .expect_err("peer request stream field should be rejected");
+        assert!(err.to_string().contains("removed_unsupported_field"));
     }
 
     #[cfg(feature = "comms")]

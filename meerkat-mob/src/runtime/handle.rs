@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 const DEFAULT_KICKOFF_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -38,6 +38,9 @@ pub struct MobMemberSnapshot {
     /// Live comms connectivity for currently wired peers, when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_connectivity: Option<MobPeerConnectivitySnapshot>,
+    /// Initial autonomous-turn kickoff state, when this member has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kickoff: Option<MobMemberKickoffSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +65,8 @@ pub struct MobMemberListEntry {
     pub is_final: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kickoff: Option<MobMemberKickoffSnapshot>,
 }
 
 impl MobMemberListEntry {
@@ -77,6 +82,29 @@ pub struct MobPeerConnectivitySnapshot {
     pub reachable_peer_count: usize,
     pub unknown_peer_count: usize,
     pub unreachable_peers: Vec<MobUnreachablePeer>,
+}
+
+/// Resolution state for a member's initial autonomous kickoff turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MobMemberKickoffPhase {
+    Pending,
+    Starting,
+    CallbackPending,
+    Started,
+    Failed,
+    Cancelled,
+}
+
+/// Durable snapshot of a member's kickoff state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct MobMemberKickoffSnapshot {
+    pub phase: MobMemberKickoffPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub updated_at: SystemTime,
 }
 
 /// One currently wired peer that is known to be unreachable.
@@ -310,6 +338,7 @@ struct CanonicalMemberSnapshotMaterial {
     tokens_used: u64,
     current_session_id: Option<SessionId>,
     peer_connectivity: Option<MobPeerConnectivitySnapshot>,
+    kickoff: Option<MobMemberKickoffSnapshot>,
 }
 
 impl CanonicalMemberSnapshotMaterial {
@@ -330,6 +359,7 @@ impl CanonicalMemberSnapshotMaterial {
             is_final,
             current_session_id: self.current_session_id.clone(),
             peer_connectivity: self.peer_connectivity.clone(),
+            kickoff: self.kickoff.clone(),
         }
     }
 
@@ -364,6 +394,7 @@ pub struct MobHandle {
         Arc<tokio::sync::Mutex<BTreeMap<RunId, mpsc::Sender<meerkat_core::ScopedAgentEvent>>>>,
     pub(super) session_service: Arc<dyn MobSessionService>,
     pub(super) restore_diagnostics: Arc<RwLock<HashMap<MeerkatId, RestoreFailureDiagnostic>>>,
+    pub(super) kickoff_state: Arc<RwLock<HashMap<MeerkatId, MobMemberKickoffSnapshot>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -558,6 +589,10 @@ impl MobHandle {
         }
     }
 
+    async fn kickoff_state_for(&self, meerkat_id: &MeerkatId) -> Option<MobMemberKickoffSnapshot> {
+        self.kickoff_state.read().await.get(meerkat_id).cloned()
+    }
+
     /// Poll mob events from the underlying store.
     pub async fn poll_events(
         &self,
@@ -699,18 +734,20 @@ impl MobHandle {
         let mut projected = Vec::with_capacity(entries.len());
         for entry in entries {
             let snapshot = self.member_status(&entry.meerkat_id).await.ok();
-            let (status, error, is_final, current_session_id) = match snapshot {
+            let (status, error, is_final, current_session_id, kickoff) = match snapshot {
                 Some(snapshot) => (
                     snapshot.status,
                     snapshot.error,
                     snapshot.is_final,
                     snapshot.current_session_id,
+                    snapshot.kickoff,
                 ),
                 None => (
                     MobMemberStatus::Unknown,
                     None,
                     true,
                     entry.session_id().cloned(),
+                    None,
                 ),
             };
             projected.push(MobMemberListEntry {
@@ -727,6 +764,7 @@ impl MobHandle {
                 error,
                 is_final,
                 current_session_id,
+                kickoff,
             });
         }
         projected
@@ -1505,6 +1543,7 @@ impl MobHandle {
                 .get(meerkat_id)
                 .cloned()
         };
+        let kickoff = self.kickoff_state_for(meerkat_id).await;
 
         if let Some(diag) = restore_failure {
             let member_present = roster_state.is_some();
@@ -1521,6 +1560,7 @@ impl MobHandle {
                 tokens_used: 0,
                 current_session_id: Some(diag.session_id),
                 peer_connectivity: None,
+                kickoff,
             };
         }
 
@@ -1534,6 +1574,7 @@ impl MobHandle {
                 tokens_used: 0,
                 current_session_id: None,
                 peer_connectivity: None,
+                kickoff,
             },
             (Some(crate::roster::MemberState::Retiring), None) => CanonicalMemberSnapshotMaterial {
                 member_present: true,
@@ -1544,6 +1585,7 @@ impl MobHandle {
                 tokens_used: 0,
                 current_session_id: None,
                 peer_connectivity: None,
+                kickoff,
             },
             (Some(crate::roster::MemberState::Active), None) => CanonicalMemberSnapshotMaterial {
                 member_present: true,
@@ -1554,6 +1596,7 @@ impl MobHandle {
                 tokens_used: 0,
                 current_session_id: None,
                 peer_connectivity: None,
+                kickoff,
             },
             (Some(roster_state), Some(session_id)) => {
                 let (output_preview, tokens_used, observation) =
@@ -1607,6 +1650,7 @@ impl MobHandle {
                     tokens_used,
                     current_session_id: Some(session_id),
                     peer_connectivity,
+                    kickoff,
                 }
             }
         }

@@ -476,7 +476,8 @@ if let Some(runtime) = factory.build_skill_runtime(&config).await {
 ## Comms, hooks, skills, multi-agent
 
 - Inproc comms is namespace-scoped; realm namespace isolates peer discovery/sends.
-- **Silent comms intents**: `AgentBuildConfig.silent_comms_intents` suppresses LLM turns for informational intents. Mob meerkats default to `["mob.peer_added", "mob.peer_retired"]`. Runtime policy enforces this canonically via silent intent override.
+- **Peer lifecycle typing**: mob lifecycle routing is typed at ingress. `mob.peer_added`, `mob.peer_retired`, and `mob.peer_unwired` are silent lifecycle notices; `mob.kickoff_failed` and `mob.kickoff_cancelled` are visible lifecycle notices. Do not depend on mob defaults in `silent_comms_intents` for canonical behavior.
+- **Comms choice**: use `peer_message` for normal collaboration. `peer_request` is only structured correlated ask-reply. Public peer reservation streams were removed.
 - Hooks and skills resolve from runtime root. Workspace-default CLI realms preserve project ergonomics.
 - **Skill introspection**: `SkillRuntime::list_all_with_provenance()` returns active + shadowed skills; `load_from_source()` bypasses first-wins.
 - Multi-agent orchestration uses mobs exclusively. `MemberLaunchMode::Fork` provides history branching via `Session::fork()`. `spawn_helper()`/`fork_helper()` provide one-call convenience.

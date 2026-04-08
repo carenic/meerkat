@@ -1307,7 +1307,7 @@ mod tests {
     fn runtime_comms_bridge_projection_rule_accepts_current_shape() {
         let bridge = r#"
             pub fn classified_interaction_to_runtime_input(
-                classified: &ClassifiedInboxInteraction,
+                classified: &PeerInputCandidate,
                 runtime_id: &LogicalRuntimeId,
             ) -> Input {
                 if classified.class == PeerInputClass::PlainEvent {
@@ -1346,7 +1346,7 @@ mod tests {
             }
         "#;
         let drain = r"
-            fn run_comms_drain(ci: ClassifiedInboxInteraction, runtime_id: LogicalRuntimeId) {
+            fn run_comms_drain(ci: PeerInputCandidate, runtime_id: LogicalRuntimeId) {
                 let input = classified_interaction_to_runtime_input(&ci, &runtime_id);
             }
         ";
@@ -1414,7 +1414,7 @@ mod tests {
             }
         "#;
         let bridge = r"
-            pub fn classified_interaction_to_runtime_input(classified: &ClassifiedInboxInteraction) -> Input {
+            pub fn classified_interaction_to_runtime_input(classified: &PeerInputCandidate) -> Input {
                 let interaction = &classified.interaction;
                 if classified.class == PeerInputClass::PlainEvent {
                     let blocks = external_event_blocks(interaction);
@@ -1468,7 +1468,7 @@ mod tests {
             }
         "#;
         let bridge = r#"
-            pub fn classified_interaction_to_runtime_input(classified: &ClassifiedInboxInteraction) -> Input {
+            pub fn classified_interaction_to_runtime_input(classified: &PeerInputCandidate) -> Input {
                 let interaction = &classified.interaction;
                 if classified.class == PeerInputClass::PlainEvent {
                     return Input::ExternalEvent(ExternalEventInput {

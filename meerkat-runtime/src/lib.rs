@@ -88,8 +88,7 @@ pub use lifecycle_ops::{abandon_non_terminal, would_abandon};
 pub use ops_lifecycle::{OpsLifecycleConfig, PersistedOpsSnapshot, RuntimeOpsLifecycleRegistry};
 pub use peer_handling_mode::{PeerHandlingModeError, validate_peer_handling_mode};
 pub use policy::{
-    ApplyMode, ConsumePoint, DrainPolicy, InterruptPolicy, PolicyDecision, QueueMode,
-    RoutingDisposition, WakeMode,
+    ApplyMode, ConsumePoint, DrainPolicy, PolicyDecision, QueueMode, RoutingDisposition, WakeMode,
 };
 pub use policy_table::{DEFAULT_POLICY_VERSION, DefaultPolicyTable};
 pub use queue::InputQueue;

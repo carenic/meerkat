@@ -1931,7 +1931,7 @@ async fn unregister_session_aborts_spawned_drain_and_clears_suppression() {
 
     let comms: Arc<dyn CommsRuntime> = Arc::new(IdleDrainRuntime::new());
     let spawned = adapter
-        .maybe_spawn_comms_drain(&sid, true, Some(comms))
+        .update_peer_ingress_context(&sid, true, Some(comms))
         .await;
     assert!(spawned, "registered host-mode session should spawn a drain");
 
@@ -1992,7 +1992,7 @@ async fn idle_non_host_sessions_do_not_spawn_background_comms_drains() {
 
     let comms: Arc<dyn CommsRuntime> = Arc::new(IdleDrainRuntime::new());
     let spawned = adapter
-        .maybe_spawn_comms_drain(&sid, false, Some(comms))
+        .update_peer_ingress_context(&sid, false, Some(comms))
         .await;
 
     assert!(
@@ -2082,7 +2082,7 @@ async fn attached_sessions_spawn_attached_comms_drains_without_keep_alive() {
 
     let comms: Arc<dyn CommsRuntime> = Arc::new(IdleDrainRuntime::new());
     let spawned = adapter
-        .maybe_spawn_comms_drain(&sid, false, Some(comms))
+        .update_peer_ingress_context(&sid, false, Some(comms))
         .await;
 
     assert!(

@@ -957,7 +957,7 @@ pub fn canonical_composition_coverage_manifests() -> Vec<CompositionCoverageMani
                 anchor(
                     "keep_alive_runtime_adapter",
                     "meerkat-runtime/src/session_adapter.rs",
-                    "runtime-owned keep-alive drain lifecycle (maybe_spawn_comms_drain)",
+                    "runtime-owned peer ingress reconciliation (update_peer_ingress_context)",
                 ),
                 anchor(
                     "runtime_comms_drain",

@@ -104,6 +104,12 @@ pub enum PeerInputClass {
     PeerLifecycleAdded,
     /// Peer retired lifecycle event.
     PeerLifecycleRetired,
+    /// Peer unwired lifecycle event.
+    PeerLifecycleUnwired,
+    /// Member kickoff failed lifecycle event.
+    PeerLifecycleKickoffFailed,
+    /// Member kickoff cancelled lifecycle event.
+    PeerLifecycleKickoffCancelled,
     /// A request whose intent is in the silent-intents set (inline-only, no LLM turn).
     SilentRequest,
     /// An ack envelope (filtered at ingress, never reaches agent loop).
@@ -117,20 +123,14 @@ impl PeerInputClass {
     pub fn is_actionable(&self) -> bool {
         matches!(
             self,
-            Self::ActionableMessage | Self::ActionableRequest | Self::Response | Self::PlainEvent
+            Self::ActionableMessage
+                | Self::ActionableRequest
+                | Self::Response
+                | Self::PlainEvent
+                | Self::PeerLifecycleKickoffFailed
+                | Self::PeerLifecycleKickoffCancelled
         )
     }
-}
-
-/// An inbox interaction with its pre-computed classification.
-#[derive(Debug, Clone)]
-pub struct ClassifiedInboxInteraction {
-    /// The original interaction data.
-    pub interaction: InboxInteraction,
-    /// Pre-computed classification from ingress.
-    pub class: PeerInputClass,
-    /// For lifecycle events, the peer name that was added/retired.
-    pub lifecycle_peer: Option<String>,
 }
 
 /// Canonical peer/event ingress candidate handed to runtime admission.
@@ -146,16 +146,6 @@ pub struct PeerInputCandidate {
     pub class: PeerInputClass,
     /// For lifecycle events, the peer name that was added/retired.
     pub lifecycle_peer: Option<String>,
-}
-
-impl From<ClassifiedInboxInteraction> for PeerInputCandidate {
-    fn from(value: ClassifiedInboxInteraction) -> Self {
-        Self {
-            interaction: value.interaction,
-            class: value.class,
-            lifecycle_peer: value.lifecycle_peer,
-        }
-    }
 }
 
 #[cfg(test)]

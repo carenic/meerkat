@@ -903,7 +903,6 @@ impl CoreCommsRuntime for LocalCommsRuntime {
     async fn send(&self, _cmd: CommsCommand) -> Result<SendReceipt, SendError> {
         Ok(SendReceipt::InputAccepted {
             interaction_id: InteractionId(uuid::Uuid::nil()),
-            stream_reserved: false,
         })
     }
 
@@ -2193,7 +2192,6 @@ mod tests {
         async fn send(&self, _cmd: CommsCommand) -> Result<SendReceipt, SendError> {
             Ok(SendReceipt::InputAccepted {
                 interaction_id: meerkat_core::interaction::InteractionId(uuid::Uuid::nil()),
-                stream_reserved: false,
             })
         }
 

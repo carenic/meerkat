@@ -787,6 +787,10 @@ Push a canonical comms command into a running session. Requires the `comms` feat
   Handling mode for `peer_message` and `peer_request`. Local callers must provide `"queue"` or `"steer"`.
 </ParamField>
 
+<Note>
+`peer_message` is the default collaboration primitive. `peer_request` is only a structured ask with correlated replies. The old peer-side reservation stream option was removed; requests no longer accept a `stream` field.
+</Note>
+
 <ParamField body="intent" type="string | null">
   Request intent (required for `peer_request`, e.g. `"review"`, `"delegate"`).
 </ParamField>

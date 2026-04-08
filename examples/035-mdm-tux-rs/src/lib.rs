@@ -26,8 +26,8 @@ pub use kennel::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
-    Anthropic,
     Openai,
+    Anthropic,
     Gemini,
 }
 
@@ -35,11 +35,11 @@ pub enum ProviderKind {
 ///
 /// Checks `ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `GEMINI_API_KEY`.
 pub fn auto_detect() -> Option<(String, ProviderKind, String)> {
+    if let Ok(k) = std::env::var("OPENAI_API_KEY") {
+        return Some(("gpt-5.4".into(), ProviderKind::Openai, k));
+    }
     if let Ok(k) = std::env::var("ANTHROPIC_API_KEY") {
         return Some(("claude-sonnet-4-6".into(), ProviderKind::Anthropic, k));
-    }
-    if let Ok(k) = std::env::var("OPENAI_API_KEY") {
-        return Some(("gpt-5.2".into(), ProviderKind::Openai, k));
     }
     if let Ok(k) = std::env::var("GEMINI_API_KEY") {
         return Some(("gemini-3.1-flash-lite".into(), ProviderKind::Gemini, k));

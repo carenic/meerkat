@@ -209,6 +209,8 @@ pub(super) struct MobActor {
     pub(super) runtime_adapter: Option<Arc<meerkat_runtime::RuntimeSessionAdapter>>,
     pub(super) restore_diagnostics:
         Arc<RwLock<HashMap<MeerkatId, super::handle::RestoreFailureDiagnostic>>>,
+    pub(super) kickoff_state:
+        Arc<RwLock<HashMap<MeerkatId, super::handle::MobMemberKickoffSnapshot>>>,
     pub(super) task_board_service: crate::tasks::MobTaskBoardService,
     pub(super) spawn_policy: Arc<super::spawn_policy::SpawnPolicyService>,
     pub(super) lifecycle_authority: MobLifecycleAuthority,
@@ -254,7 +256,39 @@ impl MobActor {
             flow_streams: self.flow_streams.clone(),
             session_service: self.session_service.clone(),
             restore_diagnostics: self.restore_diagnostics.clone(),
+            kickoff_state: self.kickoff_state.clone(),
         }
+    }
+
+    async fn set_kickoff_state(
+        &self,
+        meerkat_id: &MeerkatId,
+        phase: super::handle::MobMemberKickoffPhase,
+        error: Option<String>,
+    ) {
+        self.kickoff_state.write().await.insert(
+            meerkat_id.clone(),
+            super::handle::MobMemberKickoffSnapshot {
+                phase,
+                error,
+                updated_at: std::time::SystemTime::now(),
+            },
+        );
+    }
+
+    async fn kickoff_phase_for(
+        &self,
+        meerkat_id: &MeerkatId,
+    ) -> Option<super::handle::MobMemberKickoffPhase> {
+        self.kickoff_state
+            .read()
+            .await
+            .get(meerkat_id)
+            .map(|snapshot| snapshot.phase)
+    }
+
+    async fn clear_kickoff_state(&self, meerkat_id: &MeerkatId) {
+        self.kickoff_state.write().await.remove(meerkat_id);
     }
 
     fn expect_state(&self, expected: &[MobState], to: MobState) -> Result<(), MobError> {
@@ -701,18 +735,26 @@ impl MobActor {
             // or panic, closing the channel for barrier waiters.
             let (completion_tx, completion_rx) = tokio::sync::watch::channel(false);
             let log_id = meerkat_id.clone();
+            let completion_command_tx = self.command_tx.clone();
             let handle = tokio::spawn(async move {
                 if let Some(h) = completion_handle {
                     let outcome = h.wait().await;
-                    match outcome {
-                        meerkat_runtime::completion::CompletionOutcome::Completed(_)
-                        | meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult => {
-                        }
-                        other => tracing::warn!(
+                    let (ack_tx, ack_rx) = oneshot::channel();
+                    if completion_command_tx
+                        .send(MobCommand::KickoffOutcomeResolved {
+                            meerkat_id: log_id.clone(),
+                            outcome,
+                            ack_tx,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
                             meerkat_id = %log_id,
-                            outcome = ?other,
-                            "autonomous initial turn completed with non-success outcome"
-                        ),
+                            "mob actor dropped before kickoff outcome could be recorded"
+                        );
+                    } else {
+                        let _ = ack_rx.await;
                     }
                 }
                 let _ = completion_tx.send(true);
@@ -752,13 +794,13 @@ impl MobActor {
             if let Some(adapter) = self.runtime_adapter.clone() {
                 let comms_runtime = self.provisioner.comms_runtime(member_ref).await;
                 let spawned = adapter
-                    .maybe_spawn_comms_drain(session_id, true, comms_runtime)
+                    .update_peer_ingress_context(session_id, true, comms_runtime)
                     .await;
                 if spawned {
                     tracing::debug!(
                         meerkat_id = %meerkat_id,
                         session_id = %session_id,
-                        "spawned comms drain for autonomous member"
+                        "updated peer ingress for autonomous member"
                     );
                 }
             }
@@ -797,6 +839,79 @@ impl MobActor {
         Ok(())
     }
 
+    async fn resolve_kickoff_outcome(
+        &self,
+        meerkat_id: &MeerkatId,
+        outcome: meerkat_runtime::completion::CompletionOutcome,
+    ) {
+        use super::handle::MobMemberKickoffPhase;
+        use meerkat_runtime::completion::CompletionOutcome;
+
+        match outcome {
+            CompletionOutcome::Completed(_) | CompletionOutcome::CompletedWithoutResult => {
+                self.set_kickoff_state(meerkat_id, MobMemberKickoffPhase::Started, None)
+                    .await;
+            }
+            CompletionOutcome::CallbackPending { tool_name, args } => {
+                self.set_kickoff_state(meerkat_id, MobMemberKickoffPhase::CallbackPending, None)
+                    .await;
+                tracing::debug!(
+                    meerkat_id = %meerkat_id,
+                    tool_name = %tool_name,
+                    args = ?args,
+                    "autonomous kickoff reached callback-pending boundary"
+                );
+            }
+            CompletionOutcome::Abandoned(reason) | CompletionOutcome::RuntimeTerminated(reason) => {
+                self.set_kickoff_state(
+                    meerkat_id,
+                    MobMemberKickoffPhase::Failed,
+                    Some(reason.clone()),
+                )
+                .await;
+                if let Err(error) = self
+                    .notify_kickoff_event(meerkat_id, "mob.kickoff_failed")
+                    .await
+                {
+                    tracing::warn!(
+                        meerkat_id = %meerkat_id,
+                        error = %error,
+                        "failed to emit kickoff failure lifecycle notice"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn maybe_mark_kickoff_cancelled(&self, meerkat_id: &MeerkatId) {
+        use super::handle::MobMemberKickoffPhase;
+
+        let phase = self.kickoff_phase_for(meerkat_id).await;
+        if !matches!(
+            phase,
+            Some(
+                MobMemberKickoffPhase::Pending
+                    | MobMemberKickoffPhase::Starting
+                    | MobMemberKickoffPhase::CallbackPending
+            )
+        ) {
+            return;
+        }
+
+        self.set_kickoff_state(meerkat_id, MobMemberKickoffPhase::Cancelled, None)
+            .await;
+        if let Err(error) = self
+            .notify_kickoff_event(meerkat_id, "mob.kickoff_cancelled")
+            .await
+        {
+            tracing::warn!(
+                meerkat_id = %meerkat_id,
+                error = %error,
+                "failed to emit kickoff cancellation lifecycle notice"
+            );
+        }
+    }
+
     async fn ensure_autonomous_dispatch_capability(
         &self,
         meerkat_id: &MeerkatId,
@@ -820,6 +935,14 @@ impl MobActor {
         member_ref: &MemberRef,
     ) -> Result<(), MobError> {
         // Abort any in-flight initial turn.
+        let had_kickoff_handle = self
+            .autonomous_initial_turns
+            .lock()
+            .await
+            .contains_key(meerkat_id);
+        if had_kickoff_handle {
+            self.maybe_mark_kickoff_cancelled(meerkat_id).await;
+        }
         if let Some(handle) = self
             .autonomous_initial_turns
             .lock()
@@ -1197,6 +1320,14 @@ impl MobActor {
                 } => {
                     let snapshot = self.snapshot_kickoff_barrier_state(&meerkat_ids).await;
                     let _ = reply_tx.send(snapshot);
+                }
+                MobCommand::KickoffOutcomeResolved {
+                    meerkat_id,
+                    outcome,
+                    ack_tx,
+                } => {
+                    self.resolve_kickoff_outcome(&meerkat_id, outcome).await;
+                    let _ = ack_tx.send(());
                 }
                 MobCommand::RunFlow {
                     flow_id,
@@ -2564,6 +2695,14 @@ impl MobActor {
             );
         }
         self.restore_diagnostics.write().await.remove(meerkat_id);
+        if runtime_mode == crate::MobRuntimeMode::AutonomousHost {
+            self.set_kickoff_state(
+                meerkat_id,
+                super::handle::MobMemberKickoffPhase::Pending,
+                None,
+            )
+            .await;
+        }
         tracing::debug!(
             meerkat_id = %meerkat_id,
             "MobActor::finalize_spawn_from_pending roster updated"
@@ -2592,26 +2731,34 @@ impl MobActor {
             return Err(wiring_error);
         }
 
-        if runtime_mode == crate::MobRuntimeMode::AutonomousHost
-            && let Err(start_error) = self
+        if runtime_mode == crate::MobRuntimeMode::AutonomousHost {
+            self.set_kickoff_state(
+                meerkat_id,
+                super::handle::MobMemberKickoffPhase::Starting,
+                None,
+            )
+            .await;
+            if let Err(start_error) = self
                 .start_autonomous_member(meerkat_id, &member_ref, prompt)
                 .await
-        {
-            if let Err(rollback_error) = self
-                .rollback_failed_spawn(
-                    meerkat_id,
-                    profile_name,
-                    &member_ref,
-                    &wired_spawn_targets,
-                    &planned_wiring_targets,
-                )
-                .await
             {
-                return Err(MobError::Internal(format!(
-                    "spawn host-loop start failed for '{meerkat_id}': {start_error}; rollback failed: {rollback_error}"
-                )));
+                self.clear_kickoff_state(meerkat_id).await;
+                if let Err(rollback_error) = self
+                    .rollback_failed_spawn(
+                        meerkat_id,
+                        profile_name,
+                        &member_ref,
+                        &wired_spawn_targets,
+                        &planned_wiring_targets,
+                    )
+                    .await
+                {
+                    return Err(MobError::Internal(format!(
+                        "spawn host-loop start failed for '{meerkat_id}': {start_error}; rollback failed: {rollback_error}"
+                    )));
+                }
+                return Err(start_error);
             }
-            return Err(start_error);
         }
 
         // auto_wire_parent: wire to the actual spawner member when the spawn
@@ -3326,6 +3473,7 @@ impl MobActor {
             .write()
             .await
             .remove(&ctx.meerkat_id);
+        self.kickoff_state.write().await.remove(&ctx.meerkat_id);
     }
 
     /// P1-T06: wire() establishes local or external trust.
@@ -5227,7 +5375,6 @@ impl MobActor {
                 "description": peer_description,
             }),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
-            stream: InputStreamMode::None,
         };
 
         sender_comms.send(cmd).await?;
@@ -5268,10 +5415,35 @@ impl MobActor {
                 "role": other_peer_entry.profile.as_str(),
             }),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
-            stream: InputStreamMode::None,
         };
 
         sender_comms.send(cmd).await?;
+        Ok(())
+    }
+
+    async fn notify_kickoff_event(
+        &self,
+        meerkat_id: &MeerkatId,
+        intent: &'static str,
+    ) -> Result<(), MobError> {
+        let (entry, wired_peers) = {
+            let roster = self.roster.read().await;
+            let Some(entry) = roster.get(meerkat_id).cloned() else {
+                return Ok(());
+            };
+            let wired_peers = entry.wired_to.iter().cloned().collect::<Vec<_>>();
+            (entry, wired_peers)
+        };
+        let sender_comms = self.provisioner_comms(&entry.member_ref).await;
+
+        let Some(sender_comms) = sender_comms else {
+            return Ok(());
+        };
+
+        for peer_id in wired_peers {
+            self.notify_peer_event(intent, &peer_id, meerkat_id, &entry, &sender_comms)
+                .await?;
+        }
         Ok(())
     }
 

@@ -1992,8 +1992,7 @@ mod tests {
     use super::*;
     use crate::identifiers::PolicyVersion;
     use crate::policy::{
-        ApplyMode, ConsumePoint, DrainPolicy, InterruptPolicy, QueueMode, RoutingDisposition,
-        WakeMode,
+        ApplyMode, ConsumePoint, DrainPolicy, QueueMode, RoutingDisposition, WakeMode,
     };
 
     fn test_policy() -> PolicyDecision {
@@ -2002,7 +2001,6 @@ mod tests {
             wake_mode: WakeMode::WakeIfIdle,
             queue_mode: QueueMode::Fifo,
             consume_point: ConsumePoint::OnRunComplete,
-            interrupt_policy: InterruptPolicy::None,
             drain_policy: DrainPolicy::QueueNextTurn,
             routing_disposition: RoutingDisposition::Queue,
             record_transcript: true,
@@ -2173,7 +2171,6 @@ mod tests {
                     wake_mode: WakeMode::None,
                     queue_mode: QueueMode::Coalesce,
                     consume_point: ConsumePoint::OnRunComplete,
-                    interrupt_policy: InterruptPolicy::None,
                     drain_policy: DrainPolicy::SteerBatch,
                     routing_disposition: RoutingDisposition::Steer,
                     record_transcript: true,

@@ -13,8 +13,8 @@ mod state;
 
 use crate::budget::Budget;
 use crate::comms::{
-    CommsCommand, EventStream, PeerDirectoryEntry, SendAndStreamError, SendError, SendReceipt,
-    StreamError, StreamScope, TrustedPeerSpec,
+    CommsCommand, EventStream, PeerDirectoryEntry, SendError, SendReceipt, StreamError,
+    StreamScope, TrustedPeerSpec,
 };
 use crate::compact::SessionCompactionCadence;
 use crate::config::{AgentConfig, HookRunOverrides};
@@ -452,7 +452,6 @@ pub trait CommsRuntime: Send + Sync {
     fn stream(&self, scope: StreamScope) -> Result<EventStream, StreamError> {
         let scope_desc = match scope {
             StreamScope::Session(session_id) => format!("session {session_id}"),
-            StreamScope::Interaction(interaction_id) => format!("interaction {}", interaction_id.0),
         };
         Err(StreamError::NotFound(scope_desc))
     }
@@ -467,20 +466,6 @@ pub trait CommsRuntime: Send + Sync {
     /// Implementations can override this to avoid materializing a full peer list.
     async fn peer_count(&self) -> usize {
         self.peers().await.len()
-    }
-
-    #[doc(hidden)]
-    async fn send_and_stream(
-        &self,
-        cmd: CommsCommand,
-    ) -> Result<(SendReceipt, EventStream), SendAndStreamError> {
-        let receipt = self.send(cmd).await?;
-        Err(SendAndStreamError::StreamAttach {
-            receipt,
-            error: StreamError::Internal(
-                "send_and_stream is not implemented for this runtime".to_string(),
-            ),
-        })
     }
 
     /// Drain comms inbox and return messages formatted for the LLM

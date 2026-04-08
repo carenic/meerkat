@@ -60,7 +60,7 @@ pub struct PersistedOpsSnapshot {
 /// Shared inner state of the completion feed buffer.
 ///
 /// Protected by the registry's `RwLock<ShellState>` for writes, and by its
-/// own `RwLock` for reads by external consumers (agent, wait tool, idle wake).
+/// own `RwLock` for reads by external consumers (agent boundary, idle wake).
 #[derive(Debug)]
 struct FeedBufferInner {
     entries: VecDeque<CompletionEntry>,

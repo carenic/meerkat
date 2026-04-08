@@ -15,7 +15,7 @@ use meerkat_comms::CommsRuntime;
 use meerkat_core::Provider;
 use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
 use meerkat_core::comms::{
-    CommsCommand, InputStreamMode, PeerDirectorySource, PeerName, SendReceipt, TrustedPeerSpec,
+    CommsCommand, PeerDirectorySource, PeerName, SendReceipt, TrustedPeerSpec,
 };
 use meerkat_core::service::{
     CreateSessionRequest, SessionBuildOptions, SessionError, SessionInfo, SessionQuery,
@@ -68,7 +68,6 @@ async fn contract_mob_002_peer_request_response_round_trip() {
         intent: "mob.ping".to_string(),
         params: serde_json::json!({"seq": 1}),
         handling_mode: meerkat_core::types::HandlingMode::Queue,
-        stream: InputStreamMode::None,
     };
     let receipt = CoreCommsRuntime::send(&sender, request_cmd)
         .await
@@ -665,7 +664,6 @@ async fn contract_mob_001_keep_alive_session_stays_alive() {
         intent: "mob.contract.before".to_string(),
         params: serde_json::json!({"step": "before_turn"}),
         handling_mode: meerkat_core::types::HandlingMode::Queue,
-        stream: InputStreamMode::None,
     };
     let before_receipt = CoreCommsRuntime::send(&*comms_a, before_cmd)
         .await
@@ -706,7 +704,6 @@ async fn contract_mob_001_keep_alive_session_stays_alive() {
         intent: "mob.contract.after".to_string(),
         params: serde_json::json!({"step": "after_turn"}),
         handling_mode: meerkat_core::types::HandlingMode::Queue,
-        stream: InputStreamMode::None,
     };
     let after_receipt = CoreCommsRuntime::send(&*comms_b, after_cmd)
         .await

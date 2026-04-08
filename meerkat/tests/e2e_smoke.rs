@@ -1812,11 +1812,11 @@ mod scenario_22_runtime_host_comms {
             turn_count.load(Ordering::Relaxed)
         );
 
-        // Spawn comms drain for A — THE path under test
+        // Update peer ingress for A — this is the runtime-backed path under test.
         runtime_adapter
-            .maybe_spawn_comms_drain(&sid_a, true, Some(comms_a))
+            .update_peer_ingress_context(&sid_a, true, Some(comms_a))
             .await;
-        eprintln!("[scenario 22] Comms drain spawned for A");
+        eprintln!("[scenario 22] Peer ingress updated for A");
 
         // --- Inject message into A's inbox programmatically ---
         // Use CommsCommand::Input to inject directly into Agent A's comms inbox.
@@ -1834,7 +1834,6 @@ mod scenario_22_runtime_host_comms {
                 blocks: None,
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
                 source: meerkat_core::comms::InputSource::Rpc,
-                stream: meerkat_core::comms::InputStreamMode::None,
                 allow_self_session: true,
             })
             .await;

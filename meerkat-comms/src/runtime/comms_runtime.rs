@@ -14,23 +14,18 @@ use crate::peer_directory_reachability_authority::{
 use crate::tokio;
 use crate::{InprocRegistry, Keypair, PubKey, Router, TrustedPeer, TrustedPeers};
 use async_trait::async_trait;
-use futures::Stream;
-use futures::task::{Context, Poll};
 use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
 use meerkat_core::comms::{
-    CommsCommand, EventStream, InputStreamMode, PeerDirectoryEntry, PeerDirectorySource, PeerName,
-    PeerReachabilityReason, SendAndStreamError, SendError, SendReceipt, StreamError, StreamScope,
-    TrustedPeerSpec,
+    CommsCommand, EventStream, PeerDirectoryEntry, PeerDirectorySource, PeerName,
+    PeerReachabilityReason, SendError, SendReceipt, StreamError, StreamScope, TrustedPeerSpec,
 };
 use meerkat_core::config::PlainEventSource;
 use meerkat_core::hydrate_content_blocks;
-use meerkat_core::time_compat::Instant;
 use meerkat_core::{BlobStore, MissingBlobBehavior};
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 #[cfg(unix)]
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::LazyLock;
@@ -39,72 +34,9 @@ use thiserror::Error;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::Receiver;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::task::JoinHandle;
 use uuid::Uuid;
-
-/// Reservation lifecycle state machine.
-///
-/// State transitions:
-/// - Reserved → Attached (stream consumer attaches)
-/// - Reserved → Expired (TTL elapsed without attach)
-/// - Attached → Completed (terminal event received)
-/// - Attached → ClosedEarly (consumer drops stream before terminal)
-/// - Any terminal state → cannot re-attach
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReservationState {
-    Reserved,
-    Attached,
-    Completed,
-    Expired,
-    ClosedEarly,
-}
-
-impl ReservationState {
-    fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Expired | Self::ClosedEarly)
-    }
-}
-
-/// Default reservation TTL (time from Reserved to Expired if not attached).
-const RESERVATION_TTL: meerkat_core::time_compat::Duration =
-    meerkat_core::time_compat::Duration::from_secs(30);
-
-#[derive(Debug)]
-struct StreamRegistryEntry {
-    state: ReservationState,
-    _sender: mpsc::Sender<meerkat_core::AgentEvent>,
-    receiver: Option<Receiver<meerkat_core::AgentEvent>>,
-    created_at: Instant,
-}
-
-impl StreamRegistryEntry {
-    fn reserved(
-        sender: mpsc::Sender<meerkat_core::AgentEvent>,
-        receiver: Receiver<meerkat_core::AgentEvent>,
-    ) -> Self {
-        Self {
-            state: ReservationState::Reserved,
-            _sender: sender,
-            receiver: Some(receiver),
-            created_at: Instant::now(),
-        }
-    }
-
-    /// CAS-style state transition. Returns true if transition succeeded.
-    fn transition(&mut self, from: ReservationState, to: ReservationState) -> bool {
-        if self.state == from {
-            self.state = to;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-type InteractionStreamRegistry = Arc<Mutex<HashMap<Uuid, StreamRegistryEntry>>>;
 
 #[cfg(not(target_arch = "wasm32"))]
 static SESSION_IDENTITY_CLAIMS: LazyLock<Mutex<HashSet<String>>> =
@@ -158,14 +90,6 @@ pub fn clear_all_session_claims() {
     SESSION_IDENTITY_CLAIMS.lock().clear();
 }
 
-struct InteractionStream {
-    id: Uuid,
-    receiver: Option<Receiver<meerkat_core::AgentEvent>>,
-    registry: InteractionStreamRegistry,
-    source_id: String,
-    seq: u64,
-}
-
 struct ResolvedPeer {
     name: PeerName,
     peer_id: String,
@@ -177,56 +101,6 @@ struct ResolvedPeer {
 impl ResolvedPeer {
     fn reachability_key(&self) -> ReachabilityKey {
         ReachabilityKey::new(self.name.as_str(), self.peer_id.as_str())
-    }
-}
-
-impl InteractionStream {
-    fn finish(&mut self) {
-        if let Some(mut receiver) = self.receiver.take() {
-            receiver.close();
-        }
-        let mut registry = self.registry.lock();
-        if let Some(entry) = registry.get_mut(&self.id) {
-            // CAS: only transition to ClosedEarly if still Attached.
-            // If already Completed (terminal event won the race), leave it.
-            if entry.transition(ReservationState::Attached, ReservationState::ClosedEarly) {
-                tracing::debug!(interaction_id = %self.id, "stream closed early by consumer");
-            }
-            // Clean up terminal entries.
-            if entry.state.is_terminal() {
-                registry.remove(&self.id);
-            }
-        }
-    }
-}
-
-impl Stream for InteractionStream {
-    type Item = meerkat_core::EventEnvelope<meerkat_core::AgentEvent>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        match this.receiver.as_mut() {
-            Some(receiver) => match Pin::new(receiver).poll_recv(cx) {
-                Poll::Ready(None) => {
-                    this.finish();
-                    Poll::Ready(None)
-                }
-                Poll::Ready(Some(event)) => {
-                    this.seq = this.seq.saturating_add(1);
-                    let envelope =
-                        meerkat_core::EventEnvelope::new(&this.source_id, this.seq, None, event);
-                    Poll::Ready(Some(envelope))
-                }
-                Poll::Pending => Poll::Pending,
-            },
-            None => Poll::Ready(None),
-        }
-    }
-}
-
-impl Drop for InteractionStream {
-    fn drop(&mut self) {
-        self.finish();
     }
 }
 
@@ -291,44 +165,6 @@ impl CoreCommsRuntime for CommsRuntime {
             StreamScope::Session(session_id) => {
                 Err(StreamError::NotFound(format!("session {session_id}")))
             }
-            StreamScope::Interaction(interaction_id) => {
-                let id = interaction_id.0;
-                let mut registry = self.interaction_stream_registry.lock();
-                let entry = registry
-                    .get_mut(&id)
-                    .ok_or(StreamError::NotReserved(interaction_id))?;
-
-                match entry.state {
-                    ReservationState::Reserved => {
-                        // Check TTL
-                        if entry.created_at.elapsed() > RESERVATION_TTL {
-                            entry.state = ReservationState::Expired;
-                            registry.remove(&id);
-                            return Err(StreamError::Timeout(format!(
-                                "reservation expired for interaction {}",
-                                interaction_id.0
-                            )));
-                        }
-                        let receiver = entry.receiver.take().ok_or_else(|| {
-                            StreamError::Internal("interaction stream receiver missing".to_string())
-                        })?;
-                        entry.state = ReservationState::Attached;
-                        Ok(Box::pin(InteractionStream {
-                            id,
-                            receiver: Some(receiver),
-                            registry: self.interaction_stream_registry.clone(),
-                            source_id: format!("interaction:{id}"),
-                            seq: 0,
-                        }))
-                    }
-                    ReservationState::Attached => Err(StreamError::AlreadyAttached(interaction_id)),
-                    state if state.is_terminal() => Err(StreamError::NotReserved(interaction_id)),
-                    _ => Err(StreamError::Internal(format!(
-                        "unexpected reservation state for {}",
-                        interaction_id.0
-                    ))),
-                }
-            }
         }
     }
 
@@ -337,7 +173,6 @@ impl CoreCommsRuntime for CommsRuntime {
             CommsCommand::Input {
                 body,
                 source,
-                stream,
                 allow_self_session,
                 session_id: _,
                 blocks,
@@ -352,38 +187,18 @@ impl CoreCommsRuntime for CommsRuntime {
                             .into(),
                     ));
                 }
-                match stream {
-                    InputStreamMode::None => {
-                        let injector = CoreCommsRuntime::event_injector(self).ok_or_else(|| {
-                            SendError::Unsupported("event injector unavailable".into())
-                        })?;
-                        let content = match blocks {
-                            Some(blocks) => meerkat_core::types::ContentInput::Blocks(blocks),
-                            None => meerkat_core::types::ContentInput::Text(body),
-                        };
-                        injector
-                            .inject(content, PlainEventSource::from(source), handling_mode, None)
-                            .map_err(map_event_injector_error)?;
-                        Ok(SendReceipt::InputAccepted {
-                            interaction_id: meerkat_core::InteractionId(Uuid::new_v4()),
-                            stream_reserved: false,
-                        })
-                    }
-                    InputStreamMode::ReserveInteraction => {
-                        let interaction_id = Uuid::new_v4();
-                        self.register_interaction_stream(
-                            interaction_id,
-                            body,
-                            blocks,
-                            source,
-                            handling_mode,
-                        )?;
-                        Ok(SendReceipt::InputAccepted {
-                            interaction_id: meerkat_core::InteractionId(interaction_id),
-                            stream_reserved: true,
-                        })
-                    }
-                }
+                let injector = CoreCommsRuntime::event_injector(self)
+                    .ok_or_else(|| SendError::Unsupported("event injector unavailable".into()))?;
+                let content = match blocks {
+                    Some(blocks) => meerkat_core::types::ContentInput::Blocks(blocks),
+                    None => meerkat_core::types::ContentInput::Text(body),
+                };
+                injector
+                    .inject(content, PlainEventSource::from(source), handling_mode, None)
+                    .map_err(map_event_injector_error)?;
+                Ok(SendReceipt::InputAccepted {
+                    interaction_id: meerkat_core::InteractionId(Uuid::new_v4()),
+                })
             }
             CommsCommand::PeerMessage {
                 to,
@@ -408,24 +223,8 @@ impl CoreCommsRuntime for CommsRuntime {
                 to,
                 intent,
                 params,
-                stream,
                 handling_mode,
             } => {
-                let interaction_id = Uuid::new_v4();
-                let stream_reserved = stream == InputStreamMode::ReserveInteraction;
-
-                if stream_reserved {
-                    // Register reservation BEFORE sending so stream() can attach.
-                    let (sender, receiver) = mpsc::channel::<meerkat_core::AgentEvent>(4096);
-                    self.subscriber_registry
-                        .lock()
-                        .insert(interaction_id, sender.clone());
-                    self.interaction_stream_registry.lock().insert(
-                        interaction_id,
-                        StreamRegistryEntry::reserved(sender, receiver),
-                    );
-                }
-
                 let envelope_id = match self
                     .send_peer_command(
                         to.as_str(),
@@ -438,22 +237,12 @@ impl CoreCommsRuntime for CommsRuntime {
                     .await
                 {
                     Ok(id) => id,
-                    Err(e) => {
-                        if stream_reserved {
-                            // Clean up reservation on send failure.
-                            self.interaction_stream_registry
-                                .lock()
-                                .remove(&interaction_id);
-                            self.subscriber_registry.lock().remove(&interaction_id);
-                        }
-                        return Err(e);
-                    }
+                    Err(e) => return Err(e),
                 };
 
                 Ok(SendReceipt::PeerRequestSent {
+                    request_id: meerkat_core::InteractionId(envelope_id),
                     envelope_id,
-                    interaction_id: meerkat_core::InteractionId(interaction_id),
-                    stream_reserved,
                 })
             }
             CommsCommand::PeerResponse {
@@ -487,113 +276,6 @@ impl CoreCommsRuntime for CommsRuntime {
         }
     }
 
-    async fn send_and_stream(
-        &self,
-        cmd: CommsCommand,
-    ) -> Result<(SendReceipt, EventStream), SendAndStreamError> {
-        match cmd {
-            CommsCommand::Input {
-                body,
-                source,
-                stream: InputStreamMode::ReserveInteraction,
-                allow_self_session,
-                session_id: _,
-                blocks,
-                handling_mode,
-            } => {
-                if !allow_self_session {
-                    return Err(SendAndStreamError::Send(SendError::Validation(
-                        "self-session input rejected: set allow_self_session=true to override"
-                            .into(),
-                    )));
-                }
-                let interaction_id = Uuid::new_v4();
-                self.register_interaction_stream(
-                    interaction_id,
-                    body,
-                    blocks,
-                    source,
-                    handling_mode,
-                )?;
-                let receipt = SendReceipt::InputAccepted {
-                    interaction_id: meerkat_core::InteractionId(interaction_id),
-                    stream_reserved: true,
-                };
-                let stream = self
-                    .stream(StreamScope::Interaction(meerkat_core::InteractionId(
-                        interaction_id,
-                    )))
-                    .map_err(|error| SendAndStreamError::StreamAttach {
-                        receipt: receipt.clone(),
-                        error,
-                    })?;
-                Ok((receipt, stream))
-            }
-            CommsCommand::PeerRequest {
-                to,
-                intent,
-                params,
-                stream: InputStreamMode::ReserveInteraction,
-                handling_mode,
-            } => {
-                // Reserve a local interaction stream, then send the peer request.
-                let interaction_id = Uuid::new_v4();
-                let (sender, receiver) = mpsc::channel::<meerkat_core::AgentEvent>(4096);
-                self.subscriber_registry
-                    .lock()
-                    .insert(interaction_id, sender.clone());
-                self.interaction_stream_registry.lock().insert(
-                    interaction_id,
-                    StreamRegistryEntry::reserved(sender, receiver),
-                );
-
-                let envelope_id = match self
-                    .send_peer_command(
-                        to.as_str(),
-                        crate::types::MessageKind::Request {
-                            intent,
-                            params,
-                            handling_mode: Some(handling_mode),
-                        },
-                    )
-                    .await
-                {
-                    Ok(id) => id,
-                    Err(e) => {
-                        // Clean up reservation on send failure.
-                        self.interaction_stream_registry
-                            .lock()
-                            .remove(&interaction_id);
-                        self.subscriber_registry.lock().remove(&interaction_id);
-                        return Err(SendAndStreamError::Send(e));
-                    }
-                };
-
-                let receipt = SendReceipt::PeerRequestSent {
-                    envelope_id,
-                    interaction_id: meerkat_core::InteractionId(interaction_id),
-                    stream_reserved: true,
-                };
-                let event_stream = self
-                    .stream(StreamScope::Interaction(meerkat_core::InteractionId(
-                        interaction_id,
-                    )))
-                    .map_err(|error| SendAndStreamError::StreamAttach {
-                        receipt: receipt.clone(),
-                        error,
-                    })?;
-                Ok((receipt, event_stream))
-            }
-            other => {
-                let receipt = self.send(other).await?;
-                Err(SendAndStreamError::StreamAttach {
-                    receipt,
-                    error: StreamError::NotFound("command is not streamable".to_string()),
-                })
-            }
-        }
-    }
-
     async fn peers(&self) -> Vec<PeerDirectoryEntry> {
         self.resolve_peer_directory().await
     }
@@ -614,24 +296,11 @@ impl CoreCommsRuntime for CommsRuntime {
         &self,
         id: &meerkat_core::InteractionId,
     ) -> Option<tokio::sync::mpsc::Sender<meerkat_core::AgentEvent>> {
-        let sender = self.subscriber_registry.lock().remove(&id.0);
-        sender.as_ref()?;
-
-        let mut registry = self.interaction_stream_registry.lock();
-        match registry.get(&id.0) {
-            Some(entry) => {
-                // If not yet attached to a stream consumer, clean up.
-                if entry.state == ReservationState::Reserved {
-                    registry.remove(&id.0);
-                }
-                sender
-            }
-            None => sender,
-        }
+        self.subscriber_registry.lock().remove(&id.0)
     }
 
     fn mark_interaction_complete(&self, id: &meerkat_core::InteractionId) {
-        self.mark_interaction_complete(id.0);
+        self.subscriber_registry.lock().remove(&id.0);
     }
 
     async fn drain_peer_input_candidates(&self) -> Vec<meerkat_core::PeerInputCandidate> {
@@ -909,7 +578,6 @@ pub struct CommsRuntime {
     require_peer_auth: bool,
     dismiss_flag: AtomicBool,
     subscriber_registry: crate::event_injector::SubscriberRegistry,
-    interaction_stream_registry: InteractionStreamRegistry,
     peer_directory_reachability: Arc<Mutex<PeerDirectoryReachabilityAuthority>>,
     #[allow(dead_code)] // Kept alive — shared with IngressClassificationContext via Arc
     silent_intents: Arc<HashSet<String>>,
@@ -972,7 +640,6 @@ impl CommsRuntime {
             require_peer_auth: config.require_peer_auth,
             dismiss_flag: AtomicBool::new(false),
             subscriber_registry: crate::event_injector::new_subscriber_registry(),
-            interaction_stream_registry: Arc::new(Mutex::new(HashMap::new())),
             peer_directory_reachability: Arc::new(Mutex::new(
                 PeerDirectoryReachabilityAuthority::new(),
             )),
@@ -1065,7 +732,6 @@ impl CommsRuntime {
             require_peer_auth: true,
             dismiss_flag: AtomicBool::new(false),
             subscriber_registry: crate::event_injector::new_subscriber_registry(),
-            interaction_stream_registry: Arc::new(Mutex::new(HashMap::new())),
             peer_directory_reachability: Arc::new(Mutex::new(
                 PeerDirectoryReachabilityAuthority::new(),
             )),
@@ -1144,7 +810,6 @@ impl CommsRuntime {
             require_peer_auth: true,
             dismiss_flag: AtomicBool::new(false),
             subscriber_registry: crate::event_injector::new_subscriber_registry(),
-            interaction_stream_registry: Arc::new(Mutex::new(HashMap::new())),
             peer_directory_reachability: Arc::new(Mutex::new(
                 PeerDirectoryReachabilityAuthority::new(),
             )),
@@ -1542,42 +1207,8 @@ impl CommsRuntime {
         }
     }
 
-    /// Mark an interaction stream as completed (terminal event received).
-    ///
-    /// Uses CAS to ensure exactly-once cleanup: if the consumer already closed
-    /// the stream (ClosedEarly), this is a no-op.
     pub fn mark_interaction_complete(&self, interaction_id: Uuid) {
-        let mut registry = self.interaction_stream_registry.lock();
-        let mut should_remove = false;
-        if let Some(entry) = registry.get_mut(&interaction_id)
-            && entry.transition(ReservationState::Attached, ReservationState::Completed)
-        {
-            tracing::debug!(
-                interaction_id = %interaction_id,
-                "interaction stream completed by terminal event"
-            );
-            should_remove = true;
-        }
-        if should_remove {
-            self.subscriber_registry.lock().remove(&interaction_id);
-            registry.remove(&interaction_id);
-        }
-    }
-
-    /// Reap expired reservations that were never attached within the TTL.
-    pub fn reap_expired_reservations(&self) {
-        let mut registry = self.interaction_stream_registry.lock();
-        registry.retain(|id, entry| {
-            if entry.state == ReservationState::Reserved
-                && entry.created_at.elapsed() > RESERVATION_TTL
-            {
-                tracing::debug!(interaction_id = %id, "reservation expired (TTL)");
-                entry.state = ReservationState::Expired;
-                false
-            } else {
-                true
-            }
-        });
+        self.subscriber_registry.lock().remove(&interaction_id);
     }
 
     pub fn router_arc(&self) -> Arc<Router> {
@@ -1619,48 +1250,6 @@ impl CommsRuntime {
             self.router.inbox_sender().clone(),
             self.subscriber_registry.clone(),
         ))
-    }
-
-    fn register_interaction_stream(
-        &self,
-        interaction_id: Uuid,
-        body: String,
-        blocks: Option<Vec<meerkat_core::types::ContentBlock>>,
-        source: meerkat_core::InputSource,
-        handling_mode: meerkat_core::types::HandlingMode,
-    ) -> Result<(), SendError> {
-        let (sender, receiver) = mpsc::channel::<meerkat_core::AgentEvent>(4096);
-        self.subscriber_registry
-            .lock()
-            .insert(interaction_id, sender.clone());
-        self.interaction_stream_registry.lock().insert(
-            interaction_id,
-            StreamRegistryEntry::reserved(sender, receiver),
-        );
-
-        if let Err(error) =
-            self.router
-                .inbox_sender()
-                .send_classified(crate::types::InboxItem::PlainEvent {
-                    body,
-                    source: PlainEventSource::from(source),
-                    handling_mode,
-                    interaction_id: Some(interaction_id),
-                    blocks,
-                    render_metadata: None,
-                })
-        {
-            self.interaction_stream_registry
-                .lock()
-                .remove(&interaction_id);
-            self.subscriber_registry.lock().remove(&interaction_id);
-            return Err(match error {
-                crate::inbox::InboxError::Full => SendError::Validation("input queue full".into()),
-                crate::inbox::InboxError::Closed => SendError::InputClosed,
-            });
-        }
-
-        Ok(())
     }
 
     pub async fn drain_messages(&self) -> Vec<CommsMessage> {
@@ -1883,20 +1472,17 @@ mod tests {
     use crate::identity::Signature;
     use crate::types::{Envelope, InboxItem, MessageKind, Status};
     use async_trait::async_trait;
-    use futures::StreamExt;
     use meerkat_core::event_injector::SubscribableInjector;
     use meerkat_core::{
         BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError, SendError,
         comms::{
-            InputSource, InputStreamMode, PeerDirectorySource, PeerName, PeerReachability,
-            PeerReachabilityReason, StreamError, StreamScope, TrustedPeerSpec,
+            InputSource, PeerDirectorySource, PeerName, PeerReachability, PeerReachabilityReason,
+            TrustedPeerSpec,
         },
-        interaction::InteractionId,
         types::{ContentBlock, ImageData, SessionId},
     };
     use parking_lot::Mutex;
     use std::{collections::HashMap, sync::Arc};
-    use tokio::time::{Duration, timeout};
     use uuid::Uuid;
 
     #[derive(Default)]
@@ -2281,88 +1867,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Phase 1 red-ok comms bridge + parent wait suite"]
-    async fn runtime_bridge_red_ok_send_and_stream_reserves_one_interaction_channel() {
-        let suffix = Uuid::new_v4().simple().to_string();
-        let runtime = CommsRuntime::inproc_only(&format!("phase1-bridge-{suffix}")).unwrap();
-
-        let cmd = CommsCommand::Input {
-            blocks: None,
-            session_id: SessionId::new(),
-            body: "phase 1 bridge input".to_string(),
-            handling_mode: meerkat_core::types::HandlingMode::Queue,
-            source: InputSource::Rpc,
-            stream: InputStreamMode::ReserveInteraction,
-            allow_self_session: true,
-        };
-
-        let (receipt, _stream) = CoreCommsRuntime::send_and_stream(&runtime, cmd)
-            .await
-            .expect("send_and_stream should reserve interaction scope");
-
-        let interaction_id = match receipt {
-            SendReceipt::InputAccepted {
-                interaction_id,
-                stream_reserved,
-            } => {
-                assert!(
-                    stream_reserved,
-                    "bridge receipt should advertise reservation"
-                );
-                interaction_id
-            }
-            other => panic!("expected InputAccepted, got {other:?}"),
-        };
-
-        let duplicate =
-            CoreCommsRuntime::stream(&runtime, StreamScope::Interaction(interaction_id));
-        assert!(
-            matches!(duplicate, Err(StreamError::AlreadyAttached(_))),
-            "reserved interaction streams should reject a second attachment"
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "Phase 1 red-ok comms bridge + parent wait suite"]
-    async fn runtime_bridge_red_ok_completed_interaction_terminates_reserved_stream() {
-        let suffix = Uuid::new_v4().simple().to_string();
-        let runtime = CommsRuntime::inproc_only(&format!("phase1-complete-{suffix}")).unwrap();
-
-        let receipt = CoreCommsRuntime::send(
-            &runtime,
-            CommsCommand::Input {
-                blocks: None,
-                session_id: SessionId::new(),
-                body: "complete reserved interaction".to_string(),
-                handling_mode: meerkat_core::types::HandlingMode::Queue,
-                source: InputSource::Rpc,
-                stream: InputStreamMode::ReserveInteraction,
-                allow_self_session: true,
-            },
-        )
-        .await
-        .expect("send should succeed");
-
-        let interaction_id = match receipt {
-            SendReceipt::InputAccepted { interaction_id, .. } => interaction_id,
-            other => panic!("expected InputAccepted, got {other:?}"),
-        };
-
-        let mut stream =
-            CoreCommsRuntime::stream(&runtime, StreamScope::Interaction(interaction_id))
-                .expect("reserved stream should attach");
-        runtime.mark_interaction_complete(interaction_id.0);
-
-        let terminal = timeout(Duration::from_millis(100), stream.next())
-            .await
-            .expect("stream should terminate promptly after completion");
-        assert!(
-            terminal.is_none(),
-            "interaction completion should close the reserved stream for parent waiters"
-        );
-    }
-
-    #[tokio::test]
     async fn test_plain_event_interaction_id_is_preserved_in_drain_inbox_interactions() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = test_runtime_config("plain-id", &tmp);
@@ -2512,7 +2016,6 @@ mod tests {
             body: "standalone test input".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
             source: InputSource::Rpc,
-            stream: InputStreamMode::None,
             allow_self_session: true,
         };
 
@@ -2520,10 +2023,7 @@ mod tests {
         assert!(receipt.is_ok(), "send should succeed: {receipt:?}");
 
         match receipt.unwrap() {
-            SendReceipt::InputAccepted {
-                interaction_id: _,
-                stream_reserved,
-            } => assert!(!stream_reserved),
+            SendReceipt::InputAccepted { interaction_id: _ } => {}
             other => panic!("Expected InputAccepted, got: {other:?}"),
         }
 
@@ -2533,155 +2033,6 @@ mod tests {
             &interactions[0].content,
             meerkat_core::InteractionContent::Message { body, .. } if body == "standalone test input"
         ));
-    }
-
-    #[tokio::test]
-    async fn test_core_send_input_reserves_stream() {
-        let suffix = Uuid::new_v4().simple().to_string();
-        let runtime = CommsRuntime::inproc_only(&format!("input-res-{suffix}")).unwrap();
-
-        let cmd = CommsCommand::Input {
-            blocks: None,
-            session_id: SessionId::new(),
-            body: "streaming input".to_string(),
-            handling_mode: meerkat_core::types::HandlingMode::Queue,
-            source: InputSource::Rpc,
-            stream: InputStreamMode::ReserveInteraction,
-            allow_self_session: true,
-        };
-
-        let receipt = CoreCommsRuntime::send(&runtime, cmd).await.unwrap();
-        let (interaction_id, reserved) = match receipt {
-            SendReceipt::InputAccepted {
-                interaction_id,
-                stream_reserved,
-            } => (interaction_id, stream_reserved),
-            other => panic!("Expected InputAccepted, got: {other:?}"),
-        };
-
-        assert!(reserved);
-
-        let sender = runtime
-            .take_interaction_stream_sender(&interaction_id)
-            .expect("reserved interaction should be registered");
-        drop(sender);
-
-        assert!(
-            runtime
-                .take_interaction_stream_sender(&interaction_id)
-                .is_none(),
-            "interaction registration must be one-shot"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_core_stream_attachment_duplicate_attach_fails() {
-        let suffix = Uuid::new_v4().simple().to_string();
-        let runtime = CommsRuntime::inproc_only(&format!("dup-attach-{suffix}")).unwrap();
-
-        let cmd = CommsCommand::Input {
-            blocks: None,
-            session_id: SessionId::new(),
-            body: "duplicate stream test".to_string(),
-            handling_mode: meerkat_core::types::HandlingMode::Queue,
-            source: InputSource::Rpc,
-            stream: InputStreamMode::ReserveInteraction,
-            allow_self_session: true,
-        };
-
-        let interaction_id = match CoreCommsRuntime::send(&runtime, cmd).await.unwrap() {
-            SendReceipt::InputAccepted {
-                interaction_id,
-                stream_reserved,
-            } => {
-                assert!(stream_reserved);
-                interaction_id
-            }
-            other => panic!("Expected InputAccepted, got: {other:?}"),
-        };
-
-        let stream = CoreCommsRuntime::stream(&runtime, StreamScope::Interaction(interaction_id))
-            .expect("first attach should succeed");
-
-        let dup = CoreCommsRuntime::stream(&runtime, StreamScope::Interaction(interaction_id));
-        assert!(matches!(dup, Err(StreamError::AlreadyAttached(_))));
-
-        drop(stream);
-
-        let after_drop =
-            CoreCommsRuntime::stream(&runtime, StreamScope::Interaction(interaction_id));
-        assert!(matches!(after_drop, Err(StreamError::NotReserved(_))));
-    }
-
-    #[tokio::test]
-    async fn test_core_stream_not_reserved_before_send() {
-        let suffix = Uuid::new_v4().simple().to_string();
-        let runtime = CommsRuntime::inproc_only(&format!("pre-send-{suffix}")).unwrap();
-        let random = InteractionId(Uuid::new_v4());
-
-        let missing = CoreCommsRuntime::stream(&runtime, StreamScope::Interaction(random));
-        assert!(matches!(missing, Err(StreamError::NotReserved(_))));
-
-        let cmd = CommsCommand::Input {
-            blocks: None,
-            session_id: SessionId::new(),
-            body: "send before stream attach".to_string(),
-            handling_mode: meerkat_core::types::HandlingMode::Queue,
-            source: InputSource::Rpc,
-            stream: InputStreamMode::ReserveInteraction,
-            allow_self_session: true,
-        };
-        let interaction_id = match CoreCommsRuntime::send(&runtime, cmd).await.unwrap() {
-            SendReceipt::InputAccepted {
-                interaction_id,
-                stream_reserved,
-            } => {
-                assert!(stream_reserved);
-                interaction_id
-            }
-            other => panic!("Expected InputAccepted, got: {other:?}"),
-        };
-
-        let _stream = CoreCommsRuntime::stream(&runtime, StreamScope::Interaction(interaction_id))
-            .expect("should attach after send");
-    }
-
-    #[tokio::test]
-    async fn test_core_send_and_stream_input_returns_stream_and_receipt() {
-        let suffix = Uuid::new_v4().simple().to_string();
-        let runtime = CommsRuntime::inproc_only(&format!("sas-{suffix}")).unwrap();
-
-        let cmd = CommsCommand::Input {
-            blocks: None,
-            session_id: SessionId::new(),
-            body: "stream-first".to_string(),
-            handling_mode: meerkat_core::types::HandlingMode::Queue,
-            source: InputSource::Rpc,
-            stream: InputStreamMode::ReserveInteraction,
-            allow_self_session: true,
-        };
-
-        let (receipt, _stream) = CoreCommsRuntime::send_and_stream(&runtime, cmd)
-            .await
-            .unwrap();
-
-        let interaction_id = match receipt {
-            SendReceipt::InputAccepted {
-                interaction_id,
-                stream_reserved,
-            } => {
-                assert!(stream_reserved);
-                interaction_id
-            }
-            other => panic!("Expected InputAccepted, got: {other:?}"),
-        };
-
-        let dup = CoreCommsRuntime::stream(&runtime, StreamScope::Interaction(interaction_id));
-        assert!(matches!(dup, Err(StreamError::AlreadyAttached(_))));
-
-        assert!(
-            CoreCommsRuntime::stream(&runtime, StreamScope::Interaction(interaction_id)).is_err()
-        );
     }
 
     #[tokio::test]
@@ -3364,7 +2715,6 @@ mod tests {
                         intent: "test".to_string(),
                         params: serde_json::json!({}),
                         handling_mode: meerkat_core::types::HandlingMode::Queue,
-                        stream: InputStreamMode::None,
                     },
                     "peer_response" => CommsCommand::PeerResponse {
                         to: entry.name.clone(),
@@ -3386,215 +2736,6 @@ mod tests {
         }
     }
 
-    // --- M4: Reservation FSM + concurrency tests ---
-
-    #[tokio::test]
-    async fn test_m4_duplicate_close_is_safe() {
-        let suffix = Uuid::new_v4().simple().to_string();
-        let runtime = CommsRuntime::inproc_only(&format!("dup-close-{suffix}")).unwrap();
-        let session_id = meerkat_core::SessionId::new();
-
-        let cmd = CommsCommand::Input {
-            blocks: None,
-            session_id: session_id.clone(),
-            body: "hello".to_string(),
-            handling_mode: meerkat_core::types::HandlingMode::Queue,
-            source: meerkat_core::InputSource::Rpc,
-            stream: InputStreamMode::ReserveInteraction,
-            allow_self_session: true,
-        };
-        let receipt = CoreCommsRuntime::send(&runtime, cmd).await.unwrap();
-        let iid = match receipt {
-            SendReceipt::InputAccepted { interaction_id, .. } => interaction_id,
-            _ => panic!("expected InputAccepted"),
-        };
-
-        let stream = CoreCommsRuntime::stream(&runtime, StreamScope::Interaction(iid)).unwrap();
-        // Drop stream → ClosedEarly
-        drop(stream);
-
-        // Second attach after close → NotReserved (entry cleaned up)
-        let result = CoreCommsRuntime::stream(&runtime, StreamScope::Interaction(iid));
-        assert!(matches!(result, Err(StreamError::NotReserved(_))));
-    }
-
-    #[tokio::test]
-    async fn test_m4_mark_interaction_complete_cleans_up() {
-        let suffix = Uuid::new_v4().simple().to_string();
-        let runtime = CommsRuntime::inproc_only(&format!("complete-{suffix}")).unwrap();
-        let session_id = meerkat_core::SessionId::new();
-
-        let cmd = CommsCommand::Input {
-            blocks: None,
-            session_id: session_id.clone(),
-            body: "hello".to_string(),
-            handling_mode: meerkat_core::types::HandlingMode::Queue,
-            source: meerkat_core::InputSource::Rpc,
-            stream: InputStreamMode::ReserveInteraction,
-            allow_self_session: true,
-        };
-        let receipt = CoreCommsRuntime::send(&runtime, cmd).await.unwrap();
-        let iid = match receipt {
-            SendReceipt::InputAccepted { interaction_id, .. } => interaction_id,
-            _ => panic!("expected InputAccepted"),
-        };
-
-        let mut stream = CoreCommsRuntime::stream(&runtime, StreamScope::Interaction(iid)).unwrap();
-
-        // Simulate terminal event
-        runtime.mark_interaction_complete(iid.0);
-
-        let terminal = timeout(Duration::from_millis(100), stream.next())
-            .await
-            .expect("stream should terminate promptly after completion");
-        assert!(terminal.is_none());
-
-        // Registry entry should be cleaned up
-        let registry = runtime.interaction_stream_registry.lock();
-        assert!(
-            !registry.contains_key(&iid.0),
-            "completed entry should be cleaned from registry"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_m4_reap_expired_reservations() {
-        let suffix = Uuid::new_v4().simple().to_string();
-        let runtime = CommsRuntime::inproc_only(&format!("reap-{suffix}")).unwrap();
-
-        // Manually insert an entry with an old timestamp
-        let id = Uuid::new_v4();
-        let (sender, receiver) = mpsc::channel::<meerkat_core::AgentEvent>(16);
-        {
-            let mut entry = StreamRegistryEntry::reserved(sender, receiver);
-            entry.created_at = Instant::now()
-                .checked_sub(meerkat_core::time_compat::Duration::from_secs(60))
-                .unwrap();
-            runtime.interaction_stream_registry.lock().insert(id, entry);
-        }
-
-        runtime.reap_expired_reservations();
-
-        let registry = runtime.interaction_stream_registry.lock();
-        assert!(
-            !registry.contains_key(&id),
-            "expired reservation should have been reaped"
-        );
-    }
-
-    // --- M5: send_and_stream partial-failure tests ---
-
-    #[tokio::test]
-    async fn test_m5_send_and_stream_non_streamable_returns_stream_attach() {
-        let suffix = Uuid::new_v4().simple().to_string();
-        let peer_name = format!("m5-peer-{suffix}");
-        let runtime_name = format!("m5-runtime-{suffix}");
-
-        let _peer = CommsRuntime::inproc_only(&peer_name).unwrap();
-        let runtime = CommsRuntime::inproc_only(&runtime_name).unwrap();
-        {
-            let mut trusted = runtime.trusted_peers.write();
-            trusted.upsert(crate::TrustedPeer {
-                name: peer_name.clone(),
-                pubkey: _peer.public_key(),
-                addr: format!("inproc://{peer_name}"),
-                meta: crate::PeerMeta::default(),
-            });
-        }
-
-        let cmd = CommsCommand::PeerMessage {
-            blocks: None,
-            to: PeerName::new(peer_name).expect("peer_name is a valid peer name"),
-            body: "not streamable".to_string(),
-            handling_mode: meerkat_core::types::HandlingMode::Queue,
-        };
-        let result = CoreCommsRuntime::send_and_stream(&runtime, cmd).await;
-        match result {
-            Err(SendAndStreamError::StreamAttach { receipt, error }) => {
-                assert!(
-                    matches!(receipt, SendReceipt::PeerMessageSent { .. }),
-                    "receipt should be PeerMessageSent"
-                );
-                assert!(
-                    matches!(error, StreamError::NotFound(_)),
-                    "error should be NotFound for non-streamable command"
-                );
-            }
-            Err(e) => panic!("expected StreamAttach error, got send error: {e}"),
-            Ok(_) => panic!("expected StreamAttach error, got Ok"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_m5_send_and_stream_input_none_is_not_streamable() {
-        let suffix = Uuid::new_v4().simple().to_string();
-        let runtime = CommsRuntime::inproc_only(&format!("m5-none-{suffix}")).unwrap();
-        let session_id = meerkat_core::SessionId::new();
-
-        let cmd = CommsCommand::Input {
-            blocks: None,
-            session_id: session_id.clone(),
-            body: "no stream".to_string(),
-            handling_mode: meerkat_core::types::HandlingMode::Queue,
-            source: meerkat_core::InputSource::Rpc,
-            stream: InputStreamMode::None,
-            allow_self_session: true,
-        };
-        let result = CoreCommsRuntime::send_and_stream(&runtime, cmd).await;
-        match result {
-            Err(SendAndStreamError::StreamAttach { receipt, error }) => {
-                assert!(
-                    matches!(
-                        receipt,
-                        SendReceipt::InputAccepted {
-                            stream_reserved: false,
-                            ..
-                        }
-                    ),
-                    "receipt should indicate no stream reserved"
-                );
-                assert!(matches!(error, StreamError::NotFound(_)));
-            }
-            Err(e) => panic!("expected StreamAttach error, got send error: {e}"),
-            Ok(_) => panic!("expected StreamAttach error, got Ok"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_m4_attach_after_completed_returns_not_reserved() {
-        let suffix = Uuid::new_v4().simple().to_string();
-        let runtime = CommsRuntime::inproc_only(&format!("post-comp-{suffix}")).unwrap();
-        let session_id = meerkat_core::SessionId::new();
-
-        let cmd = CommsCommand::Input {
-            blocks: None,
-            session_id: session_id.clone(),
-            body: "hello".to_string(),
-            handling_mode: meerkat_core::types::HandlingMode::Queue,
-            source: meerkat_core::InputSource::Rpc,
-            stream: InputStreamMode::ReserveInteraction,
-            allow_self_session: true,
-        };
-        let receipt = CoreCommsRuntime::send(&runtime, cmd).await.unwrap();
-        let iid = match receipt {
-            SendReceipt::InputAccepted { interaction_id, .. } => interaction_id,
-            _ => panic!("expected InputAccepted"),
-        };
-
-        // Attach
-        let _stream = CoreCommsRuntime::stream(&runtime, StreamScope::Interaction(iid)).unwrap();
-
-        // Complete
-        runtime.mark_interaction_complete(iid.0);
-
-        // Try to attach again → NotReserved
-        let result = CoreCommsRuntime::stream(&runtime, StreamScope::Interaction(iid));
-        assert!(
-            matches!(result, Err(StreamError::NotReserved(_))),
-            "attach after completed should return NotReserved"
-        );
-    }
-
     #[tokio::test]
     async fn test_allow_self_session_guard_rejects_default() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -3605,7 +2746,6 @@ mod tests {
             body: "blocked".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
             source: meerkat_core::InputSource::Rpc,
-            stream: InputStreamMode::None,
             allow_self_session: false,
         };
         let result = CoreCommsRuntime::send(&runtime, cmd).await;
