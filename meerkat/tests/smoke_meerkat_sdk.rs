@@ -1089,7 +1089,7 @@ mod scenario_08_comms {
         // Agent A sends a message to Agent B via comms tools.
         let result_a = agent_a
             .run(
-                "Use the send tool to send a peer_message to agent-b with body \
+                "Use the send_message tool (handling_mode='steer') to send a message to agent-b with body \
                  exactly: Smoke test ping from Agent A"
                     .into(),
             )

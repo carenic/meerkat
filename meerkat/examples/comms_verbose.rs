@@ -401,7 +401,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .model(&model)
         .max_tokens_per_turn(1024)
         .system_prompt(
-            "You are Agent A. You can communicate with other agents using the send tool. \\
+            "You are Agent A. You can communicate with other agents using the send_message tool (handling_mode='steer'). \\
              Use peers to see available peers.",
         )
         .build(llm_a, tools_a, store.clone())
@@ -430,7 +430,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("╚══════════════════════════════════════════════════════════════╝");
 
     let result_a = agent_a
-        .run("Send the message 'Hello from Agent A!' to agent-b using the send tool.".into())
+        .run("Send the message 'Hello from Agent A!' to agent-b using the send_message tool (handling_mode='steer').".into())
         .await?;
 
     println!("\n═══════════════════════════════════════════════════════════════");

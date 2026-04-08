@@ -298,7 +298,7 @@ async fn e2e_smoke_mob_partial_resume_collaborative_joke() {
         &handle_1,
         service_1.as_ref(),
         "w-1",
-        "Call the send tool exactly once to send this joke ingredient to joke-smoke/lead/lead-1. \
+        "Call the send_message tool exactly once (with handling_mode='steer') to send this joke ingredient to joke-smoke/lead/lead-1. \
          Send only this text as the body: W1_TOKEN: time-traveling moose. \
          After the send succeeds, reply with SENT_W1.",
         &["SENT_W1"],
@@ -308,7 +308,7 @@ async fn e2e_smoke_mob_partial_resume_collaborative_joke() {
         &handle_1,
         service_1.as_ref(),
         "w-2",
-        "Call the send tool exactly once to send this joke ingredient to joke-smoke/lead/lead-1. \
+        "Call the send_message tool exactly once (with handling_mode='steer') to send this joke ingredient to joke-smoke/lead/lead-1. \
          Send only this text as the body: W2_TOKEN: banjo-playing otter. \
          After the send succeeds, reply with SENT_W2.",
         &["SENT_W2"],
@@ -395,7 +395,7 @@ async fn e2e_smoke_mob_partial_resume_collaborative_joke() {
         &handle_2,
         service_2.as_ref(),
         "w-1",
-        "Call the send tool exactly once to send this joke ingredient to joke-smoke/lead/lead-1. \
+        "Call the send_message tool exactly once (with handling_mode='steer') to send this joke ingredient to joke-smoke/lead/lead-1. \
          Send only this text as the body: W1B_TOKEN: laser goose. \
          After the send succeeds, reply with SENT_W1B.",
         &["SENT_W1B"],
@@ -444,7 +444,7 @@ async fn e2e_smoke_mob_partial_resume_collaborative_joke() {
         &handle_2,
         service_2.as_ref(),
         "w-2",
-        "Call the send tool exactly once to send this joke ingredient to joke-smoke/lead/lead-1. \
+        "Call the send_message tool exactly once (with handling_mode='steer') to send this joke ingredient to joke-smoke/lead/lead-1. \
          Send only this text as the body: W2B_TOKEN: quantum lawnmower. \
          After the send succeeds, reply with SENT_W2B.",
         &["SENT_W2B"],
@@ -510,7 +510,7 @@ async fn e2e_smoke_mob_partial_resume_collaborative_joke() {
         &handle_3,
         service_3.as_ref(),
         "w-1",
-        "Call the send tool exactly once to send this joke ingredient to joke-smoke/lead/lead-1. \
+        "Call the send_message tool exactly once (with handling_mode='steer') to send this joke ingredient to joke-smoke/lead/lead-1. \
          Send only this text as the body: W1C_TOKEN: disco badger. \
          After the send succeeds, reply with SENT_W1C.",
         &["SENT_W1C"],
@@ -520,7 +520,7 @@ async fn e2e_smoke_mob_partial_resume_collaborative_joke() {
         &handle_3,
         service_3.as_ref(),
         "w-2",
-        "Call the send tool exactly once to send this joke ingredient to joke-smoke/lead/lead-1. \
+        "Call the send_message tool exactly once (with handling_mode='steer') to send this joke ingredient to joke-smoke/lead/lead-1. \
          Send only this text as the body: W2C_TOKEN: moonwalking toaster. \
          After the send succeeds, reply with SENT_W2C.",
         &["SENT_W2C"],

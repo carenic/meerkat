@@ -940,10 +940,9 @@ async fn e2e_delegate_bidirectional_comms() {
             json!({
                 "model": model,
                 "prompt": format!(
-                    "Call the delegate tool exactly once with task \
-                     'Call the send tool exactly once with kind peer_message, \
-                     to e2e-comms-parent, and body exactly {nonce}. \
-                     After the send succeeds, reply with SENT.' \
+                    "Call the delegate tool exactly once with task: \
+                     'Use the send_message tool (handling_mode=steer) to send a message with body \"{nonce}\" \
+                     to your parent peer. Then reply with the word SENT.' \
                      and member_id 'comms-helper'. \
                      After delegate returns, reply with DELEGATED."
                 ),

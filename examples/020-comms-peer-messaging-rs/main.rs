@@ -165,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .model(&model)
         .max_tokens_per_turn(1024)
         .system_prompt(
-            "You are Agent A. You can communicate with other agents using the send tool. \
+            "You are Agent A. You can communicate with other agents using the send_message tool (handling_mode='steer'). \
              Use the peers tool to discover available peers, then send messages to them.",
         )
         .build(Arc::new(llm_a), tools_a, store_a)
@@ -195,7 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result_a = agent_a
         .run(
             "Send the message 'Hello from Agent A! How are you today?' \
-             to agent-b using the send tool."
+             to agent-b using the send_message tool (handling_mode='steer')."
                 .into(),
         )
         .await?;
@@ -223,7 +223,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if inbox.is_empty() {
-        println!("\nNo messages arrived. The LLM may not have called the send tool correctly.");
+        println!(
+            "\nNo messages arrived. The LLM may not have called the send_message tool correctly."
+        );
         println!("Try running again -- LLM tool use can be non-deterministic.");
         return Ok(());
     }

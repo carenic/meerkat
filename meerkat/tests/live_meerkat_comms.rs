@@ -370,7 +370,7 @@ async fn create_agent_pair(
         .model(anthropic_model())
         .max_tokens_per_turn(1024)
         .system_prompt(
-            "You are Agent A. You can communicate with Agent B using the send tool. \
+            "You are Agent A. You can communicate with Agent B using the send_message tool (always include handling_mode='steer'). \
              When you receive a message from another agent, acknowledge it and respond appropriately. \
              Use the peers tool to see available peers.",
         )
@@ -381,7 +381,7 @@ async fn create_agent_pair(
         .model(anthropic_model())
         .max_tokens_per_turn(1024)
         .system_prompt(
-            "You are Agent B. You can communicate with Agent A using the send tool. \
+            "You are Agent B. You can communicate with Agent A using the send_message tool (always include handling_mode='steer'). \
              When you receive a message from another agent, acknowledge it and respond appropriately. \
              Use the peers tool to see available peers.",
         )

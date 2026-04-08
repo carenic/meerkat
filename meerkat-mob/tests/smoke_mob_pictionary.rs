@@ -236,13 +236,13 @@ async fn spawn_and_wait(handle: &MobHandle) -> Result<(), Box<dyn std::error::Er
              2) First, send a message to guesser-b AND guesser-c describing what you see (literal shapes/objects). \
              3) WAIT for both guesser-b and guesser-c to reply with their interpretations. \
              4) Only AFTER hearing from both, synthesize a consensus guess and send it to the artist. \
-             Use the 'send' tool with kind='message' for all peer messages. Keep messages to 1-2 sentences.",
+             Use the 'send_message' tool with handling_mode='steer' for all peer messages. Keep messages to 1-2 sentences.",
         ),
         (
             "guesser-b",
             "You are guesser-b. IMPORTANT RULES: \
              1) When you receive a message from guesser-a about an image, think about the EMOTIONAL/MOOD interpretation. \
-             2) Reply to guesser-a AND guesser-c with your interpretation using the 'send' tool (kind='message'). \
+             2) Reply to guesser-a AND guesser-c with your interpretation using the 'send_message' tool (handling_mode='steer'). \
              3) Do NOT send anything to the artist — only guesser-a does that. \
              Keep messages to 1-2 sentences.",
         ),
@@ -250,7 +250,7 @@ async fn spawn_and_wait(handle: &MobHandle) -> Result<(), Box<dyn std::error::Er
             "guesser-c",
             "You are guesser-c. IMPORTANT RULES: \
              1) When you receive a message from guesser-a about an image, think about the CONTEXT/NARRATIVE interpretation. \
-             2) Reply to guesser-a AND guesser-b with your interpretation using the 'send' tool (kind='message'). \
+             2) Reply to guesser-a AND guesser-b with your interpretation using the 'send_message' tool (handling_mode='steer'). \
              3) Do NOT send anything to the artist — only guesser-a does that. \
              Keep messages to 1-2 sentences.",
         ),
