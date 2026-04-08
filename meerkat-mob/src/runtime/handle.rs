@@ -24,6 +24,18 @@ use std::time::Duration;
 
 const DEFAULT_KICKOFF_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerConnectivityProjection {
+    Omit,
+    Include,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionObservationProjection {
+    LiveOnly,
+    Full,
+}
+
 /// Point-in-time snapshot of a mob member's execution state.
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
@@ -617,6 +629,8 @@ impl MobHandle {
     ///
     /// This includes structural roster fields plus current runtime status,
     /// error/finality state, and the current session binding when known.
+    /// It intentionally skips live peer-connectivity fanout so ordinary
+    /// membership polling cannot stall on comms reachability lookups.
     /// For low-level structural roster visibility without runtime projection,
     /// use [`list_all_members`](Self::list_all_members).
     pub async fn list_members(&self) -> Vec<MobMemberListEntry> {
@@ -624,11 +638,12 @@ impl MobHandle {
             .await
     }
 
-    /// List all members including those in `Retiring` state, with full
-    /// enriched status projection.
+    /// List all members including those in `Retiring` state, with canonical
+    /// lifecycle/session projection.
     ///
-    /// Use this for observability surfaces (RPC, MCP) where in-flight
-    /// retires should remain visible with their transitional state.
+    /// Like [`list_members`](Self::list_members), this intentionally avoids
+    /// live peer-connectivity fanout. Use [`member_status`](Self::member_status)
+    /// for deep per-member inspection including live comms reachability.
     pub async fn list_members_including_retiring(&self) -> Vec<MobMemberListEntry> {
         self.project_member_list(self.roster.read().await.list_all())
             .await
@@ -641,10 +656,8 @@ impl MobHandle {
         let entries: Vec<_> = entries.cloned().collect();
         let mut projected = Vec::with_capacity(entries.len());
         for entry in entries {
-            // Skip peer connectivity resolution — list_members doesn't expose
-            // it and the live comms fanout can stall during spawn/wiring.
             let snapshot = self
-                .canonical_member_snapshot_material(&entry.meerkat_id, false)
+                .canonical_member_list_material(&entry.meerkat_id)
                 .await
                 .to_snapshot();
             let snapshot = Some(snapshot);
@@ -1078,7 +1091,7 @@ impl MobHandle {
         initial_message: Option<ContentInput>,
     ) -> Result<MemberRespawnReceipt, MobRespawnError> {
         let old_session_id_before = self
-            .canonical_member_snapshot_material(&meerkat_id, false)
+            .canonical_member_list_material(&meerkat_id)
             .await
             .current_session_id;
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1103,7 +1116,7 @@ impl MobHandle {
                     receipt.old_session_id = old_session_id_before;
                 }
                 let post_material = self
-                    .canonical_member_snapshot_material(&receipt.member_id, false)
+                    .canonical_member_list_material(&receipt.member_id)
                     .await;
                 if MobMemberTerminalClassifier::has_canonical_member(&post_material) {
                     receipt.new_session_id = post_material.current_session_id;
@@ -1119,7 +1132,7 @@ impl MobHandle {
             receipt.old_session_id = old_session_id_before;
         }
         let post_material = self
-            .canonical_member_snapshot_material(&receipt.member_id, false)
+            .canonical_member_list_material(&receipt.member_id)
             .await;
         if MobMemberTerminalClassifier::has_canonical_member(&post_material) {
             receipt.new_session_id = post_material.current_session_id;
@@ -1431,10 +1444,35 @@ impl MobHandle {
             .map_err(|_| MobError::Internal("actor reply dropped".into()))?
     }
 
+    async fn canonical_member_list_material(
+        &self,
+        meerkat_id: &MeerkatId,
+    ) -> CanonicalMemberSnapshotMaterial {
+        self.canonical_member_material(
+            meerkat_id,
+            PeerConnectivityProjection::Omit,
+            SessionObservationProjection::LiveOnly,
+        )
+        .await
+    }
+
     async fn canonical_member_snapshot_material(
         &self,
         meerkat_id: &MeerkatId,
-        resolve_connectivity: bool,
+    ) -> CanonicalMemberSnapshotMaterial {
+        self.canonical_member_material(
+            meerkat_id,
+            PeerConnectivityProjection::Include,
+            SessionObservationProjection::Full,
+        )
+        .await
+    }
+
+    async fn canonical_member_material(
+        &self,
+        meerkat_id: &MeerkatId,
+        connectivity: PeerConnectivityProjection,
+        observation: SessionObservationProjection,
     ) -> CanonicalMemberSnapshotMaterial {
         // Canonical helper-surface classification is derived only from roster
         // membership/state plus session-service activity, never side tables.
@@ -1502,23 +1540,47 @@ impl MobHandle {
                 })
             }
             (Some(roster_state), Some(session_id)) => {
-                let (output_preview, tokens_used, observation) =
-                    match self.session_service.read(&session_id).await {
-                        Ok(view) => (
-                            view.state.last_assistant_text.clone(),
-                            view.billing.total_tokens,
-                            if view.state.is_active {
-                                CanonicalSessionObservation::Active
-                            } else {
-                                CanonicalSessionObservation::Inactive
+                let (output_preview, tokens_used, observation) = match observation {
+                    SessionObservationProjection::LiveOnly => {
+                        match self.session_service.has_live_session(&session_id).await {
+                            Ok(false) => (None, 0, CanonicalSessionObservation::Missing),
+                            Ok(true) => match self.session_service.read(&session_id).await {
+                                Ok(view) => (
+                                    view.state.last_assistant_text.clone(),
+                                    view.billing.total_tokens,
+                                    if view.state.is_active {
+                                        CanonicalSessionObservation::Active
+                                    } else {
+                                        CanonicalSessionObservation::Inactive
+                                    },
+                                ),
+                                Err(SessionError::NotFound { .. }) => {
+                                    (None, 0, CanonicalSessionObservation::Unknown)
+                                }
+                                Err(_) => (None, 0, CanonicalSessionObservation::Unknown),
                             },
-                        ),
-                        Err(SessionError::NotFound { .. }) => {
-                            (None, 0, CanonicalSessionObservation::Missing)
+                            Err(_) => (None, 0, CanonicalSessionObservation::Unknown),
                         }
-                        Err(_) => (None, 0, CanonicalSessionObservation::Unknown),
-                    };
-                let peer_connectivity = if resolve_connectivity {
+                    }
+                    SessionObservationProjection::Full => {
+                        match self.session_service.read(&session_id).await {
+                            Ok(view) => (
+                                view.state.last_assistant_text.clone(),
+                                view.billing.total_tokens,
+                                if view.state.is_active {
+                                    CanonicalSessionObservation::Active
+                                } else {
+                                    CanonicalSessionObservation::Inactive
+                                },
+                            ),
+                            Err(SessionError::NotFound { .. }) => {
+                                (None, 0, CanonicalSessionObservation::Missing)
+                            }
+                            Err(_) => (None, 0, CanonicalSessionObservation::Unknown),
+                        }
+                    }
+                };
+                let peer_connectivity = if connectivity == PeerConnectivityProjection::Include {
                     match roster_entry.as_ref() {
                         Some(entry) => {
                             self.resolve_peer_connectivity(entry, &session_id, &roster_snapshot)
@@ -1636,9 +1698,7 @@ impl MobHandle {
         meerkat_id: &MeerkatId,
     ) -> Result<CanonicalMemberSnapshotMaterial, MobError> {
         loop {
-            let material = self
-                .canonical_member_snapshot_material(meerkat_id, false)
-                .await;
+            let material = self.canonical_member_list_material(meerkat_id).await;
             if MobMemberTerminalClassifier::is_terminal(&material) {
                 return Ok(material);
             }
@@ -1647,13 +1707,14 @@ impl MobHandle {
     }
 
     /// Get a point-in-time execution snapshot for a member.
+    ///
+    /// This is the deep inspection surface. Unlike list projections, it
+    /// resolves live peer connectivity when a comms runtime is available.
     pub async fn member_status(
         &self,
         meerkat_id: &MeerkatId,
     ) -> Result<MobMemberSnapshot, MobError> {
-        let material = self
-            .canonical_member_snapshot_material(meerkat_id, true)
-            .await;
+        let material = self.canonical_member_snapshot_material(meerkat_id).await;
         Ok(material.to_snapshot())
     }
 
@@ -1764,9 +1825,7 @@ impl MobHandle {
         spec.auto_wire_parent = true;
 
         self.spawn_spec(spec).await?;
-        let helper_material = self
-            .canonical_member_snapshot_material(&meerkat_id, false)
-            .await;
+        let helper_material = self.canonical_member_list_material(&meerkat_id).await;
         let _ = self.retire(meerkat_id.clone()).await;
 
         Ok(helper_material.to_helper_result())
@@ -1807,9 +1866,7 @@ impl MobHandle {
         };
 
         self.spawn_spec(spec).await?;
-        let helper_material = self
-            .canonical_member_snapshot_material(&meerkat_id, false)
-            .await;
+        let helper_material = self.canonical_member_list_material(&meerkat_id).await;
         let _ = self.retire(meerkat_id.clone()).await;
 
         Ok(helper_material.to_helper_result())

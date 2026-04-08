@@ -68,6 +68,7 @@ struct MockCommsBehavior {
     fail_send_peer_added: bool,
     fail_send_peer_retired: bool,
     fail_send_peer_unwired: bool,
+    hang_peers: bool,
 }
 
 struct MockCommsRuntime {
@@ -259,6 +260,14 @@ impl CoreCommsRuntime for MockCommsRuntime {
     }
 
     async fn peers(&self) -> Vec<PeerDirectoryEntry> {
+        if self
+            .behavior
+            .read()
+            .expect("poisoned behavior lock in mock runtime")
+            .hang_peers
+        {
+            return std::future::pending().await;
+        }
         let trusted = self.trusted_peers.read().await;
         let peer_statuses = self.peer_statuses.read().await;
         trusted
@@ -2937,6 +2946,149 @@ impl SessionServiceControlExt for InactiveReadSessionService {
 
 #[async_trait]
 impl MobSessionService for InactiveReadSessionService {
+    async fn subscribe_session_events(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<EventStream, StreamError> {
+        SessionService::subscribe_session_events(&*self.inner, session_id).await
+    }
+
+    fn supports_persistent_sessions(&self) -> bool {
+        self.inner.supports_persistent_sessions()
+    }
+
+    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::RuntimeSessionAdapter>> {
+        self.inner.runtime_adapter()
+    }
+
+    async fn session_belongs_to_mob(&self, session_id: &SessionId, mob_id: &MobId) -> bool {
+        self.inner.session_belongs_to_mob(session_id, mob_id).await
+    }
+
+    async fn load_persisted_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<Session>, SessionError> {
+        self.inner.load_persisted_session(session_id).await
+    }
+
+    async fn apply_runtime_turn(
+        &self,
+        session_id: &SessionId,
+        run_id: meerkat_core::RunId,
+        req: StartTurnRequest,
+        boundary: meerkat_core::lifecycle::run_primitive::RunApplyBoundary,
+        contributing_input_ids: Vec<meerkat_core::InputId>,
+    ) -> Result<meerkat_core::lifecycle::core_executor::CoreApplyOutput, SessionError> {
+        self.inner
+            .apply_runtime_turn(session_id, run_id, req, boundary, contributing_input_ids)
+            .await
+    }
+
+    async fn discard_live_session(&self, session_id: &SessionId) -> Result<(), SessionError> {
+        self.inner.discard_live_session(session_id).await
+    }
+
+    async fn cancel_all_checkpointers(&self) {
+        self.inner.cancel_all_checkpointers().await;
+    }
+
+    async fn rearm_all_checkpointers(&self) {
+        self.inner.rearm_all_checkpointers().await;
+    }
+}
+
+struct HangingReadWithoutLiveSessionService {
+    inner: Arc<MockSessionService>,
+}
+
+impl HangingReadWithoutLiveSessionService {
+    fn new(inner: Arc<MockSessionService>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl SessionService for HangingReadWithoutLiveSessionService {
+    async fn create_session(&self, req: CreateSessionRequest) -> Result<RunResult, SessionError> {
+        self.inner.create_session(req).await
+    }
+
+    async fn start_turn(
+        &self,
+        id: &SessionId,
+        req: StartTurnRequest,
+    ) -> Result<RunResult, SessionError> {
+        self.inner.start_turn(id, req).await
+    }
+
+    async fn interrupt(&self, id: &SessionId) -> Result<(), SessionError> {
+        self.inner.interrupt(id).await
+    }
+
+    async fn read(&self, _id: &SessionId) -> Result<SessionView, SessionError> {
+        std::future::pending().await
+    }
+
+    async fn list(&self, query: SessionQuery) -> Result<Vec<SessionSummary>, SessionError> {
+        self.inner.list(query).await
+    }
+
+    async fn archive(&self, id: &SessionId) -> Result<(), SessionError> {
+        self.inner.archive(id).await
+    }
+
+    async fn has_live_session(&self, _id: &SessionId) -> Result<bool, SessionError> {
+        Ok(false)
+    }
+
+    async fn subscribe_session_events(&self, id: &SessionId) -> Result<EventStream, StreamError> {
+        SessionService::subscribe_session_events(&*self.inner, id).await
+    }
+}
+
+#[async_trait]
+impl SessionServiceCommsExt for HangingReadWithoutLiveSessionService {
+    async fn comms_runtime(&self, session_id: &SessionId) -> Option<Arc<dyn CoreCommsRuntime>> {
+        self.inner.comms_runtime(session_id).await
+    }
+
+    async fn event_injector(&self, session_id: &SessionId) -> Option<Arc<dyn EventInjector>> {
+        self.inner.event_injector(session_id).await
+    }
+
+    async fn interaction_event_injector(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<Arc<dyn SubscribableInjector>> {
+        self.inner.interaction_event_injector(session_id).await
+    }
+}
+
+#[async_trait]
+impl SessionServiceHistoryExt for HangingReadWithoutLiveSessionService {
+    async fn read_history(
+        &self,
+        id: &SessionId,
+        query: meerkat_core::service::SessionHistoryQuery,
+    ) -> Result<meerkat_core::service::SessionHistoryPage, SessionError> {
+        self.inner.read_history(id, query).await
+    }
+}
+
+#[async_trait]
+impl SessionServiceControlExt for HangingReadWithoutLiveSessionService {
+    async fn append_system_context(
+        &self,
+        id: &SessionId,
+        req: AppendSystemContextRequest,
+    ) -> Result<AppendSystemContextResult, SessionControlError> {
+        self.inner.append_system_context(id, req).await
+    }
+}
+
+#[async_trait]
+impl MobSessionService for HangingReadWithoutLiveSessionService {
     async fn subscribe_session_events(
         &self,
         session_id: &SessionId,
@@ -7406,6 +7558,159 @@ async fn test_member_status_omits_peer_connectivity_without_live_comms_runtime()
     assert!(
         snapshot.peer_connectivity.is_none(),
         "member snapshot should omit connectivity when no live comms runtime exists"
+    );
+}
+
+#[tokio::test]
+async fn test_list_members_does_not_block_on_peer_connectivity_resolution() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let member_id = MeerkatId::from("l-1");
+    handle
+        .spawn(ProfileName::from("lead"), member_id.clone(), None)
+        .await
+        .expect("spawn lead");
+    service
+        .set_comms_behavior(
+            &test_comms_name("lead", "l-1"),
+            MockCommsBehavior {
+                hang_peers: true,
+                ..MockCommsBehavior::default()
+            },
+        )
+        .await;
+
+    let members = tokio::time::timeout(Duration::from_millis(200), handle.list_members())
+        .await
+        .expect("list_members should not wait on peer connectivity")
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    assert_eq!(members.len(), 1, "spawned member should still be listed");
+    assert_eq!(members[0].meerkat_id, member_id);
+    assert_eq!(
+        members[0].status,
+        crate::runtime::handle::MobMemberStatus::Active
+    );
+}
+
+#[tokio::test]
+async fn test_list_members_including_retiring_does_not_block_on_peer_connectivity_resolution() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let member_id = MeerkatId::from("l-1");
+    handle
+        .spawn(ProfileName::from("lead"), member_id.clone(), None)
+        .await
+        .expect("spawn lead");
+    service
+        .set_comms_behavior(
+            &test_comms_name("lead", "l-1"),
+            MockCommsBehavior {
+                hang_peers: true,
+                ..MockCommsBehavior::default()
+            },
+        )
+        .await;
+
+    let members = tokio::time::timeout(
+        Duration::from_millis(200),
+        handle.list_members_including_retiring(),
+    )
+    .await
+    .expect("list_members_including_retiring should not wait on peer connectivity")
+    .into_iter()
+    .collect::<Vec<_>>();
+
+    assert_eq!(members.len(), 1, "spawned member should still be listed");
+    assert_eq!(members[0].meerkat_id, member_id);
+    assert_eq!(
+        members[0].status,
+        crate::runtime::handle::MobMemberStatus::Active
+    );
+}
+
+#[tokio::test]
+async fn test_list_runnable_members_does_not_block_on_peer_connectivity_resolution() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let member_id = MeerkatId::from("l-1");
+    handle
+        .spawn(ProfileName::from("lead"), member_id.clone(), None)
+        .await
+        .expect("spawn lead");
+    service
+        .set_comms_behavior(
+            &test_comms_name("lead", "l-1"),
+            MockCommsBehavior {
+                hang_peers: true,
+                ..MockCommsBehavior::default()
+            },
+        )
+        .await;
+
+    let members = tokio::time::timeout(Duration::from_millis(200), handle.list_runnable_members())
+        .await
+        .expect("list_runnable_members should not wait on peer connectivity");
+
+    assert_eq!(members.len(), 1, "active member should remain runnable");
+    assert_eq!(members[0].meerkat_id, member_id);
+    assert_eq!(
+        members[0].status,
+        crate::runtime::handle::MobMemberStatus::Active
+    );
+}
+
+#[tokio::test]
+async fn test_list_members_avoids_blocking_read_fallback_when_no_live_session_exists() {
+    let inner = Arc::new(MockSessionService::new());
+    let _ = inner.enable_runtime_adapter();
+    let service = Arc::new(HangingReadWithoutLiveSessionService::new(inner));
+    let handle = MobBuilder::new(sample_definition(), MobStorage::in_memory())
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create mob");
+    let member_id = MeerkatId::from("l-1");
+    handle
+        .spawn(ProfileName::from("lead"), member_id.clone(), None)
+        .await
+        .expect("spawn lead");
+
+    let members = tokio::time::timeout(Duration::from_millis(200), handle.list_members())
+        .await
+        .expect("list_members should use live-only session observation")
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    assert_eq!(members.len(), 1, "spawned member should still be listed");
+    assert_eq!(members[0].meerkat_id, member_id);
+    assert_eq!(
+        members[0].status,
+        crate::runtime::handle::MobMemberStatus::Completed,
+        "without a live session, the cheap list projection should return promptly instead of blocking on read()"
+    );
+}
+
+#[tokio::test]
+async fn test_list_runnable_members_avoids_blocking_read_fallback_when_no_live_session_exists() {
+    let inner = Arc::new(MockSessionService::new());
+    let _ = inner.enable_runtime_adapter();
+    let service = Arc::new(HangingReadWithoutLiveSessionService::new(inner));
+    let handle = MobBuilder::new(sample_definition(), MobStorage::in_memory())
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create mob");
+    handle
+        .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
+        .await
+        .expect("spawn lead");
+
+    let members = tokio::time::timeout(Duration::from_millis(200), handle.list_runnable_members())
+        .await
+        .expect("list_runnable_members should use live-only session observation");
+
+    assert!(
+        members.is_empty(),
+        "members without a live session should not remain runnable"
     );
 }
 
