@@ -815,12 +815,12 @@ async fn accept_scheduled_event_with_completion(
     ))
 }
 
-async fn update_peer_ingress_context(context: &McpScheduleContext, session_id: &SessionId) {
+async fn update_peer_ingress_context(_context: &McpScheduleContext, _session_id: &SessionId) {
     #[cfg(feature = "comms")]
     {
-        let keep_alive = context
+        let keep_alive = _context
             .service
-            .load_persisted(session_id)
+            .load_persisted(_session_id)
             .await
             .ok()
             .flatten()
@@ -830,10 +830,10 @@ async fn update_peer_ingress_context(context: &McpScheduleContext, session_id: &
                     .map(|metadata| metadata.keep_alive)
             })
             .unwrap_or(false);
-        let comms_rt = context.service.comms_runtime(session_id).await;
-        context
+        let comms_rt = _context.service.comms_runtime(_session_id).await;
+        _context
             .runtime_adapter
-            .update_peer_ingress_context(session_id, keep_alive, comms_rt)
+            .update_peer_ingress_context(_session_id, keep_alive, comms_rt)
             .await;
     }
 }

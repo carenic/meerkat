@@ -1,18 +1,21 @@
 use std::sync::{Arc, Weak};
+#[cfg(feature = "mob")]
 use std::time::Duration;
 
 use async_trait::async_trait;
+#[cfg(feature = "mob")]
+use meerkat::DeliveryTerminal;
 use meerkat::surface::{
     ScheduledPromptDispatch, SharedScheduleTargetAdapter, SurfaceScheduleMobHost,
     SurfaceScheduleSessionHost, accepted_scheduled_input_from_runtime_outcome,
-    async_completion_dispatch, build_dispatch_from_accepted, immediate_completed_dispatch,
-    immediate_delivery_failure, schedule_attempt_idempotency_key, schedule_host_supported,
-    spawn_schedule_host,
+    build_dispatch_from_accepted, immediate_delivery_failure, schedule_attempt_idempotency_key,
+    schedule_host_supported, spawn_schedule_host,
 };
+#[cfg(feature = "mob")]
+use meerkat::surface::{async_completion_dispatch, immediate_completed_dispatch};
 use meerkat::{
-    AgentBuildConfig, DeliveryDispatch, DeliveryTerminal, MobTargetBinding, Occurrence,
-    OccurrenceFailureClass, ScheduleDomainError, SessionMaterializationSpec, SessionTargetBinding,
-    TargetProbeOutcome,
+    AgentBuildConfig, DeliveryDispatch, MobTargetBinding, Occurrence, OccurrenceFailureClass,
+    ScheduleDomainError, SessionMaterializationSpec, SessionTargetBinding, TargetProbeOutcome,
 };
 #[cfg(feature = "mob")]
 use meerkat::{

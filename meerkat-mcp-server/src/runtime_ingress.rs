@@ -1,8 +1,11 @@
 use async_trait::async_trait;
+#[cfg(feature = "comms")]
+use meerkat::surface::configure_peer_ingress;
 use meerkat::{
-    FactoryAgentBuilder, PersistentSessionService,
+    CreateSessionRequest, FactoryAgentBuilder, PersistentSessionService, RunResult, Session,
     surface::{
-        SurfaceSessionRecoveryContext, SurfaceSessionRecoveryOverrides, build_recovered_session,
+        SurfaceRuntimeMaterializeError, SurfaceSessionRecoveryContext,
+        SurfaceSessionRecoveryOverrides, build_recovered_session, materialize_session,
     },
 };
 use meerkat_core::agent::AgentToolDispatcher;
@@ -11,7 +14,7 @@ use meerkat_core::event::AgentEvent;
 use meerkat_core::lifecycle::core_executor::{CoreApplyOutput, CoreExecutor, CoreExecutorError};
 use meerkat_core::lifecycle::run_control::RunControlCommand;
 use meerkat_core::lifecycle::run_primitive::{
-    ConversationContextAppend, CoreRenderable, RunApplyBoundary, RunPrimitive,
+    ConversationContextAppend, CoreRenderable, RunPrimitive,
 };
 use meerkat_core::service::{SessionError, SessionService, StartTurnRequest};
 use meerkat_core::types::{HandlingMode, SessionId};
@@ -213,6 +216,128 @@ impl McpRuntimeIngressContext {
         crate::compose_external_tool_dispatchers(callback_tools, mcp_tools)
             .map_err(|error| SessionError::Agent(AgentError::InternalError(error)))
     }
+
+    async fn materialize_with_state(
+        &self,
+        session: Session,
+        request: CreateSessionRequest,
+        keep_alive: bool,
+        state: Arc<McpRuntimeSessionState>,
+    ) -> Result<RunResult, SessionError> {
+        let session_id = session.id().clone();
+        self.runtime_sessions
+            .write()
+            .await
+            .insert(session_id.clone(), state.clone());
+        let context = self.clone();
+        let result = materialize_session(
+            &self.service,
+            &self.runtime_adapter,
+            session,
+            request,
+            move |runtime_session_id| {
+                Box::new(McpSessionRuntimeExecutor::new(
+                    context,
+                    runtime_session_id,
+                    state,
+                ))
+            },
+        )
+        .await;
+
+        match result {
+            Ok(result) => {
+                #[cfg(feature = "comms")]
+                configure_peer_ingress(
+                    &self.runtime_adapter,
+                    &self.service,
+                    &result.session_id,
+                    keep_alive,
+                )
+                .await;
+                Ok(result)
+            }
+            Err(error) => {
+                self.clear_session(&session_id).await;
+                Err(surface_materialize_session_error(error))
+            }
+        }
+    }
+
+    pub(crate) async fn materialize_session_with_result(
+        &self,
+        session: Session,
+        request: CreateSessionRequest,
+        callback_tools: Option<Arc<dyn AgentToolDispatcher>>,
+    ) -> Result<RunResult, SessionError> {
+        let keep_alive = request.build.as_ref().is_some_and(|build| build.keep_alive);
+        let state = Arc::new(McpRuntimeSessionState::default());
+        state.set_callback_tools(callback_tools).await;
+        self.materialize_with_state(session, request, keep_alive, state)
+            .await
+    }
+
+    async fn rematerialize_persisted_session(
+        &self,
+        session_id: &SessionId,
+        state: Arc<McpRuntimeSessionState>,
+    ) -> Result<SessionId, SessionError> {
+        let session = self
+            .service
+            .load_persisted(session_id)
+            .await?
+            .ok_or_else(|| SessionError::NotFound {
+                id: session_id.clone(),
+            })?;
+        let current_snapshot = self.config_runtime.get().await.ok();
+        let current_generation = current_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.generation)
+            .or_else(|| {
+                session
+                    .session_metadata()
+                    .as_ref()
+                    .and_then(|meta| meta.config_generation)
+            });
+        let external_tools = self.external_tools_for_session(session_id, &state).await?;
+        let recovered = build_recovered_session(
+            session.clone(),
+            &SurfaceSessionRecoveryOverrides::default(),
+            SurfaceSessionRecoveryContext {
+                llm_client_override: None,
+                external_tools,
+                realm_id: Some(self.realm_id.clone()),
+                instance_id: self.instance_id.clone(),
+                backend: Some(self.backend.clone()),
+                config_generation: current_generation,
+                ..Default::default()
+            },
+        )
+        .map_err(surface_recovery_session_error)?;
+        let keep_alive = recovered.keep_alive;
+        let result = self
+            .materialize_with_state(
+                session,
+                recovered.into_deferred_create_request(),
+                keep_alive,
+                state,
+            )
+            .await?;
+        Ok(result.session_id)
+    }
+}
+
+fn surface_materialize_session_error(error: SurfaceRuntimeMaterializeError) -> SessionError {
+    match error {
+        SurfaceRuntimeMaterializeError::Session(error) => error,
+        other => SessionError::Agent(AgentError::InternalError(other.to_string())),
+    }
+}
+
+fn surface_recovery_session_error(
+    error: meerkat::surface::SurfaceSessionRecoveryError,
+) -> SessionError {
+    SessionError::Agent(AgentError::InternalError(error.to_string()))
 }
 
 #[derive(Default)]
@@ -382,10 +507,7 @@ async fn apply_runtime_turn(
     }
 
     let prompt = primitive.extract_content_input();
-    let boundary = match primitive {
-        RunPrimitive::StagedInput(staged) => staged.boundary,
-        _ => RunApplyBoundary::Immediate,
-    };
+    let boundary = primitive.apply_boundary();
     let contributing_input_ids = primitive.contributing_input_ids().to_vec();
     let queued_context = state
         .take_turn_context_for_inputs(&contributing_input_ids)
@@ -425,61 +547,10 @@ async fn apply_runtime_turn(
     {
         Ok(output) => Ok(output),
         Err(SessionError::NotFound { .. }) => {
-            let session = context.service.load_persisted(session_id).await?.ok_or(
-                SessionError::NotFound {
-                    id: session_id.clone(),
-                },
-            )?;
-            let current_snapshot = context.config_runtime.get().await.ok();
-            let current_generation = current_snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.generation)
-                .or_else(|| {
-                    session
-                        .session_metadata()
-                        .as_ref()
-                        .and_then(|meta| meta.config_generation)
-                });
-
-            let runtime_bindings = context
-                .runtime_adapter
-                .prepare_bindings(session_id.clone())
-                .await
-                .map_err(|error| {
-                    SessionError::Agent(AgentError::InternalError(error.to_string()))
-                })?;
-            let external_tools = context
-                .external_tools_for_session(session_id, state)
-                .await?;
-            let recovered = build_recovered_session(
-                session,
-                &SurfaceSessionRecoveryOverrides::default(),
-                SurfaceSessionRecoveryContext {
-                    llm_client_override: None,
-                    external_tools,
-                    runtime_build_mode: Some(meerkat_core::RuntimeBuildMode::SessionOwned(
-                        runtime_bindings,
-                    )),
-                    realm_id: Some(context.realm_id.clone()),
-                    instance_id: context.instance_id.clone(),
-                    backend: Some(context.backend.clone()),
-                    config_generation: current_generation,
-                },
-            )
-            .map_err(|error| SessionError::Agent(AgentError::InternalError(error.to_string())))?;
-            let keep_alive = recovered.keep_alive;
             context
-                .service
-                .create_session(recovered.into_deferred_create_request())
-                .await?;
-            #[cfg(feature = "comms")]
-            {
-                let comms_rt = context.service.comms_runtime(session_id).await;
-                context
-                    .runtime_adapter
-                    .update_peer_ingress_context(session_id, keep_alive, comms_rt)
-                    .await;
-            }
+                .rematerialize_persisted_session(session_id, state.clone())
+                .await
+                .map(|_| ())?;
             context
                 .service
                 .apply_runtime_turn_outcome(

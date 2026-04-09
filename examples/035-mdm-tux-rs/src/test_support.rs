@@ -2,17 +2,24 @@ use async_trait::async_trait;
 use meerkat::LlmClient;
 use meerkat_client::types::LlmStream;
 use meerkat_client::{LlmError, LlmRequest, TestClient};
+use meerkat_core::types::Message;
 use std::sync::Mutex;
 
 #[derive(Default)]
 pub struct CaptureClient {
     inner: TestClient,
     seen_tools: Mutex<Vec<String>>,
+    seen_user_messages: Mutex<Vec<String>>,
 }
 
 impl CaptureClient {
     pub fn tool_names(&self) -> Vec<String> {
         self.seen_tools.lock().expect("capture lock").clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn user_messages(&self) -> Vec<String> {
+        self.seen_user_messages.lock().expect("capture lock").clone()
     }
 }
 
@@ -22,6 +29,14 @@ impl LlmClient for CaptureClient {
     fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
         *self.seen_tools.lock().expect("capture lock") =
             request.tools.iter().map(|tool| tool.name.clone()).collect();
+        *self.seen_user_messages.lock().expect("capture lock") = request
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(message) => Some(message.text_content()),
+                _ => None,
+            })
+            .collect();
         self.inner.stream(request)
     }
 

@@ -33,6 +33,7 @@ pub struct SessionRuntimeExecutor {
 }
 
 #[cfg(feature = "mob")]
+/// Implements `CoreExecutor` directly against a mob-capable session service.
 pub struct MobRpcRuntimeExecutor {
     session_service: Arc<dyn MobSessionService>,
     session_id: SessionId,
@@ -202,10 +203,7 @@ impl CoreExecutor for MobRpcRuntimeExecutor {
                 &self.session_id,
                 run_id,
                 req,
-                match &primitive {
-                    RunPrimitive::StagedInput(staged) => staged.boundary,
-                    _ => meerkat_core::lifecycle::run_primitive::RunApplyBoundary::Immediate,
-                },
+                primitive.apply_boundary(),
                 primitive.contributing_input_ids().to_vec(),
             )
             .await;

@@ -5,13 +5,16 @@
 //! receiver that uses live trusted peers for dynamic registration.
 
 use anyhow::Context as _;
+use meerkat::{PersistenceBundle, SessionStore};
 use meerkat_comms::agent::types::{CommsContent, CommsMessage};
 use meerkat_comms::identity::Keypair;
 use meerkat_comms::router::CommsConfig;
 use meerkat_comms::{Inbox, InboxItem, InboxSender, PeerMeta, Router, TrustedPeer, TrustedPeers};
 use meerkat_core::AgentEvent;
+use meerkat_store::{JsonlStore, MemoryBlobStore, SqliteScheduleStore};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -20,6 +23,29 @@ use tokio::net::{TcpListener, TcpStream};
 pub mod kennel;
 pub mod machines;
 pub use kennel::*;
+
+pub async fn open_example_runtime_persistence(session_dir: &Path) -> anyhow::Result<PersistenceBundle> {
+    tokio::fs::create_dir_all(session_dir)
+        .await
+        .with_context(|| format!("create session dir {}", session_dir.display()))?;
+
+    let session_store = Arc::new(JsonlStore::new(session_dir.to_path_buf()));
+    session_store
+        .init()
+        .await
+        .with_context(|| format!("init jsonl session store in {}", session_dir.display()))?;
+    let schedule_store = Arc::new(
+        SqliteScheduleStore::open(session_dir.join("schedules.sqlite3"))
+            .with_context(|| format!("open sqlite schedule store in {}", session_dir.display()))?,
+    ) as Arc<dyn meerkat::ScheduleStore>;
+
+    Ok(PersistenceBundle::new_with_schedule_store(
+        session_store as Arc<dyn SessionStore>,
+        None,
+        Arc::new(MemoryBlobStore::new()),
+        schedule_store,
+    ))
+}
 
 // ── Provider auto-detection ───────────────────────────────────────────────────
 

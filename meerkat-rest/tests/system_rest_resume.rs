@@ -3,13 +3,17 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use meerkat::surface::wire_runtime_bindings;
 use meerkat::{
-    AgentFactory, Config, FactoryAgentBuilder, MemoryStore, PersistentSessionService, SessionId,
-    SessionStore,
+    AgentFactory, Config, FactoryAgentBuilder, MemoryStore, PersistenceBundle,
+    PersistentSessionService, SessionId, SessionStore,
 };
 use meerkat_client::TestClient;
 use meerkat_core::MemoryConfigStore;
+#[cfg(feature = "mob")]
+use meerkat_mob_mcp::wire_mob_tools;
 use meerkat_rest::{AppState, router};
+use meerkat_store::StoreAdapter;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -49,13 +53,27 @@ async fn inner_test_rest_resume_metadata() {
         .project_root(project_root.clone());
     let mut builder = FactoryAgentBuilder::new(factory, config.clone());
     builder.default_llm_client = Some(Arc::new(TestClient::default()));
-    let session_service = Arc::new(PersistentSessionService::new(
-        builder,
-        100,
+    let persistence = PersistenceBundle::new(
         store.clone(),
         None,
         Arc::new(meerkat_store::MemoryBlobStore::new()),
-    ));
+    );
+    let runtime_adapter = persistence.runtime_adapter();
+    builder.default_session_store = Some(Arc::new(StoreAdapter::new(persistence.session_store())));
+    #[cfg(feature = "mob")]
+    let builder_mob_tools_slot = Arc::clone(&builder.default_mob_tools);
+    let (session_store_inner, runtime_store, blob_store) = persistence.into_parts();
+    let mut session_service =
+        PersistentSessionService::new(builder, 100, session_store_inner, runtime_store, blob_store);
+    wire_runtime_bindings(&mut session_service, &runtime_adapter);
+    let session_service = Arc::new(session_service);
+    #[cfg(feature = "mob")]
+    let mob_state = wire_mob_tools(
+        &builder_mob_tools_slot,
+        session_service.clone(),
+        Some(runtime_adapter.clone()),
+        None,
+    );
     let config_store_arc: Arc<dyn meerkat_core::ConfigStore> = Arc::new(config_store);
     let config_runtime = Arc::new(meerkat_core::ConfigRuntime::new(
         Arc::clone(&config_store_arc),
@@ -93,13 +111,13 @@ async fn inner_test_rest_resume_metadata() {
         config_runtime,
         realm_lease: Arc::new(tokio::sync::Mutex::new(None)),
         skill_runtime: None,
-        runtime_adapter: std::sync::Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral()),
+        runtime_adapter: runtime_adapter.clone(),
         schedule_host: Arc::default(),
         request_executor: std::sync::Arc::new(meerkat::surface::SurfaceRequestExecutor::new(
             std::time::Duration::from_secs(5),
         )),
         #[cfg(feature = "mob")]
-        mob_state: meerkat_mob_mcp::MobMcpState::new_in_memory(),
+        mob_state,
         #[cfg(feature = "mcp")]
         mcp_sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     };
@@ -154,13 +172,33 @@ async fn inner_test_rest_resume_metadata() {
         .project_root(project_root.clone());
     let mut builder2 = FactoryAgentBuilder::new(factory2, config.clone());
     builder2.default_llm_client = Some(Arc::new(TestClient::default()));
-    let session_service2 = Arc::new(PersistentSessionService::new(
-        builder2,
-        100,
+    let persistence2 = PersistenceBundle::new(
         store.clone(),
         None,
         Arc::new(meerkat_store::MemoryBlobStore::new()),
-    ));
+    );
+    let runtime_adapter2 = persistence2.runtime_adapter();
+    builder2.default_session_store =
+        Some(Arc::new(StoreAdapter::new(persistence2.session_store())));
+    #[cfg(feature = "mob")]
+    let builder2_mob_tools_slot = Arc::clone(&builder2.default_mob_tools);
+    let (session_store2_inner, runtime_store2, blob_store2) = persistence2.into_parts();
+    let mut session_service2 = PersistentSessionService::new(
+        builder2,
+        100,
+        session_store2_inner,
+        runtime_store2,
+        blob_store2,
+    );
+    wire_runtime_bindings(&mut session_service2, &runtime_adapter2);
+    let session_service2 = Arc::new(session_service2);
+    #[cfg(feature = "mob")]
+    let mob_state2 = wire_mob_tools(
+        &builder2_mob_tools_slot,
+        session_service2.clone(),
+        Some(runtime_adapter2.clone()),
+        None,
+    );
     let config_store_resume: Arc<dyn meerkat_core::ConfigStore> =
         Arc::new(MemoryConfigStore::new(config.clone()));
     let config_runtime_resume = Arc::new(meerkat_core::ConfigRuntime::new(
@@ -199,13 +237,13 @@ async fn inner_test_rest_resume_metadata() {
         config_runtime: config_runtime_resume,
         realm_lease: Arc::new(tokio::sync::Mutex::new(None)),
         skill_runtime: None,
-        runtime_adapter: std::sync::Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral()),
+        runtime_adapter: runtime_adapter2,
         schedule_host: Arc::default(),
         request_executor: std::sync::Arc::new(meerkat::surface::SurfaceRequestExecutor::new(
             std::time::Duration::from_secs(5),
         )),
         #[cfg(feature = "mob")]
-        mob_state: meerkat_mob_mcp::MobMcpState::new_in_memory(),
+        mob_state: mob_state2,
         #[cfg(feature = "mcp")]
         mcp_sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     };

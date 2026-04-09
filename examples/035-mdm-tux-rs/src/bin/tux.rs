@@ -26,13 +26,25 @@ use anyhow::Context as _;
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
 };
-use meerkat::{AgentBuildConfig, AgentEvent, AgentFactory, DynAgent, LlmClient};
+use meerkat::{
+    AgentEvent, AgentFactory, FactoryAgentBuilder, LlmClient, PersistentSessionService,
+    SessionError, SessionService, ToolGatewayBuilder,
+};
 use meerkat_comms::MessageKind;
 use meerkat_comms::agent::CommsToolDispatcher;
 use meerkat_comms::agent::types::CommsContent;
-use meerkat_core::{AgentSessionStore, AgentToolDispatcher};
-use meerkat_mob_mcp::{AgentMobToolSurfaceFactory, MobMcpState};
-use meerkat_store::{JsonlStore, StoreAdapter};
+use meerkat_core::AgentToolDispatcher;
+use meerkat_core::service::{
+    CreateSessionRequest, DeferredPromptPolicy, InitialTurnPolicy, SessionBuildOptions,
+    StartTurnRequest,
+};
+use meerkat_core::types::{ContentInput, HandlingMode, SessionId};
+use meerkat_schedule::{ScheduleService, ScheduleToolSurface};
+use meerkat::surface::{
+    default_persistent_executor, materialize_session, spawn_runtime_backed_schedule_host,
+    wire_runtime_bindings,
+};
+use meerkat_store::StoreAdapter;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -49,8 +61,9 @@ use mdm_tux::machines::tux_runtime_registry as runtime_registry;
 use mdm_tux::{
     ClaimGrant, CommsNode, DirectControlPayload, KennelPayload, LeaseRef, LeaseTerminationReason,
     ListScope, ProviderKind, TargetListEntry, auto_detect, build_signed_envelope,
-    direct_control_request, load_or_generate_keypair, parse_direct_control_message, read_envelope,
-    run_registration_server, verify_envelope, write_envelope,
+    direct_control_request, load_or_generate_keypair, parse_direct_control_message,
+    read_envelope, run_registration_server, open_example_runtime_persistence, verify_envelope,
+    write_envelope,
 };
 use tokio::io::BufReader;
 use tokio::net::TcpStream;
@@ -60,8 +73,36 @@ use tokio::net::TcpStream;
 const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 struct HiveAgentState {
-    agent: DynAgent,
-    _mob_state: Arc<MobMcpState>,
+    service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    session_id: SessionId,
+    _schedule_host: Option<meerkat::surface::ScheduleHostHandle>,
+}
+
+impl HiveAgentState {
+    async fn run(&self, prompt: String) -> Result<meerkat::RunResult, SessionError> {
+        self.service
+            .start_turn(
+                &self.session_id,
+                StartTurnRequest {
+                    prompt: ContentInput::Text(prompt),
+                    system_prompt: None,
+                    render_metadata: None,
+                    handling_mode: HandlingMode::Queue,
+                    event_tx: None,
+                    skill_references: None,
+                    flow_tool_overlay: None,
+                    additional_instructions: None,
+                    execution_kind: None,
+                },
+            )
+            .await
+    }
+
+    async fn shutdown(self) {
+        if let Some(schedule_host) = self._schedule_host {
+            schedule_host.shutdown().await;
+        }
+    }
 }
 
 // ── Event / command types ─────────────────────────────────────────────────────
@@ -669,7 +710,9 @@ async fn main() -> anyhow::Result<()> {
                             .await;
                     }
                     AppCommand::ResetHive => {
-                        hive_agent = None;
+                        if let Some(hive) = hive_agent.take() {
+                            hive.shutdown().await;
+                        }
                     }
                     AppCommand::ClaimTarget { .. } | AppCommand::ReleaseTarget { .. } => {}
                     AppCommand::RunHive { prompt } => {
@@ -706,8 +749,8 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
-                        let agent = hive_agent.as_mut().expect("just built");
-                        let ev = match agent.agent.run(prompt.into()).await {
+                        let agent = hive_agent.as_ref().expect("just built");
+                        let ev = match agent.run(prompt).await {
                             Ok(r) => TuiEvent::HivePlanDone(r.text),
                             Err(e) => TuiEvent::HiveError(e.to_string()),
                         };
@@ -815,39 +858,95 @@ async fn build_hive_with_llm_override(
     trusted: Arc<parking_lot::RwLock<meerkat_comms::TrustedPeers>>,
     llm_client_override: Option<Arc<dyn LlmClient>>,
 ) -> anyhow::Result<HiveAgentState> {
-    let factory = AgentFactory::new(session_dir).mob(true);
-    let tools: Arc<dyn AgentToolDispatcher> = Arc::new(CommsToolDispatcher::new(router, trusted));
-    let store = Arc::new(JsonlStore::new(session_dir.to_path_buf()));
-    store.init().await?;
-    let hive_store: Arc<dyn AgentSessionStore> = Arc::new(StoreAdapter::new(store));
-    let mob_state = MobMcpState::new_in_memory();
-
-    let mut build = AgentBuildConfig::new(model.to_string());
-    build.provider = Some(meerkat_core::Provider::from_name(&provider.to_string()));
-    build.system_prompt = Some(
-        "You are a hive orchestrator for a fleet of remote machines. \
-         Use the 'peers' tool to discover targets, then 'send' to dispatch \
-         commands. Target replies appear in the TUX output panel; the user \
-         will relay results if needed. Keep dispatches concise."
-            .to_string(),
+    let persistence = open_example_runtime_persistence(session_dir).await?;
+    let config = meerkat_core::Config::default();
+    let session_store = persistence.session_store();
+    let schedule_service = ScheduleService::new(persistence.schedule_store());
+    let runtime_adapter = persistence.runtime_adapter();
+    let mut builder = FactoryAgentBuilder::new(
+        AgentFactory::new(session_dir.to_path_buf())
+            .session_store(Arc::clone(&session_store))
+            .mob(true),
+        config.clone(),
     );
-    build.external_tools = Some(tools);
-    build.session_store_override = Some(hive_store);
-    build.override_builtins = meerkat_core::ToolCategoryOverride::Disable;
-    build.override_shell = meerkat_core::ToolCategoryOverride::Disable;
-    build.override_mob = meerkat_core::ToolCategoryOverride::Enable;
-    build.mob_tools = Some(Arc::new(AgentMobToolSurfaceFactory::new(Arc::clone(
-        &mob_state,
+    builder.default_llm_client = llm_client_override;
+    builder.default_session_store = Some(Arc::new(StoreAdapter::new(Arc::clone(
+        &session_store,
     ))));
-    build.llm_client_override = llm_client_override;
-
-    let agent = factory
-        .build_agent(build, &meerkat_core::Config::default())
-        .await?;
+    let (store, runtime_store, blob_store) = persistence.into_parts();
+    let mut service =
+        PersistentSessionService::new(builder, 4, store, runtime_store, blob_store);
+    wire_runtime_bindings(&mut service, &runtime_adapter);
+    let service = Arc::new(service);
+    let schedule_tools: Arc<dyn AgentToolDispatcher> =
+        Arc::new(ScheduleToolSurface::new(schedule_service.clone()));
+    let tools: Arc<dyn AgentToolDispatcher> = Arc::new(
+        ToolGatewayBuilder::new()
+            .add_dispatcher(Arc::new(CommsToolDispatcher::new(router, trusted)))
+            .add_dispatcher(Arc::clone(&schedule_tools))
+            .build()?,
+    );
+    let build_template = hive_session_build_template(Arc::clone(&tools));
+    let schedule_host = spawn_runtime_backed_schedule_host(
+        Arc::clone(&service),
+        Arc::clone(&runtime_adapter),
+        config,
+        schedule_service,
+        build_template.clone(),
+        format!("mdm-tux:hive:{}", session_dir.display()),
+    );
+    let session_id = materialize_session(
+        &service,
+        &runtime_adapter,
+        meerkat::Session::new(),
+        CreateSessionRequest {
+            model: model.to_string(),
+            prompt: ContentInput::Text(String::new()),
+            render_metadata: None,
+            system_prompt: Some(
+                "You are a hive orchestrator for a fleet of remote machines. \
+                 Use the 'peers' tool to discover targets, then 'send' to dispatch \
+                 commands. Target replies appear in the TUX output panel; the user \
+                 will relay results if needed. Keep dispatches concise."
+                    .to_string(),
+            ),
+            max_tokens: None,
+            event_tx: None,
+            skill_references: None,
+            initial_turn: InitialTurnPolicy::Defer,
+            deferred_prompt_policy: DeferredPromptPolicy::Discard,
+            build: Some(SessionBuildOptions {
+                provider: Some(meerkat_core::Provider::from_name(&provider.to_string())),
+                llm_client_override: None,
+                ..build_template
+            }),
+            labels: None,
+        },
+        {
+            let service = Arc::clone(&service);
+            let runtime_adapter = Arc::clone(&runtime_adapter);
+            move |session_id| default_persistent_executor(service, runtime_adapter, session_id)
+        },
+    )
+    .await?
+    .session_id;
     Ok(HiveAgentState {
-        agent,
-        _mob_state: mob_state,
+        service,
+        session_id,
+        _schedule_host: schedule_host,
     })
+}
+
+fn hive_session_build_template(
+    tools: Arc<dyn AgentToolDispatcher>,
+) -> SessionBuildOptions {
+    SessionBuildOptions {
+        external_tools: Some(tools),
+        override_builtins: meerkat_core::ToolCategoryOverride::Disable,
+        override_shell: meerkat_core::ToolCategoryOverride::Disable,
+        override_mob: meerkat_core::ToolCategoryOverride::Enable,
+        ..Default::default()
+    }
 }
 
 fn current_attached_target_ids(claims: &ClaimRegistry) -> Vec<String> {
@@ -1179,7 +1278,9 @@ async fn spawn_command_processor(
                 );
             }
             AppCommand::ResetHive => {
-                hive_agent = None;
+                if let Some(hive) = hive_agent.take() {
+                    hive.shutdown().await;
+                }
             }
             AppCommand::RunHive { prompt } => {
                 if hive_agent.is_none() {
@@ -1211,8 +1312,8 @@ async fn spawn_command_processor(
                         }
                     }
                 }
-                let agent = hive_agent.as_mut().expect("just built");
-                let ev = match agent.agent.run(prompt.into()).await {
+                let agent = hive_agent.as_ref().expect("just built");
+                let ev = match agent.run(prompt).await {
                     Ok(r) => TuiEvent::HivePlanDone(r.text),
                     Err(e) => TuiEvent::HiveError(e.to_string()),
                 };
@@ -3332,7 +3433,7 @@ mod tests {
         let node = mdm_tux::CommsNode::new(Keypair::generate());
         let capture: Arc<CaptureClient> = Arc::new(CaptureClient::default());
 
-        let mut hive = build_hive_with_llm_override(
+        let hive = build_hive_with_llm_override(
             temp.path(),
             "gpt-5.2",
             ProviderKind::Openai,
@@ -3343,17 +3444,20 @@ mod tests {
         .await
         .unwrap();
 
-        hive.agent
-            .run("inspect hive tools".to_string().into())
-            .await
-            .unwrap();
+        hive.run("inspect hive tools".to_string()).await.unwrap();
 
         let tool_names = capture.tool_names();
-        assert!(tool_names.iter().any(|name| name == "send"));
+        assert!(tool_names.iter().any(|name| name == "send_message"));
+        assert!(tool_names.iter().any(|name| name == "send_request"));
+        assert!(tool_names.iter().any(|name| name == "send_response"));
         assert!(tool_names.iter().any(|name| name == "peers"));
         assert!(tool_names.iter().any(|name| name == "delegate"));
         assert!(tool_names.iter().any(|name| name == "mob_list"));
         assert!(tool_names.iter().any(|name| name == "mob_check_member"));
+        assert!(tool_names.iter().any(|name| name == "meerkat_schedule_create"));
+        assert!(tool_names.iter().any(|name| name == "meerkat_schedule_list"));
         assert!(!tool_names.iter().any(|name| name == "shell"));
+
+        hive.shutdown().await;
     }
 }
