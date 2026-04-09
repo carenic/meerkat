@@ -551,9 +551,14 @@ impl MobBuilder {
                     .await;
                     continue;
                 };
-                let profile = definition
-                    .resolve_profile(&entry.profile, realm_profile_store.as_ref())
-                    .await?;
+                // Prefer roster's effective_profile_override on restore for lifecycle safety.
+                let profile = if let Some(ref p) = entry.effective_profile_override {
+                    p.clone()
+                } else {
+                    definition
+                        .resolve_profile(&entry.profile, realm_profile_store.as_ref())
+                        .await?
+                };
                 let profile = &profile;
                 let default_ext = default_external_tools_provider.as_ref().and_then(|p| p());
                 let resumed_config =
