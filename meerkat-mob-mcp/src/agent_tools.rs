@@ -1103,7 +1103,8 @@ fn build_tool_defs_with_profile_support(
         tool_def(
             TOOL_DELEGATE,
             "Delegate a task to a helper agent. Creates an implicit mob on first use, \
-             spawns a member with auto-wiring to you. Use for quick one-off delegation.",
+             spawns a member with auto-wiring to you. Use for quick one-off delegation. \
+             Use 'tooling' to control the helper's model/tools.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1118,6 +1119,10 @@ fn build_tool_defs_with_profile_support(
                     "additional_instructions": {
                         "type": "string",
                         "description": "Extra instructions appended to the helper's system prompt"
+                    },
+                    "tooling": {
+                        "type": "object",
+                        "description": "Spawn tooling mode. Controls the helper's model and tool surface. Options: {\"mode\":\"inherit_parent\"} (default, inherits your tools), {\"mode\":\"minimal\"} (comms only), or {\"mode\":\"profile\",\"source\":{\"type\":\"realm_profile\",\"name\":\"...\"}} / {\"mode\":\"profile\",\"source\":{\"type\":\"inline\",\"model\":\"...\",\"tools\":{...}}}. Overlays: allow_overlay/deny_overlay arrays narrow the tool set."
                     }
                 },
                 "required": ["task"]
@@ -1150,12 +1155,12 @@ fn build_tool_defs_with_profile_support(
         ),
         tool_def(
             TOOL_MOB_SPAWN_MEMBER,
-            "Spawn a new member into a mob from a profile.",
+            "Spawn a new member into a mob from a profile. Use 'tooling' to override model/tools.",
             json!({
                 "type": "object",
                 "properties": {
                     "mob_id": {"type": "string"},
-                    "profile": {"type": "string", "description": "Profile name to spawn from"},
+                    "profile": {"type": "string", "description": "Role name (profile key) in the mob definition"},
                     "member_id": {"type": "string", "description": "Unique member identifier"},
                     "initial_message": {
                         "oneOf": [
@@ -1176,6 +1181,10 @@ fn build_tool_defs_with_profile_support(
                     "auto_wire_parent": {
                         "type": "boolean",
                         "description": "Auto-wire to spawner after spawn"
+                    },
+                    "tooling": {
+                        "type": "object",
+                        "description": "Spawn tooling override. Controls the member's model and tool surface instead of using the definition profile. Options: {\"mode\":\"inherit_parent\"} (inherit your tools), {\"mode\":\"minimal\"} (comms only), or {\"mode\":\"profile\",\"source\":{\"type\":\"realm_profile\",\"name\":\"...\"}} / {\"mode\":\"profile\",\"source\":{\"type\":\"inline\",\"model\":\"...\",\"tools\":{...}}}. Overlays: allow_overlay/deny_overlay arrays narrow the tool set."
                     }
                 },
                 "required": ["mob_id", "profile", "member_id"]
