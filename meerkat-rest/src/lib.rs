@@ -215,7 +215,6 @@ impl AppState {
             root: realm_paths.root.display().to_string(),
             manifest_path: realm_paths.manifest_path.display().to_string(),
             config_path: realm_paths.config_path.display().to_string(),
-            sessions_redb_path: realm_paths.sessions_redb_path.display().to_string(),
             sessions_sqlite_path: Some(realm_paths.sessions_sqlite_path.display().to_string()),
             sessions_jsonl_dir: realm_paths.sessions_jsonl_dir.display().to_string(),
         };
@@ -255,9 +254,7 @@ impl AppState {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| match manifest.backend {
                 meerkat_store::RealmBackend::Jsonl => realm_paths.sessions_jsonl_dir.clone(),
-                meerkat_store::RealmBackend::Sqlite | meerkat_store::RealmBackend::Redb => {
-                    realm_paths.root.clone()
-                }
+                meerkat_store::RealmBackend::Sqlite => realm_paths.root.clone(),
             });
 
         let enable_builtins = config.tools.builtins_enabled;
@@ -700,7 +697,6 @@ fn parse_backend_hint(raw: &str) -> Option<RealmBackend> {
     match raw {
         "jsonl" => Some(RealmBackend::Jsonl),
         "sqlite" => Some(RealmBackend::Sqlite),
-        "redb" => Some(RealmBackend::Redb),
         _ => None,
     }
 }
