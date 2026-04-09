@@ -1,8 +1,10 @@
 //! Method router - dispatches JSON-RPC requests to the correct handler.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
+
+#[cfg(feature = "mob")]
+use std::path::PathBuf;
 
 use futures::StreamExt;
 use tokio::sync::Mutex;

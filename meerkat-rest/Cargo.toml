@@ -68,7 +68,7 @@ clap = { workspace = true, features = ["derive"] }
 
 [features]
 default = ["comms", "mcp", "mob"]
-comms = ["meerkat/comms", "dep:meerkat-comms"]
+comms = ["meerkat/comms", "dep:meerkat-comms", "meerkat-surface-runtime/comms"]
 mcp = ["meerkat/mcp", "dep:meerkat-mcp"]
 mob = ["dep:meerkat-mob", "dep:meerkat-mob-mcp"]
 integration-real-tests = []

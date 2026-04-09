@@ -799,9 +799,17 @@ impl SessionRuntime {
 
     #[cfg(feature = "mob")]
     pub fn set_mob_state(&self, mob_state: Arc<meerkat_mob_mcp::MobMcpState>) {
-        if let Ok(mut slot) = self.mob_state.write() {
-            *slot = Some(mob_state);
-        }
+        let mob_tools_factory = Arc::new(meerkat_mob_mcp::AgentMobToolSurfaceFactory::new(
+            Arc::clone(&mob_state),
+        ));
+        *self
+            .mob_state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(mob_state);
+        *self
+            .builder_mob_tools_slot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(mob_tools_factory);
     }
 
     #[cfg(feature = "mob")]
@@ -3547,6 +3555,46 @@ mod tests {
         assert!(
             slot.is_some(),
             "builder_mob_tools_slot should be set after set_mob_tools"
+        );
+    }
+
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn set_mob_state_refreshes_builder_mob_tools_slot() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions"))
+            .builtins(true)
+            .mob(true);
+        let runtime = make_runtime(factory, 10);
+
+        let original_factory = runtime
+            .builder_mob_tools_slot
+            .read()
+            .unwrap()
+            .clone()
+            .expect("host should preinstall a mob tools factory");
+
+        let mob_svc = runtime.session_service();
+        let replacement_state = Arc::new(meerkat_mob_mcp::MobMcpState::new(mob_svc));
+        runtime.set_mob_state(Arc::clone(&replacement_state));
+
+        let installed_state = runtime
+            .mob_state()
+            .expect("runtime mob state should be set");
+        assert!(
+            Arc::ptr_eq(&installed_state, &replacement_state),
+            "runtime should expose the replacement mob state"
+        );
+
+        let refreshed_factory = runtime
+            .builder_mob_tools_slot
+            .read()
+            .unwrap()
+            .clone()
+            .expect("replacement mob state should refresh the builder tools slot");
+        assert!(
+            !Arc::ptr_eq(&original_factory, &refreshed_factory),
+            "builder mob tools slot should refresh when the mob state changes"
         );
     }
 

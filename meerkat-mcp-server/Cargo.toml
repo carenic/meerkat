@@ -47,7 +47,7 @@ chrono = { workspace = true }
 
 [features]
 default = ["comms"]
-comms = ["meerkat/comms", "dep:meerkat-comms"]
+comms = ["meerkat/comms", "dep:meerkat-comms", "meerkat-surface-runtime/comms"]
 mob = ["dep:meerkat-mob", "dep:meerkat-mob-mcp", "meerkat-surface-runtime/mob"]
 
 [package.metadata.cargo-machete]
