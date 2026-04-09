@@ -392,6 +392,7 @@ impl BuiltinTool for ShellTool {
                 "Execute a shell command (POSIX-style parsing for policy checks; runs via Nushell or fallback shell)"
                     .into(),
             input_schema: crate::schema::schema_for::<ShellInput>(),
+            provenance: None,
         }
     }
 

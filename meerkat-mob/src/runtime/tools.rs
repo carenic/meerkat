@@ -438,6 +438,7 @@ fn tool_def(name: &str, description: &str, input_schema: serde_json::Value) -> A
         name: name.to_string(),
         description: description.to_string(),
         input_schema,
+        provenance: None,
     })
 }
 

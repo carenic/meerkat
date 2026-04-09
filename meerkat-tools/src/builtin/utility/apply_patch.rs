@@ -103,6 +103,7 @@ impl BuiltinTool for ApplyPatchTool {
             name: self.name().into(),
             description: "Apply a structured patch to files inside the project root. The patch string must use the exact apply_patch grammar and supports Add File, Delete File, Update File, Move to, and End of File markers.".into(),
             input_schema: crate::schema::schema_for::<ApplyPatchArgs>(),
+            provenance: None,
         }
     }
 

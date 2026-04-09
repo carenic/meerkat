@@ -48,6 +48,7 @@ impl BuiltinTool for TaskGetTool {
             name: "task_get".into(),
             description: "Get a task by its ID".into(),
             input_schema: crate::schema::schema_for::<TaskGetParams>(),
+            provenance: None,
         }
     }
 

@@ -162,6 +162,7 @@ impl McpConnection {
                     name: t.name.to_string(),
                     description: t.description.unwrap_or_default().to_string(),
                     input_schema: schema,
+                    provenance: None,
                 }
             })
             .collect();

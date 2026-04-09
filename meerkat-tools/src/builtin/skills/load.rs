@@ -41,6 +41,7 @@ impl BuiltinTool for LoadSkillTool {
             name: "load_skill".into(),
             description: "Load a skill's full instructions into the conversation.".into(),
             input_schema: crate::schema::schema_for::<LoadSkillArgs>(),
+            provenance: None,
         }
     }
 

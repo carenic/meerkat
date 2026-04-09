@@ -64,6 +64,7 @@ impl BuiltinTool for SkillListResourcesTool {
             name: "skill_list_resources".into(),
             description: "List resources/artifacts exposed by a skill.".into(),
             input_schema: crate::schema::schema_for::<SkillListResourcesArgs>(),
+            provenance: None,
         }
     }
 
@@ -103,6 +104,7 @@ impl BuiltinTool for SkillReadResourceTool {
             name: "skill_read_resource".into(),
             description: "Read a resource/artifact exposed by a skill.".into(),
             input_schema: crate::schema::schema_for::<SkillReadResourceArgs>(),
+            provenance: None,
         }
     }
 

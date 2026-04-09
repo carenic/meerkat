@@ -65,6 +65,7 @@ impl MemorySearchDispatcher {
                 information from earlier in the conversation or from previous sessions."
                 .to_string(),
             input_schema: input_schema(),
+            provenance: None,
         });
 
         Self {

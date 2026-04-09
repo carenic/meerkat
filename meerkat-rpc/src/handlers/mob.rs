@@ -1072,7 +1072,11 @@ mod tests {
         });
         let err = serde_json::from_value::<MobCreateParams>(value)
             .expect_err("internal rust bundle fields must be rejected");
-        assert!(err.to_string().contains("unknown field `rust_bundles`"));
+        assert!(
+            err.to_string().contains("did not match any variant")
+                || err.to_string().contains("unknown field `rust_bundles`"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -96,6 +96,7 @@ impl BuiltinTool for TaskUpdateTool {
             name: "task_update".into(),
             description: "Update an existing task".into(),
             input_schema: crate::schema::schema_for::<TaskUpdateParams>(),
+            provenance: None,
         }
     }
 

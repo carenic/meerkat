@@ -216,6 +216,7 @@ impl MobBuilder {
         let has_autonomous = definition
             .profiles
             .values()
+            .filter_map(|b| b.as_inline())
             .any(|p| p.runtime_mode == crate::MobRuntimeMode::AutonomousHost);
         if has_autonomous && runtime_adapter.is_none() {
             return Err(MobError::Internal(
@@ -316,6 +317,7 @@ impl MobBuilder {
         let has_autonomous = definition
             .profiles
             .values()
+            .filter_map(|b| b.as_inline())
             .any(|p| p.runtime_mode == crate::MobRuntimeMode::AutonomousHost);
         if has_autonomous && runtime_adapter.is_none() {
             return Err(MobError::Internal(
@@ -546,8 +548,7 @@ impl MobBuilder {
                     continue;
                 };
                 let profile = definition
-                    .profiles
-                    .get(&entry.profile)
+                    .resolve_inline_profile(&entry.profile)
                     .ok_or_else(|| MobError::ProfileNotFound(entry.profile.clone()))?;
                 let default_ext = default_external_tools_provider.as_ref().and_then(|p| p());
                 let resumed_config =
@@ -613,8 +614,7 @@ impl MobBuilder {
                 // Ephemeral services can still fall back to fresh-create.
             }
             let profile = definition
-                .profiles
-                .get(&entry.profile)
+                .resolve_inline_profile(&entry.profile)
                 .ok_or_else(|| MobError::ProfileNotFound(entry.profile.clone()))?;
             let default_ext_fresh = default_external_tools_provider.as_ref().and_then(|p| p());
             let mut config = build::build_agent_config(build::BuildAgentConfigParams {

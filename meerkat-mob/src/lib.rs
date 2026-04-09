@@ -64,7 +64,7 @@ pub use ids::{
     RunId, StepId, TaskId,
 };
 pub use launch::{BudgetSplitPolicy, ForkContext, MemberLaunchMode};
-pub use profile::{Profile, ToolConfig};
+pub use profile::{Profile, ProfileBinding, ProfileSource, SpawnTooling, ToolConfig};
 pub use roster::{
     MemberState, MobMemberKickoffPhase, MobMemberKickoffSnapshot, Roster, RosterAddEntry,
     RosterEntry,

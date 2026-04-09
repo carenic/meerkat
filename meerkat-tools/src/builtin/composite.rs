@@ -562,6 +562,7 @@ mod tests {
                     "properties": {},
                     "required": []
                 }),
+                provenance: None,
             })]);
             Self { tools }
         }

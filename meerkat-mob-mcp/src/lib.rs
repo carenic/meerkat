@@ -918,8 +918,7 @@ impl MobMcpState {
             definition.is_implicit
                 && definition.is_owned_by_session(session_id)
                 && definition
-                    .profiles
-                    .get(&delegate_profile)
+                    .resolve_inline_profile(&delegate_profile)
                     .is_some_and(|profile| profile.model == model)
         })
     }
@@ -1695,6 +1694,7 @@ fn tool(name: &str, description: &str, input_schema: serde_json::Value) -> Arc<T
         name: name.to_string(),
         description: description.to_string(),
         input_schema,
+        provenance: None,
     })
 }
 
@@ -3947,6 +3947,8 @@ mod tests {
                 .profiles
                 .get(&ProfileName::from("delegate"))
                 .expect("delegate profile")
+                .as_inline()
+                .unwrap()
                 .model,
             "claude-sonnet-4-5"
         );
@@ -3976,6 +3978,8 @@ mod tests {
                 .profiles
                 .get(&ProfileName::from("delegate"))
                 .expect("delegate profile")
+                .as_inline()
+                .unwrap()
                 .model,
             "gpt-5.4"
         );
@@ -4007,7 +4011,7 @@ mod tests {
         let mut explicit_profiles = BTreeMap::new();
         explicit_profiles.insert(
             ProfileName::from("worker"),
-            meerkat_mob::profile::Profile {
+            meerkat_mob::ProfileBinding::Inline(meerkat_mob::profile::Profile {
                 model: "claude-sonnet-4-5".to_string(),
                 skills: Vec::new(),
                 tools: meerkat_mob::profile::ToolConfig {
@@ -4021,7 +4025,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
-            },
+            }),
         );
         MobDefinition {
             id: MobId::from(mob_id),

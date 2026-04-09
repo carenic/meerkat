@@ -49,6 +49,7 @@ impl BuiltinTool for ShellJobStatusTool {
             name: "shell_job_status".into(),
             description: "Check status of a background shell job".into(),
             input_schema: crate::schema::schema_for::<JobStatusInput>(),
+            provenance: None,
         }
     }
 

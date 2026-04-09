@@ -64,6 +64,7 @@ fn build_tool_defs() -> Arc<[Arc<ToolDef>]> {
                 name: tool["name"].as_str().unwrap_or_default().to_string(),
                 description: tool["description"].as_str().unwrap_or_default().to_string(),
                 input_schema: tool["inputSchema"].clone(),
+                provenance: None,
             })
         })
         .collect::<Vec<_>>()

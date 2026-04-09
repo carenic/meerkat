@@ -1908,8 +1908,7 @@ impl MobActor {
 
             let profile = self
                 .definition
-                .profiles
-                .get(&profile_name)
+                .resolve_inline_profile(&profile_name)
                 .ok_or_else(|| MobError::ProfileNotFound(profile_name.clone()))?;
 
             let selected_runtime_mode = runtime_mode.unwrap_or(profile.runtime_mode);
@@ -2508,8 +2507,7 @@ impl MobActor {
         let profile_name = spawn_spec.profile;
         let profile = self
             .definition
-            .profiles
-            .get(&profile_name)
+            .resolve_inline_profile(&profile_name)
             .ok_or_else(|| MobError::ProfileNotFound(profile_name.clone()))?;
         let runtime_mode = spawn_spec.runtime_mode.unwrap_or(profile.runtime_mode);
         let external_tools = self.external_tools_for_profile(profile)?;
@@ -3095,8 +3093,7 @@ impl MobActor {
         });
         let profile = self
             .definition
-            .profiles
-            .get(&snapshot.profile_name)
+            .resolve_inline_profile(&snapshot.profile_name)
             .ok_or_else(|| MobError::ProfileNotFound(snapshot.profile_name.clone()))?;
         let external_tools = self.external_tools_for_profile(profile)?;
         let mut config = build::build_agent_config(build::BuildAgentConfigParams {
@@ -4331,8 +4328,7 @@ impl MobActor {
         // Check external_addressable
         let profile = self
             .definition
-            .profiles
-            .get(&entry.profile)
+            .resolve_inline_profile(&entry.profile)
             .ok_or_else(|| MobError::ProfileNotFound(entry.profile.clone()))?;
 
         if !profile.external_addressable {
@@ -5340,8 +5336,7 @@ impl MobActor {
     ) -> Result<(), MobError> {
         let peer_description = self
             .definition
-            .profiles
-            .get(&new_peer_entry.profile)
+            .resolve_inline_profile(&new_peer_entry.profile)
             .map_or("", |p| p.peer_description.as_str());
 
         let peer_name = PeerName::new(recipient_comms_name).map_err(|error| {

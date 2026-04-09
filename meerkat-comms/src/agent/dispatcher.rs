@@ -106,6 +106,7 @@ pub fn comms_tool_defs() -> Vec<Arc<ToolDef>> {
                 name: t["name"].as_str().unwrap_or_default().to_string(),
                 description: t["description"].as_str().unwrap_or_default().to_string(),
                 input_schema: t["inputSchema"].clone(),
+                provenance: None,
             })
         })
         .collect()

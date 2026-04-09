@@ -49,6 +49,7 @@ impl BuiltinTool for ShellJobCancelTool {
             name: "shell_job_cancel".into(),
             description: "Cancel a running background shell job".into(),
             input_schema: crate::schema::schema_for::<JobCancelInput>(),
+            provenance: None,
         }
     }
 

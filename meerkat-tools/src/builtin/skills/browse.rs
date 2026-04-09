@@ -108,6 +108,7 @@ impl BuiltinTool for BrowseSkillsTool {
             name: "browse_skills".into(),
             description: "Browse available skill collections or search for skills.".into(),
             input_schema: crate::schema::schema_for::<BrowseSkillsArgs>(),
+            provenance: None,
         }
     }
 

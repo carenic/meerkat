@@ -1136,6 +1136,7 @@ fn recoverable_callback_tool_defs(tools: &[McpToolDef]) -> Vec<ToolDef> {
             name: tool.name.clone(),
             description: tool.description.clone(),
             input_schema: tool.input_schema.clone(),
+            provenance: None,
         })
         .collect()
 }
@@ -3032,6 +3033,7 @@ impl MpcToolDispatcher {
                     name: t.name.clone(),
                     description: t.description.clone(),
                     input_schema: t.input_schema.clone(),
+                    provenance: None,
                 })
             })
             .collect::<Vec<_>>()

@@ -36,11 +36,13 @@ fn get_tool_def(name: &str) -> ToolDef {
                 name: name.to_string(),
                 description: String::new(),
                 input_schema: empty_object_schema(),
+                provenance: None,
             },
             |t| ToolDef {
                 name: t["name"].as_str().unwrap_or_default().to_string(),
                 description: t["description"].as_str().unwrap_or_default().to_string(),
                 input_schema: t["inputSchema"].clone(),
+                provenance: None,
             },
         )
 }

@@ -225,6 +225,7 @@ mod tool_dispatch {
             name: "test_tool".to_string(),
             description: "A test tool".to_string(),
             input_schema: meerkat_tools::schema_for::<ToolInput>(),
+            provenance: None,
         };
 
         // Registry.register returns () - no error case
@@ -1079,11 +1080,13 @@ mod combined {
                 name: "read_file".to_string(),
                 description: "Read a file".to_string(),
                 input_schema: meerkat_tools::schema_for::<ReadFileArgs>(),
+                provenance: None,
             }),
             Arc::new(ToolDef {
                 name: "write_file".to_string(),
                 description: "Write a file".to_string(),
                 input_schema: meerkat_tools::schema_for::<WriteFileArgs>(),
+                provenance: None,
             }),
         ];
 

@@ -50,6 +50,7 @@ impl BuiltinTool for SkillInvokeFunctionTool {
             name: "skill_invoke_function".into(),
             description: "Invoke a function exposed by a skill.".into(),
             input_schema: crate::schema::schema_for::<SkillInvokeFunctionArgs>(),
+            provenance: None,
         }
     }
 

@@ -1324,7 +1324,7 @@ mod tests {
     use crate::definition::{BackendConfig, FlowSpec, WiringRules};
     use crate::event::MobEventKind;
     use crate::ids::{MeerkatId, ProfileName};
-    use crate::profile::{Profile, ToolConfig};
+    use crate::profile::{Profile, ProfileBinding, ToolConfig};
     use crate::run::StepRunStatus;
     use futures::future::join_all;
     use indexmap::IndexMap;
@@ -1339,7 +1339,7 @@ mod tests {
         let mut profiles = std::collections::BTreeMap::new();
         profiles.insert(
             ProfileName::from("worker"),
-            Profile {
+            ProfileBinding::Inline(Profile {
                 model: "model".to_string(),
                 skills: Vec::new(),
                 tools: ToolConfig::default(),
@@ -1350,7 +1350,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
-            },
+            }),
         );
         MobDefinition {
             id: MobId::from("mob"),

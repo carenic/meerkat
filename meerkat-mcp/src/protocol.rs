@@ -48,6 +48,7 @@ impl McpProtocol {
                     name: tool.name.to_string(),
                     description: tool.description.unwrap_or_default().to_string(),
                     input_schema: schema,
+                    provenance: None,
                 }
             })
             .collect();

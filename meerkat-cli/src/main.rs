@@ -7443,6 +7443,7 @@ mod tests {
                     "properties": {},
                     "required": []
                 }),
+                provenance: None,
             });
             Self {
                 tools: Arc::from([tool]),
@@ -7476,6 +7477,7 @@ mod tests {
                     "properties": {},
                     "required": []
                 }),
+                provenance: None,
             });
             Self {
                 tools: Arc::from([tool]),

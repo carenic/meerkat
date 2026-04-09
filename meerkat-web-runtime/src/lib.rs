@@ -856,6 +856,7 @@ pub fn register_tool_callback(
             name,
             description,
             input_schema: schema,
+            provenance: None,
         });
 
         with_runtime_state_mut(|state| {
@@ -914,6 +915,7 @@ pub fn register_js_tool(
             name,
             description,
             input_schema: schema,
+            provenance: None,
         });
 
         with_runtime_state_mut(|state| {

@@ -5,7 +5,7 @@ use crate::definition::{
     SkillSource, StepOutputFormat, TopologyRule, TopologySpec, WiringRules,
 };
 use crate::event::MobEvent;
-use crate::profile::{Profile, ToolConfig};
+use crate::profile::{Profile, ProfileBinding, ToolConfig};
 use crate::run::MobRunStatus;
 use crate::run::{FailureLedgerEntry, MobRun, StepLedgerEntry, StepRunStatus};
 use crate::storage::MobStorage;
@@ -1889,7 +1889,7 @@ fn sample_definition() -> MobDefinition {
     let mut profiles = BTreeMap::new();
     profiles.insert(
         ProfileName::from("lead"),
-        Profile {
+        ProfileBinding::Inline(Profile {
             model: "claude-opus-4-6".into(),
             skills: vec![],
             tools: ToolConfig {
@@ -1899,6 +1899,7 @@ fn sample_definition() -> MobDefinition {
                 memory: false,
                 mob: true,
                 mob_tasks: false,
+                schedule: false,
                 mcp: vec![],
                 rust_bundles: vec![],
             },
@@ -1909,11 +1910,11 @@ fn sample_definition() -> MobDefinition {
             max_inline_peer_notifications: None,
             output_schema: None,
             provider_params: None,
-        },
+        }),
     );
     profiles.insert(
         ProfileName::from("worker"),
-        Profile {
+        ProfileBinding::Inline(Profile {
             model: "claude-sonnet-4-5".into(),
             skills: vec![],
             tools: ToolConfig {
@@ -1927,7 +1928,7 @@ fn sample_definition() -> MobDefinition {
             max_inline_peer_notifications: None,
             output_schema: None,
             provider_params: None,
-        },
+        }),
     );
 
     MobDefinition {
@@ -1987,6 +1988,7 @@ fn sample_definition_with_tool_bundle(bundle_name: &str) -> MobDefinition {
     let worker = def
         .profiles
         .get_mut(&ProfileName::from("worker"))
+        .and_then(|b| b.as_inline_mut())
         .expect("worker profile exists");
     worker.tools.rust_bundles = vec![bundle_name.to_string()];
     def
@@ -1997,6 +1999,7 @@ fn sample_definition_with_mob_tools() -> MobDefinition {
     let worker = def
         .profiles
         .get_mut(&ProfileName::from("worker"))
+        .and_then(|b| b.as_inline_mut())
         .expect("worker profile exists");
     worker.tools.mob = true;
     worker.tools.mob_tasks = true;
@@ -2017,7 +2020,9 @@ fn sample_definition_without_mob_flags() -> MobDefinition {
     let lead = def
         .profiles
         .get_mut(&ProfileName::from("lead"))
-        .expect("lead profile exists");
+        .expect("lead profile exists")
+        .as_inline_mut()
+        .unwrap();
     lead.tools.mob = false;
     lead.tools.mob_tasks = false;
     def
@@ -2533,6 +2538,7 @@ impl AgentToolDispatcher for EchoBundleDispatcher {
             name: "bundle_echo".to_string(),
             description: "Echo input value".to_string(),
             input_schema: serde_json::Value::Object(serde_json::Map::new()),
+            provenance: None,
         })]
         .into()
     }
@@ -3192,6 +3198,7 @@ impl OverlayProbeDispatcher {
                     name: (*name).to_string(),
                     description: format!("{name} tool"),
                     input_schema,
+                    provenance: None,
                 })
             })
             .collect();
@@ -3466,6 +3473,8 @@ async fn test_mob_builder_create_rejects_mismatched_spec_store_definition() {
         .profiles
         .get_mut(&ProfileName::from("worker"))
         .expect("worker profile exists")
+        .as_inline_mut()
+        .unwrap()
         .peer_description = "mismatched worker profile".to_string();
     storage
         .specs
@@ -3524,6 +3533,8 @@ async fn test_mob_builder_persists_spec_and_resume_requires_consistency() {
         .profiles
         .get_mut(&ProfileName::from("worker"))
         .expect("worker profile exists")
+        .as_inline_mut()
+        .unwrap()
         .peer_description = "resume mismatch".to_string();
     let _ = storage_for_resume
         .specs
@@ -4021,7 +4032,9 @@ async fn test_visible_mob_operator_reads_still_require_exact_scope() {
         .definition()
         .profiles
         .get(&ProfileName::from("worker"))
-        .expect("worker profile");
+        .expect("worker profile")
+        .as_inline()
+        .unwrap();
     let dispatcher = super::tools::compose_external_tools_for_profile(
         profile,
         &BTreeMap::new(),
@@ -4067,7 +4080,9 @@ async fn test_visible_mob_operator_tools_deny_before_arg_validation_when_scope_m
         .definition()
         .profiles
         .get(&ProfileName::from("worker"))
-        .expect("worker profile");
+        .expect("worker profile")
+        .as_inline()
+        .unwrap();
     let dispatcher = super::tools::compose_external_tools_for_profile(
         profile,
         &BTreeMap::new(),
@@ -4882,7 +4897,9 @@ async fn test_mob_flow_tools_hidden_without_operator_context() {
     let worker = definition
         .profiles
         .get_mut(&ProfileName::from("worker"))
-        .expect("worker profile exists");
+        .expect("worker profile exists")
+        .as_inline_mut()
+        .unwrap();
     worker.tools.mob = true;
     worker.tools.comms = true;
 
@@ -4934,7 +4951,9 @@ async fn test_mob_flow_status_tool_is_hidden_without_operator_context_even_for_b
     let worker = definition
         .profiles
         .get_mut(&ProfileName::from("worker"))
-        .expect("worker profile exists");
+        .expect("worker profile exists")
+        .as_inline_mut()
+        .unwrap();
     worker.tools.mob = true;
 
     let (handle, service) = create_test_mob(definition).await;
@@ -5268,7 +5287,7 @@ async fn test_for_resume_rebuilds_definition_and_roster() {
 async fn test_resume_fails_when_orchestrator_resume_notification_fails() {
     let service = Arc::new(MockSessionService::new());
     let mut def = sample_definition();
-    for profile in def.profiles.values_mut() {
+    for profile in def.profiles.values_mut().filter_map(|b| b.as_inline_mut()) {
         profile.runtime_mode = crate::MobRuntimeMode::TurnDriven;
     }
     let storage = MobStorage::in_memory();
@@ -5428,7 +5447,9 @@ async fn test_resume_restores_missing_sessions_with_tool_wiring() {
     let worker = definition
         .profiles
         .get_mut(&ProfileName::from("worker"))
-        .expect("worker profile");
+        .expect("worker profile")
+        .as_inline_mut()
+        .unwrap();
     worker.tools.rust_bundles = vec!["bundle-a".to_string()];
 
     let service = Arc::new(MockSessionService::new());
@@ -5737,6 +5758,8 @@ async fn test_broken_member_turn_returns_restore_failed_error() {
         .profiles
         .get_mut(&ProfileName::from("worker"))
         .expect("worker profile")
+        .as_inline_mut()
+        .unwrap()
         .runtime_mode = crate::MobRuntimeMode::TurnDriven;
     let storage = MobStorage::in_memory();
     let events = storage.events.clone();
@@ -5812,6 +5835,8 @@ async fn test_wire_broken_member_returns_restore_failed_error() {
         .profiles
         .get_mut(&ProfileName::from("worker"))
         .expect("worker profile")
+        .as_inline_mut()
+        .unwrap()
         .runtime_mode = crate::MobRuntimeMode::TurnDriven;
     let storage = MobStorage::in_memory();
     let events = storage.events.clone();
@@ -5934,6 +5959,8 @@ async fn test_respawn_broken_member_clears_restore_diagnostic() {
         .profiles
         .get_mut(&ProfileName::from("worker"))
         .expect("worker profile")
+        .as_inline_mut()
+        .unwrap()
         .runtime_mode = crate::MobRuntimeMode::TurnDriven;
     let storage = MobStorage::in_memory();
     let events = storage.events.clone();
@@ -6240,7 +6267,9 @@ async fn test_build_resumed_agent_config_rejects_mismatched_session_identity() {
     let profile = definition
         .profiles
         .get(&profile_name)
-        .expect("worker profile");
+        .expect("worker profile")
+        .as_inline()
+        .unwrap();
     let mut resumed = Session::new();
     resumed
         .set_session_metadata(SessionMetadata {
@@ -7105,7 +7134,9 @@ async fn test_spawn_fails_when_profile_comms_disabled() {
     let worker = definition
         .profiles
         .get_mut(&ProfileName::from("worker"))
-        .expect("worker profile exists");
+        .expect("worker profile exists")
+        .as_inline_mut()
+        .unwrap();
     worker.tools.comms = false;
 
     let (handle, service) = create_test_mob(definition).await;
@@ -9114,11 +9145,15 @@ async fn test_spawn_skips_broken_orchestrator_in_auto_wire_selection() {
         .profiles
         .get_mut(&ProfileName::from("lead"))
         .expect("lead profile")
+        .as_inline_mut()
+        .unwrap()
         .runtime_mode = crate::MobRuntimeMode::TurnDriven;
     definition
         .profiles
         .get_mut(&ProfileName::from("worker"))
         .expect("worker profile")
+        .as_inline_mut()
+        .unwrap()
         .runtime_mode = crate::MobRuntimeMode::TurnDriven;
     let storage = MobStorage::in_memory();
     let events = storage.events.clone();
@@ -9596,6 +9631,8 @@ async fn test_spawn_skips_broken_role_peers_in_role_wiring_selection() {
         .profiles
         .get_mut(&ProfileName::from("worker"))
         .expect("worker profile")
+        .as_inline_mut()
+        .unwrap()
         .runtime_mode = crate::MobRuntimeMode::TurnDriven;
     let storage = MobStorage::in_memory();
     let events = storage.events.clone();
@@ -12789,7 +12826,9 @@ async fn test_supervisor_escalation_times_out_when_turn_hangs() {
     let lead = definition
         .profiles
         .get_mut(&ProfileName::from("lead"))
-        .expect("lead profile");
+        .expect("lead profile")
+        .as_inline_mut()
+        .unwrap();
     lead.runtime_mode = crate::MobRuntimeMode::TurnDriven;
     let (handle, service) = create_test_mob(definition).await;
     handle
@@ -13088,7 +13127,7 @@ async fn test_turn_driven_without_adapter_accepted_at_build_time() {
     // TurnDriven profiles don't require a runtime adapter — the Option is
     // genuinely optional for them.
     let mut def = sample_definition();
-    for profile in def.profiles.values_mut() {
+    for profile in def.profiles.values_mut().filter_map(|b| b.as_inline_mut()) {
         profile.runtime_mode = crate::MobRuntimeMode::TurnDriven;
     }
     let result = try_create_test_mob_without_adapter(def).await;
@@ -13618,7 +13657,11 @@ impl RealCommsSessionService {
 async fn create_test_mob_with_real_comms(
     mut definition: MobDefinition,
 ) -> (MobHandle, Arc<RealCommsSessionService>) {
-    for profile in definition.profiles.values_mut() {
+    for profile in definition
+        .profiles
+        .values_mut()
+        .filter_map(|b| b.as_inline_mut())
+    {
         profile.runtime_mode = crate::MobRuntimeMode::TurnDriven;
     }
     let service = Arc::new(RealCommsSessionService::new());
@@ -14049,6 +14092,8 @@ async fn test_runtime_backed_turn_driven_send_preserves_render_metadata() {
         .profiles
         .get_mut(&ProfileName::from("lead"))
         .expect("lead profile")
+        .as_inline_mut()
+        .unwrap()
         .runtime_mode = crate::MobRuntimeMode::TurnDriven;
 
     let (handle, service) = create_test_mob_with_runtime_backed_real_comms(definition).await;
@@ -14845,7 +14890,11 @@ async fn test_shutdown_does_not_stall_on_stuck_lifecycle_notification() {
     // Create a definition with a TurnDriven orchestrator so lifecycle
     // notifications go through start_turn (which we can delay).
     let mut def = sample_definition();
-    if let Some(profile) = def.profiles.get_mut(&ProfileName::from("lead")) {
+    if let Some(profile) = def
+        .profiles
+        .get_mut(&ProfileName::from("lead"))
+        .and_then(|b| b.as_inline_mut())
+    {
         profile.runtime_mode = crate::MobRuntimeMode::TurnDriven;
     }
 
@@ -14996,6 +15045,7 @@ impl MultiToolDispatcher {
                     name: name.to_string(),
                     description: format!("Tool {name}"),
                     input_schema: serde_json::Value::Object(serde_json::Map::new()),
+                    provenance: None,
                 })
             })
             .collect();
@@ -15188,6 +15238,7 @@ async fn test_external_tools_late_registration() {
                     name: name.to_string(),
                     description: format!("Tool {name}"),
                     input_schema: serde_json::Value::Object(serde_json::Map::new()),
+                    provenance: None,
                 })
             })
             .collect();

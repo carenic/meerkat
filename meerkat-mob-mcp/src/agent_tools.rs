@@ -346,8 +346,7 @@ impl AgentMobToolSurface {
 
         let peer_description = handle
             .definition()
-            .profiles
-            .get(&entry.profile)
+            .resolve_inline_profile(&entry.profile)
             .map(|profile| profile.peer_description.as_str())
             .unwrap_or("delegate helper");
         let Some(helper_session_id) = entry.member_ref.session_id() else {
@@ -768,6 +767,7 @@ fn tool_def(name: &str, description: &str, input_schema: serde_json::Value) -> A
         name: name.to_string(),
         description: description.to_string(),
         input_schema,
+        provenance: None,
     })
 }
 
@@ -1431,7 +1431,7 @@ mod tests {
         let mut profiles = std::collections::BTreeMap::new();
         profiles.insert(
             ProfileName::from("delegate"),
-            meerkat_mob::Profile {
+            meerkat_mob::ProfileBinding::Inline(meerkat_mob::Profile {
                 model: "claude-sonnet-4-5".to_string(),
                 skills: Vec::new(),
                 tools: meerkat_mob::ToolConfig {
@@ -1445,11 +1445,11 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
-            },
+            }),
         );
         profiles.insert(
             ProfileName::from("worker"),
-            meerkat_mob::Profile {
+            meerkat_mob::ProfileBinding::Inline(meerkat_mob::Profile {
                 model: "claude-sonnet-4-5".to_string(),
                 skills: Vec::new(),
                 tools: meerkat_mob::ToolConfig {
@@ -1463,7 +1463,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
-            },
+            }),
         );
 
         MobDefinition {
@@ -1667,6 +1667,8 @@ mod tests {
                 .profiles
                 .get(&ProfileName::from("delegate"))
                 .expect("delegate profile")
+                .as_inline()
+                .unwrap()
                 .model,
             "claude-sonnet-4-5"
         );
@@ -1704,6 +1706,8 @@ mod tests {
                 .profiles
                 .get(&ProfileName::from("delegate"))
                 .expect("delegate profile")
+                .as_inline()
+                .unwrap()
                 .model,
             "gpt-5.4"
         );

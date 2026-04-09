@@ -139,6 +139,8 @@ pub async fn build_agent_config(
     config.override_shell = meerkat_core::ToolCategoryOverride::from_effective(profile.tools.shell);
     config.override_memory =
         meerkat_core::ToolCategoryOverride::from_effective(profile.tools.memory);
+    config.override_schedule =
+        meerkat_core::ToolCategoryOverride::from_effective(profile.tools.schedule);
     config.override_mob = meerkat_core::ToolCategoryOverride::from_effective(
         mob_tool_access_context.authority().is_some(),
     );
@@ -321,7 +323,7 @@ async fn assemble_system_prompt(
 mod tests {
     use super::*;
     use crate::definition::{BackendConfig, MobDefinition, OrchestratorConfig, WiringRules};
-    use crate::profile::ToolConfig;
+    use crate::profile::{ProfileBinding, ToolConfig};
     use std::collections::BTreeMap;
     use std::fs;
 
@@ -329,7 +331,7 @@ mod tests {
         let mut profiles = BTreeMap::new();
         profiles.insert(
             ProfileName::from("lead"),
-            Profile {
+            ProfileBinding::Inline(Profile {
                 model: "claude-opus-4-6".into(),
                 skills: vec!["leader-skill".into()],
                 tools: ToolConfig {
@@ -339,6 +341,7 @@ mod tests {
                     memory: false,
                     mob: true,
                     mob_tasks: true,
+                    schedule: false,
                     mcp: vec![],
                     rust_bundles: vec![],
                 },
@@ -349,11 +352,11 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
-            },
+            }),
         );
         profiles.insert(
             ProfileName::from("worker"),
-            Profile {
+            ProfileBinding::Inline(Profile {
                 model: "claude-sonnet-4-5".into(),
                 skills: vec![],
                 tools: ToolConfig {
@@ -363,6 +366,7 @@ mod tests {
                     memory: false,
                     mob: false,
                     mob_tasks: false,
+                    schedule: false,
                     mcp: vec![],
                     rust_bundles: vec![],
                 },
@@ -373,7 +377,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
-            },
+            }),
         );
 
         let mut skills = BTreeMap::new();
@@ -419,7 +423,9 @@ mod tests {
     #[tokio::test]
     async fn test_build_agent_config_non_keep_alive() {
         let def = sample_definition();
-        let profile = &def.profiles[&ProfileName::from("lead")];
+        let profile = def.profiles[&ProfileName::from("lead")]
+            .as_inline()
+            .unwrap();
         let config = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
             profile_name: &ProfileName::from("lead"),
@@ -442,7 +448,9 @@ mod tests {
     #[tokio::test]
     async fn test_build_agent_config_comms_name() {
         let def = sample_definition();
-        let profile = &def.profiles[&ProfileName::from("lead")];
+        let profile = def.profiles[&ProfileName::from("lead")]
+            .as_inline()
+            .unwrap();
         let config = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
             profile_name: &ProfileName::from("lead"),
@@ -469,7 +477,9 @@ mod tests {
     #[tokio::test]
     async fn test_build_agent_config_peer_meta_labels() {
         let def = sample_definition();
-        let profile = &def.profiles[&ProfileName::from("worker")];
+        let profile = def.profiles[&ProfileName::from("worker")]
+            .as_inline()
+            .unwrap();
         let config = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
             profile_name: &ProfileName::from("worker"),
@@ -502,7 +512,9 @@ mod tests {
     #[tokio::test]
     async fn test_build_agent_config_realm_id() {
         let def = sample_definition();
-        let profile = &def.profiles[&ProfileName::from("lead")];
+        let profile = def.profiles[&ProfileName::from("lead")]
+            .as_inline()
+            .unwrap();
         let config = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
             profile_name: &ProfileName::from("lead"),
@@ -531,7 +543,9 @@ mod tests {
         let def = sample_definition();
 
         // Lead profile has builtins=true, shell=true, memory=false
-        let lead = &def.profiles[&ProfileName::from("lead")];
+        let lead = def.profiles[&ProfileName::from("lead")]
+            .as_inline()
+            .unwrap();
         let config = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
             profile_name: &ProfileName::from("lead"),
@@ -564,7 +578,9 @@ mod tests {
             meerkat_core::ToolCategoryOverride::Disable
         );
         // Worker profile has builtins=true, shell=false, memory=false
-        let worker = &def.profiles[&ProfileName::from("worker")];
+        let worker = def.profiles[&ProfileName::from("worker")]
+            .as_inline()
+            .unwrap();
         let config = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
             profile_name: &ProfileName::from("worker"),
@@ -601,7 +617,9 @@ mod tests {
     #[tokio::test]
     async fn test_build_agent_config_operator_context_enables_mob_override() {
         let def = sample_definition();
-        let lead = &def.profiles[&ProfileName::from("lead")];
+        let lead = def.profiles[&ProfileName::from("lead")]
+            .as_inline()
+            .unwrap();
         let config = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
             profile_name: &ProfileName::from("lead"),
@@ -632,7 +650,9 @@ mod tests {
     async fn test_build_resumed_agent_config_does_not_restore_mob_override_without_operator_context()
      {
         let def = sample_definition();
-        let lead = &def.profiles[&ProfileName::from("lead")];
+        let lead = def.profiles[&ProfileName::from("lead")]
+            .as_inline()
+            .unwrap();
         let session_id = SessionId::new();
         let mut resumed_session = Session::with_id(session_id.clone());
         resumed_session
@@ -690,15 +710,19 @@ mod tests {
     #[tokio::test]
     async fn test_build_agent_config_fails_when_comms_disabled() {
         let mut def = sample_definition();
-        let worker = def
-            .profiles
+        def.profiles
             .get_mut(&ProfileName::from("worker"))
-            .expect("worker profile");
-        worker.tools.comms = false;
+            .expect("worker profile")
+            .as_inline_mut()
+            .unwrap()
+            .tools
+            .comms = false;
         let worker = def
             .profiles
             .get(&ProfileName::from("worker"))
-            .expect("worker profile");
+            .expect("worker profile")
+            .as_inline()
+            .unwrap();
 
         let result = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
@@ -723,7 +747,9 @@ mod tests {
     #[tokio::test]
     async fn test_build_agent_config_system_prompt_includes_skills() {
         let def = sample_definition();
-        let lead = &def.profiles[&ProfileName::from("lead")];
+        let lead = def.profiles[&ProfileName::from("lead")]
+            .as_inline()
+            .unwrap();
         let config = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
             profile_name: &ProfileName::from("lead"),
@@ -753,7 +779,9 @@ mod tests {
     #[tokio::test]
     async fn test_build_agent_config_preloads_mob_communication_skill() {
         let def = sample_definition();
-        let lead = &def.profiles[&ProfileName::from("lead")];
+        let lead = def.profiles[&ProfileName::from("lead")]
+            .as_inline()
+            .unwrap();
         let config = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
             profile_name: &ProfileName::from("lead"),
@@ -783,7 +811,9 @@ mod tests {
     #[tokio::test]
     async fn test_build_agent_config_does_not_rely_on_silent_comms_intents_for_mob_lifecycle() {
         let def = sample_definition();
-        let lead = &def.profiles[&ProfileName::from("lead")];
+        let lead = def.profiles[&ProfileName::from("lead")]
+            .as_inline()
+            .unwrap();
         let config = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
             profile_name: &ProfileName::from("lead"),
@@ -814,8 +844,10 @@ mod tests {
         def.profiles
             .get_mut(&lead_key)
             .expect("lead profile")
+            .as_inline_mut()
+            .unwrap()
             .max_inline_peer_notifications = Some(15);
-        let lead = &def.profiles[&lead_key];
+        let lead = def.profiles[&lead_key].as_inline().unwrap();
         let config = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
             profile_name: &lead_key,
@@ -838,7 +870,9 @@ mod tests {
     #[tokio::test]
     async fn test_build_agent_config_model() {
         let def = sample_definition();
-        let lead = &def.profiles[&ProfileName::from("lead")];
+        let lead = def.profiles[&ProfileName::from("lead")]
+            .as_inline()
+            .unwrap();
         let config = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
             profile_name: &ProfileName::from("lead"),
@@ -861,7 +895,9 @@ mod tests {
     #[tokio::test]
     async fn test_to_create_session_request() {
         let def = sample_definition();
-        let lead = &def.profiles[&ProfileName::from("lead")];
+        let lead = def.profiles[&ProfileName::from("lead")]
+            .as_inline()
+            .unwrap();
         let config = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
             profile_name: &ProfileName::from("lead"),
@@ -905,7 +941,9 @@ mod tests {
     #[tokio::test]
     async fn test_to_create_session_request_worker() {
         let def = sample_definition();
-        let worker = &def.profiles[&ProfileName::from("worker")];
+        let worker = def.profiles[&ProfileName::from("worker")]
+            .as_inline()
+            .unwrap();
         let config = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
             profile_name: &ProfileName::from("worker"),
@@ -945,15 +983,19 @@ mod tests {
                 path: skill_path.display().to_string(),
             },
         );
-        let lead = def
-            .profiles
+        def.profiles
             .get_mut(&ProfileName::from("lead"))
-            .expect("lead profile");
-        lead.skills.push("path-skill".into());
+            .expect("lead profile")
+            .as_inline_mut()
+            .unwrap()
+            .skills
+            .push("path-skill".into());
         let lead = def
             .profiles
             .get(&ProfileName::from("lead"))
-            .expect("lead profile");
+            .expect("lead profile")
+            .as_inline()
+            .unwrap();
 
         let config = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
@@ -989,15 +1031,18 @@ mod tests {
                 path: missing_path.clone(),
             },
         );
-        let lead = def
-            .profiles
+        def.profiles
             .get_mut(&ProfileName::from("lead"))
-            .expect("lead profile");
-        lead.skills = vec!["missing-path-skill".into()];
+            .expect("lead profile")
+            .as_inline_mut()
+            .unwrap()
+            .skills = vec!["missing-path-skill".into()];
         let lead = def
             .profiles
             .get(&ProfileName::from("lead"))
-            .expect("lead profile");
+            .expect("lead profile")
+            .as_inline()
+            .unwrap();
 
         let err = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
@@ -1027,7 +1072,9 @@ mod tests {
     #[tokio::test]
     async fn test_build_agent_config_passes_app_context() {
         let def = sample_definition();
-        let lead = &def.profiles[&ProfileName::from("lead")];
+        let lead = def.profiles[&ProfileName::from("lead")]
+            .as_inline()
+            .unwrap();
         let ctx = serde_json::json!({"key": "val"});
         let config = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
@@ -1055,7 +1102,9 @@ mod tests {
     #[tokio::test]
     async fn test_build_agent_config_none_context() {
         let def = sample_definition();
-        let lead = &def.profiles[&ProfileName::from("lead")];
+        let lead = def.profiles[&ProfileName::from("lead")]
+            .as_inline()
+            .unwrap();
         let config = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
             profile_name: &ProfileName::from("lead"),
@@ -1085,12 +1134,14 @@ mod tests {
         def.profiles
             .get_mut(&lead_key)
             .expect("lead profile")
+            .as_inline_mut()
+            .unwrap()
             .provider_params = Some(serde_json::json!({
             "thinking_budget": 4096,
             "top_k": 40
         }));
 
-        let lead = &def.profiles[&lead_key];
+        let lead = def.profiles[&lead_key].as_inline().unwrap();
         let config = build_agent_config(BuildAgentConfigParams {
             mob_id: &def.id,
             profile_name: &lead_key,
@@ -1131,7 +1182,9 @@ mod tests {
     #[tokio::test]
     async fn test_build_agent_config_app_labels_overwritten_by_mob_labels() {
         let def = sample_definition();
-        let worker = &def.profiles[&ProfileName::from("worker")];
+        let worker = def.profiles[&ProfileName::from("worker")]
+            .as_inline()
+            .unwrap();
         let mut app_labels = std::collections::BTreeMap::new();
         app_labels.insert("faction".to_string(), "north".to_string());
         // Attempt to override mob_id should be overwritten

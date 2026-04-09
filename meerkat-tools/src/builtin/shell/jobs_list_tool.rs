@@ -39,6 +39,7 @@ impl BuiltinTool for ShellJobsListTool {
             name: "shell_jobs".into(),
             description: "List all background shell jobs".into(),
             input_schema: empty_object_schema(),
+            provenance: None,
         }
     }
 

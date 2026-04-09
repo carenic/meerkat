@@ -67,6 +67,7 @@ impl BuiltinTool for TaskListTool {
             description: "List tasks in the project, optionally filtered by status or labels"
                 .into(),
             input_schema: crate::schema::schema_for::<TaskListParams>(),
+            provenance: None,
         }
     }
 

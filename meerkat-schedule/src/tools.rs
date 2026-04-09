@@ -116,6 +116,7 @@ impl ScheduleToolDispatcher {
                     name: tool["name"].as_str().unwrap_or_default().to_string(),
                     description: tool["description"].as_str().unwrap_or_default().to_string(),
                     input_schema: tool["inputSchema"].clone(),
+                    provenance: None,
                 })
             })
             .collect::<Vec<_>>()

@@ -106,6 +106,7 @@ impl BuiltinTool for TaskCreateTool {
             name: "task_create".into(),
             description: "Create a new task in the project task list".into(),
             input_schema: crate::schema::schema_for::<TaskCreateParams>(),
+            provenance: None,
         }
     }
 
