@@ -835,6 +835,7 @@ async fn e2e_resume_model_override_recreates_implicit_mob() {
         .definition()
         .profiles
         .get(&meerkat_mob::ProfileName::from("delegate"))
+        .and_then(|p| p.as_inline())
         .map(|p| p.model.clone())
         .expect("delegate profile");
     assert_eq!(
@@ -882,6 +883,7 @@ async fn e2e_resume_model_override_recreates_implicit_mob() {
         .definition()
         .profiles
         .get(&meerkat_mob::ProfileName::from("delegate"))
+        .and_then(|p| p.as_inline())
         .map(|p| p.model.clone())
         .expect("delegate profile after build");
     assert_eq!(
@@ -909,6 +911,7 @@ async fn e2e_resume_model_override_recreates_implicit_mob() {
         .definition()
         .profiles
         .get(&meerkat_mob::ProfileName::from("delegate"))
+        .and_then(|p| p.as_inline())
         .map(|p| p.model.clone())
         .expect("delegate profile after reconciliation");
     assert_eq!(
