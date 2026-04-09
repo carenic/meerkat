@@ -2428,7 +2428,6 @@ dependencies = [
  "meerkat-core",
  "meerkat-mob-mcp",
  "meerkat-runtime",
- "meerkat-schedule",
  "meerkat-store",
  "parking_lot",
  "ratatui",
