@@ -392,66 +392,48 @@ fn date_time_schema(description: &'static str) -> Value {
 
 fn trigger_spec_schema() -> Value {
     json!({
-        "description": "TriggerSpec uses externally tagged JSON. Example once trigger: {\"Once\":{\"due_at_utc\":\"2026-04-09T12:00:00Z\"}}. Example interval trigger: {\"Interval\":{\"start_at_utc\":\"2026-04-09T12:00:00Z\",\"every_seconds\":60}}.",
+        "description": "TriggerSpec uses internally tagged JSON with a type field. Example once trigger: {\"type\":\"once\",\"due_at_utc\":\"2026-04-09T12:00:00Z\"}. Example interval trigger: {\"type\":\"interval\",\"start_at_utc\":\"2026-04-09T12:00:00Z\",\"every_seconds\":60}.",
         "oneOf": [
             {
                 "type": "object",
                 "properties": {
-                    "Once": {
-                        "type": "object",
-                        "properties": {
-                            "due_at_utc": date_time_schema("Deliver once at this UTC timestamp.")
-                        },
-                        "required": ["due_at_utc"],
-                        "additionalProperties": false
-                    }
+                    "type": { "const": "once" },
+                    "due_at_utc": date_time_schema("Deliver once at this UTC timestamp.")
                 },
-                "required": ["Once"],
+                "required": ["type", "due_at_utc"],
                 "additionalProperties": false
             },
             {
                 "type": "object",
                 "properties": {
-                    "Interval": {
-                        "type": "object",
-                        "properties": {
-                            "start_at_utc": date_time_schema("First due time in UTC."),
-                            "every_seconds": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "description": "Repeat cadence in seconds."
-                            },
-                            "end_at_utc": date_time_schema("Optional final due time in UTC.")
-                        },
-                        "required": ["start_at_utc", "every_seconds"],
-                        "additionalProperties": false
-                    }
+                    "type": { "const": "interval" },
+                    "start_at_utc": date_time_schema("First due time in UTC."),
+                    "every_seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Repeat cadence in seconds."
+                    },
+                    "end_at_utc": date_time_schema("Optional final due time in UTC.")
                 },
-                "required": ["Interval"],
+                "required": ["type", "start_at_utc", "every_seconds"],
                 "additionalProperties": false
             },
             {
                 "type": "object",
                 "properties": {
-                    "Calendar": {
-                        "type": "object",
-                        "properties": {
-                            "timezone": {
-                                "type": "string",
-                                "description": "IANA timezone such as Europe/Stockholm or UTC."
-                            },
-                            "minute": calendar_field_schema("Minute values."),
-                            "hour": calendar_field_schema("Hour values, 0-23."),
-                            "day_of_month": calendar_field_schema("Day-of-month values, 1-31."),
-                            "month": calendar_field_schema("Month values, 1-12."),
-                            "day_of_week": calendar_field_schema("Weekday values, Monday=1 style domain used by the scheduler."),
-                            "year": calendar_field_schema("Optional year filter.")
-                        },
-                        "required": ["timezone"],
-                        "additionalProperties": false
-                    }
+                    "type": { "const": "calendar" },
+                    "timezone": {
+                        "type": "string",
+                        "description": "IANA timezone such as Europe/Stockholm or UTC."
+                    },
+                    "minute": calendar_field_schema("Minute values."),
+                    "hour": calendar_field_schema("Hour values, 0-23."),
+                    "day_of_month": calendar_field_schema("Day-of-month values, 1-31."),
+                    "month": calendar_field_schema("Month values, 1-12."),
+                    "day_of_week": calendar_field_schema("Weekday values using the scheduler's cron-style domain: 0-6 and weekday names such as MON or FRI."),
+                    "year": calendar_field_schema("Optional year filter.")
                 },
-                "required": ["Calendar"],
+                "required": ["type", "timezone"],
                 "additionalProperties": false
             }
         ]
@@ -865,6 +847,35 @@ mod tests {
             .collect();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn schedule_trigger_schema_matches_internal_tagged_deserializer_shape() {
+        let tools = schedule_tools_list();
+        let create_schema = &tools
+            .iter()
+            .find(|tool| tool["name"] == "meerkat_schedule_create")
+            .expect("create tool schema must exist")["inputSchema"];
+        let trigger_schema = &create_schema["properties"]["trigger"];
+        let variants = trigger_schema["oneOf"]
+            .as_array()
+            .expect("trigger schema variants must be an array");
+
+        assert_eq!(
+            trigger_schema["description"].as_str(),
+            Some(
+                "TriggerSpec uses internally tagged JSON with a type field. Example once trigger: {\"type\":\"once\",\"due_at_utc\":\"2026-04-09T12:00:00Z\"}. Example interval trigger: {\"type\":\"interval\",\"start_at_utc\":\"2026-04-09T12:00:00Z\",\"every_seconds\":60}."
+            )
+        );
+        assert_eq!(variants[0]["properties"]["type"]["const"], json!("once"));
+        assert_eq!(
+            variants[1]["properties"]["type"]["const"],
+            json!("interval")
+        );
+        assert_eq!(
+            variants[2]["properties"]["type"]["const"],
+            json!("calendar")
+        );
     }
 
     #[tokio::test]
