@@ -48,6 +48,7 @@ use meerkat_core::service::{
     StartTurnRequest,
 };
 use meerkat_core::types::{ContentInput, HandlingMode, SessionId};
+use meerkat_core::types::Message;
 use meerkat_core::{AgentEvent, Config, Session};
 use meerkat_mob_mcp::{AgentMobToolSurfaceFactory, MobMcpState};
 use meerkat_runtime::{
@@ -1305,7 +1306,7 @@ async fn handle_command(
                 match switch_session(
                     service,
                     runtime_adapter,
-                    Some(resume_id),
+                    Some(resume_id.clone()),
                     model,
                     system_prompt,
                     mob_state,
@@ -1318,7 +1319,17 @@ async fn handle_command(
                 )
                 .await
                 {
-                    Ok(sid) => format!("Resumed session {sid}"),
+                    Ok(sid) => {
+                        let history = match jsonl_store.load(&resume_id).await {
+                            Ok(Some(session)) => format_session_history(&session),
+                            _ => String::new(),
+                        };
+                        if history.is_empty() {
+                            format!("Resumed session {sid}")
+                        } else {
+                            format!("Resumed session {sid}\n\n---\n\n{history}")
+                        }
+                    }
                     Err(e) => format!("Error resuming session: {e}"),
                 }
             }
@@ -1327,6 +1338,34 @@ async fn handle_command(
     } else {
         format!("Unknown command: {cmd}")
     }
+}
+
+fn format_session_history(session: &Session) -> String {
+    let mut out = String::new();
+    for msg in session.messages() {
+        match msg {
+            Message::User(u) => {
+                let text = u.text_content();
+                if !text.is_empty() {
+                    out.push_str(&format!("**You:** {text}\n\n"));
+                }
+            }
+            Message::Assistant(a) => {
+                if !a.content.is_empty() {
+                    out.push_str(&format!("**Assistant:** {}\n\n", a.content));
+                }
+            }
+            Message::BlockAssistant(ba) => {
+                let text: String = ba.text_blocks().collect::<Vec<_>>().join("");
+                if !text.is_empty() {
+                    out.push_str(&format!("**Assistant:** {text}\n\n"));
+                }
+            }
+            _ => {}
+        }
+    }
+    out.truncate(out.trim_end().len());
+    out
 }
 
 fn format_duration(d: std::time::Duration) -> String {

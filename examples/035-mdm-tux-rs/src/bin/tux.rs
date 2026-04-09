@@ -2922,13 +2922,7 @@ fn format_tool_completion(
 }
 
 fn timeline_max_scroll(content_height: u16, inner_height: u16) -> u16 {
-    if content_height <= inner_height {
-        0
-    } else {
-        content_height
-            .saturating_sub(inner_height)
-            .saturating_add(2)
-    }
+    content_height.saturating_sub(inner_height)
 }
 
 fn scroll_timeline_up(app: &mut App, lines: u16) {
@@ -3566,6 +3560,9 @@ fn render_output(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut 
         app.scroll_offset = max_scroll;
     } else {
         app.scroll_offset = app.scroll_offset.min(max_scroll);
+        if app.scroll_offset >= max_scroll {
+            app.auto_scroll = true;
+        }
     }
     let title = if app.auto_scroll {
         format!("TIMELINE  live  {} lines", app.output.len())
@@ -3860,8 +3857,9 @@ mod tests {
     }
 
     #[test]
-    fn timeline_max_scroll_keeps_bottom_slack() {
-        assert_eq!(timeline_max_scroll(40, 10), 32);
+    fn timeline_max_scroll_exact_bottom() {
+        assert_eq!(timeline_max_scroll(40, 10), 30);
+        assert_eq!(timeline_max_scroll(10, 10), 0);
         assert_eq!(timeline_max_scroll(8, 10), 0);
     }
 
