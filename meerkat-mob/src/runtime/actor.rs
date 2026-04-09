@@ -1863,6 +1863,7 @@ impl MobActor {
             additional_instructions,
             shell_env,
             inherited_tool_filter,
+            override_profile,
         } = spec;
         // Normalize launch-mode resume/fork details for the provisioning path.
         let (resume_session_id, fork_spec) = match launch_mode {
@@ -1908,19 +1909,14 @@ impl MobActor {
                 }
             }
 
-            let profile = match self.definition.profiles.get(&profile_name) {
-                Some(crate::profile::ProfileBinding::Inline(p)) => p.clone(),
-                Some(crate::profile::ProfileBinding::RealmRef { realm_profile }) => {
-                    let store = self.realm_profile_store.as_ref()
-                        .ok_or_else(|| MobError::Internal(
-                            "realm profile store not available for RealmRef resolution".into(),
-                        ))?;
-                    store.get(realm_profile).await
-                        .map_err(MobError::from)?
-                        .ok_or_else(|| MobError::ProfileNotFound(profile_name.clone()))?
-                        .profile
-                }
-                None => return Err(MobError::ProfileNotFound(profile_name.clone())),
+            // Use override_profile if provided (from SpawnTooling::Profile resolution),
+            // otherwise resolve from the mob definition.
+            let profile = if let Some(p) = override_profile {
+                p
+            } else {
+                self.definition
+                    .resolve_profile(&profile_name, self.realm_profile_store.as_ref())
+                    .await?
             };
 
             let selected_runtime_mode = runtime_mode.unwrap_or(profile.runtime_mode);
@@ -2521,16 +2517,16 @@ impl MobActor {
         let profile_name = spawn_spec.profile;
         let profile = self
             .definition
-            .resolve_inline_profile(&profile_name)
-            .ok_or_else(|| MobError::ProfileNotFound(profile_name.clone()))?;
+            .resolve_profile(&profile_name, self.realm_profile_store.as_ref())
+            .await?;
         let runtime_mode = spawn_spec.runtime_mode.unwrap_or(profile.runtime_mode);
-        let external_tools = self.external_tools_for_profile(profile)?;
+        let external_tools = self.external_tools_for_profile(&profile)?;
         let labels = std::collections::BTreeMap::new();
         let mut config = build::build_agent_config(build::BuildAgentConfigParams {
             mob_id: &self.definition.id,
             profile_name: &profile_name,
             meerkat_id,
-            profile,
+            profile: &profile,
             definition: &self.definition,
             external_tools,
             context: None,
@@ -3108,14 +3104,14 @@ impl MobActor {
         });
         let profile = self
             .definition
-            .resolve_inline_profile(&snapshot.profile_name)
-            .ok_or_else(|| MobError::ProfileNotFound(snapshot.profile_name.clone()))?;
-        let external_tools = self.external_tools_for_profile(profile)?;
+            .resolve_profile(&snapshot.profile_name, self.realm_profile_store.as_ref())
+            .await?;
+        let external_tools = self.external_tools_for_profile(&profile)?;
         let mut config = build::build_agent_config(build::BuildAgentConfigParams {
             mob_id: &self.definition.id,
             profile_name: &snapshot.profile_name,
             meerkat_id: &meerkat_id,
-            profile,
+            profile: &profile,
             definition: &self.definition,
             external_tools,
             context: None,
@@ -4344,8 +4340,8 @@ impl MobActor {
         // Check external_addressable
         let profile = self
             .definition
-            .resolve_inline_profile(&entry.profile)
-            .ok_or_else(|| MobError::ProfileNotFound(entry.profile.clone()))?;
+            .resolve_profile(&entry.profile, self.realm_profile_store.as_ref())
+            .await?;
 
         if !profile.external_addressable {
             return Err(MobError::NotExternallyAddressable(meerkat_id));
@@ -5352,8 +5348,10 @@ impl MobActor {
     ) -> Result<(), MobError> {
         let peer_description = self
             .definition
-            .resolve_inline_profile(&new_peer_entry.profile)
-            .map_or("", |p| p.peer_description.as_str());
+            .resolve_profile(&new_peer_entry.profile, self.realm_profile_store.as_ref())
+            .await
+            .map(|p| p.peer_description)
+            .unwrap_or_default();
 
         let peer_name = PeerName::new(recipient_comms_name).map_err(|error| {
             MobError::WiringError(format!(

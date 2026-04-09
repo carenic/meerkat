@@ -48,6 +48,18 @@ const TOOL_MOB_PROFILE_UPDATE: &str = "mob_profile_update";
 const TOOL_MOB_PROFILE_DELETE: &str = "mob_profile_delete";
 const TOOL_MOB_PROFILE_LIST_SOURCES: &str = "mob_profile_list_sources";
 
+// ─── ResolvedSpawnTooling ────────────────────────────────────────────────
+
+/// Result of resolving `SpawnTooling` into concrete values for spawning.
+#[derive(Debug, Clone)]
+pub struct ResolvedSpawnTooling {
+    /// Inherited tool filter for the child session (from overlays or inherit mode).
+    pub inherited_tool_filter: Option<meerkat_core::tool_scope::ToolFilter>,
+    /// Override profile resolved from `SpawnTooling::Profile` source.
+    /// When set, the spawn path uses this profile instead of the definition's.
+    pub override_profile: Option<meerkat_mob::Profile>,
+}
+
 // ─── AgentMobToolSurface ─────────────────────────────────────────────────
 
 /// Agent-internal tool surface for mob delegation and orchestration.
@@ -255,15 +267,15 @@ impl AgentMobToolSurface {
         Err(ToolError::access_denied(tool_name))
     }
 
-    /// Resolve spawn tooling into an inherited tool filter for the child session.
+    /// Resolve spawn tooling into inherited tool filter and optional override profile.
     ///
     /// - `InheritParent`: snapshot parent's visible tools, apply overlays
     /// - `Minimal`: only comms tools (send, send_message, send_request, send_response, peers)
-    /// - `Profile`: resolve from realm or inline profile (tool filter from profile not implemented yet)
-    fn resolve_spawn_tooling(
+    /// - `Profile`: resolve the profile from inline/realm source and apply overlays
+    async fn resolve_spawn_tooling(
         &self,
         tooling: &meerkat_mob::SpawnTooling,
-    ) -> Result<Option<meerkat_core::tool_scope::ToolFilter>, ToolError> {
+    ) -> Result<ResolvedSpawnTooling, ToolError> {
         match tooling {
             meerkat_mob::SpawnTooling::InheritParent {
                 allow_overlay,
@@ -291,7 +303,10 @@ impl AgentMobToolSurface {
                         .collect::<std::collections::HashSet<String>>()
                 });
                 let filter = snapshot.with_overlays(allow_set.as_ref(), deny_set.as_ref());
-                Ok(Some(filter))
+                Ok(ResolvedSpawnTooling {
+                    inherited_tool_filter: Some(filter),
+                    override_profile: None,
+                })
             }
             meerkat_mob::SpawnTooling::Minimal => {
                 match &self.snapshot_context {
@@ -313,45 +328,83 @@ impl AgentMobToolSurface {
                 .iter()
                 .map(ToString::to_string)
                 .collect();
-                Ok(Some(meerkat_core::tool_scope::ToolFilter::Allow(
-                    comms_tools,
-                )))
+                Ok(ResolvedSpawnTooling {
+                    inherited_tool_filter: Some(meerkat_core::tool_scope::ToolFilter::Allow(
+                        comms_tools,
+                    )),
+                    override_profile: None,
+                })
             }
             meerkat_mob::SpawnTooling::Profile {
-                source: _,
+                source,
                 allow_overlay,
                 deny_overlay,
             } => {
-                // Profile mode: the profile's ToolConfig controls categories (builtins,
-                // shell, etc.) through build_agent_config(). Overlays become the
-                // inherited filter on session metadata.
-                if allow_overlay.is_none() && deny_overlay.is_none() {
-                    return Ok(None);
-                }
-                // When overlays are present but we need a base set from the parent
-                // to apply them against, require ParentOwned.
-                let provider = match &self.snapshot_context {
-                    meerkat_core::service::MobToolSnapshotContext::ParentOwned(p) => p,
-                    meerkat_core::service::MobToolSnapshotContext::Standalone => {
-                        return Err(ToolError::execution_failed(
-                            "Profile tooling with overlays requires a parent tool scope",
-                        ));
+                // Profile mode: resolve the profile from inline or realm source.
+                let resolved_profile = match source.as_ref() {
+                    meerkat_mob::ProfileSource::Inline(profile) => profile.clone(),
+                    meerkat_mob::ProfileSource::RealmProfile { name } => {
+                        let store = self
+                            .state
+                            .realm_profile_store()
+                            .ok_or_else(|| {
+                                ToolError::execution_failed(
+                                    "Profile tooling with RealmProfile source requires a realm profile store",
+                                )
+                            })?;
+                        store
+                            .get(name)
+                            .await
+                            .map_err(|e| {
+                                ToolError::execution_failed(format!(
+                                    "failed to resolve realm profile '{name}': {e}"
+                                ))
+                            })?
+                            .ok_or_else(|| {
+                                ToolError::execution_failed(format!(
+                                    "realm profile '{name}' not found"
+                                ))
+                            })?
+                            .profile
                     }
                 };
-                let tools = provider.snapshot_visible_tools();
-                let snapshot = meerkat_mob::snapshot::ParentToolScopeSnapshot::from_tools(&tools);
-                let allow_set = allow_overlay.as_ref().map(|v| {
-                    v.iter()
-                        .cloned()
-                        .collect::<std::collections::HashSet<String>>()
-                });
-                let deny_set = deny_overlay.as_ref().map(|v| {
-                    v.iter()
-                        .cloned()
-                        .collect::<std::collections::HashSet<String>>()
-                });
-                let filter = snapshot.with_overlays(allow_set.as_ref(), deny_set.as_ref());
-                Ok(Some(filter))
+
+                // The profile's ToolConfig controls categories (builtins,
+                // shell, etc.) through build_agent_config(). Overlays become the
+                // inherited filter on session metadata.
+                let inherited_tool_filter = if allow_overlay.is_none() && deny_overlay.is_none() {
+                    None
+                } else {
+                    // When overlays are present but we need a base set from the parent
+                    // to apply them against, require ParentOwned.
+                    let provider = match &self.snapshot_context {
+                        meerkat_core::service::MobToolSnapshotContext::ParentOwned(p) => p,
+                        meerkat_core::service::MobToolSnapshotContext::Standalone => {
+                            return Err(ToolError::execution_failed(
+                                "Profile tooling with overlays requires a parent tool scope",
+                            ));
+                        }
+                    };
+                    let tools = provider.snapshot_visible_tools();
+                    let snapshot =
+                        meerkat_mob::snapshot::ParentToolScopeSnapshot::from_tools(&tools);
+                    let allow_set = allow_overlay.as_ref().map(|v| {
+                        v.iter()
+                            .cloned()
+                            .collect::<std::collections::HashSet<String>>()
+                    });
+                    let deny_set = deny_overlay.as_ref().map(|v| {
+                        v.iter()
+                            .cloned()
+                            .collect::<std::collections::HashSet<String>>()
+                    });
+                    Some(snapshot.with_overlays(allow_set.as_ref(), deny_set.as_ref()))
+                };
+
+                Ok(ResolvedSpawnTooling {
+                    inherited_tool_filter,
+                    override_profile: Some(resolved_profile),
+                })
             }
         }
     }
@@ -554,7 +607,9 @@ impl AgentMobToolSurface {
                 allow_overlay: None,
                 deny_overlay: None,
             });
-        spec.inherited_tool_filter = self.resolve_spawn_tooling(&tooling)?;
+        let resolved = self.resolve_spawn_tooling(&tooling).await?;
+        spec.inherited_tool_filter = resolved.inherited_tool_filter;
+        spec.override_profile = resolved.override_profile;
 
         // Spawn via MobMcpState
         let member_ref = self
@@ -685,7 +740,9 @@ impl AgentMobToolSurface {
             spec.auto_wire_parent = auto_wire;
         }
         if let Some(tooling) = args.tooling {
-            spec.inherited_tool_filter = self.resolve_spawn_tooling(&tooling)?;
+            let resolved = self.resolve_spawn_tooling(&tooling).await?;
+            spec.inherited_tool_filter = resolved.inherited_tool_filter;
+            spec.override_profile = resolved.override_profile;
         }
 
         let member_ref = self
@@ -2905,15 +2962,15 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_resolve_spawn_tooling_inherit_parent_captures_all_visible() {
+    #[tokio::test]
+    async fn test_resolve_spawn_tooling_inherit_parent_captures_all_visible() {
         let surface = surface_with_parent_tools();
         let tooling = meerkat_mob::SpawnTooling::InheritParent {
             allow_overlay: None,
             deny_overlay: None,
         };
-        let filter = surface.resolve_spawn_tooling(&tooling).unwrap();
-        match filter {
+        let resolved = surface.resolve_spawn_tooling(&tooling).await.unwrap();
+        match resolved.inherited_tool_filter {
             Some(meerkat_core::tool_scope::ToolFilter::Allow(names)) => {
                 assert_eq!(names.len(), 8, "should inherit all 8 parent tools");
                 assert!(names.contains("send"));
@@ -2924,15 +2981,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_resolve_spawn_tooling_inherit_parent_with_deny_overlay() {
+    #[tokio::test]
+    async fn test_resolve_spawn_tooling_inherit_parent_with_deny_overlay() {
         let surface = surface_with_parent_tools();
         let tooling = meerkat_mob::SpawnTooling::InheritParent {
             allow_overlay: None,
             deny_overlay: Some(vec!["bash".to_string(), "write_file".to_string()]),
         };
-        let filter = surface.resolve_spawn_tooling(&tooling).unwrap();
-        match filter {
+        let resolved = surface.resolve_spawn_tooling(&tooling).await.unwrap();
+        match resolved.inherited_tool_filter {
             Some(meerkat_core::tool_scope::ToolFilter::Allow(names)) => {
                 assert_eq!(names.len(), 6);
                 assert!(!names.contains("bash"));
@@ -2944,15 +3001,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_resolve_spawn_tooling_inherit_parent_with_allow_overlay() {
+    #[tokio::test]
+    async fn test_resolve_spawn_tooling_inherit_parent_with_allow_overlay() {
         let surface = surface_with_parent_tools();
         let tooling = meerkat_mob::SpawnTooling::InheritParent {
             allow_overlay: Some(vec!["send".to_string(), "read_file".to_string()]),
             deny_overlay: None,
         };
-        let filter = surface.resolve_spawn_tooling(&tooling).unwrap();
-        match filter {
+        let resolved = surface.resolve_spawn_tooling(&tooling).await.unwrap();
+        match resolved.inherited_tool_filter {
             Some(meerkat_core::tool_scope::ToolFilter::Allow(names)) => {
                 assert_eq!(names.len(), 2);
                 assert!(names.contains("send"));
@@ -2962,26 +3019,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_resolve_spawn_tooling_inherit_parent_standalone_errors() {
+    #[tokio::test]
+    async fn test_resolve_spawn_tooling_inherit_parent_standalone_errors() {
         let surface = surface_standalone();
         let tooling = meerkat_mob::SpawnTooling::InheritParent {
             allow_overlay: None,
             deny_overlay: None,
         };
-        let err = surface.resolve_spawn_tooling(&tooling).unwrap_err();
+        let err = surface.resolve_spawn_tooling(&tooling).await.unwrap_err();
         assert!(
             matches!(err, ToolError::ExecutionFailed { .. }),
             "InheritParent in Standalone context should return ExecutionFailed, got {err:?}"
         );
     }
 
-    #[test]
-    fn test_resolve_spawn_tooling_minimal_returns_comms_only() {
+    #[tokio::test]
+    async fn test_resolve_spawn_tooling_minimal_returns_comms_only() {
         let surface = surface_with_parent_tools();
         let tooling = meerkat_mob::SpawnTooling::Minimal;
-        let filter = surface.resolve_spawn_tooling(&tooling).unwrap();
-        match filter {
+        let resolved = surface.resolve_spawn_tooling(&tooling).await.unwrap();
+        match resolved.inherited_tool_filter {
             Some(meerkat_core::tool_scope::ToolFilter::Allow(names)) => {
                 assert_eq!(names.len(), 5);
                 assert!(names.contains("send"));
@@ -2996,16 +3053,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_resolve_spawn_tooling_minimal_standalone_errors() {
+    #[tokio::test]
+    async fn test_resolve_spawn_tooling_minimal_standalone_errors() {
         let surface = surface_standalone();
         let tooling = meerkat_mob::SpawnTooling::Minimal;
-        let err = surface.resolve_spawn_tooling(&tooling).unwrap_err();
+        let err = surface.resolve_spawn_tooling(&tooling).await.unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed { .. }));
     }
 
-    #[test]
-    fn test_resolve_spawn_tooling_profile_no_overlays_returns_none() {
+    #[tokio::test]
+    async fn test_resolve_spawn_tooling_profile_no_overlays_returns_none() {
         let surface = surface_with_parent_tools();
         let tooling = meerkat_mob::SpawnTooling::Profile {
             source: Box::new(meerkat_mob::ProfileSource::Inline(meerkat_mob::Profile {
@@ -3023,15 +3080,15 @@ mod tests {
             allow_overlay: None,
             deny_overlay: None,
         };
-        let filter = surface.resolve_spawn_tooling(&tooling).unwrap();
+        let resolved = surface.resolve_spawn_tooling(&tooling).await.unwrap();
         assert!(
-            filter.is_none(),
+            resolved.inherited_tool_filter.is_none(),
             "Profile without overlays should return None (no inherited filter)"
         );
     }
 
-    #[test]
-    fn test_resolve_spawn_tooling_profile_with_deny_overlay() {
+    #[tokio::test]
+    async fn test_resolve_spawn_tooling_profile_with_deny_overlay() {
         let surface = surface_with_parent_tools();
         let tooling = meerkat_mob::SpawnTooling::Profile {
             source: Box::new(meerkat_mob::ProfileSource::Inline(meerkat_mob::Profile {
@@ -3049,8 +3106,8 @@ mod tests {
             allow_overlay: None,
             deny_overlay: Some(vec!["bash".to_string()]),
         };
-        let filter = surface.resolve_spawn_tooling(&tooling).unwrap();
-        match filter {
+        let resolved = surface.resolve_spawn_tooling(&tooling).await.unwrap();
+        match resolved.inherited_tool_filter {
             Some(meerkat_core::tool_scope::ToolFilter::Allow(names)) => {
                 assert!(!names.contains("bash"));
                 assert!(names.contains("read_file"));
@@ -3059,8 +3116,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_resolve_spawn_tooling_profile_with_overlays_standalone_errors() {
+    #[tokio::test]
+    async fn test_resolve_spawn_tooling_profile_with_overlays_standalone_errors() {
         let surface = surface_standalone();
         let tooling = meerkat_mob::SpawnTooling::Profile {
             source: Box::new(meerkat_mob::ProfileSource::Inline(meerkat_mob::Profile {
@@ -3078,7 +3135,39 @@ mod tests {
             allow_overlay: Some(vec!["send".to_string()]),
             deny_overlay: None,
         };
-        let err = surface.resolve_spawn_tooling(&tooling).unwrap_err();
+        let err = surface.resolve_spawn_tooling(&tooling).await.unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+    }
+
+    /// Regression: SpawnTooling::Profile with an inline profile must populate
+    /// `override_profile` so the spawn path uses it instead of the definition's default.
+    #[tokio::test]
+    async fn test_resolve_spawn_tooling_profile_source_populates_override_profile() {
+        let surface = surface_with_parent_tools();
+        let expected_model = "claude-opus-4-6".to_string();
+        let tooling = meerkat_mob::SpawnTooling::Profile {
+            source: Box::new(meerkat_mob::ProfileSource::Inline(meerkat_mob::Profile {
+                model: expected_model.clone(),
+                skills: Vec::new(),
+                tools: meerkat_mob::ToolConfig::default(),
+                peer_description: "override test".to_string(),
+                external_addressable: false,
+                backend: None,
+                runtime_mode: MobRuntimeMode::TurnDriven,
+                max_inline_peer_notifications: None,
+                output_schema: None,
+                provider_params: None,
+            })),
+            allow_overlay: None,
+            deny_overlay: None,
+        };
+        let resolved = surface.resolve_spawn_tooling(&tooling).await.unwrap();
+        let profile = resolved
+            .override_profile
+            .expect("Profile source should populate override_profile");
+        assert_eq!(
+            profile.model, expected_model,
+            "override_profile.model must match the inline profile's model"
+        );
     }
 }

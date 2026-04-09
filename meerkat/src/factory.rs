@@ -631,17 +631,44 @@ pub fn provider_key(provider: Provider) -> &'static str {
     provider.as_str()
 }
 
-/// Snapshot provider that captures visible tools from a composed tool dispatcher.
+/// Deferred snapshot provider that captures visible tools from a composed tool dispatcher.
 ///
-/// Used to pass the parent agent's visible tool set into mob child sessions
-/// for inherited tool filtering.
-struct DispatcherSnapshotProvider {
-    dispatcher: Arc<dyn AgentToolDispatcher>,
+/// Created before mob tool composition (so it can be passed into `MobToolsBuildArgs`),
+/// then updated with the final composed dispatcher after mob tools are added.
+/// This ensures the snapshot includes mob/profile tools the parent currently has.
+///
+/// Uses a `Weak` reference to avoid inflating the `Arc` strong count on the dispatcher,
+/// which would cause `bind_ops_lifecycle` to reject rebinding due to shared ownership.
+struct DeferredSnapshotProvider {
+    dispatcher: std::sync::RwLock<Option<std::sync::Weak<dyn AgentToolDispatcher>>>,
 }
 
-impl meerkat_core::service::VisibleToolSnapshotProvider for DispatcherSnapshotProvider {
+impl DeferredSnapshotProvider {
+    fn new() -> Self {
+        Self {
+            dispatcher: std::sync::RwLock::new(None),
+        }
+    }
+
+    fn set_dispatcher(&self, dispatcher: &Arc<dyn AgentToolDispatcher>) {
+        let mut guard = self
+            .dispatcher
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(Arc::downgrade(dispatcher));
+    }
+}
+
+impl meerkat_core::service::VisibleToolSnapshotProvider for DeferredSnapshotProvider {
     fn snapshot_visible_tools(&self) -> Vec<Arc<meerkat_core::types::ToolDef>> {
-        self.dispatcher.tools().to_vec()
+        let guard = self
+            .dispatcher
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match guard.as_ref().and_then(std::sync::Weak::upgrade) {
+            Some(d) => d.tools().to_vec(),
+            None => Vec::new(),
+        }
     }
 }
 
@@ -1674,6 +1701,8 @@ impl AgentFactory {
         let mut hoisted_mob_authority_handle: Option<
             Arc<std::sync::RwLock<meerkat_core::service::MobToolAuthorityContext>>,
         > = None;
+        // Hoisted so we can re-point the Weak reference after bind_ops_lifecycle.
+        let mut hoisted_deferred_provider: Option<Arc<DeferredSnapshotProvider>> = None;
         if effective_mob && let Some(mob_factory) = mob_factory {
             // Build comms runtime arg: clone from the comms phase if available.
             #[cfg(feature = "comms")]
@@ -1691,10 +1720,14 @@ impl AgentFactory {
                 .map(|ctx| Arc::new(std::sync::RwLock::new(ctx.clone())));
             hoisted_mob_authority_handle = mob_authority_handle.clone();
 
+            // Use a deferred snapshot provider: created before mob composition
+            // so it can be passed into MobToolsBuildArgs, then updated with the
+            // final composed dispatcher after mob tools are added. This ensures
+            // InheritParent snapshots include mob/profile tools.
+            let deferred_provider = Arc::new(DeferredSnapshotProvider::new());
             let snapshot_provider: Arc<dyn meerkat_core::service::VisibleToolSnapshotProvider> =
-                Arc::new(DispatcherSnapshotProvider {
-                    dispatcher: Arc::clone(&tools),
-                });
+                Arc::clone(&deferred_provider)
+                    as Arc<dyn meerkat_core::service::VisibleToolSnapshotProvider>;
             let mob_args = meerkat_core::service::MobToolsBuildArgs {
                 session_id: session.id().clone(),
                 model: model.clone(),
@@ -1717,6 +1750,10 @@ impl AgentFactory {
                 tools,
                 mob_dispatcher,
             ]));
+            // Set the final composed dispatcher on the deferred provider so
+            // snapshots captured later include mob tools.
+            deferred_provider.set_dispatcher(&tools);
+            hoisted_deferred_provider = Some(deferred_provider);
             if !mob_usage.is_empty() {
                 if !tool_usage_instructions.is_empty() {
                     tool_usage_instructions.push_str("\n\n");
@@ -1738,6 +1775,11 @@ impl AgentFactory {
                     BuildAgentError::Config(format!("Ops lifecycle binding failed: {e}"))
                 })?;
             tools = outcome.into_dispatcher();
+        }
+        // Re-point the deferred snapshot provider after binding may have replaced
+        // the dispatcher Arc (bind_ops_lifecycle can return a new Arc).
+        if let Some(ref provider) = hoisted_deferred_provider {
+            provider.set_dispatcher(&tools);
         }
 
         tracing::debug!(

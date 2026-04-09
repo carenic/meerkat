@@ -548,6 +548,37 @@ impl MobDefinition {
     pub fn resolve_inline_profile(&self, name: &crate::ids::ProfileName) -> Option<&Profile> {
         self.profiles.get(name)?.as_inline()
     }
+
+    /// Resolve a profile by name, supporting both inline and realm-ref bindings.
+    ///
+    /// For `Inline` bindings, returns the profile directly. For `RealmRef` bindings,
+    /// looks up the profile from the provided realm profile store. Returns
+    /// `MobError::ProfileNotFound` if the profile name is missing or the realm
+    /// profile doesn't exist in the store, and `MobError::Internal` if a realm
+    /// store is required but not available.
+    pub async fn resolve_profile(
+        &self,
+        name: &crate::ids::ProfileName,
+        realm_profile_store: Option<&std::sync::Arc<dyn crate::store::RealmProfileStore>>,
+    ) -> Result<Profile, crate::error::MobError> {
+        match self.profiles.get(name) {
+            Some(ProfileBinding::Inline(p)) => Ok(p.clone()),
+            Some(ProfileBinding::RealmRef { realm_profile }) => {
+                let store = realm_profile_store.ok_or_else(|| {
+                    crate::error::MobError::Internal(
+                        "realm profile store not available for RealmRef resolution".into(),
+                    )
+                })?;
+                store
+                    .get(realm_profile)
+                    .await
+                    .map_err(crate::error::MobError::from)?
+                    .ok_or_else(|| crate::error::MobError::ProfileNotFound(name.clone()))
+                    .map(|stored| stored.profile)
+            }
+            None => Err(crate::error::MobError::ProfileNotFound(name.clone())),
+        }
+    }
 }
 
 #[cfg(test)]

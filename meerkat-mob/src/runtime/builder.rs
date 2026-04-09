@@ -429,6 +429,7 @@ impl MobBuilder {
                 &tool_bundles,
                 &preview_handle,
                 &default_external_tools_provider,
+                storage.realm_profiles.clone(),
             )
             .await?;
         }
@@ -479,6 +480,7 @@ impl MobBuilder {
         tool_bundles: &BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
         tool_handle: &MobHandle,
         default_external_tools_provider: &Option<crate::ExternalToolsProvider>,
+        realm_profile_store: Option<Arc<dyn crate::store::RealmProfileStore>>,
     ) -> Result<(), MobError> {
         tool_handle.restore_diagnostics.write().await.clear();
         let provisioner = MultiBackendProvisioner::new(
@@ -550,8 +552,9 @@ impl MobBuilder {
                     continue;
                 };
                 let profile = definition
-                    .resolve_inline_profile(&entry.profile)
-                    .ok_or_else(|| MobError::ProfileNotFound(entry.profile.clone()))?;
+                    .resolve_profile(&entry.profile, realm_profile_store.as_ref())
+                    .await?;
+                let profile = &profile;
                 let default_ext = default_external_tools_provider.as_ref().and_then(|p| p());
                 let resumed_config =
                     build::build_resumed_agent_config(build::BuildResumedAgentConfigParams {
@@ -617,17 +620,17 @@ impl MobBuilder {
                 // Ephemeral services can still fall back to fresh-create.
             }
             let profile = definition
-                .resolve_inline_profile(&entry.profile)
-                .ok_or_else(|| MobError::ProfileNotFound(entry.profile.clone()))?;
+                .resolve_profile(&entry.profile, realm_profile_store.as_ref())
+                .await?;
             let default_ext_fresh = default_external_tools_provider.as_ref().and_then(|p| p());
             let mut config = build::build_agent_config(build::BuildAgentConfigParams {
                 mob_id: &definition.id,
                 profile_name: &entry.profile,
                 meerkat_id: &entry.meerkat_id,
-                profile,
+                profile: &profile,
                 definition,
                 external_tools: compose_external_tools_for_profile(
-                    profile,
+                    &profile,
                     tool_bundles,
                     tool_handle.clone(),
                     default_ext_fresh,

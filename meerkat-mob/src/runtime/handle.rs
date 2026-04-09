@@ -377,6 +377,13 @@ pub struct SpawnMemberSpec {
     /// When set, stored as `INHERITED_TOOL_FILTER_METADATA_KEY` on the child
     /// session metadata so `AgentBuilder::build()` recovers it as a base filter.
     pub inherited_tool_filter: Option<meerkat_core::tool_scope::ToolFilter>,
+    /// Override profile resolved from `SpawnTooling::Profile` source.
+    ///
+    /// When set, the spawn path uses this profile instead of looking up by
+    /// `role_name` from the mob definition. This allows agent-owned spawn
+    /// tooling to specify a different model/skills/tools via inline or
+    /// realm-scoped profiles.
+    pub override_profile: Option<crate::profile::Profile>,
 }
 
 impl SpawnMemberSpec {
@@ -396,6 +403,7 @@ impl SpawnMemberSpec {
             additional_instructions: None,
             shell_env: None,
             inherited_tool_filter: None,
+            override_profile: None,
         }
     }
 
