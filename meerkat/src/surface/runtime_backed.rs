@@ -7,15 +7,15 @@ use meerkat_core::service::SessionService;
 use meerkat_runtime::session_adapter::RuntimeBindingsError;
 use meerkat_runtime::{RuntimeDriverError, RuntimeSessionAdapter};
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "jsonl-store", not(target_arch = "wasm32")))]
 use crate::JsonlStore;
 use crate::{
     CreateSessionRequest, FactoryAgentBuilder, PersistentSessionService, RunResult, Session,
     SessionError, SessionId, StartTurnRequest,
 };
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "jsonl-store", not(target_arch = "wasm32")))]
 use meerkat_store::MemoryBlobStore;
-#[cfg(test)]
+#[cfg(all(test, feature = "jsonl-store"))]
 use meerkat_store::StoreAdapter;
 
 #[derive(Debug, thiserror::Error)]
@@ -210,7 +210,7 @@ fn ensure_materialized_session_id_matches(
     })
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "jsonl-store", not(target_arch = "wasm32")))]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
@@ -553,6 +553,7 @@ mod tests {
             &adapter,
             Session::new(),
             make_request(SessionBuildOptions {
+                comms_name: Some("surface-peer-ingress-session".to_string()),
                 keep_alive: true,
                 ..Default::default()
             }),
@@ -587,6 +588,7 @@ mod tests {
             &adapter,
             Session::new(),
             make_request(SessionBuildOptions {
+                comms_name: Some("surface-keep-alive-session".to_string()),
                 keep_alive: true,
                 ..Default::default()
             }),

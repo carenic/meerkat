@@ -3429,6 +3429,7 @@ async fn run_agent(
         })
         .await
         .map_err(|error| anyhow::anyhow!("failed to materialize session: {error}"))?;
+        #[cfg(feature = "comms")]
         configure_peer_ingress(
             &runtime_adapter,
             &service,
