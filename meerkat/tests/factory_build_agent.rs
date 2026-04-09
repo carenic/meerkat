@@ -13,15 +13,18 @@ use async_trait::async_trait;
 use futures::stream;
 use meerkat::BuildAgentError;
 use meerkat::{AgentBuildConfig, AgentFactory, LlmDoneOutcome, LlmEvent, LlmRequest};
-use meerkat_client::LlmClient;
+use meerkat_client::{LlmClient, TestClient};
+use meerkat_comms::{CommsRuntime, ResolvedCommsConfig, TrustedPeer, identity::Keypair};
 use meerkat_core::service::{MobToolAuthorityContext, OpaquePrincipalToken};
 use meerkat_core::{
     AgentToolDispatcher, Config, Provider, ProviderConfig, Session, SessionId, SessionMetadata,
     SessionTooling, ToolCallView, ToolCategoryOverride, ToolDef, ToolDispatchOutcome, ToolError,
     UserMessage,
 };
+use meerkat_schedule::{MemoryScheduleStore, ScheduleService, ScheduleToolDispatcher};
 use meerkat_store::{SessionFilter, SessionStore, SessionStoreError};
 use serde_json::json;
+use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // Mock LLM client (returns a simple text response)
@@ -58,6 +61,39 @@ impl LlmClient for MockLlmClient {
     }
 }
 
+#[derive(Default)]
+struct CaptureClient {
+    inner: TestClient,
+    seen_tools: Mutex<Vec<String>>,
+}
+
+impl CaptureClient {
+    fn tool_names(&self) -> Vec<String> {
+        self.seen_tools.lock().expect("capture lock").clone()
+    }
+}
+
+#[async_trait]
+impl LlmClient for CaptureClient {
+    fn stream<'a>(
+        &'a self,
+        request: &'a LlmRequest,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, meerkat_client::LlmError>> + Send + 'a>>
+    {
+        *self.seen_tools.lock().expect("capture lock") =
+            request.tools.iter().map(|tool| tool.name.clone()).collect();
+        self.inner.stream(request)
+    }
+
+    fn provider(&self) -> &'static str {
+        self.inner.provider()
+    }
+
+    async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
+        self.inner.health_check().await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helper: create a factory pointing at a temp directory
 // ---------------------------------------------------------------------------
@@ -72,6 +108,37 @@ struct EmptyDispatcher;
 impl AgentToolDispatcher for EmptyDispatcher {
     fn tools(&self) -> Arc<[Arc<ToolDef>]> {
         Vec::<Arc<ToolDef>>::new().into()
+    }
+
+    async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
+        Err(ToolError::not_found(call.name))
+    }
+}
+
+struct NamedDispatcher {
+    tools: Arc<[Arc<ToolDef>]>,
+}
+
+impl NamedDispatcher {
+    fn new(name: &str) -> Self {
+        Self {
+            tools: Arc::from(vec![Arc::new(ToolDef {
+                name: name.to_string(),
+                description: format!("{name} test tool"),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+            })]),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentToolDispatcher for NamedDispatcher {
+    fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+        Arc::clone(&self.tools)
     }
 
     async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
@@ -96,6 +163,34 @@ impl meerkat_core::service::MobToolsFactory for RecordingMobToolsFactory {
             .push(args.authority_context);
         Ok(Arc::new(EmptyDispatcher))
     }
+}
+
+struct StaticMobToolsFactory {
+    dispatcher: Arc<dyn AgentToolDispatcher>,
+}
+
+#[async_trait]
+impl meerkat_core::service::MobToolsFactory for StaticMobToolsFactory {
+    async fn build_mob_tools(
+        &self,
+        _args: meerkat_core::service::MobToolsBuildArgs,
+    ) -> Result<Arc<dyn AgentToolDispatcher>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Arc::clone(&self.dispatcher))
+    }
+}
+
+async fn run_and_capture_tool_names(
+    factory: AgentFactory,
+    mut build_config: AgentBuildConfig,
+) -> Vec<String> {
+    let capture: Arc<CaptureClient> = Arc::new(CaptureClient::default());
+    build_config.llm_client_override = Some(capture.clone());
+    let mut agent = factory
+        .build_agent(build_config, &Config::default())
+        .await
+        .unwrap();
+    agent.run("inspect tools".to_string().into()).await.unwrap();
+    capture.tool_names()
 }
 
 fn create_test_authority() -> MobToolAuthorityContext {
@@ -277,6 +372,115 @@ async fn build_agent_with_builtins_has_tools() {
         ToolCategoryOverride::Inherit,
         "builtins should be Inherit when no explicit override was set"
     );
+}
+
+#[tokio::test]
+async fn build_agent_with_scheduler_has_tools_when_enabled_and_injected() {
+    let temp = tempfile::tempdir().unwrap();
+    let factory = temp_factory(&temp).schedule(true);
+    let tool_names = run_and_capture_tool_names(
+        factory,
+        AgentBuildConfig {
+            schedule_tools: Some(Arc::new(ScheduleToolDispatcher::new(ScheduleService::new(
+                Arc::new(MemoryScheduleStore::default()),
+            )))),
+            ..AgentBuildConfig::new("claude-sonnet-4-5")
+        },
+    )
+    .await;
+
+    assert!(
+        tool_names
+            .iter()
+            .any(|name| name == "meerkat_schedule_create")
+    );
+    assert!(
+        tool_names
+            .iter()
+            .any(|name| name == "meerkat_schedule_list")
+    );
+}
+
+#[tokio::test]
+async fn build_agent_without_scheduler_keeps_injected_scheduler_tools_hidden() {
+    let temp = tempfile::tempdir().unwrap();
+    let factory = temp_factory(&temp).schedule(false);
+    let tool_names = run_and_capture_tool_names(
+        factory,
+        AgentBuildConfig {
+            schedule_tools: Some(Arc::new(ScheduleToolDispatcher::new(ScheduleService::new(
+                Arc::new(MemoryScheduleStore::default()),
+            )))),
+            ..AgentBuildConfig::new("claude-sonnet-4-5")
+        },
+    )
+    .await;
+
+    assert!(
+        !tool_names
+            .iter()
+            .any(|name| name == "meerkat_schedule_create")
+    );
+}
+
+#[tokio::test]
+async fn build_agent_composes_scheduler_alongside_comms_and_mob() {
+    let temp = tempfile::tempdir().unwrap();
+    let comms_config = ResolvedCommsConfig {
+        enabled: true,
+        name: "test-scheduler-comms".to_string(),
+        inproc_namespace: None,
+        listen_tcp: None,
+        listen_uds: None,
+        event_listen_tcp: None,
+        #[cfg(unix)]
+        event_listen_uds: None,
+        identity_dir: temp.path().join("identity"),
+        trusted_peers_path: temp.path().join("trusted_peers.json"),
+        comms_config: Default::default(),
+        auth: Default::default(),
+        require_peer_auth: false,
+        allow_external_unauthenticated: false,
+    };
+    let comms_runtime = Arc::new(
+        CommsRuntime::new_with_silent_intents(comms_config, Arc::new(Default::default()))
+            .await
+            .unwrap(),
+    );
+    comms_runtime.upsert_trusted_peer(TrustedPeer {
+        name: "peer-a".into(),
+        pubkey: Keypair::generate().public_key(),
+        addr: "tcp://127.0.0.1:9999".into(),
+        meta: Default::default(),
+    });
+    let factory = temp_factory(&temp)
+        .comms(true)
+        .with_comms_runtime(comms_runtime)
+        .schedule(true)
+        .mob(true)
+        .mob_tools_factory(Arc::new(StaticMobToolsFactory {
+            dispatcher: Arc::new(NamedDispatcher::new("mob_probe")),
+        }));
+
+    let tool_names = run_and_capture_tool_names(
+        factory,
+        AgentBuildConfig {
+            schedule_tools: Some(Arc::new(ScheduleToolDispatcher::new(ScheduleService::new(
+                Arc::new(MemoryScheduleStore::default()),
+            )))),
+            ..AgentBuildConfig::new("claude-sonnet-4-5")
+        },
+    )
+    .await;
+
+    assert!(tool_names.iter().any(|name| name == "send_message"));
+    assert!(tool_names.iter().any(|name| name == "peers"));
+    assert!(
+        tool_names
+            .iter()
+            .any(|name| name == "meerkat_schedule_create")
+    );
+    assert!(tool_names.iter().any(|name| name == "mob_probe"));
 }
 
 /// 6. `build_agent` with `resume_session` preserves existing session messages.

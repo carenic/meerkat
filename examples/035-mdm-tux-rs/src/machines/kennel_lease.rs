@@ -342,7 +342,7 @@ pub fn transition(state: State, event: Event) -> Result<(State, Vec<Effect>), Tr
                     lease_ref: LeaseRef::Known {
                         lease_id: lease_id.clone(),
                     },
-                    reason: reason.clone(),
+                    reason,
                 },
                 Effect::SendClaimReleasedToTux {
                     target_id,
@@ -511,7 +511,7 @@ pub fn transition(state: State, event: Event) -> Result<(State, Vec<Effect>), Tr
                     lease_ref: LeaseRef::Known {
                         lease_id: lease_id.clone(),
                     },
-                    reason: reason.clone(),
+                    reason,
                 },
                 Effect::SendClaimReleasedToTux {
                     target_id,
@@ -684,7 +684,7 @@ pub fn transition(state: State, event: Event) -> Result<(State, Vec<Effect>), Tr
                     lease_ref: LeaseRef::Known {
                         lease_id: lease_id.clone(),
                     },
-                    reason: reason.clone(),
+                    reason,
                 },
                 Effect::SendClaimReleasedToTux {
                     target_id,

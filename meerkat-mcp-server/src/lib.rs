@@ -8,12 +8,10 @@ mod schedule_host;
 
 #[cfg(test)]
 use meerkat::SessionStore;
-use meerkat::surface::{
-    RequestContext, prepare_surface_session, request_action, wire_runtime_bindings,
-};
+use meerkat::surface::{RequestContext, prepare_surface_session, request_action};
 use meerkat::{
     AgentFactory, FactoryAgentBuilder, OutputSchema, PersistentSessionService, ScheduleService,
-    ToolError, ToolResult,
+    ScheduleToolDispatcher, ToolError, ToolResult,
 };
 use meerkat_contracts::SkillsParams;
 use meerkat_core::error::invalid_session_id_message;
@@ -27,9 +25,6 @@ use meerkat_core::{
     RealmSelection, RuntimeBootstrap, ToolCallView, ToolCategoryOverride, format_verbose_event,
 };
 use meerkat_mcp::{McpReloadTarget, McpRouter};
-#[cfg(feature = "mob")]
-use meerkat_mob_mcp::wire_mob_tools;
-use meerkat_store::StoreAdapter;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -410,48 +405,6 @@ pub struct MeerkatMcpState {
     _realm_lease: Option<meerkat_store::RealmLeaseGuard>,
 }
 
-struct McpRuntimeComponents {
-    service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
-    runtime_adapter: Arc<meerkat_runtime::RuntimeSessionAdapter>,
-    #[cfg(feature = "mob")]
-    mob_state: Arc<meerkat_mob_mcp::MobMcpState>,
-}
-
-fn compose_runtime_components(
-    mut builder: FactoryAgentBuilder,
-    max_sessions: usize,
-    persistence: meerkat::PersistenceBundle,
-    #[cfg(feature = "mob")] persistent_storage_root: PathBuf,
-) -> McpRuntimeComponents {
-    let runtime_adapter = persistence.runtime_adapter();
-    if builder.default_session_store.is_none() {
-        builder.default_session_store =
-            Some(Arc::new(StoreAdapter::new(persistence.session_store())));
-    }
-    #[cfg(feature = "mob")]
-    let builder_mob_tools_slot = Arc::clone(&builder.default_mob_tools);
-    let (store, runtime_store, blob_store) = persistence.into_parts();
-    let mut service =
-        PersistentSessionService::new(builder, max_sessions, store, runtime_store, blob_store);
-    wire_runtime_bindings(&mut service, &runtime_adapter);
-    let service = Arc::new(service);
-
-    #[cfg(feature = "mob")]
-    let mob_state = wire_mob_tools(
-        &builder_mob_tools_slot,
-        service.clone(),
-        Some(runtime_adapter.clone()),
-        Some(persistent_storage_root),
-    );
-
-    McpRuntimeComponents {
-        service,
-        runtime_adapter,
-        #[cfg(feature = "mob")]
-        mob_state,
-    }
-}
-
 struct SessionEventStreamHandle {
     stream: Mutex<meerkat_core::EventStream>,
 }
@@ -546,7 +499,10 @@ impl MeerkatMcpState {
             .store_path()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| realm_store_path(&realms_root, &realm_id, manifest.backend));
+        let runtime_adapter = persistence.runtime_adapter();
+        let runtime_store = persistence.runtime_store();
         let session_store = persistence.session_store();
+        let blob_store = persistence.blob_store();
         let schedule_service = ScheduleService::new(persistence.schedule_store());
         let realm_paths = meerkat_store::realm_paths_in(&realms_root, &realm_id);
         let conventions_context_root = bootstrap.context.context_root.clone();
@@ -578,7 +534,8 @@ impl MeerkatMcpState {
             .runtime_root(realm_paths.root.clone())
             .project_root(project_root)
             .builtins(true)
-            .shell(true);
+            .shell(true)
+            .schedule(true);
         if let Some(context_root) = conventions_context_root {
             factory = factory.context_root(context_root);
         }
@@ -590,18 +547,38 @@ impl MeerkatMcpState {
 
         let mut builder = FactoryAgentBuilder::new_with_config_store(factory, config, config_store);
         builder.default_llm_client = default_llm_client;
-        let McpRuntimeComponents {
-            service,
-            runtime_adapter,
-            #[cfg(feature = "mob")]
-            mob_state,
-        } = compose_runtime_components(
+        #[cfg(feature = "mob")]
+        let mob_tools_slot = Arc::clone(&builder.default_mob_tools);
+        *builder
+            .default_schedule_tools
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+            ScheduleToolDispatcher::new(schedule_service.clone()),
+        ));
+        let service = Arc::new(PersistentSessionService::new(
             builder,
             100,
-            persistence,
-            #[cfg(feature = "mob")]
-            realm_paths.root.clone(),
-        );
+            session_store,
+            runtime_store,
+            blob_store,
+        ));
+        #[cfg(feature = "mob")]
+        let mob_state = {
+            let persistent_mob_root = realm_paths.root.clone();
+            let state = Arc::new(
+                meerkat_mob_mcp::MobMcpState::new_with_runtime_adapter(
+                    service.clone(),
+                    Some(runtime_adapter.clone()),
+                )
+                .with_persistent_storage_root(Some(persistent_mob_root)),
+            );
+            *mob_tools_slot
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+                meerkat_mob_mcp::AgentMobToolSurfaceFactory::new(Arc::clone(&state)),
+            ));
+            state
+        };
 
         let state = Self {
             service,
@@ -630,7 +607,7 @@ impl MeerkatMcpState {
         Ok(state)
     }
 
-    /// Test constructor that accepts an injected store (avoids opening a durable store at platform data dir).
+    /// Test constructor that accepts an injected store (avoids opening redb at platform data dir).
     #[cfg(test)]
     pub(crate) async fn new_with_store(store: Arc<dyn SessionStore>) -> Self {
         let bootstrap = RuntimeBootstrap::default();
@@ -671,29 +648,26 @@ impl MeerkatMcpState {
             .runtime_root(runtime_root)
             .project_root(project_root)
             .builtins(true)
-            .shell(true);
+            .shell(true)
+            .schedule(true);
         if let Some(user_root) = bootstrap.context.user_config_root.clone() {
             factory = factory.user_config_root(user_root);
         }
 
-        let McpRuntimeComponents {
-            service,
-            runtime_adapter,
-            #[cfg(feature = "mob")]
-            mob_state,
-        } = compose_runtime_components(
-            FactoryAgentBuilder::new_with_config_store(factory, config, config_store),
-            100,
-            meerkat::PersistenceBundle::new(
-                store,
-                None,
-                Arc::new(meerkat_store::FsBlobStore::new(
-                    realm_paths.root.join("blobs"),
-                )),
-            ),
-            #[cfg(feature = "mob")]
-            realm_paths.root.clone(),
+        let builder = FactoryAgentBuilder::new_with_config_store(factory, config, config_store);
+        *builder
+            .default_schedule_tools
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Arc::new(ScheduleToolDispatcher::new(ScheduleService::new(
+                Arc::new(meerkat::MemoryScheduleStore::default()),
+            ))));
+        let blob_store: Arc<dyn meerkat_core::BlobStore> = Arc::new(
+            meerkat_store::FsBlobStore::new(realm_paths.root.join("blobs")),
         );
+        let service = Arc::new(PersistentSessionService::new(
+            builder, 100, store, None, blob_store,
+        ));
 
         let state = Self {
             service,
@@ -707,14 +681,14 @@ impl MeerkatMcpState {
             config_runtime,
             skill_runtime: None,
             #[cfg(feature = "mob")]
-            mob_state,
+            mob_state: meerkat_mob_mcp::MobMcpState::new_in_memory(),
             mcp_adapters: Arc::new(Mutex::new(HashMap::new())),
             runtime_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             session_event_streams: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "mob")]
             mob_event_streams: Arc::new(Mutex::new(HashMap::new())),
             schedule_host: StdMutex::new(None),
-            runtime_adapter,
+            runtime_adapter: Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral()),
             #[cfg(feature = "comms")]
             _realm_lease: None,
         };
@@ -2563,7 +2537,9 @@ async fn handle_meerkat_run(
         override_builtins: ToolCategoryOverride::from_override(input.enable_builtins),
         override_shell: ToolCategoryOverride::from_override(enable_shell_override),
         override_memory: ToolCategoryOverride::from_override(input.enable_memory),
+        override_schedule: ToolCategoryOverride::Inherit,
         override_mob: ToolCategoryOverride::Inherit,
+        schedule_tools: None,
         mob_tool_authority_context: None,
         preload_skills,
         realm_id: Some(state.realm_id.clone()),
@@ -2799,6 +2775,15 @@ async fn handle_meerkat_resume(
             })?),
             None => None,
         };
+    let resume_bindings = state
+        .runtime_adapter
+        .prepare_bindings(session_id.clone())
+        .await
+        .map_err(|e| {
+            ToolCallError::internal(format!(
+                "failed to prepare bindings for session {session_id}: {e}"
+            ))
+        })?;
     let mut build = SessionBuildOptions {
         provider,
         output_schema,
@@ -2807,7 +2792,7 @@ async fn handle_meerkat_resume(
             .unwrap_or(default_structured_output_retries()),
         hooks_override: input.hooks_override.clone().unwrap_or_default(),
         comms_name: input.comms_name.clone(),
-        resume_session: None,
+        resume_session: Some(session),
         budget_limits: input.budget_limits.clone().map(Into::into),
         provider_params: input.provider_params.clone(),
         call_timeout_override: meerkat_core::CallTimeoutOverride::Inherit,
@@ -2815,11 +2800,13 @@ async fn handle_meerkat_resume(
         recoverable_tool_defs: (!input.tools.is_empty())
             .then(|| recoverable_callback_tool_defs(&input.tools)),
         llm_client_override: None,
-        runtime_build_mode: meerkat_core::RuntimeBuildMode::StandaloneEphemeral,
+        runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(resume_bindings),
         override_builtins: ToolCategoryOverride::from_override(enable_builtins_override),
         override_shell: ToolCategoryOverride::from_override(enable_shell_override),
         override_memory: ToolCategoryOverride::from_override(input.enable_memory),
+        override_schedule: ToolCategoryOverride::Inherit,
         override_mob: ToolCategoryOverride::Inherit,
+        schedule_tools: None,
         mob_tool_authority_context: None,
         preload_skills,
         peer_meta: input.peer_meta.clone(),
@@ -2877,9 +2864,7 @@ async fn handle_meerkat_resume(
             build: Some(build),
             labels: None,
         };
-        ingress
-            .materialize_session_with_result(session, req, callback_tools.clone())
-            .await
+        state.service.create_session(req).await
     } else {
         if keep_alive_override.is_some() {
             let comms_rt = state.service.comms_runtime(&session_id).await;
@@ -2933,9 +2918,7 @@ async fn handle_meerkat_resume(
                     labels: None,
                 };
 
-                ingress
-                    .materialize_session_with_result(session, req, callback_tools.clone())
-                    .await
+                state.service.create_session(req).await
             }
             Err(other) => Err(other),
         }

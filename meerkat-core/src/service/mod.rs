@@ -198,7 +198,14 @@ pub struct SessionBuildOptions {
     pub override_builtins: ToolCategoryOverride,
     pub override_shell: ToolCategoryOverride,
     pub override_memory: ToolCategoryOverride,
+    /// Per-build override for the factory-level scheduler capability.
+    pub override_schedule: ToolCategoryOverride,
     pub override_mob: ToolCategoryOverride,
+    /// Agent-facing scheduler tools supplied by the embedding surface.
+    ///
+    /// Scheduler remains surface-owned. This dispatcher only controls
+    /// tool visibility/composition for the built agent.
+    pub schedule_tools: Option<Arc<dyn AgentToolDispatcher>>,
     pub preload_skills: Option<Vec<crate::skills::SkillId>>,
     pub realm_id: Option<String>,
     pub instance_id: Option<String>,
@@ -581,7 +588,9 @@ impl Default for SessionBuildOptions {
             override_builtins: ToolCategoryOverride::Inherit,
             override_shell: ToolCategoryOverride::Inherit,
             override_memory: ToolCategoryOverride::Inherit,
+            override_schedule: ToolCategoryOverride::Inherit,
             override_mob: ToolCategoryOverride::Inherit,
+            schedule_tools: None,
             preload_skills: None,
             realm_id: None,
             instance_id: None,
@@ -622,7 +631,9 @@ impl std::fmt::Debug for SessionBuildOptions {
             .field("override_builtins", &self.override_builtins)
             .field("override_shell", &self.override_shell)
             .field("override_memory", &self.override_memory)
+            .field("override_schedule", &self.override_schedule)
             .field("override_mob", &self.override_mob)
+            .field("schedule_tools", &self.schedule_tools.is_some())
             .field("preload_skills", &self.preload_skills)
             .field("realm_id", &self.realm_id)
             .field("instance_id", &self.instance_id)

@@ -221,10 +221,12 @@ pub fn build_recovered_session(
             .override_memory
             .map(ToolCategoryOverride::from_effective)
             .unwrap_or(metadata.tooling.memory),
+        override_schedule: ToolCategoryOverride::Inherit,
         override_mob: overrides
             .override_mob
             .map(ToolCategoryOverride::from_effective)
             .unwrap_or(metadata.tooling.mob),
+        schedule_tools: None,
         preload_skills: overrides
             .preload_skills
             .clone()

@@ -227,8 +227,17 @@ pub struct AgentBuildConfig {
     /// Per-build override for factory-level `enable_memory`.
     /// `Inherit` defers to the factory default.
     pub override_memory: ToolCategoryOverride,
+    /// Per-build override for factory-level `enable_schedule`.
+    /// `Inherit` defers to the factory default.
+    pub override_schedule: ToolCategoryOverride,
     /// Per-build override for factory-level `enable_mob`.
     pub override_mob: ToolCategoryOverride,
+    /// Agent-facing scheduler tools supplied by the embedding surface.
+    ///
+    /// Scheduler is a surface capability. This dispatcher only controls
+    /// visibility/composition; schedule execution remains owned by the
+    /// schedule service/host chosen by the embedding surface.
+    pub schedule_tools: Option<Arc<dyn AgentToolDispatcher>>,
     /// Runtime-injected mob operator authority context.
     ///
     /// Tool visibility may depend on this context being present, but
@@ -340,7 +349,9 @@ impl std::fmt::Debug for AgentBuildConfig {
             .field("override_builtins", &self.override_builtins)
             .field("override_shell", &self.override_shell)
             .field("override_memory", &self.override_memory)
+            .field("override_schedule", &self.override_schedule)
             .field("override_mob", &self.override_mob)
+            .field("schedule_tools", &self.schedule_tools.is_some())
             .field(
                 "mob_tool_authority_context",
                 &self.mob_tool_authority_context.is_some(),
@@ -400,7 +411,9 @@ impl AgentBuildConfig {
             override_builtins: ToolCategoryOverride::Inherit,
             override_shell: ToolCategoryOverride::Inherit,
             override_memory: ToolCategoryOverride::Inherit,
+            override_schedule: ToolCategoryOverride::Inherit,
             override_mob: ToolCategoryOverride::Inherit,
+            schedule_tools: None,
             mob_tool_authority_context: None,
             mob_tools: None,
             preload_skills: None,
@@ -487,7 +500,9 @@ impl AgentBuildConfig {
         self.override_builtins = build.override_builtins;
         self.override_shell = build.override_shell;
         self.override_memory = build.override_memory;
+        self.override_schedule = build.override_schedule;
         self.override_mob = build.override_mob;
+        self.schedule_tools = build.schedule_tools.clone();
         self.mob_tool_authority_context = build.mob_tool_authority_context.clone();
         self.mob_tools = build.mob_tools.clone();
         self.preload_skills = build.preload_skills.clone();
@@ -530,7 +545,9 @@ impl AgentBuildConfig {
             override_builtins: self.override_builtins,
             override_shell: self.override_shell,
             override_memory: self.override_memory,
+            override_schedule: self.override_schedule,
             override_mob: self.override_mob,
+            schedule_tools: self.schedule_tools.clone(),
             mob_tool_authority_context: self.mob_tool_authority_context.clone(),
             mob_tools: self.mob_tools.clone(),
             preload_skills: self.preload_skills.clone(),
@@ -625,6 +642,7 @@ pub struct AgentFactory {
     #[cfg(feature = "comms")]
     pub enable_comms: bool,
     pub enable_memory: bool,
+    pub enable_schedule: bool,
     pub enable_mob: bool,
     /// Optional skill source override. When set, bypasses config-driven
     /// repository resolution. For SDK users who wire sources programmatically.
@@ -659,6 +677,7 @@ impl std::fmt::Debug for AgentFactory {
             .field("enable_builtins", &self.enable_builtins)
             .field("enable_shell", &self.enable_shell)
             .field("enable_memory", &self.enable_memory)
+            .field("enable_schedule", &self.enable_schedule)
             .field("enable_mob", &self.enable_mob);
         #[cfg(feature = "comms")]
         d.field("enable_comms", &self.enable_comms);
@@ -690,6 +709,7 @@ impl AgentFactory {
             #[cfg(feature = "comms")]
             enable_comms: false,
             enable_memory: false,
+            enable_schedule: false,
             enable_mob: false,
             #[cfg(feature = "skills")]
             skill_source: None,
@@ -713,6 +733,7 @@ impl AgentFactory {
             #[cfg(feature = "comms")]
             enable_comms: false,
             enable_memory: false,
+            enable_schedule: false,
             enable_mob: false,
             #[cfg(feature = "skills")]
             skill_source: None,
@@ -770,6 +791,12 @@ impl AgentFactory {
     /// Enable or disable semantic memory (memory_search tool + compaction indexing).
     pub fn memory(mut self, enabled: bool) -> Self {
         self.enable_memory = enabled;
+        self
+    }
+
+    /// Enable or disable scheduler tools.
+    pub fn schedule(mut self, enabled: bool) -> Self {
+        self.enable_schedule = enabled;
         self
     }
 
@@ -1584,8 +1611,32 @@ impl AgentFactory {
             "tool composition: after comms gateway"
         );
 
-        // 9b. Compose tools with mob surface (after comms, so mob gateway wraps the
-        // already-composed comms gateway).
+        // 9b. Compose tools with scheduler surface (after comms, before mob).
+        let effective_schedule = build_config.override_schedule.resolve(self.enable_schedule);
+        if effective_schedule && let Some(schedule_dispatcher) = build_config.schedule_tools.take()
+        {
+            let schedule_usage =
+                render_tool_usage_instructions(schedule_dispatcher.tools().as_ref());
+            tools = Arc::new(meerkat_core::DynamicToolComposite::new(vec![
+                tools,
+                schedule_dispatcher,
+            ]));
+            if !schedule_usage.is_empty() {
+                if !tool_usage_instructions.is_empty() {
+                    tool_usage_instructions.push_str("\n\n");
+                }
+                tool_usage_instructions.push_str(&schedule_usage);
+            }
+        }
+
+        tracing::debug!(
+            tool_count_after_schedule = tools.tools().len(),
+            effective_schedule,
+            "tool composition: after scheduler gateway"
+        );
+
+        // 9c. Compose tools with mob surface (after comms and scheduler, so mob
+        // gateway wraps the already-composed base capability stack).
         let effective_mob = build_config.override_mob.resolve(self.enable_mob)
             || build_config.mob_tool_authority_context.is_some();
         let mob_factory = build_config
@@ -1641,7 +1692,7 @@ impl AgentFactory {
             }
         }
 
-        // 9c. Bind capabilities on the FINAL composed dispatcher shape.
+        // 9d. Bind capabilities on the FINAL composed dispatcher shape.
         //
         // All composition (comms gateway, mob gateway) is complete.
         // Binding now happens once on the final shape. Gateway wrappers
