@@ -147,7 +147,27 @@ impl MobMcpState {
     }
 
     pub fn with_persistent_storage_root(mut self, runtime_root: Option<PathBuf>) -> Self {
-        self.persistent_storage_root = runtime_root.map(|root| Self::persistent_mob_root(&root));
+        self.persistent_storage_root = runtime_root.map(|root| {
+            let mob_root = Self::persistent_mob_root(&root);
+            // Auto-create realm profile store when persistent storage is available.
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.realm_profile_store.is_none() {
+                let db_path = mob_root.join("realm_profiles.db");
+                match meerkat_mob::SqliteRealmProfileStore::open(&db_path) {
+                    Ok(store) => {
+                        self.realm_profile_store =
+                            Some(Arc::new(store) as Arc<dyn meerkat_mob::RealmProfileStore>);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "failed to create realm profile store at {}: {e}",
+                            db_path.display()
+                        );
+                    }
+                }
+            }
+            mob_root
+        });
         self
     }
 
