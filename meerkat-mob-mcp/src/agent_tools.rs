@@ -887,8 +887,14 @@ impl AgentMobToolSurface {
             std::collections::BTreeMap::new();
         for tool in &tools {
             let (kind, source_id) = match &tool.provenance {
-                Some(p) => (format!("{:?}", p.kind), p.source_id.clone()),
-                None => ("Unknown".to_string(), "unknown".to_string()),
+                Some(p) => {
+                    let kind_str = serde_json::to_value(&p.kind)
+                        .ok()
+                        .and_then(|v| v.as_str().map(String::from))
+                        .unwrap_or_else(|| format!("{:?}", p.kind));
+                    (kind_str, p.source_id.clone())
+                }
+                None => ("unknown".to_string(), "unknown".to_string()),
             };
             groups
                 .entry((kind, source_id))
