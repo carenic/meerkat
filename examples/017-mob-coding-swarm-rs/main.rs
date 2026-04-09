@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 name, profile.model, profile.skills,
             );
         } else {
-            println!("  {} -- realm ref", name);
+            println!("  {name} -- realm ref");
         }
     }
 

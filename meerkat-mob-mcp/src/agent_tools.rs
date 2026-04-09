@@ -311,7 +311,7 @@ impl AgentMobToolSurface {
                     "peers",
                 ]
                 .iter()
-                .map(|s| s.to_string())
+                .map(ToString::to_string)
                 .collect();
                 Ok(Some(meerkat_core::tool_scope::ToolFilter::Allow(
                     comms_tools,
@@ -3002,7 +3002,7 @@ mod tests {
     fn test_resolve_spawn_tooling_profile_no_overlays_returns_none() {
         let surface = surface_with_parent_tools();
         let tooling = meerkat_mob::SpawnTooling::Profile {
-            source: meerkat_mob::ProfileSource::Inline(meerkat_mob::Profile {
+            source: Box::new(meerkat_mob::ProfileSource::Inline(meerkat_mob::Profile {
                 model: "claude-sonnet-4-5".to_string(),
                 skills: Vec::new(),
                 tools: meerkat_mob::ToolConfig::default(),
@@ -3013,7 +3013,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
-            }),
+            })),
             allow_overlay: None,
             deny_overlay: None,
         };
@@ -3028,7 +3028,7 @@ mod tests {
     fn test_resolve_spawn_tooling_profile_with_deny_overlay() {
         let surface = surface_with_parent_tools();
         let tooling = meerkat_mob::SpawnTooling::Profile {
-            source: meerkat_mob::ProfileSource::Inline(meerkat_mob::Profile {
+            source: Box::new(meerkat_mob::ProfileSource::Inline(meerkat_mob::Profile {
                 model: "claude-sonnet-4-5".to_string(),
                 skills: Vec::new(),
                 tools: meerkat_mob::ToolConfig::default(),
@@ -3039,7 +3039,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
-            }),
+            })),
             allow_overlay: None,
             deny_overlay: Some(vec!["bash".to_string()]),
         };
@@ -3057,7 +3057,7 @@ mod tests {
     fn test_resolve_spawn_tooling_profile_with_overlays_standalone_errors() {
         let surface = surface_standalone();
         let tooling = meerkat_mob::SpawnTooling::Profile {
-            source: meerkat_mob::ProfileSource::Inline(meerkat_mob::Profile {
+            source: Box::new(meerkat_mob::ProfileSource::Inline(meerkat_mob::Profile {
                 model: "claude-sonnet-4-5".to_string(),
                 skills: Vec::new(),
                 tools: meerkat_mob::ToolConfig::default(),
@@ -3068,7 +3068,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
-            }),
+            })),
             allow_overlay: Some(vec!["send".to_string()]),
             deny_overlay: None,
         };

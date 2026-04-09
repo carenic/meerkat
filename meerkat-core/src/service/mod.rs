@@ -1209,10 +1209,8 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
             provenance: None,
         })];
-        let provider = Arc::new(MockSnapshotProvider {
-            tools: tools.clone(),
-        });
-        let ctx = MobToolSnapshotContext::ParentOwned(provider.clone());
+        let provider = Arc::new(MockSnapshotProvider { tools });
+        let ctx = MobToolSnapshotContext::ParentOwned(provider);
         match ctx {
             MobToolSnapshotContext::ParentOwned(p) => {
                 let snapshot = p.snapshot_visible_tools();

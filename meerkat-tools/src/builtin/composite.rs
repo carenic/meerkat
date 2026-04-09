@@ -870,6 +870,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::panic)]
     fn builtin_tools_have_correct_provenance() {
         use meerkat_core::types::ToolSourceKind;
 

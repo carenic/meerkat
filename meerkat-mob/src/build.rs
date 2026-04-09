@@ -179,13 +179,13 @@ pub async fn build_agent_config(
 
     // Inherited tool filter: inject into session metadata so AgentBuilder::build()
     // recovers it as a base filter on ToolScope.
-    if let Some(filter) = inherited_tool_filter {
-        if let Ok(value) = serde_json::to_value(&filter) {
-            config.initial_metadata_entries.insert(
-                meerkat_core::tool_scope::INHERITED_TOOL_FILTER_METADATA_KEY.to_string(),
-                value,
-            );
-        }
+    if let Some(filter) = inherited_tool_filter
+        && let Ok(value) = serde_json::to_value(&filter)
+    {
+        config.initial_metadata_entries.insert(
+            meerkat_core::tool_scope::INHERITED_TOOL_FILTER_METADATA_KEY.to_string(),
+            value,
+        );
     }
 
     Ok(config)

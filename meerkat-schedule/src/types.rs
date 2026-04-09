@@ -282,7 +282,7 @@ pub enum MissingTargetPolicy {
 #[serde(tag = "target_kind", rename_all = "snake_case")]
 pub enum TargetBinding {
     Session(Box<SessionTargetBinding>),
-    Mob(MobTargetBinding),
+    Mob(Box<MobTargetBinding>),
 }
 
 impl TargetBinding {
@@ -735,12 +735,12 @@ impl HelperOptionsSpec {
     /// `InheritParent` and `Minimal` require an active parent agent context and
     /// are only valid when created through agent tools. Public APIs must reject them.
     pub fn validate_public_api(&self) -> Result<(), String> {
-        if let Some(tooling) = &self.tooling {
-            if tooling.requires_parent_context() {
-                return Err("schedule spawn tooling mode requires parent agent context \
-                     (inherit_parent/minimal are only valid through agent tools)"
-                    .to_string());
-            }
+        if let Some(tooling) = &self.tooling
+            && tooling.requires_parent_context()
+        {
+            return Err("schedule spawn tooling mode requires parent agent context \
+                 (inherit_parent/minimal are only valid through agent tools)"
+                .to_string());
         }
         Ok(())
     }

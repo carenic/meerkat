@@ -111,7 +111,7 @@ pub enum SpawnTooling {
     /// Use a specific profile for model/tool resolution.
     Profile {
         /// Source of the profile.
-        source: ProfileSource,
+        source: Box<ProfileSource>,
         /// Optional allow-list overlay.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         allow_overlay: Option<Vec<String>>,
@@ -440,9 +440,9 @@ provider_params = { thinking_budget = 8192, top_k = 20 }
     #[test]
     fn spawn_tooling_profile_realm_roundtrip() {
         let tooling = SpawnTooling::Profile {
-            source: ProfileSource::RealmProfile {
+            source: Box::new(ProfileSource::RealmProfile {
                 name: "worker-v2".into(),
-            },
+            }),
             allow_overlay: None,
             deny_overlay: Some(vec!["dangerous_tool".into()]),
         };
@@ -466,7 +466,7 @@ provider_params = { thinking_budget = 8192, top_k = 20 }
             provider_params: None,
         };
         let tooling = SpawnTooling::Profile {
-            source: ProfileSource::Inline(profile),
+            source: Box::new(ProfileSource::Inline(profile)),
             allow_overlay: None,
             deny_overlay: None,
         };

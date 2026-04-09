@@ -940,6 +940,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::panic)]
     fn schedule_tools_have_schedule_provenance() {
         let service = ScheduleService::new(Arc::new(crate::DisabledScheduleStore));
         let dispatcher = ScheduleToolDispatcher::new(service);

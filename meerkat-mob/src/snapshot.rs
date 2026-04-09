@@ -110,7 +110,7 @@ mod tests {
         let tools = vec![make_tool("a"), make_tool("b"), make_tool("c")];
         let snapshot = ParentToolScopeSnapshot::from_tools(&tools);
 
-        let allow: HashSet<String> = ["b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        let allow: HashSet<String> = ["b", "c", "d"].iter().copied().map(String::from).collect();
         let filter = snapshot.with_overlays(Some(&allow), None);
 
         match filter {
@@ -129,7 +129,7 @@ mod tests {
         let tools = vec![make_tool("a"), make_tool("b"), make_tool("c")];
         let snapshot = ParentToolScopeSnapshot::from_tools(&tools);
 
-        let deny: HashSet<String> = ["b"].iter().map(|s| s.to_string()).collect();
+        let deny: HashSet<String> = ["b"].iter().copied().map(String::from).collect();
         let filter = snapshot.with_overlays(None, Some(&deny));
 
         match filter {
@@ -147,8 +147,8 @@ mod tests {
         let tools = vec![make_tool("a"), make_tool("b"), make_tool("c")];
         let snapshot = ParentToolScopeSnapshot::from_tools(&tools);
 
-        let allow: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
-        let deny: HashSet<String> = ["b"].iter().map(|s| s.to_string()).collect();
+        let allow: HashSet<String> = ["a", "b"].iter().copied().map(String::from).collect();
+        let deny: HashSet<String> = ["b"].iter().copied().map(String::from).collect();
         let filter = snapshot.with_overlays(Some(&allow), Some(&deny));
 
         match filter {

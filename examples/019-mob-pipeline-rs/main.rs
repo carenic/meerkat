@@ -230,10 +230,10 @@ content = "Execute deployment: build release, run smoke tests. Report pass/fail.
     println!("Pipeline: {}", definition.id);
     println!("Stages:");
     for (name, binding) in &definition.profiles {
-        if name.as_str() != "coordinator" {
-            if let Some(profile) = binding.as_inline() {
-                println!("  {} -- {}", name, profile.peer_description);
-            }
+        if let Some(profile) = binding.as_inline()
+            && name.as_str() != "coordinator"
+        {
+            println!("  {name} -- {}", profile.peer_description);
         }
     }
 

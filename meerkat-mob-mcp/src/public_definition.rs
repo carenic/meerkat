@@ -480,7 +480,7 @@ mod tests {
             .get(&ProfileName::from("lead"))
             .expect("lead profile")
             .as_inline()
-            .unwrap();
+            .expect("lead profile should be inline");
         assert_eq!(lead.backend, Some(MobBackendKind::External));
         assert_eq!(lead.runtime_mode, MobRuntimeMode::TurnDriven);
         assert_eq!(lead.tools.rust_bundles, Vec::<String>::new());
