@@ -7,10 +7,17 @@ mod stream_renderer;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-#[cfg(feature = "comms")]
-use meerkat::surface::configure_peer_ingress;
-use meerkat::surface::{materialize_session, wire_runtime_bindings};
-use meerkat::{AgentFactory, EphemeralSessionService, FactoryAgentBuilder, PersistenceBundle};
+use chrono::Utc;
+use meerkat::surface::{
+    NoopScheduleMobHost, ScheduledPromptDispatch, SharedScheduleTargetAdapter,
+    SurfaceScheduleSessionHost, accepted_scheduled_input_from_runtime_outcome,
+    build_dispatch_from_accepted, schedule_attempt_idempotency_key, schedule_host_supported,
+    spawn_schedule_host,
+};
+use meerkat::{
+    AgentFactory, EphemeralSessionService, FactoryAgentBuilder, PersistenceBundle, ScheduleService,
+    ScheduleToolDispatcher,
+};
 use meerkat_contracts::{SessionLocator, SessionLocatorError, SkillsParams, format_session_ref};
 use meerkat_core::AgentToolDispatcher;
 #[cfg(feature = "comms")]
@@ -39,6 +46,8 @@ use meerkat_mob_pack::pack::{
 };
 use meerkat_mob_pack::targz::extract_targz_safe;
 use meerkat_mob_pack::trust::{TrustPolicy, load_trusted_signers, verify_pack_trust};
+use meerkat_runtime::input::{InputDurability, InputHeader, InputVisibility};
+use meerkat_runtime::{CorrelationId, IdempotencyKey, Input, InputOrigin, PromptInput};
 use meerkat_tools::find_project_root;
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
@@ -62,8 +71,6 @@ use tokio::process::Command as TokioCommand;
 const EXIT_SUCCESS: u8 = 0;
 const EXIT_ERROR: u8 = 1;
 const EXIT_BUDGET_EXHAUSTED: u8 = 2;
-
-type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// Safely truncate a string to approximately `max_bytes`, respecting UTF-8 char boundaries.
 fn truncate_str(s: &str, max_bytes: usize) -> &str {
@@ -346,11 +353,14 @@ fn print_cli_callback_pending(
     Ok(())
 }
 
-async fn finalize_cli_runtime_backed_turn<T>(
+async fn finalize_cli_runtime_backed_turn<T, F>(
     output_pipeline: CliOutputPipeline,
     turn_result: anyhow::Result<T>,
-    after_sender_drop: BoxFuture<'_, anyhow::Result<()>>,
-) -> anyhow::Result<T> {
+    after_sender_drop: F,
+) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
     let shutdown_result = output_pipeline.shutdown_after(after_sender_drop).await;
     match (turn_result, shutdown_result) {
         (Ok(result), Ok(())) => Ok(result),
@@ -605,6 +615,7 @@ enum RealmBackendArg {
     #[cfg(feature = "jsonl-store")]
     Jsonl,
     Sqlite,
+    Redb,
 }
 
 impl From<RealmBackendArg> for RealmBackend {
@@ -613,6 +624,7 @@ impl From<RealmBackendArg> for RealmBackend {
             #[cfg(feature = "jsonl-store")]
             RealmBackendArg::Jsonl => RealmBackend::Jsonl,
             RealmBackendArg::Sqlite => RealmBackend::Sqlite,
+            RealmBackendArg::Redb => RealmBackend::Redb,
         }
     }
 }
@@ -2421,8 +2433,11 @@ async fn create_persistence_bundle(
 fn realm_store_path(manifest: &meerkat_store::RealmManifest, scope: &RuntimeScope) -> PathBuf {
     let paths = meerkat_store::realm_paths_in(&scope.locator.state_root, &scope.locator.realm_id);
     match manifest.backend {
+        #[cfg(feature = "jsonl-store")]
         RealmBackend::Jsonl => paths.sessions_jsonl_dir,
-        RealmBackend::Sqlite => paths.root,
+        RealmBackend::Sqlite | RealmBackend::Redb => paths.root,
+        #[cfg(not(feature = "jsonl-store"))]
+        _ => paths.root,
     }
 }
 
@@ -3001,12 +3016,16 @@ fn compose_external_tool_dispatchers(
 }
 
 /// Build an `EphemeralSessionService` backed by the factory.
-#[cfg(test)]
 fn build_cli_service(
     factory: AgentFactory,
     config: Config,
+    default_schedule_tools: Option<Arc<dyn AgentToolDispatcher>>,
 ) -> EphemeralSessionService<FactoryAgentBuilder> {
     let builder = FactoryAgentBuilder::new(factory, config);
+    *builder
+        .default_schedule_tools
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = default_schedule_tools;
     EphemeralSessionService::new(builder, 64)
 }
 
@@ -3015,10 +3034,18 @@ async fn build_deploy_mob_session_service(
     config: Config,
 ) -> anyhow::Result<Arc<dyn meerkat_mob::MobSessionService>> {
     let (manifest, persistence) = create_persistence_bundle(scope).await?;
-    let (service, _runtime_adapter) =
-        build_cli_persistent_service_from_bundle(scope, config, manifest, persistence)?;
-    let service = Arc::new(service);
-    Ok(Arc::new(MobCliSessionService::new(service)))
+    let surface =
+        get_or_create_cli_persistent_surface_from_bundle(scope, config, manifest, persistence)?;
+    Ok(Arc::new(MobCliSessionService::new(Arc::clone(
+        &surface.service,
+    ))))
+}
+
+fn session_err_to_anyhow(e: meerkat_core::service::SessionError) -> anyhow::Error {
+    match e {
+        meerkat_core::service::SessionError::Agent(agent_err) => anyhow::Error::from(agent_err),
+        other => anyhow::anyhow!("Session service error: {other}"),
+    }
 }
 
 fn resolve_scoped_session_id(input: &str, scope: &RuntimeScope) -> anyhow::Result<SessionId> {
@@ -3209,8 +3236,6 @@ async fn run_agent(
 ) -> anyhow::Result<()> {
     let keep_alive = resolve_keep_alive(keep_alive)?;
     let effective_mob = enable_mob || config.tools.mob_enabled;
-    #[cfg(not(feature = "comms"))]
-    let _ = line_format;
     let canonical_skill_refs = canonical_skill_keys(config, skill_refs, skill_references)?;
     let flow_tool_overlay = build_flow_tool_overlay(allow_tools, block_tools);
     let run_initial_turn_during_create = flow_tool_overlay.is_none();
@@ -3257,7 +3282,8 @@ async fn run_agent(
         )
         .project_root(project_root)
         .builtins(enable_builtins)
-        .shell(enable_shell);
+        .shell(enable_shell)
+        .schedule(true);
     if let Some(context_root) = scope.context_root.clone() {
         factory = factory.context_root(context_root);
     }
@@ -3279,8 +3305,13 @@ async fn run_agent(
         config.comms.address = Some(addr.clone());
     }
 
-    let (service, runtime_adapter) =
-        compose_runtime_service_from_factory(factory, config.clone(), persistence.clone());
+    // Build the parent session service with the same explicit scheduler tools the
+    // persistent CLI surface injects on resumed/runtime-backed paths.
+    let schedule_service = ScheduleService::new(persistence.schedule_store());
+    let default_schedule_tools = Some(
+        Arc::new(ScheduleToolDispatcher::new(schedule_service)) as Arc<dyn AgentToolDispatcher>
+    );
+    let service = build_cli_service(factory, config.clone(), default_schedule_tools);
 
     if keep_alive {
         eprintln!(
@@ -3288,6 +3319,9 @@ async fn run_agent(
             if verbose { " with verbose output" } else { "" }
         );
     }
+
+    // Wrap in Arc so we can share with the stdin reader task
+    let service = Arc::new(service);
 
     let mut run_mob_tools = if effective_mob {
         let mob_persistent = get_or_create_mob_persistent_service_from_bundle(
@@ -3324,6 +3358,13 @@ async fn run_agent(
     let output_pipeline =
         CliOutputPipeline::new(stream, verbose, stream_policy.clone(), primary_scope_path)?;
 
+    // Create ephemeral runtime adapter and prepare epoch-local bindings.
+    let runtime_adapter = std::sync::Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral());
+    let bindings = runtime_adapter
+        .prepare_bindings(session_id.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("runtime bindings: {e}"))?;
+
     let mut build = SessionBuildOptions {
         provider: Some(provider.as_core()),
         output_schema,
@@ -3331,7 +3372,7 @@ async fn run_agent(
         hooks_override,
         comms_name: comms_name.clone(),
         peer_meta: comms_overrides.peer_meta.clone(),
-        resume_session: None,
+        resume_session: Some(session),
         budget_limits: Some(limits),
         provider_params,
         external_tools,
@@ -3340,7 +3381,9 @@ async fn run_agent(
         override_builtins: meerkat_core::ToolCategoryOverride::from_effective(enable_builtins),
         override_shell: meerkat_core::ToolCategoryOverride::from_effective(enable_shell),
         override_memory: meerkat_core::ToolCategoryOverride::from_effective(enable_memory),
+        override_schedule: meerkat_core::ToolCategoryOverride::Inherit,
         override_mob: meerkat_core::ToolCategoryOverride::Inherit,
+        schedule_tools: None,
         mob_tool_authority_context: None,
         preload_skills,
         realm_id: Some(scope.locator.realm_id.clone()),
@@ -3358,7 +3401,7 @@ async fn run_agent(
             Some(instructions)
         },
         shell_env: None,
-        runtime_build_mode: meerkat_core::RuntimeBuildMode::StandaloneEphemeral,
+        runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
         resume_override_mask: Default::default(),
         call_timeout_override: Default::default(),
         blob_store_override: None,
@@ -3412,58 +3455,38 @@ async fn run_agent(
     let mut stdin_reader_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     let turn_result = async {
-        let executor_event_tx = output_pipeline.event_sender();
         #[cfg(feature = "comms")]
-        let create_result = materialize_session(&service, &runtime_adapter, session, create_req, {
-            let service = Arc::clone(&service);
-            let runtime_adapter = Arc::clone(&runtime_adapter);
-            move |runtime_session_id| {
-                Box::new(CliRuntimeExecutor {
-                    service: Arc::clone(&service) as Arc<dyn meerkat_core::service::SessionService>,
-                    persistent_service: Some(Arc::clone(&service)),
-                    session_id: runtime_session_id,
-                    runtime_adapter: Arc::clone(&runtime_adapter),
-                    event_tx: executor_event_tx,
-                })
-            }
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("failed to materialize session: {error}"))?;
-        #[cfg(feature = "comms")]
-        configure_peer_ingress(
-            &runtime_adapter,
-            &service,
-            &create_result.session_id,
-            keep_alive,
-        )
-        .await;
+        let create_result = service
+            .create_session(create_req)
+            .await
+            .map_err(session_err_to_anyhow)?;
 
         #[cfg(not(feature = "comms"))]
         let create_result = {
             let _ = stdin_events;
-            materialize_session(&service, &runtime_adapter, session, create_req, {
-                let service = Arc::clone(&service);
-                let runtime_adapter = Arc::clone(&runtime_adapter);
-                move |runtime_session_id| {
-                    Box::new(CliRuntimeExecutor {
-                        service: Arc::clone(&service)
-                            as Arc<dyn meerkat_core::service::SessionService>,
-                        persistent_service: Some(Arc::clone(&service)),
-                        session_id: runtime_session_id,
-                        runtime_adapter: Arc::clone(&runtime_adapter),
-                        event_tx: executor_event_tx,
-                    })
-                }
-            })
-            .await
-            .map_err(|error| anyhow::anyhow!("failed to materialize session: {error}"))?
+            service
+                .create_session(create_req)
+                .await
+                .map_err(session_err_to_anyhow)?
         };
+
+        // Register executor and route turn through runtime adapter.
         let session_id = create_result.session_id.clone();
+        let executor = Box::new(CliRuntimeExecutor {
+            service: service.clone() as Arc<dyn meerkat_core::service::SessionService>,
+            persistent_service: None,
+            session_id: session_id.clone(),
+            runtime_adapter: runtime_adapter.clone(),
+            event_tx: output_pipeline.event_sender(),
+        });
+        runtime_adapter
+            .register_session_with_executor(session_id.clone(), executor)
+            .await;
 
         #[cfg(feature = "comms")]
         if stdin_events && keep_alive {
             stdin_reader_handle = Some(stdin_events::spawn_stdin_reader(
-                Arc::clone(&runtime_adapter),
+                runtime_adapter.clone(),
                 session_id.clone(),
                 match line_format {
                     LineFormat::Text => stdin_events::StdinLineFormat::Text,
@@ -3488,6 +3511,16 @@ async fn run_agent(
             .accept_input_with_completion(&session_id, input)
             .await
             .map_err(|err| anyhow::anyhow!("runtime accept failed: {err}"))?;
+
+        // Spawn the comms drain in keep-alive mode so inbound peer interactions are
+        // routed through the runtime adapter and automatically trigger new turns.
+        #[cfg(feature = "comms")]
+        {
+            let comms_rt = service.comms_runtime(&session_id).await;
+            runtime_adapter
+                .update_peer_ingress_context(&session_id, keep_alive, comms_rt)
+                .await;
+        }
 
         match handle {
             Some(handle) => completion_outcome_to_cli_runtime_turn_result(
@@ -3517,10 +3550,10 @@ async fn run_agent(
         eprintln!("\nShutting down...");
     }
 
-    let result = finalize_cli_runtime_backed_turn(
+    let result = Box::pin(finalize_cli_runtime_backed_turn(
         output_pipeline,
         turn_result,
-        Box::pin(async {
+        async {
             // Abort the comms drain so the CLI can exit cleanly.
             #[cfg(feature = "comms")]
             {
@@ -3544,8 +3577,8 @@ async fn run_agent(
                 mob_ctx.persist(scope).await?;
             }
             Ok(())
-        }),
-    )
+        },
+    ))
     .await?;
 
     // Output the result
@@ -3785,7 +3818,8 @@ async fn resume_session_with_llm_override(
         )
         .project_root(project_root)
         .builtins(tooling.builtins.resolve(config.tools.builtins_enabled))
-        .shell(tooling.shell.resolve(config.tools.shell_enabled));
+        .shell(tooling.shell.resolve(config.tools.shell_enabled))
+        .schedule(true);
     if let Some(context_root) = scope.context_root.clone() {
         factory = factory.context_root(context_root);
     }
@@ -3797,8 +3831,15 @@ async fn resume_session_with_llm_override(
     let factory = factory.comms(tooling.comms.resolve(config.tools.comms_enabled) || keep_alive);
 
     log_stage("build_cli_persistent_service");
-    let (service, resume_adapter) =
-        compose_runtime_service_from_factory(factory, config.clone(), persistence.clone());
+    // Build persistent session service for resume — durable runtime semantics.
+    let (persistent_service, resume_adapter) =
+        meerkat::build_persistent_service_with_runtime_adapter(
+            factory,
+            config.clone(),
+            64,
+            persistence.clone(),
+        );
+    let service = Arc::new(persistent_service);
 
     log_stage("compose_external_tool_dispatchers");
     let mut run_mob_tools = if tooling.mob.resolve(config.tools.mob_enabled) {
@@ -3836,13 +3877,19 @@ async fn resume_session_with_llm_override(
         }],
     )?;
 
+    // Prepare epoch-local bindings for the resumed session.
+    let resume_bindings = resume_adapter
+        .prepare_bindings(session_id.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("runtime bindings: {e}"))?;
+
     let mut build = SessionBuildOptions {
         provider: Some(provider_core),
         output_schema: None,
         structured_output_retries: 2,
         hooks_override,
         comms_name: comms_name.clone(),
-        resume_session: None,
+        resume_session: Some(session),
         budget_limits: budget_override,
         provider_params: merged_provider_params,
         external_tools,
@@ -3851,7 +3898,9 @@ async fn resume_session_with_llm_override(
         override_builtins: tooling.builtins,
         override_shell: tooling.shell,
         override_memory: tooling.memory,
+        override_schedule: meerkat_core::ToolCategoryOverride::Inherit,
         override_mob: meerkat_core::ToolCategoryOverride::Inherit,
+        schedule_tools: None,
         mob_tool_authority_context: None,
         preload_skills: None,
         peer_meta: stored_metadata.as_ref().and_then(|m| m.peer_meta.clone()),
@@ -3875,7 +3924,7 @@ async fn resume_session_with_llm_override(
         app_context: None,
         additional_instructions: None,
         shell_env: None,
-        runtime_build_mode: meerkat_core::RuntimeBuildMode::StandaloneEphemeral,
+        runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(resume_bindings),
         resume_override_mask: ResumeOverrideMask {
             provider_params: provider_params_override,
             ..Default::default()
@@ -3893,16 +3942,12 @@ async fn resume_session_with_llm_override(
     );
 
     let turn_result = async {
-        let executor_event_tx = output_pipeline.event_sender();
         // Route through SessionService::create_session() with the resumed session
         // staged in the build config. The service builds the agent (which picks up
         // the resume_session), runs the first turn, and returns RunResult.
         log_stage("service.create_session(start)");
-        let create_result = materialize_session(
-            &service,
-            &resume_adapter,
-            session,
-            CreateSessionRequest {
+        let create_result = service
+            .create_session(CreateSessionRequest {
                 model,
                 prompt: prompt.to_string().into(),
                 render_metadata: None,
@@ -3920,32 +3965,9 @@ async fn resume_session_with_llm_override(
                 deferred_prompt_policy: DeferredPromptPolicy::Discard,
                 build: Some(build),
                 labels: None,
-            },
-            {
-                let service = Arc::clone(&service);
-                let resume_adapter = Arc::clone(&resume_adapter);
-                move |runtime_session_id| {
-                    Box::new(CliRuntimeExecutor {
-                        service: Arc::clone(&service)
-                            as Arc<dyn meerkat_core::service::SessionService>,
-                        persistent_service: Some(Arc::clone(&service)),
-                        session_id: runtime_session_id,
-                        runtime_adapter: Arc::clone(&resume_adapter),
-                        event_tx: executor_event_tx,
-                    })
-                }
-            },
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("failed to materialize session: {error}"))?;
-        #[cfg(feature = "comms")]
-        configure_peer_ingress(
-            &resume_adapter,
-            &service,
-            &create_result.session_id,
-            keep_alive,
-        )
-        .await;
+            })
+            .await
+            .map_err(session_err_to_anyhow)?;
 
         let additional_instructions = if instructions.is_empty() {
             None
@@ -3955,6 +3977,17 @@ async fn resume_session_with_llm_override(
 
         // Route through runtime adapter (same pattern as run command)
         let session_id = create_result.session_id.clone();
+        let executor = Box::new(CliRuntimeExecutor {
+            service: service.clone() as Arc<dyn meerkat_core::service::SessionService>,
+            persistent_service: Some(service.clone()),
+            session_id: session_id.clone(),
+            runtime_adapter: resume_adapter.clone(),
+            event_tx: output_pipeline.event_sender(),
+        });
+        resume_adapter
+            .register_session_with_executor(session_id.clone(), executor)
+            .await;
+
         let input = meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
             prompt.to_string(),
             Some(
@@ -3972,6 +4005,16 @@ async fn resume_session_with_llm_override(
             .await
             .map_err(|err| anyhow::anyhow!("runtime accept failed: {err}"))?;
 
+        // Spawn the comms drain in keep-alive mode so inbound peer interactions are
+        // routed through the runtime adapter and automatically trigger new turns.
+        #[cfg(feature = "comms")]
+        {
+            let comms_rt = service.comms_runtime(&session_id).await;
+            resume_adapter
+                .update_peer_ingress_context(&session_id, keep_alive, comms_rt)
+                .await;
+        }
+
         match handle {
             Some(handle) => completion_outcome_to_cli_runtime_turn_result(
                 handle.wait().await,
@@ -3987,10 +4030,10 @@ async fn resume_session_with_llm_override(
     }
     .await;
 
-    let result = finalize_cli_runtime_backed_turn(
+    let result = Box::pin(finalize_cli_runtime_backed_turn(
         output_pipeline,
         turn_result,
-        Box::pin(async {
+        async {
             // The resume turn is complete — abort the comms drain so the CLI can
             // return. Same rationale as run_agent: one-shot commands must not block.
             #[cfg(feature = "comms")]
@@ -4011,8 +4054,8 @@ async fn resume_session_with_llm_override(
                 mob_ctx.persist(scope).await?;
             }
             Ok(())
-        }),
-    )
+        },
+    ))
     .await?;
 
     // Output the result
@@ -4044,7 +4087,7 @@ async fn build_cli_persistent_service(
     scope: &RuntimeScope,
     config: Config,
 ) -> anyhow::Result<(
-    meerkat::PersistentSessionService<FactoryAgentBuilder>,
+    Arc<meerkat::PersistentSessionService<FactoryAgentBuilder>>,
     Arc<meerkat_runtime::RuntimeSessionAdapter>,
 )> {
     let (manifest, persistence) = create_persistence_bundle(scope).await?;
@@ -4057,9 +4100,27 @@ fn build_cli_persistent_service_from_bundle(
     manifest: meerkat_store::RealmManifest,
     persistence: PersistenceBundle,
 ) -> anyhow::Result<(
-    meerkat::PersistentSessionService<FactoryAgentBuilder>,
+    Arc<meerkat::PersistentSessionService<FactoryAgentBuilder>>,
     Arc<meerkat_runtime::RuntimeSessionAdapter>,
 )> {
+    let surface =
+        get_or_create_cli_persistent_surface_from_bundle(scope, config, manifest, persistence)?;
+    Ok((
+        Arc::clone(&surface.service),
+        Arc::clone(&surface.runtime_adapter),
+    ))
+}
+
+fn get_or_create_cli_persistent_surface_from_bundle(
+    scope: &RuntimeScope,
+    config: Config,
+    manifest: meerkat_store::RealmManifest,
+    persistence: PersistenceBundle,
+) -> anyhow::Result<Arc<CliPersistentSurfaceState>> {
+    if let Some(existing) = cached_cli_persistent_surface(scope)? {
+        return Ok(existing);
+    }
+
     let store = persistence.session_store();
     let store_path = persistence
         .store_path()
@@ -4077,7 +4138,8 @@ fn build_cli_persistent_service_from_bundle(
         )
         .project_root(project_root)
         .builtins(config.tools.builtins_enabled)
-        .shell(config.tools.shell_enabled);
+        .shell(config.tools.shell_enabled)
+        .schedule(true);
     if let Some(context_root) = scope.context_root.clone() {
         factory = factory.context_root(context_root);
     }
@@ -4085,24 +4147,57 @@ fn build_cli_persistent_service_from_bundle(
         factory = factory.user_config_root(user_root);
     }
 
-    let (mut service, runtime_adapter) =
-        meerkat::build_persistent_service_with_runtime_adapter(factory, config, 64, persistence);
-    wire_runtime_bindings(&mut service, &runtime_adapter);
-    Ok((service, runtime_adapter))
-}
+    let schedule_service = ScheduleService::new(persistence.schedule_store());
+    let runtime_adapter = persistence.runtime_adapter();
+    let (store, runtime_store, blob_store) = persistence.into_parts();
+    let builder = FactoryAgentBuilder::new(factory, config);
+    *builder
+        .default_schedule_tools
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+        ScheduleToolDispatcher::new(schedule_service.clone()),
+    ));
 
-fn compose_runtime_service_from_factory(
-    factory: AgentFactory,
-    config: Config,
-    persistence: PersistenceBundle,
-) -> (
-    Arc<meerkat::PersistentSessionService<FactoryAgentBuilder>>,
-    Arc<meerkat_runtime::RuntimeSessionAdapter>,
-) {
-    let (mut service, runtime_adapter) =
-        meerkat::build_persistent_service_with_runtime_adapter(factory, config, 64, persistence);
-    wire_runtime_bindings(&mut service, &runtime_adapter);
-    (Arc::new(service), runtime_adapter)
+    let mut service =
+        meerkat::PersistentSessionService::new(builder, 64, store, runtime_store, blob_store);
+    {
+        let adapter = runtime_adapter.clone();
+        service.set_runtime_bindings_provider(Arc::new(move |session_id| {
+            let adapter = adapter.clone();
+            Box::pin(async move { adapter.prepare_bindings(session_id).await.ok() })
+        }));
+    }
+
+    let service = Arc::new(service);
+    let schedule_host = if schedule_host_supported(schedule_service.store().kind()) {
+        let session_host: Arc<dyn SurfaceScheduleSessionHost> = Arc::new(CliScheduleSessionHost {
+            service: Arc::clone(&service),
+            runtime_adapter: Arc::clone(&runtime_adapter),
+        });
+        let shared_adapter = Arc::new(SharedScheduleTargetAdapter::new(
+            schedule_service.clone(),
+            session_host,
+            Arc::new(NoopScheduleMobHost::new(
+                "scheduled mob targets are not enabled in the CLI host",
+            )),
+        ));
+        Some(spawn_schedule_host(
+            schedule_service,
+            shared_adapter,
+            format!("rkat:{}", scope.locator.realm_id),
+        ))
+    } else {
+        None
+    };
+
+    remember_cli_persistent_surface(
+        scope,
+        Arc::new(CliPersistentSurfaceState {
+            service,
+            runtime_adapter,
+            _schedule_host: schedule_host,
+        }),
+    )
 }
 
 async fn handle_blob_command(command: BlobCommands, scope: &RuntimeScope) -> anyhow::Result<()> {
@@ -4136,6 +4231,356 @@ async fn handle_blob_command(command: BlobCommands, scope: &RuntimeScope) -> any
 }
 
 type CliPersistentService = meerkat::PersistentSessionService<FactoryAgentBuilder>;
+
+struct CliPersistentSurfaceState {
+    service: Arc<CliPersistentService>,
+    runtime_adapter: Arc<meerkat_runtime::RuntimeSessionAdapter>,
+    _schedule_host: Option<meerkat::surface::ScheduleHostHandle>,
+}
+
+#[derive(Clone)]
+struct CliScheduleSessionHost {
+    service: Arc<CliPersistentService>,
+    runtime_adapter: Arc<meerkat_runtime::RuntimeSessionAdapter>,
+}
+
+impl CliScheduleSessionHost {
+    fn executor(&self, session_id: SessionId) -> CliRuntimeExecutor {
+        CliRuntimeExecutor {
+            service: Arc::clone(&self.service) as Arc<dyn meerkat_core::service::SessionService>,
+            persistent_service: Some(Arc::clone(&self.service)),
+            session_id,
+            runtime_adapter: Arc::clone(&self.runtime_adapter),
+            event_tx: None,
+        }
+    }
+
+    async fn ensure_runtime_session_registered(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), meerkat::ScheduleDomainError> {
+        let session_exists = self.service.read(session_id).await.is_ok()
+            || self
+                .service
+                .load_persisted(session_id)
+                .await
+                .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?
+                .is_some();
+        if !session_exists {
+            return Err(meerkat::ScheduleDomainError::InvalidSchedule(format!(
+                "session not found: {session_id}"
+            )));
+        }
+
+        self.runtime_adapter
+            .ensure_session_with_executor(
+                session_id.clone(),
+                Box::new(self.executor(session_id.clone())),
+            )
+            .await;
+        self.update_peer_ingress_context(session_id).await;
+        Ok(())
+    }
+
+    async fn update_peer_ingress_context(&self, session_id: &SessionId) {
+        let keep_alive = self
+            .service
+            .load_persisted(session_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|session| {
+                session
+                    .session_metadata()
+                    .map(|metadata| metadata.keep_alive)
+            })
+            .unwrap_or(false);
+        let comms_rt = self.service.comms_runtime(session_id).await;
+        self.runtime_adapter
+            .update_peer_ingress_context(session_id, keep_alive, comms_rt)
+            .await;
+    }
+}
+
+fn cli_session_metadata_marks_archived(session: &Session) -> bool {
+    session
+        .metadata()
+        .get("session_archived")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn scheduled_skill_keys(
+    skill_references: &[String],
+) -> Result<Option<Vec<meerkat_core::skills::SkillKey>>, meerkat::ScheduleDomainError> {
+    if skill_references.is_empty() {
+        return Ok(None);
+    }
+
+    skill_references
+        .iter()
+        .map(|reference| {
+            let mut parts = reference.split('/');
+            let Some(source_uuid_raw) = parts.next() else {
+                return Err(meerkat::ScheduleDomainError::InvalidSchedule(format!(
+                    "invalid scheduled skill reference: {reference}"
+                )));
+            };
+            let Some(skill_name_raw) = parts.next() else {
+                return Err(meerkat::ScheduleDomainError::InvalidSchedule(format!(
+                    "invalid scheduled skill reference: {reference}"
+                )));
+            };
+            if parts.next().is_some() {
+                return Err(meerkat::ScheduleDomainError::InvalidSchedule(format!(
+                    "invalid scheduled skill reference: {reference}"
+                )));
+            }
+            Ok(meerkat_core::skills::SkillKey {
+                source_uuid: meerkat_core::skills::SourceUuid::parse(source_uuid_raw).map_err(
+                    |_| {
+                        meerkat::ScheduleDomainError::InvalidSchedule(format!(
+                            "invalid scheduled skill reference: {reference}"
+                        ))
+                    },
+                )?,
+                skill_name: meerkat_core::skills::SkillName::parse(skill_name_raw).map_err(
+                    |_| {
+                        meerkat::ScheduleDomainError::InvalidSchedule(format!(
+                            "invalid scheduled skill reference: {reference}"
+                        ))
+                    },
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+#[async_trait::async_trait]
+impl SurfaceScheduleSessionHost for CliScheduleSessionHost {
+    async fn probe_session_target(
+        &self,
+        binding: &meerkat::SessionTargetBinding,
+    ) -> Result<meerkat::TargetProbeOutcome, meerkat::ScheduleDomainError> {
+        let Some(session_id) = binding.resolved_session_id() else {
+            return Ok(meerkat::TargetProbeOutcome::Ready);
+        };
+
+        if let Ok(view) = self.service.read(session_id).await {
+            return Ok(if view.state.is_active {
+                meerkat::TargetProbeOutcome::Busy {
+                    detail: Some(format!("session still running: {session_id}")),
+                }
+            } else {
+                meerkat::TargetProbeOutcome::Ready
+            });
+        }
+
+        let persisted = self
+            .service
+            .load_persisted(session_id)
+            .await
+            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
+        match persisted {
+            Some(session) if !cli_session_metadata_marks_archived(&session) => {
+                Ok(meerkat::TargetProbeOutcome::Ready)
+            }
+            _ => Ok(meerkat::TargetProbeOutcome::Missing {
+                detail: Some(format!("session not found: {session_id}")),
+            }),
+        }
+    }
+
+    async fn materialize_session(
+        &self,
+        create: &meerkat::SessionMaterializationSpec,
+        prompt_system_prompt: Option<&str>,
+    ) -> Result<SessionId, meerkat::ScheduleDomainError> {
+        let session = Session::new();
+        let session_id = session.id().clone();
+        let bindings = self
+            .runtime_adapter
+            .prepare_bindings(session_id.clone())
+            .await
+            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
+
+        let build = SessionBuildOptions {
+            provider: create.provider,
+            output_schema: create.output_schema.clone(),
+            structured_output_retries: create.structured_output_retries,
+            comms_name: create.comms_name.clone(),
+            peer_meta: create.peer_meta.clone(),
+            resume_session: Some(session),
+            provider_params: create.provider_params.clone(),
+            preload_skills: (!create.preload_skills.is_empty()).then(|| {
+                create
+                    .preload_skills
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect()
+            }),
+            additional_instructions: (!create.additional_instructions.is_empty())
+                .then(|| create.additional_instructions.clone()),
+            realm_id: create.realm_id.clone(),
+            instance_id: create.instance_id.clone(),
+            backend: create.backend.clone(),
+            keep_alive: create.keep_alive,
+            app_context: create.app_context.clone(),
+            runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
+            ..SessionBuildOptions::default()
+        };
+
+        let result = self
+            .service
+            .create_session(CreateSessionRequest {
+                model: create.model.clone(),
+                prompt: "".into(),
+                render_metadata: None,
+                system_prompt: prompt_system_prompt
+                    .map(str::to_owned)
+                    .or_else(|| create.system_prompt.clone()),
+                max_tokens: create.max_tokens,
+                event_tx: None,
+                skill_references: None,
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                deferred_prompt_policy: DeferredPromptPolicy::Discard,
+                build: Some(build),
+                labels: Some(create.labels.clone()),
+            })
+            .await
+            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
+
+        self.runtime_adapter
+            .ensure_session_with_executor(
+                result.session_id.clone(),
+                Box::new(self.executor(result.session_id.clone())),
+            )
+            .await;
+        self.update_peer_ingress_context(&result.session_id).await;
+        Ok(result.session_id)
+    }
+
+    async fn deliver_prompt(
+        &self,
+        session_id: &SessionId,
+        occurrence: &meerkat::Occurrence,
+        dispatch: ScheduledPromptDispatch,
+    ) -> Result<meerkat::DeliveryDispatch, meerkat::ScheduleDomainError> {
+        self.ensure_runtime_session_registered(session_id).await?;
+
+        let mut prompt_input = PromptInput::from_content_input(
+            dispatch.prompt,
+            Some(
+                meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                    handling_mode: None,
+                    keep_alive: None,
+                    skill_references: scheduled_skill_keys(&dispatch.skill_references)?,
+                    flow_tool_overlay: None,
+                    additional_instructions: (!dispatch.additional_instructions.is_empty())
+                        .then_some(dispatch.additional_instructions.clone()),
+                    model: None,
+                    provider: None,
+                    provider_params: None,
+                    render_metadata: dispatch.render_metadata.clone(),
+                    execution_kind: None,
+                },
+            ),
+        );
+        prompt_input.header.source = InputOrigin::System;
+        prompt_input.header.idempotency_key = Some(IdempotencyKey::new(
+            schedule_attempt_idempotency_key(occurrence),
+        ));
+        prompt_input.header.correlation_id =
+            Some(CorrelationId::from_uuid(occurrence.occurrence_id.0));
+
+        let (outcome, handle) = self
+            .runtime_adapter
+            .accept_input_with_completion(session_id, Input::Prompt(prompt_input))
+            .await
+            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
+        Ok(build_dispatch_from_accepted(
+            occurrence,
+            accepted_scheduled_input_from_runtime_outcome(outcome, handle),
+            dispatch.materialized_session_id,
+        ))
+    }
+
+    async fn deliver_event(
+        &self,
+        session_id: &SessionId,
+        occurrence: &meerkat::Occurrence,
+        event_type: String,
+        payload: serde_json::Value,
+        render_metadata: Option<meerkat_core::types::RenderMetadata>,
+        materialized_session_id: Option<SessionId>,
+    ) -> Result<meerkat::DeliveryDispatch, meerkat::ScheduleDomainError> {
+        self.ensure_runtime_session_registered(session_id).await?;
+
+        let input = Input::ExternalEvent(meerkat_runtime::ExternalEventInput {
+            header: InputHeader {
+                id: meerkat_core::lifecycle::InputId::new(),
+                timestamp: Utc::now(),
+                source: InputOrigin::External {
+                    source_name: format!("schedule:{}", occurrence.schedule_id),
+                },
+                durability: InputDurability::Durable,
+                visibility: InputVisibility::default(),
+                idempotency_key: Some(IdempotencyKey::new(schedule_attempt_idempotency_key(
+                    occurrence,
+                ))),
+                supersession_key: None,
+                correlation_id: Some(CorrelationId::from_uuid(occurrence.occurrence_id.0)),
+            },
+            event_type,
+            payload,
+            blocks: None,
+            handling_mode: meerkat_core::types::HandlingMode::Queue,
+            render_metadata,
+        });
+        let (outcome, handle) = self
+            .runtime_adapter
+            .accept_input_with_completion(session_id, input)
+            .await
+            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
+        Ok(build_dispatch_from_accepted(
+            occurrence,
+            accepted_scheduled_input_from_runtime_outcome(outcome, handle),
+            materialized_session_id,
+        ))
+    }
+}
+
+fn cli_persistent_surface_cache()
+-> &'static Mutex<std::collections::HashMap<String, Arc<CliPersistentSurfaceState>>> {
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<String, Arc<CliPersistentSurfaceState>>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn cached_cli_persistent_surface(
+    scope: &RuntimeScope,
+) -> anyhow::Result<Option<Arc<CliPersistentSurfaceState>>> {
+    let key = mob_persistent_service_key(scope);
+    Ok(cli_persistent_surface_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("cli persistent surface cache poisoned"))?
+        .get(&key)
+        .cloned())
+}
+
+fn remember_cli_persistent_surface(
+    scope: &RuntimeScope,
+    created: Arc<CliPersistentSurfaceState>,
+) -> anyhow::Result<Arc<CliPersistentSurfaceState>> {
+    let key = mob_persistent_service_key(scope);
+    let mut cache = cli_persistent_surface_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("cli persistent surface cache poisoned"))?;
+    Ok(cache.entry(key).or_insert(created).clone())
+}
 
 fn mob_persistent_service_cache()
 -> &'static Mutex<std::collections::HashMap<String, Weak<CliPersistentService>>> {
@@ -4187,7 +4632,7 @@ fn build_mob_persistent_service_from_bundle(
 ) -> anyhow::Result<Arc<CliPersistentService>> {
     let (persistent_service, _runtime_adapter) =
         build_cli_persistent_service_from_bundle(scope, config, manifest, persistence)?;
-    remember_mob_persistent_service(scope, Arc::new(persistent_service))
+    remember_mob_persistent_service(scope, persistent_service)
 }
 
 async fn get_or_create_mob_persistent_service(
@@ -4562,7 +5007,6 @@ async fn delete_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
 
     let (config, _) = load_config(scope).await?;
     let (service, _runtime_adapter) = build_cli_persistent_service(scope, config.clone()).await?;
-    let service = Arc::new(service);
 
     // Archive and clean up any session-owned mobs.
     if config.tools.mob_enabled
@@ -6222,15 +6666,15 @@ const WEB_INDEX_HTML: &str = r#"<!doctype html>
 </html>
 "#;
 
-fn execute_mob_deploy<'a>(
-    scope: &'a RuntimeScope,
-    pack: &'a std::path::Path,
-    prompt: &'a str,
+async fn execute_mob_deploy(
+    scope: &RuntimeScope,
+    pack: &std::path::Path,
+    prompt: &str,
     cli_trust_policy: Option<TrustPolicyArg>,
     surface: DeploySurfaceArg,
     cli_overrides: CliOverrides,
-) -> BoxFuture<'a, anyhow::Result<String>> {
-    execute_mob_deploy_internal(
+) -> anyhow::Result<String> {
+    Box::pin(execute_mob_deploy_internal(
         scope,
         pack,
         prompt,
@@ -6241,7 +6685,8 @@ fn execute_mob_deploy<'a>(
             rpc_io: None,
             config_observer: None,
         },
-    )
+    ))
+    .await
 }
 
 type RpcDeployIo = (
@@ -6257,105 +6702,100 @@ struct DeployInvocation {
     config_observer: Option<DeployConfigObserver>,
 }
 
-fn execute_mob_deploy_internal<'a>(
-    scope: &'a RuntimeScope,
-    pack: &'a std::path::Path,
-    prompt: &'a str,
+async fn execute_mob_deploy_internal(
+    scope: &RuntimeScope,
+    pack: &std::path::Path,
+    prompt: &str,
     invocation: DeployInvocation,
-) -> BoxFuture<'a, anyhow::Result<String>> {
-    Box::pin(async move {
-        let bytes = tokio::fs::read(pack)
-            .await
-            .map_err(|err| anyhow::anyhow!("failed reading pack '{}': {err}", pack.display()))?;
-        let files = extract_targz_safe(&bytes)
-            .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
-        let archive = MobpackArchive::from_extracted_files(&files)
-            .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
-        let digest = compute_archive_digest(&bytes)
-            .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
-        let config_trust = read_config_trust_policy(scope)?;
-        let trust_policy = resolve_trust_policy(
-            invocation.cli_trust_policy,
-            |key| std::env::var(key).ok(),
-            config_trust,
-        )?;
-        let trusted_signers = load_trusted_signers(
-            &user_trust_store_path(scope),
-            &project_trust_store_path(scope),
-        )
+) -> anyhow::Result<String> {
+    let bytes = tokio::fs::read(pack)
+        .await
+        .map_err(|err| anyhow::anyhow!("failed reading pack '{}': {err}", pack.display()))?;
+    let files =
+        extract_targz_safe(&bytes).map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
+    let archive = MobpackArchive::from_extracted_files(&files)
         .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
-        let warnings = verify_pack_trust(&files, digest, trust_policy, &trusted_signers)
-            .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
-        validate_required_capabilities(
-            &archive.manifest,
-            &runtime_capabilities(invocation.surface),
-        )
+    let digest = compute_archive_digest(&bytes)
         .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
-        let effective_config = load_deploy_config_with_pack_defaults(
-            scope,
-            archive.config.get("config/defaults.toml"),
-            invocation.cli_overrides,
-        )?;
-        if let Some(observer) = invocation.config_observer.as_ref() {
-            observer(&effective_config);
-        }
+    let config_trust = read_config_trust_policy(scope)?;
+    let trust_policy = resolve_trust_policy(
+        invocation.cli_trust_policy,
+        |key| std::env::var(key).ok(),
+        config_trust,
+    )?;
+    let trusted_signers = load_trusted_signers(
+        &user_trust_store_path(scope),
+        &project_trust_store_path(scope),
+    )
+    .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
+    let warnings = verify_pack_trust(&files, digest, trust_policy, &trusted_signers)
+        .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
+    validate_required_capabilities(&archive.manifest, &runtime_capabilities(invocation.surface))
+        .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
+    let effective_config = load_deploy_config_with_pack_defaults(
+        scope,
+        archive.config.get("config/defaults.toml"),
+        invocation.cli_overrides,
+    )?;
+    if let Some(observer) = invocation.config_observer.as_ref() {
+        observer(&effective_config);
+    }
 
-        let deployed_mob_id = if matches!(invocation.surface, DeploySurfaceArg::Rpc) {
-            let (reader, writer): RpcDeployIo = invocation.rpc_io.unwrap_or_else(|| {
-                (
-                    Box::new(BufReader::new(tokio::io::stdin())),
-                    Box::new(tokio::io::stdout()),
-                )
-            });
-            run_rpc_surface(scope, effective_config, &archive, prompt, reader, writer).await?
-        } else {
-            let session_service =
-                build_deploy_mob_session_service(scope, effective_config.clone()).await?;
-            let mut builder = meerkat_mob::MobBuilder::from_mobpack(
-                archive.definition.clone(),
-                archive.skills.clone(),
-                meerkat_mob::MobStorage::in_memory(),
+    let deployed_mob_id = if matches!(invocation.surface, DeploySurfaceArg::Rpc) {
+        let (reader, writer): RpcDeployIo = invocation.rpc_io.unwrap_or_else(|| {
+            (
+                Box::new(BufReader::new(tokio::io::stdin())),
+                Box::new(tokio::io::stdout()),
             )
-            .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?
-            .with_session_service(session_service.clone());
-            if let Some(adapter) = session_service.runtime_adapter() {
-                builder = builder.with_runtime_adapter(adapter);
-            }
-            let handle = builder
-                .create()
-                .await
-                .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
-
-            if let Some(orchestrator) = &archive.definition.orchestrator {
-                let roster = handle.roster().await;
-                if let Some(entry) = roster.by_profile(&orchestrator.profile).next() {
-                    handle
-                        .member(&entry.meerkat_id)
-                        .await
-                        .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?
-                        .send(prompt.to_string(), meerkat_core::types::HandlingMode::Queue)
-                        .await
-                        .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
-                }
-            }
-
-            handle.mob_id().to_string()
-        };
-
-        let mut rendered = format!(
-            "deployed\tmob={}\tsurface={}\tprompt_bytes={}",
-            deployed_mob_id,
-            match invocation.surface {
-                DeploySurfaceArg::Cli => "cli",
-                DeploySurfaceArg::Rpc => "rpc",
-            },
-            prompt.len()
-        );
-        for warning in warnings {
-            rendered.push_str(&format!("\nwarning\t{warning}"));
+        });
+        run_rpc_surface(scope, effective_config, &archive, prompt, reader, writer).await?
+    } else {
+        let session_service =
+            build_deploy_mob_session_service(scope, effective_config.clone()).await?;
+        let mut builder = meerkat_mob::MobBuilder::from_mobpack(
+            archive.definition.clone(),
+            archive.skills.clone(),
+            meerkat_mob::MobStorage::in_memory(),
+        )
+        .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?
+        .with_session_service(session_service.clone());
+        if let Some(adapter) = session_service.runtime_adapter() {
+            builder = builder.with_runtime_adapter(adapter);
         }
-        Ok(rendered)
-    })
+        let handle = builder
+            .create()
+            .await
+            .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
+
+        if let Some(orchestrator) = &archive.definition.orchestrator {
+            let roster = handle.roster().await;
+            if let Some(entry) = roster.by_profile(&orchestrator.profile).next() {
+                handle
+                    .member(&entry.meerkat_id)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?
+                    .send(prompt.to_string(), meerkat_core::types::HandlingMode::Queue)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
+            }
+        }
+
+        handle.mob_id().to_string()
+    };
+
+    let mut rendered = format!(
+        "deployed\tmob={}\tsurface={}\tprompt_bytes={}",
+        deployed_mob_id,
+        match invocation.surface {
+            DeploySurfaceArg::Cli => "cli",
+            DeploySurfaceArg::Rpc => "rpc",
+        },
+        prompt.len()
+    );
+    for warning in warnings {
+        rendered.push_str(&format!("\nwarning\t{warning}"));
+    }
+    Ok(rendered)
 }
 
 fn resolve_trust_policy<F>(
@@ -6528,6 +6968,7 @@ where
                 root: paths.root.display().to_string(),
                 manifest_path: paths.manifest_path.display().to_string(),
                 config_path: paths.config_path.display().to_string(),
+                sessions_redb_path: paths.sessions_redb_path.display().to_string(),
                 sessions_sqlite_path: Some(paths.sessions_sqlite_path.display().to_string()),
                 sessions_jsonl_dir: paths.sessions_jsonl_dir.display().to_string(),
             }),
@@ -6800,7 +7241,7 @@ mod tests {
                 realm_id: realm_id.to_string(),
             },
             instance_id: None,
-            backend_hint: Some(RealmBackend::Sqlite),
+            backend_hint: Some(RealmBackend::Redb),
             origin_hint: RealmOrigin::Explicit,
             context_root: None,
             user_config_root: None,
@@ -6937,10 +7378,10 @@ mod tests {
             finalize_cli_runtime_backed_turn(
                 pipeline,
                 Err::<(), _>(anyhow::anyhow!("turn abandoned: synthetic failure")),
-                Box::pin(async {
+                async {
                     runtime_adapter.unregister_session(&session_id).await;
                     Ok(())
-                }),
+                },
             ),
         )
         .await
@@ -8498,14 +8939,14 @@ capabilities = ["definitely_missing_capability"]
             .await
             .expect("pack succeeds");
 
-        let err = Box::pin(execute_mob_deploy(
+        let err = execute_mob_deploy(
             &scope,
             &pack_out,
             "hello",
             None,
             DeploySurfaceArg::Cli,
             CliOverrides::default(),
-        ))
+        )
         .await
         .expect_err("missing capability should reject deploy");
         assert!(
@@ -8525,14 +8966,14 @@ capabilities = ["definitely_missing_capability"]
             .await
             .expect("pack succeeds");
 
-        let output = Box::pin(execute_mob_deploy(
+        let output = execute_mob_deploy(
             &scope,
             &pack_out,
             "hello",
             None,
             DeploySurfaceArg::Cli,
             CliOverrides::default(),
-        ))
+        )
         .await
         .expect("deploy should succeed");
         assert!(
@@ -8566,14 +9007,14 @@ capabilities = ["definitely_missing_capability"]
             .await
             .expect("write archive");
 
-        let err = Box::pin(execute_mob_deploy(
+        let err = execute_mob_deploy(
             &scope,
             &pack_out,
             "hello",
             None,
             DeploySurfaceArg::Cli,
             CliOverrides::default(),
-        ))
+        )
         .await
         .expect_err("missing packed skill path should fail");
         assert!(
@@ -8605,14 +9046,14 @@ capabilities = ["definitely_missing_capability"]
             .await
             .expect("write archive");
 
-        let err = Box::pin(execute_mob_deploy(
+        let err = execute_mob_deploy(
             &scope,
             &pack_out,
             "hello",
             None,
             DeploySurfaceArg::Cli,
             CliOverrides::default(),
-        ))
+        )
         .await
         .expect_err("invalid UTF-8 skill bytes should fail");
         assert!(
@@ -8689,14 +9130,14 @@ capabilities = ["definitely_missing_capability"]
             .await
             .expect("pack succeeds");
 
-        let err = Box::pin(execute_mob_deploy(
+        let err = execute_mob_deploy(
             &scope,
             &pack_out,
             "hello",
             Some(TrustPolicyArg::Strict),
             DeploySurfaceArg::Cli,
             CliOverrides::default(),
-        ))
+        )
         .await
         .expect_err("strict mode must reject unsigned pack");
         assert!(
@@ -8717,14 +9158,14 @@ capabilities = ["definitely_missing_capability"]
             .await
             .expect("pack succeeds");
 
-        let output = Box::pin(execute_mob_deploy(
+        let output = execute_mob_deploy(
             &scope,
             &pack_out,
             "hello",
             Some(TrustPolicyArg::Permissive),
             DeploySurfaceArg::Cli,
             CliOverrides::default(),
-        ))
+        )
         .await
         .expect("permissive mode should allow unsigned pack");
         assert!(
@@ -8777,14 +9218,14 @@ capabilities = ["definitely_missing_capability"]
         )
         .expect("write trusted signers");
 
-        let output = Box::pin(execute_mob_deploy(
+        let output = execute_mob_deploy(
             &scope,
             &pack_out,
             "hello",
             Some(TrustPolicyArg::Strict),
             DeploySurfaceArg::Cli,
             CliOverrides::default(),
-        ))
+        )
         .await
         .expect("strict trusted signed deploy should succeed");
         assert!(
@@ -8809,14 +9250,14 @@ capabilities = ["definitely_missing_capability"]
             .await
             .expect("pack should succeed");
 
-        let output = Box::pin(execute_mob_deploy(
+        let output = execute_mob_deploy(
             &scope,
             &pack_out,
             "hello",
             None,
             DeploySurfaceArg::Cli,
             CliOverrides::default(),
-        ))
+        )
         .await
         .expect("deploy should succeed");
 
@@ -8873,14 +9314,14 @@ capabilities = ["definitely_missing_capability"]
         )
         .expect("write trust store");
 
-        let output = Box::pin(execute_mob_deploy(
+        let output = execute_mob_deploy(
             &scope,
             &pack_out,
             "hello",
             Some(TrustPolicyArg::Strict),
             DeploySurfaceArg::Cli,
             CliOverrides::default(),
-        ))
+        )
         .await
         .expect("strict signed deploy should succeed");
 
@@ -8905,14 +9346,14 @@ capabilities = ["definitely_missing_capability"]
             .await
             .expect("pack should succeed");
 
-        let err = Box::pin(execute_mob_deploy(
+        let err = execute_mob_deploy(
             &scope,
             &pack_out,
             "hello",
             Some(TrustPolicyArg::Strict),
             DeploySurfaceArg::Cli,
             CliOverrides::default(),
-        ))
+        )
         .await
         .expect_err("strict mode must reject unsigned pack");
         assert!(
@@ -8939,14 +9380,14 @@ capabilities = ["definitely_missing_capability"]
             .await
             .expect("signed pack should succeed");
 
-        let err = Box::pin(execute_mob_deploy(
+        let err = execute_mob_deploy(
             &scope,
             &pack_out,
             "hello",
             Some(TrustPolicyArg::Strict),
             DeploySurfaceArg::Cli,
             CliOverrides::default(),
-        ))
+        )
         .await
         .expect_err("strict mode must reject unknown signer");
         assert!(
@@ -9009,14 +9450,14 @@ capabilities = ["definitely_missing_capability"]
         )
         .expect("write trust store");
 
-        let err = Box::pin(execute_mob_deploy(
+        let err = execute_mob_deploy(
             &scope,
             &tampered_pack,
             "hello",
             Some(TrustPolicyArg::Strict),
             DeploySurfaceArg::Cli,
             CliOverrides::default(),
-        ))
+        )
         .await
         .expect_err("strict mode must reject tampered content");
         assert!(
@@ -9078,14 +9519,14 @@ capabilities = ["definitely_missing_capability"]
             .await
             .expect("write archive");
 
-        let err = Box::pin(execute_mob_deploy(
+        let err = execute_mob_deploy(
             &scope,
             &bad_signature_pack,
             "hello",
             Some(TrustPolicyArg::Permissive),
             DeploySurfaceArg::Cli,
             CliOverrides::default(),
-        ))
+        )
         .await
         .expect_err("permissive mode must reject invalid signatures when present");
         assert!(
@@ -9421,7 +9862,7 @@ printf '\0\141\163\155' > "$out_dir/runtime_bg.wasm"
         let factory = AgentFactory::new(temp.path().join("sessions"))
             .builtins(true)
             .mob(true);
-        let service = Arc::new(build_cli_service(factory, Config::default()));
+        let service = Arc::new(build_cli_service(factory, Config::default(), None));
 
         // Create mob tools factory (new pattern: factory instead of external_tools)
         let mob_service: Arc<dyn meerkat_mob::MobSessionService> =
@@ -9488,6 +9929,66 @@ printf '\0\141\163\155' > "$out_dir/runtime_bg.wasm"
         assert!(system_prompt.contains("mob_list"));
         assert!(system_prompt.contains("mob_create"));
         assert!(system_prompt.contains("delegate"));
+    }
+
+    #[tokio::test]
+    async fn test_run_session_build_wires_schedule_tools_into_initial_llm_request() {
+        let temp = tempfile::tempdir().expect("tempdir must be created");
+        let factory = AgentFactory::new(temp.path().join("sessions"))
+            .builtins(true)
+            .schedule(true);
+        let schedule_service =
+            ScheduleService::new(Arc::new(meerkat::MemoryScheduleStore::default()));
+        let default_schedule_tools =
+            Some(Arc::new(ScheduleToolDispatcher::new(schedule_service))
+                as Arc<dyn AgentToolDispatcher>);
+        let service = Arc::new(build_cli_service(
+            factory,
+            Config::default(),
+            default_schedule_tools,
+        ));
+
+        let captured_tool_names = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_system_prompt = Arc::new(Mutex::new(None::<String>));
+        let llm_override: Arc<dyn LlmClient> = Arc::new(CapturingLlmClient::new(
+            captured_tool_names.clone(),
+            captured_system_prompt,
+        ));
+
+        let req = CreateSessionRequest {
+            model: "gpt-5.4".to_string(),
+            prompt: "list tools".to_string().into(),
+            render_metadata: None,
+            system_prompt: None,
+            max_tokens: Some(32),
+            event_tx: None,
+            skill_references: None,
+            initial_turn: meerkat_core::service::InitialTurnPolicy::RunImmediately,
+            deferred_prompt_policy: DeferredPromptPolicy::Discard,
+            build: Some(SessionBuildOptions {
+                llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
+                    llm_override,
+                )),
+                ..SessionBuildOptions::default()
+            }),
+            labels: None,
+        };
+
+        service
+            .create_session(req)
+            .await
+            .expect("session should run with llm override");
+
+        let names: std::collections::BTreeSet<String> = captured_tool_names
+            .lock()
+            .expect("captured tool mutex should not be poisoned")
+            .iter()
+            .cloned()
+            .collect();
+
+        assert!(names.contains("meerkat_schedule_create"));
+        assert!(names.contains("meerkat_schedule_list"));
+        assert!(names.contains("meerkat_schedule_occurrences"));
     }
 
     async fn call_tool_json(
@@ -9921,9 +10422,7 @@ printf '\0\141\163\155' > "$out_dir/runtime_bg.wasm"
         let tools = dispatcher.tools();
         let tool_names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
 
-        assert!(tool_names.contains(&"send_message"));
-        assert!(tool_names.contains(&"send_request"));
-        assert!(tool_names.contains(&"send_response"));
+        assert!(tool_names.contains(&"send"));
         assert!(tool_names.contains(&"peers"));
     }
 
@@ -9938,7 +10437,7 @@ printf '\0\141\163\155' > "$out_dir/runtime_bg.wasm"
             .expect("create root");
         let manifest = serde_json::json!({
             "realm_id": realm_id,
-            "backend": "sqlite",
+            "backend": "redb",
             "created_at": "1"
         });
         tokio::fs::write(
@@ -9964,7 +10463,7 @@ printf '\0\141\163\155' > "$out_dir/runtime_bg.wasm"
         let _manifest = meerkat_store::ensure_realm_manifest_in(
             &state_root,
             realm_id,
-            Some(meerkat_store::RealmBackend::Sqlite),
+            Some(meerkat_store::RealmBackend::Redb),
             Some(meerkat_store::RealmOrigin::Generated),
         )
         .await
@@ -10000,7 +10499,7 @@ printf '\0\141\163\155' > "$out_dir/runtime_bg.wasm"
         let _manifest = meerkat_store::ensure_realm_manifest_in(
             &state_root,
             realm_id,
-            Some(meerkat_store::RealmBackend::Sqlite),
+            Some(meerkat_store::RealmBackend::Redb),
             Some(meerkat_store::RealmOrigin::Generated),
         )
         .await
@@ -10047,7 +10546,7 @@ printf '\0\141\163\155' > "$out_dir/runtime_bg.wasm"
             let (_manifest, store) = meerkat_store::open_realm_session_store_in(
                 &state_root,
                 realm_id,
-                Some(RealmBackend::Sqlite),
+                Some(RealmBackend::Redb),
                 Some(RealmOrigin::Explicit),
             )
             .await
@@ -10076,7 +10575,7 @@ printf '\0\141\163\155' > "$out_dir/runtime_bg.wasm"
                 realm_id: "test-realm".to_string(),
             },
             instance_id: None,
-            backend_hint: Some(RealmBackend::Sqlite),
+            backend_hint: Some(RealmBackend::Redb),
             origin_hint: RealmOrigin::Explicit,
             context_root: Some(root),
             user_config_root: None,

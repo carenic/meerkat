@@ -25,7 +25,7 @@ name = "live_rpc_regression"
 path = "tests/live_rpc_regression.rs"
 
 [dependencies]
-meerkat = { workspace = true, features = ["anthropic", "openai", "gemini", "jsonl-store", "session-store", "memory-store", "skills"] }
+meerkat = { workspace = true, features = ["anthropic", "openai", "gemini", "jsonl-store", "session-store", "memory-store", "skills", "schedule"] }
 meerkat-models = { workspace = true }
 meerkat-core = { workspace = true }
 meerkat-contracts = { workspace = true }
@@ -48,10 +48,11 @@ uuid = { workspace = true }
 clap = { workspace = true }
 
 [features]
-default = ["comms", "mcp", "mob"]
+default = ["comms", "mcp", "mob", "schedule"]
 comms = ["meerkat/comms"]
 mcp = ["meerkat/mcp"]
 mob = ["dep:meerkat-mob", "dep:meerkat-mob-mcp"]
+schedule = ["meerkat/schedule"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

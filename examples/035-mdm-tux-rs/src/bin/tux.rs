@@ -27,24 +27,34 @@ use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
 };
 use meerkat::{
-    AgentEvent, AgentFactory, FactoryAgentBuilder, LlmClient, PersistentSessionService,
-    SessionError, SessionService, ToolGatewayBuilder,
+    AgentEvent, AgentFactory, FactoryAgentBuilder, LlmClient, PersistenceBundle,
+    PersistentSessionService, ScheduleService, ScheduleToolDispatcher, SqliteScheduleStore,
+};
+use meerkat::surface::{
+    NoopScheduleMobHost, ScheduledPromptDispatch, SharedScheduleTargetAdapter,
+    SurfaceScheduleSessionHost, accepted_scheduled_input_from_runtime_outcome,
+    build_dispatch_from_accepted, schedule_attempt_idempotency_key, schedule_host_supported,
+    spawn_schedule_host,
 };
 use meerkat_comms::MessageKind;
 use meerkat_comms::agent::CommsToolDispatcher;
 use meerkat_comms::agent::types::CommsContent;
-use meerkat_core::AgentToolDispatcher;
+use meerkat_core::lifecycle::RunId;
+use meerkat_core::lifecycle::core_executor::{CoreApplyOutput, CoreExecutor, CoreExecutorError};
+use meerkat_core::lifecycle::run_control::RunControlCommand;
+use meerkat_core::lifecycle::run_primitive::{RunApplyBoundary, RunPrimitive};
 use meerkat_core::service::{
-    CreateSessionRequest, DeferredPromptPolicy, InitialTurnPolicy, SessionBuildOptions,
+    CreateSessionRequest, InitialTurnPolicy, SessionBuildOptions, SessionError, SessionService,
     StartTurnRequest,
 };
 use meerkat_core::types::{ContentInput, HandlingMode, SessionId};
-use meerkat_schedule::{ScheduleService, ScheduleToolSurface};
-use meerkat::surface::{
-    default_persistent_executor, materialize_session, spawn_runtime_backed_schedule_host,
-    wire_runtime_bindings,
+use meerkat_core::{AgentToolDispatcher, Config, Session, ToolCategoryOverride};
+use meerkat_mob_mcp::{AgentMobToolSurfaceFactory, MobMcpState};
+use meerkat_runtime::{
+    CorrelationId, IdempotencyKey, Input, InputOrigin, PromptInput, RuntimeSessionAdapter,
 };
-use meerkat_store::StoreAdapter;
+use meerkat_runtime::input::{InputDurability, InputHeader, InputVisibility};
+use meerkat_store::{JsonlStore, MemoryBlobStore, SessionStore};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -61,9 +71,8 @@ use mdm_tux::machines::tux_runtime_registry as runtime_registry;
 use mdm_tux::{
     ClaimGrant, CommsNode, DirectControlPayload, KennelPayload, LeaseRef, LeaseTerminationReason,
     ListScope, ProviderKind, TargetListEntry, auto_detect, build_signed_envelope,
-    direct_control_request, load_or_generate_keypair, parse_direct_control_message,
-    read_envelope, run_registration_server, open_example_runtime_persistence, verify_envelope,
-    write_envelope,
+    direct_control_request, load_or_generate_keypair, parse_direct_control_message, read_envelope,
+    run_registration_server, verify_envelope, write_envelope,
 };
 use tokio::io::BufReader;
 use tokio::net::TcpStream;
@@ -73,35 +82,391 @@ use tokio::net::TcpStream;
 const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 struct HiveAgentState {
-    service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    _service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    runtime_adapter: Arc<RuntimeSessionAdapter>,
     session_id: SessionId,
+    _mob_state: Arc<MobMcpState>,
     _schedule_host: Option<meerkat::surface::ScheduleHostHandle>,
 }
 
 impl HiveAgentState {
-    async fn run(&self, prompt: String) -> Result<meerkat::RunResult, SessionError> {
+    async fn run(&mut self, prompt: String) -> anyhow::Result<meerkat_core::RunResult> {
+        let (_outcome, handle) = self
+            .runtime_adapter
+            .accept_input_with_completion(&self.session_id, Input::Prompt(PromptInput::new(prompt, None)))
+            .await
+            .map_err(|error| anyhow::anyhow!("runtime accept failed: {error}"))?;
+        match handle {
+            Some(handle) => match handle.wait().await {
+                meerkat_runtime::completion::CompletionOutcome::Completed(result) => Ok(result),
+                meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult => {
+                    Err(anyhow::anyhow!("turn completed without result"))
+                }
+                meerkat_runtime::completion::CompletionOutcome::CallbackPending { tool_name, .. } => {
+                    Err(anyhow::anyhow!("callback pending for tool {tool_name}"))
+                }
+                meerkat_runtime::completion::CompletionOutcome::Abandoned(reason) => {
+                    Err(anyhow::anyhow!("turn abandoned: {reason}"))
+                }
+                meerkat_runtime::completion::CompletionOutcome::RuntimeTerminated(reason) => {
+                    Err(anyhow::anyhow!("runtime terminated: {reason}"))
+                }
+            },
+            None => Err(anyhow::anyhow!("duplicate input")),
+        }
+    }
+}
+
+struct HiveCoreExecutor {
+    service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    session_id: SessionId,
+}
+
+#[async_trait::async_trait]
+impl CoreExecutor for HiveCoreExecutor {
+    async fn apply(
+        &mut self,
+        run_id: RunId,
+        primitive: RunPrimitive,
+    ) -> Result<CoreApplyOutput, CoreExecutorError> {
+        let req = StartTurnRequest {
+            prompt: primitive.extract_content_input(),
+            system_prompt: None,
+            render_metadata: None,
+            handling_mode: HandlingMode::Queue,
+            event_tx: None,
+            skill_references: primitive
+                .turn_metadata()
+                .and_then(|meta| meta.skill_references.clone()),
+            flow_tool_overlay: primitive
+                .turn_metadata()
+                .and_then(|meta| meta.flow_tool_overlay.clone()),
+            additional_instructions: primitive
+                .turn_metadata()
+                .and_then(|meta| meta.additional_instructions.clone()),
+            execution_kind: primitive.turn_metadata().and_then(|m| m.execution_kind),
+        };
+        let boundary = match &primitive {
+            RunPrimitive::StagedInput(staged) => staged.boundary,
+            _ => RunApplyBoundary::Immediate,
+        };
+
         self.service
-            .start_turn(
+            .apply_runtime_turn(
                 &self.session_id,
-                StartTurnRequest {
-                    prompt: ContentInput::Text(prompt),
-                    system_prompt: None,
-                    render_metadata: None,
-                    handling_mode: HandlingMode::Queue,
-                    event_tx: None,
-                    skill_references: None,
-                    flow_tool_overlay: None,
-                    additional_instructions: None,
-                    execution_kind: None,
-                },
+                run_id,
+                req,
+                boundary,
+                primitive.contributing_input_ids().to_vec(),
             )
             .await
+            .map_err(|error| CoreExecutorError::ApplyFailed {
+                reason: error.to_string(),
+            })
     }
 
-    async fn shutdown(self) {
-        if let Some(schedule_host) = self._schedule_host {
-            schedule_host.shutdown().await;
+    async fn control(&mut self, command: RunControlCommand) -> Result<(), CoreExecutorError> {
+        match command {
+            RunControlCommand::CancelCurrentRun { .. } => {
+                self.service
+                    .interrupt(&self.session_id)
+                    .await
+                    .map_err(|error| CoreExecutorError::ControlFailed {
+                        reason: error.to_string(),
+                    })
+            }
+            RunControlCommand::StopRuntimeExecutor { .. } => match self
+                .service
+                .discard_live_session(&self.session_id)
+                .await
+            {
+                Ok(()) | Err(SessionError::NotFound { .. }) => Ok(()),
+                Err(error) => Err(CoreExecutorError::ControlFailed {
+                    reason: error.to_string(),
+                }),
+            },
+            _ => Ok(()),
         }
+    }
+}
+
+#[derive(Clone)]
+struct HiveScheduleSessionHost {
+    service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    runtime_adapter: Arc<RuntimeSessionAdapter>,
+}
+
+impl HiveScheduleSessionHost {
+    async fn ensure_runtime_session_registered(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), meerkat::ScheduleDomainError> {
+        let session_exists = self.service.read(session_id).await.is_ok()
+            || self
+                .service
+                .load_persisted(session_id)
+                .await
+                .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?
+                .is_some();
+        if !session_exists {
+            return Err(meerkat::ScheduleDomainError::InvalidSchedule(format!(
+                "session not found: {session_id}"
+            )));
+        }
+        self.runtime_adapter
+            .ensure_session_with_executor(
+                session_id.clone(),
+                Box::new(HiveCoreExecutor {
+                    service: Arc::clone(&self.service),
+                    session_id: session_id.clone(),
+                }),
+            )
+            .await;
+        Ok(())
+    }
+}
+
+fn hive_session_metadata_marks_archived(session: &Session) -> bool {
+    session
+        .metadata()
+        .get("session_archived")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn scheduled_skill_keys(
+    skill_references: &[String],
+) -> Result<Option<Vec<meerkat_core::skills::SkillKey>>, meerkat::ScheduleDomainError> {
+    if skill_references.is_empty() {
+        return Ok(None);
+    }
+
+    skill_references
+        .iter()
+        .map(|reference| {
+            let mut parts = reference.split('/');
+            let Some(source_uuid_raw) = parts.next() else {
+                return Err(meerkat::ScheduleDomainError::InvalidSchedule(format!(
+                    "invalid scheduled skill reference: {reference}"
+                )));
+            };
+            let Some(skill_name_raw) = parts.next() else {
+                return Err(meerkat::ScheduleDomainError::InvalidSchedule(format!(
+                    "invalid scheduled skill reference: {reference}"
+                )));
+            };
+            if parts.next().is_some() {
+                return Err(meerkat::ScheduleDomainError::InvalidSchedule(format!(
+                    "invalid scheduled skill reference: {reference}"
+                )));
+            }
+            Ok(meerkat_core::skills::SkillKey {
+                source_uuid: meerkat_core::skills::SourceUuid::parse(source_uuid_raw).map_err(
+                    |_| {
+                        meerkat::ScheduleDomainError::InvalidSchedule(format!(
+                            "invalid scheduled skill reference: {reference}"
+                        ))
+                    },
+                )?,
+                skill_name: meerkat_core::skills::SkillName::parse(skill_name_raw).map_err(
+                    |_| {
+                        meerkat::ScheduleDomainError::InvalidSchedule(format!(
+                            "invalid scheduled skill reference: {reference}"
+                        ))
+                    },
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+#[async_trait::async_trait]
+impl SurfaceScheduleSessionHost for HiveScheduleSessionHost {
+    async fn probe_session_target(
+        &self,
+        binding: &meerkat::SessionTargetBinding,
+    ) -> Result<meerkat::TargetProbeOutcome, meerkat::ScheduleDomainError> {
+        let Some(session_id) = binding.resolved_session_id() else {
+            return Ok(meerkat::TargetProbeOutcome::Ready);
+        };
+
+        if let Ok(view) = self.service.read(session_id).await {
+            return Ok(if view.state.is_active {
+                meerkat::TargetProbeOutcome::Busy {
+                    detail: Some(format!("session still running: {session_id}")),
+                }
+            } else {
+                meerkat::TargetProbeOutcome::Ready
+            });
+        }
+
+        let persisted = self
+            .service
+            .load_persisted(session_id)
+            .await
+            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
+        match persisted {
+            Some(session) if !hive_session_metadata_marks_archived(&session) => {
+                Ok(meerkat::TargetProbeOutcome::Ready)
+            }
+            _ => Ok(meerkat::TargetProbeOutcome::Missing {
+                detail: Some(format!("session not found: {session_id}")),
+            }),
+        }
+    }
+
+    async fn materialize_session(
+        &self,
+        create: &meerkat::SessionMaterializationSpec,
+        prompt_system_prompt: Option<&str>,
+    ) -> Result<SessionId, meerkat::ScheduleDomainError> {
+        let session = Session::new();
+        let session_id = session.id().clone();
+        let bindings = self
+            .runtime_adapter
+            .prepare_bindings(session_id.clone())
+            .await
+            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
+        let build = SessionBuildOptions {
+            provider: create.provider,
+            output_schema: create.output_schema.clone(),
+            structured_output_retries: create.structured_output_retries,
+            comms_name: create.comms_name.clone(),
+            peer_meta: create.peer_meta.clone(),
+            resume_session: Some(session),
+            provider_params: create.provider_params.clone(),
+            preload_skills: (!create.preload_skills.is_empty()).then(|| {
+                create
+                    .preload_skills
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect()
+            }),
+            additional_instructions: (!create.additional_instructions.is_empty())
+                .then(|| create.additional_instructions.clone()),
+            realm_id: create.realm_id.clone(),
+            instance_id: create.instance_id.clone(),
+            backend: create.backend.clone(),
+            keep_alive: create.keep_alive,
+            app_context: create.app_context.clone(),
+            runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
+            ..SessionBuildOptions::default()
+        };
+        let result = self
+            .service
+            .create_session(CreateSessionRequest {
+                model: create.model.clone(),
+                prompt: ContentInput::Text(String::new()),
+                render_metadata: None,
+                system_prompt: prompt_system_prompt
+                    .map(str::to_owned)
+                    .or_else(|| create.system_prompt.clone()),
+                max_tokens: create.max_tokens,
+                event_tx: None,
+                skill_references: None,
+                initial_turn: InitialTurnPolicy::Defer,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+                build: Some(build),
+                labels: Some(create.labels.clone()),
+            })
+            .await
+            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
+        self.runtime_adapter
+            .ensure_session_with_executor(
+                result.session_id.clone(),
+                Box::new(HiveCoreExecutor {
+                    service: Arc::clone(&self.service),
+                    session_id: result.session_id.clone(),
+                }),
+            )
+            .await;
+        Ok(result.session_id)
+    }
+
+    async fn deliver_prompt(
+        &self,
+        session_id: &SessionId,
+        occurrence: &meerkat::Occurrence,
+        dispatch: ScheduledPromptDispatch,
+    ) -> Result<meerkat::DeliveryDispatch, meerkat::ScheduleDomainError> {
+        self.ensure_runtime_session_registered(session_id).await?;
+        let mut prompt_input = PromptInput::from_content_input(
+            dispatch.prompt,
+            Some(meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                handling_mode: None,
+                keep_alive: None,
+                skill_references: scheduled_skill_keys(&dispatch.skill_references)?,
+                flow_tool_overlay: None,
+                additional_instructions: (!dispatch.additional_instructions.is_empty())
+                    .then_some(dispatch.additional_instructions.clone()),
+                model: None,
+                provider: None,
+                provider_params: None,
+                render_metadata: dispatch.render_metadata.clone(),
+                execution_kind: None,
+            }),
+        );
+        prompt_input.header.source = InputOrigin::System;
+        prompt_input.header.idempotency_key = Some(IdempotencyKey::new(
+            schedule_attempt_idempotency_key(occurrence),
+        ));
+        prompt_input.header.correlation_id =
+            Some(CorrelationId::from_uuid(occurrence.occurrence_id.0));
+        let (outcome, handle) = self
+            .runtime_adapter
+            .accept_input_with_completion(session_id, Input::Prompt(prompt_input))
+            .await
+            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
+        Ok(build_dispatch_from_accepted(
+            occurrence,
+            accepted_scheduled_input_from_runtime_outcome(outcome, handle),
+            dispatch.materialized_session_id,
+        ))
+    }
+
+    async fn deliver_event(
+        &self,
+        session_id: &SessionId,
+        occurrence: &meerkat::Occurrence,
+        event_type: String,
+        payload: serde_json::Value,
+        render_metadata: Option<meerkat_core::types::RenderMetadata>,
+        materialized_session_id: Option<SessionId>,
+    ) -> Result<meerkat::DeliveryDispatch, meerkat::ScheduleDomainError> {
+        self.ensure_runtime_session_registered(session_id).await?;
+        let input = Input::ExternalEvent(meerkat_runtime::ExternalEventInput {
+            header: InputHeader {
+                id: meerkat_core::lifecycle::InputId::new(),
+                timestamp: chrono::Utc::now(),
+                source: InputOrigin::External {
+                    source_name: format!("schedule:{}", occurrence.schedule_id),
+                },
+                durability: InputDurability::Durable,
+                visibility: InputVisibility::default(),
+                idempotency_key: Some(IdempotencyKey::new(schedule_attempt_idempotency_key(
+                    occurrence,
+                ))),
+                supersession_key: None,
+                correlation_id: Some(CorrelationId::from_uuid(occurrence.occurrence_id.0)),
+            },
+            event_type,
+            payload,
+            blocks: None,
+            handling_mode: HandlingMode::Queue,
+            render_metadata,
+        });
+        let (outcome, handle) = self
+            .runtime_adapter
+            .accept_input_with_completion(session_id, input)
+            .await
+            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
+        Ok(build_dispatch_from_accepted(
+            occurrence,
+            accepted_scheduled_input_from_runtime_outcome(outcome, handle),
+            materialized_session_id,
+        ))
     }
 }
 
@@ -372,9 +737,7 @@ fn short_id(id: &str) -> String {
 }
 
 fn format_age_ms(age_ms: i64) -> String {
-    if age_ms < 0 {
-        "just now".into()
-    } else if age_ms < 1_000 {
+    if age_ms < 1_000 {
         "just now".into()
     } else if age_ms < 60_000 {
         format!("{}s ago", age_ms / 1_000)
@@ -710,9 +1073,7 @@ async fn main() -> anyhow::Result<()> {
                             .await;
                     }
                     AppCommand::ResetHive => {
-                        if let Some(hive) = hive_agent.take() {
-                            hive.shutdown().await;
-                        }
+                        hive_agent = None;
                     }
                     AppCommand::ClaimTarget { .. } | AppCommand::ReleaseTarget { .. } => {}
                     AppCommand::RunHive { prompt } => {
@@ -749,7 +1110,7 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
-                        let agent = hive_agent.as_ref().expect("just built");
+                        let agent = hive_agent.as_mut().expect("just built");
                         let ev = match agent.run(prompt).await {
                             Ok(r) => TuiEvent::HivePlanDone(r.text),
                             Err(e) => TuiEvent::HiveError(e.to_string()),
@@ -858,95 +1219,135 @@ async fn build_hive_with_llm_override(
     trusted: Arc<parking_lot::RwLock<meerkat_comms::TrustedPeers>>,
     llm_client_override: Option<Arc<dyn LlmClient>>,
 ) -> anyhow::Result<HiveAgentState> {
-    let persistence = open_example_runtime_persistence(session_dir).await?;
-    let config = meerkat_core::Config::default();
-    let session_store = persistence.session_store();
-    let schedule_service = ScheduleService::new(persistence.schedule_store());
+    let factory = AgentFactory::new(session_dir)
+        .builtins(false)
+        .shell(false)
+        .schedule(true)
+        .mob(true);
+    let tools: Arc<dyn AgentToolDispatcher> = Arc::new(CommsToolDispatcher::new(router, trusted));
+    let schedule_store = Arc::new(SqliteScheduleStore::open(
+        session_dir.join("schedule.sqlite"),
+    )?) as Arc<dyn meerkat::ScheduleStore>;
+    let schedule_service = ScheduleService::new(Arc::clone(&schedule_store));
+
+    let jsonl_store = Arc::new(JsonlStore::new(session_dir.to_path_buf()));
+    jsonl_store.init().await?;
+    let persistence = PersistenceBundle::new_with_schedule_store(
+        Arc::clone(&jsonl_store) as Arc<dyn SessionStore>,
+        None,
+        Arc::new(MemoryBlobStore::new()),
+        schedule_store,
+    );
     let runtime_adapter = persistence.runtime_adapter();
-    let mut builder = FactoryAgentBuilder::new(
-        AgentFactory::new(session_dir.to_path_buf())
-            .session_store(Arc::clone(&session_store))
-            .mob(true),
-        config.clone(),
-    );
+    let (session_store, runtime_store, blob_store) = persistence.into_parts();
+
+    let mut builder = FactoryAgentBuilder::new(factory, Config::default());
     builder.default_llm_client = llm_client_override;
-    builder.default_session_store = Some(Arc::new(StoreAdapter::new(Arc::clone(
-        &session_store,
-    ))));
-    let (store, runtime_store, blob_store) = persistence.into_parts();
-    let mut service =
-        PersistentSessionService::new(builder, 4, store, runtime_store, blob_store);
-    wire_runtime_bindings(&mut service, &runtime_adapter);
-    let service = Arc::new(service);
-    let schedule_tools: Arc<dyn AgentToolDispatcher> =
-        Arc::new(ScheduleToolSurface::new(schedule_service.clone()));
-    let tools: Arc<dyn AgentToolDispatcher> = Arc::new(
-        ToolGatewayBuilder::new()
-            .add_dispatcher(Arc::new(CommsToolDispatcher::new(router, trusted)))
-            .add_dispatcher(Arc::clone(&schedule_tools))
-            .build()?,
+    let mob_tools_slot = Arc::clone(&builder.default_mob_tools);
+    *builder
+        .default_schedule_tools
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+        ScheduleToolDispatcher::new(schedule_service.clone()),
+    ));
+
+    let mut session_service =
+        PersistentSessionService::new(builder, 10, session_store, runtime_store, blob_store);
+    {
+        let adapter = runtime_adapter.clone();
+        session_service.set_runtime_bindings_provider(Arc::new(move |session_id| {
+            let adapter = adapter.clone();
+            Box::pin(async move { adapter.prepare_bindings(session_id).await.ok() })
+        }));
+    }
+    let service = Arc::new(session_service);
+    let mob_state = Arc::new(MobMcpState::new_with_runtime_adapter(
+        service.clone(),
+        Some(runtime_adapter.clone()),
+    ));
+    *mob_tools_slot
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+        AgentMobToolSurfaceFactory::new(Arc::clone(&mob_state)),
+    ));
+
+    let schedule_host = if schedule_host_supported(schedule_service.store().kind()) {
+        let session_host: Arc<dyn SurfaceScheduleSessionHost> =
+            Arc::new(HiveScheduleSessionHost {
+                service: service.clone(),
+                runtime_adapter: runtime_adapter.clone(),
+            });
+        let shared_adapter = Arc::new(SharedScheduleTargetAdapter::new(
+            schedule_service.clone(),
+            session_host,
+            Arc::new(NoopScheduleMobHost::new(
+                "scheduled mob targets are not enabled in mdm-tux hive",
+            )),
+        ));
+        Some(spawn_schedule_host(
+            schedule_service,
+            shared_adapter,
+            "mdm-tux-hive",
+        ))
+    } else {
+        None
+    };
+
+    let session = Session::new();
+    let session_id = session.id().clone();
+    let system_prompt = format!(
+        "You are a hive orchestrator for a fleet of remote machines. \
+         Your current session_id is '{session_id}'. If you schedule follow-up work for this same running hive session, use that exact session_id. \
+         Use the 'peers' tool to discover targets, then 'send_message' to dispatch \
+         commands. Target replies appear in the TUX output panel; the user \
+         will relay results if needed. Keep dispatches concise."
     );
-    let build_template = hive_session_build_template(Arc::clone(&tools));
-    let schedule_host = spawn_runtime_backed_schedule_host(
-        Arc::clone(&service),
-        Arc::clone(&runtime_adapter),
-        config,
-        schedule_service,
-        build_template.clone(),
-        format!("mdm-tux:hive:{}", session_dir.display()),
-    );
-    let session_id = materialize_session(
-        &service,
-        &runtime_adapter,
-        meerkat::Session::new(),
-        CreateSessionRequest {
+    let bindings = runtime_adapter
+        .prepare_bindings(session_id.clone())
+        .await
+        .map_err(|error| anyhow::anyhow!("runtime bindings: {error}"))?;
+    let create_result = service
+        .create_session(CreateSessionRequest {
             model: model.to_string(),
             prompt: ContentInput::Text(String::new()),
             render_metadata: None,
-            system_prompt: Some(
-                "You are a hive orchestrator for a fleet of remote machines. \
-                 Use the 'peers' tool to discover targets, then 'send' to dispatch \
-                 commands. Target replies appear in the TUX output panel; the user \
-                 will relay results if needed. Keep dispatches concise."
-                    .to_string(),
-            ),
+            system_prompt: Some(system_prompt),
             max_tokens: None,
             event_tx: None,
             skill_references: None,
             initial_turn: InitialTurnPolicy::Defer,
-            deferred_prompt_policy: DeferredPromptPolicy::Discard,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
             build: Some(SessionBuildOptions {
                 provider: Some(meerkat_core::Provider::from_name(&provider.to_string())),
-                llm_client_override: None,
-                ..build_template
+                resume_session: Some(session),
+                external_tools: Some(tools),
+                override_builtins: ToolCategoryOverride::Disable,
+                override_shell: ToolCategoryOverride::Disable,
+                override_schedule: ToolCategoryOverride::Enable,
+                override_mob: ToolCategoryOverride::Enable,
+                runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
+                ..SessionBuildOptions::default()
             }),
             labels: None,
-        },
-        {
-            let service = Arc::clone(&service);
-            let runtime_adapter = Arc::clone(&runtime_adapter);
-            move |session_id| default_persistent_executor(service, runtime_adapter, session_id)
-        },
-    )
-    .await?
-    .session_id;
+        })
+        .await?;
+    runtime_adapter
+        .ensure_session_with_executor(
+            create_result.session_id.clone(),
+            Box::new(HiveCoreExecutor {
+                service: Arc::clone(&service),
+                session_id: create_result.session_id.clone(),
+            }),
+        )
+        .await;
+
     Ok(HiveAgentState {
-        service,
-        session_id,
+        _service: service,
+        runtime_adapter,
+        session_id: create_result.session_id,
+        _mob_state: mob_state,
         _schedule_host: schedule_host,
     })
-}
-
-fn hive_session_build_template(
-    tools: Arc<dyn AgentToolDispatcher>,
-) -> SessionBuildOptions {
-    SessionBuildOptions {
-        external_tools: Some(tools),
-        override_builtins: meerkat_core::ToolCategoryOverride::Disable,
-        override_shell: meerkat_core::ToolCategoryOverride::Disable,
-        override_mob: meerkat_core::ToolCategoryOverride::Enable,
-        ..Default::default()
-    }
 }
 
 fn current_attached_target_ids(claims: &ClaimRegistry) -> Vec<String> {
@@ -1278,9 +1679,7 @@ async fn spawn_command_processor(
                 );
             }
             AppCommand::ResetHive => {
-                if let Some(hive) = hive_agent.take() {
-                    hive.shutdown().await;
-                }
+                hive_agent = None;
             }
             AppCommand::RunHive { prompt } => {
                 if hive_agent.is_none() {
@@ -1312,7 +1711,7 @@ async fn spawn_command_processor(
                         }
                     }
                 }
-                let agent = hive_agent.as_ref().expect("just built");
+                let agent = hive_agent.as_mut().expect("just built");
                 let ev = match agent.run(prompt).await {
                     Ok(r) => TuiEvent::HivePlanDone(r.text),
                     Err(e) => TuiEvent::HiveError(e.to_string()),
@@ -3309,12 +3708,39 @@ mod tests {
         is_known_slash_command, normalize_tool_text, parse_provider_override, scroll_timeline_down,
         scroll_timeline_up, timeline_max_scroll,
     };
+    use chrono::{Duration as ChronoDuration, Utc};
     use mdm_tux::ProviderKind;
-    use meerkat::LlmClient;
+    use meerkat::{
+        CreateScheduleRequest, LlmClient, MisfirePolicy, MissingTargetPolicy, OverlapPolicy,
+        ScheduleService, ScheduledSessionAction, SessionTargetBinding, SqliteScheduleStore,
+        TargetBinding, TriggerSpec,
+    };
     use meerkat_comms::identity::Keypair;
     use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::sync::Arc;
     use test_support::CaptureClient;
+    use tokio::time::{Duration, timeout};
+
+    async fn wait_for_captured_user_message(
+        capture: &CaptureClient,
+        expected: &str,
+    ) -> anyhow::Result<()> {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let matches = capture
+                    .user_messages()
+                    .into_iter()
+                    .filter(|message| message == expected)
+                    .count();
+                if matches == 1 {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for scheduled prompt '{expected}'"))?
+    }
 
     #[test]
     fn provider_override_requires_model_and_provider_together() {
@@ -3433,6 +3859,36 @@ mod tests {
         let node = mdm_tux::CommsNode::new(Keypair::generate());
         let capture: Arc<CaptureClient> = Arc::new(CaptureClient::default());
 
+        let mut hive = build_hive_with_llm_override(
+            temp.path(),
+            "gpt-5.2",
+            ProviderKind::Openai,
+            node.router.clone(),
+            node.trusted.clone(),
+            Some(capture.clone() as Arc<dyn LlmClient>),
+        )
+        .await
+        .unwrap();
+
+        hive.run("inspect hive tools".to_string().into()).await.unwrap();
+
+        let tool_names = capture.tool_names();
+        assert!(tool_names.iter().any(|name| name == "send_message"));
+        assert!(tool_names.iter().any(|name| name == "peers"));
+        assert!(tool_names.iter().any(|name| name == "meerkat_schedule_create"));
+        assert!(tool_names.iter().any(|name| name == "meerkat_schedule_list"));
+        assert!(tool_names.iter().any(|name| name == "delegate"));
+        assert!(tool_names.iter().any(|name| name == "mob_list"));
+        assert!(tool_names.iter().any(|name| name == "mob_check_member"));
+        assert!(!tool_names.iter().any(|name| name == "shell"));
+    }
+
+    #[tokio::test]
+    async fn hive_schedule_host_delivers_future_prompt_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = mdm_tux::CommsNode::new(Keypair::generate());
+        let capture: Arc<CaptureClient> = Arc::new(CaptureClient::default());
+
         let hive = build_hive_with_llm_override(
             temp.path(),
             "gpt-5.2",
@@ -3444,20 +3900,38 @@ mod tests {
         .await
         .unwrap();
 
-        hive.run("inspect hive tools".to_string()).await.unwrap();
+        let schedule_service = ScheduleService::new(Arc::new(
+            SqliteScheduleStore::open(temp.path().join("schedule.sqlite")).unwrap(),
+        ));
+        schedule_service
+            .create(CreateScheduleRequest {
+                name: Some("scheduled-ping".into()),
+                description: Some("deliver one scheduled prompt".into()),
+                trigger: TriggerSpec::Once {
+                    due_at_utc: Utc::now() + ChronoDuration::seconds(1),
+                },
+                target: TargetBinding::session(SessionTargetBinding::ExactSession {
+                    session_id: hive.session_id.clone(),
+                    action: ScheduledSessionAction::Prompt {
+                        prompt: "scheduled ping".into(),
+                        system_prompt: None,
+                        render_metadata: None,
+                        skill_references: Vec::new(),
+                        additional_instructions: Vec::new(),
+                    },
+                }),
+                misfire_policy: MisfirePolicy::Skip,
+                overlap_policy: OverlapPolicy::SkipIfRunning,
+                missing_target_policy: MissingTargetPolicy::MarkMisfired,
+                labels: Default::default(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await
+            .unwrap();
 
-        let tool_names = capture.tool_names();
-        assert!(tool_names.iter().any(|name| name == "send_message"));
-        assert!(tool_names.iter().any(|name| name == "send_request"));
-        assert!(tool_names.iter().any(|name| name == "send_response"));
-        assert!(tool_names.iter().any(|name| name == "peers"));
-        assert!(tool_names.iter().any(|name| name == "delegate"));
-        assert!(tool_names.iter().any(|name| name == "mob_list"));
-        assert!(tool_names.iter().any(|name| name == "mob_check_member"));
-        assert!(tool_names.iter().any(|name| name == "meerkat_schedule_create"));
-        assert!(tool_names.iter().any(|name| name == "meerkat_schedule_list"));
-        assert!(!tool_names.iter().any(|name| name == "shell"));
-
-        hive.shutdown().await;
+        wait_for_captured_user_message(capture.as_ref(), "scheduled ping")
+            .await
+            .unwrap();
     }
 }

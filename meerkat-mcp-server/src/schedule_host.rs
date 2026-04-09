@@ -205,7 +205,9 @@ impl McpScheduleContext {
             override_builtins: meerkat_core::ToolCategoryOverride::Inherit,
             override_shell: meerkat_core::ToolCategoryOverride::Inherit,
             override_memory: meerkat_core::ToolCategoryOverride::Inherit,
+            override_schedule: meerkat_core::ToolCategoryOverride::Inherit,
             override_mob: meerkat_core::ToolCategoryOverride::Inherit,
+            schedule_tools: None,
             mob_tool_authority_context: None,
             preload_skills: preload_skill_ids(Some(create.preload_skills.clone())),
             realm_id: create

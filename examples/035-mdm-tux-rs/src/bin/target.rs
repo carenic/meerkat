@@ -6,7 +6,7 @@
 //! This target is a **runtime-backed surface** (same tier as CLI/RPC/REST):
 //! - Agent construction via `AgentFactory::build_agent()`
 //! - Session lifecycle via `PersistentSessionService`
-//! - Input routing via canonical classified peer ingress
+//! - Input routing via `RuntimeSessionAdapter` with `HandlingMode::Steer`
 //! - Typed `MessageKind` classification (no string prefixes)
 //!
 //! Sessions are persisted to disk. On restart the most recent session
@@ -19,40 +19,50 @@
 //!
 //! Set one of: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GEMINI_API_KEY`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use futures::StreamExt;
-use meerkat::{AgentFactory, FactoryAgentBuilder, PersistentSessionService};
+use meerkat::PersistentSessionService;
+use meerkat::{
+    AgentFactory, FactoryAgentBuilder, PersistenceBundle, ScheduleService,
+    ScheduleToolDispatcher, SqliteScheduleStore,
+};
+use meerkat::surface::{
+    NoopScheduleMobHost, ScheduledPromptDispatch, SharedScheduleTargetAdapter,
+    SurfaceScheduleSessionHost, accepted_scheduled_input_from_runtime_outcome,
+    build_dispatch_from_accepted, schedule_attempt_idempotency_key, schedule_host_supported,
+    spawn_schedule_host,
+};
 use meerkat_comms::MessageKind;
 use meerkat_comms::{CommsRuntime, PeerMeta, ResolvedCommsConfig, TrustedPeer};
-use meerkat_core::agent::CommsRuntime as _;
-use meerkat_core::interaction::{InteractionContent, PeerInputCandidate};
+use meerkat_core::lifecycle::RunId;
+use meerkat_core::lifecycle::core_executor::{CoreApplyOutput, CoreExecutor, CoreExecutorError};
+use meerkat_core::lifecycle::run_control::RunControlCommand;
+use meerkat_core::lifecycle::run_primitive::{CoreRenderable, RunApplyBoundary, RunPrimitive};
 use meerkat_core::service::{
-    CreateSessionRequest, InitialTurnPolicy, SessionBuildOptions, SessionError,
+    CreateSessionRequest, InitialTurnPolicy, SessionBuildOptions, SessionError, SessionService,
+    StartTurnRequest,
 };
-use meerkat_core::types::{ContentInput, SessionId};
-use meerkat_core::{AgentEvent, AgentToolDispatcher, Config};
-use meerkat_mob_mcp::wire_mob_tools;
-use meerkat_mob_mcp::MobMcpState;
-use meerkat_runtime::comms_bridge::peer_input_candidate_to_runtime_input;
-use meerkat_runtime::identifiers::LogicalRuntimeId;
-use meerkat_runtime::SessionServiceRuntimeExt;
-use meerkat_runtime::RuntimeSessionAdapter;
-use meerkat_schedule::{ScheduleService, ScheduleToolSurface};
-use meerkat_store::{MemoryBlobStore, SessionFilter, StoreAdapter};
-use meerkat::surface::{
-    default_persistent_executor, materialize_session, spawn_runtime_backed_schedule_host,
-    wire_runtime_bindings,
+use meerkat_core::types::{ContentInput, HandlingMode, SessionId};
+use meerkat_core::{AgentEvent, Config, Session};
+use meerkat_mob_mcp::{AgentMobToolSurfaceFactory, MobMcpState};
+use meerkat_runtime::{
+    CorrelationId, IdempotencyKey, Input, InputOrigin, PromptInput, RuntimeSessionAdapter,
 };
+use meerkat_runtime::input::{
+    InputDurability, InputHeader, InputVisibility, PeerConvention, PeerInput,
+};
+use meerkat_runtime::service_ext::SessionServiceRuntimeExt;
+use meerkat_store::{JsonlStore, MemoryBlobStore, SessionFilter, SessionStore};
 
 use mdm_tux::{
     DirectControlPayload, KennelPayload, ProviderKind, RegResponse, auto_detect,
-    build_signed_envelope, direct_control_request, read_envelope, register_with_backoff,
-    open_example_runtime_persistence, verify_envelope, write_envelope, DIRECT_CONTROL_INTENT,
+    build_signed_envelope, direct_control_request, parse_direct_control_message, read_envelope,
+    register_with_backoff, verify_envelope, write_envelope,
 };
 use tokio::io::BufReader;
 use tokio::net::TcpStream;
@@ -65,29 +75,333 @@ use mdm_tux::machines::target_session_binding::{
 const SYSTEM_PROMPT: &str = "\
 You are a managed system agent named '{name}' controlled by a human operator via TUX.
 Execute user requests using your available tools. Respond conversationally.
+Your current session_id is '{session_id}'. If you schedule follow-up work for this same running agent session, use that exact session_id.
 Your responses stream directly to the controller — do not use the 'send' comms tool to reply.";
 
 struct TargetRuntimeSurface {
     service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
     runtime_adapter: Arc<RuntimeSessionAdapter>,
-    comms_runtime: Arc<CommsRuntime>,
-    #[allow(dead_code)]
-    schedule_service: ScheduleService,
-    schedule_tools: Arc<dyn AgentToolDispatcher>,
-    session_store: Arc<dyn meerkat::SessionStore>,
+    jsonl_store: Arc<JsonlStore>,
     mob_state: Arc<MobMcpState>,
     _schedule_host: Option<meerkat::surface::ScheduleHostHandle>,
 }
 
-fn target_session_build_template(
-    schedule_tools: Arc<dyn AgentToolDispatcher>,
-) -> SessionBuildOptions {
-    SessionBuildOptions {
-        external_tools: Some(schedule_tools),
-        override_builtins: meerkat_core::ToolCategoryOverride::Enable,
-        override_shell: meerkat_core::ToolCategoryOverride::Enable,
-        override_mob: meerkat_core::ToolCategoryOverride::Enable,
-        ..Default::default()
+#[derive(Clone)]
+struct TargetScheduleSessionHost {
+    service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    runtime_adapter: Arc<RuntimeSessionAdapter>,
+    mob_state: Arc<MobMcpState>,
+}
+
+impl TargetScheduleSessionHost {
+    fn new(
+        service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
+        runtime_adapter: Arc<RuntimeSessionAdapter>,
+        mob_state: Arc<MobMcpState>,
+    ) -> Self {
+        Self {
+            service,
+            runtime_adapter,
+            mob_state,
+        }
+    }
+
+    fn executor(&self, session_id: SessionId) -> TargetCoreExecutor {
+        TargetCoreExecutor::new(
+            Arc::clone(&self.service),
+            Arc::clone(&self.mob_state),
+            session_id,
+        )
+    }
+
+    async fn ensure_runtime_session_registered(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), meerkat::ScheduleDomainError> {
+        let session_exists = self.service.read(session_id).await.is_ok()
+            || self
+                .service
+                .load_persisted(session_id)
+                .await
+                .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?
+                .is_some();
+        if !session_exists {
+            return Err(meerkat::ScheduleDomainError::InvalidSchedule(format!(
+                "session not found: {session_id}"
+            )));
+        }
+
+        let executor = Box::new(self.executor(session_id.clone()));
+        self.runtime_adapter
+            .ensure_session_with_executor(session_id.clone(), executor)
+            .await;
+        Ok(())
+    }
+
+    async fn update_peer_ingress_context(&self, session_id: &SessionId) {
+        let keep_alive = self
+            .service
+            .load_persisted(session_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|session| session.session_metadata().map(|metadata| metadata.keep_alive))
+            .unwrap_or(false);
+        let comms_rt = self.service.comms_runtime(session_id).await;
+        self.runtime_adapter
+            .update_peer_ingress_context(session_id, keep_alive, comms_rt)
+            .await;
+    }
+}
+
+fn session_metadata_marks_archived(session: &Session) -> bool {
+    session
+        .metadata()
+        .get("session_archived")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn scheduled_skill_keys(
+    skill_references: &[String],
+) -> Result<Option<Vec<meerkat_core::skills::SkillKey>>, meerkat::ScheduleDomainError> {
+    if skill_references.is_empty() {
+        return Ok(None);
+    }
+
+    skill_references
+        .iter()
+        .map(|reference| {
+            let mut parts = reference.split('/');
+            let Some(source_uuid_raw) = parts.next() else {
+                return Err(meerkat::ScheduleDomainError::InvalidSchedule(format!(
+                    "invalid scheduled skill reference: {reference}"
+                )));
+            };
+            let Some(skill_name_raw) = parts.next() else {
+                return Err(meerkat::ScheduleDomainError::InvalidSchedule(format!(
+                    "invalid scheduled skill reference: {reference}"
+                )));
+            };
+            if parts.next().is_some() {
+                return Err(meerkat::ScheduleDomainError::InvalidSchedule(format!(
+                    "invalid scheduled skill reference: {reference}"
+                )));
+            }
+            Ok(meerkat_core::skills::SkillKey {
+                source_uuid: meerkat_core::skills::SourceUuid::parse(source_uuid_raw).map_err(
+                    |_| {
+                        meerkat::ScheduleDomainError::InvalidSchedule(format!(
+                            "invalid scheduled skill reference: {reference}"
+                        ))
+                    },
+                )?,
+                skill_name: meerkat_core::skills::SkillName::parse(skill_name_raw).map_err(
+                    |_| {
+                        meerkat::ScheduleDomainError::InvalidSchedule(format!(
+                            "invalid scheduled skill reference: {reference}"
+                        ))
+                    },
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+#[async_trait::async_trait]
+impl SurfaceScheduleSessionHost for TargetScheduleSessionHost {
+    async fn probe_session_target(
+        &self,
+        binding: &meerkat::SessionTargetBinding,
+    ) -> Result<meerkat::TargetProbeOutcome, meerkat::ScheduleDomainError> {
+        let Some(session_id) = binding.resolved_session_id() else {
+            return Ok(meerkat::TargetProbeOutcome::Ready);
+        };
+
+        if let Ok(view) = self.service.read(session_id).await {
+            return Ok(if view.state.is_active {
+                meerkat::TargetProbeOutcome::Busy {
+                    detail: Some(format!("session still running: {session_id}")),
+                }
+            } else {
+                meerkat::TargetProbeOutcome::Ready
+            });
+        }
+
+        let persisted = self
+            .service
+            .load_persisted(session_id)
+            .await
+            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
+        match persisted {
+            Some(session) if !session_metadata_marks_archived(&session) => {
+                Ok(meerkat::TargetProbeOutcome::Ready)
+            }
+            _ => Ok(meerkat::TargetProbeOutcome::Missing {
+                detail: Some(format!("session not found: {session_id}")),
+            }),
+        }
+    }
+
+    async fn materialize_session(
+        &self,
+        create: &meerkat::SessionMaterializationSpec,
+        prompt_system_prompt: Option<&str>,
+    ) -> Result<SessionId, meerkat::ScheduleDomainError> {
+        let session = Session::new();
+        let session_id = session.id().clone();
+        let bindings = self
+            .runtime_adapter
+            .prepare_bindings(session_id.clone())
+            .await
+            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
+
+        let build = SessionBuildOptions {
+            provider: create.provider,
+            output_schema: create.output_schema.clone(),
+            structured_output_retries: create.structured_output_retries,
+            comms_name: create.comms_name.clone(),
+            peer_meta: create.peer_meta.clone(),
+            resume_session: Some(session),
+            provider_params: create.provider_params.clone(),
+            preload_skills: (!create.preload_skills.is_empty()).then(|| {
+                create
+                    .preload_skills
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect()
+            }),
+            additional_instructions: (!create.additional_instructions.is_empty())
+                .then(|| create.additional_instructions.clone()),
+            realm_id: create.realm_id.clone(),
+            instance_id: create.instance_id.clone(),
+            backend: create.backend.clone(),
+            keep_alive: create.keep_alive,
+            app_context: create.app_context.clone(),
+            runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
+            ..SessionBuildOptions::default()
+        };
+
+        let result = self
+            .service
+            .create_session(CreateSessionRequest {
+                model: create.model.clone(),
+                prompt: ContentInput::Text(String::new()),
+                render_metadata: None,
+                system_prompt: prompt_system_prompt
+                    .map(str::to_owned)
+                    .or_else(|| create.system_prompt.clone()),
+                max_tokens: create.max_tokens,
+                event_tx: None,
+                skill_references: None,
+                initial_turn: InitialTurnPolicy::Defer,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+                build: Some(build),
+                labels: Some(create.labels.clone()),
+            })
+            .await
+            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
+
+        self.runtime_adapter
+            .ensure_session_with_executor(
+                result.session_id.clone(),
+                Box::new(self.executor(result.session_id.clone())),
+            )
+            .await;
+
+        Ok(result.session_id)
+    }
+
+    async fn deliver_prompt(
+        &self,
+        session_id: &SessionId,
+        occurrence: &meerkat::Occurrence,
+        dispatch: ScheduledPromptDispatch,
+    ) -> Result<meerkat::DeliveryDispatch, meerkat::ScheduleDomainError> {
+        self.ensure_runtime_session_registered(session_id).await?;
+        self.update_peer_ingress_context(session_id).await;
+
+        let turn_metadata = Some(meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+            handling_mode: None,
+            keep_alive: None,
+            skill_references: scheduled_skill_keys(&dispatch.skill_references)?,
+            flow_tool_overlay: None,
+            additional_instructions: (!dispatch.additional_instructions.is_empty())
+                .then_some(dispatch.additional_instructions.clone()),
+            model: None,
+            provider: None,
+            provider_params: None,
+            render_metadata: dispatch.render_metadata.clone(),
+            execution_kind: None,
+        });
+        let mut prompt_input = PromptInput::from_content_input(dispatch.prompt, turn_metadata);
+        prompt_input.header.source = InputOrigin::System;
+        prompt_input.header.idempotency_key = Some(IdempotencyKey::new(
+            schedule_attempt_idempotency_key(occurrence),
+        ));
+        prompt_input.header.correlation_id =
+            Some(CorrelationId::from_uuid(occurrence.occurrence_id.0));
+
+        let (outcome, handle) = self
+            .runtime_adapter
+            .accept_input_with_completion(session_id, Input::Prompt(prompt_input))
+            .await
+            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
+
+        Ok(build_dispatch_from_accepted(
+            occurrence,
+            accepted_scheduled_input_from_runtime_outcome(outcome, handle),
+            dispatch.materialized_session_id,
+        ))
+    }
+
+    async fn deliver_event(
+        &self,
+        session_id: &SessionId,
+        occurrence: &meerkat::Occurrence,
+        event_type: String,
+        payload: serde_json::Value,
+        render_metadata: Option<meerkat_core::types::RenderMetadata>,
+        materialized_session_id: Option<SessionId>,
+    ) -> Result<meerkat::DeliveryDispatch, meerkat::ScheduleDomainError> {
+        self.ensure_runtime_session_registered(session_id).await?;
+        self.update_peer_ingress_context(session_id).await;
+
+        let input = Input::ExternalEvent(meerkat_runtime::ExternalEventInput {
+            header: InputHeader {
+                id: meerkat_core::lifecycle::InputId::new(),
+                timestamp: chrono::Utc::now(),
+                source: InputOrigin::External {
+                    source_name: format!("schedule:{}", occurrence.schedule_id),
+                },
+                durability: InputDurability::Durable,
+                visibility: InputVisibility::default(),
+                idempotency_key: Some(IdempotencyKey::new(schedule_attempt_idempotency_key(
+                    occurrence,
+                ))),
+                supersession_key: None,
+                correlation_id: Some(CorrelationId::from_uuid(occurrence.occurrence_id.0)),
+            },
+            event_type,
+            payload,
+            blocks: None,
+            handling_mode: HandlingMode::Queue,
+            render_metadata,
+        });
+
+        let (outcome, handle) = self
+            .runtime_adapter
+            .accept_input_with_completion(session_id, input)
+            .await
+            .map_err(|error| meerkat::ScheduleDomainError::Internal(error.to_string()))?;
+
+        Ok(build_dispatch_from_accepted(
+            occurrence,
+            accepted_scheduled_input_from_runtime_outcome(outcome, handle),
+            materialized_session_id,
+        ))
     }
 }
 
@@ -95,50 +409,84 @@ async fn build_target_runtime_surface(
     session_dir: &Path,
     comms_runtime: Arc<CommsRuntime>,
 ) -> anyhow::Result<TargetRuntimeSurface> {
-    let persistence = open_example_runtime_persistence(session_dir).await?;
-    let config = Config::default();
-    let session_store = persistence.session_store();
-    let schedule_service = ScheduleService::new(persistence.schedule_store());
+    let factory = AgentFactory::new(session_dir)
+        .shell(true)
+        .builtins(true)
+        .comms(true)
+        .schedule(true)
+        .mob(true)
+        .with_comms_runtime(comms_runtime);
+    let schedule_store = Arc::new(SqliteScheduleStore::open(
+        session_dir.join("schedule.sqlite"),
+    )?) as Arc<dyn meerkat::ScheduleStore>;
+    let schedule_service = ScheduleService::new(Arc::clone(&schedule_store));
+    let builder = FactoryAgentBuilder::new(factory, Config::default());
+    let mob_tools_slot = Arc::clone(&builder.default_mob_tools);
+    *builder
+        .default_schedule_tools
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+        ScheduleToolDispatcher::new(schedule_service.clone()),
+    ));
+
+    let jsonl_store = Arc::new(JsonlStore::new(session_dir.to_path_buf()));
+    jsonl_store.init().await?;
+
+    let persistence = PersistenceBundle::new_with_schedule_store(
+        Arc::clone(&jsonl_store) as Arc<dyn SessionStore>,
+        None,
+        Arc::new(MemoryBlobStore::new()),
+        schedule_store,
+    );
     let runtime_adapter = persistence.runtime_adapter();
-    let mut builder = FactoryAgentBuilder::new(
-        AgentFactory::new(session_dir.to_path_buf())
-            .session_store(Arc::clone(&session_store))
-            .with_comms_runtime(Arc::clone(&comms_runtime))
-            .shell(true)
-            .builtins(true)
-            .mob(true),
-        config.clone(),
-    );
-    builder.default_session_store = Some(Arc::new(StoreAdapter::new(Arc::clone(&session_store))));
-    let builder_mob_tools_slot = Arc::clone(&builder.default_mob_tools);
-    let (store, runtime_store, blob_store) = persistence.into_parts();
-    let mut service = PersistentSessionService::new(builder, 10, store, runtime_store, blob_store);
-    wire_runtime_bindings(&mut service, &runtime_adapter);
-    let service = Arc::new(service);
-    let schedule_tools: Arc<dyn AgentToolDispatcher> =
-        Arc::new(ScheduleToolSurface::new(schedule_service.clone()));
-    let schedule_host = spawn_runtime_backed_schedule_host(
-        Arc::clone(&service),
-        Arc::clone(&runtime_adapter),
-        config,
-        schedule_service.clone(),
-        target_session_build_template(Arc::clone(&schedule_tools)),
-        format!("mdm-target:{}", session_dir.display()),
-    );
-    let mob_state = wire_mob_tools(
-        &builder_mob_tools_slot,
+    let (session_store, runtime_store, blob_store) = persistence.into_parts();
+
+    let mut session_service =
+        PersistentSessionService::new(builder, 10, session_store, runtime_store, blob_store);
+    {
+        let adapter = runtime_adapter.clone();
+        session_service.set_runtime_bindings_provider(Arc::new(move |session_id| {
+            let adapter = adapter.clone();
+            Box::pin(async move { adapter.prepare_bindings(session_id).await.ok() })
+        }));
+    }
+    let service = Arc::new(session_service);
+    let mob_state = Arc::new(MobMcpState::new_with_runtime_adapter(
         service.clone(),
         Some(runtime_adapter.clone()),
-        None,
-    );
+    ));
+    *mob_tools_slot
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+        AgentMobToolSurfaceFactory::new(Arc::clone(&mob_state)),
+    ));
+    let schedule_host = if schedule_host_supported(schedule_service.store().kind()) {
+        let session_host: Arc<dyn SurfaceScheduleSessionHost> =
+            Arc::new(TargetScheduleSessionHost::new(
+                service.clone(),
+                runtime_adapter.clone(),
+                mob_state.clone(),
+            ));
+        let shared_adapter = Arc::new(SharedScheduleTargetAdapter::new(
+            schedule_service.clone(),
+            session_host,
+            Arc::new(NoopScheduleMobHost::new(
+                "scheduled mob targets are not enabled in mdm-target",
+            )),
+        ));
+        Some(spawn_schedule_host(
+            schedule_service,
+            shared_adapter,
+            "mdm-target",
+        ))
+    } else {
+        None
+    };
 
     Ok(TargetRuntimeSurface {
         service,
         runtime_adapter,
-        comms_runtime,
-        schedule_service,
-        schedule_tools,
-        session_store,
+        jsonl_store,
         mob_state,
         _schedule_host: schedule_host,
     })
@@ -157,78 +505,6 @@ async fn discard_live_session_with_mob_cleanup(
         eprintln!("[target] warning: cleanup mobs for session {session_id}: {error}");
     }
     discard_result
-}
-
-async fn sync_session_trusted_peers_from_surface(
-    surface: &TargetRuntimeSurface,
-    session_id: &SessionId,
-    source_runtime: &Arc<CommsRuntime>,
-) -> anyhow::Result<()> {
-    let Some(session_runtime) = surface.service.comms_runtime(session_id).await else {
-        return Ok(());
-    };
-
-    let desired_peers = source_runtime.peers().await;
-    let existing_peers = session_runtime.peers().await;
-
-    for peer in &existing_peers {
-        if desired_peers
-            .iter()
-            .all(|desired| desired.peer_id != peer.peer_id)
-        {
-            session_runtime
-                .remove_trusted_peer(&peer.peer_id)
-                .await
-                .with_context(|| {
-                    format!(
-                        "remove stale session peer {} ({})",
-                        peer.name.as_str(),
-                        peer.peer_id
-                    )
-                })?;
-        }
-    }
-
-    for peer in desired_peers {
-        if existing_peers
-            .iter()
-            .all(|existing| existing.peer_id != peer.peer_id)
-        {
-            let spec = meerkat_core::comms::TrustedPeerSpec::new(
-                peer.name.as_str(),
-                peer.peer_id.clone(),
-                peer.address.clone(),
-            )
-            .map_err(anyhow::Error::msg)
-            .context("build session trusted peer spec")?;
-            session_runtime
-                .add_trusted_peer(spec)
-                .await
-                .with_context(|| {
-                    format!(
-                        "add session peer {} ({})",
-                        peer.name.as_str(),
-                        peer.peer_id
-                    )
-                })?;
-        }
-    }
-
-    Ok(())
-}
-
-async fn inject_peer_input_candidate(
-    surface: &TargetRuntimeSurface,
-    session_id: &SessionId,
-    candidate: &PeerInputCandidate,
-) -> anyhow::Result<meerkat_runtime::AcceptOutcome> {
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
-    let input = peer_input_candidate_to_runtime_input(candidate, &runtime_id);
-    surface
-        .runtime_adapter
-        .accept_input(session_id, input)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
 /// Build a `ResolvedCommsConfig` for the target's stable identity.
@@ -347,13 +623,25 @@ async fn main() -> anyhow::Result<()> {
     let session_dir = data_dir.join("sessions");
     tokio::fs::create_dir_all(&session_dir).await?;
     let surface = build_target_runtime_surface(&session_dir, Arc::clone(&comms_runtime)).await?;
+    let _schedule_host_guard = surface._schedule_host.as_ref();
     let service = Arc::clone(&surface.service);
+    let runtime_adapter = Arc::clone(&surface.runtime_adapter);
+    let jsonl_store = Arc::clone(&surface.jsonl_store);
+    let mob_state = Arc::clone(&surface.mob_state);
 
-    let system_prompt = SYSTEM_PROMPT.replace("{name}", &name);
+    let system_prompt_template = SYSTEM_PROMPT.replace("{name}", &name);
 
     // ── 4. Create or auto-resume session ──────────────────────────────────────
-    let mut current_session_id =
-        create_or_resume_session(&surface, &model, &system_prompt, &provider).await?;
+    let mut current_session_id = create_or_resume_session(
+        &service,
+        &runtime_adapter,
+        &jsonl_store,
+        &model,
+        &system_prompt_template,
+        &mob_state,
+        &provider,
+    )
+    .await?;
 
     let mut event_forwarder: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -451,14 +739,6 @@ async fn main() -> anyhow::Result<()> {
             addr: format!("tcp://{host_addr}"),
             meta: PeerMeta::default(),
         });
-        if let Err(error) =
-            sync_session_trusted_peers_from_surface(&surface, &current_session_id, &comms_runtime)
-                .await
-        {
-            eprintln!(
-                "[target] warning: sync trusted peers into session {current_session_id}: {error}"
-            );
-        }
 
         // Disconnect signal: heartbeat + event forwarder can trigger reconnect
         let (disconnect_tx, disconnect_rx) = tokio::sync::watch::channel(false);
@@ -487,9 +767,12 @@ async fn main() -> anyhow::Result<()> {
             &comms_runtime,
             disconnect_rx,
             disconnect_tx,
-            &surface,
+            &service,
+            &runtime_adapter,
+            &jsonl_store,
             &model,
-            &system_prompt,
+            &system_prompt_template,
+            &mob_state,
             &provider,
             &mut session_binding_state,
             &mut current_session_id,
@@ -542,65 +825,39 @@ async fn run_inbox_loop(
     comms_runtime: &Arc<CommsRuntime>,
     mut disconnect_rx: tokio::sync::watch::Receiver<bool>,
     disconnect_tx: tokio::sync::watch::Sender<bool>,
-    surface: &TargetRuntimeSurface,
+    service: &Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    runtime_adapter: &Arc<RuntimeSessionAdapter>,
+    jsonl_store: &JsonlStore,
     model: &str,
     system_prompt: &str,
+    mob_state: &Arc<MobMcpState>,
     provider: &str,
     session_binding_state: &mut SessionBindingState,
     current_session_id: &mut SessionId,
     event_forwarder: &mut Option<tokio::task::JoinHandle<()>>,
 ) {
-    let mut pending_candidates = VecDeque::new();
     loop {
-        if let Some(candidate) = pending_candidates.pop_front() {
-            match parse_direct_control_candidate(&candidate) {
-                Ok(Some(payload)) => {
-                    tracing::debug!(?payload, "ignoring direct control payload at target surface");
-                    continue;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    eprintln!("[target] invalid direct control payload: {error}");
-                    continue;
-                }
-            }
-            match handle_target_message(
-                &candidate,
-                comms_runtime,
-                &disconnect_tx,
-                surface,
-                model,
-                system_prompt,
-                provider,
-                session_binding_state,
-                current_session_id,
-                event_forwarder,
-            )
-            .await
-            {
-                TargetLoopAction::Continue => {}
-                TargetLoopAction::ExitProcess => std::process::exit(0),
-            }
-            continue;
-        }
-
-        let inbox_notify = comms_runtime.inbox_notify();
-        let notified = inbox_notify.notified();
-        pending_candidates.extend(comms_runtime.drain_peer_input_candidates().await);
-        if !pending_candidates.is_empty() {
-            continue;
-        }
-        if comms_runtime.dismiss_received() {
-            eprintln!("[target] received DISMISS — shutting down");
-            std::process::exit(0);
-        }
-
         tokio::select! {
-            _ = notified => {
-                pending_candidates.extend(comms_runtime.drain_peer_input_candidates().await);
-                if pending_candidates.is_empty() && comms_runtime.dismiss_received() {
-                    eprintln!("[target] received DISMISS — shutting down");
-                    std::process::exit(0);
+            msg = comms_runtime.recv_message() => {
+                let Some(msg) = msg else { break };
+                match handle_target_message(
+                    &msg,
+                    comms_runtime,
+                    &disconnect_tx,
+                    service,
+                    runtime_adapter,
+                    jsonl_store,
+                    model,
+                    system_prompt,
+                    mob_state,
+                    provider,
+                    session_binding_state,
+                    current_session_id,
+                    event_forwarder,
+                )
+                .await {
+                    TargetLoopAction::Continue => {}
+                    TargetLoopAction::ExitProcess => std::process::exit(0),
                 }
             }
 
@@ -780,32 +1037,42 @@ async fn apply_target_control_effects(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_target_message(
-    candidate: &PeerInputCandidate,
+    msg: &meerkat_comms::agent::types::CommsMessage,
     comms_runtime: &Arc<CommsRuntime>,
     disconnect_tx: &tokio::sync::watch::Sender<bool>,
-    surface: &TargetRuntimeSurface,
+    service: &Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    runtime_adapter: &Arc<RuntimeSessionAdapter>,
+    jsonl_store: &JsonlStore,
     model: &str,
     system_prompt: &str,
+    mob_state: &Arc<MobMcpState>,
     provider: &str,
     session_binding_state: &mut SessionBindingState,
     current_session_id: &mut SessionId,
     event_forwarder: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> TargetLoopAction {
-    let sender = candidate.interaction.from.clone();
-    match &candidate.interaction.content {
-        InteractionContent::Request { intent, .. } if intent == "dismiss" => {
+    let sender = msg.from_peer.clone();
+    match &msg.content {
+        meerkat_comms::agent::types::CommsContent::Request { intent, .. }
+            if intent.as_str() == "dismiss" =>
+        {
             eprintln!("[target] received DISMISS — shutting down");
             return TargetLoopAction::ExitProcess;
         }
-        InteractionContent::Request { intent, params } if intent == "command" => {
+        meerkat_comms::agent::types::CommsContent::Request { intent, params, .. }
+            if intent.as_str() == "command" =>
+        {
             let cmd = params.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
             eprintln!("[target] command: {cmd}");
 
             let response = handle_command(
                 cmd,
-                surface,
+                service,
+                runtime_adapter,
+                jsonl_store,
                 model,
                 system_prompt,
+                mob_state,
                 provider,
                 session_binding_state,
                 current_session_id,
@@ -828,41 +1095,63 @@ async fn handle_target_message(
             );
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), reply_fut).await;
         }
-        InteractionContent::Request { intent, .. } if intent == "heartbeat" => {}
-        InteractionContent::Request { intent, .. } if intent == DIRECT_CONTROL_INTENT => {
-            tracing::debug!("ignoring direct control payload after surface handling");
+        meerkat_comms::agent::types::CommsContent::Request { intent, .. }
+            if intent.as_str() == "heartbeat" => {}
+        meerkat_comms::agent::types::CommsContent::Message { body, .. } => {
+            eprintln!("[target] received message from '{sender}'");
+
+            let peer_input = Input::Peer(PeerInput {
+                header: InputHeader {
+                    id: meerkat_core::lifecycle::InputId::new(),
+                    timestamp: chrono::Utc::now(),
+                    source: InputOrigin::Peer {
+                        peer_id: sender.clone(),
+                        runtime_id: None,
+                    },
+                    durability: InputDurability::Ephemeral,
+                    visibility: InputVisibility::default(),
+                    idempotency_key: None,
+                    supersession_key: None,
+                    correlation_id: None,
+                },
+                convention: Some(PeerConvention::Message),
+                body: body.clone(),
+                blocks: None,
+                handling_mode: Some(HandlingMode::Steer),
+            });
+
+            match runtime_adapter
+                .accept_input(active_session_id(session_binding_state), peer_input)
+                .await
+            {
+                Ok(outcome) => {
+                    tracing::debug!(?outcome, "input accepted");
+                }
+                Err(e) => {
+                    eprintln!("[target] accept_input error: {e}");
+                    let req = StartTurnRequest {
+                        prompt: ContentInput::Text(body.clone()),
+                        system_prompt: None,
+                        render_metadata: None,
+                        handling_mode: HandlingMode::Queue,
+                        event_tx: None,
+                        skill_references: None,
+                        flow_tool_overlay: None,
+                        additional_instructions: None,
+                        execution_kind: None,
+                    };
+                    if let Err(e) = service
+                        .start_turn(active_session_id(session_binding_state), req)
+                        .await
+                    {
+                        eprintln!("[target] fallback start_turn error: {e}");
+                    }
+                }
+            }
         }
-        InteractionContent::Message { .. }
-        | InteractionContent::Request { .. }
-        | InteractionContent::Response { .. } => match inject_peer_input_candidate(
-            surface,
-            active_session_id(session_binding_state),
-            candidate,
-        )
-        .await
-        {
-            Ok(outcome) => {
-                tracing::debug!(?outcome, "classified input accepted");
-            }
-            Err(error) => {
-                eprintln!("[target] inject_peer_input_candidate error: {error}");
-            }
-        },
+        _ => {}
     }
     TargetLoopAction::Continue
-}
-
-fn parse_direct_control_candidate(
-    candidate: &PeerInputCandidate,
-) -> anyhow::Result<Option<DirectControlPayload>> {
-    match &candidate.interaction.content {
-        InteractionContent::Request { intent, params } if intent == DIRECT_CONTROL_INTENT => {
-            let payload =
-                serde_json::from_value(params.clone()).context("decode direct control payload")?;
-            Ok(Some(payload))
-        }
-        _ => Ok(None),
-    }
 }
 
 async fn forward_stream_event(
@@ -933,9 +1222,12 @@ fn spawn_heartbeat(
 #[allow(clippy::too_many_arguments)]
 async fn handle_command(
     cmd: &str,
-    surface: &TargetRuntimeSurface,
+    service: &Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    runtime_adapter: &Arc<RuntimeSessionAdapter>,
+    jsonl_store: &JsonlStore,
     model: &str,
     system_prompt: &str,
+    mob_state: &Arc<MobMcpState>,
     provider: &str,
     session_binding_state: &mut SessionBindingState,
     current_session_id: &mut SessionId,
@@ -945,10 +1237,12 @@ async fn handle_command(
 ) -> String {
     if cmd == "NEW_SESSION" {
         match switch_session(
-            surface,
+            service,
+            runtime_adapter,
             None,
             model,
             system_prompt,
+            mob_state,
             provider,
             session_binding_state,
             current_session_id,
@@ -962,7 +1256,7 @@ async fn handle_command(
             Err(e) => format!("Failed to create session: {e}"),
         }
     } else if cmd == "LIST_SESSIONS" {
-        match surface.session_store.list(SessionFilter::default()).await {
+        match jsonl_store.list(SessionFilter::default()).await {
             Ok(mut sessions) => {
                 sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
                 if sessions.is_empty() {
@@ -1001,7 +1295,7 @@ async fn handle_command(
             Ok(n) if n >= 1 => n - 1,
             _ => return format!("Invalid session number: {arg}"),
         };
-        match surface.session_store.list(SessionFilter::default()).await {
+        match jsonl_store.list(SessionFilter::default()).await {
             Ok(mut sessions) => {
                 sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
                 if idx >= sessions.len() {
@@ -1009,10 +1303,12 @@ async fn handle_command(
                 }
                 let resume_id = sessions[idx].id.clone();
                 match switch_session(
-                    surface,
+                    service,
+                    runtime_adapter,
                     Some(resume_id),
                     model,
                     system_prompt,
+                    mob_state,
                     provider,
                     session_binding_state,
                     current_session_id,
@@ -1051,21 +1347,32 @@ fn format_duration(d: std::time::Duration) -> String {
 /// Create a new session or resume an existing one. Registers the session
 /// with the RuntimeSessionAdapter and subscribes to its events.
 async fn create_or_resume_session(
-    surface: &TargetRuntimeSurface,
+    service: &Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    runtime_adapter: &Arc<RuntimeSessionAdapter>,
+    jsonl_store: &JsonlStore,
     model: &str,
     system_prompt: &str,
+    mob_state: &Arc<MobMcpState>,
     provider: &str,
 ) -> anyhow::Result<SessionId> {
     // Try to auto-resume the most recent session. On failure, warn and start fresh.
-    if let Ok(mut sessions) = surface.session_store.list(SessionFilter::default()).await {
+    if let Ok(mut sessions) = jsonl_store.list(SessionFilter::default()).await {
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         if let Some(latest) = sessions.first() {
             eprintln!(
                 "[target] auto-resuming session {} ({} messages)",
                 latest.id, latest.message_count
             );
-            match setup_session(surface, Some(latest.id.clone()), model, system_prompt, provider)
-                .await
+            match setup_session(
+                service,
+                runtime_adapter,
+                Some(latest.id.clone()),
+                model,
+                system_prompt,
+                mob_state,
+                provider,
+            )
+            .await
             {
                 Ok(sid) => return Ok(sid),
                 Err(e) => {
@@ -1076,7 +1383,16 @@ async fn create_or_resume_session(
     }
 
     eprintln!("[target] starting fresh session");
-    setup_session(surface, None, model, system_prompt, provider).await
+    setup_session(
+        service,
+        runtime_adapter,
+        None,
+        model,
+        system_prompt,
+        mob_state,
+        provider,
+    )
+    .await
 }
 
 /// Switch to a new or resumed session. Drops the old event forwarder,
@@ -1084,10 +1400,12 @@ async fn create_or_resume_session(
 /// and spawns a new event forwarder.
 #[allow(clippy::too_many_arguments)]
 async fn switch_session(
-    surface: &TargetRuntimeSurface,
+    service: &Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    runtime_adapter: &Arc<RuntimeSessionAdapter>,
     resume_id: Option<SessionId>,
     model: &str,
     system_prompt: &str,
+    mob_state: &Arc<MobMcpState>,
     provider: &str,
     session_binding_state: &mut SessionBindingState,
     current_session_id: &mut SessionId,
@@ -1107,8 +1425,16 @@ async fn switch_session(
     let mut new_id: Option<SessionId> = None;
     for effect in effects {
         if let SessionBindingEffect::SetupSession { resume_id } = effect {
-            let setup_result =
-                setup_session(surface, resume_id, model, system_prompt, provider).await;
+            let setup_result = setup_session(
+                service,
+                runtime_adapter,
+                resume_id,
+                model,
+                system_prompt,
+                mob_state,
+                provider,
+            )
+            .await;
             match setup_result {
                 Ok(session_id) => new_id = Some(session_id),
                 Err(err) => {
@@ -1150,7 +1476,7 @@ async fn switch_session(
                     old.abort();
                 }
                 match spawn_event_forwarder(
-                    &surface.service,
+                    service,
                     &session_id,
                     Arc::clone(comms_runtime),
                     disconnect_tx.clone(),
@@ -1172,12 +1498,12 @@ async fn switch_session(
                         for cleanup in cleanup_effects {
                             match cleanup {
                                 SessionBindingEffect::UnregisterRuntimeSession { session_id } => {
-                                    surface.runtime_adapter.unregister_session(&session_id).await;
+                                    runtime_adapter.unregister_session(&session_id).await;
                                 }
                                 SessionBindingEffect::DiscardLiveSession { session_id } => {
                                     if let Err(discard_err) = discard_live_session_with_mob_cleanup(
-                                        &surface.service,
-                                        &surface.mob_state,
+                                        service,
+                                        mob_state,
                                         &session_id,
                                     )
                                     .await
@@ -1197,16 +1523,11 @@ async fn switch_session(
                 }
             }
             SessionBindingEffect::UnregisterRuntimeSession { session_id } => {
-                surface.runtime_adapter.unregister_session(&session_id).await;
+                runtime_adapter.unregister_session(&session_id).await;
             }
             SessionBindingEffect::DiscardLiveSession { session_id } => {
                 if let Err(e) =
-                    discard_live_session_with_mob_cleanup(
-                        &surface.service,
-                        &surface.mob_state,
-                        &session_id,
-                    )
-                    .await
+                    discard_live_session_with_mob_cleanup(service, mob_state, &session_id).await
                     && !matches!(e, SessionError::NotFound { .. })
                 {
                     eprintln!("[target] warning: discard old session {session_id}: {e}");
@@ -1225,15 +1546,11 @@ async fn switch_session(
     for effect in effects {
         match effect {
             SessionBindingEffect::UnregisterRuntimeSession { session_id } => {
-                surface.runtime_adapter.unregister_session(&session_id).await;
+                runtime_adapter.unregister_session(&session_id).await;
             }
             SessionBindingEffect::DiscardLiveSession { session_id } => {
-                if let Err(e) = discard_live_session_with_mob_cleanup(
-                    &surface.service,
-                    &surface.mob_state,
-                    &session_id,
-                )
-                .await
+                if let Err(e) =
+                    discard_live_session_with_mob_cleanup(service, mob_state, &session_id).await
                     && !matches!(e, SessionError::NotFound { .. })
                 {
                     eprintln!("[target] warning: discard old session {session_id}: {e}");
@@ -1264,18 +1581,47 @@ async fn switch_session(
 
 /// Create or resume a session and register it with the runtime adapter.
 async fn setup_session(
-    surface: &TargetRuntimeSurface,
+    service: &Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    runtime_adapter: &Arc<RuntimeSessionAdapter>,
     resume_id: Option<SessionId>,
     model: &str,
     system_prompt: &str,
+    mob_state: &Arc<MobMcpState>,
     provider: &str,
 ) -> anyhow::Result<SessionId> {
+    let resume_session = match &resume_id {
+        Some(id) => {
+            let loaded = service
+                .load_persisted(id)
+                .await
+                .map_err(|e| anyhow::anyhow!("load session {id}: {e}"))?;
+            Some(loaded.ok_or_else(|| anyhow::anyhow!("session {id} not found on disk"))?)
+        }
+        None => Some(Session::new()),
+    };
+    let prepared_session = resume_session
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("target setup requires a prepared session"))?;
+    let prepared_session_id = prepared_session.id().clone();
+    let system_prompt = system_prompt.replace("{session_id}", &prepared_session_id.to_string());
+
+    // Prepare canonical runtime bindings (registers + allocates epoch in one shot).
+    let bindings = runtime_adapter
+        .prepare_bindings(prepared_session_id.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("runtime bindings: {e}"))?;
+
     // No external_tools needed — the factory composes comms tools automatically
     // from the CommsRuntime set via AgentFactory::with_comms_runtime().
-    let mut build_opts = target_session_build_template(Arc::clone(&surface.schedule_tools));
-    build_opts.provider = Some(meerkat_core::Provider::from_name(provider));
-    build_opts.comms_name = resume_id.is_none().then(|| format!("target/{}", SessionId::new()));
-    build_opts.keep_alive = true;
+    let build_opts = SessionBuildOptions {
+        provider: Some(meerkat_core::Provider::from_name(provider)),
+        override_builtins: meerkat_core::ToolCategoryOverride::Enable,
+        override_shell: meerkat_core::ToolCategoryOverride::Enable,
+        override_mob: meerkat_core::ToolCategoryOverride::Enable,
+        resume_session: Some(prepared_session),
+        runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
+        ..Default::default()
+    };
 
     let req = CreateSessionRequest {
         model: model.to_string(),
@@ -1291,42 +1637,181 @@ async fn setup_session(
         labels: None,
     };
 
-    let session = match resume_id {
-        Some(session_id) => surface
-            .service
-            .load_persisted(&session_id)
-            .await
-            .map_err(|error| anyhow::anyhow!("load session {session_id}: {error}"))?
-            .ok_or_else(|| anyhow::anyhow!("persisted session not found: {session_id}"))?,
-        None => meerkat::Session::new(),
+    let result = match service.create_session(req).await {
+        Ok(result) => result,
+        Err(error) => {
+            runtime_adapter
+                .unregister_session(&prepared_session_id)
+                .await;
+            return Err(anyhow::anyhow!("create session: {error}"));
+        }
     };
-    let keep_alive = req.build.as_ref().is_some_and(|build| build.keep_alive);
-    let result = materialize_session(
-        &surface.service,
-        &surface.runtime_adapter,
-        session,
-        req,
-        {
-            let service = Arc::clone(&surface.service);
-            let runtime_adapter = Arc::clone(&surface.runtime_adapter);
-            move |session_id| default_persistent_executor(service, runtime_adapter, session_id)
-        },
-    )
-    .await
-    .map_err(|error| anyhow::anyhow!("create session: {error}"))?;
-    meerkat::surface::configure_peer_ingress(
-        &surface.runtime_adapter,
-        &surface.service,
-        &result.session_id,
-        keep_alive,
-    )
-    .await;
+
     let session_id = result.session_id;
-    sync_session_trusted_peers_from_surface(surface, &session_id, &surface.comms_runtime).await?;
     eprintln!("[target] session ready: {session_id}");
+
+    // Create executor and register with runtime adapter for Steer support
+    let executor = Box::new(TargetCoreExecutor::new(
+        service.clone(),
+        mob_state.clone(),
+        session_id.clone(),
+    ));
+    runtime_adapter
+        .ensure_session_with_executor(session_id.clone(), executor)
+        .await;
+
+    // Configure peer ingress so the comms drain runs for this session.
+    // Without this, peer messages from delegate helpers sit in the inbox
+    // and the parent never processes them.
+    let comms_rt = service.comms_runtime(&session_id).await;
+    runtime_adapter
+        .update_peer_ingress_context(&session_id, true, comms_rt)
+        .await;
 
     Ok(session_id)
 }
+
+// ── CoreExecutor for runtime loop ────────────────────────────────────────────
+
+/// Bridges the RuntimeSessionAdapter's runtime loop to the PersistentSessionService.
+/// When the runtime loop dequeues an input (via DefaultPolicyTable routing),
+/// it calls `apply()` which translates the RunPrimitive into a `start_turn()`.
+struct TargetCoreExecutor {
+    service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    mob_state: Arc<MobMcpState>,
+    session_id: SessionId,
+}
+
+impl TargetCoreExecutor {
+    fn new(
+        service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
+        mob_state: Arc<MobMcpState>,
+        session_id: SessionId,
+    ) -> Self {
+        Self {
+            service,
+            mob_state,
+            session_id,
+        }
+    }
+}
+
+/// Extract prompt content from a `RunPrimitive`, preserving multimodal blocks.
+fn extract_prompt(primitive: &RunPrimitive) -> ContentInput {
+    match primitive {
+        RunPrimitive::StagedInput(staged) => {
+            let mut all_blocks = Vec::new();
+            for append in &staged.appends {
+                match &append.content {
+                    CoreRenderable::Text { text } => {
+                        all_blocks
+                            .push(meerkat_core::types::ContentBlock::Text { text: text.clone() });
+                    }
+                    CoreRenderable::Blocks { blocks } => {
+                        all_blocks.extend(blocks.iter().cloned());
+                    }
+                    _ => {}
+                }
+            }
+            if all_blocks.is_empty() {
+                ContentInput::Text(String::new())
+            } else if all_blocks.len() == 1 {
+                if let meerkat_core::types::ContentBlock::Text { text } = &all_blocks[0] {
+                    ContentInput::Text(text.clone())
+                } else {
+                    ContentInput::Blocks(all_blocks)
+                }
+            } else {
+                ContentInput::Blocks(all_blocks)
+            }
+        }
+        RunPrimitive::ImmediateAppend(append) => match &append.content {
+            CoreRenderable::Text { text } => ContentInput::Text(text.clone()),
+            CoreRenderable::Blocks { blocks } => ContentInput::Blocks(blocks.clone()),
+            _ => ContentInput::Text(String::new()),
+        },
+        RunPrimitive::ImmediateContextAppend(ctx) => match &ctx.content {
+            CoreRenderable::Text { text } => ContentInput::Text(text.clone()),
+            CoreRenderable::Blocks { blocks } => ContentInput::Blocks(blocks.clone()),
+            _ => ContentInput::Text(String::new()),
+        },
+        _ => ContentInput::Text(String::new()),
+    }
+}
+
+#[async_trait::async_trait]
+impl CoreExecutor for TargetCoreExecutor {
+    async fn apply(
+        &mut self,
+        run_id: RunId,
+        primitive: RunPrimitive,
+    ) -> Result<CoreApplyOutput, CoreExecutorError> {
+        let prompt = extract_prompt(&primitive);
+
+        let req = StartTurnRequest {
+            prompt,
+            system_prompt: None,
+            render_metadata: None,
+            handling_mode: HandlingMode::Queue,
+            event_tx: None,
+            skill_references: primitive
+                .turn_metadata()
+                .and_then(|meta| meta.skill_references.clone()),
+            flow_tool_overlay: primitive
+                .turn_metadata()
+                .and_then(|meta| meta.flow_tool_overlay.clone()),
+            additional_instructions: primitive
+                .turn_metadata()
+                .and_then(|meta| meta.additional_instructions.clone()),
+            execution_kind: primitive.turn_metadata().and_then(|m| m.execution_kind),
+        };
+
+        let boundary = match &primitive {
+            RunPrimitive::StagedInput(staged) => staged.boundary,
+            _ => RunApplyBoundary::Immediate,
+        };
+        let input_ids = primitive.contributing_input_ids().to_vec();
+
+        self.service
+            .apply_runtime_turn(&self.session_id, run_id, req, boundary, input_ids)
+            .await
+            .map_err(|e| CoreExecutorError::ApplyFailed {
+                reason: e.to_string(),
+            })
+    }
+
+    async fn control(&mut self, command: RunControlCommand) -> Result<(), CoreExecutorError> {
+        match command {
+            RunControlCommand::CancelCurrentRun { .. } => {
+                self.service.interrupt(&self.session_id).await.map_err(|e| {
+                    CoreExecutorError::ControlFailed {
+                        reason: e.to_string(),
+                    }
+                })
+            }
+            RunControlCommand::StopRuntimeExecutor { .. } => {
+                let discard_result = discard_live_session_with_mob_cleanup(
+                    &self.service,
+                    &self.mob_state,
+                    &self.session_id,
+                )
+                .await;
+                runtime_adapter_unregister_noop();
+                match discard_result {
+                    Ok(()) | Err(SessionError::NotFound { .. }) => Ok(()),
+                    Err(err) => Err(CoreExecutorError::ControlFailed {
+                        reason: err.to_string(),
+                    }),
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Placeholder for StopRuntimeExecutor — the target owns the adapter lifetime
+/// so explicit unregistration isn't needed during shutdown.
+fn runtime_adapter_unregister_noop() {}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1370,9 +1855,22 @@ async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
     let session_dir = data_dir.join("sessions");
     tokio::fs::create_dir_all(&session_dir).await?;
     let surface = build_target_runtime_surface(&session_dir, Arc::clone(&comms_runtime)).await?;
+    let _schedule_host_guard = surface._schedule_host.as_ref();
+    let service = Arc::clone(&surface.service);
+    let runtime_adapter = Arc::clone(&surface.runtime_adapter);
+    let jsonl_store = Arc::clone(&surface.jsonl_store);
+    let mob_state = Arc::clone(&surface.mob_state);
     let system_prompt = SYSTEM_PROMPT.replace("{name}", &name);
-    let mut current_session_id =
-        create_or_resume_session(&surface, &model, &system_prompt, &provider).await?;
+    let mut current_session_id = create_or_resume_session(
+        &service,
+        &runtime_adapter,
+        &jsonl_store,
+        &model,
+        &system_prompt,
+        &mob_state,
+        &provider,
+    )
+    .await?;
     let mut event_forwarder: Option<tokio::task::JoinHandle<()>> = None;
     let (mut session_binding_state, _) = target_session_binding::transition(
         SessionBindingState::Unbound,
@@ -1531,9 +2029,12 @@ async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
                                 &mut write_half,
                                 adoption,
                                 true,
-                                &surface,
+                                &service,
+                                &runtime_adapter,
+                                &jsonl_store,
                                 &model,
                                 &system_prompt,
+                                &mob_state,
                                 &provider,
                                 &mut session_binding_state,
                                 &mut current_session_id,
@@ -1596,9 +2097,12 @@ async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
                                 &mut write_half,
                                 adoption,
                                 false,
-                                &surface,
+                                &service,
+                                &runtime_adapter,
+                                &jsonl_store,
                                 &model,
                                 &system_prompt,
+                                &mob_state,
                                 &provider,
                                 &mut session_binding_state,
                                 &mut current_session_id,
@@ -1669,9 +2173,12 @@ async fn run_adopted_loop(
     write_half: &mut tokio::net::tcp::OwnedWriteHalf,
     adoption: ActiveAdoption,
     attach_required: bool,
-    surface: &TargetRuntimeSurface,
+    service: &Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    runtime_adapter: &Arc<RuntimeSessionAdapter>,
+    jsonl_store: &JsonlStore,
     model: &str,
     system_prompt: &str,
+    mob_state: &Arc<MobMcpState>,
     provider: &str,
     session_binding_state: &mut SessionBindingState,
     current_session_id: &mut SessionId,
@@ -1685,7 +2192,7 @@ async fn run_adopted_loop(
         old.abort();
     }
     if let Ok(handle) = spawn_event_forwarder(
-        &surface.service,
+        service,
         active_session_id(session_binding_state),
         Arc::clone(comms_runtime),
         disconnect_tx.clone(),
@@ -1705,9 +2212,12 @@ async fn run_adopted_loop(
         write_half,
         adoption,
         attach_required,
-        surface,
+        service,
+        runtime_adapter,
+        jsonl_store,
         model,
         system_prompt,
+        mob_state,
         provider,
         session_binding_state,
         current_session_id,
@@ -1734,9 +2244,12 @@ async fn run_adopted_loop_inner(
     write_half: &mut tokio::net::tcp::OwnedWriteHalf,
     adoption: ActiveAdoption,
     attach_required: bool,
-    surface: &TargetRuntimeSurface,
+    service: &Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    runtime_adapter: &Arc<RuntimeSessionAdapter>,
+    jsonl_store: &JsonlStore,
     model: &str,
     system_prompt: &str,
+    mob_state: &Arc<MobMcpState>,
     provider: &str,
     session_binding_state: &mut SessionBindingState,
     current_session_id: &mut SessionId,
@@ -1771,7 +2284,7 @@ async fn run_adopted_loop_inner(
         comms_runtime,
         &effects,
         &mut heartbeat,
-        &disconnect_tx,
+        disconnect_tx,
         attachment_hint,
         attachment_hint_path,
     )
@@ -1784,7 +2297,7 @@ async fn run_adopted_loop_inner(
             comms_runtime,
             &effects,
             &mut heartbeat,
-            &disconnect_tx,
+            disconnect_tx,
             attachment_hint,
             attachment_hint_path,
         )
@@ -1796,80 +2309,64 @@ async fn run_adopted_loop_inner(
     }
 
     let mut kennel_heartbeat = tokio::time::interval(Duration::from_secs(10));
-    let mut pending_candidates = VecDeque::new();
 
     loop {
-        if let Some(candidate) = pending_candidates.pop_front() {
-            if let Some(payload) = parse_direct_control_candidate(&candidate)? {
-                match payload {
-                    DirectControlPayload::AttachAck { lease_id }
-                        if matches!(machine_state.attachment, TaState::Attaching { .. }) =>
-                    {
-                        let (s, effects) = target_kennel_control::transition(
-                            machine_state.clone(),
-                            TkcEvent::DirectAttachAck { lease_id },
-                        )
-                        .map_err(|e| anyhow::anyhow!("direct-attach-ack transition: {e}"))?;
-                        machine_state = s;
-                        let _ = apply_target_control_effects(
-                            comms_runtime,
-                            &effects,
-                            &mut heartbeat,
-                            &disconnect_tx,
-                            attachment_hint,
-                            attachment_hint_path,
-                        )
-                        .await?;
-                        continue;
-                    }
-                    other => {
-                        tracing::debug!(?other, "ignoring direct control payload at target surface");
-                        continue;
-                    }
-                }
-            }
-            match handle_target_message(
-                &candidate,
-                comms_runtime,
-                &disconnect_tx,
-                surface,
-                model,
-                system_prompt,
-                provider,
-                session_binding_state,
-                current_session_id,
-                event_forwarder,
-            )
-            .await
-            {
-                TargetLoopAction::Continue => {}
-                TargetLoopAction::ExitProcess => std::process::exit(0),
-            }
-            continue;
-        }
-
-        let inbox_notify = comms_runtime.inbox_notify();
-        let notified = inbox_notify.notified();
-        pending_candidates.extend(comms_runtime.drain_peer_input_candidates().await);
-        if !pending_candidates.is_empty() {
-            continue;
-        }
-        if comms_runtime.dismiss_received() {
-            eprintln!("[target] received DISMISS — shutting down");
-            std::process::exit(0);
-        }
-
         let poll_kennel = matches!(
             &machine_state.attachment,
             TaState::Attaching { .. } | TaState::Attached { .. }
         );
 
         tokio::select! {
-            _ = notified => {
-                pending_candidates.extend(comms_runtime.drain_peer_input_candidates().await);
-                if pending_candidates.is_empty() && comms_runtime.dismiss_received() {
-                    eprintln!("[target] received DISMISS — shutting down");
-                    std::process::exit(0);
+            msg = comms_runtime.recv_message() => {
+                let Some(msg) = msg else {
+                    if let Some(h) = heartbeat.take() { h.abort(); }
+                    let (s, effects) = target_kennel_control::transition(
+                        machine_state,
+                        TkcEvent::DirectLinkLost,
+                    )
+                    .map_err(|e| anyhow::anyhow!("direct-link-lost transition: {e}"))?;
+                    let _ = apply_target_control_effects(
+                        comms_runtime,
+                        &effects,
+                        &mut heartbeat,
+                        disconnect_tx,
+                        attachment_hint,
+                        attachment_hint_path,
+                    )
+                    .await?;
+                    if let Some(fwd) = event_forwarder.take() {
+                        fwd.abort();
+                    }
+                    return Ok(s);
+                };
+                if let Some(payload) = parse_direct_control_message(&msg)?
+                    && let DirectControlPayload::AttachAck { lease_id } = payload
+                    && matches!(machine_state.attachment, TaState::Attaching { .. })
+                {
+                    let (s, effects) = target_kennel_control::transition(
+                        machine_state.clone(),
+                        TkcEvent::DirectAttachAck { lease_id },
+                    )
+                    .map_err(|e| anyhow::anyhow!("direct-attach-ack transition: {e}"))?;
+                    machine_state = s;
+                    let _ = apply_target_control_effects(
+                        comms_runtime,
+                        &effects,
+                        &mut heartbeat,
+                        disconnect_tx,
+                        attachment_hint,
+                        attachment_hint_path,
+                    )
+                    .await?;
+                    continue;
+                }
+                match handle_target_message(
+                    &msg, comms_runtime, disconnect_tx, service, runtime_adapter,
+                    jsonl_store, model, system_prompt, mob_state, provider,
+                    session_binding_state, current_session_id, event_forwarder,
+                ).await {
+                    TargetLoopAction::Continue => {}
+                    TargetLoopAction::ExitProcess => std::process::exit(0),
                 }
             }
             // Event forwarding is handled by the dedicated event_forwarder task.
@@ -1891,7 +2388,7 @@ async fn run_adopted_loop_inner(
                         comms_runtime,
                         &effects,
                         &mut heartbeat,
-                        &disconnect_tx,
+                        disconnect_tx,
                         attachment_hint,
                         attachment_hint_path,
                     )
@@ -1921,7 +2418,7 @@ async fn run_adopted_loop_inner(
                                 comms_runtime,
                                 &effects,
                                 &mut heartbeat,
-                                &disconnect_tx,
+                                disconnect_tx,
                                 attachment_hint,
                                 attachment_hint_path,
                             )
@@ -1948,7 +2445,7 @@ async fn run_adopted_loop_inner(
                                     comms_runtime,
                                     &effects,
                                     &mut heartbeat,
-                                    &disconnect_tx,
+                                    disconnect_tx,
                                     attachment_hint,
                                     attachment_hint_path,
                                 )
@@ -1982,7 +2479,7 @@ async fn run_adopted_loop_inner(
                                     comms_runtime,
                                     &effects,
                                     &mut heartbeat,
-                                    &disconnect_tx,
+                                    disconnect_tx,
                                     attachment_hint,
                                     attachment_hint_path,
                                 )
@@ -2003,7 +2500,7 @@ async fn run_adopted_loop_inner(
                             comms_runtime,
                             &effects,
                             &mut heartbeat,
-                            &disconnect_tx,
+                            disconnect_tx,
                             attachment_hint,
                             attachment_hint_path,
                         )
@@ -2031,7 +2528,7 @@ async fn run_adopted_loop_inner(
                         comms_runtime,
                         &effects,
                         &mut heartbeat,
-                        &disconnect_tx,
+                        disconnect_tx,
                         attachment_hint,
                         attachment_hint_path,
                     )
@@ -2091,19 +2588,26 @@ mod tests {
     }
 
     use super::{
-        TargetRuntimeSurface, build_target_runtime_surface, create_target_comms_runtime,
-        discard_live_session_with_mob_cleanup, parse_provider_override, setup_session,
-        target_session_build_template,
+        TargetRuntimeSurface, TargetScheduleSessionHost, build_target_runtime_surface,
+        create_target_comms_runtime, discard_live_session_with_mob_cleanup,
+        parse_provider_override, setup_session,
     };
     use anyhow::Context as _;
-    use mdm_tux::{ProviderKind, open_example_runtime_persistence};
+    use chrono::{Duration as ChronoDuration, Utc};
+    use mdm_tux::ProviderKind;
+    use meerkat::surface::{
+        NoopScheduleMobHost, SharedScheduleTargetAdapter, SurfaceScheduleSessionHost,
+        schedule_host_supported, spawn_schedule_host,
+    };
     use meerkat::{
-        AgentFactory, FactoryAgentBuilder, LlmClient, SessionAgentBuilder, SessionService,
+        AgentFactory, CreateScheduleRequest, FactoryAgentBuilder, LlmClient, MisfirePolicy,
+        MissingTargetPolicy, OverlapPolicy, PersistenceBundle, PersistentSessionService,
+        ScheduleService, ScheduleToolDispatcher, ScheduledSessionAction, SessionAgentBuilder,
+        SessionService, SessionTargetBinding, SqliteScheduleStore, TargetBinding, TriggerSpec,
         encode_llm_client_override_for_service,
     };
     use meerkat_client::types::LlmStream;
     use meerkat_client::{LlmDoneOutcome, LlmError, LlmEvent, LlmRequest, TestClient};
-    use meerkat::{PersistentSessionService};
     use meerkat_comms::{CommsRuntime, ResolvedCommsConfig};
     use meerkat_core::Config;
     use meerkat_core::ops_lifecycle::OperationKind;
@@ -2111,14 +2615,8 @@ mod tests {
         CreateSessionRequest, InitialTurnPolicy, SessionBuildOptions, StartTurnRequest,
     };
     use meerkat_core::types::{ContentInput, HandlingMode};
-    use meerkat_mob_mcp::{AgentMobToolSurfaceFactory, MobMcpState, wire_mob_tools};
-    use meerkat_schedule::{
-        CreateScheduleRequest, MisfirePolicy, MissingTargetPolicy, OverlapPolicy,
-        ScheduleService, ScheduleToolSurface, ScheduledSessionAction, SessionTargetBinding,
-        TargetBinding, TriggerSpec,
-    };
-    use meerkat::surface::{spawn_runtime_backed_schedule_host, wire_runtime_bindings};
-    use meerkat_store::StoreAdapter;
+    use meerkat_mob_mcp::{AgentMobToolSurfaceFactory, MobMcpState};
+    use meerkat_store::{JsonlStore, MemoryBlobStore, SessionStore};
     use std::collections::{HashSet, VecDeque};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -2136,6 +2634,27 @@ mod tests {
                 responses: Mutex::new(responses.into()),
             }
         }
+    }
+
+    async fn wait_for_captured_user_message(
+        capture: &CaptureClient,
+        expected: &str,
+    ) -> anyhow::Result<()> {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let matches = capture
+                    .user_messages()
+                    .into_iter()
+                    .filter(|message| message == expected)
+                    .count();
+                if matches == 1 {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for scheduled prompt '{expected}'"))?
     }
 
     #[async_trait::async_trait]
@@ -2171,54 +2690,88 @@ mod tests {
         comms_runtime: Arc<CommsRuntime>,
         llm_client: Arc<dyn LlmClient>,
     ) -> anyhow::Result<TargetRuntimeSurface> {
-        let persistence = open_example_runtime_persistence(session_dir).await?;
-        let config = Config::default();
-        let session_store = persistence.session_store();
-        let schedule_service = ScheduleService::new(persistence.schedule_store());
-        let runtime_adapter = persistence.runtime_adapter();
-        let mut builder = FactoryAgentBuilder::new(
-            AgentFactory::new(session_dir.to_path_buf())
-                .session_store(Arc::clone(&session_store))
-                .with_comms_runtime(Arc::clone(&comms_runtime))
-                .shell(true)
-                .builtins(true)
-                .mob(true),
-            config.clone(),
-        );
+        let factory = AgentFactory::new(session_dir)
+            .shell(true)
+            .builtins(true)
+            .comms(true)
+            .schedule(true)
+            .mob(true)
+            .with_comms_runtime(comms_runtime);
+        let schedule_store = Arc::new(SqliteScheduleStore::open(
+            session_dir.join("schedule.sqlite"),
+        )?) as Arc<dyn meerkat::ScheduleStore>;
+        let schedule_service = ScheduleService::new(Arc::clone(&schedule_store));
+        let mut builder = FactoryAgentBuilder::new(factory, Config::default());
         builder.default_llm_client = Some(llm_client);
-        builder.default_session_store = Some(Arc::new(StoreAdapter::new(Arc::clone(
-            &session_store,
-        ))));
-        let builder_mob_tools_slot = Arc::clone(&builder.default_mob_tools);
-        let (store, runtime_store, blob_store) = persistence.into_parts();
-        let mut service =
-            PersistentSessionService::new(builder, 10, store, runtime_store, blob_store);
-        wire_runtime_bindings(&mut service, &runtime_adapter);
-        let service = Arc::new(service);
-        let schedule_tools: Arc<dyn meerkat_core::AgentToolDispatcher> =
-            Arc::new(ScheduleToolSurface::new(schedule_service.clone()));
-        let schedule_host = spawn_runtime_backed_schedule_host(
-            Arc::clone(&service),
-            Arc::clone(&runtime_adapter),
-            config,
-            schedule_service.clone(),
-            target_session_build_template(Arc::clone(&schedule_tools)),
-            format!("mdm-target:test:{}", session_dir.display()),
+        let mob_tools_slot = Arc::clone(&builder.default_mob_tools);
+        *builder
+            .default_schedule_tools
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+            ScheduleToolDispatcher::new(schedule_service.clone()),
+        ));
+
+        let jsonl_store = Arc::new(JsonlStore::new(session_dir.to_path_buf()));
+        jsonl_store.init().await?;
+
+        let bundle_store = JsonlStore::new(session_dir.to_path_buf());
+        bundle_store.init().await?;
+
+        let persistence = PersistenceBundle::new_with_schedule_store(
+            Arc::new(bundle_store) as Arc<dyn SessionStore>,
+            None,
+            Arc::new(MemoryBlobStore::new()),
+            schedule_store,
         );
-        let mob_state = wire_mob_tools(
-            &builder_mob_tools_slot,
+        let runtime_adapter = persistence.runtime_adapter();
+        let (session_store, runtime_store, blob_store) = persistence.into_parts();
+
+        let mut session_service =
+            PersistentSessionService::new(builder, 10, session_store, runtime_store, blob_store);
+        {
+            let adapter = runtime_adapter.clone();
+            session_service.set_runtime_bindings_provider(Arc::new(move |session_id| {
+                let adapter = adapter.clone();
+                Box::pin(async move { adapter.prepare_bindings(session_id).await.ok() })
+            }));
+        }
+        let service = Arc::new(session_service);
+        let mob_state = Arc::new(MobMcpState::new_with_runtime_adapter(
             service.clone(),
             Some(runtime_adapter.clone()),
-            None,
-        );
+        ));
+        *mob_tools_slot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+            AgentMobToolSurfaceFactory::new(Arc::clone(&mob_state)),
+        ));
+        let schedule_host = if schedule_host_supported(schedule_service.store().kind()) {
+            let session_host: Arc<dyn SurfaceScheduleSessionHost> =
+                Arc::new(TargetScheduleSessionHost::new(
+                    service.clone(),
+                    runtime_adapter.clone(),
+                    mob_state.clone(),
+                ));
+            let shared_adapter = Arc::new(SharedScheduleTargetAdapter::new(
+                schedule_service.clone(),
+                session_host,
+                Arc::new(NoopScheduleMobHost::new(
+                    "scheduled mob targets are not enabled in mdm-target",
+                )),
+            ));
+            Some(spawn_schedule_host(
+                schedule_service,
+                shared_adapter,
+                "mdm-target-test",
+            ))
+        } else {
+            None
+        };
 
         Ok(TargetRuntimeSurface {
             service,
             runtime_adapter,
-            comms_runtime,
-            schedule_service,
-            schedule_tools,
-            session_store,
+            jsonl_store,
             mob_state,
             _schedule_host: schedule_host,
         })
@@ -2283,6 +2836,8 @@ mod tests {
         let factory = AgentFactory::new(temp.path().join("sessions"))
             .shell(true)
             .builtins(true)
+            .comms(true)
+            .schedule(true)
             .mob(true)
             .with_comms_runtime(comms_runtime);
         let builder = FactoryAgentBuilder::new(factory, Config::default());
@@ -2293,15 +2848,16 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
             AgentMobToolSurfaceFactory::new(Arc::clone(&mob_state)),
         ));
+        *builder
+            .default_schedule_tools
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+            ScheduleToolDispatcher::new(ScheduleService::new(Arc::new(
+                SqliteScheduleStore::open(temp.path().join("schedule.sqlite")).unwrap(),
+            ))),
+        ));
 
         let capture: Arc<CaptureClient> = Arc::new(CaptureClient::default());
-        let schedule_tools: Arc<dyn meerkat_core::AgentToolDispatcher> =
-            Arc::new(ScheduleToolSurface::new(ScheduleService::new(
-                open_example_runtime_persistence(temp.path())
-                    .await
-                    .unwrap()
-                    .schedule_store(),
-            )));
 
         let req = CreateSessionRequest {
             model: "gpt-5.2".to_string(),
@@ -2317,7 +2873,6 @@ mod tests {
                 llm_client_override: Some(encode_llm_client_override_for_service(
                     capture.clone() as Arc<dyn LlmClient>
                 )),
-                external_tools: Some(schedule_tools),
                 override_builtins: meerkat_core::ToolCategoryOverride::Enable,
                 override_shell: meerkat_core::ToolCategoryOverride::Enable,
                 override_mob: meerkat_core::ToolCategoryOverride::Enable,
@@ -2339,54 +2894,55 @@ mod tests {
         assert!(!tool_names.iter().any(|name| name == "wait"));
         assert!(tool_names.iter().any(|name| name == "shell"));
         assert!(tool_names.iter().any(|name| name == "send_message"));
-        assert!(tool_names.iter().any(|name| name == "send_request"));
-        assert!(tool_names.iter().any(|name| name == "send_response"));
         assert!(tool_names.iter().any(|name| name == "peers"));
+        assert!(tool_names.iter().any(|name| name == "meerkat_schedule_create"));
+        assert!(tool_names.iter().any(|name| name == "meerkat_schedule_list"));
         assert!(tool_names.iter().any(|name| name == "delegate"));
         assert!(tool_names.iter().any(|name| name == "mob_list"));
         assert!(tool_names.iter().any(|name| name == "mob_check_member"));
-        assert!(tool_names.iter().any(|name| name == "meerkat_schedule_create"));
-        assert!(tool_names.iter().any(|name| name == "meerkat_schedule_list"));
     }
 
     #[tokio::test]
-    async fn target_schedule_host_delivers_due_prompt_to_runtime_session() {
+    async fn target_schedule_host_delivers_future_prompt_once() {
         let temp = tempfile::tempdir().unwrap();
-        let comms_runtime = create_target_comms_runtime("test-schedule", temp.path())
+        let comms_runtime = create_target_comms_runtime("test-scheduled-target", temp.path())
             .await
             .unwrap();
-        comms_runtime.upsert_trusted_peer(meerkat_comms::TrustedPeer {
-            name: "tux".into(),
-            pubkey: meerkat_comms::identity::Keypair::generate().public_key(),
-            addr: "tcp://127.0.0.1:9999".into(),
-            meta: meerkat_comms::PeerMeta::default(),
-        });
-
         let capture: Arc<CaptureClient> = Arc::new(CaptureClient::default());
-        let session_dir = temp.path().join("sessions");
+
         let surface = build_target_runtime_surface_with_client(
-            &session_dir,
+            temp.path(),
             Arc::clone(&comms_runtime),
             capture.clone() as Arc<dyn LlmClient>,
         )
         .await
         .unwrap();
-        let session_id = setup_session(&surface, None, "gpt-5.2", "test", "openai")
-            .await
-            .unwrap();
+        let session_id = setup_session(
+            &surface.service,
+            &surface.runtime_adapter,
+            None,
+            "gpt-5.2",
+            "test",
+            &surface.mob_state,
+            "openai",
+        )
+        .await
+        .unwrap();
 
-        let schedule = surface
-            .schedule_service
+        let schedule_service = ScheduleService::new(Arc::new(
+            SqliteScheduleStore::open(temp.path().join("schedule.sqlite")).unwrap(),
+        ));
+        schedule_service
             .create(CreateScheduleRequest {
-                name: Some("scheduled-target-prompt".into()),
-                description: None,
+                name: Some("scheduled-ping".into()),
+                description: Some("deliver one scheduled prompt".into()),
                 trigger: TriggerSpec::Once {
-                    due_at_utc: chrono::Utc::now() - chrono::Duration::seconds(1),
+                    due_at_utc: Utc::now() + ChronoDuration::seconds(1),
                 },
                 target: TargetBinding::session(SessionTargetBinding::ExactSession {
-                    session_id: session_id.clone(),
+                    session_id,
                     action: ScheduledSessionAction::Prompt {
-                        prompt: ContentInput::Text("scheduled hello".into()),
+                        prompt: "scheduled ping".into(),
                         system_prompt: None,
                         render_metadata: None,
                         skill_references: Vec::new(),
@@ -2396,50 +2952,16 @@ mod tests {
                 misfire_policy: MisfirePolicy::Skip,
                 overlap_policy: OverlapPolicy::SkipIfRunning,
                 missing_target_policy: MissingTargetPolicy::MarkMisfired,
-                labels: std::collections::BTreeMap::new(),
+                labels: Default::default(),
                 planning_horizon_days: Some(1),
                 planning_horizon_occurrences: Some(1),
             })
             .await
             .unwrap();
 
-        timeout(Duration::from_secs(5), async {
-            loop {
-                if capture
-                    .user_messages()
-                    .iter()
-                    .any(|message| message.contains("scheduled hello"))
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("scheduled prompt should reach the target session");
-
-        let occurrences = surface
-            .schedule_service
-            .list_occurrences(&schedule.schedule_id)
+        wait_for_captured_user_message(capture.as_ref(), "scheduled ping")
             .await
             .unwrap();
-        assert!(
-            occurrences.iter().any(|occurrence| {
-                matches!(
-                    &occurrence.target_snapshot,
-                    TargetBinding::Session(binding)
-                        if binding.resolved_session_id() == Some(&session_id)
-                )
-            }),
-            "scheduled occurrence should stay bound to the target session target"
-        );
-
-        surface.runtime_adapter.abort_comms_drain(&session_id).await;
-        surface.runtime_adapter.wait_comms_drain(&session_id).await;
-        discard_live_session_with_mob_cleanup(&surface.service, &surface.mob_state, &session_id)
-            .await
-            .unwrap();
-        surface.runtime_adapter.unregister_session(&session_id).await;
     }
 
     #[tokio::test]
@@ -2585,9 +3107,17 @@ mod tests {
                 .await
                 .unwrap();
 
-        let session_id = setup_session(&surface, None, "gpt-5.2", "test background shell", "openai")
-            .await
-            .unwrap();
+        let session_id = setup_session(
+            &surface.service,
+            &surface.runtime_adapter,
+            None,
+            "gpt-5.2",
+            "test background shell",
+            &surface.mob_state,
+            "openai",
+        )
+        .await
+        .unwrap();
 
         let runtime_registry = surface
             .runtime_adapter
@@ -2662,6 +3192,8 @@ mod tests {
         let factory = AgentFactory::new(temp.path().join("sessions2"))
             .shell(true)
             .builtins(true)
+            .comms(true)
+            .schedule(true)
             .mob(true)
             .with_comms_runtime(Arc::clone(&comms_runtime));
         let builder = FactoryAgentBuilder::new(factory, Config::default());
@@ -2671,15 +3203,16 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
             AgentMobToolSurfaceFactory::new(MobMcpState::new_in_memory()),
         ));
+        *builder
+            .default_schedule_tools
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+            ScheduleToolDispatcher::new(ScheduleService::new(Arc::new(
+                SqliteScheduleStore::open(temp.path().join("sessions2-schedule.sqlite")).unwrap(),
+            ))),
+        ));
 
         let capture2: Arc<CaptureClient> = Arc::new(CaptureClient::default());
-        let schedule_tools: Arc<dyn meerkat_core::AgentToolDispatcher> =
-            Arc::new(ScheduleToolSurface::new(ScheduleService::new(
-                open_example_runtime_persistence(temp.path())
-                    .await
-                    .unwrap()
-                    .schedule_store(),
-            )));
         let req2 = CreateSessionRequest {
             model: "gpt-5.2".to_string(),
             prompt: ContentInput::Text("list tools".into()),
@@ -2694,7 +3227,6 @@ mod tests {
                 llm_client_override: Some(encode_llm_client_override_for_service(
                     capture2.clone() as Arc<dyn LlmClient>
                 )),
-                external_tools: Some(schedule_tools),
                 override_builtins: meerkat_core::ToolCategoryOverride::Enable,
                 override_shell: meerkat_core::ToolCategoryOverride::Enable,
                 override_mob: meerkat_core::ToolCategoryOverride::Enable,
@@ -2732,16 +3264,16 @@ mod tests {
             "missing comms 'send_message', got: {tool_names:?}"
         );
         assert!(
-            tool_names.iter().any(|n| n == "send_request"),
-            "missing comms 'send_request', got: {tool_names:?}"
-        );
-        assert!(
-            tool_names.iter().any(|n| n == "send_response"),
-            "missing comms 'send_response', got: {tool_names:?}"
-        );
-        assert!(
             tool_names.iter().any(|n| n == "peers"),
             "missing comms 'peers', got: {tool_names:?}"
+        );
+        assert!(
+            tool_names.iter().any(|n| n == "meerkat_schedule_create"),
+            "missing scheduler 'meerkat_schedule_create', got: {tool_names:?}"
+        );
+        assert!(
+            tool_names.iter().any(|n| n == "meerkat_schedule_list"),
+            "missing scheduler 'meerkat_schedule_list', got: {tool_names:?}"
         );
         // Mob
         assert!(
@@ -2751,14 +3283,6 @@ mod tests {
         assert!(
             tool_names.iter().any(|n| n == "mob_list"),
             "missing 'mob_list', got: {tool_names:?}"
-        );
-        assert!(
-            tool_names.iter().any(|n| n == "meerkat_schedule_create"),
-            "missing schedule 'meerkat_schedule_create', got: {tool_names:?}"
-        );
-        assert!(
-            tool_names.iter().any(|n| n == "meerkat_schedule_list"),
-            "missing schedule 'meerkat_schedule_list', got: {tool_names:?}"
         );
     }
 
@@ -2783,59 +3307,78 @@ mod tests {
         let surface = build_target_runtime_surface(&session_dir, Arc::clone(&comms_runtime))
             .await
             .unwrap();
-        let fresh_id = setup_session(&surface, None, "gpt-5.2", "test", "openai")
-            .await
-            .unwrap();
-
-        // 2. Simulate a process restart before resuming.
-        discard_live_session_with_mob_cleanup(&surface.service, &surface.mob_state, &fresh_id)
-            .await
-            .unwrap();
-        surface.runtime_adapter.unregister_session(&fresh_id).await;
-        drop(surface);
-        drop(comms_runtime);
-
-        let restart_dir = temp.path().join("resume-restart");
-        let restart_comms_runtime =
-            create_target_comms_runtime("test-resume-restart", restart_dir.as_path())
-                .await
-                .unwrap();
-        restart_comms_runtime.upsert_trusted_peer(meerkat_comms::TrustedPeer {
-            name: "tux".into(),
-            pubkey: meerkat_comms::identity::Keypair::generate().public_key(),
-            addr: "tcp://127.0.0.1:9999".into(),
-            meta: meerkat_comms::PeerMeta::default(),
-        });
-
-        let capture: Arc<CaptureClient> = Arc::new(CaptureClient::default());
-        let restart_surface = build_target_runtime_surface_with_client(
-            &session_dir,
-            Arc::clone(&restart_comms_runtime),
-            capture.clone() as Arc<dyn LlmClient>,
+        let fresh_id = setup_session(
+            &surface.service,
+            &surface.runtime_adapter,
+            None,
+            "gpt-5.2",
+            "test",
+            &surface.mob_state,
+            "openai",
         )
         .await
         .unwrap();
-        let resumed_id = setup_session(&restart_surface, Some(fresh_id.clone()), "gpt-5.2", "test", "openai")
-            .await
-            .unwrap();
-        assert_eq!(resumed_id, fresh_id);
 
-        restart_surface
+        // 2. Resume that session through the builder with a capture client.
+        let capture: Arc<CaptureClient> = Arc::new(CaptureClient::default());
+        let loaded = surface
             .service
-            .start_turn(
-                &resumed_id,
-                StartTurnRequest {
-                    prompt: ContentInput::Text("list tools".into()),
-                    system_prompt: None,
-                    render_metadata: None,
-                    handling_mode: HandlingMode::Queue,
-                    event_tx: None,
-                    skill_references: None,
-                    flow_tool_overlay: None,
-                    additional_instructions: None,
-                    execution_kind: None,
-                },
-            )
+            .load_persisted(&fresh_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let factory = AgentFactory::new(temp.path().join("sessions2"))
+            .shell(true)
+            .builtins(true)
+            .comms(true)
+            .schedule(true)
+            .mob(true)
+            .with_comms_runtime(Arc::clone(&comms_runtime));
+        let builder = FactoryAgentBuilder::new(factory, Config::default());
+        *builder
+            .default_mob_tools
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+            AgentMobToolSurfaceFactory::new(MobMcpState::new_in_memory()),
+        ));
+        *builder
+            .default_schedule_tools
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+            ScheduleToolDispatcher::new(ScheduleService::new(Arc::new(
+                SqliteScheduleStore::open(temp.path().join("sessions2-schedule.sqlite")).unwrap(),
+            ))),
+        ));
+
+        let req = CreateSessionRequest {
+            model: "gpt-5.2".to_string(),
+            prompt: ContentInput::Text("list tools".into()),
+            render_metadata: None,
+            system_prompt: Some("test".into()),
+            max_tokens: None,
+            event_tx: None,
+            skill_references: None,
+            initial_turn: InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+            build: Some(SessionBuildOptions {
+                llm_client_override: Some(encode_llm_client_override_for_service(
+                    capture.clone() as Arc<dyn LlmClient>
+                )),
+                override_builtins: meerkat_core::ToolCategoryOverride::Enable,
+                override_shell: meerkat_core::ToolCategoryOverride::Enable,
+                override_mob: meerkat_core::ToolCategoryOverride::Enable,
+                resume_session: Some(loaded),
+                ..Default::default()
+            }),
+            labels: None,
+        };
+
+        let (event_tx, _) = mpsc::channel(8);
+        let mut agent = builder.build_agent(&req, event_tx).await.unwrap();
+        agent
+            .agent_mut()
+            .run(ContentInput::Text("list tools".into()))
             .await
             .unwrap();
 
@@ -2857,28 +3400,12 @@ mod tests {
             "resumed session missing comms 'send_message', got: {tool_names:?}"
         );
         assert!(
-            tool_names.iter().any(|n| n == "send_request"),
-            "resumed session missing comms 'send_request', got: {tool_names:?}"
-        );
-        assert!(
-            tool_names.iter().any(|n| n == "send_response"),
-            "resumed session missing comms 'send_response', got: {tool_names:?}"
-        );
-        assert!(
-            tool_names.iter().any(|n| n == "peers"),
-            "resumed session missing comms 'peers', got: {tool_names:?}"
+            tool_names.iter().any(|n| n == "meerkat_schedule_create"),
+            "resumed session missing scheduler 'meerkat_schedule_create', got: {tool_names:?}"
         );
         assert!(
             tool_names.iter().any(|n| n == "delegate"),
             "resumed session missing mob 'delegate', got: {tool_names:?}"
-        );
-        assert!(
-            tool_names.iter().any(|n| n == "meerkat_schedule_create"),
-            "resumed session missing schedule 'meerkat_schedule_create', got: {tool_names:?}"
-        );
-        assert!(
-            tool_names.iter().any(|n| n == "meerkat_schedule_list"),
-            "resumed session missing schedule 'meerkat_schedule_list', got: {tool_names:?}"
         );
     }
 }

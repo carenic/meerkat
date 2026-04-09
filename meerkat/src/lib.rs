@@ -166,7 +166,7 @@ pub use meerkat_schedule::{
     SCHEDULE_TOOL_NOT_FOUND, Schedule, ScheduleDomainError, ScheduleDriver, ScheduleDriverConfig,
     ScheduleFilter, ScheduleId, SchedulePhase, ScheduleRevision, ScheduleService, ScheduleStore,
     ScheduleStoreError, ScheduleStoreKind, ScheduleTargetDelivery, ScheduleTargetProbe,
-    ScheduleToolError, ScheduleToolSurface, ScheduledMobAction, ScheduledMobBackendKind,
+    ScheduleToolDispatcher, ScheduleToolError, ScheduledMobAction, ScheduledMobBackendKind,
     ScheduledMobRuntimeMode, ScheduledSessionAction, SessionMaterializationSpec,
     SessionTargetBinding, TargetBinding, TargetProbeOutcome, TriggerSpec, UpdateScheduleRequest,
     handle_schedule_tools_call, schedule_tools_list,
@@ -230,6 +230,10 @@ pub use meerkat_store::JsonlStore;
 #[cfg(feature = "memory-store")]
 pub use meerkat_store::MemoryStore;
 
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+pub use meerkat_store::RedbScheduleStore;
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+pub use meerkat_store::RedbSessionStore;
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
 pub use meerkat_store::SqliteScheduleStore;
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]

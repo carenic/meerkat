@@ -37,7 +37,7 @@ pub use tool_surface::ScheduleToolSurface;
 pub use tools::{
     CAPABILITY_UNAVAILABLE as SCHEDULE_TOOL_CAPABILITY_UNAVAILABLE,
     INVALID_ARGUMENTS as SCHEDULE_TOOL_INVALID_ARGUMENTS, NOT_FOUND as SCHEDULE_TOOL_NOT_FOUND,
-    ScheduleToolError, handle_schedule_tools_call, schedule_tools_list,
+    ScheduleToolDispatcher, ScheduleToolError, handle_schedule_tools_call, schedule_tools_list,
 };
 pub use trigger::{CronAuthoringSpec, next_due_after, occurrences_for_horizon};
 pub use types::{

@@ -890,7 +890,7 @@ fn dispatch_effects(
                         kennel_id,
                         KennelPayload::Released {
                             lease_ref: lease_ref.clone(),
-                            reason: reason.clone(),
+                            reason: *reason,
                         },
                     )
                 {
@@ -910,7 +910,7 @@ fn dispatch_effects(
                         KennelPayload::ClaimReleased {
                             lease_ref: lease_ref.clone(),
                             target_id: target_id.to_string(),
-                            reason: reason.clone(),
+                            reason: *reason,
                         },
                     )
                 {

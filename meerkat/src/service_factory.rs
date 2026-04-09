@@ -281,6 +281,13 @@ pub struct FactoryAgentBuilder {
     /// session service construction and mob state creation).
     pub default_mob_tools:
         Arc<std::sync::RwLock<Option<Arc<dyn meerkat_core::service::MobToolsFactory>>>>,
+    /// Default scheduler tools injected into all builds.
+    ///
+    /// Wrapped in `Arc<StdRwLock<...>>` so surfaces can attach scheduler tool
+    /// visibility after the builder is consumed into a session service, while
+    /// keeping runtime/service ownership in the surface.
+    pub default_schedule_tools:
+        Arc<std::sync::RwLock<Option<Arc<dyn meerkat_core::AgentToolDispatcher>>>>,
 }
 
 impl FactoryAgentBuilder {
@@ -295,6 +302,7 @@ impl FactoryAgentBuilder {
             default_tool_dispatcher: None,
             default_session_store: None,
             default_mob_tools: Arc::new(std::sync::RwLock::new(None)),
+            default_schedule_tools: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -315,6 +323,7 @@ impl FactoryAgentBuilder {
             default_tool_dispatcher: None,
             default_session_store: None,
             default_mob_tools: Arc::new(std::sync::RwLock::new(None)),
+            default_schedule_tools: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -384,6 +393,17 @@ impl SessionAgentBuilder for FactoryAgentBuilder {
                 .clone()
         {
             build_config.mob_tools = Some(mob_factory);
+        }
+
+        // Inject default scheduler tools if none provided.
+        if build_config.schedule_tools.is_none()
+            && let Some(schedule_dispatcher) = self
+                .default_schedule_tools
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        {
+            build_config.schedule_tools = Some(schedule_dispatcher);
         }
 
         let config = self.resolve_config().await;
@@ -465,6 +485,7 @@ mod tests {
         Provider, ToolCallView, ToolDef, ToolDispatchOutcome, ToolError, ToolResult,
     };
     use meerkat_runtime::RuntimeSessionAdapter;
+    use meerkat_schedule::{MemoryScheduleStore, ScheduleService, ScheduleToolDispatcher};
     use meerkat_session::ephemeral::SessionAgent;
     use std::pin::Pin;
     use std::sync::Mutex;
@@ -478,6 +499,41 @@ mod tests {
     impl Default for MockLlmClient {
         fn default() -> Self {
             Self { delta: "ok" }
+        }
+    }
+
+    #[derive(Default)]
+    struct CaptureToolClient {
+        inner: meerkat_client::TestClient,
+        seen_tools: Mutex<Vec<String>>,
+    }
+
+    impl CaptureToolClient {
+        fn tool_names(&self) -> Vec<String> {
+            self.seen_tools.lock().expect("capture lock").clone()
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl LlmClient for CaptureToolClient {
+        fn stream<'a>(
+            &'a self,
+            request: &'a LlmRequest,
+        ) -> Pin<
+            Box<dyn futures::Stream<Item = Result<LlmEvent, meerkat_client::LlmError>> + Send + 'a>,
+        > {
+            *self.seen_tools.lock().expect("capture lock") =
+                request.tools.iter().map(|tool| tool.name.clone()).collect();
+            self.inner.stream(request)
+        }
+
+        fn provider(&self) -> &'static str {
+            self.inner.provider()
+        }
+
+        async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
+            self.inner.health_check().await
         }
     }
 
@@ -731,6 +787,78 @@ mod tests {
             .session_metadata()
             .ok_or_else(|| "missing session metadata".to_string())?;
         assert_eq!(metadata.provider, Provider::Other);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn factory_builder_uses_default_schedule_tools_on_runtime_backed_resume()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|err| format!("tempdir: {err}"))?;
+        let factory = AgentFactory::new(temp.path().join("sessions")).schedule(true);
+        let mut builder = FactoryAgentBuilder::new(factory, Config::default());
+        let capture: Arc<CaptureToolClient> = Arc::new(CaptureToolClient::default());
+        builder.default_llm_client = Some(capture.clone());
+        *builder
+            .default_schedule_tools
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Arc::new(ScheduleToolDispatcher::new(ScheduleService::new(
+                Arc::new(MemoryScheduleStore::default()),
+            ))));
+
+        let runtime_adapter = RuntimeSessionAdapter::ephemeral();
+        let session = Session::new();
+        let session_id = session.id().clone();
+        runtime_adapter.register_session(session_id.clone()).await;
+        let bindings = meerkat_core::SessionRuntimeBindings {
+            session_id,
+            epoch_id: meerkat_core::runtime_epoch::RuntimeEpochId::new(),
+            ops_lifecycle: runtime_adapter
+                .ops_lifecycle_registry(session.id())
+                .await
+                .ok_or_else(|| "missing runtime registry".to_string())?,
+            cursor_state: Arc::new(meerkat_core::EpochCursorState::new()),
+        };
+
+        let req = CreateSessionRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            prompt: "hello".to_string().into(),
+            render_metadata: None,
+            system_prompt: None,
+            max_tokens: None,
+            event_tx: None,
+            skill_references: None,
+            initial_turn: meerkat_core::service::InitialTurnPolicy::RunImmediately,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+            build: Some(SessionBuildOptions {
+                resume_session: Some(session),
+                runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
+                ..SessionBuildOptions::default()
+            }),
+            labels: None,
+        };
+
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let mut agent = builder
+            .build_agent(&req, event_tx)
+            .await
+            .map_err(|err| format!("{err}"))?;
+        let (run_tx, _run_rx) = mpsc::channel(8);
+        SessionAgent::run_with_events(&mut agent, "inspect".to_string().into(), run_tx)
+            .await
+            .map_err(|err| format!("{err}"))?;
+
+        let tool_names = capture.tool_names();
+        assert!(
+            tool_names
+                .iter()
+                .any(|name| name == "meerkat_schedule_create")
+        );
+        assert!(
+            tool_names
+                .iter()
+                .any(|name| name == "meerkat_schedule_list")
+        );
         Ok(())
     }
 

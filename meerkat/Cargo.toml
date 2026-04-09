@@ -87,6 +87,7 @@ memory-store-session = ["dep:meerkat-memory"]
 # Optional subsystems
 comms = ["dep:meerkat-comms", "dep:parking_lot", "meerkat-tools/comms"]
 mcp = ["dep:meerkat-mcp", "meerkat-tools/mcp"]
+schedule = []
 skills = ["dep:meerkat-skills", "meerkat-skills/skills-http", "meerkat-tools/skills"]
 
 [package.metadata.cargo-machete]

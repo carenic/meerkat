@@ -2,9 +2,14 @@ use crate::{
     CreateScheduleRequest, Occurrence, ScheduleDomainError, ScheduleId, ScheduleService,
     ScheduleStoreError, UpdateScheduleRequest,
 };
+use async_trait::async_trait;
+use meerkat_core::error::ToolError;
+use meerkat_core::types::{ToolCallView, ToolDef, ToolResult};
+use meerkat_core::{AgentToolDispatcher, ToolDispatchOutcome};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 pub const INVALID_ARGUMENTS: i32 = -32602;
 const INTERNAL_ERROR: i32 = -32000;
@@ -95,6 +100,49 @@ pub fn schedule_tools_list() -> Vec<Value> {
             schedule_id_schema("The schedule_id whose occurrences should be listed."),
         ),
     ]
+}
+
+pub struct ScheduleToolDispatcher {
+    service: ScheduleService,
+    tool_defs: Arc<[Arc<ToolDef>]>,
+}
+
+impl ScheduleToolDispatcher {
+    pub fn new(service: ScheduleService) -> Self {
+        let tool_defs: Arc<[Arc<ToolDef>]> = schedule_tools_list()
+            .into_iter()
+            .map(|tool| {
+                Arc::new(ToolDef {
+                    name: tool["name"].as_str().unwrap_or_default().to_string(),
+                    description: tool["description"].as_str().unwrap_or_default().to_string(),
+                    input_schema: tool["inputSchema"].clone(),
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
+        Self { service, tool_defs }
+    }
+}
+
+#[async_trait]
+impl AgentToolDispatcher for ScheduleToolDispatcher {
+    fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+        Arc::clone(&self.tool_defs)
+    }
+
+    async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
+        if !self.tool_defs.iter().any(|tool| tool.name == call.name) {
+            return Err(ToolError::not_found(call.name));
+        }
+
+        let arguments: Value = serde_json::from_str(call.args.get())
+            .unwrap_or_else(|_| Value::String(call.args.get().to_string()));
+        let result = handle_schedule_tools_call(&self.service, call.name, &arguments)
+            .await
+            .map_err(|error| map_schedule_tool_dispatch_error(call.name, error))?;
+
+        Ok(ToolResult::new(call.id.to_string(), result.to_string(), false).into())
+    }
 }
 
 pub async fn handle_schedule_tools_call(
@@ -232,6 +280,15 @@ fn map_schedule_error(error: ScheduleDomainError) -> ScheduleToolError {
     }
 }
 
+fn map_schedule_tool_dispatch_error(name: &str, error: ScheduleToolError) -> ToolError {
+    if error.code == INVALID_ARGUMENTS {
+        return ToolError::invalid_arguments(name, error.message);
+    }
+    ToolError::ExecutionFailed {
+        message: format!("{name}: {}", error.message),
+    }
+}
+
 fn tool_descriptor(name: &'static str, description: &'static str, input_schema: Value) -> Value {
     json!({
         "name": name,
@@ -351,7 +408,9 @@ mod tests {
         OverlapPolicy, ScheduledSessionAction, SessionTargetBinding, TargetBinding, TriggerSpec,
     };
     use chrono::{Duration, Utc};
+    use meerkat_core::{AgentToolDispatcher, ToolError};
     use meerkat_core::{ContentInput, SessionId};
+    use serde_json::value::RawValue;
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -418,5 +477,88 @@ mod tests {
             "planning should persist occurrences"
         );
         Ok(())
+    }
+
+    fn tool_call<'a>(
+        id: &'a str,
+        name: &'a str,
+        args: &'a RawValue,
+    ) -> meerkat_core::ToolCallView<'a> {
+        meerkat_core::ToolCallView { id, name, args }
+    }
+
+    #[tokio::test]
+    async fn schedule_tool_dispatcher_tools_match_tool_list() {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
+        let dispatcher = ScheduleToolDispatcher::new(service);
+
+        let actual: Vec<String> = dispatcher
+            .tools()
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        let expected: Vec<String> = schedule_tools_list()
+            .into_iter()
+            .map(|value| value["name"].as_str().expect("tool name").to_string())
+            .collect();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn schedule_tool_dispatcher_delegates_to_schedule_handler() -> Result<(), String> {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
+        let dispatcher = ScheduleToolDispatcher::new(service.clone());
+        let args = serde_json::to_string(&schedule_request()).map_err(|error| error.to_string())?;
+        let raw = RawValue::from_string(args).map_err(|error| error.to_string())?;
+        let call = tool_call("sched-1", "meerkat_schedule_create", raw.as_ref());
+
+        let outcome = dispatcher
+            .dispatch(call)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let created_value: Value = serde_json::from_str(&outcome.result.text_content())
+            .map_err(|error| error.to_string())?;
+        assert_eq!(created_value["name"].as_str(), Some("heartbeat"));
+        assert!(created_value["schedule_id"].as_str().is_some());
+
+        let listed = handle_schedule_tools_call(&service, "meerkat_schedule_list", &json!({}))
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(listed["schedules"].as_array().map(Vec::len), Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schedule_tool_dispatcher_unknown_tool_is_not_found() {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
+        let dispatcher = ScheduleToolDispatcher::new(service);
+        let raw = RawValue::from_string("{}".to_string()).expect("raw args");
+        let err = dispatcher
+            .dispatch(tool_call("sched-2", "unknown_schedule_tool", raw.as_ref()))
+            .await
+            .expect_err("unknown tool should fail");
+
+        assert!(matches!(err, ToolError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn schedule_tool_dispatcher_maps_unsupported_backend_to_execution_failed() {
+        let service = ScheduleService::new(Arc::new(crate::DisabledScheduleStore));
+        let dispatcher = ScheduleToolDispatcher::new(service);
+        let raw = RawValue::from_string(
+            serde_json::to_string(&schedule_request()).expect("schedule request json"),
+        )
+        .expect("raw args");
+        let err = dispatcher
+            .dispatch(tool_call(
+                "sched-3",
+                "meerkat_schedule_create",
+                raw.as_ref(),
+            ))
+            .await
+            .expect_err("unsupported backend should fail");
+
+        assert!(matches!(err, ToolError::ExecutionFailed { .. }));
     }
 }
