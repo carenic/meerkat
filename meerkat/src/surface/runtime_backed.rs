@@ -281,7 +281,7 @@ mod tests {
             .expect("build default persistence");
         let runtime_adapter = persistence.runtime_adapter();
 
-        let factory = crate::AgentFactory::new(temp.path().join("sessions"));
+        let mut factory = crate::AgentFactory::new(temp.path().join("sessions"));
         #[cfg(feature = "comms")]
         if let Some(shared_runtime) = shared_runtime {
             factory = factory.with_comms_runtime(shared_runtime);
@@ -600,12 +600,14 @@ mod tests {
         .expect("materialize session");
 
         configure_peer_ingress(&adapter, &service, &result.session_id, false).await;
-        let live = service
-            .read(&result.session_id)
+        let persisted = service
+            .load_persisted(&result.session_id)
             .await
-            .expect("read live session");
+            .expect("load persisted session")
+            .expect("persisted session");
         assert!(
-            live.session_metadata()
+            persisted
+                .session_metadata()
                 .is_some_and(|metadata| metadata.keep_alive),
             "explicit peer ingress configuration must not mutate persisted keep_alive metadata"
         );
