@@ -16,7 +16,7 @@ pub mod session_executor;
 pub mod session_runtime;
 pub mod transport;
 
-pub use server::{serve_stdio, serve_stdio_with_skill_runtime};
+pub use server::{serve_stdio, serve_stdio_with_skill_runtime, serve_tcp, serve_tcp_connection};
 
 /// Default capacity for notification / event channels throughout the crate.
 pub const NOTIFICATION_CHANNEL_CAPACITY: usize = 256;

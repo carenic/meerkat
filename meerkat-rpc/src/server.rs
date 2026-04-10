@@ -520,6 +520,56 @@ pub async fn serve_stdio_with_skill_runtime(
     server.run().await
 }
 
+/// Accept a single RPC client over an already-connected TCP stream.
+///
+/// The stream is split into read/write halves and wired directly into the
+/// generic `RpcServer`. The caller is responsible for the accept loop —
+/// this function handles exactly one connection lifetime.
+pub async fn serve_tcp_connection(
+    stream: tokio::net::TcpStream,
+    runtime: Arc<SessionRuntime>,
+    config_store: Arc<dyn ConfigStore>,
+    skill_runtime: Option<Arc<meerkat_core::skills::SkillRuntime>>,
+) -> Result<(), ServerError> {
+    let (read_half, write_half) = stream.into_split();
+    let reader = BufReader::new(read_half);
+    let mut server =
+        RpcServer::new_with_skill_runtime(reader, write_half, runtime, config_store, skill_runtime);
+    server.run().await
+}
+
+/// Listen on a TCP address and serve one RPC client at a time.
+///
+/// Each accepted connection gets a dedicated `RpcServer` with its own
+/// session runtime. The listener runs until the returned handle is dropped
+/// or the address becomes unavailable. Connections are served sequentially
+/// — when one client disconnects, the next is accepted.
+pub async fn serve_tcp(
+    addr: &str,
+    runtime: Arc<SessionRuntime>,
+    config_store: Arc<dyn ConfigStore>,
+    skill_runtime: Option<Arc<meerkat_core::skills::SkillRuntime>>,
+) -> Result<(), ServerError> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("RPC TCP listener bound to {addr}");
+    loop {
+        let (stream, peer_addr) = listener.accept().await?;
+        tracing::info!("RPC client connected from {peer_addr}");
+        if let Err(e) = serve_tcp_connection(
+            stream,
+            Arc::clone(&runtime),
+            Arc::clone(&config_store),
+            skill_runtime.clone(),
+        )
+        .await
+        {
+            tracing::warn!("RPC client {peer_addr} disconnected: {e}");
+        } else {
+            tracing::info!("RPC client {peer_addr} disconnected cleanly");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
