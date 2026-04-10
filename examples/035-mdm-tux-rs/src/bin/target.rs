@@ -3054,6 +3054,7 @@ mod tests {
             "test",
             &surface.mob_state,
             "openai",
+            None,
         )
         .await
         .unwrap();
@@ -3244,6 +3245,7 @@ mod tests {
             "test background shell",
             &surface.mob_state,
             "openai",
+            None,
         )
         .await
         .unwrap();
@@ -3448,6 +3450,7 @@ mod tests {
             "test",
             &surface.mob_state,
             "openai",
+            None,
         )
         .await
         .unwrap();
