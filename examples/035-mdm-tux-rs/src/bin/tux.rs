@@ -724,7 +724,7 @@ fn is_known_slash_command(input: &str) -> bool {
     input.starts_with('/')
         && matches!(
             input.split_once(' ').map(|(cmd, _)| cmd).unwrap_or(input),
-            "/new" | "/resume" | "/help" | "/claim" | "/release"
+            "/new" | "/resume" | "/help" | "/claim" | "/release" | "/model"
         )
 }
 
@@ -3122,7 +3122,26 @@ fn handle_key(
                         app.push("  `/new`          — start a fresh session".into());
                         app.push("  `/resume`       — list past sessions".into());
                         app.push("  `/resume <N>`   — resume session N".into());
+                        app.push(
+                            "  `/model <name>` — switch target's LLM model live".into(),
+                        );
                         app.push("  `/help`         — show this help".into());
+                    }
+                    "/model" if !arg.is_empty() => {
+                        if app.targets.is_empty() {
+                            return;
+                        }
+                        let target = app.targets[app.selected].clone();
+                        let target_id = app.target_runtime_id(&target).to_string();
+                        app.push_user_turn(&target, &format!("/model {arg}"));
+                        let _ = command_tx.send(AppCommand::SlashCmd {
+                            target_peer: target,
+                            target_id,
+                            cmd: format!("MODEL {arg}"),
+                        });
+                    }
+                    "/model" => {
+                        app.push("Usage: /model <model-name>".into());
                     }
                     "/claim" => {
                         if app.transport != TransportMode::Kennel || app.targets.is_empty() {

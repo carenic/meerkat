@@ -50,7 +50,8 @@ use meerkat_core::service::{
 use meerkat_core::types::{ContentInput, HandlingMode, SessionId};
 use meerkat_core::types::Message;
 use meerkat_core::mcp_config::McpConfig;
-use meerkat_core::{AgentEvent, AgentToolDispatcher, Config, Session};
+use meerkat_core::session::SessionLlmIdentity;
+use meerkat_core::{AgentEvent, AgentToolDispatcher, Config, Provider, Session};
 use meerkat_mcp::{McpRouter, McpRouterAdapter};
 use meerkat_mob_mcp::{AgentMobToolSurfaceFactory, MobMcpState};
 use meerkat_runtime::{
@@ -86,6 +87,8 @@ struct TargetRuntimeSurface {
     runtime_adapter: Arc<RuntimeSessionAdapter>,
     jsonl_store: Arc<JsonlStore>,
     mob_state: Arc<MobMcpState>,
+    factory: Arc<AgentFactory>,
+    config: Config,
     _schedule_host: Option<meerkat::surface::ScheduleHostHandle>,
 }
 
@@ -423,7 +426,13 @@ async fn build_target_runtime_surface(
         session_dir.join("schedule.sqlite"),
     )?) as Arc<dyn meerkat::ScheduleStore>;
     let schedule_service = ScheduleService::new(Arc::clone(&schedule_store));
-    let builder = FactoryAgentBuilder::new(factory, Config::default());
+    let home = dirs::home_dir();
+    let config = Config::load_from(session_dir, home.as_deref())
+        .await
+        .unwrap_or_default();
+    let shared_factory = Arc::new(factory.clone());
+    let shared_config = config.clone();
+    let builder = FactoryAgentBuilder::new(factory, config);
     let mob_tools_slot = Arc::clone(&builder.default_mob_tools);
     *builder
         .default_schedule_tools
@@ -491,6 +500,8 @@ async fn build_target_runtime_surface(
         runtime_adapter,
         jsonl_store,
         mob_state,
+        factory: shared_factory,
+        config: shared_config,
         _schedule_host: schedule_host,
     })
 }
@@ -794,6 +805,8 @@ async fn main() -> anyhow::Result<()> {
             &mob_state,
             &provider,
             &mcp_external_tools,
+            &surface.factory,
+            &surface.config,
             &mut session_binding_state,
             &mut current_session_id,
             &mut event_forwarder,
@@ -853,6 +866,8 @@ async fn run_inbox_loop(
     mob_state: &Arc<MobMcpState>,
     provider: &str,
     external_tools: &Option<Arc<dyn AgentToolDispatcher>>,
+    factory: &Arc<AgentFactory>,
+    config: &Config,
     session_binding_state: &mut SessionBindingState,
     current_session_id: &mut SessionId,
     event_forwarder: &mut Option<tokio::task::JoinHandle<()>>,
@@ -873,6 +888,8 @@ async fn run_inbox_loop(
                     mob_state,
                     provider,
                     external_tools,
+                    factory,
+                    config,
                     session_binding_state,
                     current_session_id,
                     event_forwarder,
@@ -1070,6 +1087,8 @@ async fn handle_target_message(
     mob_state: &Arc<MobMcpState>,
     provider: &str,
     external_tools: &Option<Arc<dyn meerkat_core::AgentToolDispatcher>>,
+    factory: &Arc<AgentFactory>,
+    config: &Config,
     session_binding_state: &mut SessionBindingState,
     current_session_id: &mut SessionId,
     event_forwarder: &mut Option<tokio::task::JoinHandle<()>>,
@@ -1098,6 +1117,8 @@ async fn handle_target_message(
                 mob_state,
                 provider,
                 external_tools.as_ref().cloned(),
+                factory,
+                config,
                 session_binding_state,
                 current_session_id,
                 event_forwarder,
@@ -1254,6 +1275,8 @@ async fn handle_command(
     mob_state: &Arc<MobMcpState>,
     provider: &str,
     external_tools: Option<Arc<dyn meerkat_core::AgentToolDispatcher>>,
+    factory: &Arc<AgentFactory>,
+    config: &Config,
     session_binding_state: &mut SessionBindingState,
     current_session_id: &mut SessionId,
     event_forwarder: &mut Option<tokio::task::JoinHandle<()>>,
@@ -1361,9 +1384,58 @@ async fn handle_command(
             }
             Err(e) => format!("Error listing sessions: {e}"),
         }
+    } else if let Some(new_model) = cmd.strip_prefix("MODEL ") {
+        let new_model = new_model.trim();
+        match hot_swap_model(service, factory, config, current_session_id, new_model).await {
+            Ok(msg) => msg,
+            Err(e) => format!("Model switch failed: {e}"),
+        }
     } else {
         format!("Unknown command: {cmd}")
     }
+}
+
+async fn hot_swap_model(
+    service: &Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    factory: &Arc<AgentFactory>,
+    config: &Config,
+    session_id: &SessionId,
+    model_name: &str,
+) -> anyhow::Result<String> {
+    // Resolve provider from model name or registry
+    let registry = config.model_registry().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (provider, self_hosted_server_id) = if let Some(entry) = registry.entry(model_name) {
+        (
+            entry.provider,
+            entry.self_hosted.as_ref().map(|s| s.server_id.clone()),
+        )
+    } else {
+        let provider = Provider::infer_from_model(model_name)
+            .ok_or_else(|| anyhow::anyhow!("cannot infer provider for '{model_name}'"))?;
+        (provider, None)
+    };
+
+    let identity = SessionLlmIdentity {
+        model: model_name.to_string(),
+        provider,
+        self_hosted_server_id,
+        provider_params: None,
+    };
+
+    let raw_client = factory
+        .build_llm_client_for_identity(config, &identity)
+        .await
+        .map_err(|e| anyhow::anyhow!("build client: {e}"))?;
+    let adapter = Arc::new(factory.build_llm_adapter(raw_client, model_name.to_string()).await);
+
+    service
+        .hot_swap_session_llm_identity(session_id, adapter, identity)
+        .await
+        .map_err(|e| anyhow::anyhow!("hot swap: {e}"))?;
+
+    let provider_name = provider.as_str();
+    eprintln!("[target] model switched to {model_name} ({provider_name})");
+    Ok(format!("Model switched to {model_name} (provider: {provider_name})"))
 }
 
 fn format_session_history(session: &Session) -> String {
@@ -2160,6 +2232,8 @@ async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
                                 &mob_state,
                                 &provider,
                                 &mcp_external_tools,
+                                &surface.factory,
+                                &surface.config,
                                 &mut session_binding_state,
                                 &mut current_session_id,
                                 &mut event_forwarder,
@@ -2229,6 +2303,8 @@ async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
                                 &mob_state,
                                 &provider,
                                 &mcp_external_tools,
+                                &surface.factory,
+                                &surface.config,
                                 &mut session_binding_state,
                                 &mut current_session_id,
                                 &mut event_forwarder,
@@ -2306,6 +2382,8 @@ async fn run_adopted_loop(
     mob_state: &Arc<MobMcpState>,
     provider: &str,
     external_tools: &Option<Arc<dyn AgentToolDispatcher>>,
+    factory: &Arc<AgentFactory>,
+    config: &Config,
     session_binding_state: &mut SessionBindingState,
     current_session_id: &mut SessionId,
     event_forwarder: &mut Option<tokio::task::JoinHandle<()>>,
@@ -2346,6 +2424,8 @@ async fn run_adopted_loop(
         mob_state,
         provider,
         external_tools,
+        factory,
+        config,
         session_binding_state,
         current_session_id,
         event_forwarder,
@@ -2379,6 +2459,8 @@ async fn run_adopted_loop_inner(
     mob_state: &Arc<MobMcpState>,
     provider: &str,
     external_tools: &Option<Arc<dyn AgentToolDispatcher>>,
+    factory: &Arc<AgentFactory>,
+    config: &Config,
     session_binding_state: &mut SessionBindingState,
     current_session_id: &mut SessionId,
     event_forwarder: &mut Option<tokio::task::JoinHandle<()>>,
@@ -2491,8 +2573,8 @@ async fn run_adopted_loop_inner(
                 match handle_target_message(
                     &msg, comms_runtime, disconnect_tx, service, runtime_adapter,
                     jsonl_store, model, system_prompt, mob_state, provider,
-                    external_tools, session_binding_state, current_session_id,
-                    event_forwarder,
+                    external_tools, factory, config,
+                    session_binding_state, current_session_id, event_forwarder,
                 ).await {
                     TargetLoopAction::Continue => {}
                     TargetLoopAction::ExitProcess => std::process::exit(0),
@@ -2902,6 +2984,8 @@ mod tests {
             runtime_adapter,
             jsonl_store,
             mob_state,
+            factory: Arc::new(AgentFactory::new(session_dir)),
+            config: Config::default(),
             _schedule_host: schedule_host,
         })
     }
