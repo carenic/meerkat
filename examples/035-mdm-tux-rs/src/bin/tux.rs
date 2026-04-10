@@ -724,7 +724,7 @@ fn is_known_slash_command(input: &str) -> bool {
     input.starts_with('/')
         && matches!(
             input.split_once(' ').map(|(cmd, _)| cmd).unwrap_or(input),
-            "/new" | "/resume" | "/help" | "/claim" | "/release" | "/model"
+            "/new" | "/resume" | "/help" | "/claim" | "/release" | "/model" | "/models"
         )
 }
 
@@ -3125,6 +3125,7 @@ fn handle_key(
                         app.push(
                             "  `/model <name>` — switch target's LLM model live".into(),
                         );
+                        app.push("  `/models`       — list available models".into());
                         app.push("  `/help`         — show this help".into());
                     }
                     "/model" if !arg.is_empty() => {
@@ -3142,6 +3143,19 @@ fn handle_key(
                     }
                     "/model" => {
                         app.push("Usage: /model <model-name>".into());
+                    }
+                    "/models" => {
+                        if app.targets.is_empty() {
+                            return;
+                        }
+                        let target = app.targets[app.selected].clone();
+                        let target_id = app.target_runtime_id(&target).to_string();
+                        app.push_user_turn(&target, "/models");
+                        let _ = command_tx.send(AppCommand::SlashCmd {
+                            target_peer: target,
+                            target_id,
+                            cmd: "LIST_MODELS".into(),
+                        });
                     }
                     "/claim" => {
                         if app.transport != TransportMode::Kennel || app.targets.is_empty() {

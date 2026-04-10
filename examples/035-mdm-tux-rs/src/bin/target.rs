@@ -1384,6 +1384,8 @@ async fn handle_command(
             }
             Err(e) => format!("Error listing sessions: {e}"),
         }
+    } else if cmd == "LIST_MODELS" {
+        list_models(config)
     } else if let Some(new_model) = cmd.strip_prefix("MODEL ") {
         let new_model = new_model.trim();
         match hot_swap_model(service, factory, config, current_session_id, new_model).await {
@@ -1393,6 +1395,29 @@ async fn handle_command(
     } else {
         format!("Unknown command: {cmd}")
     }
+}
+
+fn list_models(config: &Config) -> String {
+    let registry = match config.model_registry() {
+        Ok(r) => r,
+        Err(e) => return format!("Failed to load model registry: {e}"),
+    };
+    let mut lines = vec!["**Available models:**".to_string()];
+    for (provider, default_model) in registry.provider_defaults() {
+        lines.push(format!("\n*{} (default: {})*", provider.as_str(), default_model));
+        for entry in registry.entries_for_provider(provider) {
+            let self_hosted_tag = if entry.self_hosted.is_some() {
+                " [self-hosted]"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "  `{}` — {}{}",
+                entry.id, entry.display_name, self_hosted_tag
+            ));
+        }
+    }
+    lines.join("\n")
 }
 
 async fn hot_swap_model(
