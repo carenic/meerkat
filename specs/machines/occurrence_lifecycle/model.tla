@@ -177,7 +177,7 @@ LeaseExpiredFromAwaitingCompletion(at_utc_ms) ==
 
 
 Next ==
-    \/ \E owner_id \in {"alpha", "beta"} : \E at_utc_ms \in 0..2 : \E arg_lease_expires_at_utc_ms \in 0..2 : \E arg_claim_token \in {"alpha", "beta"} : ClaimPending(owner_id, at_utc_ms, arg_lease_expires_at_utc_ms, arg_claim_token)
+    \/ \E owner_id \in StringValues : \E at_utc_ms \in 0..2 : \E arg_lease_expires_at_utc_ms \in 0..2 : \E arg_claim_token \in StringValues : ClaimPending(owner_id, at_utc_ms, arg_lease_expires_at_utc_ms, arg_claim_token)
     \/ \E correlation_id \in OptionStringValues : \E at_utc_ms \in 0..2 : DispatchStartedFromClaimed(correlation_id, at_utc_ms)
     \/ \E at_utc_ms \in 0..2 : AwaitCompletionFromDispatching(at_utc_ms)
     \/ \E receipt_stage \in DeliveryReceiptStageValues : \E at_utc_ms \in 0..2 : CompleteFromDispatchingOrAwaiting(receipt_stage, at_utc_ms)

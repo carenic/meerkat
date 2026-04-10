@@ -2252,12 +2252,6 @@ pub fn external_tool_bundle_composition() -> CompositionSchema {
                     witness_transition_order(
                         "turn_execution",
                         "LlmReturnedTerminal",
-                        "turn_execution",
-                        "BoundaryComplete",
-                    ),
-                    witness_transition_order(
-                        "turn_execution",
-                        "BoundaryComplete",
                         "external_tool_surface",
                         "ApplyBoundaryAdd",
                     ),
@@ -2266,6 +2260,12 @@ pub fn external_tool_bundle_composition() -> CompositionSchema {
                         "ApplyBoundaryAdd",
                         "runtime_control",
                         "ExternalToolDeltaReceivedIdle",
+                    ),
+                    witness_transition_order(
+                        "runtime_control",
+                        "ExternalToolDeltaReceivedIdle",
+                        "turn_execution",
+                        "BoundaryComplete",
                     ),
                 ],
                 state_limits: CompositionStateLimits {
@@ -2354,12 +2354,6 @@ pub fn external_tool_bundle_composition() -> CompositionSchema {
                     witness_transition_order(
                         "turn_execution",
                         "LlmReturnedTerminal",
-                        "turn_execution",
-                        "BoundaryComplete",
-                    ),
-                    witness_transition_order(
-                        "turn_execution",
-                        "BoundaryComplete",
                         "external_tool_surface",
                         "ApplyBoundaryAdd",
                     ),
@@ -2368,6 +2362,12 @@ pub fn external_tool_bundle_composition() -> CompositionSchema {
                         "ApplyBoundaryAdd",
                         "runtime_control",
                         "ExternalToolDeltaReceivedIdle",
+                    ),
+                    witness_transition_order(
+                        "runtime_control",
+                        "ExternalToolDeltaReceivedIdle",
+                        "turn_execution",
+                        "BoundaryComplete",
                     ),
                 ],
                 state_limits: CompositionStateLimits {
@@ -2539,22 +2539,29 @@ pub fn external_tool_bundle_composition() -> CompositionSchema {
                     witness_transition_order(
                         "turn_execution",
                         "LlmReturnedTerminal",
-                        "turn_execution",
-                        "BoundaryComplete",
-                    ),
-                    witness_transition_order(
-                        "turn_execution",
-                        "BoundaryComplete",
                         "external_tool_surface",
                         "ApplyBoundaryAdd",
                     ),
-                    // ApplyBoundaryAdd emits ScheduleSurfaceCompletion — owner realizes
                     witness_transition_order(
                         "external_tool_surface",
                         "ApplyBoundaryAdd",
+                        "runtime_control",
+                        "ExternalToolDeltaReceivedIdle",
+                    ),
+                    witness_transition_order(
+                        "runtime_control",
+                        "ExternalToolDeltaReceivedIdle",
+                        "turn_execution",
+                        "BoundaryComplete",
+                    ),
+                    // Boundary completion precedes the owner feedback inputs in the witness.
+                    witness_transition_order(
+                        "turn_execution",
+                        "BoundaryComplete",
                         "external_tool_surface",
                         "PendingSucceededAdd",
                     ),
+                    // ApplyBoundaryAdd emits ScheduleSurfaceCompletion — owner realizes it later.
                     witness_transition_order(
                         "external_tool_surface",
                         "PendingSucceededAdd",
@@ -2657,7 +2664,7 @@ pub fn peer_runtime_bundle_composition() -> CompositionSchema {
                     },
                     RouteFieldBinding {
                         to_field: "content_shape".into(),
-                        source: RouteBindingSource::Literal(Expr::String("text".into())),
+                        source: RouteBindingSource::Literal(Expr::String("TextOnly".into())),
                     },
                     RouteFieldBinding {
                         to_field: "request_id".into(),
@@ -3058,21 +3065,34 @@ pub fn peer_runtime_bundle_composition() -> CompositionSchema {
                     "EnqueueActionableMessage",
                 )],
                 state_limits: CompositionStateLimits {
-                    step_limit: 3,
-                    pending_input_limit: 3,
-                    pending_route_limit: 1,
-                    delivered_route_limit: 1,
-                    emitted_effect_limit: 1,
-                    seq_limit: 3,
-                    set_limit: 3,
-                    map_limit: 3,
+                    step_limit: 5,
+                    pending_input_limit: 4,
+                    pending_route_limit: 2,
+                    delivered_route_limit: 2,
+                    emitted_effect_limit: 2,
+                    seq_limit: 4,
+                    set_limit: 4,
+                    map_limit: 4,
                 },
             },
         ],
         deep_domain_cardinality: 2,
         deep_domain_overrides: BTreeMap::new(),
         witness_domain_cardinality: 1,
-        ci_limits: None,
+        // peer_runtime_bundle CI open-exploration is skipped (step_limit: 0 → initial state only).
+        // The meaningful coverage here is witness-driven: peer_comms already checks the generic
+        // classifier state space at machine scope, while the composition witnesses cover the routed
+        // runtime admission / ingress handoff paths without exploding the base spec.
+        ci_limits: Some(CompositionStateLimits {
+            step_limit: 0,
+            pending_input_limit: 1,
+            pending_route_limit: 1,
+            delivered_route_limit: 1,
+            emitted_effect_limit: 1,
+            seq_limit: 1,
+            set_limit: 1,
+            map_limit: 1,
+        }),
         closed_world: true,
     }
 }
@@ -3310,6 +3330,10 @@ pub fn ops_runtime_bundle_composition() -> CompositionSchema {
                         },
                     },
                     RouteFieldBinding {
+                        to_field: "content_shape".into(),
+                        source: RouteBindingSource::Literal(Expr::String("TextOnly".into())),
+                    },
+                    RouteFieldBinding {
                         to_field: "handling_mode".into(),
                         source: RouteBindingSource::Literal(Expr::String("Steer".into())),
                     },
@@ -3336,6 +3360,13 @@ pub fn ops_runtime_bundle_composition() -> CompositionSchema {
                         to_field: "handling_mode".into(),
                         source: RouteBindingSource::Field {
                             from_field: "handling_mode".into(),
+                            allow_named_alias: false,
+                        },
+                    },
+                    RouteFieldBinding {
+                        to_field: "content_shape".into(),
+                        source: RouteBindingSource::Field {
+                            from_field: "content_shape".into(),
                             allow_named_alias: false,
                         },
                     },
@@ -5505,6 +5536,13 @@ pub fn continuation_runtime_bundle_composition() -> CompositionSchema {
                         },
                     },
                     RouteFieldBinding {
+                        to_field: "content_shape".into(),
+                        source: RouteBindingSource::Field {
+                            from_field: "content_shape".into(),
+                            allow_named_alias: false,
+                        },
+                    },
+                    RouteFieldBinding {
                         to_field: "handling_mode".into(),
                         source: RouteBindingSource::Literal(Expr::String("Steer".into())),
                     },
@@ -6592,6 +6630,7 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 to: RouteTarget { machine: "runtime_control".into(), input_variant: "SubmitWork".into() },
                 bindings: vec![
                     RouteFieldBinding { to_field: "work_id".into(), source: RouteBindingSource::Field { from_field: "step_id".into(), allow_named_alias: true } },
+                    RouteFieldBinding { to_field: "content_shape".into(), source: RouteBindingSource::Literal(Expr::String("TextOnly".into())) },
                     RouteFieldBinding { to_field: "handling_mode".into(), source: RouteBindingSource::Literal(Expr::String("Queue".into())) },
                 ],
                 delivery: RouteDelivery::Immediate,
@@ -6625,6 +6664,7 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 to: RouteTarget { machine: "runtime_control".into(), input_variant: "SubmitWork".into() },
                 bindings: vec![
                     RouteFieldBinding { to_field: "work_id".into(), source: RouteBindingSource::Field { from_field: "operation_id".into(), allow_named_alias: true } },
+                    RouteFieldBinding { to_field: "content_shape".into(), source: RouteBindingSource::Literal(Expr::String("TextOnly".into())) },
                     RouteFieldBinding { to_field: "handling_mode".into(), source: RouteBindingSource::Literal(Expr::String("Steer".into())) },
                 ],
                 delivery: RouteDelivery::Immediate,
@@ -6676,6 +6716,7 @@ pub fn mob_bundle_composition() -> CompositionSchema {
                 to: RouteTarget { machine: "runtime_ingress".into(), input_variant: "AdmitQueued".into() },
                 bindings: vec![
                     RouteFieldBinding { to_field: "work_id".into(), source: RouteBindingSource::Field { from_field: "work_id".into(), allow_named_alias: true } },
+                    RouteFieldBinding { to_field: "content_shape".into(), source: RouteBindingSource::Field { from_field: "content_shape".into(), allow_named_alias: false } },
                     RouteFieldBinding { to_field: "handling_mode".into(), source: RouteBindingSource::Field { from_field: "handling_mode".into(), allow_named_alias: false } },
                     RouteFieldBinding { to_field: "policy".into(), source: RouteBindingSource::Literal(Expr::String("MobQueued".into())) },
                 ],

@@ -447,6 +447,7 @@ pub fn render_machine_ci_cfg(schema: &MachineSchema, deep: bool) -> String {
                     &ty,
                     default_sample_cardinality(deep),
                     &named_samples,
+                    false,
                 )
             )
             .expect("write to string");
@@ -533,7 +534,7 @@ pub fn render_composition_ci_cfg(schema: &CompositionSchema, deep: bool) -> Stri
                 &mut out,
                 "  {} = {}",
                 name,
-                render_default_domain_assignment(&ty, cardinality, &named_samples,)
+                render_default_domain_assignment(&ty, cardinality, &named_samples, false)
             )
             .expect("write to string");
         }
@@ -633,7 +634,12 @@ pub fn render_composition_witness_cfg(
                 &mut out,
                 "  {} = {}",
                 name,
-                render_default_domain_assignment(&ty, witness_sample_cardinality, &named_samples,)
+                render_default_domain_assignment(
+                    &ty,
+                    witness_sample_cardinality,
+                    &named_samples,
+                    true,
+                )
             )
             .expect("write to string");
         }
@@ -1217,64 +1223,6 @@ fn collect_composition_witness_named_type_samples(
     machine_by_instance: &BTreeMap<&str, &MachineSchema>,
 ) -> BTreeMap<String, BTreeSet<String>> {
     let mut samples = BTreeMap::new();
-    let expected_routes = witness.expected_routes.iter().collect::<BTreeSet<_>>();
-
-    for route in &schema.routes {
-        if !expected_routes.contains(&route.name) {
-            continue;
-        }
-
-        let Some(source_machine) = machine_by_instance
-            .get(route.from_machine.as_str())
-            .copied()
-        else {
-            continue;
-        };
-        let Ok(source_variant) = source_machine.effects.variant_named(&route.effect_variant) else {
-            continue;
-        };
-        let source_field_types = source_variant
-            .fields
-            .iter()
-            .map(|field| (field.name.clone(), field.ty.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let Some(target_machine) = machine_by_instance.get(route.to.machine.as_str()).copied()
-        else {
-            continue;
-        };
-        let Ok(target_variant) = target_machine.inputs.variant_named(&route.to.input_variant)
-        else {
-            continue;
-        };
-        let field_types = target_variant
-            .fields
-            .iter()
-            .map(|field| (field.name.clone(), field.ty.clone()))
-            .collect::<BTreeMap<_, _>>();
-
-        for binding in &route.bindings {
-            if let RouteBindingSource::Literal(expr) = &binding.source
-                && let Some(field_ty) = field_types.get(&binding.to_field)
-            {
-                collect_named_literals_from_expr(
-                    &mut samples,
-                    expr,
-                    Some(field_ty),
-                    &field_types,
-                    &BTreeMap::new(),
-                    &BTreeMap::new(),
-                );
-            }
-            if let RouteBindingSource::Field { from_field, .. } = &binding.source
-                && let (Some(source_ty), Some(target_ty)) = (
-                    source_field_types.get(from_field),
-                    field_types.get(&binding.to_field),
-                )
-            {
-                propagate_named_samples_between_types(&mut samples, source_ty, target_ty);
-            }
-        }
-    }
 
     for preload in &witness.preload_inputs {
         let Some(machine) = machine_by_instance.get(preload.machine.as_str()).copied() else {
@@ -1301,51 +1249,23 @@ fn collect_composition_witness_named_type_samples(
                 );
             }
         }
-
-        for route in &schema.routes {
-            if !expected_routes.contains(&route.name) || route.from_machine != preload.machine {
-                continue;
-            }
-            let Some(source_machine) = machine_by_instance
-                .get(route.from_machine.as_str())
-                .copied()
-            else {
-                continue;
-            };
-            let Ok(source_variant) = source_machine.effects.variant_named(&route.effect_variant)
-            else {
-                continue;
-            };
-            let source_field_types = source_variant
-                .fields
-                .iter()
-                .map(|field| (field.name.clone(), field.ty.clone()))
-                .collect::<BTreeMap<_, _>>();
-            let Some(target_machine) = machine_by_instance.get(route.to.machine.as_str()).copied()
-            else {
-                continue;
-            };
-            let Ok(target_variant) = target_machine.inputs.variant_named(&route.to.input_variant)
-            else {
-                continue;
-            };
-            let target_field_types = target_variant
-                .fields
-                .iter()
-                .map(|field| (field.name.clone(), field.ty.clone()))
-                .collect::<BTreeMap<_, _>>();
-            for binding in &route.bindings {
-                if let RouteBindingSource::Field { from_field, .. } = &binding.source
-                    && let (Some(source_ty), Some(target_ty)) = (
-                        source_field_types.get(from_field),
-                        target_field_types.get(&binding.to_field),
-                    )
-                {
-                    propagate_named_samples_between_types(&mut samples, source_ty, target_ty);
-                }
-            }
-        }
     }
+
+    let witness_routes = schema
+        .routes
+        .iter()
+        .filter(|route| {
+            witness
+                .expected_routes
+                .iter()
+                .any(|name| name == &route.name)
+        })
+        .collect::<Vec<_>>();
+    collect_route_binding_named_type_samples_to_fixpoint(
+        &mut samples,
+        &witness_routes,
+        machine_by_instance,
+    );
 
     samples
 }
@@ -1359,26 +1279,109 @@ fn merge_named_type_samples(
     }
 }
 
+fn collect_route_binding_named_type_samples_to_fixpoint(
+    samples: &mut BTreeMap<String, BTreeSet<String>>,
+    routes: &[&Route],
+    machine_by_instance: &BTreeMap<&str, &MachineSchema>,
+) {
+    loop {
+        let mut changed = false;
+        for route in routes {
+            changed |=
+                collect_route_binding_named_type_samples(samples, route, machine_by_instance);
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn collect_route_binding_named_type_samples(
+    samples: &mut BTreeMap<String, BTreeSet<String>>,
+    route: &Route,
+    machine_by_instance: &BTreeMap<&str, &MachineSchema>,
+) -> bool {
+    let Some(source_machine) = machine_by_instance
+        .get(route.from_machine.as_str())
+        .copied()
+    else {
+        return false;
+    };
+    let Ok(source_variant) = source_machine.effects.variant_named(&route.effect_variant) else {
+        return false;
+    };
+    let source_field_types = source_variant
+        .fields
+        .iter()
+        .map(|field| (field.name.clone(), field.ty.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let Some(target_machine) = machine_by_instance.get(route.to.machine.as_str()).copied() else {
+        return false;
+    };
+    let Ok(target_variant) = target_machine.inputs.variant_named(&route.to.input_variant) else {
+        return false;
+    };
+    let target_field_types = target_variant
+        .fields
+        .iter()
+        .map(|field| (field.name.clone(), field.ty.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut changed = false;
+    for binding in &route.bindings {
+        if let RouteBindingSource::Literal(expr) = &binding.source
+            && let Some(field_ty) = target_field_types.get(&binding.to_field)
+        {
+            let before = samples.clone();
+            collect_named_literals_from_expr(
+                samples,
+                expr,
+                Some(field_ty),
+                &target_field_types,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            );
+            changed |= *samples != before;
+        }
+        if let RouteBindingSource::Field { from_field, .. } = &binding.source
+            && let (Some(source_ty), Some(target_ty)) = (
+                source_field_types.get(from_field),
+                target_field_types.get(&binding.to_field),
+            )
+        {
+            changed |= propagate_named_samples_between_types(samples, source_ty, target_ty);
+        }
+    }
+
+    changed
+}
+
 fn propagate_named_samples_between_types(
     samples: &mut BTreeMap<String, BTreeSet<String>>,
     source_ty: &TypeRef,
     target_ty: &TypeRef,
-) {
+) -> bool {
     match (source_ty, target_ty) {
-        (TypeRef::Named(source_name), TypeRef::Named(target_name)) => {
-            if let Some(source_samples) = samples.get(source_name).cloned() {
-                samples
-                    .entry(target_name.clone())
-                    .or_default()
-                    .extend(source_samples);
-            }
-        }
         (TypeRef::Option(source_inner), TypeRef::Option(target_inner))
         | (TypeRef::Seq(source_inner), TypeRef::Seq(target_inner))
         | (TypeRef::Set(source_inner), TypeRef::Set(target_inner)) => {
-            propagate_named_samples_between_types(samples, source_inner, target_inner);
+            propagate_named_samples_between_types(samples, source_inner, target_inner)
         }
-        _ => {}
+        _ => {
+            let (Some(source_bucket), Some(target_bucket)) =
+                (type_sample_bucket(source_ty), type_sample_bucket(target_ty))
+            else {
+                return false;
+            };
+            if let Some(source_samples) = samples.get(&source_bucket).cloned() {
+                let target_samples = samples.entry(target_bucket).or_default();
+                let before = target_samples.len();
+                target_samples.extend(source_samples);
+                target_samples.len() != before
+            } else {
+                false
+            }
+        }
     }
 }
 
@@ -1536,28 +1539,41 @@ fn collect_named_literals_from_expr(
     helper_returns: &BTreeMap<String, TypeRef>,
     binding_types: &BTreeMap<String, TypeRef>,
 ) {
-    if let (Expr::String(value), Some(TypeRef::Named(name))) = (expr, expected_ty) {
-        samples
-            .entry(name.clone())
-            .or_default()
-            .insert(value.clone());
+    if let Expr::String(value) = expr
+        && let Some(bucket) = expected_ty.and_then(type_sample_bucket)
+    {
+        samples.entry(bucket).or_default().insert(value.clone());
+    }
+
+    if let (Expr::NamedVariant { variant, .. }, Some(expected_ty)) = (expr, expected_ty)
+        && let Some(bucket) = type_sample_bucket(expected_ty)
+    {
+        samples.entry(bucket).or_default().insert(variant.clone());
     }
 
     match expr {
         Expr::Eq(left, right) | Expr::Neq(left, right) => {
             let left_ty = infer_expr_type(left, field_types, helper_returns, binding_types);
             let right_ty = infer_expr_type(right, field_types, helper_returns, binding_types);
-            if let (Some(TypeRef::Named(name)), Expr::String(value)) = (&left_ty, right.as_ref()) {
-                samples
-                    .entry(name.clone())
-                    .or_default()
-                    .insert(value.clone());
+            if let (Some(left_ty), Expr::String(value)) = (&left_ty, right.as_ref())
+                && let Some(bucket) = type_sample_bucket(left_ty)
+            {
+                samples.entry(bucket).or_default().insert(value.clone());
             }
-            if let (Some(TypeRef::Named(name)), Expr::String(value)) = (&right_ty, left.as_ref()) {
-                samples
-                    .entry(name.clone())
-                    .or_default()
-                    .insert(value.clone());
+            if let (Some(right_ty), Expr::String(value)) = (&right_ty, left.as_ref())
+                && let Some(bucket) = type_sample_bucket(right_ty)
+            {
+                samples.entry(bucket).or_default().insert(value.clone());
+            }
+            if let (Some(left_ty), Expr::NamedVariant { variant, .. }) = (&left_ty, right.as_ref())
+                && let Some(bucket) = type_sample_bucket(left_ty)
+            {
+                samples.entry(bucket).or_default().insert(variant.clone());
+            }
+            if let (Some(right_ty), Expr::NamedVariant { variant, .. }) = (&right_ty, left.as_ref())
+                && let Some(bucket) = type_sample_bucket(right_ty)
+            {
+                samples.entry(bucket).or_default().insert(variant.clone());
             }
             collect_named_literals_from_expr(
                 samples,
@@ -1867,10 +1883,58 @@ fn default_sample_cardinality(deep: bool) -> usize {
     if deep { 2 } else { 1 }
 }
 
+fn type_sample_bucket(ty: &TypeRef) -> Option<String> {
+    match ty {
+        TypeRef::String => Some("String".into()),
+        TypeRef::Named(name) | TypeRef::Enum(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+fn collected_sample_literals(
+    bucket: &str,
+    sample_cardinality: usize,
+    named_samples: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<Vec<String>> {
+    let samples = named_samples.get(bucket)?;
+    let limit = sample_cardinality.max(1);
+    let rendered = samples
+        .iter()
+        .take(limit)
+        .map(|sample| tla_string(sample))
+        .collect::<Vec<_>>();
+    (!rendered.is_empty()).then_some(rendered)
+}
+
+fn generic_string_samples(sample_cardinality: usize) -> Vec<String> {
+    if sample_cardinality > 1 {
+        vec!["alpha".into(), "beta".into()]
+    } else {
+        vec!["alpha".into()]
+    }
+}
+
+fn collected_string_samples(
+    sample_cardinality: usize,
+    named_samples: &BTreeMap<String, BTreeSet<String>>,
+    include_named_samples: bool,
+) -> Vec<String> {
+    let mut values = generic_string_samples(sample_cardinality);
+    if include_named_samples && let Some(samples) = named_samples.get("String") {
+        for sample in samples {
+            if !values.iter().any(|existing| existing == sample) {
+                values.push(sample.clone());
+            }
+        }
+    }
+    values
+}
+
 fn render_default_domain_assignment(
     ty: &TypeRef,
     sample_cardinality: usize,
     named_samples: &BTreeMap<String, BTreeSet<String>>,
+    include_string_samples: bool,
 ) -> String {
     match ty {
         TypeRef::Bool => "{TRUE, FALSE}".into(),
@@ -1885,18 +1949,24 @@ fn render_default_domain_assignment(
                 "{1}".into()
             }
         }
-        TypeRef::String => {
-            if sample_cardinality > 1 {
-                "{\"alpha\", \"beta\"}".into()
-            } else {
-                "{\"alpha\"}".into()
-            }
-        }
+        TypeRef::String => format!(
+            "{{{}}}",
+            collected_string_samples(sample_cardinality, named_samples, include_string_samples)
+                .into_iter()
+                .map(|sample| tla_string(&sample))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         TypeRef::Named(name) | TypeRef::Enum(name) => {
             render_named_domain_assignment(name, sample_cardinality, named_samples)
         }
         TypeRef::Seq(inner) => {
-            let samples = sample_values(inner, sample_cardinality, named_samples);
+            let samples = sample_values(
+                inner,
+                sample_cardinality,
+                named_samples,
+                include_string_samples,
+            );
             if samples.len() >= 2 {
                 format!(
                     "{{<<>>, <<{}>>, <<{}, {}>>}}",
@@ -1909,7 +1979,12 @@ fn render_default_domain_assignment(
             }
         }
         TypeRef::Set(inner) => {
-            let samples = sample_values(inner, sample_cardinality, named_samples);
+            let samples = sample_values(
+                inner,
+                sample_cardinality,
+                named_samples,
+                include_string_samples,
+            );
             if samples.len() >= 2 {
                 format!(
                     "{{{{}}, {{{}}}, {{{}, {}}}}}",
@@ -1922,10 +1997,15 @@ fn render_default_domain_assignment(
             }
         }
         TypeRef::Option(inner) => {
-            let samples = sample_values(inner, sample_cardinality, named_samples)
-                .into_iter()
-                .map(|sample| format!("[tag |-> {}, value |-> {}]", tla_string("some"), sample))
-                .collect::<Vec<_>>();
+            let samples = sample_values(
+                inner,
+                sample_cardinality,
+                named_samples,
+                include_string_samples,
+            )
+            .into_iter()
+            .map(|sample| format!("[tag |-> {}, value |-> {}]", tla_string("some"), sample))
+            .collect::<Vec<_>>();
             if samples.is_empty() {
                 format!(
                     "{{[tag |-> {}, value |-> {}]}}",
@@ -1950,16 +2030,8 @@ fn render_named_domain_assignment(
     sample_cardinality: usize,
     named_samples: &BTreeMap<String, BTreeSet<String>>,
 ) -> String {
-    if let Some(samples) = named_samples.get(name) {
-        let limit = sample_cardinality.max(1);
-        let rendered = samples
-            .iter()
-            .take(limit)
-            .map(|sample| tla_string(sample))
-            .collect::<Vec<_>>();
-        if !rendered.is_empty() {
-            return format!("{{{}}}", rendered.join(", "));
-        }
+    if let Some(rendered) = collected_sample_literals(name, sample_cardinality, named_samples) {
+        return format!("{{{}}}", rendered.join(", "));
     }
 
     let values = (1..=sample_cardinality.max(1))
@@ -1973,6 +2045,7 @@ fn sample_values(
     ty: &TypeRef,
     sample_cardinality: usize,
     named_samples: &BTreeMap<String, BTreeSet<String>>,
+    include_string_samples: bool,
 ) -> Vec<String> {
     match ty {
         TypeRef::Bool => vec!["TRUE".into(), "FALSE".into()],
@@ -1984,11 +2057,10 @@ fn sample_values(
             }
         }
         TypeRef::String => {
-            if sample_cardinality > 1 {
-                vec![tla_string("alpha"), tla_string("beta")]
-            } else {
-                vec![tla_string("alpha")]
-            }
+            collected_string_samples(sample_cardinality, named_samples, include_string_samples)
+                .into_iter()
+                .map(|sample| tla_string(&sample))
+                .collect()
         }
         TypeRef::Named(name) | TypeRef::Enum(name) => {
             if let Some(samples) = named_samples.get(name) {
@@ -2013,16 +2085,29 @@ fn sample_values(
                 tla_string("none")
             )];
             values.extend(
-                sample_values(inner, sample_cardinality, named_samples)
-                    .into_iter()
-                    .map(|sample| {
-                        format!("[tag |-> {}, value |-> {}]", tla_string("some"), sample)
-                    }),
+                sample_values(
+                    inner,
+                    sample_cardinality,
+                    named_samples,
+                    include_string_samples,
+                )
+                .into_iter()
+                .map(|sample| format!("[tag |-> {}, value |-> {}]", tla_string("some"), sample)),
             );
             values
         }
-        TypeRef::Seq(inner) => sample_values(inner, sample_cardinality, named_samples),
-        TypeRef::Set(inner) => sample_values(inner, sample_cardinality, named_samples),
+        TypeRef::Seq(inner) => sample_values(
+            inner,
+            sample_cardinality,
+            named_samples,
+            include_string_samples,
+        ),
+        TypeRef::Set(inner) => sample_values(
+            inner,
+            sample_cardinality,
+            named_samples,
+            include_string_samples,
+        ),
         TypeRef::Map(_, _) => vec![],
     }
 }
@@ -2725,7 +2810,7 @@ impl<'a> CompositionTlaCompiler<'a> {
         match ty {
             TypeRef::Bool => "BOOLEAN".into(),
             TypeRef::U32 | TypeRef::U64 => "0..2".into(),
-            TypeRef::String => "{\"alpha\", \"beta\"}".into(),
+            TypeRef::String => "StringValues".into(),
             TypeRef::Named(_)
             | TypeRef::Enum(_)
             | TypeRef::Seq(_)
@@ -3894,11 +3979,12 @@ impl<'a> CompositionTlaCompiler<'a> {
 
         let mut queued_route_packets = Vec::new();
         let mut immediate_route_packets = Vec::new();
+        let mut owner_route_quantifiers = Vec::new();
         for (effect_variant, _effect_packet, payload_fields) in &effect_packets {
             for route in self.schema.routes.iter().filter(|route| {
                 route.from_machine == instance_id && route.effect_variant == *effect_variant
             }) {
-                let target_payload = self.target_payload_for_route(
+                let (target_payload, route_owner_quantifiers) = self.target_payload_for_route(
                     machine,
                     effect_variant,
                     payload_fields,
@@ -3908,6 +3994,11 @@ impl<'a> CompositionTlaCompiler<'a> {
                     &binding_env,
                     &binding_types,
                 );
+                for quantifier in route_owner_quantifiers {
+                    if !owner_route_quantifiers.contains(&quantifier) {
+                        owner_route_quantifiers.push(quantifier);
+                    }
+                }
                 let route_packet = self.route_packet_expr(
                     &route.name,
                     instance_id,
@@ -4090,31 +4181,45 @@ impl<'a> CompositionTlaCompiler<'a> {
             }
         }
 
-        pushln!(out, "       /\\ pending_inputs' = {}", pending_inputs_next);
-        writeln!(
-            out,
-            "       /\\ observed_inputs' = {}",
-            observed_inputs_next
-        )
-        .expect("write to string");
-        writeln!(out, "       /\\ pending_routes' = {}", pending_routes_next)
+        let route_update_prefix = if owner_route_quantifiers.is_empty() {
+            "       /\\"
+        } else {
+            writeln!(
+                out,
+                "       /\\ \\E {} :",
+                owner_route_quantifiers.join(", ")
+            )
             .expect("write to string");
+            "           /\\"
+        };
         writeln!(
             out,
-            "       /\\ delivered_routes' = {}",
-            delivered_routes_next
+            "{route_update_prefix} pending_inputs' = {pending_inputs_next}"
         )
         .expect("write to string");
         writeln!(
             out,
-            "       /\\ emitted_effects' = {}",
-            emitted_effects_next
+            "{route_update_prefix} observed_inputs' = {observed_inputs_next}"
         )
         .expect("write to string");
         writeln!(
             out,
-            "       /\\ observed_transitions' = {}",
-            observed_transitions_next
+            "{route_update_prefix} pending_routes' = {pending_routes_next}"
+        )
+        .expect("write to string");
+        writeln!(
+            out,
+            "{route_update_prefix} delivered_routes' = {delivered_routes_next}"
+        )
+        .expect("write to string");
+        writeln!(
+            out,
+            "{route_update_prefix} emitted_effects' = {emitted_effects_next}"
+        )
+        .expect("write to string");
+        writeln!(
+            out,
+            "{route_update_prefix} observed_transitions' = {observed_transitions_next}"
         )
         .expect("write to string");
         // Write obligation variable updates — touched protocols get \cup, untouched get UNCHANGED
@@ -4122,7 +4227,8 @@ impl<'a> CompositionTlaCompiler<'a> {
         let mut unchanged_obligation_vars = Vec::new();
         for ovar in &all_obligation_vars {
             if let Some(next_expr) = obligation_updates.get(ovar) {
-                writeln!(out, "       /\\ {}' = {}", ovar, next_expr).expect("write to string");
+                writeln!(out, "{route_update_prefix} {}' = {}", ovar, next_expr)
+                    .expect("write to string");
             } else {
                 unchanged_obligation_vars.push(ovar.clone());
             }
@@ -4130,13 +4236,16 @@ impl<'a> CompositionTlaCompiler<'a> {
         if !unchanged_obligation_vars.is_empty() {
             writeln!(
                 out,
-                "       /\\ UNCHANGED << {} >>",
+                "{route_update_prefix} UNCHANGED << {} >>",
                 unchanged_obligation_vars.join(", ")
             )
             .expect("write to string");
         }
-        writeln!(out, "       /\\ model_step_count' = model_step_count + 1")
-            .expect("write to string");
+        writeln!(
+            out,
+            "{route_update_prefix} model_step_count' = model_step_count + 1"
+        )
+        .expect("write to string");
     }
 
     fn target_payload_for_route(
@@ -4149,15 +4258,16 @@ impl<'a> CompositionTlaCompiler<'a> {
         next_env: &BTreeMap<String, String>,
         binding_env: &BTreeMap<String, String>,
         binding_types: &BTreeMap<String, TypeRef>,
-    ) -> String {
+    ) -> (String, Vec<String>) {
         let target_machine = self.machine(route.to.machine.as_str());
         let Ok(target_variant) = target_machine.inputs.variant_named(&route.to.input_variant)
         else {
-            return String::new();
+            return (String::new(), Vec::new());
         };
         let Ok(source_effect_variant) = source_machine.effects.variant_named(effect_variant) else {
-            return String::new();
+            return (String::new(), Vec::new());
         };
+        let mut owner_context_quantifiers = Vec::new();
         let bindings = route
             .bindings
             .iter()
@@ -4180,7 +4290,26 @@ impl<'a> CompositionTlaCompiler<'a> {
                     RouteBindingSource::Literal(expr) => {
                         compiler.render_expr_with_types(expr, next_env, binding_env, binding_types)
                     }
-                    RouteBindingSource::OwnerProvided => "\"owner_val\"".to_string(),
+                    RouteBindingSource::OwnerProvided => {
+                        if let Some(target_field) = target_variant
+                            .fields
+                            .iter()
+                            .find(|field| field.name == binding.to_field)
+                        {
+                            let var_name = format!(
+                                "route_owner_ctx_{}_{}",
+                                tla_ident(&route.name),
+                                tla_ident(&binding.to_field)
+                            );
+                            owner_context_quantifiers.push(format!(
+                                "{var_name} \\in {}",
+                                render_type_domain_expr(&target_field.ty)
+                            ));
+                            var_name
+                        } else {
+                            "\"owner_val\"".to_string()
+                        }
+                    }
                 };
                 (binding.to_field.clone(), expr)
             })
@@ -4196,7 +4325,10 @@ impl<'a> CompositionTlaCompiler<'a> {
                 (field.name.clone(), expr)
             })
             .collect::<BTreeMap<_, _>>();
-        self.payload_record_expr(&payload_fields)
+        (
+            self.payload_record_expr(&payload_fields),
+            owner_context_quantifiers,
+        )
     }
 
     fn append_if_missing_chain(&self, base: String, items: &[String]) -> String {
@@ -4748,7 +4880,7 @@ impl<'a> MachineTlaCompiler<'a> {
         match ty {
             TypeRef::Bool => "BOOLEAN".into(),
             TypeRef::U32 | TypeRef::U64 => "0..2".into(),
-            TypeRef::String => "{\"alpha\", \"beta\"}".into(),
+            TypeRef::String => "StringValues".into(),
             TypeRef::Named(_)
             | TypeRef::Enum(_)
             | TypeRef::Seq(_)

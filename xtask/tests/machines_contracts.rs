@@ -124,7 +124,219 @@ fn codegen_respects_composition_domain_cardinality_overrides() {
     assert!(deep_cfg.contains("StringValues = {\"alpha\"}"));
     assert!(deep_cfg.contains("RunIdValues = {\"runid_1\"}"));
     assert!(!deep_cfg.contains("\"beta\""));
+    assert!(!deep_cfg.contains("\"mob.kickoff_cancelled\""));
     assert!(!deep_cfg.contains("\"runid_2\""));
+}
+
+#[test]
+fn peer_runtime_bundle_ci_skips_open_exploration() {
+    let registry = CanonicalRegistry::load();
+    let selection = registry
+        .select(&SelectionArgs {
+            all: false,
+            machines: vec![],
+            compositions: vec!["peer_runtime_bundle".into()],
+        })
+        .expect("selection");
+    let dir = tempdir().expect("tempdir");
+
+    machine_codegen_at_root(dir.path(), &selection).expect("generate outputs");
+
+    let model = fs::read_to_string(
+        dir.path()
+            .join("specs/compositions/peer_runtime_bundle/model.tla"),
+    )
+    .expect("peer runtime bundle model");
+    assert!(model.contains("CiStateConstraint == /\\ model_step_count <= 0"));
+}
+
+#[test]
+fn peer_runtime_bundle_witness_cfg_preserves_classifier_literals() {
+    let registry = CanonicalRegistry::load();
+    let selection = registry
+        .select(&SelectionArgs {
+            all: false,
+            machines: vec![],
+            compositions: vec!["peer_runtime_bundle".into()],
+        })
+        .expect("selection");
+    let dir = tempdir().expect("tempdir");
+
+    machine_codegen_at_root(dir.path(), &selection).expect("generate outputs");
+
+    let trusted_cfg = fs::read_to_string(
+        dir.path()
+            .join("specs/compositions/peer_runtime_bundle/witness-trusted_peer_enters_runtime.cfg"),
+    )
+    .expect("trusted witness cfg");
+    assert!(trusted_cfg.contains("PeerEnvelopeKindValues = {\"Message\"}"));
+    assert!(trusted_cfg.contains("\"peer_1\""));
+    assert!(trusted_cfg.contains("\"review\""));
+
+    let admitted_cfg = fs::read_to_string(dir.path().join(
+        "specs/compositions/peer_runtime_bundle/witness-admitted_peer_work_enters_ingress.cfg",
+    ))
+    .expect("admitted witness cfg");
+    assert!(admitted_cfg.contains("PeerEnvelopeKindValues = {\"Request\"}"));
+    assert!(admitted_cfg.contains("AdmissionEffectValues = {\"SubmitAdmittedIngressEffect\"}"));
+
+    let control_cfg =
+        fs::read_to_string(dir.path().join(
+            "specs/compositions/peer_runtime_bundle/witness-control_preempts_peer_delivery.cfg",
+        ))
+        .expect("control witness cfg");
+    assert!(!control_cfg.contains("\"text\""));
+
+    let model = fs::read_to_string(
+        dir.path()
+            .join("specs/compositions/peer_runtime_bundle/model.tla"),
+    )
+    .expect("peer runtime bundle model");
+    assert!(model.contains("\\E arg_sender_name \\in StringValues"));
+    assert!(!model.contains("\\E arg_sender_name \\in {\"alpha\", \"beta\"}"));
+}
+
+#[test]
+fn mob_witness_sampling_stays_scoped_to_expected_routes() {
+    let registry = CanonicalRegistry::load();
+    let selection = registry
+        .select(&SelectionArgs {
+            all: false,
+            machines: vec![],
+            compositions: vec!["mob_bundle".into()],
+        })
+        .expect("selection");
+    let dir = tempdir().expect("tempdir");
+
+    machine_codegen_at_root(dir.path(), &selection).expect("generate outputs");
+
+    let flow_cfg = fs::read_to_string(
+        dir.path()
+            .join("specs/compositions/mob_bundle/witness-mob_flow_success_path.cfg"),
+    )
+    .expect("mob flow success witness cfg");
+    assert!(flow_cfg.contains("ContentShapeValues = {\"TextOnly\"}"));
+    assert!(!flow_cfg.contains("\"text\""));
+}
+
+#[test]
+fn peer_comms_ci_keeps_generic_string_domain() {
+    let registry = CanonicalRegistry::load();
+    let selection = registry
+        .select(&SelectionArgs {
+            all: false,
+            machines: vec!["peer_comms".into()],
+            compositions: vec![],
+        })
+        .expect("selection");
+    let dir = tempdir().expect("tempdir");
+
+    machine_codegen_at_root(dir.path(), &selection).expect("generate outputs");
+
+    let ci_cfg = fs::read_to_string(dir.path().join("specs/machines/peer_comms/ci.cfg"))
+        .expect("peer comms ci cfg");
+    assert!(ci_cfg.contains("\"alpha\""));
+    assert!(!ci_cfg.contains("StringValues = {\"mob.kickoff_cancelled\"}"));
+}
+
+#[test]
+fn async_op_routes_bind_runtime_content_shape_literals() {
+    let registry = CanonicalRegistry::load();
+    let selection = registry
+        .select(&SelectionArgs {
+            all: false,
+            machines: vec![],
+            compositions: vec![
+                "ops_runtime_bundle".into(),
+                "mob_bundle".into(),
+                "continuation_runtime_bundle".into(),
+            ],
+        })
+        .expect("selection");
+    let dir = tempdir().expect("tempdir");
+
+    machine_codegen_at_root(dir.path(), &selection).expect("generate outputs");
+
+    let ops_model = fs::read_to_string(
+        dir.path()
+            .join("specs/compositions/ops_runtime_bundle/model.tla"),
+    )
+    .expect("ops runtime bundle model");
+    assert!(ops_model.contains(
+        "[machine |-> \"runtime_control\", variant |-> \"SubmitWork\", payload |-> [content_shape |-> \"TextOnly\", handling_mode |-> \"Steer\""
+    ));
+    assert!(ops_model.contains(
+        "[machine |-> \"runtime_ingress\", variant |-> \"AdmitQueued\", payload |-> [content_shape |-> packet.payload.content_shape, handling_mode |-> packet.payload.handling_mode, policy |-> \"OperationQueued\""
+    ));
+    assert!(!ops_model.contains("content_shape |-> \"contentshape_default\""));
+
+    let mob_model = fs::read_to_string(dir.path().join("specs/compositions/mob_bundle/model.tla"))
+        .expect("mob bundle model");
+    assert!(mob_model.contains(
+        "[machine |-> \"runtime_control\", variant |-> \"SubmitWork\", payload |-> [content_shape |-> \"TextOnly\", handling_mode |-> \"Queue\""
+    ));
+    assert!(mob_model.contains(
+        "[machine |-> \"runtime_control\", variant |-> \"SubmitWork\", payload |-> [content_shape |-> \"TextOnly\", handling_mode |-> \"Steer\""
+    ));
+    assert!(mob_model.contains("source_route |-> \"mob_peer_candidate_enters_runtime_admission\""));
+    assert!(mob_model.contains(
+        "payload |-> [content_shape |-> \"text\", handling_mode |-> peer_comms__NormalizedHandlingMode("
+    ));
+    assert!(mob_model.contains(
+        "[machine |-> \"runtime_ingress\", variant |-> \"AdmitQueued\", payload |-> [content_shape |-> packet.payload.content_shape, handling_mode |-> packet.payload.handling_mode, policy |-> \"MobQueued\""
+    ));
+    assert!(!mob_model.contains("content_shape |-> \"contentshape_default\""));
+
+    let continuation_model = fs::read_to_string(
+        dir.path()
+            .join("specs/compositions/continuation_runtime_bundle/model.tla"),
+    )
+    .expect("continuation runtime bundle model");
+    assert!(continuation_model.contains(
+        "[machine |-> \"runtime_ingress\", variant |-> \"AdmitQueued\", payload |-> [content_shape |-> packet.payload.content_shape, handling_mode |-> \"Steer\", policy |-> \"ContinuationQueued\""
+    ));
+    assert!(!continuation_model.contains("content_shape |-> \"contentshape_default\""));
+}
+
+#[test]
+fn flow_run_machine_ci_stays_initial_state_only() {
+    let registry = CanonicalRegistry::load();
+    let selection = registry
+        .select(&SelectionArgs {
+            all: false,
+            machines: vec!["flow_run".into()],
+            compositions: vec![],
+        })
+        .expect("selection");
+    let dir = tempdir().expect("tempdir");
+
+    machine_codegen_at_root(dir.path(), &selection).expect("generate outputs");
+
+    let model = fs::read_to_string(dir.path().join("specs/machines/flow_run/model.tla"))
+        .expect("flow run model");
+    assert!(model.contains("CiStateConstraint == /\\ model_step_count <= 0"));
+    assert!(model.contains("THEOREM Spec => []output_only_follows_completed_steps"));
+}
+
+#[test]
+fn flow_frame_machine_dependency_quantifiers_use_sequence_elements() {
+    let registry = CanonicalRegistry::load();
+    let selection = registry
+        .select(&SelectionArgs {
+            all: false,
+            machines: vec!["flow_frame".into()],
+            compositions: vec![],
+        })
+        .expect("selection");
+    let dir = tempdir().expect("tempdir");
+
+    machine_codegen_at_root(dir.path(), &selection).expect("generate outputs");
+
+    let model = fs::read_to_string(dir.path().join("specs/machines/flow_frame/model.tla"))
+        .expect("flow frame model");
+    assert!(model.contains("\\E dep_id \\in SeqElements((IF Head(ready_queue) \\in DOMAIN node_dependencies THEN node_dependencies[Head(ready_queue)] ELSE <<>>))"));
+    assert!(model.contains("\\A dep_id \\in SeqElements((IF node_id \\in DOMAIN node_dependencies THEN node_dependencies[node_id] ELSE <<>>))"));
+    assert!(!model.contains("\\E dep_id \\in (IF Head(ready_queue) \\in DOMAIN node_dependencies THEN node_dependencies[Head(ready_queue)] ELSE <<>>)"));
 }
 
 #[test]
@@ -224,16 +436,23 @@ fn external_tool_witness_uses_boundary_applied_causal_order() {
             .join("specs/compositions/external_tool_bundle/model.tla"),
     )
     .expect("external tool model");
-    // Causal chain: LlmReturnedTerminal → BoundaryComplete → ApplyBoundaryAdd → ExternalToolDeltaReceivedIdle
+    // Causal chain: LlmReturnedTerminal → ApplyBoundaryAdd → ExternalToolDeltaReceivedIdle → BoundaryComplete
     assert!(model.contains(
-        "earlier.machine = \"turn_execution\" /\\ earlier.transition = \"LlmReturnedTerminal\" /\\ later.machine = \"turn_execution\" /\\ later.transition = \"BoundaryComplete\""
-    ));
-    assert!(model.contains(
-        "earlier.machine = \"turn_execution\" /\\ earlier.transition = \"BoundaryComplete\" /\\ later.machine = \"external_tool_surface\" /\\ later.transition = \"ApplyBoundaryAdd\""
+        "earlier.machine = \"turn_execution\" /\\ earlier.transition = \"LlmReturnedTerminal\" /\\ later.machine = \"external_tool_surface\" /\\ later.transition = \"ApplyBoundaryAdd\""
     ));
     assert!(model.contains(
         "earlier.machine = \"external_tool_surface\" /\\ earlier.transition = \"ApplyBoundaryAdd\" /\\ later.machine = \"runtime_control\" /\\ later.transition = \"ExternalToolDeltaReceivedIdle\""
     ));
+    assert!(model.contains(
+        "earlier.machine = \"runtime_control\" /\\ earlier.transition = \"ExternalToolDeltaReceivedIdle\" /\\ later.machine = \"turn_execution\" /\\ later.transition = \"BoundaryComplete\""
+    ));
+    assert!(model.contains(
+        "route_owner_ctx_turn_boundary_applies_surface_changes_surface_id \\in SurfaceIdValues"
+    ));
+    assert!(model.contains(
+        "route_owner_ctx_turn_boundary_applies_surface_changes_applied_at_turn \\in TurnNumberValues"
+    ));
+    assert!(!model.contains("\"owner_val\""));
     assert!(model.contains(
         "WitnessTransitionObserved_surface_add_notifies_control_turn_execution_LlmReturnedTerminal"
     ));

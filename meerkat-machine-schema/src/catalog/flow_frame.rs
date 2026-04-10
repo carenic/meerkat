@@ -59,6 +59,13 @@ fn dep_is_terminal_expr(dep_binding: &str) -> Expr {
     ])
 }
 
+fn dependency_ids_expr(node_id_expr: Expr) -> Expr {
+    Expr::SeqElements(Box::new(Expr::MapGet {
+        map: Box::new(Expr::Field("node_dependencies".into())),
+        key: Box::new(node_id_expr),
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers: update blocks re-used across multiple transitions
 // ---------------------------------------------------------------------------
@@ -452,10 +459,9 @@ fn guard_head_should_skip() -> Guard {
                 Expr::Quantified {
                     quantifier: Quantifier::Any,
                     binding: "dep_id".into(),
-                    over: Box::new(Expr::MapGet {
-                        map: Box::new(Expr::Field("node_dependencies".into())),
-                        key: Box::new(Expr::Head(Box::new(Expr::Field("ready_queue".into())))),
-                    }),
+                    over: Box::new(dependency_ids_expr(Expr::Head(Box::new(Expr::Field(
+                        "ready_queue".into(),
+                    ))))),
                     body: Box::new(Expr::Or(vec![
                         Expr::Eq(
                             Box::new(Expr::MapGet {
@@ -525,10 +531,9 @@ fn guard_head_should_fail() -> Guard {
             Expr::Quantified {
                 quantifier: Quantifier::All,
                 binding: "dep_id".into(),
-                over: Box::new(Expr::MapGet {
-                    map: Box::new(Expr::Field("node_dependencies".into())),
-                    key: Box::new(Expr::Head(Box::new(Expr::Field("ready_queue".into())))),
-                }),
+                over: Box::new(dependency_ids_expr(Expr::Head(Box::new(Expr::Field(
+                    "ready_queue".into(),
+                ))))),
                 body: Box::new(dep_is_terminal_expr("dep_id")),
             },
             // No dep is Completed (otherwise would have been admitted as run)
@@ -958,10 +963,7 @@ pub fn flow_frame_machine() -> MachineSchema {
                         then_expr: Box::new(Expr::Quantified {
                             quantifier: Quantifier::All,
                             binding: "dep_id".into(),
-                            over: Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field("node_dependencies".into())),
-                                key: Box::new(Expr::Binding("node_id".into())),
-                            }),
+                            over: Box::new(dependency_ids_expr(Expr::Binding("node_id".into()))),
                             // dep is terminal iff its status is one of the 4 terminal states
                             body: Box::new(dep_is_terminal_expr("dep_id")),
                         }),
@@ -970,10 +972,9 @@ pub fn flow_frame_machine() -> MachineSchema {
                             Expr::Quantified {
                                 quantifier: Quantifier::Any,
                                 binding: "dep_id".into(),
-                                over: Box::new(Expr::MapGet {
-                                    map: Box::new(Expr::Field("node_dependencies".into())),
-                                    key: Box::new(Expr::Binding("node_id".into())),
-                                }),
+                                over: Box::new(dependency_ids_expr(Expr::Binding(
+                                    "node_id".into(),
+                                ))),
                                 body: Box::new(Expr::Eq(
                                     Box::new(Expr::MapGet {
                                         map: Box::new(Expr::Field("node_status".into())),
@@ -989,10 +990,9 @@ pub fn flow_frame_machine() -> MachineSchema {
                             Expr::Quantified {
                                 quantifier: Quantifier::All,
                                 binding: "dep_id".into(),
-                                over: Box::new(Expr::MapGet {
-                                    map: Box::new(Expr::Field("node_dependencies".into())),
-                                    key: Box::new(Expr::Binding("node_id".into())),
-                                }),
+                                over: Box::new(dependency_ids_expr(Expr::Binding(
+                                    "node_id".into(),
+                                ))),
                                 body: Box::new(dep_is_terminal_expr("dep_id")),
                             },
                         ])),
@@ -1007,10 +1007,7 @@ pub fn flow_frame_machine() -> MachineSchema {
                 body: Expr::Quantified {
                     quantifier: Quantifier::All,
                     binding: "dep_id".into(),
-                    over: Box::new(Expr::MapGet {
-                        map: Box::new(Expr::Field("node_dependencies".into())),
-                        key: Box::new(Expr::Binding("node_id".into())),
-                    }),
+                    over: Box::new(dependency_ids_expr(Expr::Binding("node_id".into()))),
                     body: Box::new(Expr::Eq(
                         Box::new(Expr::MapGet {
                             map: Box::new(Expr::Field("node_status".into())),
@@ -1031,10 +1028,7 @@ pub fn flow_frame_machine() -> MachineSchema {
                 body: Expr::Quantified {
                     quantifier: Quantifier::Any,
                     binding: "dep_id".into(),
-                    over: Box::new(Expr::MapGet {
-                        map: Box::new(Expr::Field("node_dependencies".into())),
-                        key: Box::new(Expr::Binding("node_id".into())),
-                    }),
+                    over: Box::new(dependency_ids_expr(Expr::Binding("node_id".into()))),
                     body: Box::new(Expr::Eq(
                         Box::new(Expr::MapGet {
                             map: Box::new(Expr::Field("node_status".into())),
