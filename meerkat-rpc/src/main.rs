@@ -33,6 +33,11 @@ struct Cli {
     /// Optional user-global conventions root.
     #[arg(long)]
     user_config_root: Option<PathBuf>,
+    /// Listen on a TCP address instead of stdin/stdout.
+    ///
+    /// Example: --tcp 127.0.0.1:4800 or --tcp 0.0.0.0:4800
+    #[arg(long)]
+    tcp: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -175,8 +180,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "rkat-rpc",
     )
     .await?;
-    let serve_result =
-        meerkat_rpc::serve_stdio_with_skill_runtime(runtime, config_store, skill_runtime).await;
+    let serve_result = if let Some(ref tcp_addr) = cli.tcp {
+        eprintln!("rkat-rpc listening on tcp://{tcp_addr}");
+        meerkat_rpc::serve_tcp(tcp_addr, runtime, config_store, skill_runtime).await
+    } else {
+        meerkat_rpc::serve_stdio_with_skill_runtime(runtime, config_store, skill_runtime).await
+    };
     lease.shutdown().await;
     serve_result?;
 
