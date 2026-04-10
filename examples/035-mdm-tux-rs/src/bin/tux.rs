@@ -1176,19 +1176,10 @@ fn spawn_target_sender(
     let (tx, mut rx) = mpsc::channel::<MessageKind>(32);
     tokio::spawn(async move {
         while let Some(kind) = rx.recv().await {
-            eprintln!("[tux-sender] sending to '{target_peer}': {}", match &kind {
-                MessageKind::Message { body, .. } => format!("Message({})", &body[..body.len().min(60)]),
-                MessageKind::Request { intent, .. } => format!("Request(intent={intent})"),
-                MessageKind::Response { .. } => "Response".into(),
-                MessageKind::Ack { .. } => "Ack".into(),
-            });
             let send_fut = router.send(&target_peer, kind);
             match tokio::time::timeout(SEND_TIMEOUT, send_fut).await {
-                Ok(Ok(_)) => {
-                    eprintln!("[tux-sender] send OK to '{target_peer}'");
-                }
+                Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
-                    eprintln!("[tux-sender] send FAILED to '{target_peer}': {e}");
                     let _ = event_tx
                         .send(TuiEvent::SendFailed {
                             target_id: Some(target_id.clone()),

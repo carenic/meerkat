@@ -1094,7 +1094,6 @@ async fn handle_target_message(
     event_forwarder: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> TargetLoopAction {
     let sender = msg.from_peer.clone();
-    eprintln!("[target] incoming from '{sender}': {:?}", std::mem::discriminant(&msg.content));
     match &msg.content {
         meerkat_comms::agent::types::CommsContent::Request { intent, .. }
             if intent.as_str() == "dismiss" =>
