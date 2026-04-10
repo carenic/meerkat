@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+#### Realm-scoped mob profiles
+- `RealmProfileStore` with `InMemoryRealmProfileStore` and `SqliteRealmProfileStore` for realm-local reusable profile definitions.
+- Profile CRUD tools: `mob_profile_create`, `mob_profile_get`, `mob_profile_list`, `mob_profile_update`, `mob_profile_delete`, `mob_profile_list_sources`.
+- Public MCP tools: `meerkat_mob_profile_create|get|list|update|delete|list_sources`.
+- RPC methods: `mob/profile/create|get|list|update|delete` and `mob/profile/sources/list`.
+- `SpawnTooling` enum (`InheritParent`, `Minimal`, `Profile`) for agent-driven child spawn tooling modes.
+- `ProfileBinding::RealmRef` for mob definitions that reference realm-stored profiles.
+- `ToolProvenance` metadata on `ToolDef` with `ToolSourceKind` propagated across builtins, shell, comms, schedule, mob, callback, and MCP tool sources.
+- `ToolScope` snapshot seam for parent-selected child tooling at spawn time.
+- `effective_profile_override` persisted in mob roster for lifecycle-safe respawn/restore.
+- `tooling` parameter exposed in `delegate` and `mob_spawn_member` tool schemas.
+
 #### Scheduler as first-class surface capability
 - `ScheduleToolDispatcher` implements `AgentToolDispatcher`, wired natively into CLI, REST, RPC, and MCP surfaces.
 - Schedule tools added to MDM target and hive configurations.
@@ -16,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 #### Test lane reorganization
 - Unified e2e test lanes under cargo aliases: `e2e-fast` (deterministic), `e2e-system` (real local-resource), `e2e-live` (targeted live-provider), and `e2e-smoke` (kitchen-sink live smoke).
 - Legacy aliases `int-real` (→ `e2e-system`) and `e2e` (→ `e2e-live` + `e2e-smoke`) retained for compatibility.
+
+#### Homebrew tap and macOS codesigning
+- `lukacf/homebrew-meerkat` Homebrew tap: `brew install lukacf/meerkat/rkat` installs all 4 binaries.
+- Release workflow auto-updates the tap formula on tag push with correct checksums.
+- macOS release binaries are now ad-hoc codesigned before packaging.
 
 ### Changed
 
@@ -42,6 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Peer reservations removed from comms and delegate paths.
 
 ### Fixed
+- TUX scroll overflow: text no longer renders below the input box.
+- TUX auto-scroll resumes when user scrolls to bottom instead of staying paused permanently.
+- TUX session resume now loads and displays conversation history in the timeline.
+- TUX idle CPU usage reduced from ~25% to <1% via dirty-flag rendering and coarser timers.
+- Scenario 56 test passes API key to RPC/REST subprocesses and skips when unavailable.
+- Unused `meerkat-schedule` dependency removed from example 035.
 - Post-merge test regressions: send tool rename assertions and redb rejection paths updated.
 - Mob peer auto-wiring semantics corrected.
 - Mob authority via typed tool effects (no re-entrant deadlock).
