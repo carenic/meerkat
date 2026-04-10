@@ -1,0 +1,196 @@
+//! End-to-end tests for rkat-rpc --tcp.
+//!
+//! These spawn the real `rkat-rpc` binary with `--tcp`, connect over TCP,
+//! and exercise the JSON-RPC protocol. No LLM API key needed — the tests
+//! only exercise handshake, config, and session create (deferred).
+//!
+//! Lane: e2e-system (deterministic, local resources only).
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use serde_json::{Value, json};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+use tokio::time::timeout;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Spawn rkat-rpc --tcp on a random port, return (child, port).
+async fn spawn_rpc_tcp() -> (tokio::process::Child, u16) {
+    // Bind a listener to discover a free port, then release it.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rkat-rpc"))
+        .args(["--isolated", "--tcp", &format!("127.0.0.1:{port}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn rkat-rpc");
+
+    // Wait for the TCP port to become reachable.
+    let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        if TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .is_ok()
+        {
+            return (child, port);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("rkat-rpc --tcp did not become reachable on port {port}");
+}
+
+async fn send_jsonl(stream: &mut TcpStream, value: &Value) {
+    let mut line = serde_json::to_string(value).unwrap();
+    line.push('\n');
+    stream.write_all(line.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+}
+
+async fn read_jsonl(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Value {
+    let mut line = String::new();
+    timeout(READ_TIMEOUT, reader.read_line(&mut line))
+        .await
+        .expect("read timed out")
+        .expect("read error");
+    serde_json::from_str(line.trim()).expect("invalid JSON")
+}
+
+#[tokio::test]
+async fn tcp_e2e_initialize_and_config_roundtrip() {
+    let (mut child, port) = spawn_rpc_tcp().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+
+    // Initialize handshake
+    send_jsonl(
+        &mut stream,
+        &json!({"jsonrpc":"2.0","method":"initialize","params":{},"id":1}),
+    )
+    .await;
+
+    let (read, write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+
+    let resp = read_jsonl(&mut reader).await;
+    assert_eq!(resp["id"], 1);
+    assert!(resp["result"]["server_info"]["name"].is_string());
+    let methods = resp["result"]["methods"].as_array().unwrap();
+    assert!(methods.iter().any(|m| m == "session/create"));
+    assert!(methods.iter().any(|m| m == "config/get"));
+    assert!(methods.iter().any(|m| m == "turn/start"));
+
+    // Config round-trip
+    let mut stream2 = write.reunite(reader.into_inner()).unwrap();
+    send_jsonl(
+        &mut stream2,
+        &json!({"jsonrpc":"2.0","method":"config/get","params":{},"id":2}),
+    )
+    .await;
+
+    let (read, _write) = stream2.into_split();
+    let mut reader2 = BufReader::new(read);
+    let config_resp = read_jsonl(&mut reader2).await;
+    assert_eq!(config_resp["id"], 2);
+    assert!(config_resp["result"]["config"].is_object());
+
+    child.kill().await.ok();
+}
+
+#[tokio::test]
+async fn tcp_e2e_session_create_deferred() {
+    let (mut child, port) = spawn_rpc_tcp().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+
+    // Initialize
+    send_jsonl(
+        &mut stream,
+        &json!({"jsonrpc":"2.0","method":"initialize","params":{},"id":1}),
+    )
+    .await;
+    let (read, write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    let _init = read_jsonl(&mut reader).await;
+
+    // Create deferred session (no LLM call needed)
+    let mut stream2 = write.reunite(reader.into_inner()).unwrap();
+    send_jsonl(
+        &mut stream2,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "session/create",
+            "params": {
+                "model": "gpt-5.4",
+                "prompt": "hello",
+                "initial_turn": "deferred"
+            },
+            "id": 2
+        }),
+    )
+    .await;
+    let (read, _write) = stream2.into_split();
+    let mut reader2 = BufReader::new(read);
+    let create_resp = read_jsonl(&mut reader2).await;
+    assert_eq!(create_resp["id"], 2);
+    let session_id = create_resp["result"]["session_id"].as_str().unwrap();
+    assert!(!session_id.is_empty());
+
+    // Session list should show the created session
+    let mut stream3 = _write.reunite(reader2.into_inner()).unwrap();
+    send_jsonl(
+        &mut stream3,
+        &json!({"jsonrpc":"2.0","method":"session/list","params":{},"id":3}),
+    )
+    .await;
+    let (read, _write) = stream3.into_split();
+    let mut reader3 = BufReader::new(read);
+    let list_resp = read_jsonl(&mut reader3).await;
+    assert_eq!(list_resp["id"], 3);
+    let sessions = list_resp["result"]["sessions"].as_array().unwrap();
+    assert!(
+        sessions.iter().any(|s| s["session_id"] == session_id),
+        "created session should appear in list"
+    );
+
+    child.kill().await.ok();
+}
+
+#[tokio::test]
+async fn tcp_e2e_capabilities_get() {
+    let (mut child, port) = spawn_rpc_tcp().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+
+    send_jsonl(
+        &mut stream,
+        &json!({"jsonrpc":"2.0","method":"initialize","params":{},"id":1}),
+    )
+    .await;
+    let (read, write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    let _init = read_jsonl(&mut reader).await;
+
+    let mut stream2 = write.reunite(reader.into_inner()).unwrap();
+    send_jsonl(
+        &mut stream2,
+        &json!({"jsonrpc":"2.0","method":"capabilities/get","params":{},"id":2}),
+    )
+    .await;
+    let (read, _write) = stream2.into_split();
+    let mut reader2 = BufReader::new(read);
+    let resp = read_jsonl(&mut reader2).await;
+    assert_eq!(resp["id"], 2);
+    assert!(resp["result"]["capabilities"].is_array());
+
+    child.kill().await.ok();
+}
