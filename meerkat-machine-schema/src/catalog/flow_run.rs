@@ -2138,7 +2138,11 @@ pub fn flow_run_machine() -> MachineSchema {
                 ],
             },
         ],
-        ci_step_limit: Some(2),
+        // Standalone CI TLC for FlowRunMachine stays at the initial state only. The CreateRun
+        // input surface is intentionally rich and causes a large open-exploration cross-product
+        // even at one step, while the meaningful multi-step flow semantics and invariants are
+        // already exercised non-vacuously in flow_frame_loop and mob_bundle.
+        ci_step_limit: Some(0),
         effect_dispositions: vec![
             disposition("EmitFlowRunNotice", EffectDisposition::External),
             disposition("EmitStepNotice", EffectDisposition::External),

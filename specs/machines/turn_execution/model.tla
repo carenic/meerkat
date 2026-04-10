@@ -865,7 +865,7 @@ Next ==
     \/ \E run_id \in RunIdValues : \E max_retries \in 0..2 : EnterExtraction(run_id, max_retries)
     \/ \E run_id \in RunIdValues : ExtractionValidationPassed(run_id)
     \/ \E run_id \in RunIdValues : ExtractionStart(run_id)
-    \/ \E run_id \in RunIdValues : \E error \in {"alpha", "beta"} : ExtractionValidationFailed(run_id, error)
+    \/ \E run_id \in RunIdValues : \E error \in StringValues : ExtractionValidationFailed(run_id, error)
     \/ \E run_id \in RunIdValues : RecoverableFailureFromCallingLlm(run_id)
     \/ \E run_id \in RunIdValues : RecoverableFailureFromWaitingForOps(run_id)
     \/ \E run_id \in RunIdValues : RecoverableFailureFromDrainingBoundary(run_id)
