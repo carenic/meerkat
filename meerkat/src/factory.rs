@@ -11,6 +11,8 @@ use meerkat_client::{
     DefaultClientFactory, DefaultFactoryConfig, FactoryError, LlmClient, LlmClientAdapter,
     LlmClientFactory, LlmProvider, ProviderResolver,
 };
+#[cfg(feature = "openai")]
+use meerkat_client::{OpenAiCompatibleClient, OpenAiCompatibleMode};
 use meerkat_core::ops_lifecycle::OpsLifecycleRegistry;
 use meerkat_core::service::{CreateSessionRequest, SessionBuildOptions};
 
@@ -37,8 +39,8 @@ const DEFAULT_WASM_SYSTEM_PROMPT: &str = r"You are an autonomous agent. Your tas
 - If the task cannot be completed, explain what blocked progress and what was attempted.";
 use meerkat_core::{
     Agent, AgentBuilder, AgentEvent, AgentLlmClient, AgentSessionStore, AgentToolDispatcher,
-    BlobStore, BudgetLimits, Config, HookRunOverrides, OutputSchema, Provider, Session,
-    SessionMetadata, SessionTooling, ToolCategoryOverride,
+    BlobStore, BudgetLimits, Config, HookRunOverrides, ModelRegistry, OutputSchema, Provider,
+    Session, SessionLlmIdentity, SessionMetadata, SessionTooling, ToolCategoryOverride,
 };
 #[cfg(not(feature = "memory-store"))]
 use meerkat_core::{SessionId, SessionMeta};
@@ -185,6 +187,8 @@ pub struct AgentBuildConfig {
     pub model: String,
     /// Explicit provider. If `None`, inferred from the model name.
     pub provider: Option<Provider>,
+    /// Durable self-hosted server binding for configured aliases.
+    pub self_hosted_server_id: Option<String>,
     /// Max tokens per turn. If `None`, uses `Config::max_tokens`.
     pub max_tokens: Option<u32>,
     /// Override the system prompt. If `None`, uses the default composed prompt.
@@ -330,6 +334,7 @@ impl std::fmt::Debug for AgentBuildConfig {
         f.debug_struct("AgentBuildConfig")
             .field("model", &self.model)
             .field("provider", &self.provider)
+            .field("self_hosted_server_id", &self.self_hosted_server_id)
             .field("max_tokens", &self.max_tokens)
             .field(
                 "system_prompt",
@@ -398,6 +403,7 @@ impl AgentBuildConfig {
         Self {
             model: model.into(),
             provider: None,
+            self_hosted_server_id: None,
             max_tokens: None,
             system_prompt: None,
             output_schema: None,
@@ -489,6 +495,7 @@ impl AgentBuildConfig {
     /// Merge `SessionBuildOptions` into this build config.
     pub fn apply_session_build_options(&mut self, build: &SessionBuildOptions) {
         self.provider = build.provider;
+        self.self_hosted_server_id = build.self_hosted_server_id.clone();
         self.output_schema = build.output_schema.clone();
         self.structured_output_retries = build.structured_output_retries;
         self.hooks_override = build.hooks_override.clone();
@@ -534,6 +541,7 @@ impl AgentBuildConfig {
     pub fn to_session_build_options(&self) -> SessionBuildOptions {
         SessionBuildOptions {
             provider: self.provider,
+            self_hosted_server_id: self.self_hosted_server_id.clone(),
             output_schema: self.output_schema.clone(),
             structured_output_retries: self.structured_output_retries,
             hooks_override: self.hooks_override.clone(),
@@ -616,11 +624,15 @@ pub enum BuildAgentError {
 /// This struct bridges the dependency gap: `meerkat-core` owns the
 /// `ModelOperationalDefaultsResolver` trait, and this facade-layer
 /// implementation provides the concrete `meerkat-models` lookup.
-struct ProfileBasedDefaultsResolver;
+struct RegistryBackedDefaultsResolver {
+    registry: Arc<ModelRegistry>,
+}
 
-impl meerkat_core::ModelOperationalDefaultsResolver for ProfileBasedDefaultsResolver {
+impl meerkat_core::ModelOperationalDefaultsResolver for RegistryBackedDefaultsResolver {
     fn call_timeout_for(&self, provider: &str, model: &str) -> Option<std::time::Duration> {
-        meerkat_models::profile::profile_for(provider, model)
+        let _ = provider;
+        self.registry
+            .profile_for(model)
             .and_then(|p| p.call_timeout_secs)
             .map(std::time::Duration::from_secs)
     }
@@ -984,6 +996,9 @@ impl AgentFactory {
         if !mask.provider {
             build_config.provider = Some(metadata.provider);
         }
+        if !mask.model && !mask.provider {
+            build_config.self_hosted_server_id = metadata.self_hosted_server_id.clone();
+        }
         if !mask.provider_params {
             build_config.provider_params = metadata.provider_params.clone();
         }
@@ -1052,6 +1067,9 @@ impl AgentFactory {
             Provider::Anthropic => LlmProvider::Anthropic,
             Provider::OpenAI => LlmProvider::OpenAi,
             Provider::Gemini => LlmProvider::Gemini,
+            Provider::SelfHosted => {
+                return Err(FactoryError::UnsupportedProvider("self_hosted".to_string()));
+            }
             Provider::Other => return Err(FactoryError::UnsupportedProvider("other".to_string())),
         };
 
@@ -1066,6 +1084,159 @@ impl AgentFactory {
 
         let factory = DefaultClientFactory::with_config(config);
         factory.create_client(mapped, api_key)
+    }
+
+    pub async fn build_llm_client_for_identity(
+        &self,
+        config: &Config,
+        identity: &SessionLlmIdentity,
+    ) -> Result<Arc<dyn LlmClient>, FactoryError> {
+        let registry = config
+            .model_registry()
+            .map_err(|err| FactoryError::ClientCreationFailed(err.to_string()))?;
+        if matches!(identity.provider, Provider::SelfHosted) {
+            return self.build_self_hosted_client_for_identity(&registry, identity);
+        }
+        let (api_key, base_url) = self.resolve_provider_credentials(identity.provider, config);
+        self.build_llm_client(identity.provider, api_key, base_url)
+            .await
+    }
+
+    fn model_registry(&self, config: &Config) -> Result<ModelRegistry, BuildAgentError> {
+        config
+            .model_registry()
+            .map_err(|err| BuildAgentError::Config(err.to_string()))
+    }
+
+    fn resolve_provider_from_registry(
+        &self,
+        registry: &ModelRegistry,
+        build_config: &AgentBuildConfig,
+    ) -> Result<(Provider, Option<String>), BuildAgentError> {
+        if let Some(provider) = build_config.provider {
+            return match provider {
+                Provider::SelfHosted => {
+                    let entry = registry.entry(&build_config.model).ok_or_else(|| {
+                        BuildAgentError::Config(format!(
+                            "self-hosted model '{}' is not registered in config",
+                            build_config.model
+                        ))
+                    })?;
+                    let server_id = entry
+                        .self_hosted
+                        .as_ref()
+                        .map(|server| server.server_id.clone())
+                        .ok_or_else(|| {
+                            BuildAgentError::Config(format!(
+                                "model '{}' is not backed by a self-hosted server",
+                                build_config.model
+                            ))
+                        })?;
+                    Ok((
+                        Provider::SelfHosted,
+                        build_config
+                            .self_hosted_server_id
+                            .clone()
+                            .or(Some(server_id)),
+                    ))
+                }
+                Provider::Other => Ok((Provider::Other, None)),
+                other => Ok((other, None)),
+            };
+        }
+
+        if let Some(entry) = registry.entry(&build_config.model) {
+            let server_id = entry
+                .self_hosted
+                .as_ref()
+                .map(|server| server.server_id.clone());
+            return Ok((
+                entry.provider,
+                if matches!(entry.provider, Provider::SelfHosted) {
+                    build_config.self_hosted_server_id.clone().or(server_id)
+                } else {
+                    None
+                },
+            ));
+        }
+
+        let inferred = ProviderResolver::infer_from_model(&build_config.model);
+        if inferred != Provider::Other {
+            return Ok((inferred, None));
+        }
+        if let Some(client) = build_config.llm_client_override.as_ref() {
+            return Ok((Provider::from_name(client.provider()), None));
+        }
+
+        Err(BuildAgentError::UnknownProvider {
+            model: build_config.model.clone(),
+        })
+    }
+
+    fn build_self_hosted_client_from_registry(
+        &self,
+        registry: &ModelRegistry,
+        identity: &SessionLlmIdentity,
+    ) -> Result<Arc<dyn LlmClient>, FactoryError> {
+        self.build_self_hosted_client_for_identity(registry, identity)
+    }
+
+    fn build_self_hosted_client_for_identity(
+        &self,
+        registry: &ModelRegistry,
+        identity: &SessionLlmIdentity,
+    ) -> Result<Arc<dyn LlmClient>, FactoryError> {
+        #[cfg(not(feature = "openai"))]
+        {
+            let _ = registry;
+            let _ = identity;
+            return Err(FactoryError::UnsupportedProvider(
+                "self_hosted requires the openai feature".to_string(),
+            ));
+        }
+
+        #[cfg(feature = "openai")]
+        {
+            let entry = registry.entry(&identity.model).ok_or_else(|| {
+                FactoryError::ClientCreationFailed(format!("unknown model '{}'", identity.model))
+            })?;
+            let self_hosted = entry.self_hosted.as_ref().ok_or_else(|| {
+                FactoryError::ClientCreationFailed(format!(
+                    "model '{}' is not self-hosted",
+                    identity.model
+                ))
+            })?;
+            if let Some(expected_server_id) = identity.self_hosted_server_id.as_deref()
+                && self_hosted.server_id != expected_server_id
+            {
+                return Err(FactoryError::ClientCreationFailed(format!(
+                    "self-hosted model '{}' is bound to server '{}', but registry resolves to '{}'",
+                    identity.model, expected_server_id, self_hosted.server_id
+                )));
+            }
+            if self_hosted.transport != meerkat_core::SelfHostedTransport::OpenAiCompatible {
+                return Err(FactoryError::UnsupportedProvider(
+                    "only openai_compatible transport is supported".to_string(),
+                ));
+            }
+
+            let mode = match self_hosted.api_style {
+                meerkat_core::SelfHostedApiStyle::Responses => OpenAiCompatibleMode::Responses,
+                meerkat_core::SelfHostedApiStyle::ChatCompletions => {
+                    OpenAiCompatibleMode::ChatCompletions
+                }
+            };
+
+            Ok(Arc::new(OpenAiCompatibleClient::new(
+                mode,
+                self_hosted.remote_model.clone(),
+                self_hosted.base_url.clone(),
+                self_hosted.resolve_bearer_token(),
+                entry.profile.supports_temperature,
+                entry.profile.supports_thinking,
+                entry.profile.supports_reasoning,
+            )))
+        }
     }
 
     fn resolve_provider_credentials(
@@ -1337,38 +1508,50 @@ impl AgentFactory {
             return Err(BuildAgentError::KeepAliveRequiresCommsName);
         }
 
-        // 2. Resolve provider
-        let provider = match build_config.provider {
-            Some(p) => p,
-            None => {
-                let inferred = ProviderResolver::infer_from_model(&build_config.model);
-                if inferred != Provider::Other {
-                    inferred
-                } else if let Some(client) = build_config.llm_client_override.as_ref() {
-                    // An explicit override is the authoritative execution transport
-                    // when the model name is not recognizable.
-                    Provider::from_name(client.provider())
-                } else {
-                    return Err(BuildAgentError::UnknownProvider {
-                        model: build_config.model.clone(),
-                    });
-                }
-            }
+        let registry = self.model_registry(config)?;
+
+        // 2. Resolve provider and any self-hosted server binding.
+        let resumed_self_hosted_server_id = resumed_session_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.self_hosted_server_id.clone());
+        let (provider, resolved_self_hosted_server_id) =
+            self.resolve_provider_from_registry(&registry, &build_config)?;
+        let self_hosted_server_id = if matches!(provider, Provider::SelfHosted) {
+            build_config
+                .self_hosted_server_id
+                .clone()
+                .or(resumed_self_hosted_server_id)
+                .or(resolved_self_hosted_server_id)
+        } else {
+            None
         };
 
         // 3. Create LLM client
         let llm_client: Arc<dyn LlmClient> = match build_config.llm_client_override.as_ref() {
             Some(client) => Arc::clone(client),
             None => {
-                let (api_key, base_url) = self.resolve_provider_credentials(provider, config);
-                if api_key.is_none() {
-                    return Err(BuildAgentError::MissingApiKey {
-                        provider: provider_key(provider).to_string(),
-                    });
-                }
-                self.build_llm_client(provider, api_key, base_url)
-                    .await
+                if matches!(provider, Provider::SelfHosted) {
+                    self.build_self_hosted_client_from_registry(
+                        &registry,
+                        &SessionLlmIdentity {
+                            model: build_config.model.clone(),
+                            provider,
+                            self_hosted_server_id: self_hosted_server_id.clone(),
+                            provider_params: build_config.provider_params.clone(),
+                        },
+                    )
                     .map_err(BuildAgentError::LlmClient)?
+                } else {
+                    let (api_key, base_url) = self.resolve_provider_credentials(provider, config);
+                    if api_key.is_none() {
+                        return Err(BuildAgentError::MissingApiKey {
+                            provider: provider_key(provider).to_string(),
+                        });
+                    }
+                    self.build_llm_client(provider, api_key, base_url)
+                        .await
+                        .map_err(BuildAgentError::LlmClient)?
+                }
             }
         };
 
@@ -1540,7 +1723,8 @@ impl AgentFactory {
 
         // Resolve model profile for capability gating (e.g., hiding view_image
         // when the model cannot process image blocks in tool results).
-        let image_tool_results = meerkat_models::profile::profile_for(provider.as_str(), &model)
+        let image_tool_results = registry
+            .profile_for(&model)
             .is_none_or(|p| p.image_tool_results);
         // Resolve ops lifecycle registry via RuntimeBuildMode.
         use meerkat_core::runtime_epoch::RuntimeBuildMode;
@@ -2036,7 +2220,9 @@ impl AgentFactory {
             .budget(budget_limits)
             .structured_output_retries(build_config.structured_output_retries)
             .with_hook_run_overrides(build_config.hooks_override)
-            .with_model_defaults_resolver(Arc::new(ProfileBasedDefaultsResolver))
+            .with_model_defaults_resolver(Arc::new(RegistryBackedDefaultsResolver {
+                registry: Arc::new(registry.clone()),
+            }))
             .with_call_timeout_override(effective_call_timeout_override);
 
         if let Some(system_prompt) = system_prompt {
@@ -2174,6 +2360,7 @@ impl AgentFactory {
             metadata.max_tokens = max_tokens;
             metadata.structured_output_retries = build_config.structured_output_retries;
             metadata.provider = provider;
+            metadata.self_hosted_server_id = self_hosted_server_id.clone();
             metadata.provider_params = build_config.provider_params;
             metadata.tooling.builtins = build_config.override_builtins;
             metadata.tooling.shell = build_config.override_shell;
@@ -2199,6 +2386,7 @@ impl AgentFactory {
                 max_tokens,
                 structured_output_retries: build_config.structured_output_retries,
                 provider,
+                self_hosted_server_id,
                 provider_params: build_config.provider_params,
                 tooling: SessionTooling {
                     builtins: build_config.override_builtins,
@@ -2225,6 +2413,84 @@ impl AgentFactory {
         }
 
         Ok(agent)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+    use meerkat_core::{
+        SelfHostedApiStyle, SelfHostedModelConfig, SelfHostedServerConfig, SelfHostedTransport,
+    };
+
+    #[test]
+    fn resumed_self_hosted_binding_overrides_current_registry_server() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions"));
+        let mut config = Config::default();
+        config.self_hosted.servers.insert(
+            "local".to_string(),
+            SelfHostedServerConfig {
+                transport: SelfHostedTransport::OpenAiCompatible,
+                base_url: "http://127.0.0.1:11434".to_string(),
+                api_style: SelfHostedApiStyle::ChatCompletions,
+                bearer_token: None,
+                bearer_token_env: None,
+            },
+        );
+        config.self_hosted.models.insert(
+            "gemma-4-e2b".to_string(),
+            SelfHostedModelConfig {
+                server: "local".to_string(),
+                remote_model: "gemma4:e2b".to_string(),
+                display_name: "Gemma 4 E2B".to_string(),
+                family: "gemma-4".to_string(),
+                tier: meerkat_models::ModelTier::Supported,
+                context_window: Some(128_000),
+                max_output_tokens: Some(8_192),
+                vision: true,
+                image_tool_results: true,
+                inline_video: false,
+                supports_temperature: true,
+                supports_thinking: true,
+                supports_reasoning: true,
+                call_timeout_secs: Some(600),
+            },
+        );
+
+        let mut resumed = Session::new();
+        resumed
+            .set_session_metadata(SessionMetadata {
+                model: "gemma-4-e2b".to_string(),
+                max_tokens: 8_192,
+                structured_output_retries: 2,
+                provider: Provider::SelfHosted,
+                self_hosted_server_id: Some("other".to_string()),
+                provider_params: None,
+                tooling: SessionTooling::default(),
+                keep_alive: false,
+                comms_name: None,
+                peer_meta: None,
+                realm_id: None,
+                instance_id: None,
+                backend: None,
+                config_generation: None,
+            })
+            .expect("resume metadata");
+
+        let mut build = AgentBuildConfig::new("gemma-4-e2b");
+        build.resume_session = Some(resumed);
+        let _ = AgentFactory::apply_resumed_session_metadata(&mut build);
+
+        let registry = factory.model_registry(&config).expect("registry");
+        let (provider, server_id) = factory
+            .resolve_provider_from_registry(&registry, &build)
+            .expect("resolved provider");
+
+        assert_eq!(provider, Provider::SelfHosted);
+        assert_eq!(server_id.as_deref(), Some("other"));
     }
 }
 

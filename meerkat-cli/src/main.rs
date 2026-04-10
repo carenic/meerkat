@@ -1612,7 +1612,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         },
         Commands::Capabilities => handle_capabilities(&cli_scope).await,
         Commands::Models { command } => match command {
-            ModelsCommands::Catalog => handle_models_catalog().await,
+            ModelsCommands::Catalog => handle_models_catalog(&cli_scope).await,
         },
         Commands::Doctor => handle_doctor(&cli_scope).await,
     };
@@ -1673,9 +1673,7 @@ async fn handle_run_command(
 
     let model = model.unwrap_or_else(|| config.agent.model.clone());
     let max_tokens = max_tokens.unwrap_or(config.agent.max_tokens_per_turn);
-    let resolved_provider = provider
-        .or_else(|| Provider::infer_from_model(&model))
-        .unwrap_or_default();
+    let resolved_provider = resolve_cli_provider(&config, &model, provider);
 
     let duration = max_duration.map(|s| parse_duration(&s)).transpose();
     let provider_params = parse_provider_params(&params);
@@ -2075,8 +2073,10 @@ async fn handle_capabilities(scope: &RuntimeScope) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_models_catalog() -> anyhow::Result<()> {
-    let response = meerkat::surface::build_models_catalog_response();
+async fn handle_models_catalog(scope: &RuntimeScope) -> anyhow::Result<()> {
+    let (config, _) = load_config(scope).await?;
+    let response = meerkat::surface::build_models_catalog_response(&config)
+        .map_err(|e| anyhow::anyhow!("failed to build model catalog: {e}"))?;
     println!(
         "{}",
         serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
@@ -2086,6 +2086,7 @@ async fn handle_models_catalog() -> anyhow::Result<()> {
 
 async fn handle_doctor(scope: &RuntimeScope) -> anyhow::Result<()> {
     let mut ok = true;
+    let (config, _) = load_config(scope).await?;
     let config_path =
         meerkat_store::realm_paths_in(&scope.locator.state_root, &scope.locator.realm_id)
             .config_path;
@@ -2110,6 +2111,82 @@ async fn handle_doctor(scope: &RuntimeScope) -> anyhow::Result<()> {
             println!("ok\tprovider\t{provider} via {env_key}");
         } else {
             println!("warn\tprovider\t{provider} missing {env_key}");
+        }
+    }
+
+    if config.self_hosted.servers.is_empty() {
+        println!("ok\tself_hosted\tno self-hosted servers configured");
+    } else {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to build doctor HTTP client: {e}"))?;
+
+        for (server_id, server) in &config.self_hosted.servers {
+            let base_url = meerkat_core::model_registry::normalize_base_url(&server.base_url);
+            let models_url = format!("{base_url}/models");
+            let mut request = http.get(&models_url);
+
+            if let Some(token) = server.resolve_bearer_token() {
+                request = request.bearer_auth(token);
+            }
+
+            match request.send().await {
+                Ok(response) if response.status().is_success() => {
+                    println!("ok\tself_hosted\tserver {server_id} reachable at {models_url}");
+
+                    let configured_models: Vec<_> = config
+                        .self_hosted
+                        .models
+                        .iter()
+                        .filter(|(_, model)| model.server == *server_id)
+                        .map(|(alias, model)| (alias.as_str(), model.remote_model.as_str()))
+                        .collect();
+
+                    match response.json::<serde_json::Value>().await {
+                        Ok(json) => {
+                            let available: std::collections::HashSet<String> = json["data"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|entry| entry["id"].as_str().map(ToString::to_string))
+                                .collect();
+                            for (alias, remote_model) in configured_models {
+                                if available.is_empty() {
+                                    break;
+                                }
+                                if available.contains(remote_model) {
+                                    println!(
+                                        "ok\tself_hosted\talias {alias} -> {remote_model} listed by {server_id}"
+                                    );
+                                } else {
+                                    println!(
+                                        "warn\tself_hosted\talias {alias} -> {remote_model} not listed by {server_id}"
+                                    );
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            println!(
+                                "warn\tself_hosted\tserver {server_id} did not return a parseable /models payload"
+                            );
+                        }
+                    }
+                }
+                Ok(response) => {
+                    ok = false;
+                    println!(
+                        "warn\tself_hosted\tserver {server_id} returned {} from {models_url}",
+                        response.status()
+                    );
+                }
+                Err(err) => {
+                    ok = false;
+                    println!(
+                        "warn\tself_hosted\tserver {server_id} unreachable at {models_url}: {err}"
+                    );
+                }
+            }
         }
     }
 
@@ -3365,6 +3442,7 @@ async fn run_agent(
 
     let mut build = SessionBuildOptions {
         provider: Some(provider.as_core()),
+        self_hosted_server_id: None,
         output_schema,
         structured_output_retries,
         hooks_override,
@@ -3784,11 +3862,7 @@ async fn resume_session_with_llm_override(
     let provider_core = stored_metadata
         .as_ref()
         .map(|meta| meta.provider)
-        .unwrap_or_else(|| {
-            Provider::infer_from_model(&model)
-                .unwrap_or_default()
-                .as_core()
-        });
+        .unwrap_or_else(|| resolve_cli_provider(&config, &model, None).as_core());
 
     tracing::info!(
         "Resuming session {} with {} messages (provider: {:?}, model: {})",
@@ -3883,6 +3957,9 @@ async fn resume_session_with_llm_override(
 
     let mut build = SessionBuildOptions {
         provider: Some(provider_core),
+        self_hosted_server_id: stored_metadata
+            .as_ref()
+            .and_then(|m| m.self_hosted_server_id.clone()),
         output_schema: None,
         structured_output_retries: 2,
         hooks_override,
@@ -7135,6 +7212,8 @@ pub enum Provider {
     Openai,
     /// Google Gemini models
     Gemini,
+    /// Self-hosted models registered in config
+    SelfHosted,
 }
 
 impl Provider {
@@ -7171,6 +7250,7 @@ impl Provider {
             Provider::Anthropic => "anthropic",
             Provider::Openai => "openai",
             Provider::Gemini => "gemini",
+            Provider::SelfHosted => "self_hosted",
         }
     }
 
@@ -7180,6 +7260,7 @@ impl Provider {
             Provider::Anthropic => meerkat_core::Provider::Anthropic,
             Provider::Openai => meerkat_core::Provider::OpenAI,
             Provider::Gemini => meerkat_core::Provider::Gemini,
+            Provider::SelfHosted => meerkat_core::Provider::SelfHosted,
         }
     }
 
@@ -7189,6 +7270,7 @@ impl Provider {
             meerkat_core::Provider::Anthropic => Some(Provider::Anthropic),
             meerkat_core::Provider::OpenAI => Some(Provider::Openai),
             meerkat_core::Provider::Gemini => Some(Provider::Gemini),
+            meerkat_core::Provider::SelfHosted => Some(Provider::SelfHosted),
             meerkat_core::Provider::Other => None,
         }
     }
@@ -7202,6 +7284,19 @@ impl Provider {
             _ => None,
         }
     }
+}
+
+fn resolve_cli_provider(config: &Config, model: &str, explicit: Option<Provider>) -> Provider {
+    explicit
+        .or_else(|| {
+            config
+                .model_registry()
+                .ok()
+                .and_then(|registry| registry.entry(model).map(|entry| entry.provider))
+                .and_then(Provider::from_core)
+        })
+        .or_else(|| Provider::infer_from_model(model))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -10390,6 +10485,41 @@ printf '\0\141\163\155' > "$out_dir/runtime_bg.wasm"
         assert_eq!(Provider::infer_from_model("mistral-7b"), None);
         assert_eq!(Provider::infer_from_model("custom-model"), None);
         assert_eq!(Provider::infer_from_model(""), None);
+    }
+
+    #[test]
+    fn test_resolve_cli_provider_prefers_self_hosted_registry_alias() {
+        let mut config = Config::default();
+        config
+            .merge_toml_str(
+                r#"
+[self_hosted.servers.ollama]
+transport = "openai_compatible"
+base_url = "http://127.0.0.1:11434"
+api_style = "chat_completions"
+
+[self_hosted.models.gemma-4-e2b]
+server = "ollama"
+remote_model = "gemma4:e2b"
+display_name = "Gemma 4 E2B"
+family = "gemma"
+tier = "supported"
+context_window = 128000
+max_output_tokens = 8192
+vision = true
+image_tool_results = true
+inline_video = false
+supports_temperature = true
+supports_thinking = true
+supports_reasoning = true
+"#,
+            )
+            .expect("valid self-hosted config");
+
+        assert_eq!(
+            resolve_cli_provider(&config, "gemma-4-e2b", None),
+            Provider::SelfHosted
+        );
     }
 
     #[cfg(feature = "comms")]

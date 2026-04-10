@@ -9,12 +9,13 @@ use crate::{
     retry::RetryPolicy,
     types::{OutputSchema, SecurityMode},
 };
+use meerkat_models::ModelTier;
 use schemars::JsonSchema;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -41,6 +42,7 @@ pub struct Config {
     pub rest: RestServerConfig,
     pub hooks: HooksConfig,
     pub skills: crate::skills_config::SkillsConfig,
+    pub self_hosted: SelfHostedConfig,
 }
 
 impl Default for Config {
@@ -69,11 +71,17 @@ impl Default for Config {
             rest: RestServerConfig::default(),
             hooks: HooksConfig::default(),
             skills: crate::skills_config::SkillsConfig::default(),
+            self_hosted: SelfHostedConfig::default(),
         }
     }
 }
 
 impl Config {
+    /// Build the effective model registry for this config snapshot.
+    pub fn model_registry(&self) -> Result<crate::ModelRegistry, ConfigError> {
+        crate::ModelRegistry::from_config(self)
+    }
+
     /// Return the config template as TOML.
     pub fn template_toml() -> &'static str {
         CONFIG_TEMPLATE_TOML
@@ -222,11 +230,13 @@ impl Config {
         let file_config: Config = toml::from_str(content).map_err(ConfigError::Parse)?;
         let tools_layer = file_config.tools.clone();
         let retry_layer = file_config.retry.clone();
+        let self_hosted_layer = file_config.self_hosted.clone();
         // Merge (file values override defaults)
         self.merge(file_config);
         let parsed: toml::Value = toml::from_str(content).map_err(ConfigError::Parse)?;
         self.merge_tools_from_toml_presence(&parsed, &tools_layer);
         self.merge_retry_from_toml_presence(&parsed, &retry_layer);
+        self.merge_self_hosted_from_toml_presence(&parsed, &self_hosted_layer);
         Ok(())
     }
 
@@ -419,6 +429,122 @@ impl Config {
         }
     }
 
+    fn merge_self_hosted_from_toml_presence(
+        &mut self,
+        parsed: &toml::Value,
+        layer: &SelfHostedConfig,
+    ) {
+        let Some(self_hosted) = parsed.get("self_hosted").and_then(toml::Value::as_table) else {
+            return;
+        };
+
+        if let Some(servers) = self_hosted.get("servers").and_then(toml::Value::as_table) {
+            if servers.is_empty() {
+                self.self_hosted.servers.clear();
+                self.self_hosted.models.clear();
+            } else {
+                let mut merged_servers = self.self_hosted.servers.clone();
+                for (server_id, server_value) in servers {
+                    let Some(server_table) = server_value.as_table() else {
+                        continue;
+                    };
+                    let mut merged = self
+                        .self_hosted
+                        .servers
+                        .get(server_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let Some(server_layer) = layer.servers.get(server_id) else {
+                        continue;
+                    };
+                    if server_table.contains_key("transport") {
+                        merged.transport = server_layer.transport;
+                    }
+                    if server_table.contains_key("base_url") {
+                        merged.base_url = server_layer.base_url.clone();
+                    }
+                    if server_table.contains_key("api_style") {
+                        merged.api_style = server_layer.api_style;
+                    }
+                    if server_table.contains_key("bearer_token") {
+                        merged.bearer_token = server_layer.bearer_token.clone();
+                    }
+                    if server_table.contains_key("bearer_token_env") {
+                        merged.bearer_token_env = server_layer.bearer_token_env.clone();
+                    }
+                    merged_servers.insert(server_id.clone(), merged);
+                }
+                self.self_hosted.servers = merged_servers;
+            }
+        }
+
+        if let Some(models) = self_hosted.get("models").and_then(toml::Value::as_table) {
+            if models.is_empty() {
+                self.self_hosted.models.clear();
+            } else {
+                let mut merged_models = self.self_hosted.models.clone();
+                for (model_id, model_value) in models {
+                    let Some(model_table) = model_value.as_table() else {
+                        continue;
+                    };
+                    let mut merged = self
+                        .self_hosted
+                        .models
+                        .get(model_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let Some(model_layer) = layer.models.get(model_id) else {
+                        continue;
+                    };
+                    if model_table.contains_key("server") {
+                        merged.server = model_layer.server.clone();
+                    }
+                    if model_table.contains_key("remote_model") {
+                        merged.remote_model = model_layer.remote_model.clone();
+                    }
+                    if model_table.contains_key("display_name") {
+                        merged.display_name = model_layer.display_name.clone();
+                    }
+                    if model_table.contains_key("family") {
+                        merged.family = model_layer.family.clone();
+                    }
+                    if model_table.contains_key("tier") {
+                        merged.tier = model_layer.tier;
+                    }
+                    if model_table.contains_key("context_window") {
+                        merged.context_window = model_layer.context_window;
+                    }
+                    if model_table.contains_key("max_output_tokens") {
+                        merged.max_output_tokens = model_layer.max_output_tokens;
+                    }
+                    if model_table.contains_key("vision") {
+                        merged.vision = model_layer.vision;
+                    }
+                    if model_table.contains_key("image_tool_results") {
+                        merged.image_tool_results = model_layer.image_tool_results;
+                    }
+                    if model_table.contains_key("inline_video") {
+                        merged.inline_video = model_layer.inline_video;
+                    }
+                    if model_table.contains_key("supports_temperature") {
+                        merged.supports_temperature = model_layer.supports_temperature;
+                    }
+                    if model_table.contains_key("supports_thinking") {
+                        merged.supports_thinking = model_layer.supports_thinking;
+                    }
+                    if model_table.contains_key("supports_reasoning") {
+                        merged.supports_reasoning = model_layer.supports_reasoning;
+                    }
+                    if model_table.contains_key("call_timeout_secs") {
+                        merged.call_timeout_secs = model_layer.call_timeout_secs;
+                    }
+                    merged_models.insert(model_id.clone(), merged);
+                }
+                self.self_hosted.models = merged_models;
+            }
+        }
+    }
+
     /// Apply environment variable overrides
     pub fn apply_env_overrides(&mut self) -> Result<(), ConfigError> {
         self.apply_env_overrides_from(|key| std::env::var(key).ok())
@@ -583,6 +709,8 @@ impl Config {
                 ));
             }
         }
+
+        crate::model_registry::ModelRegistry::from_config(self)?;
 
         Ok(())
     }
@@ -841,6 +969,106 @@ pub struct StoreConfig {
 pub struct ProviderSettings {
     pub base_urls: Option<HashMap<String, String>>,
     pub api_keys: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfHostedTransport {
+    #[default]
+    #[serde(alias = "openai_compatible")]
+    OpenAiCompatible,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfHostedApiStyle {
+    Responses,
+    #[default]
+    ChatCompletions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(default)]
+pub struct SelfHostedServerConfig {
+    pub transport: SelfHostedTransport,
+    pub base_url: String,
+    pub api_style: SelfHostedApiStyle,
+    #[serde(default, skip_serializing)]
+    pub bearer_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token_env: Option<String>,
+}
+
+impl Default for SelfHostedServerConfig {
+    fn default() -> Self {
+        Self {
+            transport: SelfHostedTransport::OpenAiCompatible,
+            base_url: String::new(),
+            api_style: SelfHostedApiStyle::ChatCompletions,
+            bearer_token: None,
+            bearer_token_env: None,
+        }
+    }
+}
+
+impl SelfHostedServerConfig {
+    pub fn resolve_bearer_token(&self) -> Option<String> {
+        self.bearer_token.clone().or_else(|| {
+            self.bearer_token_env
+                .as_deref()
+                .and_then(|env_key| std::env::var(env_key).ok())
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[serde(default)]
+pub struct SelfHostedModelConfig {
+    pub server: String,
+    pub remote_model: String,
+    pub display_name: String,
+    pub family: String,
+    pub tier: ModelTier,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    pub vision: bool,
+    pub image_tool_results: bool,
+    pub inline_video: bool,
+    pub supports_temperature: bool,
+    pub supports_thinking: bool,
+    pub supports_reasoning: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_timeout_secs: Option<u64>,
+}
+
+impl Default for SelfHostedModelConfig {
+    fn default() -> Self {
+        Self {
+            server: String::new(),
+            remote_model: String::new(),
+            display_name: String::new(),
+            family: String::new(),
+            tier: ModelTier::Supported,
+            context_window: None,
+            max_output_tokens: None,
+            vision: false,
+            image_tool_results: false,
+            inline_video: false,
+            supports_temperature: true,
+            supports_thinking: false,
+            supports_reasoning: false,
+            call_timeout_secs: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, JsonSchema)]
+#[serde(default)]
+pub struct SelfHostedConfig {
+    pub servers: BTreeMap<String, SelfHostedServerConfig>,
+    pub models: BTreeMap<String, SelfHostedModelConfig>,
 }
 
 /// Runtime limits configured at the config layer.
@@ -1696,6 +1924,170 @@ model = "custom-model"
     }
 
     #[test]
+    fn test_merge_self_hosted_preserves_lower_layer_servers_and_models() {
+        let mut base = Config::default();
+        base.merge_toml_str(
+            r#"
+[self_hosted.servers.local]
+base_url = "http://127.0.0.1:11434"
+"#,
+        )
+        .expect("base self-hosted server");
+        base.merge_toml_str(
+            r#"
+[self_hosted.models.gemma-4-e2b]
+server = "local"
+remote_model = "gemma4:e2b"
+display_name = "Gemma 4 E2B"
+family = "gemma-4"
+"#,
+        )
+        .expect("overlay self-hosted model");
+
+        assert!(base.self_hosted.servers.contains_key("local"));
+        assert!(base.self_hosted.models.contains_key("gemma-4-e2b"));
+        let registry = base.model_registry().expect("merged self-hosted registry");
+        assert_eq!(
+            registry
+                .entry("gemma-4-e2b")
+                .and_then(|entry| entry.self_hosted.as_ref())
+                .map(|server| server.server_id.as_str()),
+            Some("local")
+        );
+    }
+
+    #[test]
+    fn test_merge_self_hosted_partial_server_override_preserves_existing_fields() {
+        let mut config = Config::default();
+        config
+            .merge_toml_str(
+                r#"
+[self_hosted.servers.local]
+base_url = "http://127.0.0.1:11434"
+api_style = "responses"
+"#,
+            )
+            .expect("base server");
+        config
+            .merge_toml_str(
+                r#"
+[self_hosted.servers.local]
+bearer_token_env = "OLLAMA_TOKEN"
+"#,
+            )
+            .expect("overlay server");
+
+        let server = config
+            .self_hosted
+            .servers
+            .get("local")
+            .expect("merged server");
+        assert_eq!(server.base_url, "http://127.0.0.1:11434");
+        assert_eq!(server.api_style, SelfHostedApiStyle::Responses);
+        assert_eq!(server.bearer_token_env.as_deref(), Some("OLLAMA_TOKEN"));
+    }
+
+    #[test]
+    fn test_merge_self_hosted_partial_override_preserves_unrelated_inherited_entries() {
+        let mut config = Config::default();
+        config
+            .merge_toml_str(
+                r#"
+[self_hosted.servers.local]
+base_url = "http://127.0.0.1:11434"
+
+[self_hosted.servers.backup]
+base_url = "http://127.0.0.1:11435"
+
+[self_hosted.models.gemma-4-e2b]
+server = "local"
+remote_model = "gemma4:e2b"
+display_name = "Gemma 4 E2B"
+family = "gemma-4"
+
+[self_hosted.models.gemma-4-e4b]
+server = "backup"
+remote_model = "gemma4:e4b"
+display_name = "Gemma 4 E4B"
+family = "gemma-4"
+"#,
+            )
+            .expect("base self-hosted config");
+        config
+            .merge_toml_str(
+                r#"
+[self_hosted.servers.local]
+bearer_token_env = "OLLAMA_TOKEN"
+"#,
+            )
+            .expect("overlay self-hosted config");
+
+        assert!(config.self_hosted.servers.contains_key("backup"));
+        assert!(config.self_hosted.models.contains_key("gemma-4-e4b"));
+        let registry = config
+            .model_registry()
+            .expect("registry should remain valid");
+        assert_eq!(
+            registry
+                .entry("gemma-4-e4b")
+                .and_then(|entry| entry.self_hosted.as_ref())
+                .map(|server| server.server_id.as_str()),
+            Some("backup")
+        );
+    }
+
+    #[test]
+    fn test_merge_self_hosted_empty_table_clears_inherited_entries() {
+        let mut config = Config::default();
+        config
+            .merge_toml_str(
+                r#"
+[self_hosted.servers.local]
+base_url = "http://127.0.0.1:11434"
+
+[self_hosted.models.gemma-4-e2b]
+server = "local"
+remote_model = "gemma4:e2b"
+display_name = "Gemma 4 E2B"
+family = "gemma-4"
+"#,
+            )
+            .expect("base self-hosted config");
+
+        config
+            .merge_toml_str(
+                r"
+[self_hosted.servers]
+
+[self_hosted.models]
+",
+            )
+            .expect("clear self-hosted config");
+
+        assert!(config.self_hosted.servers.is_empty());
+        assert!(config.self_hosted.models.is_empty());
+    }
+
+    #[test]
+    fn test_self_hosted_bearer_token_is_not_serialized() {
+        let config: Config = toml::from_str(
+            r#"
+[self_hosted.servers.local]
+base_url = "http://127.0.0.1:11434"
+bearer_token = "secret-token"
+"#,
+        )
+        .expect("config");
+
+        let value = serde_json::to_value(&config).expect("serialize config");
+        let server = &value["self_hosted"]["servers"]["local"];
+        assert!(
+            server.get("bearer_token").is_none(),
+            "literal bearer tokens must be redacted from serialized config"
+        );
+    }
+
+    #[test]
     fn test_merge_providers_section_replaces_non_default() {
         let mut base = Config::default();
         base.providers.base_urls = Some(HashMap::from([
@@ -1835,6 +2227,39 @@ initial_delay = "750ms"
         assert_eq!(parsed.max_tokens, Some(100_000));
         assert_eq!(parsed.max_duration, Some(Duration::from_secs(300)));
         assert_eq!(parsed.max_tool_calls, Some(50));
+    }
+
+    #[test]
+    fn test_self_hosted_transport_accepts_openai_compatible_alias() {
+        let mut config = Config::default();
+        config
+            .merge_toml_str(
+                r#"
+[self_hosted.servers.ollama]
+transport = "openai_compatible"
+base_url = "http://127.0.0.1:11434"
+api_style = "chat_completions"
+"#,
+            )
+            .expect("alias should parse");
+
+        assert_eq!(
+            config
+                .self_hosted
+                .servers
+                .get("ollama")
+                .expect("server should exist")
+                .transport,
+            SelfHostedTransport::OpenAiCompatible
+        );
+    }
+
+    #[test]
+    fn test_self_hosted_server_config_defaults_to_chat_completions() {
+        assert_eq!(
+            SelfHostedServerConfig::default().api_style,
+            SelfHostedApiStyle::ChatCompletions
+        );
     }
 
     #[test]

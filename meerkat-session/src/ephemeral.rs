@@ -103,6 +103,9 @@ enum SessionCommand {
         filter: meerkat_core::ToolFilter,
         reply_tx: oneshot::Sender<Result<(), meerkat_core::error::AgentError>>,
     },
+    SyncSystemContextState {
+        reply_tx: oneshot::Sender<()>,
+    },
     /// Export the full session (messages + metadata) for persistence.
     ExportSession {
         reply_tx: oneshot::Sender<meerkat_core::Session>,
@@ -351,6 +354,9 @@ pub trait SessionAgent: Send {
         &self,
     ) -> Arc<std::sync::Mutex<meerkat_core::SessionSystemContextState>>;
 
+    /// Synchronize the shared system-context control state into the canonical session metadata.
+    fn sync_system_context_state(&mut self) {}
+
     /// Get an event injector for pushing external events.
     ///
     /// Called once before the agent moves into its dedicated task. The returned
@@ -513,6 +519,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         SessionLlmIdentity {
             model: req.model.clone(),
             provider,
+            self_hosted_server_id: None,
             provider_params,
         }
     }
@@ -559,7 +566,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         &self,
         id: &SessionId,
     ) -> Result<meerkat_core::Session, SessionError> {
-        let (command_tx, deferred_turn_state) = {
+        let (command_tx, deferred_turn_state, system_context_state) = {
             let sessions = self.sessions.read().await;
             let handle = sessions
                 .get(id)
@@ -567,6 +574,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             (
                 handle.command_tx.clone(),
                 Arc::clone(&handle.deferred_turn_state),
+                Arc::clone(&handle.system_context_state),
             )
         };
 
@@ -592,6 +600,21 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
                 "failed to serialize deferred-turn state: {err}"
             )))
         })?;
+
+        let system_context = match system_context_state.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                tracing::warn!("system-context state lock poisoned while exporting session");
+                poisoned.into_inner().clone()
+            }
+        };
+        session
+            .set_system_context_state(system_context)
+            .map_err(|err| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+                    "failed to serialize system-context state: {err}"
+                )))
+            })?;
 
         Ok(session)
     }
@@ -650,6 +673,31 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         reply_rx.await.map_err(|_| {
             SessionError::Agent(meerkat_core::error::AgentError::InternalError(
                 "Session task dropped the reply channel".to_string(),
+            ))
+        })
+    }
+
+    pub(crate) async fn sync_system_context_state(
+        &self,
+        id: &SessionId,
+    ) -> Result<(), SessionError> {
+        let sessions = self.sessions.read().await;
+        let handle = sessions
+            .get(id)
+            .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .command_tx
+            .send(SessionCommand::SyncSystemContextState { reply_tx })
+            .await
+            .map_err(|_| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                    "Session task has exited".to_string(),
+                ))
+            })?;
+        reply_rx.await.map_err(|_| {
+            SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                "Session task dropped reply channel".to_string(),
             ))
         })
     }
@@ -1531,6 +1579,10 @@ impl<B: SessionAgentBuilder + 'static> SessionServiceControlExt for EphemeralSes
                 .map_err(|err| err.into_control_error(id))?
         };
 
+        self.sync_system_context_state(id)
+            .await
+            .map_err(SessionControlError::Session)?;
+
         Ok(AppendSystemContextResult { status })
     }
 
@@ -1804,6 +1856,11 @@ async fn session_task<A: SessionAgent>(
             }
             SessionCommand::StageToolFilter { filter, reply_tx } => {
                 let _ = reply_tx.send(agent.stage_external_tool_filter(filter));
+                continue;
+            }
+            SessionCommand::SyncSystemContextState { reply_tx } => {
+                agent.sync_system_context_state();
+                let _ = reply_tx.send(());
                 continue;
             }
             SessionCommand::StartTurn {

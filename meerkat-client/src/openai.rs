@@ -19,12 +19,15 @@ use std::collections::HashSet;
 
 /// Client for OpenAI Responses API
 pub struct OpenAiClient {
-    api_key: String,
+    api_key: Option<String>,
     base_url: String,
     http: reqwest::Client,
 }
 
 impl OpenAiClient {
+    pub(crate) const INTERNAL_SUPPORTS_TEMPERATURE: &str = "__meerkat_supports_temperature";
+    pub(crate) const INTERNAL_SUPPORTS_REASONING: &str = "__meerkat_supports_reasoning";
+
     fn model_supports_temperature(model: &str) -> bool {
         meerkat_models::profile::openai::supports_temperature(model)
     }
@@ -33,13 +36,42 @@ impl OpenAiClient {
         meerkat_models::profile::openai::supports_reasoning(model)
     }
 
+    fn request_supports_temperature(request: &LlmRequest) -> bool {
+        request
+            .provider_params
+            .as_ref()
+            .and_then(|params| params.get(Self::INTERNAL_SUPPORTS_TEMPERATURE))
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| Self::model_supports_temperature(&request.model))
+    }
+
+    fn request_supports_reasoning_payload(request: &LlmRequest) -> bool {
+        request
+            .provider_params
+            .as_ref()
+            .and_then(|params| params.get(Self::INTERNAL_SUPPORTS_REASONING))
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| Self::model_supports_reasoning_payload(&request.model))
+    }
+
     /// Create a new OpenAI client with the given API key
     pub fn new(api_key: String) -> Self {
-        Self::new_with_base_url(api_key, "https://api.openai.com".to_string())
+        Self::new_with_optional_api_key_and_base_url(
+            Some(api_key),
+            "https://api.openai.com".to_string(),
+        )
     }
 
     /// Create a new OpenAI client with an explicit base URL
     pub fn new_with_base_url(api_key: String, base_url: String) -> Self {
+        Self::new_with_optional_api_key_and_base_url(Some(api_key), base_url)
+    }
+
+    /// Create a new OpenAI client with an optional API key and explicit base URL.
+    pub fn new_with_optional_api_key_and_base_url(
+        api_key: Option<String>,
+        base_url: String,
+    ) -> Self {
         let http =
             crate::http::build_http_client_for_base_url(reqwest::Client::builder(), &base_url)
                 .unwrap_or_else(|_| reqwest::Client::new());
@@ -72,7 +104,7 @@ impl OpenAiClient {
     /// Build request body for OpenAI Responses API
     fn build_request_body(&self, request: &LlmRequest) -> Result<Value, LlmError> {
         let input = Self::convert_to_responses_input(&request.messages)?;
-        let reasoning_enabled = Self::model_supports_reasoning_payload(&request.model);
+        let reasoning_enabled = Self::request_supports_reasoning_payload(request);
 
         let mut body = serde_json::json!({
             "model": request.model,
@@ -91,7 +123,7 @@ impl OpenAiClient {
             });
         }
 
-        if Self::model_supports_temperature(&request.model)
+        if Self::request_supports_temperature(request)
             && let Some(temp) = request.temperature
             && let Some(num) = serde_json::Number::from_f64(temp as f64)
         {
@@ -296,7 +328,10 @@ impl OpenAiClient {
 
     /// Parse an SSE event from the Responses API stream
     fn parse_responses_sse_line(line: &str) -> Option<ResponsesStreamEvent> {
-        if let Some(data) = line.strip_prefix("data: ") {
+        if let Some(data) = line
+            .strip_prefix("data: ")
+            .or_else(|| line.strip_prefix("data:"))
+        {
             if data == "[DONE]" {
                 return None;
             }
@@ -343,10 +378,16 @@ impl LlmClient for OpenAiClient {
         let inner: LlmStream<'a> = Box::pin(async_stream::try_stream! {
             let body = self.build_request_body(request)?;
 
-            let response = self.http
+            let request_builder = self
+                .http
                 .post(format!("{}/v1/responses", self.base_url))
-                .header("Authorization", format!("Bearer {}", self.api_key))
-                .header("Content-Type", "application/json")
+                .header("Content-Type", "application/json");
+            let request_builder = if let Some(api_key) = &self.api_key {
+                request_builder.header("Authorization", format!("Bearer {api_key}"))
+            } else {
+                request_builder
+            };
+            let response = request_builder
                 .json(&body)
                 .send()
                 .await
@@ -1093,6 +1134,28 @@ mod tests {
         assert!(body.get("reasoning").is_none());
     }
 
+    #[test]
+    fn test_request_respects_internal_capability_overrides_for_self_hosted_aliases() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gemma4:e2b",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_temperature(0.3)
+        .with_provider_param(OpenAiClient::INTERNAL_SUPPORTS_TEMPERATURE, true)
+        .with_provider_param(OpenAiClient::INTERNAL_SUPPORTS_REASONING, true)
+        .with_provider_param("reasoning_effort", "high");
+
+        let body = client.build_request_body(&request).expect("build request");
+
+        let temperature = body["temperature"]
+            .as_f64()
+            .expect("temperature should be numeric");
+        assert!((temperature - 0.3).abs() < 1e-6);
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+    }
+
     // =========================================================================
     // BlockAssistant Message Tests
     // =========================================================================
@@ -1730,6 +1793,13 @@ mod tests {
         let line = "data: [DONE]";
         let event = OpenAiClient::parse_responses_sse_line(line);
         assert!(event.is_none());
+    }
+
+    #[test]
+    fn test_parse_responses_sse_line_without_trailing_space() {
+        let line = r#"data:{"type":"response.output_text.delta","delta":"hello"}"#;
+        let event = OpenAiClient::parse_responses_sse_line(line);
+        assert!(event.is_some());
     }
 
     #[test]

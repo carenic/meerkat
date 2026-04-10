@@ -816,7 +816,10 @@ impl MethodRouter {
                 let config = self.config_store.get().await.unwrap_or_default();
                 handlers::capabilities::handle_get(id, &config)
             }
-            "models/catalog" => handlers::models::handle_catalog(id),
+            "models/catalog" => {
+                let config = self.config_store.get().await.unwrap_or_default();
+                handlers::models::handle_catalog(id, &config)
+            }
             "config/get" => {
                 handlers::config::handle_get(id, &self.config_store, self.runtime.config_runtime())
                     .await
@@ -4505,6 +4508,10 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
+        recorded_requests
+            .lock()
+            .expect("recorded requests lock poisoned")
+            .clear();
 
         let first_turn = {
             let router = router.clone();

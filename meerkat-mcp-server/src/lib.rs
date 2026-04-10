@@ -1386,7 +1386,8 @@ pub async fn handle_tools_call_with_notifier(
             .await
             .map(wrap_tool_payload)
             .map_err(ToolCallError::internal),
-        "meerkat_models_catalog" => handle_meerkat_models_catalog()
+        "meerkat_models_catalog" => handle_meerkat_models_catalog(state)
+            .await
             .map(wrap_tool_payload)
             .map_err(ToolCallError::internal),
         "meerkat_skills" => {
@@ -1611,8 +1612,15 @@ async fn handle_meerkat_capabilities(state: &MeerkatMcpState) -> Result<Value, S
     serde_json::to_value(&response).map_err(|e| format!("Serialization failed: {e}"))
 }
 
-fn handle_meerkat_models_catalog() -> Result<Value, String> {
-    let response = meerkat::surface::build_models_catalog_response();
+async fn handle_meerkat_models_catalog(state: &MeerkatMcpState) -> Result<Value, String> {
+    let config = state
+        .config_runtime
+        .get()
+        .await
+        .map(|snapshot| snapshot.config)
+        .unwrap_or_default();
+    let response =
+        meerkat::surface::build_models_catalog_response(&config).map_err(|e| e.to_string())?;
     serde_json::to_value(&response).map_err(|e| format!("Serialization failed: {e}"))
 }
 
@@ -2446,7 +2454,10 @@ async fn handle_meerkat_run(
         .await
         .map(|snapshot| snapshot.config)
         .unwrap_or_default();
-    let model = input.model.unwrap_or_else(|| config.agent.model.clone());
+    let model = input
+        .model
+        .clone()
+        .unwrap_or_else(|| config.agent.model.clone());
 
     // Build composed external tools:
     // - callback tools supplied by the MCP client
@@ -2520,8 +2531,20 @@ async fn handle_meerkat_run(
     });
 
     let current_generation = state.config_runtime.get().await.ok().map(|s| s.generation);
+    let llm_binding = meerkat_core::session_recovery::resolve_resume_llm_binding(
+        session
+            .session_metadata()
+            .map(|meta| meta.provider)
+            .unwrap_or(meerkat_core::Provider::Other),
+        session
+            .session_metadata()
+            .and_then(|meta| meta.self_hosted_server_id),
+        input.model.as_deref(),
+        input.provider.map(ProviderInput::to_provider),
+    );
     let mut build = SessionBuildOptions {
-        provider: input.provider.map(ProviderInput::to_provider),
+        provider: llm_binding.provider,
+        self_hosted_server_id: llm_binding.self_hosted_server_id,
         output_schema,
         structured_output_retries: input
             .structured_output_retries
@@ -2558,7 +2581,7 @@ async fn handle_meerkat_run(
         additional_instructions: input.additional_instructions.clone(),
         shell_env: input.shell_env.clone(),
         resume_override_mask: ResumeOverrideMask {
-            provider: input.provider.is_some(),
+            provider: llm_binding.provider_overridden,
             max_tokens: input.max_tokens.is_some(),
             structured_output_retries: input.structured_output_retries.is_some(),
             provider_params: input.provider_params.is_some(),
@@ -2788,8 +2811,20 @@ async fn handle_meerkat_resume(
                 "failed to prepare bindings for session {session_id}: {e}"
             ))
         })?;
-    let mut build = SessionBuildOptions {
+    let llm_binding = meerkat_core::session_recovery::resolve_resume_llm_binding(
+        stored_metadata
+            .as_ref()
+            .map(|m| m.provider)
+            .unwrap_or(meerkat_core::Provider::Other),
+        stored_metadata
+            .as_ref()
+            .and_then(|m| m.self_hosted_server_id.clone()),
+        input.model.as_deref(),
         provider,
+    );
+    let mut build = SessionBuildOptions {
+        provider: llm_binding.provider,
+        self_hosted_server_id: llm_binding.self_hosted_server_id,
         output_schema,
         structured_output_retries: input
             .structured_output_retries
@@ -2836,7 +2871,7 @@ async fn handle_meerkat_resume(
         shell_env: None,
         resume_override_mask: ResumeOverrideMask {
             model: input.model.is_some(),
-            provider: input.provider.is_some(),
+            provider: llm_binding.provider_overridden,
             max_tokens: input.max_tokens.is_some(),
             structured_output_retries: input.structured_output_retries.is_some(),
             provider_params: input.provider_params.is_some(),
