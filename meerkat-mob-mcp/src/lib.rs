@@ -106,6 +106,12 @@ pub struct MobMcpState {
     restore_lock: Mutex<bool>,
     /// Shared realm-scoped profile store for cross-mob profile CRUD.
     realm_profile_store: Option<Arc<dyn meerkat_mob::RealmProfileStore>>,
+    /// Whether the current realm profile store was explicitly supplied by the caller.
+    ///
+    /// Default constructor wiring installs an in-memory store so profile CRUD is
+    /// available on ephemeral surfaces. Persistent roots may upgrade that
+    /// default to SQLite, but must not override an explicit caller-owned store.
+    realm_profile_store_explicit: bool,
 }
 
 impl MobMcpState {
@@ -128,7 +134,8 @@ impl MobMcpState {
             mobs: RwLock::new(BTreeMap::new()),
             implicit_mob_locks: Mutex::new(HashMap::new()),
             restore_lock: Mutex::new(false),
-            realm_profile_store: None,
+            realm_profile_store: Some(Arc::new(meerkat_mob::InMemoryRealmProfileStore::new())),
+            realm_profile_store_explicit: false,
         }
     }
 
@@ -138,6 +145,7 @@ impl MobMcpState {
         store: Option<Arc<dyn meerkat_mob::RealmProfileStore>>,
     ) -> Self {
         self.realm_profile_store = store;
+        self.realm_profile_store_explicit = true;
         self
     }
 
@@ -151,7 +159,7 @@ impl MobMcpState {
             let mob_root = Self::persistent_mob_root(&root);
             // Auto-create realm profile store when persistent storage is available.
             #[cfg(not(target_arch = "wasm32"))]
-            if self.realm_profile_store.is_none() {
+            if !self.realm_profile_store_explicit {
                 let db_path = mob_root.join("realm_profiles.db");
                 match meerkat_mob::SqliteRealmProfileStore::open(&db_path) {
                     Ok(store) => {
@@ -1209,10 +1217,7 @@ impl MobMcpState {
         let state = Self::new_with_runtime_adapter(
             Arc::new(LocalSessionService::new()),
             Some(Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral())),
-        )
-        .with_realm_profile_store(Some(Arc::new(
-            meerkat_mob::InMemoryRealmProfileStore::new(),
-        )));
+        );
         Arc::new(state)
     }
 }
@@ -4164,6 +4169,21 @@ mod tests {
         }
     }
 
+    fn sample_realm_profile(model: &str) -> meerkat_mob::Profile {
+        meerkat_mob::profile::Profile {
+            model: model.to_string(),
+            skills: Vec::new(),
+            tools: meerkat_mob::profile::ToolConfig::default(),
+            peer_description: "realm worker".to_string(),
+            external_addressable: false,
+            backend: None,
+            runtime_mode: meerkat_mob::MobRuntimeMode::AutonomousHost,
+            max_inline_peer_notifications: None,
+            output_schema: None,
+            provider_params: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_persistent_root_restores_explicit_mob_member_status() {
         let svc = Arc::new(MockSessionSvc::new());
@@ -4240,6 +4260,50 @@ mod tests {
             restored.mob_list().await.is_empty(),
             "destroyed persistent mobs must not reappear after restart"
         );
+    }
+
+    #[tokio::test]
+    async fn test_default_constructor_exposes_realm_profile_crud_with_in_memory_store() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let state = Arc::new(MobMcpState::new(svc));
+
+        let created = state
+            .realm_profile_create("worker", &sample_realm_profile("claude-sonnet-4-6"))
+            .await
+            .expect("default constructor should provide realm profile store");
+        assert_eq!(created.name, "worker");
+
+        let fetched = state
+            .realm_profile_get("worker")
+            .await
+            .expect("get realm profile")
+            .expect("stored profile");
+        assert_eq!(fetched.profile.model, "claude-sonnet-4-6");
+    }
+
+    #[tokio::test]
+    async fn test_persistent_root_upgrades_default_realm_profile_store_to_durable_sqlite() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+
+        let state = Arc::new(
+            MobMcpState::new(svc.clone())
+                .with_persistent_storage_root(Some(root.path().to_path_buf())),
+        );
+        state
+            .realm_profile_create("worker", &sample_realm_profile("claude-opus-4-6"))
+            .await
+            .expect("create persistent realm profile");
+
+        let restored = Arc::new(
+            MobMcpState::new(svc).with_persistent_storage_root(Some(root.path().to_path_buf())),
+        );
+        let fetched = restored
+            .realm_profile_get("worker")
+            .await
+            .expect("get restored realm profile")
+            .expect("restored profile should exist");
+        assert_eq!(fetched.profile.model, "claude-opus-4-6");
     }
 
     #[tokio::test]

@@ -3323,6 +3323,10 @@ mod tests {
             tool_names.iter().any(|n| n == "mob_list"),
             "missing 'mob_list', got: {tool_names:?}"
         );
+        assert!(
+            tool_names.iter().any(|n| n == "mob_profile_create"),
+            "missing 'mob_profile_create', got: {tool_names:?}"
+        );
     }
 
     /// Regression: auto-resumed session from disk must retain all tool categories.

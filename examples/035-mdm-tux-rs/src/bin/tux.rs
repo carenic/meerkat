@@ -3890,6 +3890,7 @@ mod tests {
         assert!(tool_names.iter().any(|name| name == "delegate"));
         assert!(tool_names.iter().any(|name| name == "mob_list"));
         assert!(tool_names.iter().any(|name| name == "mob_check_member"));
+        assert!(tool_names.iter().any(|name| name == "mob_profile_create"));
         assert!(!tool_names.iter().any(|name| name == "shell"));
     }
 
