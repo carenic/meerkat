@@ -1194,7 +1194,58 @@ async fn handle_target_message(
                 }
             }
         }
-        _ => {}
+        // All other message types (Response from delegate helpers, unrecognized
+        // Request intents, etc.) are injected into the session as peer input so
+        // the LLM can observe them. This replaces the automatic peer ingress
+        // drain, which we intentionally disable to prevent the race between
+        // the manual command-aware loop and the blind drain.
+        other => {
+            let body = match other {
+                meerkat_comms::agent::types::CommsContent::Response {
+                    status, result, ..
+                } => {
+                    format!(
+                        "[COMMS RESPONSE from {sender}]\nStatus: {status:?}\nResult: {}",
+                        serde_json::to_string_pretty(result).unwrap_or_default()
+                    )
+                }
+                meerkat_comms::agent::types::CommsContent::Request {
+                    intent, params, ..
+                } => {
+                    format!(
+                        "[COMMS REQUEST from {sender}]\nIntent: {}\nParams: {}",
+                        intent.as_str(),
+                        serde_json::to_string_pretty(params).unwrap_or_default()
+                    )
+                }
+                _ => return TargetLoopAction::Continue,
+            };
+            let peer_input = Input::Peer(PeerInput {
+                header: InputHeader {
+                    id: meerkat_core::lifecycle::InputId::new(),
+                    timestamp: chrono::Utc::now(),
+                    source: InputOrigin::Peer {
+                        peer_id: sender.clone(),
+                        runtime_id: None,
+                    },
+                    durability: InputDurability::Ephemeral,
+                    visibility: InputVisibility::default(),
+                    idempotency_key: None,
+                    supersession_key: None,
+                    correlation_id: None,
+                },
+                convention: Some(PeerConvention::Message),
+                body,
+                blocks: None,
+                handling_mode: Some(HandlingMode::Queue),
+            });
+            if let Err(e) = runtime_adapter
+                .accept_input(active_session_id(session_binding_state), peer_input)
+                .await
+            {
+                eprintln!("[target] accept_input for peer event: {e}");
+            }
+        }
     }
     TargetLoopAction::Continue
 }
@@ -1827,13 +1878,12 @@ async fn setup_session(
         .ensure_session_with_executor(session_id.clone(), executor)
         .await;
 
-    // Configure peer ingress so the comms drain runs for this session.
-    // Without this, peer messages from delegate helpers sit in the inbox
-    // and the parent never processes them.
-    let comms_rt = service.comms_runtime(&session_id).await;
-    runtime_adapter
-        .update_peer_ingress_context(&session_id, true, comms_rt)
-        .await;
+    // NOTE: Do NOT enable peer ingress here. The kennel adopted loop and the
+    // direct-mode inbox loop manually drain comms_runtime.recv_message() and
+    // route messages through handle_target_message — which distinguishes
+    // control commands (Request intent "command") from regular peer messages.
+    // Enabling peer ingress would create a second consumer racing the manual
+    // loop, causing commands to be misrouted to the LLM as plain text prompts.
 
     Ok(session_id)
 }
