@@ -17,7 +17,7 @@ type PollEventsFn = (handle: number) => string;
 type AppendSystemContextFn = (
   handle: number,
   request_json: string,
-) => string;
+) => Promise<string>;
 
 /** A direct (non-mob) agent session. */
 export class Session {
@@ -114,11 +114,11 @@ export class Session {
   }
 
   /** Stage runtime system context for application at the next LLM boundary. */
-  appendSystemContext(
+  async appendSystemContext(
     options: AppendSystemContextOptions,
-  ): AppendSystemContextResult {
+  ): Promise<AppendSystemContextResult> {
     if (this.destroyed) throw new Error('Session has been destroyed');
-    const json = this.appendSystemContextFn(
+    const json = await this.appendSystemContextFn(
       this.handle,
       JSON.stringify({
         text: options.text,

@@ -1400,7 +1400,7 @@ fn merge_runtime_system_context_state(
 
 /// Append runtime system context to a browser session handle.
 #[wasm_bindgen]
-pub fn append_system_context(handle: u32, request_json: &str) -> Result<JsValue, JsValue> {
+pub async fn append_system_context(handle: u32, request_json: &str) -> Result<JsValue, JsValue> {
     let req: AppendSystemContextOptions =
         serde_json::from_str(request_json).map_err(|e| err_str("invalid_request", e))?;
 
@@ -1411,16 +1411,18 @@ pub fn append_system_context(handle: u32, request_json: &str) -> Result<JsValue,
             .ok_or_else(|| err_js("SESSION_NOT_FOUND", &format!("unknown handle: {handle}")))?;
         Ok((state.session_service.clone(), session.session_id.clone()))
     })?;
-    let status = futures::executor::block_on(session_service.append_system_context(
-        &session_id,
-        meerkat_core::AppendSystemContextRequest {
-            text: req.text,
-            source: req.source,
-            idempotency_key: req.idempotency_key,
-        },
-    ))
-    .map_err(err_session_control)?
-    .status;
+    let status = session_service
+        .append_system_context(
+            &session_id,
+            meerkat_core::AppendSystemContextRequest {
+                text: req.text,
+                source: req.source,
+                idempotency_key: req.idempotency_key,
+            },
+        )
+        .await
+        .map_err(err_session_control)?
+        .status;
 
     Ok(JsValue::from_str(
         &serde_json::json!({
@@ -2696,8 +2698,8 @@ mod tests {
     }
 
     #[cfg(target_arch = "wasm32")]
-    #[test]
-    fn append_system_context_export_stages_context_for_direct_session_handle() {
+    #[wasm_bindgen_test::wasm_bindgen_test(async)]
+    async fn append_system_context_export_stages_context_for_direct_session_handle() {
         init_test_runtime();
         let handle = create_session_simple(
             &json!({
@@ -2717,6 +2719,7 @@ mod tests {
             })
             .to_string(),
         )
+        .await
         .expect("append system context");
         let result_json = result.as_string().expect("append result string");
         let parsed: serde_json::Value =

@@ -56,7 +56,7 @@ test("MeerkatRuntime drives direct-session lifecycle through shipped wasm export
       model: "claude-sonnet-4-5",
       apiKey: "sk-test",
     });
-    const staged = session.appendSystemContext({
+    const staged = await session.appendSystemContext({
       text: "Remember the browser-side coordinator.",
       source: "web",
       idempotencyKey: "ctx-web-1",
@@ -103,7 +103,7 @@ test("Session.destroy remains retryable when the underlying wasm destroy throws"
       }
     },
     () => "[]",
-    () => JSON.stringify({ handle: 7, status: "staged" }),
+    async () => JSON.stringify({ handle: 7, status: "staged" }),
   );
 
   assert.throws(() => session.destroy(), /SESSION_BUSY/);
@@ -136,7 +136,7 @@ test("Session.destroy becomes idempotent after the runtime has already been dest
       throw new Error("not_initialized: runtime not initialized");
     },
     () => "[]",
-    () => JSON.stringify({ handle: 8, status: "staged" }),
+    async () => JSON.stringify({ handle: 8, status: "staged" }),
   );
 
   assert.doesNotThrow(() => session.destroy());

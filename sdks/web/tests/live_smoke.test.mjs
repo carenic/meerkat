@@ -219,7 +219,7 @@ test(
         anthropicBaseUrl: baseUrls.anthropicBaseUrl,
       });
 
-      const staged = session.appendSystemContext({
+      const staged = await session.appendSystemContext({
         text: "Always include the marker [WASM-CTX-46] in your replies.",
         source: "web-live-smoke",
         idempotencyKey: "wasm-ctx-46",

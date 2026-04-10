@@ -221,6 +221,7 @@ async fn browser_contract_requires_bootstrap_and_uses_runtime_backed_sessions_to
             })
             .to_string(),
         )
+        .await
         .expect("append system context"),
     );
     assert_eq!(staged["handle"], handle);

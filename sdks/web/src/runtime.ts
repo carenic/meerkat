@@ -82,7 +82,7 @@ export interface WasmModule {
   get_session_state: (handle: number) => string;
   destroy_session: (handle: number) => void;
   poll_events: (handle: number) => string;
-  append_system_context: (handle: number, requestJson: string) => string;
+  append_system_context: (handle: number, requestJson: string) => Promise<string>;
   inspect_mobpack: (mobpackBytes: Uint8Array) => string;
   mob_create: (definitionJson: string) => Promise<string>;
   mob_status: (mobId: string) => Promise<string>;

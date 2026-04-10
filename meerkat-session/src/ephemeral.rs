@@ -1027,8 +1027,25 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
         drop(session_event_rx);
         let interrupt_notify = Arc::new(tokio::sync::Notify::new());
 
-        // Spawn the session task
+        // Spawn the session task using the platform-appropriate task API.
+        #[cfg(not(target_arch = "wasm32"))]
         tokio::spawn(session_task(
+            agent,
+            agent_event_tx,
+            agent_event_rx,
+            command_rx,
+            Arc::clone(&deferred_turn_state),
+            SessionTaskControl {
+                state_tx,
+                summary_tx,
+                llm_identity_tx,
+                turn_admission: Arc::clone(&turn_admission),
+                interrupt_notify: interrupt_notify.clone(),
+                session_event_tx: session_event_tx.clone(),
+            },
+        ));
+        #[cfg(target_arch = "wasm32")]
+        tokio_with_wasm::alias::task::spawn(session_task(
             agent,
             agent_event_tx,
             agent_event_rx,

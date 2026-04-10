@@ -78,7 +78,7 @@ async function scenarioRawSession001({ wasm }) {
   assert(Number.isInteger(handle) && handle > 0, `unexpected session handle: ${handle}`);
 
   const staged = JSON.parse(
-    wasm.append_system_context(
+    await wasm.append_system_context(
       handle,
       JSON.stringify({
         text: 'Remember the browser smoke control plane.',
@@ -125,7 +125,7 @@ async function scenarioRawRecall002({ wasm }) {
     }),
   );
   const staged = JSON.parse(
-    wasm.append_system_context(
+    await wasm.append_system_context(
       handle,
       JSON.stringify({
         text: 'Always include the marker BROWSER_CTX_OK when asked to recall state.',
