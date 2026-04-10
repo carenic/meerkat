@@ -3540,21 +3540,14 @@ fn render_output(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut 
     // Render markdown → styled ratatui Text
     let text = tui_markdown::from_str(&md);
 
-    // Compute actual rendered height by counting lines after wrapping.
-    // This is the real content height that Paragraph will render.
-    let content_height: u16 = text
-        .lines
-        .iter()
-        .map(|line| {
-            let line_width: u16 = line.width() as u16;
-            if inner_width == 0 {
-                1
-            } else {
-                line_width.div_ceil(inner_width).max(1)
-            }
-        })
-        .sum();
+    // Build the paragraph once — use its own line_count() for the true
+    // wrapped height (uses the same WordWrapper as rendering, so the
+    // scroll offset always matches reality).
+    let paragraph = Paragraph::new(text)
+        .block(Block::default().borders(Borders::ALL).title(""))
+        .wrap(Wrap { trim: false });
 
+    let content_height = paragraph.line_count(inner_width) as u16;
     let max_scroll = timeline_max_scroll(content_height, inner_height);
     if app.auto_scroll {
         app.scroll_offset = max_scroll;
@@ -3574,13 +3567,13 @@ fn render_output(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut 
         )
     };
 
-    f.render_widget(
-        Paragraph::new(text)
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .wrap(Wrap { trim: false })
-            .scroll((app.scroll_offset, 0)),
-        area,
-    );
+    // Rebuild with the final title and scroll position
+    let paragraph = Paragraph::new(tui_markdown::from_str(&md))
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false })
+        .scroll((app.scroll_offset, 0));
+
+    f.render_widget(paragraph, area);
 }
 
 fn render_input(
