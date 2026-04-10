@@ -19,9 +19,10 @@ name = "mdm-kennel"
 path = "src/bin/kennel.rs"
 
 [dependencies]
-meerkat       = { path = "../../meerkat", features = ["comms", "jsonl-store", "session-store", "schedule"] }
+meerkat       = { path = "../../meerkat", features = ["comms", "jsonl-store", "mcp", "session-store", "schedule", "skills"] }
 meerkat-core  = { path = "../../meerkat-core" }
 meerkat-comms = { path = "../../meerkat-comms" }
+meerkat-mcp   = { path = "../../meerkat-mcp" }
 meerkat-mob-mcp = { path = "../../meerkat-mob-mcp" }
 meerkat-runtime = { path = "../../meerkat-runtime" }
 meerkat-store = { path = "../../meerkat-store", features = ["jsonl", "sqlite"] }

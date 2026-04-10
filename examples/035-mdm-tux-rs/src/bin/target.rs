@@ -49,7 +49,9 @@ use meerkat_core::service::{
 };
 use meerkat_core::types::{ContentInput, HandlingMode, SessionId};
 use meerkat_core::types::Message;
-use meerkat_core::{AgentEvent, Config, Session};
+use meerkat_core::mcp_config::McpConfig;
+use meerkat_core::{AgentEvent, AgentToolDispatcher, Config, Session};
+use meerkat_mcp::{McpRouter, McpRouterAdapter};
 use meerkat_mob_mcp::{AgentMobToolSurfaceFactory, MobMcpState};
 use meerkat_runtime::{
     CorrelationId, IdempotencyKey, Input, InputOrigin, PromptInput, RuntimeSessionAdapter,
@@ -610,6 +612,21 @@ async fn main() -> anyhow::Result<()> {
                 .join(format!(".rkat/mdm/targets/{name}"))
         });
 
+    // Load MCP servers from ~/.rkat/mcp.toml (user) + <data_dir>/.rkat/mcp.toml (per-target)
+    let mcp_external_tools: Option<Arc<dyn meerkat_core::AgentToolDispatcher>> =
+        match load_mcp_tools(Some(&data_dir)).await {
+            Ok(Some(adapter)) => {
+                let adapter = Arc::new(adapter);
+                eprintln!("[target] MCP tools loaded: {}", adapter.tools().len());
+                Some(adapter)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("[target] MCP load failed (continuing without): {e}");
+                None
+            }
+        };
+
     // ── 1. Create CommsRuntime with target's stable identity ───────────────
     let comms_runtime = create_target_comms_runtime(&name, &data_dir).await?;
 
@@ -641,6 +658,7 @@ async fn main() -> anyhow::Result<()> {
         &system_prompt_template,
         &mob_state,
         &provider,
+        mcp_external_tools.as_ref().cloned(),
     )
     .await?;
 
@@ -775,6 +793,7 @@ async fn main() -> anyhow::Result<()> {
             &system_prompt_template,
             &mob_state,
             &provider,
+            &mcp_external_tools,
             &mut session_binding_state,
             &mut current_session_id,
             &mut event_forwarder,
@@ -833,6 +852,7 @@ async fn run_inbox_loop(
     system_prompt: &str,
     mob_state: &Arc<MobMcpState>,
     provider: &str,
+    external_tools: &Option<Arc<dyn AgentToolDispatcher>>,
     session_binding_state: &mut SessionBindingState,
     current_session_id: &mut SessionId,
     event_forwarder: &mut Option<tokio::task::JoinHandle<()>>,
@@ -852,6 +872,7 @@ async fn run_inbox_loop(
                     system_prompt,
                     mob_state,
                     provider,
+                    external_tools,
                     session_binding_state,
                     current_session_id,
                     event_forwarder,
@@ -1048,6 +1069,7 @@ async fn handle_target_message(
     system_prompt: &str,
     mob_state: &Arc<MobMcpState>,
     provider: &str,
+    external_tools: &Option<Arc<dyn meerkat_core::AgentToolDispatcher>>,
     session_binding_state: &mut SessionBindingState,
     current_session_id: &mut SessionId,
     event_forwarder: &mut Option<tokio::task::JoinHandle<()>>,
@@ -1075,6 +1097,7 @@ async fn handle_target_message(
                 system_prompt,
                 mob_state,
                 provider,
+                external_tools.as_ref().cloned(),
                 session_binding_state,
                 current_session_id,
                 event_forwarder,
@@ -1230,6 +1253,7 @@ async fn handle_command(
     system_prompt: &str,
     mob_state: &Arc<MobMcpState>,
     provider: &str,
+    external_tools: Option<Arc<dyn meerkat_core::AgentToolDispatcher>>,
     session_binding_state: &mut SessionBindingState,
     current_session_id: &mut SessionId,
     event_forwarder: &mut Option<tokio::task::JoinHandle<()>>,
@@ -1245,6 +1269,7 @@ async fn handle_command(
             system_prompt,
             mob_state,
             provider,
+            external_tools.clone(),
             session_binding_state,
             current_session_id,
             event_forwarder,
@@ -1311,6 +1336,7 @@ async fn handle_command(
                     system_prompt,
                     mob_state,
                     provider,
+                    external_tools.clone(),
                     session_binding_state,
                     current_session_id,
                     event_forwarder,
@@ -1393,6 +1419,7 @@ async fn create_or_resume_session(
     system_prompt: &str,
     mob_state: &Arc<MobMcpState>,
     provider: &str,
+    external_tools: Option<Arc<dyn meerkat_core::AgentToolDispatcher>>,
 ) -> anyhow::Result<SessionId> {
     // Try to auto-resume the most recent session. On failure, warn and start fresh.
     if let Ok(mut sessions) = jsonl_store.list(SessionFilter::default()).await {
@@ -1410,6 +1437,7 @@ async fn create_or_resume_session(
                 system_prompt,
                 mob_state,
                 provider,
+                external_tools.clone(),
             )
             .await
             {
@@ -1430,6 +1458,7 @@ async fn create_or_resume_session(
         system_prompt,
         mob_state,
         provider,
+        external_tools,
     )
     .await
 }
@@ -1446,6 +1475,7 @@ async fn switch_session(
     system_prompt: &str,
     mob_state: &Arc<MobMcpState>,
     provider: &str,
+    external_tools: Option<Arc<dyn meerkat_core::AgentToolDispatcher>>,
     session_binding_state: &mut SessionBindingState,
     current_session_id: &mut SessionId,
     event_forwarder: &mut Option<tokio::task::JoinHandle<()>>,
@@ -1472,6 +1502,7 @@ async fn switch_session(
                 system_prompt,
                 mob_state,
                 provider,
+                external_tools.clone(),
             )
             .await;
             match setup_result {
@@ -1627,6 +1658,7 @@ async fn setup_session(
     system_prompt: &str,
     mob_state: &Arc<MobMcpState>,
     provider: &str,
+    external_tools: Option<Arc<dyn meerkat_core::AgentToolDispatcher>>,
 ) -> anyhow::Result<SessionId> {
     let resume_session = match &resume_id {
         Some(id) => {
@@ -1650,8 +1682,6 @@ async fn setup_session(
         .await
         .map_err(|e| anyhow::anyhow!("runtime bindings: {e}"))?;
 
-    // No external_tools needed — the factory composes comms tools automatically
-    // from the CommsRuntime set via AgentFactory::with_comms_runtime().
     let build_opts = SessionBuildOptions {
         provider: Some(meerkat_core::Provider::from_name(provider)),
         override_builtins: meerkat_core::ToolCategoryOverride::Enable,
@@ -1659,6 +1689,7 @@ async fn setup_session(
         override_mob: meerkat_core::ToolCategoryOverride::Enable,
         resume_session: Some(prepared_session),
         runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
+        external_tools,
         ..Default::default()
     };
 
@@ -1863,6 +1894,43 @@ struct ActiveAdoption {
     tux_direct_addr: String,
 }
 
+/// Load MCP tools from `~/.rkat/mcp.toml` (user scope) and optionally
+/// `<data_dir>/.rkat/mcp.toml` (per-target project scope).
+/// Returns `None` when no servers are configured.
+async fn load_mcp_tools(data_dir: Option<&Path>) -> anyhow::Result<Option<McpRouterAdapter>> {
+    // data_dir as project scope, home dir as user scope
+    let home = dirs::home_dir();
+    let servers = McpConfig::load_with_scopes_from_roots(
+        data_dir,
+        home.as_deref(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("MCP config: {e}"))?;
+    if servers.is_empty() {
+        return Ok(None);
+    }
+    eprintln!("[target] staging {} MCP server(s)", servers.len());
+    let mut router = McpRouter::new();
+    for s in &servers {
+        eprintln!("[target]   - {}", s.server.name);
+        router.stage_add(s.server.clone());
+    }
+    router
+        .apply_staged()
+        .await
+        .map_err(|e| anyhow::anyhow!("MCP apply: {e}"))?;
+    let adapter = McpRouterAdapter::new(router);
+    // Wait up to 30s for servers to connect
+    let _ = adapter
+        .wait_until_ready(std::time::Duration::from_secs(30))
+        .await;
+    adapter
+        .refresh_tools()
+        .await
+        .map_err(|e| anyhow::anyhow!("MCP refresh: {e}"))?;
+    Ok(Some(adapter))
+}
+
 async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
     let kennel_addr = find_flag(args, "--kennel").context("--kennel HOST:PORT is required")?;
     let name = find_flag(args, "--name")
@@ -1888,6 +1956,21 @@ async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
                 .join(format!(".rkat/mdm/targets/{name}"))
         });
 
+    // Load MCP servers from ~/.rkat/mcp.toml (user) + <data_dir>/.rkat/mcp.toml (per-target)
+    let mcp_external_tools: Option<Arc<dyn meerkat_core::AgentToolDispatcher>> =
+        match load_mcp_tools(Some(&data_dir)).await {
+            Ok(Some(adapter)) => {
+                let adapter = Arc::new(adapter);
+                eprintln!("[target] MCP tools loaded: {}", adapter.tools().len());
+                Some(adapter)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("[target] MCP load failed (continuing without): {e}");
+                None
+            }
+        };
+
     let comms_runtime = create_target_comms_runtime(&name, &data_dir).await?;
     let comms_port = spawn_comms_listener(&comms_runtime).await?;
     let target_id = comms_runtime.public_key().to_peer_id();
@@ -1908,6 +1991,7 @@ async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
         &system_prompt,
         &mob_state,
         &provider,
+        mcp_external_tools.as_ref().cloned(),
     )
     .await?;
     let mut event_forwarder: Option<tokio::task::JoinHandle<()>> = None;
@@ -2075,6 +2159,7 @@ async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
                                 &system_prompt,
                                 &mob_state,
                                 &provider,
+                                &mcp_external_tools,
                                 &mut session_binding_state,
                                 &mut current_session_id,
                                 &mut event_forwarder,
@@ -2143,6 +2228,7 @@ async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
                                 &system_prompt,
                                 &mob_state,
                                 &provider,
+                                &mcp_external_tools,
                                 &mut session_binding_state,
                                 &mut current_session_id,
                                 &mut event_forwarder,
@@ -2219,6 +2305,7 @@ async fn run_adopted_loop(
     system_prompt: &str,
     mob_state: &Arc<MobMcpState>,
     provider: &str,
+    external_tools: &Option<Arc<dyn AgentToolDispatcher>>,
     session_binding_state: &mut SessionBindingState,
     current_session_id: &mut SessionId,
     event_forwarder: &mut Option<tokio::task::JoinHandle<()>>,
@@ -2258,6 +2345,7 @@ async fn run_adopted_loop(
         system_prompt,
         mob_state,
         provider,
+        external_tools,
         session_binding_state,
         current_session_id,
         event_forwarder,
@@ -2290,6 +2378,7 @@ async fn run_adopted_loop_inner(
     system_prompt: &str,
     mob_state: &Arc<MobMcpState>,
     provider: &str,
+    external_tools: &Option<Arc<dyn AgentToolDispatcher>>,
     session_binding_state: &mut SessionBindingState,
     current_session_id: &mut SessionId,
     event_forwarder: &mut Option<tokio::task::JoinHandle<()>>,
@@ -2402,7 +2491,8 @@ async fn run_adopted_loop_inner(
                 match handle_target_message(
                     &msg, comms_runtime, disconnect_tx, service, runtime_adapter,
                     jsonl_store, model, system_prompt, mob_state, provider,
-                    session_binding_state, current_session_id, event_forwarder,
+                    external_tools, session_binding_state, current_session_id,
+                    event_forwarder,
                 ).await {
                     TargetLoopAction::Continue => {}
                     TargetLoopAction::ExitProcess => std::process::exit(0),
