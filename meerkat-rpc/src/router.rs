@@ -313,43 +313,51 @@ impl MethodRouter {
         notification_sink: NotificationSink,
     ) -> Self {
         let runtime_adapter = runtime.runtime_adapter();
+        // Reuse the runtime's existing mob state if one was pre-configured
+        // (e.g., by a kennel that created a hive mob before serving TCP
+        // connections). Only create a fresh MobMcpState when no existing
+        // state is present.
         #[cfg(feature = "mob")]
-        let persistent_mob_root = config_store
-            .metadata()
-            .and_then(|metadata| metadata.resolved_paths)
-            .map(|paths| PathBuf::from(paths.root));
-        #[cfg(feature = "mob")]
-        let mob_state = Arc::new({
-            let llm_provider: Arc<
-                dyn Fn() -> Option<Arc<dyn meerkat_client::LlmClient>> + Send + Sync,
-            > = Arc::new({
-                let runtime = runtime.clone();
-                move || runtime.default_llm_client()
+        let mob_state = if let Some(existing) = runtime.mob_state() {
+            existing
+        } else {
+            let persistent_mob_root = config_store
+                .metadata()
+                .and_then(|metadata| metadata.resolved_paths)
+                .map(|paths| PathBuf::from(paths.root));
+            let mob_state = Arc::new({
+                let llm_provider: Arc<
+                    dyn Fn() -> Option<Arc<dyn meerkat_client::LlmClient>> + Send + Sync,
+                > = Arc::new({
+                    let runtime = runtime.clone();
+                    move || runtime.default_llm_client()
+                });
+                let tools_provider: meerkat_mob::ExternalToolsProvider = Arc::new({
+                    let runtime = runtime.clone();
+                    move || {
+                        let tx = runtime.callback_request_tx()?;
+                        Some(
+                            Arc::new(crate::callback_dispatcher::CallbackToolDispatcher::new(
+                                runtime.registered_tools(),
+                                tx,
+                                runtime.callback_id_counter(),
+                                vec![],
+                            ))
+                                as Arc<dyn meerkat_core::AgentToolDispatcher>,
+                        )
+                    }
+                });
+                meerkat_mob_mcp::MobMcpState::new_with_runtime_adapter(
+                    runtime.session_service(),
+                    Some(runtime_adapter.clone()),
+                )
+                .with_persistent_storage_root(persistent_mob_root)
+                .with_default_llm_client_provider(Some(llm_provider))
+                .with_external_tools_provider(Some(tools_provider))
             });
-            let tools_provider: meerkat_mob::ExternalToolsProvider = Arc::new({
-                let runtime = runtime.clone();
-                move || {
-                    let tx = runtime.callback_request_tx()?;
-                    Some(
-                        Arc::new(crate::callback_dispatcher::CallbackToolDispatcher::new(
-                            runtime.registered_tools(),
-                            tx,
-                            runtime.callback_id_counter(),
-                            vec![],
-                        )) as Arc<dyn meerkat_core::AgentToolDispatcher>,
-                    )
-                }
-            });
-            meerkat_mob_mcp::MobMcpState::new_with_runtime_adapter(
-                runtime.session_service(),
-                Some(runtime_adapter.clone()),
-            )
-            .with_persistent_storage_root(persistent_mob_root)
-            .with_default_llm_client_provider(Some(llm_provider))
-            .with_external_tools_provider(Some(tools_provider))
-        });
-        #[cfg(feature = "mob")]
-        runtime.set_mob_state(mob_state.clone());
+            runtime.set_mob_state(mob_state.clone());
+            mob_state
+        };
         let schedule_runtime = runtime.clone();
         tokio::spawn(async move {
             if let Err(error) = schedule_runtime.ensure_schedule_host_started().await {

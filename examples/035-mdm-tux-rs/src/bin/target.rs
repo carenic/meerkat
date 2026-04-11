@@ -888,6 +888,7 @@ async fn create_or_resume_session(
     mob_state: &Arc<MobMcpState>,
     provider: &str,
     external_tools: Option<Arc<dyn meerkat_core::AgentToolDispatcher>>,
+    comms_runtime: Option<Arc<meerkat_comms::CommsRuntime>>,
 ) -> anyhow::Result<SessionId> {
     // Try to auto-resume the most recent session. On failure, warn and start fresh.
     if let Ok(mut sessions) = jsonl_store.list(SessionFilter::default()).await {
@@ -906,6 +907,7 @@ async fn create_or_resume_session(
                 mob_state,
                 provider,
                 external_tools.clone(),
+                comms_runtime.clone(),
             )
             .await
             {
@@ -927,6 +929,7 @@ async fn create_or_resume_session(
         mob_state,
         provider,
         external_tools,
+        comms_runtime,
     )
     .await
 }
@@ -942,6 +945,7 @@ async fn setup_session(
     mob_state: &Arc<MobMcpState>,
     provider: &str,
     external_tools: Option<Arc<dyn meerkat_core::AgentToolDispatcher>>,
+    comms_runtime: Option<Arc<meerkat_comms::CommsRuntime>>,
 ) -> anyhow::Result<SessionId> {
     let resume_session = match &resume_id {
         Some(id) => {
@@ -1013,10 +1017,18 @@ async fn setup_session(
         .ensure_session_with_executor(session_id.clone(), executor)
         .await;
 
-    // NOTE: Peer ingress is NOT enabled here. The RPC server handles all
-    // command traffic natively. Inter-agent comms messages (delegate helpers,
-    // mob members) are drained by the kennel adopted loop or the comms
-    // listener and routed through the runtime adapter.
+    // Enable peer ingress so the hive can send us comms messages (requests
+    // and responses) that trigger autonomous turns.
+    if let Some(comms) = comms_runtime {
+        runtime_adapter
+            .update_peer_ingress_context(
+                &session_id,
+                true,
+                Some(comms as Arc<dyn meerkat_core::agent::CommsRuntime>),
+            )
+            .await;
+        eprintln!("[target] peer ingress enabled for {session_id}");
+    }
 
     Ok(session_id)
 }
@@ -1272,6 +1284,7 @@ async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
         &mob_state,
         &provider,
         mcp_external_tools.as_ref().cloned(),
+        Some(Arc::clone(&comms_runtime)),
     )
     .await?;
 
@@ -1433,7 +1446,19 @@ async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
         };
         let _ = verify_envelope(&env)?;
         match &env.payload {
-            KennelPayload::TargetRegistered => {
+            KennelPayload::TargetRegistered { hive_pubkey, hive_comms_addr } => {
+                // Add the hive as a trusted peer so it can send us comms messages.
+                if let (Some(pk_str), Some(addr)) = (hive_pubkey, hive_comms_addr) {
+                    if let Ok(pk) = meerkat_comms::identity::PubKey::from_peer_id(pk_str.as_str()) {
+                        comms_runtime.upsert_trusted_peer(meerkat_comms::TrustedPeer {
+                            name: "hive".into(),
+                            pubkey: pk,
+                            addr: addr.clone(),
+                            meta: meerkat_comms::PeerMeta::default(),
+                        });
+                        eprintln!("[target] added hive as trusted peer at {addr}");
+                    }
+                }
                 kennel_session_state = target_kennel_session::transition(
                     kennel_session_state,
                     TksEvent::RegistrationAcked,
@@ -1585,7 +1610,17 @@ async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
                                 .unwrap_or(TksState::Disconnected);
                             }
                         }
-                        KennelPayload::TargetRegistered => {
+                        KennelPayload::TargetRegistered { hive_pubkey, hive_comms_addr } => {
+                            if let (Some(pk_str), Some(addr)) = (hive_pubkey, hive_comms_addr) {
+                                if let Ok(pk) = meerkat_comms::identity::PubKey::from_peer_id(pk_str.as_str()) {
+                                    comms_runtime.upsert_trusted_peer(meerkat_comms::TrustedPeer {
+                                        name: "hive".into(),
+                                        pubkey: pk,
+                                        addr: addr.clone(),
+                                        meta: meerkat_comms::PeerMeta::default(),
+                                    });
+                                }
+                            }
                             kennel_session_state = target_kennel_session::transition(
                                 kennel_session_state,
                                 TksEvent::RegistrationAcked,
@@ -2297,6 +2332,7 @@ mod tests {
             &surface.mob_state,
             "openai",
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2487,6 +2523,7 @@ mod tests {
             "test background shell",
             &surface.mob_state,
             "openai",
+            None,
             None,
         )
         .await
@@ -2692,6 +2729,7 @@ mod tests {
             "test",
             &surface.mob_state,
             "openai",
+            None,
             None,
         )
         .await

@@ -159,7 +159,7 @@ async fn kennel_target_register_and_list() {
         .await
         .unwrap();
     let resp = target.recv().await.unwrap();
-    assert!(matches!(resp, KennelPayload::TargetRegistered));
+    assert!(matches!(resp, KennelPayload::TargetRegistered { .. }));
 
     // Register a TUX and list targets
     let tux_kp = Keypair::generate();

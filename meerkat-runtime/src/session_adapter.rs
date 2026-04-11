@@ -882,6 +882,32 @@ impl RuntimeSessionAdapter {
         self.sessions.read().await.contains_key(session_id)
     }
 
+    /// Check whether a session is registered AND has an active RuntimeLoop
+    /// (executor attached with live channels). Sessions registered via
+    /// `prepare_bindings()` / `register_session()` exist in the map but have
+    /// no loop — inputs will queue but never be processed until an executor
+    /// is attached via `ensure_session_with_executor()`.
+    pub async fn session_has_executor(&self, session_id: &SessionId) -> bool {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(session_id)
+            .map(|entry| entry.has_attachment())
+            .unwrap_or(false)
+    }
+
+    /// Check whether a session already has a comms runtime configured.
+    ///
+    /// Returns `true` if `update_peer_ingress_context` was previously called
+    /// with a non-None comms runtime for this session (e.g., via
+    /// `SessionRuntime::enable_comms_drain`).
+    pub async fn session_has_comms(&self, session_id: &SessionId) -> bool {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(session_id)
+            .map(|entry| entry.comms_runtime.is_some())
+            .unwrap_or(false)
+    }
+
     /// Cancel the currently-running turn for a registered session.
     pub async fn interrupt_current_run(
         &self,

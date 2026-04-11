@@ -215,9 +215,9 @@ pub struct SessionRuntime {
     config_runtime: Option<Arc<meerkat_core::ConfigRuntime>>,
     runtime_adapter: Arc<RuntimeSessionAdapter>,
     /// Notification sink for event forwarding to the RPC transport.
-    /// Used by lazy executor registration in start_turn_via_runtime.
-    #[allow(dead_code)]
-    notification_sink: crate::router::NotificationSink,
+    /// Wrapped in `RwLock` so it can be updated when a new TCP client
+    /// connects (each connection has its own transport sink).
+    notification_sink: StdRwLock<crate::router::NotificationSink>,
     skill_identity_registry: Arc<StdRwLock<SkillIdentityRegistryState>>,
     #[cfg(feature = "mob")]
     mob_state: StdRwLock<Option<Arc<meerkat_mob_mcp::MobMcpState>>>,
@@ -315,7 +315,7 @@ impl SessionRuntime {
             backend: None,
             config_runtime: None,
             runtime_adapter,
-            notification_sink,
+            notification_sink: StdRwLock::new(notification_sink),
             skill_identity_registry: Arc::new(StdRwLock::new(SkillIdentityRegistryState {
                 generation: 0,
                 registry: SourceIdentityRegistry::default(),
@@ -378,7 +378,7 @@ impl SessionRuntime {
             backend: None,
             config_runtime: None,
             runtime_adapter,
-            notification_sink,
+            notification_sink: StdRwLock::new(notification_sink),
             skill_identity_registry: Arc::new(StdRwLock::new(SkillIdentityRegistryState {
                 generation: 0,
                 registry: SourceIdentityRegistry::default(),
@@ -984,6 +984,43 @@ impl SessionRuntime {
         self.mob_state.read().ok().and_then(|slot| slot.clone())
     }
 
+    /// Replace the notification sink used by lazily-created session executors.
+    ///
+    /// Called by `serve_tcp_connection` when a new TCP client connects — each
+    /// connection has its own transport writer so the sink must be updated to
+    /// route events to the currently-connected client.
+    pub fn set_notification_sink(&self, sink: crate::router::NotificationSink) {
+        if let Ok(mut slot) = self.notification_sink.write() {
+            *slot = sink;
+        }
+    }
+
+    /// Wire an external comms runtime as the peer-ingress source for a session.
+    ///
+    /// This enables the session to receive incoming comms messages (peer
+    /// requests/responses) between turns. The session must already be
+    /// registered via `create_session` (which calls `prepare_bindings`).
+    ///
+    /// The comms drain starts once an executor is attached (i.e., on the first
+    /// `turn/start`). Calling this before the first turn is safe — the drain
+    /// context is stored and will be reconciled when the executor materializes.
+    ///
+    /// Used by the kennel hive agent where the comms runtime is shared at the
+    /// factory level (not per-session via `comms_name`).
+    #[cfg(feature = "comms")]
+    pub async fn enable_comms_drain(
+        self: &Arc<Self>,
+        session_id: &meerkat_core::types::SessionId,
+        comms_runtime: Arc<dyn meerkat_core::agent::CommsRuntime>,
+    ) {
+        // Only store the comms context — don't create an executor yet.
+        // The executor is created lazily on first turn/start, and it needs
+        // the per-connection notification sink (not the startup noop sink).
+        self.runtime_adapter
+            .update_peer_ingress_context(session_id, true, Some(comms_runtime))
+            .await;
+    }
+
     pub fn set_skill_identity_registry(&self, registry: SourceIdentityRegistry) {
         if let Ok(mut slot) = self.skill_identity_registry.write() {
             slot.registry = registry;
@@ -1007,8 +1044,12 @@ impl SessionRuntime {
         self: &Arc<Self>,
         session_id: &SessionId,
     ) -> Result<(), RpcError> {
-        if !self.runtime_adapter.contains_session(session_id).await {
-            let session_exists = self.pending.read().await.contains_key(session_id)
+        // Check for a live executor (not just registration). Sessions
+        // registered via `prepare_bindings()` exist in the adapter map but
+        // have no RuntimeLoop — inputs would queue without being processed.
+        if !self.runtime_adapter.session_has_executor(session_id).await {
+            let session_exists = self.runtime_adapter.contains_session(session_id).await
+                || self.pending.read().await.contains_key(session_id)
                 || self.service.read(session_id).await.is_ok()
                 || self
                     .load_persisted_session(session_id)
@@ -1023,10 +1064,15 @@ impl SessionRuntime {
                     data: None,
                 });
             }
+            let sink = self
+                .notification_sink
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             let executor = Box::new(crate::session_executor::SessionRuntimeExecutor::new(
                 Arc::clone(self),
                 session_id.clone(),
-                self.notification_sink.clone(),
+                sink,
             ));
             self.runtime_adapter
                 .ensure_session_with_executor(session_id.clone(), executor)
@@ -1149,11 +1195,18 @@ impl SessionRuntime {
             };
             let comms_rt = self.service.comms_runtime(session_id).await;
             if keep_alive && comms_rt.is_none() {
-                return Err(RpcError {
-                    code: error::INVALID_PARAMS,
-                    message: "keep_alive requires a session created with comms_name".to_string(),
-                    data: None,
-                });
+                // Check if the runtime adapter already has comms configured
+                // for this session (e.g., via enable_comms_drain). If so,
+                // the session-service comms check is not authoritative.
+                let adapter_has_comms = self.runtime_adapter.session_has_comms(session_id).await;
+                if !adapter_has_comms {
+                    return Err(RpcError {
+                        code: error::INVALID_PARAMS,
+                        message: "keep_alive requires a session created with comms_name"
+                            .to_string(),
+                        data: None,
+                    });
+                }
             }
             // Persist explicit override so subsequent inheriting calls observe it.
             if keep_alive_override.is_some() {
@@ -1162,9 +1215,14 @@ impl SessionRuntime {
                     .await
                     .map_err(session_error_to_rpc)?;
             }
-            self.runtime_adapter
-                .update_peer_ingress_context(session_id, keep_alive, comms_rt)
-                .await;
+            // Only update peer ingress if we have something to set — don't
+            // downgrade a session that already has comms drain via
+            // enable_comms_drain().
+            if comms_rt.is_some() || keep_alive {
+                self.runtime_adapter
+                    .update_peer_ingress_context(session_id, keep_alive, comms_rt)
+                    .await;
+            }
         }
 
         let (outcome, handle) = self

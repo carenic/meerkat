@@ -203,8 +203,11 @@ pub async fn handle_start(
     // Lazy-register executor if not already registered.
     // This handles cases where session/create used deferred mode or
     // the session was created before the runtime adapter was active.
+    // Use session_has_executor (not contains_session) because sessions
+    // registered via prepare_bindings() exist in the map but have no
+    // RuntimeLoop — inputs would queue without being processed.
     if runtime_adapter.runtime_mode() == meerkat_runtime::RuntimeMode::V9Compliant
-        && !runtime_adapter.contains_session(&session_id).await
+        && !runtime_adapter.session_has_executor(&session_id).await
     {
         let executor = Box::new(crate::session_executor::SessionRuntimeExecutor::new(
             runtime.clone(),

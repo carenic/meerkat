@@ -17,7 +17,7 @@
 //! ## Keys
 //! Tab=mode  Up/Down=target  PgUp/PgDn=scroll  End=auto-scroll  Esc=quit
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,6 +71,9 @@ struct TargetView {
     phase: TargetPhase,
     /// Channel to cancel background notification listener.
     _cancel_tx: Option<mpsc::Sender<()>>,
+    /// Cached model IDs from the last `/models` catalog fetch. Used to
+    /// validate `/model <name>` before persisting a potentially bad name.
+    known_models: HashSet<String>,
 }
 
 impl TargetView {
@@ -85,6 +88,7 @@ impl TargetView {
             handling_mode: HandlingMode::Steer,
             phase: TargetPhase::Disconnected,
             _cancel_tx: None,
+            known_models: HashSet::new(),
         }
     }
 
@@ -359,8 +363,10 @@ async fn rpc_command_loop(
                 tokio::spawn(async move {
                     let (ntf_tx, mut ntf_rx) = mpsc::unbounded_channel::<Value>();
                     match RpcClient::connect(&rpc_addr, ntf_tx).await {
-                        Ok(client) => {
-                            // Send initialize handshake before anything else.
+                        Ok(mut client) => {
+                            // Set a generous timeout for turns that involve
+                            // multiple tool calls + LLM reasoning.
+                            client.set_request_timeout(Duration::from_secs(300));
                             if let Err(e) = client
                                 .request("initialize", serde_json::json!({}))
                                 .await
@@ -386,6 +392,8 @@ async fn rpc_command_loop(
                             // Drain notifications
                             let event_tx2 = event_tx.clone();
                             let tid2 = tid.clone();
+                            let clients2 = clients.clone();
+                            let this_client = client.clone();
                             tokio::spawn(async move {
                                 while let Some(notification) = ntf_rx.recv().await {
                                     let method = notification
@@ -408,11 +416,31 @@ async fn rpc_command_loop(
                                         _ => {}
                                     }
                                 }
-                                let _ = event_tx2
-                                    .send(TuiEvent::TargetDisconnected {
-                                        target_id: tid2,
-                                    })
-                                    .await;
+                                // Remove dead client, but only if no newer
+                                // connection has already replaced it.
+                                let was_current = {
+                                    let mut map = clients2.lock().await;
+                                    if let Some(existing) = map.get(&tid2) {
+                                        if Arc::ptr_eq(existing, &this_client) {
+                                            map.remove(&tid2);
+                                            true
+                                        } else {
+                                            false // newer connection already replaced us
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                };
+                                // Only fire TargetDisconnected if we were still the
+                                // active client — a newer connection should not be
+                                // overridden by a stale disconnect event.
+                                if was_current {
+                                    let _ = event_tx2
+                                        .send(TuiEvent::TargetDisconnected {
+                                            target_id: tid2,
+                                        })
+                                        .await;
+                                }
                             });
                         }
                         Err(e) => {
@@ -775,7 +803,8 @@ async fn rpc_command_loop(
                         map.get(&target_id).cloned()
                     };
                     let Some(client) = client else { return };
-                    // Try to find an existing session to resume
+                    let is_hive = target_id == "hive";
+                    // Try to find an existing session to resume.
                     if let Ok(list_result) = client
                         .request("session/list", serde_json::json!({}))
                         .await
@@ -801,8 +830,6 @@ async fn rpc_command_loop(
                             }
                         }
                     }
-                    // No existing session — create new (deferred)
-                    let is_hive = target_id == "hive";
                     let mut params = serde_json::json!({
                         "prompt": "",
                         "initial_turn": "deferred",
@@ -821,8 +848,6 @@ async fn rpc_command_loop(
                              to the appropriate targets and collect their responses.\n\
                              Always check peers first to see who is available.".into()
                         );
-                        params["keep_alive"] = Value::Bool(true);
-                        params["comms_name"] = Value::String("hive".into());
                     }
                     if let Some(m) = model {
                         params["model"] = Value::String(m);
@@ -1318,8 +1343,10 @@ async fn spawn_kennel_client(
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         }
-        let hive_rpc_addr = match &env.payload {
-            KennelPayload::TuxRegistered { hive_rpc_addr } => hive_rpc_addr.clone(),
+        let (hive_rpc_addr, hive_session_id) = match &env.payload {
+            KennelPayload::TuxRegistered { hive_rpc_addr, hive_session_id } => {
+                (hive_rpc_addr.clone(), hive_session_id.clone())
+            }
             _ => {
                 let _ = event_tx
                     .send(TuiEvent::KennelError(format!(
@@ -1340,6 +1367,16 @@ async fn spawn_kennel_client(
                     rpc_addr: addr.clone(),
                 })
                 .await;
+            // Pre-bind the hive session so ResumeLatestOrCreate doesn't
+            // create a new session (the kennel already created it).
+            if let Some(sid) = hive_session_id {
+                let _ = event_tx
+                    .send(TuiEvent::SessionBound {
+                        target_id: "hive".into(),
+                        session_id: sid,
+                    })
+                    .await;
+            }
             // Auto-connect to hive RPC
             let _ = _rpc_command_tx.send(RpcCommand::Connect {
                 target_id: "hive".into(),
@@ -1861,6 +1898,7 @@ fn process_event(
         TuiEvent::ModelCatalog { target_id, catalog } => {
             if let Some(idx) = app.find_target_by_id(&target_id) {
                 let mut lines = vec!["**Available models:**".to_string(), String::new()];
+                let mut model_ids = HashSet::new();
                 // The catalog response has { providers: [{ provider, default_model_id, models: [...] }] }
                 if let Some(providers) = catalog.get("providers").and_then(|v| v.as_array()) {
                     for provider_entry in providers {
@@ -1878,6 +1916,7 @@ fn process_event(
                                 let id = model.get("id").and_then(|v| v.as_str()).unwrap_or("?");
                                 let name = model.get("display_name").and_then(|v| v.as_str()).unwrap_or(id);
                                 lines.push(format!("  `{id}` -- {name}"));
+                                model_ids.insert(id.to_string());
                             }
                         }
                         lines.push(String::new());
@@ -1885,6 +1924,7 @@ fn process_event(
                 } else {
                     lines.push("(unexpected catalog format)".into());
                 }
+                app.targets[idx].known_models = model_ids;
                 app.targets[idx].push_section(lines);
             }
         }
@@ -2180,8 +2220,9 @@ fn handle_key(
                     app.targets[idx].push_notice("error", "no session; use /new first");
                     return;
                 }
-                // Kennel claim check
-                if app.transport == TransportMode::Kennel {
+                // Kennel claim check (skip for hive — it's directly connected
+                // via RPC, not brokered through the kennel claim protocol).
+                if app.transport == TransportMode::Kennel && target.target_id != "hive" {
                     let tid = &target.target_id;
                     if !matches!(
                         app.target_states.get(tid),
@@ -2314,8 +2355,18 @@ fn handle_slash_command(
             }
         }
         "/model" if !arg.is_empty() => {
-            app.pending_model = Some(arg.to_string());
             if let Some(t) = app.targets.get_mut(idx) {
+                // Validate against cached model catalog (if available).
+                if !t.known_models.is_empty() && !t.known_models.contains(arg) {
+                    t.push_notice(
+                        "error",
+                        &format!(
+                            "unknown model '{arg}'. Run /models to see available models."
+                        ),
+                    );
+                    return;
+                }
+                app.pending_model = Some(arg.to_string());
                 t.push_notice("model", &format!("next turn will use model: {arg}"));
                 // Also push to server if we have a session
                 if let Some(session_id) = t.session_id.clone() {

@@ -58,6 +58,10 @@ pub struct RpcServer<R, W> {
     long_running_tx: mpsc::Sender<LongRunningResponse>,
     long_running_rx: mpsc::Receiver<LongRunningResponse>,
     request_executor: SurfaceRequestExecutor,
+    /// When true, skip runtime shutdown on EOF. Used by `serve_tcp` where the
+    /// runtime is shared across sequential connections and must not be destroyed
+    /// when a single client disconnects.
+    pub skip_shutdown_on_eof: bool,
 }
 
 impl<R: AsyncBufRead + Unpin, W: TransportWriter> RpcServer<R, W> {
@@ -100,6 +104,10 @@ impl<R: AsyncBufRead + Unpin, W: TransportWriter> RpcServer<R, W> {
             registered_tools.clone(),
         );
 
+        // Update the runtime's notification sink so that lazily-created
+        // session executors forward events to the current transport.
+        runtime.set_notification_sink(notification_sink.clone());
+
         let router = MethodRouter::new(runtime, config_store, notification_sink)
             .with_skill_runtime(skill_runtime);
         Self {
@@ -116,6 +124,7 @@ impl<R: AsyncBufRead + Unpin, W: TransportWriter> RpcServer<R, W> {
             long_running_tx,
             long_running_rx,
             request_executor: SurfaceRequestExecutor::new(tokio::time::Duration::from_secs(5)),
+            skip_shutdown_on_eof: false,
         }
     }
 
@@ -175,6 +184,7 @@ impl<R: AsyncBufRead + Unpin, W: TransportWriter> RpcServer<R, W> {
             long_running_tx,
             long_running_rx,
             request_executor: SurfaceRequestExecutor::new(tokio::time::Duration::from_secs(5)),
+            skip_shutdown_on_eof: false,
         }
     }
 
@@ -341,9 +351,12 @@ impl<R: AsyncBufRead + Unpin, W: TransportWriter> RpcServer<R, W> {
             }
         }
 
-        // Graceful shutdown: close all sessions.
+        // Graceful shutdown: close all sessions (unless this is a shared TCP
+        // runtime where client disconnect should not destroy state).
         self.request_executor.shutdown_and_abort_stragglers().await;
-        self.router.runtime().shutdown().await;
+        if !self.skip_shutdown_on_eof {
+            self.router.runtime().shutdown().await;
+        }
         Ok(())
     }
 
@@ -535,15 +548,15 @@ pub async fn serve_tcp_connection(
     let reader = BufReader::new(read_half);
     let mut server =
         RpcServer::new_with_skill_runtime(reader, write_half, runtime, config_store, skill_runtime);
+    server.skip_shutdown_on_eof = true;
     server.run().await
 }
 
-/// Listen on a TCP address and serve one RPC client at a time.
+/// Listen on a TCP address and serve RPC clients concurrently.
 ///
-/// Each accepted connection gets a dedicated `RpcServer` with its own
-/// session runtime. The listener runs until the returned handle is dropped
-/// or the address becomes unavailable. Connections are served sequentially
-/// — when one client disconnects, the next is accepted.
+/// Each accepted connection is spawned into its own task with a dedicated
+/// `RpcServer` sharing the underlying `SessionRuntime`. This ensures a
+/// dead client (missing TCP FIN after kill) does not block new connections.
 pub async fn serve_tcp(
     addr: &str,
     runtime: Arc<SessionRuntime>,
@@ -555,18 +568,17 @@ pub async fn serve_tcp(
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         tracing::info!("RPC client connected from {peer_addr}");
-        if let Err(e) = serve_tcp_connection(
-            stream,
-            Arc::clone(&runtime),
-            Arc::clone(&config_store),
-            skill_runtime.clone(),
-        )
-        .await
-        {
-            tracing::warn!("RPC client {peer_addr} disconnected: {e}");
-        } else {
-            tracing::info!("RPC client {peer_addr} disconnected cleanly");
-        }
+        let runtime = Arc::clone(&runtime);
+        let config_store = Arc::clone(&config_store);
+        let skill_runtime = skill_runtime.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serve_tcp_connection(stream, runtime, config_store, skill_runtime).await
+            {
+                tracing::warn!("RPC client {peer_addr} disconnected: {e}");
+            } else {
+                tracing::info!("RPC client {peer_addr} disconnected cleanly");
+            }
+        });
     }
 }
 

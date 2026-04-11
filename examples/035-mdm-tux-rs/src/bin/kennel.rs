@@ -92,6 +92,13 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("bind kennel listener at {listen}"))?;
     let state = Arc::new(Mutex::new(KennelState::default()));
 
+    // Resolve the externally-reachable IP for addresses advertised to TUX
+    // and targets. If --listen is 0.0.0.0:PORT, probe the default route.
+    let kennel_host = listen.rsplit_once(':').map(|(h, _)| h).unwrap_or(&listen);
+    let advertise_ip = find_flag(&args, "--advertise")
+        .unwrap_or_else(|| resolve_advertise_ip(kennel_host)
+            .unwrap_or_else(|_| kennel_host.to_string()));
+
     // ── Hive agent: CommsRuntime ────────────────────────────────────────────
     let hive_comms_config = meerkat_comms::ResolvedCommsConfig {
         enabled: true,
@@ -140,6 +147,15 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&hive_dir).await?;
     let session_dir = hive_dir.join("sessions");
     tokio::fs::create_dir_all(&session_dir).await?;
+
+    // Add a sentinel peer so comms tools are never gated out at build time.
+    // Real peers are added dynamically when targets register.
+    hive_comms_runtime.upsert_trusted_peer(meerkat_comms::TrustedPeer {
+        name: "__sentinel__".into(),
+        pubkey: hive_comms_runtime.public_key(),
+        addr: "inproc://sentinel".into(),
+        meta: meerkat_comms::PeerMeta::default(),
+    });
 
     // ── Hive agent: AgentFactory + Config ───────────────────────────────────
     let hive_factory = meerkat::AgentFactory::new(&session_dir)
@@ -214,6 +230,72 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ── Create hive session (long-lived, resumed on restart) ─────────────
+    // The hive session is created BEFORE the mob, so it's always the first
+    // session and won't be confused with mob-spawned member sessions.
+    // It uses the shared comms runtime (no comms_name) so target peers
+    // registered on the factory runtime are visible.
+    // ── Create hive session directly on SessionRuntime ────────────────────
+    let hive_session_id: Option<String> = {
+        // Check for existing sessions (resume on restart)
+        let existing = hive_runtime.list_sessions(Default::default()).await;
+        let resumed_id = existing
+            .into_iter()
+            .next()
+            .map(|s| s.session_id.to_string());
+        if let Some(ref sid) = resumed_id {
+            eprintln!("[kennel] hive session resumed: {sid}");
+            resumed_id
+        } else {
+            let mut build = meerkat::AgentBuildConfig::new("gpt-5.4".to_string());
+            build.system_prompt = Some(
+                "You are the hive orchestrator for a fleet of managed target agents.\n\
+                 Use the 'peers' tool to discover which targets are connected.\n\
+                 Use 'send_request' to dispatch tasks to targets and collect responses.\n\
+                 Use 'send_message' for fire-and-forget notifications.\n\
+                 Always check peers first to see who is available before dispatching work."
+                    .to_string(),
+            );
+            build.override_builtins = meerkat_core::ToolCategoryOverride::Enable;
+            build.override_shell = meerkat_core::ToolCategoryOverride::Enable;
+            build.override_mob = meerkat_core::ToolCategoryOverride::Enable;
+            match hive_runtime.create_session(build, None, None).await {
+                Ok(sid) => {
+                    let sid_str = sid.to_string();
+                    eprintln!("[kennel] hive session created: {sid_str}");
+                    // Verify the session is accessible
+                    let sessions = hive_runtime.list_sessions(Default::default()).await;
+                    eprintln!("[kennel] sessions after create: {}", sessions.len());
+                    for s in &sessions {
+                        eprintln!("[kennel]   session: {} state={:?}", s.session_id, s.state);
+                    }
+                    Some(sid_str)
+                }
+                Err(e) => {
+                    eprintln!("[kennel] failed to create hive session: {e:?}");
+                    None
+                }
+            }
+        }
+    };
+
+    // ── Enable comms drain on hive session ────────────────────────────────
+    // The hive session uses the factory's shared comms runtime (no comms_name),
+    // so keep_alive / update_peer_ingress_context can't be set through the
+    // normal turn/start path. Wire the drain explicitly so the hive receives
+    // incoming peer requests/responses between turns.
+    if let Some(ref sid) = hive_session_id {
+        let uuid = uuid::Uuid::parse_str(sid).expect("hive session id is valid uuid");
+        let session_id = meerkat_core::types::SessionId(uuid);
+        hive_runtime
+            .enable_comms_drain(
+                &session_id,
+                Arc::clone(&hive_comms_runtime) as Arc<dyn meerkat_core::agent::CommsRuntime>,
+            )
+            .await;
+        eprintln!("[kennel] hive comms drain enabled for {sid}");
+    }
+
     // ── Create hive mob (external backend) ────────────────────────────────
     let hive_mob_id: Option<MobId> = {
         let mut profiles = BTreeMap::new();
@@ -251,7 +333,7 @@ async fn main() -> anyhow::Result<()> {
             backend: BackendConfig {
                 default: MobBackendKind::External,
                 external: Some(ExternalBackendConfig {
-                    address_base: format!("tcp://0.0.0.0:{hive_comms_port}"),
+                    address_base: format!("tcp://{advertise_ip}:{hive_comms_port}"),
                 }),
             },
             flows: BTreeMap::new(),
@@ -280,18 +362,18 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let hive_rpc_addr = format!("tcp://{advertise_ip}:{hive_rpc_port}");
+    let hive_comms_addr = format!("tcp://{advertise_ip}:{hive_comms_port}");
+
     println!("=== MCM Kennel ===");
     println!("listen    : {listen}");
     println!("kennel_id : {kennel_id}");
-    println!("hive_rpc  : tcp://0.0.0.0:{hive_rpc_port}");
-    println!("hive_comms: tcp://0.0.0.0:{hive_comms_port}");
+    println!("advertise : {advertise_ip}");
+    println!("hive_rpc  : {hive_rpc_addr}");
+    println!("hive_comms: {hive_comms_addr}");
     if let Some(mob_id) = &hive_mob_id {
         println!("hive_mob  : {mob_id}");
     }
-
-    // Use the kennel's listen host for the hive RPC address (not 0.0.0.0)
-    let kennel_host = listen.rsplit_once(':').map(|(h, _)| h).unwrap_or(&listen);
-    let hive_rpc_addr = format!("tcp://{kennel_host}:{hive_rpc_port}");
 
     tokio::spawn(run_janitor(
         state.clone(),
@@ -305,8 +387,11 @@ async fn main() -> anyhow::Result<()> {
         let keypair = keypair.clone();
         let kennel_id = kennel_id.clone();
         let hive_rpc_addr = hive_rpc_addr.clone();
+        let hive_comms_addr_c = hive_comms_addr.clone();
+        let hive_sid = hive_session_id.clone();
         let mob_state = Arc::clone(&hive_mob_state_for_kennel);
         let mob_id = hive_mob_id.clone();
+        let hive_comms = Arc::clone(&hive_comms_runtime);
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
                 stream,
@@ -314,8 +399,11 @@ async fn main() -> anyhow::Result<()> {
                 keypair,
                 kennel_id,
                 hive_rpc_addr,
+                hive_comms_addr_c,
+                hive_sid,
                 mob_state,
                 mob_id,
+                hive_comms,
             )
             .await
             {
@@ -338,8 +426,11 @@ async fn handle_connection(
     keypair: Arc<meerkat_comms::identity::Keypair>,
     kennel_id: String,
     hive_rpc_addr: String,
+    hive_comms_addr: String,
+    hive_session_id: Option<String>,
     hive_mob_state: Arc<MobMcpState>,
     hive_mob_id: Option<MobId>,
+    hive_comms_runtime: Arc<meerkat_comms::CommsRuntime>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -398,7 +489,10 @@ async fn handle_connection(
                         let reply = build_signed_envelope(
                             &keypair,
                             &kennel_id,
-                            KennelPayload::TargetRegistered,
+                            KennelPayload::TargetRegistered {
+                                hive_pubkey: Some(hive_comms_runtime.public_key().to_peer_id()),
+                                hive_comms_addr: Some(hive_comms_addr.clone()),
+                            },
                         )?;
                         let _ = tx.send(reply);
                         {
@@ -412,6 +506,19 @@ async fn handle_connection(
                             );
                         }
                         session_kind = Some(SessionKind::Target(target_id.clone()));
+
+                        // Always update trusted peer on (re-)registration so the
+                        // hive has the target's current comms address.
+                        if let Ok(pk) = meerkat_comms::identity::PubKey::from_peer_id(pubkey) {
+                            hive_comms_runtime.upsert_trusted_peer(
+                                meerkat_comms::TrustedPeer {
+                                    name: name.clone(),
+                                    pubkey: pk,
+                                    addr: direct_addr.clone(),
+                                    meta: meerkat_comms::PeerMeta::default(),
+                                },
+                            );
+                        }
 
                         // Spawn target as external mob member in the hive fleet.
                         if let Some(mob_id) = &hive_mob_id {
@@ -434,7 +541,7 @@ async fn handle_connection(
                                 }
                                 Err(e) => {
                                     eprintln!(
-                                        "[kennel] failed to spawn {name} in hive mob: {e}"
+                                        "[kennel] mob spawn {name}: {e} (peer still updated)"
                                     );
                                 }
                             }
@@ -474,6 +581,7 @@ async fn handle_connection(
                     &kennel_id,
                     KennelPayload::TuxRegistered {
                         hive_rpc_addr: Some(hive_rpc_addr.clone()),
+                        hive_session_id: hive_session_id.clone(),
                     },
                 )?;
                 let _ = tx.send(reply);
@@ -1301,4 +1409,22 @@ fn find_flag(args: &[String], flag: &str) -> Option<String> {
     args.iter()
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1).cloned())
+}
+
+/// Resolve the externally-reachable IP for this host.
+///
+/// If `listen_host` is a wildcard (`0.0.0.0` or `::`), probe the default
+/// route via a non-sending UDP connect to discover the LAN-facing IP.
+/// Otherwise return `listen_host` as-is.
+fn resolve_advertise_ip(listen_host: &str) -> anyhow::Result<String> {
+    if listen_host == "0.0.0.0" || listen_host == "::" || listen_host.is_empty() {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0")
+            .context("bind UDP probe socket")?;
+        // Connect to a well-known external address (doesn't send any data).
+        sock.connect("8.8.8.8:80")
+            .context("UDP probe to discover local IP")?;
+        Ok(sock.local_addr()?.ip().to_string())
+    } else {
+        Ok(listen_host.to_string())
+    }
 }

@@ -93,7 +93,15 @@ pub enum KennelPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attached_tux_id: Option<String>,
     },
-    TargetRegistered,
+    TargetRegistered {
+        /// Hive agent's comms pubkey — the target should add this as a trusted
+        /// peer so the hive can send comms messages to it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hive_pubkey: Option<String>,
+        /// Hive agent's comms address (tcp://host:port).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hive_comms_addr: Option<String>,
+    },
     TargetRegistrationRejected {
         reason: TargetRegistrationRejectReason,
         message: String,
@@ -109,6 +117,9 @@ pub enum KennelPayload {
         /// RPC address for the kennel-resident hive agent (if available).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hive_rpc_addr: Option<String>,
+        /// Session ID for the hive agent (pre-created by kennel).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hive_session_id: Option<String>,
     },
     ListTargets {
         scope: ListScope,
