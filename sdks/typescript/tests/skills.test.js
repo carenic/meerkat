@@ -294,19 +294,52 @@ describe("Skills v2.1", () => {
     assert.deepEqual(client.unmatchedStandaloneStreamBuffer.get("stream-1"), [{ event_id: "e1" }]);
   });
 
-  it("setConfig returns the config envelope response", async () => {
+  it("config wrappers preserve config envelope metadata fields", async () => {
     const client = new MeerkatClient();
     const calls = [];
     client.request = async (method, params) => {
       calls.push({ method, params });
-      return { config: { agent: { model: "x" } }, generation: 3 };
+      return {
+        config: { agent: { model: "x" } },
+        generation: 3,
+        realm_id: "realm-alpha",
+        instance_id: "instance-42",
+        backend: "sqlite",
+        resolved_paths: {
+          root: "/tmp/realm-alpha",
+          config: "/tmp/realm-alpha/config.toml",
+        },
+      };
     };
 
-    const response = await client.setConfig({ agent: { model: "x" } }, { expectedGeneration: 2 });
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].method, "config/set");
-    assert.equal(calls[0].params.expected_generation, 2);
-    assert.equal(response.generation, 3);
+    const getResponse = await client.getConfig();
+    const setResponse = await client.setConfig(
+      { agent: { model: "x" } },
+      { expectedGeneration: 2 },
+    );
+    const patchResponse = await client.patchConfig(
+      { agent: { max_tokens_per_turn: 4096 } },
+      { expectedGeneration: 3 },
+    );
+
+    assert.equal(calls.length, 3);
+    assert.equal(calls[0].method, "config/get");
+    assert.deepEqual(calls[0].params, {});
+    assert.equal(calls[1].method, "config/set");
+    assert.equal(calls[1].params.expected_generation, 2);
+    assert.equal(calls[2].method, "config/patch");
+    assert.equal(calls[2].params.expected_generation, 3);
+
+    for (const response of [getResponse, setResponse, patchResponse]) {
+      assert.equal(response.generation, 3);
+      assert.equal(response.realmId, "realm-alpha");
+      assert.equal(response.instanceId, "instance-42");
+      assert.equal(response.backend, "sqlite");
+      assert.deepEqual(response.resolvedPaths, {
+        root: "/tmp/realm-alpha",
+        config: "/tmp/realm-alpha/config.toml",
+      });
+    }
   });
 
 
