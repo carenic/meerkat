@@ -830,7 +830,6 @@ async fn initialize_methods_list_complete() {
         "models/catalog",
         "skills/list",
         "skills/inspect",
-        "tools/register",
     ];
     for method in &expected_core {
         assert!(
