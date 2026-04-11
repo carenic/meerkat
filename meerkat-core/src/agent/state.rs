@@ -605,11 +605,12 @@ where
                         } else {
                             Arc::from([])
                         };
-                        let (control_tool_names, deferred_tool_names) =
-                            if exact_catalog && matches!(catalog_mode, ToolCatalogMode::Deferred) {
-                                let catalog = current_catalog
-                                    .as_ref()
-                                    .expect("exact catalog should be captured above");
+                        let (control_tool_names, deferred_tool_names) = match (
+                            exact_catalog,
+                            matches!(catalog_mode, ToolCatalogMode::Deferred),
+                            current_catalog.as_ref(),
+                        ) {
+                            (true, true, Some(catalog)) => {
                                 let control_names = catalog
                                     .iter()
                                     .filter(|entry| entry.plane == ToolPlaneClass::Control)
@@ -627,12 +628,12 @@ where
                                     .map(|entry| entry.tool.name.clone())
                                     .collect();
                                 (control_names, deferred_names)
-                            } else {
-                                (
-                                    std::collections::HashSet::new(),
-                                    std::collections::HashSet::new(),
-                                )
-                            };
+                            }
+                            _ => (
+                                std::collections::HashSet::new(),
+                                std::collections::HashSet::new(),
+                            ),
+                        };
                         match self.tool_scope.apply_staged_projection(
                             dispatcher_tools.clone(),
                             control_tool_names,
