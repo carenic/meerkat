@@ -251,7 +251,7 @@ Throws `MeerkatError` with code `"CAPABILITY_UNAVAILABLE"` if the capability is 
 async getConfig(): Promise<ConfigEnvelope>
 ```
 
-Returns a config envelope: `{ config, generation, metadata? }`.
+Returns a config envelope: `{ config, generation, realmId?, instanceId?, backend?, resolvedPaths? }`.
 
 ### setConfig(config)
 

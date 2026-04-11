@@ -346,7 +346,10 @@ export interface Capability {
 export interface ConfigEnvelope {
   readonly config: Record<string, unknown>;
   readonly generation: number;
-  readonly metadata?: Record<string, unknown>;
+  readonly realmId?: string;
+  readonly instanceId?: string;
+  readonly backend?: string;
+  readonly resolvedPaths?: Readonly<Record<string, string>>;
 }
 
 export interface CommsSendReceipt extends Record<string, unknown> {

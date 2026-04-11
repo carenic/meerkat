@@ -1723,14 +1723,22 @@ export class MeerkatClient {
       data.config && typeof data.config === "object"
         ? (data.config as Record<string, unknown>)
         : {};
-    const metadata =
-      data.metadata && typeof data.metadata === "object"
-        ? (data.metadata as Record<string, unknown>)
+    const rawResolvedPaths =
+      data.resolved_paths && typeof data.resolved_paths === "object"
+        ? (data.resolved_paths as Record<string, unknown>)
         : undefined;
+    const resolvedPaths = rawResolvedPaths
+      ? Object.fromEntries(
+          Object.entries(rawResolvedPaths).map(([key, value]) => [key, String(value)]),
+        )
+      : undefined;
     return {
       config: rawConfig,
       generation: Number(data.generation ?? 0),
-      metadata,
+      realmId: data.realm_id != null ? String(data.realm_id) : undefined,
+      instanceId: data.instance_id != null ? String(data.instance_id) : undefined,
+      backend: data.backend != null ? String(data.backend) : undefined,
+      resolvedPaths,
     };
   }
 
