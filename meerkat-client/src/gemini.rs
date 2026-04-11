@@ -331,6 +331,21 @@ impl GeminiClient {
             }]);
         }
 
+        // Inject provider-native google_search tool from provider_params.
+        // google_search is a separate tools array element alongside functionDeclarations.
+        // Bool(false) and Null are treated as explicit disable; only objects are injected.
+        if let Some(ref params) = request.provider_params
+            && let Some(gs) = params.get("google_search")
+            && gs.is_object()
+        {
+            match body.get_mut("tools").and_then(|v| v.as_array_mut()) {
+                Some(arr) => arr.push(serde_json::json!({"google_search": gs})),
+                None => {
+                    body["tools"] = Value::Array(vec![serde_json::json!({"google_search": gs})]);
+                }
+            }
+        }
+
         Ok(body)
     }
 
@@ -2509,6 +2524,81 @@ mod tests {
             Some("iVBOR..."),
             "image base64 data should be preserved"
         );
+        Ok(())
+    }
+
+    // =========================================================================
+    // Google search tool injection tests
+    // =========================================================================
+
+    #[test]
+    fn test_google_search_alongside_functions() -> Result<(), Box<dyn std::error::Error>> {
+        use meerkat_core::ToolDef;
+        use std::sync::Arc;
+
+        let client = GeminiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gemini-1.5-pro",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_tools(vec![Arc::new(ToolDef::new(
+            "my_tool",
+            "A test tool",
+            serde_json::json!({"type": "object", "properties": {}}),
+        ))])
+        .with_provider_params(serde_json::json!({"google_search": {}}));
+        let body = client.build_request_body(&request)?;
+        let tools = body["tools"].as_array().expect("tools should be array");
+        assert_eq!(
+            tools.len(),
+            2,
+            "should have functionDeclarations + google_search"
+        );
+        assert!(
+            tools[0].get("functionDeclarations").is_some(),
+            "first element should be functionDeclarations"
+        );
+        assert!(
+            tools[1].get("google_search").is_some(),
+            "second element should be google_search"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_google_search_alone() -> Result<(), Box<dyn std::error::Error>> {
+        let client = GeminiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gemini-1.5-pro",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_provider_params(serde_json::json!({"google_search": {}}));
+        let body = client.build_request_body(&request)?;
+        let tools = body["tools"].as_array().expect("tools should be array");
+        assert_eq!(tools.len(), 1, "should have only google_search");
+        assert!(tools[0].get("google_search").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn test_no_google_search_when_absent() -> Result<(), Box<dyn std::error::Error>> {
+        use meerkat_core::ToolDef;
+        use std::sync::Arc;
+
+        let client = GeminiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gemini-1.5-pro",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_tools(vec![Arc::new(ToolDef::new(
+            "my_tool",
+            "A test tool",
+            serde_json::json!({"type": "object", "properties": {}}),
+        ))]);
+        let body = client.build_request_body(&request)?;
+        let tools = body["tools"].as_array().expect("tools should be array");
+        assert_eq!(tools.len(), 1, "should only have functionDeclarations");
+        assert!(tools[0].get("functionDeclarations").is_some());
         Ok(())
     }
 }

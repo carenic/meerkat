@@ -35,6 +35,8 @@ pub struct ModelProfile {
     /// Whether the model can process image blocks in tool results.
     /// When false, `view_image` is hidden from the tool list.
     pub image_tool_results: bool,
+    /// Whether the model supports provider-native web search tools.
+    pub supports_web_search: bool,
     /// JSON Schema describing accepted provider-specific parameters.
     pub params_schema: serde_json::Value,
     /// Authoritative default call timeout in seconds for this model family.
@@ -201,5 +203,39 @@ mod tests {
     fn unknown_provider_call_timeout_is_none() {
         // Unknown provider returns None, so no call_timeout_secs
         assert!(profile_for("unknown", "model").is_none());
+    }
+
+    #[test]
+    fn web_search_flag_populated_for_all_catalog_models() {
+        // Every catalog model must have a profile that includes the
+        // supports_web_search field. We don't assert the value — future
+        // models may not support web search.
+        for entry in crate::catalog::catalog() {
+            let profile = profile_for(entry.provider, entry.id);
+            assert!(
+                profile.is_some(),
+                "catalog model '{}' (provider '{}') must have a profile",
+                entry.id,
+                entry.provider
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_supports_web_search() {
+        let profile = profile_for("anthropic", "claude-opus-4-6").unwrap();
+        assert!(profile.supports_web_search);
+    }
+
+    #[test]
+    fn openai_supports_web_search() {
+        let profile = profile_for("openai", "gpt-5.4").unwrap();
+        assert!(profile.supports_web_search);
+    }
+
+    #[test]
+    fn gemini_supports_web_search() {
+        let profile = profile_for("gemini", "gemini-3-flash-preview").unwrap();
+        assert!(profile.supports_web_search);
     }
 }

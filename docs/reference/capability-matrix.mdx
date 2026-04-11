@@ -80,12 +80,36 @@ meerkat = { version = "0.5", features = ["all-providers", "session-store", "sess
 |------------|-------------|-----------|--------|--------|
 | `vision` | Model can process image content in user messages | Yes | Yes | Yes |
 | `image_tool_results` | Model can process image content in tool results | Yes | No | Yes |
+| `supports_web_search` | Model supports provider-native web search tools | Yes | Yes | Yes |
 
 These fields are set in the model catalog (`meerkat-models`) and exposed via `ModelProfile`. They control:
 
 - **`view_image` tool visibility** -- hidden via `ToolScope` when either `vision` or `image_tool_results` is `false`.
 - **`ContentBlock::Image` in tool results** -- providers that do not support `image_tool_results` will receive image content blocks converted to text descriptions.
 - **`ContentBlock::Image` in user messages** -- providers that do not support `vision` will not receive image content blocks in user messages.
+- **Provider-native web search** -- injected by default when `supports_web_search` is `true` and the corresponding `provider_tools.*` config is enabled.
+
+## Provider-native web search
+
+Web search is enabled by default for all catalog models with `supports_web_search: true`. The factory resolves provider-specific tool config at build time and injects it as non-persisted `AgentConfig.provider_tool_defaults`, merged per-turn with explicit `provider_params` via RFC 7396 merge-patch.
+
+| Provider | Tool type | Config key | Default |
+|----------|-----------|------------|---------|
+| Anthropic | `web_search_20250305` | `provider_tools.anthropic.web_search` | `true` |
+| OpenAI | `web_search` | `provider_tools.openai.web_search` | `true` |
+| Gemini | `google_search` | `provider_tools.gemini.google_search` | `true` |
+| Self-hosted | Not wired (v1) | `SelfHostedModelConfig.supports_web_search` | `false` |
+
+**Opt-out:**
+- Config-level: `[provider_tools.anthropic] web_search = false`
+- Per-request: `provider_params: {"web_search": null}` (RFC 7396 null removal)
+- Per-request: `provider_params: {"web_search": false}` (treated as disable)
+
+**Resume behavior:** Tool defaults are re-derived on every build (including resume) from current config and model profile. Config changes take effect immediately on resumed sessions. Explicit `provider_params` overrides are persisted in `SessionMetadata`.
+
+**Extraction turns:** Web search tools are stripped during structured output extraction to maintain the deterministic, tool-free invariant.
+
+**Hook interaction:** Pre-LLM hooks see the merged tool defaults in `HookLlmRequest.provider_params`. Hook patches replace the entire effective params (existing contract).
 
 ## MCP server loading
 
