@@ -1984,7 +1984,7 @@ fn handle_key(
             let body = std::mem::take(&mut app.input);
 
             if is_slash {
-                handle_slash_command(app, &body, rpc_tx, claims);
+                handle_slash_command(app, &body, rpc_tx, claims, kennel_tx);
                 return;
             }
 
@@ -2056,6 +2056,7 @@ fn handle_slash_command(
     body: &str,
     rpc_tx: &mpsc::UnboundedSender<RpcCommand>,
     claims: Option<&ClaimRegistry>,
+    kennel_tx: Option<&mpsc::UnboundedSender<KennelClientCommand>>,
 ) {
     let parts: Vec<&str> = body.splitn(2, ' ').collect();
     let slash = parts[0];
@@ -2178,7 +2179,7 @@ fn handle_slash_command(
             if let Some(claims) = claims {
                 let _ = apply_tkc_event(
                     claims,
-                    None,
+                    kennel_tx,
                     TkcEvent::UserClaimTarget { target_id },
                     |_| (),
                 );
@@ -2195,7 +2196,7 @@ fn handle_slash_command(
                         app.targets[idx].push_user_turn("/release");
                         let _ = apply_tkc_event(
                             claims,
-                            None,
+                            kennel_tx,
                             TkcEvent::UserReleaseLease {
                                 lease_id: lease_id.to_string(),
                             },
