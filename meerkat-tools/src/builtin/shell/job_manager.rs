@@ -232,6 +232,19 @@ impl JobManager {
         self
     }
 
+    /// Bind the manager to a canonical async-op context.
+    ///
+    /// Background shell jobs export detached async-op identities only when they
+    /// are anchored to a real owner session and lifecycle registry.
+    pub fn bind_canonical_async_ops(
+        self,
+        session_id: SessionId,
+        ops_registry: Arc<dyn OpsLifecycleRegistry>,
+    ) -> Self {
+        self.with_owner_session_id(session_id)
+            .with_ops_registry(ops_registry)
+    }
+
     /// Whether background jobs may export canonical async-op identities.
     ///
     /// This is intentionally stricter than "has some registry object": exported

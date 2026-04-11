@@ -6,6 +6,9 @@
 //!
 //! Tests use `/bin/sh` for portability and hermetic execution.
 
+use meerkat_core::ops_lifecycle::OpsLifecycleRegistry;
+use meerkat_core::types::SessionId;
+use meerkat_runtime::RuntimeOpsLifecycleRegistry;
 use meerkat_tools::builtin::BuiltinTool;
 use meerkat_tools::builtin::shell::{
     JobId, JobManager, JobStatus, ShellConfig, ShellError, ShellOutput, ShellTool, ShellToolSet,
@@ -17,6 +20,7 @@ use nix::sys::signal::kill;
 #[cfg(unix)]
 use nix::unistd::Pid;
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -40,6 +44,11 @@ fn create_sh_config(temp_dir: &TempDir) -> ShellConfig {
         security_patterns: vec![],
         env_vars: std::collections::HashMap::new(),
     }
+}
+
+fn create_bound_job_manager(temp_dir: &TempDir) -> JobManager {
+    let registry: Arc<dyn OpsLifecycleRegistry> = Arc::new(RuntimeOpsLifecycleRegistry::new());
+    JobManager::new(create_sh_config(temp_dir)).bind_canonical_async_ops(SessionId::new(), registry)
 }
 
 // ============================================================================
@@ -169,8 +178,7 @@ async fn integration_real_shell_stderr() {
 #[ignore = "lane:e2e-system"]
 async fn integration_real_shell_background_spawn() {
     let temp_dir = TempDir::new().unwrap();
-    let config = create_sh_config(&temp_dir);
-    let job_manager = JobManager::new(config);
+    let job_manager = create_bound_job_manager(&temp_dir);
 
     // Spawn a background job
     let job_id = job_manager
@@ -209,8 +217,7 @@ async fn integration_real_shell_background_spawn() {
 #[ignore = "lane:e2e-system"]
 async fn integration_real_shell_background_completion() {
     let temp_dir = TempDir::new().unwrap();
-    let config = create_sh_config(&temp_dir);
-    let job_manager = JobManager::new(config);
+    let job_manager = create_bound_job_manager(&temp_dir);
 
     // Spawn a quick job
     let job_id = job_manager
@@ -249,8 +256,7 @@ async fn integration_real_shell_background_completion() {
 #[ignore = "lane:e2e-system"]
 async fn integration_real_shell_background_cancel() {
     let temp_dir = TempDir::new().unwrap();
-    let config = create_sh_config(&temp_dir);
-    let job_manager = JobManager::new(config);
+    let job_manager = create_bound_job_manager(&temp_dir);
 
     // Spawn a long-running job
     let job_id = job_manager
@@ -288,8 +294,7 @@ async fn integration_real_shell_background_cancel() {
 #[ignore = "lane:e2e-system"]
 async fn integration_real_shell_multiple_jobs() {
     let temp_dir = TempDir::new().unwrap();
-    let config = create_sh_config(&temp_dir);
-    let job_manager = JobManager::new(config);
+    let job_manager = create_bound_job_manager(&temp_dir);
 
     // Spawn multiple jobs
     let id1 = job_manager
@@ -553,8 +558,7 @@ async fn integration_real_shell_basic_sh_execution() {
 #[ignore = "lane:e2e-system"]
 async fn integration_real_job_manager_basic_sh() {
     let temp_dir = TempDir::new().unwrap();
-    let config = create_sh_config(&temp_dir);
-    let job_manager = JobManager::new(config);
+    let job_manager = create_bound_job_manager(&temp_dir);
 
     // Spawn a quick job
     let job_id = job_manager
@@ -586,8 +590,7 @@ async fn integration_real_job_manager_basic_sh() {
 #[ignore = "lane:e2e-system"]
 async fn integration_real_job_status_after_completion_sh() {
     let temp_dir = TempDir::new().unwrap();
-    let config = create_sh_config(&temp_dir);
-    let job_manager = JobManager::new(config);
+    let job_manager = create_bound_job_manager(&temp_dir);
 
     // Spawn a quick job
     let job_id = job_manager
@@ -636,8 +639,7 @@ async fn integration_real_regression_async_execution_nonblocking() {
     use std::time::Instant;
 
     let temp_dir = TempDir::new().unwrap();
-    let config = create_sh_config(&temp_dir);
-    let job_manager = JobManager::new(config);
+    let job_manager = create_bound_job_manager(&temp_dir);
 
     let start = Instant::now();
 
@@ -684,8 +686,7 @@ async fn integration_real_regression_async_execution_nonblocking() {
 #[ignore = "lane:e2e-system"]
 async fn integration_real_regression_timeout_enforced() {
     let temp_dir = TempDir::new().unwrap();
-    let config = create_sh_config(&temp_dir);
-    let job_manager = JobManager::new(config);
+    let job_manager = create_bound_job_manager(&temp_dir);
 
     // Spawn a job that sleeps longer than the timeout
     let job_id = job_manager
@@ -725,8 +726,7 @@ async fn integration_real_regression_timeout_enforced() {
 #[cfg(unix)]
 async fn integration_real_regression_kill_terminates_process() {
     let temp_dir = TempDir::new().unwrap();
-    let config = create_sh_config(&temp_dir);
-    let job_manager = JobManager::new(config);
+    let job_manager = create_bound_job_manager(&temp_dir);
 
     // Spawn a long-running job
     let job_id = job_manager
@@ -882,11 +882,8 @@ async fn integration_real_regression_truncation_keeps_tail() {
 #[tokio::test]
 #[ignore = "lane:e2e-system"]
 async fn integration_real_regression_concurrent_job_spawning() {
-    use std::sync::Arc;
-
     let temp_dir = TempDir::new().unwrap();
-    let config = create_sh_config(&temp_dir);
-    let job_manager = Arc::new(JobManager::new(config));
+    let job_manager = Arc::new(create_bound_job_manager(&temp_dir));
 
     // Spawn 20 jobs concurrently
     let mut handles = Vec::new();
@@ -944,8 +941,7 @@ async fn integration_real_regression_concurrent_job_spawning() {
 #[ignore = "lane:e2e-system"]
 async fn integration_real_regression_job_cleanup_prevents_leak() {
     let temp_dir = TempDir::new().unwrap();
-    let config = create_sh_config(&temp_dir);
-    let job_manager = JobManager::new(config);
+    let job_manager = create_bound_job_manager(&temp_dir);
 
     // Spawn many jobs that complete quickly
     let mut all_ids = Vec::new();

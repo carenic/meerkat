@@ -1,9 +1,29 @@
-use meerkat_integration_tests::e2e_lanes::run_named_suite;
+use meerkat_integration_tests::e2e_lanes::{run_catalog_scenario, run_named_suite};
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
+
+fn system_lane_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+macro_rules! system_scenario {
+    ($name:ident, $id:literal) => {
+        #[tokio::test(flavor = "current_thread")]
+        async fn $name() {
+            let _guard = system_lane_lock().lock().await;
+            run_catalog_scenario($id)
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+    };
+}
 
 macro_rules! system_suite {
     ($name:ident, $suite:literal) => {
         #[tokio::test(flavor = "current_thread")]
         async fn $name() {
+            let _guard = system_lane_lock().lock().await;
             run_named_suite($suite)
                 .await
                 .unwrap_or_else(|error| panic!("{error}"));
@@ -11,6 +31,10 @@ macro_rules! system_suite {
     };
 }
 
+system_scenario!(
+    e2e_system_s56_rpc_rest_explicit_mob_registry_restores_without_live_api,
+    56
+);
 system_suite!(e2e_system_cli_init_snapshot, "cli-init-snapshot");
 system_suite!(e2e_system_cli_resume_tools, "cli-resume-tools");
 system_suite!(e2e_system_rest_resume_metadata, "rest-resume-metadata");

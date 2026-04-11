@@ -22,6 +22,23 @@ fn workspace_root() -> PathBuf {
 }
 
 fn binary_path(name: &str) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(format!(
+        "RKAT_TEST_BIN_{}",
+        name.replace('-', "_").to_ascii_uppercase()
+    )) {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    if let Some(path) = std::env::var_os(format!("CARGO_BIN_EXE_{name}")) {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
     if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") {
         let target_dir = PathBuf::from(target_dir);
         let candidates = [
@@ -660,8 +677,25 @@ fn history_comms_message_token_count(history: &Value, token: &str) -> usize {
         .flatten()
         .filter(|message| message["role"].as_str() == Some("user"))
         .filter_map(|message| message["content"].as_str())
-        .filter(|content| content.contains("[COMMS MESSAGE"))
-        .map(|content| content.matches(token).count())
+        .map(|content| {
+            let mut total = 0;
+            let mut remaining = content;
+            while let Some(start) = remaining.find("[COMMS ") {
+                remaining = &remaining[start..];
+                let next = remaining[1..]
+                    .find("[COMMS ")
+                    .map(|idx| idx + 1)
+                    .unwrap_or(remaining.len());
+                let block = &remaining[..next];
+                if block.starts_with("[COMMS MESSAGE")
+                    && let Some((_, body)) = block.split_once('\n')
+                {
+                    total += usize::from(body.lines().any(|line| line.trim() == token));
+                }
+                remaining = &remaining[next..];
+            }
+            total
+        })
         .sum()
 }
 
@@ -1912,12 +1946,15 @@ async fn e2e_scenario_55_rpc_rest_callback_peer_storm_resume()
 
     let initialize = pump.call(&mut rpc, "initialize", json!({}), 20).await?;
     assert!(
-        initialize["methods"]
-            .as_array()
-            .is_some_and(|methods| methods
+        initialize["methods"].as_array().is_some_and(|methods| {
+            methods
                 .iter()
-                .any(|entry| entry.as_str() == Some("mob/spawn"))),
-        "rpc initialize should advertise mob methods: {initialize}"
+                .any(|entry| entry.as_str() == Some("session/create"))
+                && methods
+                    .iter()
+                    .any(|entry| entry.as_str() == Some("capabilities/get"))
+        }),
+        "rpc initialize should advertise the core RPC surface: {initialize}"
     );
     eprintln!("[scenario 55] rpc initialized");
 
@@ -2112,18 +2149,19 @@ async fn e2e_scenario_55_rpc_rest_callback_peer_storm_resume()
     pump.respond_callback(&mut rpc, "parent", "PARENT_GATE_RELEASED")
         .await?;
     eprintln!("[scenario 55] parent callback released");
-    let _parent_turn = pump
+    let parent_turn = pump
         .wait_for_response(&mut rpc, parent_turn_id, 180)
         .await?;
-    eprintln!("[scenario 55] parent turn completed");
-
-    let post_parent_history =
-        wait_for_rpc_history_token(&mut pump, &mut rpc, &parent_session_id, &token_a_steer, 30)
-            .await?;
-    eprintln!(
-        "[scenario 55] post-parent history observed steer token (queue visible: {})",
-        has_token(&post_parent_history, &token_b_queue)
+    let parent_turn_text = parent_turn["text"].as_str().unwrap_or_default();
+    assert!(
+        parent_turn_text == "SEEN:",
+        "parent turn should reply with the expected SEEN format: {parent_turn}"
     );
+    assert!(
+        !parent_turn_text.contains(&token_a_steer) && !parent_turn_text.contains(&token_b_queue),
+        "callback-pending turn should not surface peer tokens until the next turn boundary: {parent_turn}"
+    );
+    eprintln!("[scenario 55] parent turn completed");
 
     let helper_a_started = pump
         .call(
@@ -2249,6 +2287,7 @@ async fn e2e_scenario_55_rpc_rest_callback_peer_storm_resume()
 // ===========================================================================
 
 #[tokio::test]
+#[ignore = "lane:e2e-system"]
 async fn rpc_rest_explicit_mob_registry_restores_without_live_api()
 -> Result<(), Box<dyn std::error::Error>> {
     let rkat_rpc = binary_path("rkat-rpc");
@@ -2293,12 +2332,15 @@ async fn rpc_rest_explicit_mob_registry_restores_without_live_api()
 
     let initialize = pump.call(&mut rpc, "initialize", json!({}), 20).await?;
     assert!(
-        initialize["methods"]
-            .as_array()
-            .is_some_and(|methods| methods
+        initialize["methods"].as_array().is_some_and(|methods| {
+            methods
                 .iter()
-                .any(|entry| entry.as_str() == Some("mob/spawn"))),
-        "rpc initialize should advertise mob methods: {initialize}"
+                .any(|entry| entry.as_str() == Some("session/create"))
+                && methods
+                    .iter()
+                    .any(|entry| entry.as_str() == Some("capabilities/get"))
+        }),
+        "rpc initialize should advertise the core RPC surface: {initialize}"
     );
 
     let created = pump

@@ -8,6 +8,11 @@ import { fileURLToPath } from "node:url";
 import { MeerkatRuntime, Session, isKnownEvent, KNOWN_AGENT_EVENT_TYPES } from "@rkat/web";
 import * as rawWasm from "@rkat/web/wasm/meerkat_web_runtime.js";
 
+const WEB_PACKAGE_JSON_URL = new URL("../package.json", import.meta.url);
+const { version: CURRENT_WASM_VERSION } = JSON.parse(
+  await readFile(WEB_PACKAGE_JSON_URL, "utf8"),
+);
+
 async function makeNodeCompatibleWasmModule() {
   const wasmUrl = import.meta.resolve("@rkat/web/wasm/meerkat_web_runtime_bg.wasm");
   const wasmBytes = await readFile(fileURLToPath(wasmUrl));
@@ -278,7 +283,7 @@ test("MeerkatRuntime exposes runtime-scoped tool registration on the instance su
   const wasm = {
     async default() {},
     runtime_version() {
-      return "0.4.13";
+      return CURRENT_WASM_VERSION;
     },
     init_runtime_from_config() {
       return JSON.stringify({ status: "initialized", model: "claude-sonnet-4-5", providers: ["anthropic"] });
@@ -414,7 +419,7 @@ test("MeerkatRuntime forwards canonical mob status/helper methods through the wa
   const wasm = {
     async default() {},
     runtime_version() {
-      return "0.4.13";
+      return CURRENT_WASM_VERSION;
     },
     init_runtime_from_config() {
       return JSON.stringify({ status: "initialized", model: "claude-sonnet-4-5", providers: ["anthropic"] });
