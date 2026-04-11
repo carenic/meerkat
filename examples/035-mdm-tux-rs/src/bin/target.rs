@@ -1323,6 +1323,12 @@ async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
             Arc::clone(&rpc_mob_state),
         )));
         rpc_runtime.set_mob_state(rpc_mob_state);
+        // Wire config runtime so hot-swap (turn/start with model override) can
+        // resolve self-hosted models from the loaded config.
+        rpc_runtime.set_config_runtime(Arc::new(meerkat_core::ConfigRuntime::new(
+            Arc::clone(&rpc_config_store),
+            session_dir.join("rpc_config_state.json"),
+        )));
         let rpc_runtime = Arc::new(rpc_runtime);
         let rpc_config_store_clone = Arc::clone(&rpc_config_store);
         let rpc_runtime_clone = Arc::clone(&rpc_runtime);

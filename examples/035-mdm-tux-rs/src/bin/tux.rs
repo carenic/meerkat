@@ -522,7 +522,18 @@ async fn rpc_command_loop(
                         "handling_mode": mode_str,
                     });
                     if let Some(m) = model {
+                        // Infer provider from model name prefix
+                        let provider = if m.starts_with("claude-") {
+                            "anthropic"
+                        } else if m.starts_with("gpt-") || m.starts_with("o1-") || m.starts_with("o3-") {
+                            "openai"
+                        } else if m.starts_with("gemini-") {
+                            "gemini"
+                        } else {
+                            "self_hosted"
+                        };
                         params["model"] = Value::String(m);
+                        params["provider"] = Value::String(provider.into());
                     }
                     match client.request("turn/start", params).await {
                         Ok(_) => {
