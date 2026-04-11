@@ -12,6 +12,11 @@ use mdm_tux::{
     SignedKennelEnvelope, TargetListEntry, TargetRegistrationRejectReason, build_signed_envelope,
     load_or_generate_keypair, read_envelope, verify_envelope, write_envelope,
 };
+use meerkat_mob::{
+    MeerkatId, MobBackendKind, MobDefinition, MobId, MobRuntimeMode, Profile, ProfileBinding,
+    ProfileName, ToolConfig,
+};
+use meerkat_mob::definition::{BackendConfig, ExternalBackendConfig, SessionCleanupPolicy, WiringRules};
 use meerkat_mob_mcp::{AgentMobToolSurfaceFactory, MobMcpState};
 use meerkat_store::{JsonlStore, MemoryBlobStore, SessionStore};
 use parking_lot::Mutex;
@@ -176,6 +181,7 @@ async fn main() -> anyhow::Result<()> {
         hive_runtime.session_service(),
         Some(hive_runtime.runtime_adapter()),
     ));
+    let hive_mob_state_for_kennel = Arc::clone(&hive_mob_state);
     hive_runtime.set_mob_tools(Arc::new(AgentMobToolSurfaceFactory::new(
         Arc::clone(&hive_mob_state),
     )));
@@ -208,11 +214,80 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ── Create hive mob (external backend) ────────────────────────────────
+    let hive_mob_id: Option<MobId> = {
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            ProfileName::from("target"),
+            ProfileBinding::Inline(Profile {
+                model: "gpt-5.4".to_string(),
+                skills: Vec::new(),
+                tools: ToolConfig {
+                    comms: true,
+                    shell: true,
+                    builtins: true,
+                    ..Default::default()
+                },
+                peer_description: "Managed target agent".to_string(),
+                external_addressable: true,
+                backend: Some(MobBackendKind::External),
+                runtime_mode: MobRuntimeMode::AutonomousHost,
+                max_inline_peer_notifications: None,
+                output_schema: None,
+                provider_params: None,
+            }),
+        );
+
+        let definition = MobDefinition {
+            id: MobId::from("hive-fleet"),
+            orchestrator: None,
+            profiles,
+            mcp_servers: BTreeMap::new(),
+            wiring: WiringRules {
+                auto_wire_orchestrator: true,
+                role_wiring: Vec::new(),
+            },
+            skills: BTreeMap::new(),
+            backend: BackendConfig {
+                default: MobBackendKind::External,
+                external: Some(ExternalBackendConfig {
+                    address_base: format!("tcp://0.0.0.0:{hive_comms_port}"),
+                }),
+            },
+            flows: BTreeMap::new(),
+            topology: None,
+            supervisor: None,
+            limits: None,
+            spawn_policy: None,
+            event_router: None,
+            owner_session_id: None,
+            session_cleanup_policy: SessionCleanupPolicy::Manual,
+            is_implicit: false,
+        };
+
+        match hive_mob_state_for_kennel
+            .mob_create_definition(definition)
+            .await
+        {
+            Ok(mob_id) => {
+                eprintln!("[kennel] hive mob created: {mob_id}");
+                Some(mob_id)
+            }
+            Err(e) => {
+                eprintln!("[kennel] failed to create hive mob: {e}");
+                None
+            }
+        }
+    };
+
     println!("=== MCM Kennel ===");
     println!("listen    : {listen}");
     println!("kennel_id : {kennel_id}");
     println!("hive_rpc  : tcp://0.0.0.0:{hive_rpc_port}");
     println!("hive_comms: tcp://0.0.0.0:{hive_comms_port}");
+    if let Some(mob_id) = &hive_mob_id {
+        println!("hive_mob  : {mob_id}");
+    }
 
     let hive_rpc_addr = format!("0.0.0.0:{hive_rpc_port}");
 
@@ -228,9 +303,19 @@ async fn main() -> anyhow::Result<()> {
         let keypair = keypair.clone();
         let kennel_id = kennel_id.clone();
         let hive_rpc_addr = hive_rpc_addr.clone();
+        let mob_state = Arc::clone(&hive_mob_state_for_kennel);
+        let mob_id = hive_mob_id.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_connection(stream, state, keypair, kennel_id, hive_rpc_addr).await
+            if let Err(e) = handle_connection(
+                stream,
+                state,
+                keypair,
+                kennel_id,
+                hive_rpc_addr,
+                mob_state,
+                mob_id,
+            )
+            .await
             {
                 eprintln!("[kennel] connection error: {e}");
             }
@@ -251,6 +336,8 @@ async fn handle_connection(
     keypair: Arc<meerkat_comms::identity::Keypair>,
     kennel_id: String,
     hive_rpc_addr: String,
+    hive_mob_state: Arc<MobMcpState>,
+    hive_mob_id: Option<MobId>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -323,6 +410,33 @@ async fn handle_connection(
                             );
                         }
                         session_kind = Some(SessionKind::Target(target_id.clone()));
+
+                        // Spawn target as external mob member in the hive fleet.
+                        if let Some(mob_id) = &hive_mob_id {
+                            let member_id =
+                                MeerkatId::from(format!("hive-fleet/target/{name}"));
+                            match hive_mob_state
+                                .mob_spawn(
+                                    mob_id,
+                                    ProfileName::from("target"),
+                                    member_id,
+                                    None,
+                                    Some(MobBackendKind::External),
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    eprintln!(
+                                        "[kennel] spawned {name} as hive mob member"
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[kennel] failed to spawn {name} in hive mob: {e}"
+                                    );
+                                }
+                            }
+                        }
                     }
                     RegisterTargetOutcome::Rejected { reason, message } => {
                         let reply = build_signed_envelope(
@@ -504,13 +618,35 @@ async fn handle_connection(
     writer_task.abort();
 
     if let Some(kind) = session_kind {
-        let mut guard = state.lock();
-        match kind {
+        // Look up the target name before taking the lock for mob retire.
+        let target_name_for_retire = match &kind {
             SessionKind::Target(target_id) => {
-                handle_target_disconnect(&mut guard, &keypair, &kennel_id, &target_id);
+                let guard = state.lock();
+                guard.targets.get(target_id).map(|t| t.name.clone())
             }
-            SessionKind::Tux(tux_id) => {
-                handle_tux_disconnect(&mut guard, &keypair, &kennel_id, &tux_id);
+            _ => None,
+        };
+
+        {
+            let mut guard = state.lock();
+            match &kind {
+                SessionKind::Target(target_id) => {
+                    handle_target_disconnect(&mut guard, &keypair, &kennel_id, target_id);
+                }
+                SessionKind::Tux(tux_id) => {
+                    handle_tux_disconnect(&mut guard, &keypair, &kennel_id, tux_id);
+                }
+            }
+        }
+
+        // Retire the target from the hive mob (async, outside the lock).
+        if let (SessionKind::Target(_), Some(mob_id), Some(name)) =
+            (&kind, &hive_mob_id, target_name_for_retire)
+        {
+            let member_id = MeerkatId::from(format!("hive-fleet/target/{name}"));
+            match hive_mob_state.mob_retire(mob_id, member_id).await {
+                Ok(()) => eprintln!("[kennel] retired {name} from hive mob"),
+                Err(e) => eprintln!("[kennel] failed to retire {name} from hive mob: {e}"),
             }
         }
     }

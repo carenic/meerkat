@@ -2519,6 +2519,7 @@ dependencies = [
  "meerkat-comms",
  "meerkat-core",
  "meerkat-mcp",
+ "meerkat-mob",
  "meerkat-mob-mcp",
  "meerkat-rpc",
  "meerkat-runtime",

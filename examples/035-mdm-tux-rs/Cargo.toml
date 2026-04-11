@@ -23,6 +23,7 @@ meerkat       = { path = "../../meerkat", features = ["comms", "jsonl-store", "m
 meerkat-core  = { path = "../../meerkat-core" }
 meerkat-comms = { path = "../../meerkat-comms" }
 meerkat-mcp   = { path = "../../meerkat-mcp" }
+meerkat-mob     = { path = "../../meerkat-mob" }
 meerkat-mob-mcp = { path = "../../meerkat-mob-mcp" }
 meerkat-rpc   = { path = "../../meerkat-rpc", features = ["mob"] }
 meerkat-runtime = { path = "../../meerkat-runtime" }
