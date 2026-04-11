@@ -264,6 +264,17 @@ impl CatalogControlDispatcher {
                         });
                         continue;
                     }
+                    if !entry.currently_callable {
+                        resolutions.push(ToolCatalogLoadResolution {
+                            name,
+                            accepted: false,
+                            accepted_noop: false,
+                            rejected_reason: Some(
+                                ToolCatalogLoadRejectedReason::TemporarilyUnavailable,
+                            ),
+                        });
+                        continue;
+                    }
 
                     witnesses.insert(
                         name.clone(),
@@ -736,7 +747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_accepts_currently_absent_deferred_names_and_emits_effect() {
+    async fn load_rejects_temporarily_unavailable_deferred_names() {
         let deferred = session_tool("deferred_mcp_tool", "Deferred MCP tool");
         let dispatcher = Arc::new(ExactCatalogDispatcher {
             tools: Arc::from([]),
@@ -763,21 +774,18 @@ mod tests {
             .unwrap();
         let response: LoadResponse = serde_json::from_str(&outcome.result.text_content()).unwrap();
 
-        assert_eq!(
-            response.accepted_names,
-            vec!["deferred_mcp_tool".to_string()]
-        );
+        assert!(response.accepted_names.is_empty());
         assert!(response.noop_names.is_empty());
-        assert_eq!(outcome.session_effects.len(), 1);
-        let SessionEffect::RequestDeferredTools { names, witnesses } = &outcome.session_effects[0]
-        else {
-            unreachable!("unexpected session effect");
-        };
-        assert!(names.contains("deferred_mcp_tool"));
         assert_eq!(
-            witnesses["deferred_mcp_tool"].stable_owner_key.as_deref(),
-            Some("callback:test")
+            response.resolutions,
+            vec![ToolCatalogLoadResolution {
+                name: "deferred_mcp_tool".to_string(),
+                accepted: false,
+                accepted_noop: false,
+                rejected_reason: Some(ToolCatalogLoadRejectedReason::TemporarilyUnavailable),
+            }]
         );
+        assert!(outcome.session_effects.is_empty());
     }
 
     #[tokio::test]

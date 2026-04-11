@@ -73,6 +73,40 @@ fn write_deferred_turn_state(
     })
 }
 
+fn rollback_tool_visibility_state_snapshot(
+    session: &Session,
+) -> Option<meerkat_core::SessionToolVisibilityState> {
+    if let Some(state) = session.tool_visibility_state() {
+        return Some(state);
+    }
+
+    let mut state = meerkat_core::SessionToolVisibilityState::default();
+    let mut changed = false;
+
+    if let Some(raw_filter) = session
+        .metadata()
+        .get(meerkat_core::EXTERNAL_TOOL_FILTER_METADATA_KEY)
+        .cloned()
+        && let Ok(filter) = serde_json::from_value::<meerkat_core::ToolFilter>(raw_filter)
+    {
+        state.active_filter = filter.clone();
+        state.staged_filter = filter;
+        changed = true;
+    }
+
+    if let Some(raw_filter) = session
+        .metadata()
+        .get(meerkat_core::tool_scope::INHERITED_TOOL_FILTER_METADATA_KEY)
+        .cloned()
+        && let Ok(filter) = serde_json::from_value::<meerkat_core::ToolFilter>(raw_filter)
+    {
+        state.inherited_base_filter = filter;
+        changed = true;
+    }
+
+    changed.then_some(state)
+}
+
 fn control_error_into_session_error(err: SessionControlError) -> SessionError {
     match err {
         SessionControlError::Session(session_err) => session_err,
@@ -961,8 +995,8 @@ impl<B: SessionAgentBuilder + 'static> SessionService for PersistentSessionServi
     ) -> Result<(), SessionError> {
         let previous_visibility_state = self
             .export_session_with_labels(id)
-            .await?
-            .tool_visibility_state();
+            .await
+            .map(|session| rollback_tool_visibility_state_snapshot(&session))?;
 
         self.inner.set_session_tool_filter(id, filter).await?;
 
@@ -3980,6 +4014,41 @@ mod tests {
             persisted.tool_visibility_state(),
             baseline.tool_visibility_state(),
             "store should retain the pre-mutation visibility state after rollback"
+        );
+    }
+
+    #[test]
+    fn rollback_snapshot_recovers_legacy_filter_metadata_when_canonical_state_is_absent() {
+        let mut session = Session::new();
+        session.set_metadata(
+            meerkat_core::EXTERNAL_TOOL_FILTER_METADATA_KEY,
+            serde_json::to_value(meerkat_core::ToolFilter::Deny(
+                ["secret".to_string()].into_iter().collect(),
+            ))
+            .unwrap(),
+        );
+        session.set_metadata(
+            meerkat_core::tool_scope::INHERITED_TOOL_FILTER_METADATA_KEY,
+            serde_json::to_value(meerkat_core::ToolFilter::Allow(
+                ["visible".to_string()].into_iter().collect(),
+            ))
+            .unwrap(),
+        );
+
+        let snapshot = rollback_tool_visibility_state_snapshot(&session)
+            .expect("legacy-only metadata should still produce a rollback snapshot");
+
+        assert_eq!(
+            snapshot.active_filter,
+            meerkat_core::ToolFilter::Deny(["secret".to_string()].into_iter().collect())
+        );
+        assert_eq!(
+            snapshot.staged_filter,
+            meerkat_core::ToolFilter::Deny(["secret".to_string()].into_iter().collect())
+        );
+        assert_eq!(
+            snapshot.inherited_base_filter,
+            meerkat_core::ToolFilter::Allow(["visible".to_string()].into_iter().collect())
         );
     }
 

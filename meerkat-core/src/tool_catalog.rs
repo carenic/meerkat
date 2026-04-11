@@ -192,6 +192,7 @@ pub enum ToolCatalogLoadRejectedReason {
     NotDeferredEligible,
     AlreadyRequested,
     NotFilterable,
+    TemporarilyUnavailable,
 }
 
 /// Structured result for one requested catalog name.

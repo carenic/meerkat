@@ -614,11 +614,10 @@ where
                                     .iter()
                                     .filter(|entry| entry.plane == ToolPlaneClass::Control)
                                     .map(|entry| entry.tool.name.clone())
-                                    .collect();
-                                let deferred_names = if matches!(
-                                    catalog_mode,
-                                    ToolCatalogMode::Deferred
-                                ) {
+                                    .collect::<std::collections::HashSet<_>>();
+                                let deferred_names = if !control_names.is_empty()
+                                    && matches!(catalog_mode, ToolCatalogMode::Deferred)
+                                {
                                     catalog
                                                 .iter()
                                                 .filter(|entry| {
@@ -2620,6 +2619,79 @@ mod tests {
         }
     }
 
+    struct DeferredWithoutControlDispatcher {
+        tools: Arc<[Arc<ToolDef>]>,
+        catalog: Arc<[crate::ToolCatalogEntry]>,
+    }
+
+    impl DeferredWithoutControlDispatcher {
+        fn new() -> Self {
+            let secret = Arc::new(ToolDef {
+                name: "secret".to_string(),
+                description: "deferred secret tool that direct AgentBuilder users must still reach without a control plane."
+                    .to_string(),
+                input_schema: serde_json::json!({ "type": "object" }),
+                provenance: Some(crate::ToolProvenance {
+                    kind: crate::ToolSourceKind::Callback,
+                    source_id: "direct-builder".to_string(),
+                }),
+            });
+            let deferred_two = Arc::new(ToolDef {
+                name: "deferred_tool_two".to_string(),
+                description:
+                    "second deferred tool used only to keep the direct builder dispatcher above the adaptive threshold."
+                        .to_string(),
+                input_schema: serde_json::json!({ "type": "object" }),
+                provenance: Some(crate::ToolProvenance {
+                    kind: crate::ToolSourceKind::Callback,
+                    source_id: "direct-builder".to_string(),
+                }),
+            });
+
+            Self {
+                tools: vec![Arc::clone(&secret), Arc::clone(&deferred_two)].into(),
+                catalog: vec![
+                    crate::ToolCatalogEntry::session_deferred(
+                        secret,
+                        true,
+                        "callback:direct-builder".to_string(),
+                    ),
+                    crate::ToolCatalogEntry::session_deferred(
+                        deferred_two,
+                        true,
+                        "callback:direct-builder".to_string(),
+                    ),
+                ]
+                .into(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgentToolDispatcher for DeferredWithoutControlDispatcher {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            Arc::clone(&self.tools)
+        }
+
+        fn tool_catalog_capabilities(&self) -> crate::ToolCatalogCapabilities {
+            crate::ToolCatalogCapabilities {
+                exact_catalog: true,
+                may_require_catalog_control_plane: false,
+            }
+        }
+
+        fn tool_catalog(&self) -> Arc<[crate::ToolCatalogEntry]> {
+            Arc::clone(&self.catalog)
+        }
+
+        async fn dispatch(
+            &self,
+            call: ToolCallView<'_>,
+        ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
+            Ok(ToolResult::new(call.id.to_string(), format!("ran {}", call.name), false).into())
+        }
+    }
+
     struct VisibilityRecordingLlmClient {
         call_count: Mutex<u32>,
         seen_tools: Mutex<Vec<Vec<String>>>,
@@ -3545,6 +3617,31 @@ mod tests {
                 .iter()
                 .any(|names| names.iter().any(|name| name == "deferred_tool")),
             "expected a deferred catalog delta that removes deferred_tool after it is loaded"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_builder_exact_catalog_without_control_plane_keeps_deferred_tools_inline() {
+        let client = Arc::new(VisibilityRecordingLlmClient::new());
+        let tools = Arc::new(DeferredWithoutControlDispatcher::new());
+        let mut agent = AgentBuilder::new()
+            .build(client.clone(), tools, Arc::new(NoopStore))
+            .await;
+        agent.config.max_turns = Some(2);
+
+        let result = agent.run("prompt".to_string().into()).await.unwrap();
+        assert_eq!(result.text, "done");
+
+        let seen = client.seen_tools();
+        assert_eq!(
+            seen[0],
+            vec!["secret".to_string(), "deferred_tool_two".to_string()],
+            "direct AgentBuilder sessions without a composed control plane must keep deferred tools inline"
+        );
+        assert_eq!(
+            seen[1],
+            vec!["secret".to_string(), "deferred_tool_two".to_string()],
+            "boundary recompute must not hide deferred tools when no control plane is available"
         );
     }
 

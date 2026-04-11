@@ -239,8 +239,10 @@ impl AgentBuilder {
                     .iter()
                     .filter(|entry| entry.plane == ToolPlaneClass::Control)
                     .map(|entry| entry.tool.name.clone())
-                    .collect();
-                let deferred_names = if matches!(catalog_mode, ToolCatalogMode::Deferred) {
+                    .collect::<std::collections::HashSet<_>>();
+                let deferred_names = if !control_names.is_empty()
+                    && matches!(catalog_mode, ToolCatalogMode::Deferred)
+                {
                     catalog
                         .iter()
                         .filter(|entry| entry.plane == ToolPlaneClass::Session)
