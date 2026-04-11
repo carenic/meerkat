@@ -105,7 +105,11 @@ pub enum KennelPayload {
         #[serde(default)]
         attached_target_ids: Vec<String>,
     },
-    TuxRegistered,
+    TuxRegistered {
+        /// RPC address for the kennel-resident hive agent (if available).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hive_rpc_addr: Option<String>,
+    },
     ListTargets {
         scope: ListScope,
     },

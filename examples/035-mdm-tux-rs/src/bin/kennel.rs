@@ -12,6 +12,8 @@ use mdm_tux::{
     SignedKennelEnvelope, TargetListEntry, TargetRegistrationRejectReason, build_signed_envelope,
     load_or_generate_keypair, read_envelope, verify_envelope, write_envelope,
 };
+use meerkat_mob_mcp::{AgentMobToolSurfaceFactory, MobMcpState};
+use meerkat_store::{JsonlStore, MemoryBlobStore, SessionStore};
 use parking_lot::Mutex;
 use tokio::io::BufReader;
 use tokio::net::{TcpListener, TcpStream};
@@ -64,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
-        eprintln!("Usage: mdm-kennel --listen HOST:PORT [--data-dir PATH]");
+        eprintln!("Usage: mdm-kennel --listen HOST:PORT [--data-dir PATH] [--hive-rpc-port PORT]");
         std::process::exit(1);
     }
     let listen = find_flag(&args, "--listen")
@@ -85,9 +87,134 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("bind kennel listener at {listen}"))?;
     let state = Arc::new(Mutex::new(KennelState::default()));
 
+    // ── Hive agent: CommsRuntime ────────────────────────────────────────────
+    let hive_comms_config = meerkat_comms::ResolvedCommsConfig {
+        enabled: true,
+        name: "hive".to_string(),
+        inproc_namespace: None,
+        listen_tcp: None,
+        listen_uds: None,
+        event_listen_tcp: None,
+        #[cfg(unix)]
+        event_listen_uds: None,
+        identity_dir: data_dir.join("hive_identity"),
+        trusted_peers_path: data_dir.join("hive_trusted_peers.json"),
+        comms_config: Default::default(),
+        auth: Default::default(),
+        require_peer_auth: true,
+        allow_external_unauthenticated: false,
+    };
+    let mut hive_comms_runtime = meerkat_comms::CommsRuntime::new(hive_comms_config)
+        .await
+        .map_err(|e| anyhow::anyhow!("hive comms runtime: {e}"))?;
+    hive_comms_runtime.set_blob_store(Arc::new(MemoryBlobStore::new()));
+    let hive_comms_runtime = Arc::new(hive_comms_runtime);
+    let hive_comms_port = {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+        let local_addr = listener.local_addr()?;
+        let kp = hive_comms_runtime.router_arc().keypair_arc();
+        let tp = hive_comms_runtime.trusted_peers_shared();
+        let inbox = hive_comms_runtime.router_arc().inbox_sender().clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (kp, tp, sender) = (kp.clone(), tp.clone(), inbox.clone());
+                tokio::spawn(async move {
+                    let snapshot = tp.read().clone();
+                    let _ = meerkat_comms::handle_connection(
+                        stream, true, &kp, &snapshot, &sender,
+                    )
+                    .await;
+                });
+            }
+        });
+        local_addr.port()
+    };
+
+    // ── Hive agent: session directory & persistence ─────────────────────────
+    let hive_dir = data_dir.join("hive");
+    tokio::fs::create_dir_all(&hive_dir).await?;
+    let session_dir = hive_dir.join("sessions");
+    tokio::fs::create_dir_all(&session_dir).await?;
+
+    // ── Hive agent: AgentFactory + Config ───────────────────────────────────
+    let hive_factory = meerkat::AgentFactory::new(&session_dir)
+        .shell(true)
+        .builtins(true)
+        .comms(true)
+        .schedule(true)
+        .mob(true)
+        .with_comms_runtime(Arc::clone(&hive_comms_runtime));
+    let home = dirs::home_dir();
+    let hive_config = meerkat_core::Config::load_from(&session_dir, home.as_deref())
+        .await
+        .unwrap_or_default();
+
+    // ── Hive agent: persistence stores ──────────────────────────────────────
+    let hive_schedule_store = Arc::new(meerkat::SqliteScheduleStore::open(
+        session_dir.join("hive_schedule.sqlite"),
+    )?) as Arc<dyn meerkat::ScheduleStore>;
+    let hive_jsonl = Arc::new(JsonlStore::new(session_dir.to_path_buf()));
+    hive_jsonl.init().await?;
+    let hive_persistence = meerkat::PersistenceBundle::new_with_schedule_store(
+        hive_jsonl as Arc<dyn SessionStore>,
+        None,
+        Arc::new(MemoryBlobStore::new()),
+        hive_schedule_store,
+    );
+
+    // ── Hive agent: SessionRuntime with mob tools ───────────────────────────
+    let hive_config_store: Arc<dyn meerkat_core::ConfigStore> =
+        Arc::new(meerkat_core::MemoryConfigStore::new(hive_config.clone()));
+    let mut hive_runtime = meerkat_rpc::session_runtime::SessionRuntime::new(
+        hive_factory,
+        hive_config,
+        1024,
+        hive_persistence,
+        meerkat_rpc::router::NotificationSink::noop(),
+    );
+    let hive_mob_state = Arc::new(MobMcpState::new_with_runtime_adapter(
+        hive_runtime.session_service(),
+        Some(hive_runtime.runtime_adapter()),
+    ));
+    hive_runtime.set_mob_tools(Arc::new(AgentMobToolSurfaceFactory::new(
+        Arc::clone(&hive_mob_state),
+    )));
+    hive_runtime.set_mob_state(hive_mob_state);
+    hive_runtime.set_config_runtime(Arc::new(meerkat_core::ConfigRuntime::new(
+        Arc::clone(&hive_config_store),
+        session_dir.join("hive_config_state.json"),
+    )));
+    let hive_runtime = Arc::new(hive_runtime);
+
+    // ── Hive agent: RPC TCP server ──────────────────────────────────────────
+    let hive_rpc_port: u16 = find_flag(&args, "--hive-rpc-port")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(4801);
+    {
+        let hive_runtime_clone = Arc::clone(&hive_runtime);
+        let hive_config_store_clone = Arc::clone(&hive_config_store);
+        tokio::spawn(async move {
+            let addr = format!("0.0.0.0:{hive_rpc_port}");
+            if let Err(e) = meerkat_rpc::serve_tcp(
+                &addr,
+                hive_runtime_clone,
+                hive_config_store_clone,
+                None,
+            )
+            .await
+            {
+                eprintln!("[kennel] hive RPC server error: {e}");
+            }
+        });
+    }
+
     println!("=== MCM Kennel ===");
     println!("listen    : {listen}");
     println!("kennel_id : {kennel_id}");
+    println!("hive_rpc  : tcp://0.0.0.0:{hive_rpc_port}");
+    println!("hive_comms: tcp://0.0.0.0:{hive_comms_port}");
+
+    let hive_rpc_addr = format!("0.0.0.0:{hive_rpc_port}");
 
     tokio::spawn(run_janitor(
         state.clone(),
@@ -100,8 +227,11 @@ async fn main() -> anyhow::Result<()> {
         let state = state.clone();
         let keypair = keypair.clone();
         let kennel_id = kennel_id.clone();
+        let hive_rpc_addr = hive_rpc_addr.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, state, keypair, kennel_id).await {
+            if let Err(e) =
+                handle_connection(stream, state, keypair, kennel_id, hive_rpc_addr).await
+            {
                 eprintln!("[kennel] connection error: {e}");
             }
         });
@@ -120,6 +250,7 @@ async fn handle_connection(
     state: Arc<Mutex<KennelState>>,
     keypair: Arc<meerkat_comms::identity::Keypair>,
     kennel_id: String,
+    hive_rpc_addr: String,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -222,8 +353,13 @@ async fn handle_connection(
                         },
                     );
                 }
-                let reply =
-                    build_signed_envelope(&keypair, &kennel_id, KennelPayload::TuxRegistered)?;
+                let reply = build_signed_envelope(
+                    &keypair,
+                    &kennel_id,
+                    KennelPayload::TuxRegistered {
+                        hive_rpc_addr: Some(hive_rpc_addr.clone()),
+                    },
+                )?;
                 let _ = tx.send(reply);
                 session_kind = Some(SessionKind::Tux(tux_id.clone()));
             }
@@ -339,13 +475,20 @@ async fn handle_connection(
                 if !matches!(&session_kind, Some(SessionKind::Tux(_))) {
                     continue;
                 }
-                // STUB: hive agent not yet implemented. Send back an error.
-                eprintln!("[kennel] hive prompt from TUX (stub): {prompt}");
+                // The hive agent is available via the RPC server. Direct TUX
+                // to connect there instead of sending prompts over the kennel
+                // control channel.
+                eprintln!("[kennel] hive prompt via control channel (redirecting to RPC): {prompt}");
                 let reply = build_signed_envelope(
                     &keypair,
                     &kennel_id,
                     KennelPayload::HiveError {
-                        message: "Hive agent not yet implemented".into(),
+                        message: format!(
+                            "Hive agent is available via RPC at {}. \
+                             Connect to the hive RPC port directly instead of \
+                             sending prompts over the kennel control channel.",
+                            hive_rpc_addr,
+                        ),
                     },
                 );
                 if let Ok(env) = reply {

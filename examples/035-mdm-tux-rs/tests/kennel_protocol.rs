@@ -172,7 +172,7 @@ async fn kennel_target_register_and_list() {
     .await
     .unwrap();
     let resp = tux.recv().await.unwrap();
-    assert!(matches!(resp, KennelPayload::TuxRegistered));
+    assert!(matches!(resp, KennelPayload::TuxRegistered { .. }));
 
     tux.send(KennelPayload::ListTargets {
         scope: ListScope::Available,

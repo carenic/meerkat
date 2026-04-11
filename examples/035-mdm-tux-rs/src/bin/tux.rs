@@ -1303,15 +1303,33 @@ async fn spawn_kennel_client(
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         }
-        if !matches!(env.payload, KennelPayload::TuxRegistered) {
+        let hive_rpc_addr = match &env.payload {
+            KennelPayload::TuxRegistered { hive_rpc_addr } => hive_rpc_addr.clone(),
+            _ => {
+                let _ = event_tx
+                    .send(TuiEvent::KennelError(format!(
+                        "[kennel] unexpected register reply: {:?}",
+                        env.payload
+                    )))
+                    .await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        // If the kennel has a hive agent, add it as a connectable target
+        if let Some(addr) = hive_rpc_addr {
             let _ = event_tx
-                .send(TuiEvent::KennelError(format!(
-                    "[kennel] unexpected register reply: {:?}",
-                    env.payload
-                )))
+                .send(TuiEvent::KennelTargetDiscovered {
+                    target_id: "hive".into(),
+                    name: "hive".into(),
+                    rpc_addr: addr.clone(),
+                })
                 .await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            continue;
+            // Auto-connect to hive RPC
+            let _ = _rpc_command_tx.send(RpcCommand::Connect {
+                target_id: "hive".into(),
+                rpc_addr: addr,
+            });
         }
         let _ = apply_tkc_event(
             &claims,
@@ -2174,18 +2192,33 @@ fn handle_key(
                 });
             }
 
-            // Hive mode: send prompt to kennel
+            // Hive mode: dispatch to the "hive" target via RPC (same as Direct)
             else if app.mode == Mode::Hive {
-                if app.transport != TransportMode::Kennel {
-                    app.hive_view.push_notice("error", "hive mode requires kennel transport (--kennel)");
-                    return;
-                }
-                if let Some(ktx) = kennel_tx {
-                    app.hive_view.push_user_turn(&body);
-                    app.hive_planning = true;
-                    let _ = ktx.send(KennelClientCommand::HivePrompt { prompt: body });
+                if let Some(hive_idx) = app.find_target_by_id("hive") {
+                    let hive = &app.targets[hive_idx];
+                    if hive.phase == TargetPhase::Disconnected {
+                        app.targets[hive_idx].push_notice("error", "hive not connected");
+                        return;
+                    }
+                    if hive.session_id.is_none() {
+                        app.targets[hive_idx].push_notice("error", "hive has no session; waiting for connection");
+                        return;
+                    }
+                    let target_id = hive.target_id.clone();
+                    let session_id = hive.session_id.clone().unwrap_or_default();
+                    let handling_mode = hive.handling_mode;
+                    let model = app.pending_model.take();
+                    app.targets[hive_idx].push_user_turn(&body);
+                    app.targets[hive_idx].phase = TargetPhase::Running;
+                    let _ = rpc_tx.send(RpcCommand::StartTurn {
+                        target_id,
+                        session_id,
+                        prompt: body,
+                        handling_mode,
+                        model,
+                    });
                 } else {
-                    app.hive_view.push_notice("error", "kennel not connected");
+                    app.targets.get_mut(0).map(|t| t.push_notice("error", "hive not available (kennel mode required)"));
                 }
             }
         }
@@ -2516,9 +2549,11 @@ fn render_timeline(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mu
     let inner_width = area.width.saturating_sub(2);
     let inner_height = area.height.saturating_sub(2);
 
-    // In Hive mode, show the hive view; in Direct mode, show the selected target.
+    // In Hive mode, show the hive target's view; in Direct mode, show the selected target.
     let target: &TargetView = if app.mode == Mode::Hive {
-        &app.hive_view
+        app.find_target_by_id("hive")
+            .and_then(|idx| app.targets.get(idx))
+            .unwrap_or(&app.hive_view)
     } else if let Some(t) = app.targets.get(app.selected) {
         t
     } else {
