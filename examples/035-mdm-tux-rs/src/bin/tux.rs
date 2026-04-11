@@ -355,6 +355,19 @@ async fn rpc_command_loop(
                     let (ntf_tx, mut ntf_rx) = mpsc::unbounded_channel::<Value>();
                     match RpcClient::connect(&rpc_addr, ntf_tx).await {
                         Ok(client) => {
+                            // Send initialize handshake before anything else.
+                            if let Err(e) = client
+                                .request("initialize", serde_json::json!({}))
+                                .await
+                            {
+                                let _ = event_tx
+                                    .send(TuiEvent::RpcError {
+                                        target_id: tid,
+                                        message: format!("initialize failed: {e}"),
+                                    })
+                                    .await;
+                                return;
+                            }
                             let client = Arc::new(client);
                             {
                                 let mut map = clients.lock().await;
@@ -741,9 +754,15 @@ async fn rpc_command_loop(
 // ── Stream event handling ────────────────────────────────────────────────────
 
 fn handle_stream_event(target: &mut TargetView, params: &Value) {
-    // The stream notification params contain { stream_id, session_id, event: { ... } }.
-    // Unwrap to the actual event, falling back to the params itself for flat events.
-    let event = params.get("event").unwrap_or(params);
+    // Notifications arrive in two shapes:
+    // 1. session/stream_event: { stream_id, session_id, event: { payload: { type, ... } } }
+    // 2. session/event:        { event: { payload: { type, ... } } }
+    // Unwrap to the payload level where the event type lives.
+    let event = params
+        .get("event")
+        .and_then(|e| e.get("payload"))
+        .or_else(|| params.get("event"))
+        .unwrap_or(params);
     let kind = event
         .get("kind")
         .or_else(|| event.get("type"))
