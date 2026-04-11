@@ -65,15 +65,18 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
-    /// Open a TCP connection to `addr` (e.g. `"127.0.0.1:9500"`) and return a
-    /// ready-to-use client.
+    /// Open a TCP connection to `addr` (e.g. `"127.0.0.1:9500"` or
+    /// `"tcp://127.0.0.1:9500"`) and return a ready-to-use client.
     ///
     /// Notifications received from the server are forwarded to `notification_tx`.
     pub async fn connect(
         addr: &str,
         notification_tx: mpsc::UnboundedSender<Value>,
     ) -> Result<Self, RpcError> {
-        let stream = TcpStream::connect(addr)
+        let tcp_addr = addr
+            .strip_prefix("tcp://")
+            .unwrap_or(addr);
+        let stream = TcpStream::connect(tcp_addr)
             .await
             .map_err(|e| RpcError::Transport(e.to_string()))?;
 
