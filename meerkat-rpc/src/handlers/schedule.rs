@@ -580,57 +580,101 @@ mod tests {
 
     #[tokio::test]
     async fn schedule_list_supports_label_filter_and_pagination() {
-        let temp = TempDir::new().expect("temp dir");
+        let temp_result = TempDir::new();
+        assert!(temp_result.is_ok(), "temp dir: {temp_result:?}");
+        let Ok(temp) = temp_result else {
+            return;
+        };
         let runtime = test_runtime(&temp);
 
-        let mut prod = missing_target_schedule_request().expect("valid schedule");
+        let prod_result = missing_target_schedule_request();
+        assert!(prod_result.is_ok(), "valid schedule: {prod_result:?}");
+        let Ok(mut prod) = prod_result else {
+            return;
+        };
         prod.name = Some("prod".to_string());
         prod.labels.insert("env".to_string(), "prod".to_string());
-        runtime
-            .schedule_service()
-            .create(prod)
-            .await
-            .expect("create prod schedule");
+        let create_prod_result = runtime.schedule_service().create(prod).await;
+        assert!(
+            create_prod_result.is_ok(),
+            "create prod schedule: {create_prod_result:?}"
+        );
 
-        let mut dev = missing_target_schedule_request().expect("valid schedule");
+        let dev_result = missing_target_schedule_request();
+        assert!(dev_result.is_ok(), "valid schedule: {dev_result:?}");
+        let Ok(mut dev) = dev_result else {
+            return;
+        };
         dev.name = Some("dev".to_string());
         dev.labels.insert("env".to_string(), "dev".to_string());
-        runtime
-            .schedule_service()
-            .create(dev)
-            .await
-            .expect("create dev schedule");
+        let create_dev_result = runtime.schedule_service().create(dev).await;
+        assert!(
+            create_dev_result.is_ok(),
+            "create dev schedule: {create_dev_result:?}"
+        );
 
-        let raw = schedule_list_raw(json!({
+        let raw_result = schedule_list_raw(json!({
             "labels": { "env": "prod" },
             "limit": 1,
             "offset": 0
-        }))
-        .expect("raw list params");
+        }));
+        assert!(raw_result.is_ok(), "raw list params: {raw_result:?}");
+        let Ok(raw) = raw_result else {
+            return;
+        };
 
         let response = handle_list(Some(RpcId::Num(1)), Some(raw.as_ref()), runtime.clone()).await;
         assert!(response.error.is_none(), "schedule/list should succeed");
-        let result = response.result.expect("schedule/list result");
-        let value: Value = serde_json::from_str(result.get()).expect("valid json");
-        let schedules = value["schedules"].as_array().expect("schedules array");
+        assert!(
+            response.result.is_some(),
+            "schedule/list result should exist"
+        );
+        let Some(result) = response.result else {
+            return;
+        };
+        let value_result: Result<Value, _> = serde_json::from_str(result.get());
+        assert!(value_result.is_ok(), "valid json: {value_result:?}");
+        let Ok(value) = value_result else {
+            return;
+        };
+        let schedules_opt = value["schedules"].as_array();
+        assert!(schedules_opt.is_some(), "schedules array should exist");
+        let Some(schedules) = schedules_opt else {
+            return;
+        };
         assert_eq!(schedules.len(), 1);
         assert_eq!(schedules[0]["name"], "prod");
     }
 
     #[tokio::test]
     async fn schedule_occurrences_honors_include_terminal_flag() {
-        let temp = TempDir::new().expect("temp dir");
+        let temp_result = TempDir::new();
+        assert!(temp_result.is_ok(), "temp dir: {temp_result:?}");
+        let Ok(temp) = temp_result else {
+            return;
+        };
         let runtime = test_runtime(&temp);
-        let request = missing_target_schedule_request().expect("valid schedule request");
-        let schedule = runtime
-            .schedule_service()
-            .create(request)
-            .await
-            .expect("create schedule");
-        runtime
-            .ensure_schedule_host_started()
-            .await
-            .expect("start schedule host");
+        let request_result = missing_target_schedule_request();
+        assert!(
+            request_result.is_ok(),
+            "valid schedule request: {request_result:?}"
+        );
+        let Ok(request) = request_result else {
+            return;
+        };
+        let schedule_result = runtime.schedule_service().create(request).await;
+        assert!(
+            schedule_result.is_ok(),
+            "create schedule: {schedule_result:?}"
+        );
+        let Ok(schedule) = schedule_result else {
+            return;
+        };
+        let start_host_result = runtime.ensure_schedule_host_started().await;
+        assert!(
+            start_host_result.is_ok(),
+            "start schedule host: {start_host_result:?}"
+        );
 
         let occurrence = wait_for_missing_target_misfire(&runtime, &schedule.schedule_id).await;
         assert!(
@@ -638,8 +682,14 @@ mod tests {
             "expected terminal occurrence to be created"
         );
 
-        let exclude_raw =
-            schedule_occurrences_raw(&schedule.schedule_id, false).expect("occurrence params");
+        let exclude_raw_result = schedule_occurrences_raw(&schedule.schedule_id, false);
+        assert!(
+            exclude_raw_result.is_ok(),
+            "occurrence params: {exclude_raw_result:?}"
+        );
+        let Ok(exclude_raw) = exclude_raw_result else {
+            return;
+        };
         let exclude_response = handle_occurrences(
             Some(RpcId::Num(1)),
             Some(exclude_raw.as_ref()),
@@ -650,35 +700,69 @@ mod tests {
             exclude_response.error.is_none(),
             "schedule/occurrences exclude-terminal should succeed"
         );
-        let exclude_result = exclude_response.result.expect("exclude result");
-        let exclude_value: Value =
-            serde_json::from_str(exclude_result.get()).expect("valid exclude json");
-        assert_eq!(
-            exclude_value["occurrences"]
-                .as_array()
-                .expect("occurrence array")
-                .len(),
-            0
+        assert!(
+            exclude_response.result.is_some(),
+            "exclude result should exist"
         );
+        let Some(exclude_result) = exclude_response.result else {
+            return;
+        };
+        let exclude_value_result: Result<Value, _> = serde_json::from_str(exclude_result.get());
+        assert!(
+            exclude_value_result.is_ok(),
+            "valid exclude json: {exclude_value_result:?}"
+        );
+        let Ok(exclude_value) = exclude_value_result else {
+            return;
+        };
+        let exclude_occurrences = exclude_value["occurrences"].as_array();
+        assert!(
+            exclude_occurrences.is_some(),
+            "exclude occurrences array should exist"
+        );
+        let Some(exclude_occurrences) = exclude_occurrences else {
+            return;
+        };
+        assert_eq!(exclude_occurrences.len(), 0);
 
-        let include_raw =
-            schedule_occurrences_raw(&schedule.schedule_id, true).expect("occurrence params");
+        let include_raw_result = schedule_occurrences_raw(&schedule.schedule_id, true);
+        assert!(
+            include_raw_result.is_ok(),
+            "occurrence params: {include_raw_result:?}"
+        );
+        let Ok(include_raw) = include_raw_result else {
+            return;
+        };
         let include_response =
             handle_occurrences(Some(RpcId::Num(1)), Some(include_raw.as_ref()), runtime).await;
         assert!(
             include_response.error.is_none(),
             "schedule/occurrences include-terminal should succeed"
         );
-        let include_result = include_response.result.expect("include result");
-        let include_value: Value =
-            serde_json::from_str(include_result.get()).expect("valid include json");
-        assert_eq!(
-            include_value["occurrences"]
-                .as_array()
-                .expect("occurrence array")
-                .len(),
-            1
+        assert!(
+            include_response.result.is_some(),
+            "include result should exist"
         );
+        let Some(include_result) = include_response.result else {
+            return;
+        };
+        let include_value_result: Result<Value, _> = serde_json::from_str(include_result.get());
+        assert!(
+            include_value_result.is_ok(),
+            "valid include json: {include_value_result:?}"
+        );
+        let Ok(include_value) = include_value_result else {
+            return;
+        };
+        let include_occurrences = include_value["occurrences"].as_array();
+        assert!(
+            include_occurrences.is_some(),
+            "include occurrences array should exist"
+        );
+        let Some(include_occurrences) = include_occurrences else {
+            return;
+        };
+        assert_eq!(include_occurrences.len(), 1);
     }
 
     #[tokio::test]
