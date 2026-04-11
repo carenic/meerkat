@@ -802,6 +802,7 @@ async fn rpc_command_loop(
                         }
                     }
                     // No existing session — create new (deferred)
+                    let is_hive = target_id == "hive";
                     let mut params = serde_json::json!({
                         "prompt": "",
                         "initial_turn": "deferred",
@@ -809,6 +810,20 @@ async fn rpc_command_loop(
                         "enable_shell": true,
                         "enable_mob": true,
                     });
+                    if is_hive {
+                        params["system_prompt"] = Value::String(
+                            "You are the hive orchestrator for a fleet of managed target agents.\n\
+                             Use the 'peers' tool to discover which targets are connected.\n\
+                             Use 'send_request' with handling_mode 'steer' to dispatch tasks to targets. \
+                             Each target will process your request and send back a structured response \
+                             via send_response. Use 'send_message' for fire-and-forget notifications.\n\
+                             When the user asks you to do something across targets, fan the work out \
+                             to the appropriate targets and collect their responses.\n\
+                             Always check peers first to see who is available.".into()
+                        );
+                        params["keep_alive"] = Value::Bool(true);
+                        params["comms_name"] = Value::String("hive".into());
+                    }
                     if let Some(m) = model {
                         params["model"] = Value::String(m);
                     }
