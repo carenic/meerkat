@@ -26,6 +26,7 @@ use meerkat_core::agent::ExternalToolUpdate;
 use meerkat_core::error::ToolError;
 use meerkat_core::event::{ExternalToolDelta, ExternalToolDeltaPhase, ToolConfigChangeOperation};
 use meerkat_core::types::{ToolCallView, ToolDef, ToolResult};
+use meerkat_core::{ToolCatalogCapabilities, ToolCatalogEntry};
 
 use crate::protocol::{RpcId, RpcRequest, RpcResponse};
 
@@ -127,6 +128,28 @@ impl AgentToolDispatcher for CallbackToolDispatcher {
             for t in global.iter() {
                 if !self.inline_names.contains(&t.name) {
                     result.push(Arc::new(t.clone()));
+                }
+            }
+        }
+        result.into()
+    }
+
+    fn tool_catalog_capabilities(&self) -> ToolCatalogCapabilities {
+        ToolCatalogCapabilities {
+            exact_catalog: true,
+        }
+    }
+
+    fn tool_catalog(&self) -> Arc<[ToolCatalogEntry]> {
+        let mut result: Vec<ToolCatalogEntry> = self
+            .inline_tools
+            .iter()
+            .map(|tool| ToolCatalogEntry::session_inline(Arc::new(tool.clone()), true))
+            .collect();
+        if let Ok(global) = self.registered_tools.read() {
+            for tool in global.iter() {
+                if !self.inline_names.contains(&tool.name) {
+                    result.push(callback_catalog_entry(tool.clone()));
                 }
             }
         }
@@ -248,6 +271,16 @@ impl AgentToolDispatcher for CallbackToolDispatcher {
             background_completions: Vec::new(),
         }
     }
+}
+
+fn callback_catalog_entry(tool: ToolDef) -> ToolCatalogEntry {
+    let stable_owner_key = tool
+        .provenance
+        .as_ref()
+        .map(|provenance| format!("{:?}:{}", provenance.kind, provenance.source_id))
+        .unwrap_or_else(|| "Callback:registered".to_string());
+
+    ToolCatalogEntry::session_deferred(Arc::new(tool), true, stable_owner_key)
 }
 
 #[cfg(test)]
@@ -405,6 +438,56 @@ mod tests {
 
         // "shared" appears exactly once (inline wins, global filtered)
         assert_eq!(names.iter().filter(|n| *n == "shared").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_catalog_prefers_inline_winners_and_reports_exact_support() {
+        let (callback_tx, _rx) = mpsc::channel(10);
+        let id_counter = Arc::new(AtomicU64::new(0));
+        let tools = Arc::new(StdRwLock::new(vec![
+            make_tool_def("shared"),
+            make_tool_def("global_only"),
+        ]));
+        let inline = vec![make_tool_def("shared"), make_tool_def("inline_only")];
+
+        let dispatcher = CallbackToolDispatcher::new(tools, callback_tx, id_counter, inline);
+
+        assert!(
+            dispatcher.tool_catalog_capabilities().exact_catalog,
+            "callback dispatcher should expose an exact catalog"
+        );
+
+        let catalog = dispatcher.tool_catalog();
+        let names: Vec<_> = catalog
+            .iter()
+            .map(|entry| entry.tool.name.clone())
+            .collect();
+        assert_eq!(names.len(), 3);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_str() == "shared")
+                .count(),
+            1
+        );
+        assert!(names.contains(&"inline_only".to_string()));
+        assert!(names.contains(&"global_only".to_string()));
+        assert!(matches!(
+            catalog
+                .iter()
+                .find(|entry| entry.tool.name == "shared")
+                .unwrap()
+                .deferred_eligibility,
+            meerkat_core::ToolCatalogDeferredEligibility::InlineOnly
+        ));
+        assert!(matches!(
+            catalog
+                .iter()
+                .find(|entry| entry.tool.name == "global_only")
+                .unwrap()
+                .deferred_eligibility,
+            meerkat_core::ToolCatalogDeferredEligibility::DeferredEligible { .. }
+        ));
     }
 
     #[tokio::test]

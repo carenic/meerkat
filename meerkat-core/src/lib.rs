@@ -59,6 +59,7 @@ pub mod skills;
 pub mod skills_config;
 pub mod state;
 pub mod time_compat;
+pub mod tool_catalog;
 pub mod tool_scope;
 pub mod turn_boundary;
 pub mod turn_execution_authority;
@@ -182,10 +183,11 @@ pub use service::{
 pub use session::{
     DeferredFirstTurnPhase, PendingDeferredPrompt, PendingSystemContextAppend,
     PendingToolResultsMessage, SESSION_BUILD_STATE_KEY, SESSION_DEFERRED_TURN_STATE_KEY,
-    SESSION_SYSTEM_CONTEXT_STATE_KEY, SESSION_VERSION, SYSTEM_CONTEXT_SEPARATOR,
-    SeenSystemContextKey, SeenSystemContextState, Session, SessionBuildState,
-    SessionDeferredTurnState, SessionLlmIdentity, SessionMeta, SessionMetadata,
-    SessionSystemContextState, SessionTooling, SystemContextStageError, ToolCategoryOverride,
+    SESSION_SYSTEM_CONTEXT_STATE_KEY, SESSION_TOOL_VISIBILITY_STATE_KEY, SESSION_VERSION,
+    SYSTEM_CONTEXT_SEPARATOR, SeenSystemContextKey, SeenSystemContextState, Session,
+    SessionBuildState, SessionDeferredTurnState, SessionLlmIdentity, SessionMeta, SessionMetadata,
+    SessionSystemContextState, SessionToolVisibilityState, SessionTooling, SystemContextStageError,
+    ToolCategoryOverride, ToolVisibilityWitness,
 };
 pub use session_recovery::{
     BUILD_ONLY_RECOVERY_OVERRIDE_ERROR, RecoveredSessionBuild, SurfaceSessionRecoveryContext,
@@ -195,6 +197,10 @@ pub use session_recovery::{
 };
 pub use session_store::{SessionFilter, SessionStore, SessionStoreError};
 pub use state::LoopState;
+pub use tool_catalog::{
+    ToolCatalogCapabilities, ToolCatalogDeferredEligibility, ToolCatalogEntry,
+    ToolCatalogLoadRejectedReason, ToolCatalogLoadResolution, ToolPlaneClass,
+};
 pub use tool_scope::{
     ComposedToolFilter, EXTERNAL_TOOL_FILTER_METADATA_KEY, ToolFilter, ToolScope, ToolScopeHandle,
     ToolScopeRevision, ToolScopeStageError,

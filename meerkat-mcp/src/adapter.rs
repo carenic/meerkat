@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use meerkat_core::error::ToolError;
 use meerkat_core::{
-    ExternalToolDelta, ExternalToolUpdate, ToolCallView, ToolDef, ToolResult,
-    agent::AgentToolDispatcher,
+    ExternalToolDelta, ExternalToolUpdate, ToolCallView, ToolCatalogCapabilities, ToolDef,
+    ToolResult, agent::AgentToolDispatcher,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -275,6 +275,14 @@ impl AgentToolDispatcher for McpRouterAdapter {
         self.sync_router_projection(router);
         update
     }
+
+    fn tool_catalog_capabilities(&self) -> ToolCatalogCapabilities {
+        let has_pending = self.has_pending.load(Ordering::Acquire);
+        let is_empty = self.cached_tools().is_empty();
+        ToolCatalogCapabilities {
+            exact_catalog: !has_pending && is_empty,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -321,6 +329,27 @@ mod tests {
             vec![],
             HashMap::new(),
         )
+    }
+
+    #[tokio::test]
+    async fn empty_adapter_reports_exact_catalog_support() {
+        let adapter = McpRouterAdapter::new(McpRouter::new());
+        assert!(
+            adapter.tool_catalog_capabilities().exact_catalog,
+            "empty MCP adapters should preserve exact deferred catalogs on other tool planes"
+        );
+        assert!(adapter.tools().is_empty());
+    }
+
+    #[tokio::test]
+    async fn staging_server_disables_exact_catalog_support() {
+        let adapter = McpRouterAdapter::new(McpRouter::new());
+        adapter.has_pending.store(true, Ordering::Release);
+
+        assert!(
+            !adapter.tool_catalog_capabilities().exact_catalog,
+            "pending MCP state should force the adapter back to non-exact mode"
+        );
     }
 
     #[tokio::test]

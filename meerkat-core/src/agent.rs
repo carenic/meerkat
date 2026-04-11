@@ -28,6 +28,7 @@ use crate::session::Session;
 use crate::state::LoopState;
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
+use crate::tool_catalog::{ToolCatalogCapabilities, ToolCatalogEntry};
 use crate::tool_scope::ToolScope;
 use crate::types::{
     AssistantBlock, BlockAssistantMessage, Message, OutputSchema, StopReason, ToolCallView,
@@ -213,6 +214,29 @@ impl BindOutcome {
 pub trait AgentToolDispatcher: Send + Sync {
     /// Get available tool definitions
     fn tools(&self) -> Arc<[Arc<ToolDef>]>;
+
+    /// Query exact catalog support for this dispatcher.
+    ///
+    /// Dispatchers report `exact_catalog=true` only when `tool_catalog()`
+    /// returns the exact precedence-resolved winner registry for the plane
+    /// they own. Wrappers that cannot prove exactness must leave this false.
+    fn tool_catalog_capabilities(&self) -> ToolCatalogCapabilities {
+        ToolCatalogCapabilities::default()
+    }
+
+    /// Return the precedence-resolved tool catalog for this dispatcher.
+    ///
+    /// The default implementation mirrors `tools()` as a visible-only inline
+    /// catalog. Callers must gate any deferred-catalog behavior on
+    /// `tool_catalog_capabilities().exact_catalog`.
+    fn tool_catalog(&self) -> Arc<[ToolCatalogEntry]> {
+        self.tools()
+            .iter()
+            .map(|tool| ToolCatalogEntry::session_inline(Arc::clone(tool), true))
+            .collect::<Vec<_>>()
+            .into()
+    }
+
     /// Execute a tool call, returning the transcript result and any async operations.
     ///
     /// The `ToolDispatchOutcome` separates transcript data (`result`) from
