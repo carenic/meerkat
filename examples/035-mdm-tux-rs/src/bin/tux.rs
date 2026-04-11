@@ -740,7 +740,10 @@ async fn rpc_command_loop(
 
 // ── Stream event handling ────────────────────────────────────────────────────
 
-fn handle_stream_event(target: &mut TargetView, event: &Value) {
+fn handle_stream_event(target: &mut TargetView, params: &Value) {
+    // The stream notification params contain { stream_id, session_id, event: { ... } }.
+    // Unwrap to the actual event, falling back to the params itself for flat events.
+    let event = params.get("event").unwrap_or(params);
     let kind = event
         .get("kind")
         .or_else(|| event.get("type"))
@@ -1698,14 +1701,40 @@ fn process_event(
         }
         TuiEvent::ModelCatalog { target_id, models } => {
             if let Some(idx) = app.find_target_by_id(&target_id) {
-                let display = serde_json::to_string_pretty(&models)
-                    .unwrap_or_else(|_| models.to_string());
-                app.targets[idx].push_section([
-                    "**Models**".to_string(),
-                    "```text".to_string(),
-                    display,
-                    "```".to_string(),
-                ]);
+                let mut lines = vec!["**Available models:**".to_string(), String::new()];
+                if let Some(entries) = models.get("models").and_then(|v| v.as_array()) {
+                    let mut by_provider: std::collections::BTreeMap<String, Vec<String>> =
+                        std::collections::BTreeMap::new();
+                    for entry in entries {
+                        let provider = entry
+                            .get("provider")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                        let name = entry
+                            .get("display_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(id);
+                        by_provider
+                            .entry(provider.to_string())
+                            .or_default()
+                            .push(format!("  `{id}` -- {name}"));
+                    }
+                    for (provider, models) in &by_provider {
+                        lines.push(format!("*{provider}*"));
+                        for m in models {
+                            lines.push(m.clone());
+                        }
+                        lines.push(String::new());
+                    }
+                } else {
+                    lines.push(format!(
+                        "```text\n{}\n```",
+                        serde_json::to_string_pretty(&models)
+                            .unwrap_or_else(|_| models.to_string())
+                    ));
+                }
+                app.targets[idx].push_section(lines);
             }
         }
         TuiEvent::SessionList {
