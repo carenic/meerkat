@@ -9,10 +9,10 @@
 //! the machine schema in `meerkat-machine-schema/src/catalog/runtime_ingress.rs`:
 //!
 //! - 3 phases: Active, Retired, Destroyed
-//! - 15 inputs: AdmitQueued, AdmitConsumedOnAccept, AdmitDeduplicated, StageDrainSnapshot,
+//! - 16 inputs: AdmitQueued, AdmitConsumedOnAccept, AdmitDeduplicated, StageDrainSnapshot,
 //!   BoundaryApplied, RunCompleted, RunFailed, RunCancelled,
 //!   SupersedeQueuedInput, CoalesceQueuedInputs, Retire, Reset, Destroy,
-//!   Recover, SetSilentIntentOverrides
+//!   Recover, ReconcileTerminalInputs, SetSilentIntentOverrides
 //! - 18 fields: admitted_inputs, admission_order, content_shape, request_id,
 //!   reservation_key, policy_snapshot, handling_mode, lifecycle,
 //!   terminal_outcome, queue, steer_queue, current_run, current_run_contributors,
@@ -156,6 +156,11 @@ pub enum RuntimeIngressInput {
     },
     /// Recover: re-derive transient state from canonical state.
     Recover,
+    /// Reconcile inputs that became terminal outside the ingress authority's
+    /// local retry bookkeeping.
+    ReconcileTerminalInputs {
+        terminal_inputs: Vec<(InputId, InputTerminalOutcome)>,
+    },
     /// Configure silent intent overrides.
     SetSilentIntentOverrides { intents: BTreeSet<String> },
 }
@@ -718,6 +723,9 @@ impl RuntimeIngressAuthority {
             RuntimeIngressInput::Reset => self.eval_reset(phase),
             RuntimeIngressInput::Destroy => self.eval_destroy(phase),
             RuntimeIngressInput::Recover => self.eval_recover(phase),
+            RuntimeIngressInput::ReconcileTerminalInputs { terminal_inputs } => {
+                self.eval_reconcile_terminal_inputs(phase, terminal_inputs)
+            }
 
             RuntimeIngressInput::SetSilentIntentOverrides { intents } => {
                 self.eval_set_silent_intent_overrides(phase, intents)
@@ -1910,6 +1918,66 @@ impl RuntimeIngressAuthority {
         Ok((phase, fields, effects))
     }
 
+    fn eval_reconcile_terminal_inputs(
+        &self,
+        phase: IngressPhase,
+        terminal_inputs: &[(InputId, InputTerminalOutcome)],
+    ) -> Result<
+        (
+            IngressPhase,
+            RuntimeIngressFields,
+            Vec<RuntimeIngressEffect>,
+        ),
+        RuntimeIngressError,
+    > {
+        if !matches!(phase, IngressPhase::Active | IngressPhase::Retired) {
+            return Err(RuntimeIngressError::InvalidTransition {
+                from: phase,
+                input: "ReconcileTerminalInputs".into(),
+            });
+        }
+
+        let mut fields = self.fields.clone();
+        let mut effects = Vec::new();
+
+        for (work_id, outcome) in terminal_inputs {
+            if !fields.admitted_inputs.contains(work_id) {
+                continue;
+            }
+
+            fields.queue.retain(|id| id != work_id);
+            fields.steer_queue.retain(|id| id != work_id);
+
+            let terminal_state = match outcome {
+                InputTerminalOutcome::Consumed => InputLifecycleState::Consumed,
+                InputTerminalOutcome::Superseded { .. } => InputLifecycleState::Superseded,
+                InputTerminalOutcome::Coalesced { .. } => InputLifecycleState::Coalesced,
+                InputTerminalOutcome::Abandoned { .. } => InputLifecycleState::Abandoned,
+            };
+
+            fields.lifecycle.insert(work_id.clone(), terminal_state);
+            fields
+                .terminal_outcome
+                .insert(work_id.clone(), Some(outcome.clone()));
+
+            effects.push(RuntimeIngressEffect::InputLifecycleNotice {
+                work_id: work_id.clone(),
+                new_state: terminal_state,
+            });
+            effects.push(RuntimeIngressEffect::CompletionResolved {
+                work_id: work_id.clone(),
+                outcome: outcome.clone(),
+            });
+        }
+
+        if fields.queue.is_empty() && fields.steer_queue.is_empty() {
+            fields.wake_requested = false;
+            fields.process_requested = false;
+        }
+
+        Ok((phase, fields, effects))
+    }
+
     fn eval_set_silent_intent_overrides(
         &self,
         phase: IngressPhase,
@@ -2470,6 +2538,49 @@ mod tests {
         assert!(auth.queue().contains(&w1));
         assert!(auth.current_run().is_none());
         assert!(auth.wake_requested());
+    }
+
+    #[test]
+    fn reconcile_terminal_inputs_prunes_requeued_terminal_work() {
+        let mut auth = RuntimeIngressAuthority::new();
+        let w1 = InputId::new();
+        admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
+
+        let run_id = RunId::new();
+        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
+            run_id: run_id.clone(),
+            contributing_work_ids: vec![w1.clone()],
+        })
+        .unwrap();
+        auth.apply(RuntimeIngressInput::RunFailed { run_id })
+            .unwrap();
+
+        let transition = auth
+            .apply(RuntimeIngressInput::ReconcileTerminalInputs {
+                terminal_inputs: vec![(
+                    w1.clone(),
+                    InputTerminalOutcome::Abandoned {
+                        reason: crate::input_state::InputAbandonReason::MaxAttemptsExhausted {
+                            attempts: 3,
+                        },
+                    },
+                )],
+            })
+            .expect("reconcile terminal inputs should succeed");
+
+        assert_eq!(
+            auth.lifecycle_state(&w1),
+            Some(InputLifecycleState::Abandoned)
+        );
+        assert!(!auth.queue().contains(&w1));
+        assert!(!auth.wake_requested());
+        assert!(transition.effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeIngressEffect::CompletionResolved {
+                work_id,
+                outcome: InputTerminalOutcome::Abandoned { .. },
+            } if work_id == &w1
+        )));
     }
 
     // ---- RunCancelled ----
