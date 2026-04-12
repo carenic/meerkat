@@ -61,4 +61,6 @@ examples/*/web/dist/
 examples/*/web/public/meerkat-pkg/
 *.png
 artifacts/live_smoke_last_failures.json
+artifacts/deprecated_backend_scan.txt
+artifacts/m0_legacy_surface_inventory.txt
 states/
