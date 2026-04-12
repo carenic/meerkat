@@ -1,7 +1,7 @@
 // Generated wire types for Meerkat SDK
-// Contract version: 0.5.1
+// Contract version: 0.5.2
 
-export const CONTRACT_VERSION = "0.5.1";
+export const CONTRACT_VERSION = "0.5.2";
 
 export interface WireUsage {
   input_tokens: number;
@@ -351,4 +351,5 @@ export interface WireModelProfile {
   supports_reasoning: boolean;
   supports_temperature: boolean;
   supports_thinking: boolean;
+  supports_web_search?: boolean;
 }

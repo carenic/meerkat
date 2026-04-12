@@ -2,14 +2,14 @@ from __future__ import annotations
 
 """Generated wire types for Meerkat SDK.
 
-Contract version: 0.5.1
+Contract version: 0.5.2
 """
 
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
 
-CONTRACT_VERSION = "0.5.1"
+CONTRACT_VERSION = "0.5.2"
 
 
 @dataclass
@@ -429,6 +429,7 @@ class WireModelProfile:
     supports_reasoning: bool = False
     supports_temperature: bool = False
     supports_thinking: bool = False
+    supports_web_search: bool = False
 
 
 # Wire-safe content block (no `source_path` — internal only).

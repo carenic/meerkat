@@ -3,6 +3,12 @@
 
 export type BudgetType = "tokens" | "time" | "tool_calls";
 
+export interface DeferredCatalogDelta {
+  added_hidden_names?: string[];
+  pending_sources?: string[];
+  removed_hidden_names?: string[];
+}
+
 export type HookId = string;
 
 export type HookPatch = {
@@ -47,10 +53,14 @@ export type SkillId = string;
 
 export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filter" | "cancelled";
 
+export type ToolConfigChangeDomain = "tool_scope" | "deferred_catalog";
+
 export type ToolConfigChangeOperation = "add" | "remove" | "reload";
 
 export type ToolConfigChangedPayload = {
   applied_at_turn?: number | null;
+  deferred_catalog_delta?: DeferredCatalogDelta | unknown;
+  domain?: ToolConfigChangeDomain | unknown;
   operation: ToolConfigChangeOperation;
   persisted: boolean;
   status: string;

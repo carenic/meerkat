@@ -10,6 +10,30 @@
         ],
         "type": "string"
       },
+      "DeferredCatalogDelta": {
+        "description": "Additive hidden-catalog delta metadata for runtime notices.",
+        "properties": {
+          "added_hidden_names": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "pending_sources": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "removed_hidden_names": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
       "HookId": {
         "description": "Stable identifier for a configured hook.",
         "type": "string"
@@ -226,6 +250,14 @@
           }
         ]
       },
+      "ToolConfigChangeDomain": {
+        "description": "Optional typed domain for tool-configuration change payloads.",
+        "enum": [
+          "tool_scope",
+          "deferred_catalog"
+        ],
+        "type": "string"
+      },
       "ToolConfigChangeOperation": {
         "description": "Operation kind for live tool configuration changes.",
         "enum": [
@@ -244,6 +276,26 @@
             "type": [
               "integer",
               "null"
+            ]
+          },
+          "deferred_catalog_delta": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/DeferredCatalogDelta"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "domain": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ToolConfigChangeDomain"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "operation": {
@@ -1912,6 +1964,30 @@
         ],
         "type": "string"
       },
+      "DeferredCatalogDelta": {
+        "description": "Additive hidden-catalog delta metadata for runtime notices.",
+        "properties": {
+          "added_hidden_names": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "pending_sources": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "removed_hidden_names": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
       "HookId": {
         "description": "Stable identifier for a configured hook.",
         "type": "string"
@@ -2175,6 +2251,14 @@
           }
         ]
       },
+      "ToolConfigChangeDomain": {
+        "description": "Optional typed domain for tool-configuration change payloads.",
+        "enum": [
+          "tool_scope",
+          "deferred_catalog"
+        ],
+        "type": "string"
+      },
       "ToolConfigChangeOperation": {
         "description": "Operation kind for live tool configuration changes.",
         "enum": [
@@ -2193,6 +2277,26 @@
             "type": [
               "integer",
               "null"
+            ]
+          },
+          "deferred_catalog_delta": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/DeferredCatalogDelta"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "domain": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ToolConfigChangeDomain"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "operation": {
