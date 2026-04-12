@@ -714,28 +714,35 @@ impl EphemeralRuntimeDriver {
     }
 
     pub fn rollback_staged(&mut self, input_ids: &[InputId]) -> Result<(), InputLifecycleError> {
+        let mut terminal_inputs = Vec::new();
+
         for input_id in input_ids {
-            let mut requeue_input = None;
-            let mut is_steer = false;
             if let Some(state) = self.ledger.get_mut(input_id) {
                 match state.apply(InputLifecycleInput::RollbackStaged) {
                     Ok(transition) => {
-                        // Only re-enqueue if the transition went to Queued.
-                        // If max attempts exhausted, the machine transitions
-                        // to Abandoned — do not re-enqueue.
-                        if transition.next_phase == crate::input_state::InputLifecycleState::Queued
+                        if transition.next_phase != crate::input_state::InputLifecycleState::Queued
                         {
-                            requeue_input = state.persisted_input.clone();
-                            is_steer = requeue_input
-                                .as_ref()
-                                .and_then(super::super::input::Input::handling_mode)
-                                == Some(HandlingMode::Steer);
-                        } else {
                             tracing::warn!(
                                 input_id = %input_id,
                                 next_phase = ?transition.next_phase,
                                 "input abandoned after max stage attempts"
                             );
+                            if let Some(outcome) = state.terminal_outcome().cloned() {
+                                terminal_inputs.push((input_id.clone(), outcome.clone()));
+                                if let crate::input_state::InputTerminalOutcome::Abandoned {
+                                    reason,
+                                } = outcome
+                                {
+                                    self.events.push(self.make_envelope(
+                                        RuntimeEvent::InputLifecycle(
+                                            InputLifecycleEvent::Abandoned {
+                                                input_id: input_id.clone(),
+                                                reason: format!("{reason:?}"),
+                                            },
+                                        ),
+                                    ));
+                                }
+                            }
                         }
                     }
                     Err(
@@ -745,16 +752,25 @@ impl EphemeralRuntimeDriver {
                     Err(err) => return Err(err),
                 }
             }
-            if !self.has_queued_input(input_id)
-                && let Some(input) = requeue_input
+        }
+
+        if !terminal_inputs.is_empty() {
+            match self
+                .ingress
+                .apply(RuntimeIngressInput::ReconcileTerminalInputs { terminal_inputs })
             {
-                if is_steer {
-                    self.steer_queue.enqueue(input_id.clone(), input);
-                } else {
-                    self.queue.enqueue(input_id.clone(), input);
+                Ok(transition) => {
+                    self.process_ingress_effects(&transition.effects);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "ingress authority rejected ReconcileTerminalInputs"
+                    );
                 }
             }
         }
+
         self.rebuild_queue_projections();
         self.debug_assert_queue_projection_alignment();
         Ok(())

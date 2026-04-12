@@ -677,9 +677,9 @@ async fn accept_with_executor_triggers_loop() {
     assert!(active.is_empty(), "All inputs should be consumed");
 }
 
-/// Test that a failed executor re-queues the input (not stranded in APC).
+/// Test that a failed executor never strands the input in APC.
 #[tokio::test]
-async fn failed_executor_requeues_input() {
+async fn failed_executor_does_not_strand_input_in_apc() {
     use meerkat_core::lifecycle::core_executor::{
         CoreApplyOutput, CoreExecutor, CoreExecutorError,
     };
@@ -722,12 +722,88 @@ async fn failed_executor_requeues_input() {
     let state = adapter.runtime_state(&sid).await.unwrap();
     assert_eq!(state, RuntimeState::Attached);
 
-    // Input should be rolled back to Queued (not stranded in APC)
+    // Input should roll back or abandon after retry exhaustion, but never
+    // remain stuck in an in-flight lifecycle state.
     let is = adapter.input_state(&sid, &input_id).await.unwrap().unwrap();
+    assert!(
+        matches!(
+            is.current_state(),
+            InputLifecycleState::Queued | InputLifecycleState::Abandoned
+        ),
+        "Failed execution should roll input back or abandon it after retry budget exhaustion, not strand it in AppliedPendingConsumption"
+    );
+}
+
+#[tokio::test]
+async fn failed_executor_stops_retrying_after_stage_budget_exhausted() {
+    use meerkat_core::lifecycle::core_executor::{
+        CoreApplyOutput, CoreExecutor, CoreExecutorError,
+    };
+    use meerkat_core::lifecycle::run_control::RunControlCommand;
+    use meerkat_core::lifecycle::run_primitive::RunPrimitive;
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    struct CountingFailExecutor {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for CountingFailExecutor {
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(CoreExecutorError::ApplyFailed {
+                reason: "always fails".into(),
+            })
+        }
+
+        async fn control(&mut self, _cmd: RunControlCommand) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapter = RuntimeSessionAdapter::ephemeral();
+    let sid = SessionId::new();
+    adapter
+        .register_session_with_executor(
+            sid.clone(),
+            Box::new(CountingFailExecutor {
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .await;
+
+    let input = make_prompt("hello failing forever");
+    let input_id = input.id().clone();
+    adapter.accept_input(&sid, input).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let call_count = calls.load(Ordering::SeqCst);
+    assert!(
+        (1..=3).contains(&call_count),
+        "retry budget should remain bounded; expected 1-3 attempts, saw {call_count}"
+    );
+
+    let state = adapter.input_state(&sid, &input_id).await.unwrap().unwrap();
+    assert!(
+        !matches!(
+            state.current_state(),
+            InputLifecycleState::Staged | InputLifecycleState::AppliedPendingConsumption
+        ),
+        "failed inputs must not remain stuck in an in-flight lifecycle state"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
     assert_eq!(
-        is.current_state(),
-        InputLifecycleState::Queued,
-        "Failed execution should roll input back to Queued, not strand in AppliedPendingConsumption"
+        calls.load(Ordering::SeqCst),
+        call_count,
+        "failed inputs must not keep spinning through fresh run ids"
     );
 }
 
