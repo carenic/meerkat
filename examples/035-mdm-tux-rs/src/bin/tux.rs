@@ -1817,7 +1817,7 @@ fn tui_loop(
 
         while let Ok(ev) = event_rx.try_recv() {
             dirty = true;
-            process_event(&mut app, ev, &rpc_tx, claims.as_deref());
+            process_event(&mut app, ev, &rpc_tx, claims.as_deref(), kennel_tx.as_ref());
         }
 
         if dirty {
@@ -1836,6 +1836,7 @@ fn process_event(
     ev: TuiEvent,
     rpc_tx: &mpsc::UnboundedSender<RpcCommand>,
     claims: Option<&ClaimRegistry>,
+    kennel_tx: Option<&mpsc::UnboundedSender<KennelClientCommand>>,
 ) {
     match ev {
         TuiEvent::TargetConnected { target_id } => {
@@ -1955,7 +1956,8 @@ fn process_event(
                     },
                     |_| (),
                 );
-                // Add any new targets with rpc_addr
+                // Add any new targets with rpc_addr, and auto-reclaim
+                // disconnected targets that reappear as available.
                 for entry in &targets {
                     if let Some(rpc_addr) = &entry.rpc_addr {
                         if app.find_target_by_id(&entry.target_id).is_none() {
@@ -1964,6 +1966,20 @@ fn process_event(
                                 entry.target_id.clone(),
                                 rpc_addr.clone(),
                             ));
+                        } else if let Some(idx) = app.find_target_by_id(&entry.target_id) {
+                            // Target reappeared — update rpc_addr and
+                            // auto-reclaim if disconnected.
+                            app.targets[idx].rpc_addr = rpc_addr.clone();
+                            if app.targets[idx].phase == TargetPhase::Disconnected {
+                                let _ = apply_tkc_event(
+                                    claims,
+                                    kennel_tx,
+                                    TkcEvent::UserClaimTarget {
+                                        target_id: entry.target_id.clone(),
+                                    },
+                                    |_| (),
+                                );
+                            }
                         }
                     }
                     app.target_states
