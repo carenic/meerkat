@@ -1841,9 +1841,15 @@ fn process_event(
     match ev {
         TuiEvent::TargetConnected { target_id } => {
             if let Some(idx) = app.find_target_by_id(&target_id) {
+                let was_disconnected = app.targets[idx].phase == TargetPhase::Disconnected;
                 app.targets[idx].phase = TargetPhase::Idle;
                 let name = app.targets[idx].name.clone();
                 app.targets[idx].push_notice("connected", &format!("RPC connection to {name} established"));
+                // Clear stale session on reconnect — the target may have
+                // restarted with a different session.
+                if was_disconnected {
+                    app.targets[idx].session_id = None;
+                }
                 // Auto-resume latest session or create new
                 if app.targets[idx].session_id.is_none() {
                     let _ = rpc_tx.send(RpcCommand::ResumeLatestOrCreate {
