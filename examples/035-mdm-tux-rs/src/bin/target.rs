@@ -1637,6 +1637,23 @@ async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
                             ))?;
                             bail!("kennel rejected target re-registration ({reason:?}): {message}");
                         }
+                        KennelPayload::PeerWire { peer_name, peer_id, peer_addr } => {
+                            if let Ok(pk) = meerkat_comms::identity::PubKey::from_peer_id(&peer_id) {
+                                comms_runtime.upsert_trusted_peer(meerkat_comms::TrustedPeer {
+                                    name: peer_name.clone(),
+                                    pubkey: pk,
+                                    addr: peer_addr.clone(),
+                                    meta: meerkat_comms::PeerMeta::default(),
+                                });
+                                eprintln!("[target] peer wired: {peer_name} at {peer_addr}");
+                            }
+                        }
+                        KennelPayload::PeerUnwire { peer_id } => {
+                            if let Ok(pk) = meerkat_comms::identity::PubKey::from_peer_id(&peer_id) {
+                                comms_runtime.router_arc().remove_trusted_peer(&pk);
+                                eprintln!("[target] peer unwired: {peer_id}");
+                            }
+                        }
                         _ => {}
                     }
                 }
