@@ -253,6 +253,10 @@ async fn main() -> anyhow::Result<()> {
                  Use the 'peers' tool to discover which targets are connected.\n\
                  Use 'send_request' to dispatch tasks to targets and collect responses.\n\
                  Use 'send_message' for fire-and-forget notifications.\n\
+                 Use 'mob_wire' to create direct comms links between targets so they \
+                 can communicate peer-to-peer without routing through you.\n\
+                 Use 'mob_unwire' to remove peer-to-peer links between targets.\n\
+                 Use 'mob_list_members' to see which targets are in the fleet.\n\
                  Always check peers first to see who is available before dispatching work."
                     .to_string(),
             );
@@ -545,6 +549,43 @@ async fn handle_connection(
                                     eprintln!(
                                         "[kennel] mob spawn {name}: {e} (peer still updated)"
                                     );
+                                }
+                            }
+                        }
+
+                        // Mesh-wire: tell the new target about all existing targets
+                        // and tell each existing target about the new one.
+                        {
+                            let guard = state.lock();
+                            for (tid, rec) in &guard.targets {
+                                if tid == target_id {
+                                    continue;
+                                }
+                                // Tell new target about existing peer
+                                let wire_new = build_signed_envelope(
+                                    &keypair,
+                                    &kennel_id,
+                                    KennelPayload::PeerWire {
+                                        peer_name: rec.name.clone(),
+                                        peer_id: rec.pubkey.clone(),
+                                        peer_addr: rec.direct_addr.clone(),
+                                    },
+                                );
+                                if let Ok(env) = wire_new {
+                                    let _ = tx.send(env);
+                                }
+                                // Tell existing peer about new target
+                                let wire_existing = build_signed_envelope(
+                                    &keypair,
+                                    &kennel_id,
+                                    KennelPayload::PeerWire {
+                                        peer_name: name.clone(),
+                                        peer_id: pubkey.clone(),
+                                        peer_addr: direct_addr.clone(),
+                                    },
+                                );
+                                if let Ok(env) = wire_existing {
+                                    let _ = rec.tx.send(env);
                                 }
                             }
                         }

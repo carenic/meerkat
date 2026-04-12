@@ -195,6 +195,21 @@ pub enum KennelPayload {
     HiveError {
         message: String,
     },
+    /// Kennel tells a target to add another target as a trusted comms peer.
+    /// Sent to both sides when the kennel wires two targets together.
+    PeerWire {
+        /// Human-readable name for the peer (the other target's name).
+        peer_name: String,
+        /// Comms public key of the peer (ed25519 peer ID).
+        peer_id: String,
+        /// Comms transport address of the peer (tcp://host:port).
+        peer_addr: String,
+    },
+    /// Kennel tells a target to remove another target from its trusted peers.
+    PeerUnwire {
+        /// Comms public key of the peer to remove.
+        peer_id: String,
+    },
     Error {
         message: String,
     },
