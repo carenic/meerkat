@@ -76,7 +76,7 @@ impl std::fmt::Display for DisposalStep {
 ///
 /// Steps never re-read the roster — prevents TOCTOU races.
 pub(super) struct DisposalContext {
-    pub meerkat_id: MeerkatId,
+    pub(crate) meerkat_id: MeerkatId,
     pub entry: RosterEntry,
     pub retiring_comms: Option<Arc<dyn CoreCommsRuntime>>,
     pub retiring_key: Option<String>,
@@ -209,7 +209,7 @@ impl ErrorPolicy for AbortOnError {
 mod tests {
     use super::*;
     use crate::event::MemberRef;
-    use crate::ids::ProfileName;
+    use crate::ids::{AgentIdentity, AgentRuntimeId, FenceToken, Generation, ProfileName};
     use crate::roster::MemberState;
     use meerkat_core::types::SessionId;
     use std::collections::BTreeSet;
@@ -218,9 +218,13 @@ mod tests {
         DisposalContext {
             meerkat_id: MeerkatId::from("test-member"),
             entry: RosterEntry {
+                agent_identity: AgentIdentity::from("test-member"),
+                generation: Generation::INITIAL,
+                fence_token: FenceToken::new(0),
+                agent_runtime_id: AgentRuntimeId::initial(AgentIdentity::from("test-member")),
                 meerkat_id: MeerkatId::from("test-member"),
-                profile: ProfileName::from("worker"),
-                member_ref: MemberRef::from_session_id(SessionId::new()),
+                role: ProfileName::from("worker"),
+                member_ref: MemberRef::from_bridge_session_id(SessionId::new()),
                 runtime_mode: crate::MobRuntimeMode::TurnDriven,
                 peer_id: None,
                 state: MemberState::Retiring,

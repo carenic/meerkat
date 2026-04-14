@@ -16,8 +16,8 @@ use meerkat_core::types::{
     ContentInput, SessionId, ToolCallView, ToolDef, ToolProvenance, ToolResult, ToolSourceKind,
 };
 use meerkat_mob::{
-    MeerkatId, MobBackendKind, MobDefinition, MobError, MobId, MobRuntimeMode, ProfileName,
-    SpawnMemberSpec,
+    AgentIdentity, MobBackendKind, MobDefinition, MobError, MobId, MobRuntimeMode, ProfileName,
+    SpawnMemberSpec, SpawnResult, ids::MeerkatId,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -79,7 +79,7 @@ pub struct AgentMobToolSurface {
     /// handle is provided (non-runtime test paths).
     effective_authority: Arc<std::sync::RwLock<MobToolAuthorityContext>>,
     tools: Arc<[Arc<ToolDef>]>,
-    owner_session_id: SessionId,
+    owner_bridge_session_id: SessionId,
     /// Model name inherited by implicit mob helpers.
     model: String,
     /// Parent agent's comms name (for building TrustedPeerSpec when wiring helpers).
@@ -129,6 +129,7 @@ impl AgentMobToolSurface {
                     "description": description,
                 }),
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
+                stream: meerkat_core::comms::InputStreamMode::None,
             })
             .await
             .is_ok()
@@ -140,14 +141,14 @@ impl AgentMobToolSurface {
     /// * `state` - Shared MobMcpState for mob lifecycle operations
     /// * `implicit_mob_id` - Pre-seeded implicit mob ID (resume case)
     /// * `model` - Model name inherited by spawned helpers
-    /// * `owner_session_id` - Session ID of the owning agent
+    /// * `owner_bridge_session_id` - Bridge session ID of the owning agent
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         state: Arc<MobMcpState>,
         implicit_mob_id: Option<MobId>,
         authority_context: MobToolAuthorityContext,
         model: String,
-        owner_session_id: SessionId,
+        owner_bridge_session_id: SessionId,
         comms_name: Option<String>,
         comms_peer_id: Option<String>,
         comms_runtime: Option<Arc<dyn meerkat_core::agent::CommsRuntime>>,
@@ -157,7 +158,7 @@ impl AgentMobToolSurface {
             implicit_mob_id,
             Arc::new(std::sync::RwLock::new(authority_context)),
             model,
-            owner_session_id,
+            owner_bridge_session_id,
             comms_name,
             comms_peer_id,
             comms_runtime,
@@ -175,7 +176,7 @@ impl AgentMobToolSurface {
         implicit_mob_id: Option<MobId>,
         effective_authority: Arc<std::sync::RwLock<MobToolAuthorityContext>>,
         model: String,
-        owner_session_id: SessionId,
+        owner_bridge_session_id: SessionId,
         comms_name: Option<String>,
         comms_peer_id: Option<String>,
         comms_runtime: Option<Arc<dyn meerkat_core::agent::CommsRuntime>>,
@@ -192,7 +193,7 @@ impl AgentMobToolSurface {
             cached_implicit_mob_id: RwLock::new(implicit_mob_id),
             effective_authority,
             tools,
-            owner_session_id,
+            owner_bridge_session_id,
             model,
             comms_name,
             comms_peer_id,
@@ -234,6 +235,14 @@ impl AgentMobToolSurface {
             result: ToolResult::new(call.id.to_string(), content, false),
             async_ops: vec![],
             session_effects,
+        })
+    }
+
+    fn spawn_result_payload(result: &SpawnResult) -> serde_json::Value {
+        json!({
+            "agent_identity": result.agent_identity,
+            "agent_runtime_id": result.agent_runtime_id,
+            "fence_token": result.fence_token,
         })
     }
 
@@ -444,7 +453,7 @@ impl AgentMobToolSurface {
         let (mob_id, first_delegate) = self
             .state
             .ensure_implicit_mob_for_model(
-                &self.owner_session_id.to_string(),
+                &self.owner_bridge_session_id.to_string(),
                 &self.model,
                 cached_mob_id.as_ref(),
             )
@@ -459,7 +468,7 @@ impl AgentMobToolSurface {
     async fn wire_delegate_helper_to_creator(
         &self,
         mob_id: &MobId,
-        meerkat_id: &MeerkatId,
+        identity: &AgentIdentity,
     ) -> bool {
         let Some(name) = self.comms_name.as_ref() else {
             return false;
@@ -483,7 +492,7 @@ impl AgentMobToolSurface {
             .state
             .mob_wire(
                 mob_id,
-                meerkat_id.clone(),
+                identity.clone(),
                 meerkat_mob::PeerTarget::External(parent_spec),
             )
             .await
@@ -496,19 +505,19 @@ impl AgentMobToolSurface {
             return false;
         };
         let roster = handle.roster().await;
-        let Some(entry) = roster.get(meerkat_id) else {
+        let Some(entry) = roster.get_by_identity(identity) else {
             return false;
         };
-        let Some(helper_peer_id) = entry.peer_id.as_ref() else {
+        let Some(helper_peer_id) = entry.peer_id() else {
             return false;
         };
-        let helper_comms_name = format!("{}/{}/{}", mob_id, entry.profile, meerkat_id);
+        let helper_comms_name = format!("{}/{}/{}", mob_id, entry.role, identity);
         if helper_comms_name == *name {
             return false;
         }
         let Ok(helper_spec) = meerkat_core::comms::TrustedPeerSpec::new(
             &helper_comms_name,
-            helper_peer_id.as_str(),
+            helper_peer_id,
             format!("inproc://{helper_comms_name}"),
         ) else {
             return false;
@@ -520,15 +529,16 @@ impl AgentMobToolSurface {
 
         let peer_description = handle
             .definition()
-            .resolve_inline_profile(&entry.profile)
+            .resolve_inline_profile(&entry.role)
             .map(|profile| profile.peer_description.as_str())
             .unwrap_or("delegate helper");
-        let Some(helper_session_id) = entry.member_ref.session_id() else {
+        let Some(helper_bridge_session_id) = handle.resolve_bridge_session_id(identity).await
+        else {
             return false;
         };
         let helper_runtime = meerkat_core::service::SessionServiceCommsExt::comms_runtime(
             self.state.session_service().as_ref(),
-            helper_session_id,
+            &helper_bridge_session_id,
         )
         .await;
         let Some(helper_runtime) = helper_runtime else {
@@ -538,8 +548,8 @@ impl AgentMobToolSurface {
         let notify_parent = Self::notify_peer_added(
             &helper_runtime,
             name,
-            meerkat_id.as_str(),
-            entry.profile.as_str(),
+            identity.as_str(),
+            entry.role.as_str(),
             peer_description,
         )
         .await;
@@ -587,12 +597,12 @@ impl AgentMobToolSurface {
         }
 
         // Build spawn spec
-        let meerkat_id = MeerkatId::from(
+        let identity = AgentIdentity::from(
             args.member_id
                 .unwrap_or_else(|| format!("helper-{}", uuid::Uuid::new_v4())),
         );
         // Implicit mob always uses the "delegate" profile.
-        let mut spec = SpawnMemberSpec::new(ProfileName::from("delegate"), meerkat_id.clone());
+        let mut spec = SpawnMemberSpec::new(ProfileName::from("delegate"), identity.clone());
         spec.initial_message = Some(ContentInput::Text(args.task));
         spec.runtime_mode = Some(MobRuntimeMode::AutonomousHost);
         // Don't use auto_wire_parent — it requires an orchestrator member in the roster.
@@ -614,7 +624,7 @@ impl AgentMobToolSurface {
         spec.override_profile = resolved.override_profile;
 
         // Spawn via MobMcpState
-        let member_ref = self
+        let spawn_result = self
             .state
             .mob_spawn_spec(&mob_id, spec)
             .await
@@ -624,16 +634,13 @@ impl AgentMobToolSurface {
         // 1. Wire helper → parent: helper trusts parent as external peer
         // 2. Wire parent → helper: parent trusts helper so it can receive messages
         let wired = self
-            .wire_delegate_helper_to_creator(&mob_id, &meerkat_id)
+            .wire_delegate_helper_to_creator(&mob_id, &identity)
             .await;
 
-        let mut result = json!({
-            "mob_id": mob_id,
-            "meerkat_id": meerkat_id,
-            "member_ref": member_ref,
-            "session_id": member_ref.session_id(),
-            "wired": wired,
-        });
+        let mut result = Self::spawn_result_payload(&spawn_result);
+        result["mob_id"] = json!(mob_id);
+        result["agent_identity"] = json!(identity);
+        result["wired"] = json!(wired);
 
         if first_delegate {
             let notice = if wired {
@@ -669,7 +676,7 @@ impl AgentMobToolSurface {
         // cleanup policy.
         let mut definition = args.definition;
         definition.clear_internal_lifecycle_flags();
-        definition.mark_session_scoped(&self.owner_session_id.to_string());
+        definition.mark_owner_bridge_session_indexed(&self.owner_bridge_session_id.to_string());
 
         let mob_id = self
             .state
@@ -747,7 +754,7 @@ impl AgentMobToolSurface {
             spec.override_profile = resolved.override_profile;
         }
 
-        let member_ref = self
+        let spawn_result = self
             .state
             .mob_spawn_spec(&mob_id, spec)
             .await
@@ -756,13 +763,7 @@ impl AgentMobToolSurface {
         self.record_successful_operator_action(&audit_handle, call.name)
             .await;
 
-        Self::encode_result(
-            call,
-            json!({
-                "member_ref": member_ref,
-                "session_id": member_ref.session_id(),
-            }),
-        )
+        Self::encode_result(call, Self::spawn_result_payload(&spawn_result))
     }
 
     async fn dispatch_mob_retire_member(
@@ -782,7 +783,7 @@ impl AgentMobToolSurface {
             .map_err(|e| Self::map_mob_error(call, e))?;
 
         self.state
-            .mob_retire(&mob_id, MeerkatId::from(args.member_id))
+            .mob_retire(&mob_id, AgentIdentity::from(args.member_id))
             .await
             .map_err(|e| Self::map_mob_error(call, e))?;
 
@@ -805,7 +806,7 @@ impl AgentMobToolSurface {
 
         let snapshot = self
             .state
-            .mob_member_status(&mob_id, &MeerkatId::from(args.member_id))
+            .mob_member_status(&mob_id, &AgentIdentity::from(args.member_id))
             .await
             .map_err(|e| Self::map_mob_error(call, e))?;
 
@@ -862,7 +863,7 @@ impl AgentMobToolSurface {
             .parse_args()
             .map_err(|e| ToolError::invalid_arguments(call.name, e.to_string()))?;
         let mob_id = meerkat_mob::MobId::from(args.mob_id.as_str());
-        let local = meerkat_mob::MeerkatId::from(args.member_id.as_str());
+        let local = AgentIdentity::from(args.member_id.as_str());
         let target = peer_target_from_args(args.peer);
         self.state
             .mob_wire(&mob_id, local, target)
@@ -879,7 +880,7 @@ impl AgentMobToolSurface {
             .parse_args()
             .map_err(|e| ToolError::invalid_arguments(call.name, e.to_string()))?;
         let mob_id = meerkat_mob::MobId::from(args.mob_id.as_str());
-        let local = meerkat_mob::MeerkatId::from(args.member_id.as_str());
+        let local = AgentIdentity::from(args.member_id.as_str());
         let target = peer_target_from_args(args.peer);
         self.state
             .mob_unwire(&mob_id, local, target)
@@ -1043,7 +1044,10 @@ impl meerkat_core::service::MobToolsFactory for AgentMobToolSurfaceFactory {
             return Ok(Arc::new(EmptyAgentToolSurface));
         };
         let session_id_str = args.session_id.to_string();
-        let implicit_mob_id = self.state.find_implicit_mob(&session_id_str).await;
+        let implicit_mob_id = self
+            .state
+            .find_implicit_mob_for_bridge_session(&session_id_str)
+            .await;
 
         // Extract parent comms identity for wiring helpers.
         let comms_peer_id = args.comms_runtime.as_ref().and_then(|r| r.public_key());
@@ -1702,9 +1706,7 @@ struct ExternalPeerArg {
 
 fn peer_target_from_args(peer: WirePeerArg) -> meerkat_mob::PeerTarget {
     match peer {
-        WirePeerArg::Local { local } => {
-            meerkat_mob::PeerTarget::Local(meerkat_mob::MeerkatId::from(local.as_str()))
-        }
+        WirePeerArg::Local { local } => meerkat_mob::PeerTarget::Local(local.into()),
         WirePeerArg::External { external } => {
             meerkat_mob::PeerTarget::External(meerkat_core::comms::TrustedPeerSpec {
                 name: external.name,
@@ -1744,7 +1746,7 @@ struct ProfileDeleteArgs {
 /// Archive a session and clean up any mobs it owns (best-effort).
 ///
 /// Single-function cleanup path used by CLI delete_session. Other surfaces
-/// (REST, MCP, RPC) call `destroy_session_mobs` inline after their own
+/// (REST, MCP, RPC) call `destroy_bridge_session_mobs` inline after their own
 /// archive calls because their session service types are concrete and
 /// can't be wrapped with a decorator.
 pub async fn archive_session_with_mob_cleanup(
@@ -1754,7 +1756,7 @@ pub async fn archive_session_with_mob_cleanup(
 ) -> Result<(), SessionError> {
     service.archive(session_id).await?;
     let _ = mob_state
-        .destroy_session_mobs(&session_id.to_string())
+        .destroy_bridge_session_mobs(&session_id.to_string())
         .await;
     Ok(())
 }
@@ -1773,7 +1775,9 @@ mod tests {
     };
     use meerkat_core::event::AgentEvent;
     use meerkat_core::event_injector::{InteractionSubscription, SubscribableInjector};
-    use meerkat_core::interaction::{InboxInteraction, InteractionContent, InteractionId};
+    use meerkat_core::interaction::{
+        InboxInteraction, InteractionContent, InteractionId, PeerInputCandidate, PeerInputClass,
+    };
     use meerkat_core::service::{
         AppendSystemContextRequest, AppendSystemContextResult, MobToolAuthorityContext,
         MobToolSnapshotContext, MobToolsFactory, OpaquePrincipalToken, SessionControlError,
@@ -1899,6 +1903,7 @@ mod tests {
                     intent,
                     params,
                     handling_mode: _,
+                    stream: _,
                 } => {
                     let trusted = self.trusted.read().await;
                     if !trusted.values().any(|peer| peer.name == to.as_str()) {
@@ -1920,8 +1925,9 @@ mod tests {
                     });
                     recipient.notify.notify_waiters();
                     Ok(SendReceipt::PeerRequestSent {
-                        request_id: InteractionId(uuid::Uuid::new_v4()),
                         envelope_id: uuid::Uuid::new_v4(),
+                        interaction_id: InteractionId(uuid::Uuid::new_v4()),
+                        stream_reserved: false,
                     })
                 }
                 unsupported => Err(SendError::Unsupported(format!(
@@ -1959,13 +1965,13 @@ mod tests {
             self.notify.clone()
         }
 
-        async fn drain_peer_input_candidates(&self) -> Vec<meerkat_core::PeerInputCandidate> {
+        async fn drain_peer_input_candidates(&self) -> Vec<PeerInputCandidate> {
             self.drain_inbox_interactions()
                 .await
                 .into_iter()
-                .map(|interaction| meerkat_core::PeerInputCandidate {
+                .map(|interaction| PeerInputCandidate {
                     interaction,
-                    class: meerkat_core::PeerInputClass::ActionableRequest,
+                    class: PeerInputClass::ActionableRequest,
                     lifecycle_peer: None,
                 })
                 .collect()
@@ -1980,7 +1986,7 @@ mod tests {
     struct RealCommsSessionSvc {
         sessions: tokio::sync::RwLock<HashMap<SessionId, Arc<TestCommsRuntime>>>,
         counter: AtomicU64,
-        runtime_adapter: Arc<meerkat_runtime::RuntimeSessionAdapter>,
+        runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
         registry: Arc<TestCommsRegistry>,
         injector: Arc<TestInjector>,
     }
@@ -1990,7 +1996,7 @@ mod tests {
             Self {
                 sessions: tokio::sync::RwLock::new(HashMap::new()),
                 counter: AtomicU64::new(0),
-                runtime_adapter: Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral()),
+                runtime_adapter: Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
                 registry: Arc::new(TestCommsRegistry::default()),
                 injector: Arc::new(TestInjector),
             }
@@ -2164,7 +2170,7 @@ mod tests {
             true
         }
 
-        fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::RuntimeSessionAdapter>> {
+        fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::MeerkatMachine>> {
             Some(self.runtime_adapter.clone())
         }
 
@@ -2262,24 +2268,9 @@ mod tests {
             }),
         );
 
-        MobDefinition {
-            id: MobId::from(mob_id),
-            orchestrator: None,
-            profiles,
-            mcp_servers: std::collections::BTreeMap::new(),
-            wiring: Default::default(),
-            skills: std::collections::BTreeMap::new(),
-            backend: Default::default(),
-            flows: std::collections::BTreeMap::new(),
-            topology: None,
-            supervisor: None,
-            limits: None,
-            spawn_policy: None,
-            event_router: None,
-            owner_session_id: None,
-            session_cleanup_policy: meerkat_mob::definition::SessionCleanupPolicy::Manual,
-            is_implicit: false,
-        }
+        let mut definition = MobDefinition::explicit(MobId::from(mob_id));
+        definition.profiles = profiles;
+        definition
     }
 
     #[test]
@@ -2392,12 +2383,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_build_mob_tools_does_not_widen_scope_from_session_owned_mobs() {
+    async fn test_build_mob_tools_does_not_widen_scope_from_bridge_session_owned_mobs() {
         let state = MobMcpState::new_in_memory();
         let factory = AgentMobToolSurfaceFactory::new(Arc::clone(&state));
         let session_id = SessionId::new();
         let mut definition = sample_definition("owned-without-scope");
-        definition.owner_session_id = Some(session_id.to_string());
+        definition.mark_owner_bridge_session_indexed(&session_id.to_string());
         let mob_id = state
             .mob_create_definition(definition)
             .await
@@ -2430,7 +2421,7 @@ mod tests {
         assert_eq!(
             listed["mobs"],
             json!([]),
-            "session-owned mobs must not be widened into scope during rebuild"
+            "bridge-session-owned mobs must not be widened into scope during rebuild"
         );
 
         let members_args =
@@ -2454,7 +2445,7 @@ mod tests {
         let session_id = SessionId::new();
         let session_key = session_id.to_string();
         let stale_mob_id = state
-            .get_or_create_implicit_mob(&session_key, "claude-sonnet-4-5")
+            .get_or_create_implicit_mob_for_bridge_session(&session_key, "claude-sonnet-4-5")
             .await
             .expect("create stale implicit mob");
 
@@ -2472,7 +2463,9 @@ mod tests {
             .expect("build_mob_tools");
 
         assert_eq!(
-            state.find_implicit_mob(&session_key).await,
+            state
+                .find_implicit_mob_for_bridge_session(&session_key)
+                .await,
             Some(stale_mob_id.clone()),
             "surface building must not own implicit-mob reconciliation"
         );
@@ -2586,7 +2579,6 @@ mod tests {
                             "runtime_mode": "turn_driven"
                         }
                     },
-                    "owner_session_id": "spoofed-session",
                     "is_implicit": true,
                     "session_cleanup_policy": "manual"
                 }
@@ -2619,14 +2611,14 @@ mod tests {
             .expect("created mob handle");
         let created_definition = created_handle.definition();
         assert_eq!(
-            created_definition.owner_session_id.as_deref(),
+            created_definition.owner_bridge_session_index(),
             Some(expected_session_id.as_str()),
-            "mob_create must rebind session indexing to the current owner session"
+            "mob_create must rebind bridge-session indexing to the current owner bridge session"
         );
         assert_eq!(
             created_definition.session_cleanup_policy,
             meerkat_mob::definition::SessionCleanupPolicy::DestroyOnOwnerArchive,
-            "mob_create must set explicit session-scoped cleanup truth"
+            "mob_create must set explicit bridge-session-scoped cleanup truth"
         );
         assert!(
             !created_definition.is_implicit,
@@ -2682,7 +2674,7 @@ mod tests {
         );
         // The implicit mob should still be created even though spawn failed.
         let _mob_id = state
-            .find_implicit_mob(&session_key)
+            .find_implicit_mob_for_bridge_session(&session_key)
             .await
             .expect("delegate should still create an implicit mob");
 
@@ -2849,7 +2841,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        surface
+        let spawn_result = surface
             .dispatch(ToolCallView {
                 id: "spawn-scope",
                 name: "mob_spawn_member",
@@ -2857,6 +2849,16 @@ mod tests {
             })
             .await
             .expect("in-scope spawn should succeed");
+        let spawn_payload: serde_json::Value =
+            serde_json::from_str(&spawn_result.result.text_content()).unwrap();
+        assert!(
+            spawn_payload["agent_identity"].is_string(),
+            "Mob-MCP operator results should surface the canonical agent identity"
+        );
+        assert!(
+            spawn_payload["agent_runtime_id"].is_object(),
+            "Mob-MCP operator results should surface the canonical agent runtime id"
+        );
 
         let handle = state.handle_for(&mob_id).await.expect("handle");
         let audit_events = handle
@@ -2909,10 +2911,10 @@ mod tests {
             .ensure_implicit_mob()
             .await
             .expect("create implicit mob");
-        let helper_id = MeerkatId::from("helper-1");
+        let helper_id = AgentIdentity::from("helper-1");
         let mut spec = SpawnMemberSpec::new(ProfileName::from("delegate"), helper_id.clone());
         spec.runtime_mode = Some(MobRuntimeMode::TurnDriven);
-        let member_ref = state
+        let spawn_result = state
             .mob_spawn_spec(&mob_id, spec)
             .await
             .expect("spawn helper for delegate wiring test");
@@ -2924,9 +2926,13 @@ mod tests {
             "delegate wiring should succeed when creator comms are present"
         );
 
-        let helper_session_id = member_ref.session_id().cloned().expect("helper session id");
+        let handle = state.handle_for(&mob_id).await.expect("mob handle");
+        let helper_bridge_session_id = handle
+            .resolve_bridge_session_id(&spawn_result.agent_identity)
+            .await
+            .expect("helper bridge session id");
         let helper_comms = service
-            .real_comms(&helper_session_id)
+            .real_comms(&helper_bridge_session_id)
             .await
             .expect("helper comms");
         let helper_name = format!("{}/{}/{}", mob_id, "delegate", helper_id);

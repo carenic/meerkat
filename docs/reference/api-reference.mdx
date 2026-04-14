@@ -53,7 +53,7 @@ This page is a quick-lookup index. For settled 0.5 session/runtime semantics, se
 
 For runtime-backed Rust surfaces, the canonical path is:
 
-1. `RuntimeSessionAdapter::prepare_bindings(session_id)`
+1. `MeerkatMachine::prepare_bindings(session_id)`
 2. `SessionBuildOptions.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings)`
 3. `SessionService::create_session(...)`
 
@@ -77,7 +77,7 @@ Mob runtime APIs live primarily in:
 | `MobSessionService` | Session-service bridge trait required by mob runtime |
 | `MobState` | Lifecycle state (`Creating`, `Running`, `Stopped`, `Completed`, `Destroyed`) |
 | `MobRun` | Persisted flow run aggregate |
-| `SpawnMemberSpec` | Batch spawn input contract (`profile_name`, `meerkat_id`, `initial_message`, `runtime_mode`, `backend`) |
+| `SpawnMemberSpec` | Batch spawn input contract (`profile_name`, `agent_identity`, `initial_message`, `runtime_mode`, `backend`) |
 
 ### `MobBuilder` methods
 
@@ -98,7 +98,7 @@ Mob runtime APIs live primarily in:
 |------|---------|
 | `status()` | Current lifecycle state |
 | `roster().await` / `list_members().await` | Membership inspection |
-| `spawn(...).await` | Spawn member (returns `MemberRef`) |
+| `spawn(...).await` | Spawn member (returns `SpawnResult`) |
 | `spawn_many(Vec<SpawnMemberSpec>).await` | Batch spawn members in parallel (results preserve input order) |
 | `spawn_with_backend(...).await` | Spawn member with explicit backend override |
 | `spawn_with_options(...).await` | Spawn member with runtime mode and backend overrides |
@@ -116,7 +116,8 @@ Mob runtime APIs live primarily in:
 use std::sync::Arc;
 use meerkat_core::types::HandlingMode;
 use meerkat_mob::{
-    FlowId, MeerkatId, MobBuilder, MobDefinition, MobSessionService, MobStorage, ProfileName,
+    AgentIdentity, FlowId, MobBuilder, MobDefinition, MobSessionService, MobStorage,
+    SpawnMemberSpec,
 };
 
 async fn orchestrate(
@@ -132,16 +133,19 @@ async fn orchestrate(
         .await?;
 
     handle
-        .spawn(ProfileName::from("lead"), MeerkatId::from("lead-1"), None)
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
         .await?;
     handle
-        .spawn(ProfileName::from("worker"), MeerkatId::from("worker-1"), None)
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("worker-1")))
         .await?;
     handle
-        .wire(MeerkatId::from("lead-1"), MeerkatId::from("worker-1"))
+        .wire(
+            AgentIdentity::from("lead-1"),
+            AgentIdentity::from("worker-1"),
+        )
         .await?;
-    let lead = handle.member(&MeerkatId::from("lead-1")).await?;
-    lead.send("Coordinate work.", HandlingMode::Queue, None).await?;
+    let lead = handle.member(&AgentIdentity::from("lead-1")).await?;
+    lead.send("Coordinate work.", HandlingMode::Queue).await?;
 
     let run_id = handle
         .run_flow(FlowId::from("release_flow"), serde_json::json!({"severity":"critical"}))

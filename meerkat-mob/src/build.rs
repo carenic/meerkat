@@ -20,6 +20,7 @@ use std::sync::Arc;
 pub enum MobToolAccessContext {
     #[default]
     None,
+    #[allow(dead_code)]
     InjectedAuthority(MobToolAuthorityContext),
 }
 
@@ -36,7 +37,7 @@ impl MobToolAccessContext {
 pub struct BuildAgentConfigParams<'a> {
     pub mob_id: &'a MobId,
     pub profile_name: &'a ProfileName,
-    pub meerkat_id: &'a MeerkatId,
+    pub(crate) meerkat_id: &'a MeerkatId,
     pub profile: &'a Profile,
     pub definition: &'a MobDefinition,
     pub external_tools: Option<Arc<dyn meerkat_core::AgentToolDispatcher>>,
@@ -54,7 +55,7 @@ pub struct BuildAgentConfigParams<'a> {
 
 pub struct BuildResumedAgentConfigParams<'a> {
     pub base: BuildAgentConfigParams<'a>,
-    pub expected_session_id: &'a SessionId,
+    pub(crate) expected_session_id: &'a SessionId,
     pub resumed_session: Session,
 }
 
@@ -421,7 +422,7 @@ mod tests {
             limits: None,
             spawn_policy: None,
             event_router: None,
-            owner_session_id: None,
+            owner_bridge_session_id: None,
             session_cleanup_policy: crate::definition::SessionCleanupPolicy::Manual,
             is_implicit: false,
         }

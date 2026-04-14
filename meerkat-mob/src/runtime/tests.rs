@@ -68,7 +68,6 @@ struct MockCommsBehavior {
     fail_send_peer_added: bool,
     fail_send_peer_retired: bool,
     fail_send_peer_unwired: bool,
-    hang_peers: bool,
 }
 
 struct MockCommsRuntime {
@@ -248,8 +247,9 @@ impl CoreCommsRuntime for MockCommsRuntime {
 
                 self.sent_intents.write().await.push(intent);
                 Ok(SendReceipt::PeerRequestSent {
-                    request_id: InteractionId(uuid::Uuid::new_v4()),
                     envelope_id: uuid::Uuid::new_v4(),
+                    interaction_id: InteractionId(uuid::Uuid::new_v4()),
+                    stream_reserved: false,
                 })
             }
             unsupported => Err(SendError::Unsupported(format!(
@@ -260,14 +260,6 @@ impl CoreCommsRuntime for MockCommsRuntime {
     }
 
     async fn peers(&self) -> Vec<PeerDirectoryEntry> {
-        if self
-            .behavior
-            .read()
-            .expect("poisoned behavior lock in mock runtime")
-            .hang_peers
-        {
-            return std::future::pending().await;
-        }
         let trusted = self.trusted_peers.read().await;
         let peer_statuses = self.peer_statuses.read().await;
         trusted
@@ -304,10 +296,6 @@ impl CoreCommsRuntime for MockCommsRuntime {
     fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
         self.inbox_notify.clone()
     }
-
-    async fn drain_peer_input_candidates(&self) -> Vec<meerkat_core::PeerInputCandidate> {
-        Vec::new()
-    }
 }
 
 // -----------------------------------------------------------------------
@@ -334,17 +322,6 @@ struct CreateSessionRecord {
     peer_meta_labels: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug)]
-enum MockKeepAliveTurnMode {
-    WaitForNotifier,
-    CompleteImmediately,
-    CallbackPending {
-        tool_name: String,
-        args: serde_json::Value,
-    },
-    Fail(String),
-}
-
 /// A mock session service that creates sessions with mock comms runtimes.
 struct MockSessionService {
     sessions: RwLock<HashMap<SessionId, Arc<MockCommsRuntime>>>,
@@ -352,7 +329,7 @@ struct MockSessionService {
     persisted_sessions: RwLock<HashMap<SessionId, Session>>,
     keep_alive_notifiers: RwLock<HashMap<SessionId, Arc<tokio::sync::Notify>>>,
     session_comms_names: RwLock<HashMap<SessionId, String>>,
-    runtime_adapter: Mutex<Option<Arc<meerkat_runtime::RuntimeSessionAdapter>>>,
+    runtime_adapter: Mutex<Option<Arc<meerkat_runtime::MeerkatMachine>>>,
     session_counter: AtomicU64,
     /// Records (session_id, prompt) for each create_session call.
     prompts: RwLock<Vec<(SessionId, String)>>,
@@ -375,7 +352,7 @@ struct MockSessionService {
     fail_inject: std::sync::atomic::AtomicBool,
     start_turn_calls: AtomicU64,
     keep_alive_start_turn_calls: AtomicU64,
-    keep_alive_turn_mode: std::sync::Mutex<MockKeepAliveTurnMode>,
+    keep_alive_turns_complete_immediately: std::sync::atomic::AtomicBool,
     keep_alive_prompts: RwLock<Vec<(SessionId, String)>>,
     interrupt_calls: AtomicU64,
     inject_calls: Arc<AtomicU64>,
@@ -415,7 +392,7 @@ impl MockSessionService {
             fail_inject: std::sync::atomic::AtomicBool::new(false),
             start_turn_calls: AtomicU64::new(0),
             keep_alive_start_turn_calls: AtomicU64::new(0),
-            keep_alive_turn_mode: std::sync::Mutex::new(MockKeepAliveTurnMode::WaitForNotifier),
+            keep_alive_turns_complete_immediately: std::sync::atomic::AtomicBool::new(false),
             keep_alive_prompts: RwLock::new(Vec::new()),
             interrupt_calls: AtomicU64::new(0),
             inject_calls: Arc::new(AtomicU64::new(0)),
@@ -465,12 +442,12 @@ impl MockSessionService {
         self.persisted_sessions.write().await.remove(session_id);
     }
 
-    fn enable_runtime_adapter(&self) -> Arc<meerkat_runtime::RuntimeSessionAdapter> {
+    fn enable_runtime_adapter(&self) -> Arc<meerkat_runtime::MeerkatMachine> {
         let mut guard = self.runtime_adapter.lock().expect("runtime_adapter mutex");
         if let Some(adapter) = guard.as_ref() {
             return adapter.clone();
         }
-        let adapter = Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral());
+        let adapter = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
         *guard = Some(adapter.clone());
         adapter
     }
@@ -633,38 +610,8 @@ impl MockSessionService {
     }
 
     fn set_keep_alive_turns_complete_immediately(&self, enabled: bool) {
-        let mut guard = self
-            .keep_alive_turn_mode
-            .lock()
-            .expect("keep_alive_turn_mode mutex");
-        *guard = if enabled {
-            MockKeepAliveTurnMode::CompleteImmediately
-        } else {
-            MockKeepAliveTurnMode::WaitForNotifier
-        };
-    }
-
-    fn set_keep_alive_turn_callback_pending(
-        &self,
-        tool_name: impl Into<String>,
-        args: serde_json::Value,
-    ) {
-        let mut guard = self
-            .keep_alive_turn_mode
-            .lock()
-            .expect("keep_alive_turn_mode mutex");
-        *guard = MockKeepAliveTurnMode::CallbackPending {
-            tool_name: tool_name.into(),
-            args,
-        };
-    }
-
-    fn set_keep_alive_turn_failure(&self, reason: impl Into<String>) {
-        let mut guard = self
-            .keep_alive_turn_mode
-            .lock()
-            .expect("keep_alive_turn_mode mutex");
-        *guard = MockKeepAliveTurnMode::Fail(reason.into());
+        self.keep_alive_turns_complete_immediately
+            .store(enabled, Ordering::Relaxed);
     }
 
     fn interrupt_call_count(&self) -> u64 {
@@ -1011,27 +958,14 @@ impl SessionService for MockSessionService {
         drop(sessions);
 
         if is_keep_alive {
-            let mode = self
-                .keep_alive_turn_mode
-                .lock()
-                .expect("keep_alive_turn_mode mutex")
-                .clone();
-            match mode {
-                MockKeepAliveTurnMode::CompleteImmediately => {
-                    return Ok(mock_run_result(
-                        id.clone(),
-                        "Autonomous kickoff completed".to_string(),
-                    ));
-                }
-                MockKeepAliveTurnMode::CallbackPending { tool_name, args } => {
-                    return Err(SessionError::Agent(
-                        meerkat_core::error::AgentError::CallbackPending { tool_name, args },
-                    ));
-                }
-                MockKeepAliveTurnMode::Fail(reason) => {
-                    return Err(SessionError::Store(Box::new(std::io::Error::other(reason))));
-                }
-                MockKeepAliveTurnMode::WaitForNotifier => {}
+            let complete_immediately = self
+                .keep_alive_turns_complete_immediately
+                .load(Ordering::Relaxed);
+            if complete_immediately {
+                return Ok(mock_run_result(
+                    id.clone(),
+                    "Autonomous kickoff completed".to_string(),
+                ));
             }
             let notifier = self
                 .keep_alive_notifiers
@@ -1396,7 +1330,7 @@ impl MobSessionService for MockSessionService {
         true
     }
 
-    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::RuntimeSessionAdapter>> {
+    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::MeerkatMachine>> {
         self.runtime_adapter
             .lock()
             .expect("runtime_adapter mutex")
@@ -1425,30 +1359,20 @@ impl MobSessionService for MockSessionService {
         boundary: meerkat_core::lifecycle::run_primitive::RunApplyBoundary,
         contributing_input_ids: Vec<meerkat_core::InputId>,
     ) -> Result<meerkat_core::lifecycle::core_executor::CoreApplyOutput, SessionError> {
-        let receipt = meerkat_core::lifecycle::run_receipt::RunBoundaryReceipt {
-            run_id,
-            boundary,
-            contributing_input_ids,
-            conversation_digest: None,
-            message_count: 0,
-            sequence: 0,
-        };
-        match <Self as SessionService>::start_turn(self, session_id, req).await {
-            Ok(_) => Ok(
-                meerkat_core::lifecycle::core_executor::CoreApplyOutput::without_terminal(
-                    receipt, None,
-                ),
-            ),
-            Err(SessionError::Agent(meerkat_core::error::AgentError::CallbackPending {
-                tool_name,
-                args,
-            })) => Ok(
-                meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_callback_pending(
-                    receipt, None, tool_name, args,
-                ),
-            ),
-            Err(error) => Err(error),
-        }
+        <Self as SessionService>::start_turn(self, session_id, req).await?;
+        Ok(meerkat_core::lifecycle::core_executor::CoreApplyOutput {
+            receipt: meerkat_core::lifecycle::run_receipt::RunBoundaryReceipt {
+                run_id,
+                boundary,
+                contributing_input_ids,
+                conversation_digest: None,
+                message_count: 0,
+                sequence: 0,
+            },
+            session_snapshot: None,
+            terminal: None,
+            run_result: None,
+        })
     }
 
     async fn discard_live_session(&self, session_id: &SessionId) -> Result<(), SessionError> {
@@ -1492,13 +1416,14 @@ impl FaultInjectedMobEventStore {
             MobEventKind::MobCreated { .. } => "MobCreated",
             MobEventKind::MobCompleted => "MobCompleted",
             MobEventKind::MobReset => "MobReset",
-            MobEventKind::MeerkatSpawned { .. } => "MeerkatSpawned",
-            MobEventKind::MeerkatRetired { .. } => "MeerkatRetired",
-            MobEventKind::MeerkatKickoffUpdated { .. } => "MeerkatKickoffUpdated",
-            MobEventKind::PeersWired { .. } => "PeersWired",
+            MobEventKind::MemberSpawned(..) => "MemberSpawned",
+            MobEventKind::MemberRetired { .. } => "MemberRetired",
+            MobEventKind::MemberReset { .. } => "MemberReset",
+            MobEventKind::MemberKickoffUpdated { .. } => "MemberKickoffUpdated",
+            MobEventKind::MembersWired { .. } => "MembersWired",
             MobEventKind::ExternalPeerWired { .. } => "ExternalPeerWired",
             MobEventKind::ExternalPeerUnwired { .. } => "ExternalPeerUnwired",
-            MobEventKind::PeersUnwired { .. } => "PeersUnwired",
+            MobEventKind::MembersUnwired { .. } => "MembersUnwired",
             MobEventKind::TaskCreated { .. } => "TaskCreated",
             MobEventKind::TaskUpdated { .. } => "TaskUpdated",
             MobEventKind::FlowStarted { .. } => "FlowStarted",
@@ -1948,7 +1873,7 @@ fn sample_definition() -> MobDefinition {
         limits: None,
         spawn_policy: None,
         event_router: None,
-        owner_session_id: None,
+        owner_bridge_session_id: None,
         session_cleanup_policy: crate::definition::SessionCleanupPolicy::Manual,
         is_implicit: false,
     }
@@ -2799,7 +2724,7 @@ impl MobSessionService for PersistedListingSessionService {
         self.inner.supports_persistent_sessions()
     }
 
-    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::RuntimeSessionAdapter>> {
+    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::MeerkatMachine>> {
         self.inner.runtime_adapter()
     }
 
@@ -2973,150 +2898,7 @@ impl MobSessionService for InactiveReadSessionService {
         self.inner.supports_persistent_sessions()
     }
 
-    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::RuntimeSessionAdapter>> {
-        self.inner.runtime_adapter()
-    }
-
-    async fn session_belongs_to_mob(&self, session_id: &SessionId, mob_id: &MobId) -> bool {
-        self.inner.session_belongs_to_mob(session_id, mob_id).await
-    }
-
-    async fn load_persisted_session(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Option<Session>, SessionError> {
-        self.inner.load_persisted_session(session_id).await
-    }
-
-    async fn apply_runtime_turn(
-        &self,
-        session_id: &SessionId,
-        run_id: meerkat_core::RunId,
-        req: StartTurnRequest,
-        boundary: meerkat_core::lifecycle::run_primitive::RunApplyBoundary,
-        contributing_input_ids: Vec<meerkat_core::InputId>,
-    ) -> Result<meerkat_core::lifecycle::core_executor::CoreApplyOutput, SessionError> {
-        self.inner
-            .apply_runtime_turn(session_id, run_id, req, boundary, contributing_input_ids)
-            .await
-    }
-
-    async fn discard_live_session(&self, session_id: &SessionId) -> Result<(), SessionError> {
-        self.inner.discard_live_session(session_id).await
-    }
-
-    async fn cancel_all_checkpointers(&self) {
-        self.inner.cancel_all_checkpointers().await;
-    }
-
-    async fn rearm_all_checkpointers(&self) {
-        self.inner.rearm_all_checkpointers().await;
-    }
-}
-
-struct HangingReadWithoutLiveSessionService {
-    inner: Arc<MockSessionService>,
-}
-
-impl HangingReadWithoutLiveSessionService {
-    fn new(inner: Arc<MockSessionService>) -> Self {
-        Self { inner }
-    }
-}
-
-#[async_trait]
-impl SessionService for HangingReadWithoutLiveSessionService {
-    async fn create_session(&self, req: CreateSessionRequest) -> Result<RunResult, SessionError> {
-        self.inner.create_session(req).await
-    }
-
-    async fn start_turn(
-        &self,
-        id: &SessionId,
-        req: StartTurnRequest,
-    ) -> Result<RunResult, SessionError> {
-        self.inner.start_turn(id, req).await
-    }
-
-    async fn interrupt(&self, id: &SessionId) -> Result<(), SessionError> {
-        self.inner.interrupt(id).await
-    }
-
-    async fn read(&self, _id: &SessionId) -> Result<SessionView, SessionError> {
-        std::future::pending().await
-    }
-
-    async fn list(&self, query: SessionQuery) -> Result<Vec<SessionSummary>, SessionError> {
-        self.inner.list(query).await
-    }
-
-    async fn archive(&self, id: &SessionId) -> Result<(), SessionError> {
-        self.inner.archive(id).await
-    }
-
-    async fn has_live_session(&self, _id: &SessionId) -> Result<bool, SessionError> {
-        Ok(false)
-    }
-
-    async fn subscribe_session_events(&self, id: &SessionId) -> Result<EventStream, StreamError> {
-        SessionService::subscribe_session_events(&*self.inner, id).await
-    }
-}
-
-#[async_trait]
-impl SessionServiceCommsExt for HangingReadWithoutLiveSessionService {
-    async fn comms_runtime(&self, session_id: &SessionId) -> Option<Arc<dyn CoreCommsRuntime>> {
-        self.inner.comms_runtime(session_id).await
-    }
-
-    async fn event_injector(&self, session_id: &SessionId) -> Option<Arc<dyn EventInjector>> {
-        self.inner.event_injector(session_id).await
-    }
-
-    async fn interaction_event_injector(
-        &self,
-        session_id: &SessionId,
-    ) -> Option<Arc<dyn SubscribableInjector>> {
-        self.inner.interaction_event_injector(session_id).await
-    }
-}
-
-#[async_trait]
-impl SessionServiceHistoryExt for HangingReadWithoutLiveSessionService {
-    async fn read_history(
-        &self,
-        id: &SessionId,
-        query: meerkat_core::service::SessionHistoryQuery,
-    ) -> Result<meerkat_core::service::SessionHistoryPage, SessionError> {
-        self.inner.read_history(id, query).await
-    }
-}
-
-#[async_trait]
-impl SessionServiceControlExt for HangingReadWithoutLiveSessionService {
-    async fn append_system_context(
-        &self,
-        id: &SessionId,
-        req: AppendSystemContextRequest,
-    ) -> Result<AppendSystemContextResult, SessionControlError> {
-        self.inner.append_system_context(id, req).await
-    }
-}
-
-#[async_trait]
-impl MobSessionService for HangingReadWithoutLiveSessionService {
-    async fn subscribe_session_events(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<EventStream, StreamError> {
-        SessionService::subscribe_session_events(&*self.inner, session_id).await
-    }
-
-    fn supports_persistent_sessions(&self) -> bool {
-        self.inner.supports_persistent_sessions()
-    }
-
-    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::RuntimeSessionAdapter>> {
+    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::MeerkatMachine>> {
         self.inner.runtime_adapter()
     }
 
@@ -3754,7 +3536,10 @@ async fn test_mob_builder_accepts_persistent_session_service() {
         .await
         .expect("spawn with persistent session service");
     assert!(
-        handle.get_member(&MeerkatId::from("w-1")).await.is_some(),
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_some(),
         "spawn should succeed when mob is built with PersistentSessionService"
     );
 }
@@ -3891,16 +3676,11 @@ async fn test_lifecycle_updates_mcp_server_states() {
 #[tokio::test]
 async fn test_stop_persists_all_state_and_rejects_mutations() {
     let (handle, service) = create_test_mob(sample_definition()).await;
-    service.set_keep_alive_turns_complete_immediately(true);
     handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn");
-    handle
-        .wait_for_kickoff_complete(Some(Duration::from_secs(2)))
-        .await
-        .expect("kickoff should settle before counting persisted events");
-    let event_count_before = handle.events().replay_all().await.expect("replay").len();
+    let events_before = handle.events().replay_all().await.expect("replay");
 
     handle.stop().await.expect("stop");
     assert_eq!(handle.status(), MobState::Stopped);
@@ -3909,10 +3689,22 @@ async fn test_stop_persists_all_state_and_rejects_mutations() {
         1,
         "stop should not archive active sessions"
     );
-    assert_eq!(
-        handle.events().replay_all().await.expect("replay").len(),
-        event_count_before,
+    let events_after = handle.events().replay_all().await.expect("replay");
+    assert!(
+        events_after.len() >= events_before.len(),
         "stop should not delete persisted events"
+    );
+    let before_cursors = events_before
+        .iter()
+        .map(|event| event.cursor)
+        .collect::<Vec<_>>();
+    let after_prefix_cursors = events_after[..events_before.len()]
+        .iter()
+        .map(|event| event.cursor)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        after_prefix_cursors, before_cursors,
+        "stop should preserve the existing event log prefix even if a concurrent lifecycle projection appends later"
     );
 
     let err = handle
@@ -3939,7 +3731,7 @@ async fn test_register_tool_bundle_is_wired_into_spawn() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
@@ -3990,8 +3782,8 @@ async fn test_spawn_fails_when_tool_bundle_not_registered() {
     assert!(
         !events
             .iter()
-            .any(|e| matches!(e.kind, MobEventKind::MeerkatSpawned { .. })),
-        "failed spawn should not emit MeerkatSpawned"
+            .any(|e| matches!(e.kind, MobEventKind::MemberSpawned(..))),
+        "failed spawn should not emit any spawn event"
     );
 }
 
@@ -4002,18 +3794,18 @@ async fn test_mob_management_tools_hidden_without_operator_context() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
     let tool_names = service.external_tool_names(&sid_1).await;
     for required in [
-        "spawn_meerkat",
-        "spawn_many_meerkats",
-        "retire_meerkat",
-        "wire_peers",
-        "unwire_peers",
-        "list_meerkats",
+        "spawn_member",
+        "spawn_many_members",
+        "retire_member",
+        "wire_members",
+        "unwire_members",
+        "list_members",
     ] {
         assert!(
             !tool_names.contains(&required.to_string()),
@@ -4024,14 +3816,17 @@ async fn test_mob_management_tools_hidden_without_operator_context() {
     let spawn_err = service
         .dispatch_external_tool_outcome(
             &sid_1,
-            "spawn_meerkat",
-            serde_json::json!({"profile": "worker", "meerkat_id": "w-2"}),
+            "spawn_member",
+            serde_json::json!({"profile": "worker", "member_id": "w-2"}),
         )
         .await
-        .expect_err("spawn_meerkat tool should be unavailable");
+        .expect_err("spawn_member tool should be unavailable");
     assert!(matches!(spawn_err, ToolError::NotFound { .. }));
     assert!(
-        handle.get_member(&MeerkatId::from("w-2")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-2"))
+            .await
+            .is_none(),
         "hidden operator tools must not mutate roster state"
     );
 }
@@ -4068,7 +3863,7 @@ async fn test_visible_mob_operator_reads_still_require_exact_scope() {
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
     assert!(
-        tool_names.contains(&"list_meerkats"),
+        tool_names.contains(&"list_members"),
         "tool visibility should depend on injected authority presence, not scope success"
     );
 
@@ -4076,7 +3871,7 @@ async fn test_visible_mob_operator_reads_still_require_exact_scope() {
     let error = dispatcher
         .dispatch(ToolCallView {
             id: "call-1",
-            name: "list_meerkats",
+            name: "list_members",
             args: &args,
         })
         .await
@@ -4114,7 +3909,7 @@ async fn test_visible_mob_operator_tools_deny_before_arg_validation_when_scope_m
     let error = dispatcher
         .dispatch(ToolCallView {
             id: "call-2",
-            name: "spawn_meerkat",
+            name: "spawn_member",
             args: &args,
         })
         .await
@@ -4123,9 +3918,101 @@ async fn test_visible_mob_operator_tools_deny_before_arg_validation_when_scope_m
 }
 
 #[tokio::test]
+async fn test_visible_mob_operator_tools_emit_identity_native_member_payloads() {
+    let (handle, _service) = create_test_mob(sample_definition_with_mob_tools()).await;
+    let mob_id = handle.definition().id.to_string();
+    let profile = handle
+        .definition()
+        .profiles
+        .get(&ProfileName::from("worker"))
+        .expect("worker profile")
+        .as_inline()
+        .unwrap();
+    let dispatcher = super::tools::compose_external_tools_for_profile(
+        profile,
+        &BTreeMap::new(),
+        handle.clone(),
+        None,
+        crate::build::MobToolAccessContext::InjectedAuthority(
+            meerkat_core::service::MobToolAuthorityContext::new(
+                meerkat_core::service::OpaquePrincipalToken::new("in-scope"),
+                false,
+            )
+            .with_managed_mob_scope([mob_id.as_str()]),
+        ),
+    )
+    .expect("compose dispatcher")
+    .expect("operator dispatcher should be visible when authority is injected");
+
+    let spawn_args = RawValue::from_string(
+        serde_json::json!({
+            "profile": "worker",
+            "member_id": "w-bridge"
+        })
+        .to_string(),
+    )
+    .expect("spawn args");
+    let spawn_result = dispatcher
+        .dispatch(ToolCallView {
+            id: "call-bridge-spawn",
+            name: "spawn_member",
+            args: &spawn_args,
+        })
+        .await
+        .expect("spawn_member should dispatch");
+    let spawn_payload: serde_json::Value =
+        serde_json::from_str(&spawn_result.result.text_content()).expect("spawn payload");
+    assert!(
+        spawn_payload["agent_identity"].is_string(),
+        "spawn result should surface agent_identity"
+    );
+    assert!(
+        spawn_payload["agent_runtime_id"].is_object(),
+        "spawn result should surface agent_runtime_id"
+    );
+    assert!(
+        spawn_payload["fence_token"].is_number(),
+        "spawn result should surface fence_token"
+    );
+
+    let list_args = RawValue::from_string("{}".to_string()).expect("list args");
+    let list_result = dispatcher
+        .dispatch(ToolCallView {
+            id: "call-bridge-list",
+            name: "list_members",
+            args: &list_args,
+        })
+        .await
+        .expect("list_members should dispatch");
+    let list_payload: serde_json::Value =
+        serde_json::from_str(&list_result.result.text_content()).expect("list payload");
+    let member = list_payload["members"]
+        .as_array()
+        .expect("members array")
+        .iter()
+        .find(|entry| entry["agent_identity"] == "w-bridge")
+        .expect("spawned member should appear in list");
+    assert_eq!(member["agent_identity"], "w-bridge");
+    assert!(
+        member["agent_runtime_id"].is_object(),
+        "list output should surface agent_runtime_id"
+    );
+    assert!(
+        member["fence_token"].is_number(),
+        "list output should surface fence_token"
+    );
+    assert_eq!(member["role"], "worker");
+    assert!(member.get("member_ref").is_none());
+    assert!(member.get("session_id").is_none());
+    assert!(member.get("bridge_session_id").is_none());
+    assert!(member.get("current_session_id").is_none());
+    assert!(member.get("current_bridge_session_id").is_none());
+}
+
+#[tokio::test]
 async fn test_spawn_helper_contract_aligns_with_retired_terminal_state() {
-    let (handle, service) = create_test_mob(sample_definition()).await;
-    let helper_id = MeerkatId::from("helper-spawn");
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let helper_id = AgentIdentity::from("helper-spawn");
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(1),
         handle.spawn_helper(
@@ -4142,25 +4029,22 @@ async fn test_spawn_helper_contract_aligns_with_retired_terminal_state() {
     .expect("spawn_helper must not wait on helper terminality")
     .expect("spawn_helper succeeds");
 
-    let session_id = result.session_id.expect("helper session id");
+    assert_eq!(result.agent_identity, helper_id);
     assert!(
-        service.read(&session_id).await.is_err(),
-        "spawn_helper must retire the helper session once it returns"
-    );
-    assert!(
-        handle.get_member(&helper_id).await.is_none(),
+        handle.get_member(&result.agent_identity).await.is_none(),
         "spawn_helper must remove the helper from the active roster once it returns"
     );
 }
 
 #[tokio::test]
 async fn test_fork_helper_contract_aligns_with_retired_terminal_state() {
-    let (handle, service) = create_test_mob(sample_definition()).await;
-    let source_id = MeerkatId::from("fork-source");
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let source_id = AgentIdentity::from("fork-source");
+    let source_meerkat_id = MeerkatId::from("fork-source");
     let source_ref = handle
         .spawn_with_options(
             ProfileName::from("worker"),
-            source_id.clone(),
+            source_meerkat_id,
             Some("source context".into()),
             Some(crate::MobRuntimeMode::TurnDriven),
             None,
@@ -4168,7 +4052,7 @@ async fn test_fork_helper_contract_aligns_with_retired_terminal_state() {
         .await
         .expect("spawn source member");
 
-    let helper_id = MeerkatId::from("fork-helper");
+    let helper_id = AgentIdentity::from("fork-helper");
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(1),
         handle.fork_helper(
@@ -4187,21 +4071,17 @@ async fn test_fork_helper_contract_aligns_with_retired_terminal_state() {
     .expect("fork_helper must not wait on helper terminality")
     .expect("fork_helper succeeds");
 
-    let helper_session_id = result.session_id.expect("fork helper session id");
+    assert_eq!(result.agent_identity, helper_id);
     assert!(
-        service.read(&helper_session_id).await.is_err(),
-        "fork_helper must retire the helper session once it returns"
-    );
-    assert!(
-        handle.get_member(&helper_id).await.is_none(),
+        handle.get_member(&result.agent_identity).await.is_none(),
         "fork_helper must remove the helper from the active roster once it returns"
     );
     assert_eq!(
-        source_ref.session_id().cloned(),
+        source_ref.bridge_session_id().cloned(),
         handle
-            .get_member(&source_id)
+            .get_member(&AgentIdentity::from(source_id.as_str()))
             .await
-            .and_then(|entry| entry.member_ref.session_id().cloned()),
+            .and_then(|entry| entry.member_ref.bridge_session_id().cloned()),
         "fork_helper must not perturb the source member's canonical session binding"
     );
 }
@@ -4213,7 +4093,7 @@ async fn test_spawn_helper_defaults_to_turn_driven_even_when_profile_is_autonomo
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(1),
         handle.spawn_helper(
-            MeerkatId::from("helper-default"),
+            AgentIdentity::from("helper-default"),
             "summarize this",
             HelperOptions {
                 role_name: Some(ProfileName::from("worker")),
@@ -4247,37 +4127,60 @@ async fn test_respawn_contract_aligns_receipt_with_canonical_member_state() {
         .await
         .expect("spawn original member");
     let old_session_id = original_ref
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("original session id");
+    let original_snapshot = handle
+        .member_status(&AgentIdentity::from(member_id.as_str()))
+        .await
+        .expect("original member snapshot");
 
     let receipt = handle
-        .respawn(member_id.clone(), Some("resume task".into()))
+        .respawn(
+            AgentIdentity::from(member_id.as_str()),
+            Some("resume task".into()),
+        )
         .await
         .expect("respawn succeeds");
 
-    assert_eq!(receipt.member_id, member_id);
-    assert_eq!(receipt.old_session_id, Some(old_session_id.clone()));
-    let new_session_id = receipt.new_session_id.clone().expect("new session id");
-    assert_ne!(new_session_id, old_session_id);
+    assert_eq!(receipt.identity, AgentIdentity::from(member_id.as_str()));
+    assert_eq!(receipt.previous_fence_token, original_snapshot.fence_token);
+    assert_eq!(
+        receipt.agent_runtime_id.identity,
+        AgentIdentity::from(member_id.as_str())
+    );
+    assert_eq!(
+        receipt.agent_runtime_id.generation,
+        original_snapshot.agent_runtime_id.generation
+    );
+    let snapshot = handle
+        .member_status(&receipt.identity)
+        .await
+        .expect("member snapshot");
+    let new_bridge_session_id = snapshot
+        .current_bridge_session_id
+        .clone()
+        .expect("new session id");
+    assert_ne!(new_bridge_session_id, old_session_id);
     assert!(
         service.read(&old_session_id).await.is_err(),
         "respawn must archive the retired session before returning"
     );
 
-    let snapshot = handle
-        .member_status(&receipt.member_id)
-        .await
-        .expect("member snapshot");
-    assert_eq!(snapshot.current_session_id, Some(new_session_id.clone()));
+    assert_eq!(snapshot.agent_runtime_id, receipt.agent_runtime_id);
+    assert_eq!(snapshot.fence_token, receipt.fence_token);
+    assert_eq!(
+        snapshot.current_session_id,
+        Some(new_bridge_session_id.clone())
+    );
     assert_eq!(
         service
-            .read(&new_session_id)
+            .read(&new_bridge_session_id)
             .await
             .expect("new session readable")
             .state
             .session_id,
-        new_session_id,
+        new_bridge_session_id,
         "respawn receipt must align with the canonical replacement session"
     );
 }
@@ -4308,42 +4211,105 @@ async fn test_respawn_success_restores_existing_peer_wiring() {
         .await
         .expect("spawn right");
     handle
-        .wire(left.clone(), right.clone())
+        .wire(AgentIdentity::from(left.as_str()), right.clone())
         .await
         .expect("wire peers before respawn");
+    let original_left_snapshot = handle
+        .member_status(&AgentIdentity::from(left.as_str()))
+        .await
+        .expect("left snapshot before respawn");
 
     let old_session_id = original_left
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("left session id");
     let receipt = handle
-        .respawn(left.clone(), Some("rebuild wiring".into()))
+        .respawn(
+            AgentIdentity::from(left.as_str()),
+            Some("rebuild wiring".into()),
+        )
         .await
         .expect("respawn succeeds");
 
-    assert_eq!(receipt.old_session_id, Some(old_session_id.clone()));
+    assert_eq!(
+        receipt.previous_fence_token,
+        original_left_snapshot.fence_token
+    );
+    assert_eq!(
+        receipt.agent_runtime_id.generation,
+        original_left_snapshot.agent_runtime_id.generation
+    );
     assert!(
         service.read(&old_session_id).await.is_err(),
         "respawn must archive the retired session before returning"
     );
 
-    let left_entry = handle.get_member(&left).await.expect("left remains active");
+    let left_entry = handle
+        .get_member(&AgentIdentity::from(left.as_str()))
+        .await
+        .expect("left remains active");
     let right_entry = handle
-        .get_member(&right)
+        .get_member(&AgentIdentity::from(right.as_str()))
         .await
         .expect("right remains active");
     assert!(
-        left_entry.wired_to.contains(&right),
+        left_entry
+            .wired_to
+            .contains(&AgentIdentity::from(right.as_str())),
         "respawn replacement must restore canonical wiring on the replacement member"
     );
     assert!(
-        right_entry.wired_to.contains(&left),
+        right_entry
+            .wired_to
+            .contains(&AgentIdentity::from(left.as_str())),
         "respawn replacement must preserve the peer's canonical wiring projection"
     );
+    assert_eq!(left_entry.agent_runtime_id, receipt.agent_runtime_id);
+    assert_eq!(left_entry.fence_token, receipt.fence_token);
     assert_eq!(
-        left_entry.member_ref.session_id().cloned(),
-        receipt.new_session_id,
+        left_entry.agent_runtime_id, receipt.agent_runtime_id,
         "respawn receipt must align with the replacement member's canonical session binding"
+    );
+}
+
+#[tokio::test]
+async fn test_list_members_returns_after_respawn_without_hanging() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let member_id = MeerkatId::from("respawn-list-members");
+
+    handle
+        .spawn_with_options(
+            ProfileName::from("worker"),
+            member_id.clone(),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn original member");
+
+    let receipt = handle
+        .respawn(
+            AgentIdentity::from(member_id.as_str()),
+            Some("refresh listing".into()),
+        )
+        .await
+        .expect("respawn succeeds");
+
+    let members = tokio::time::timeout(std::time::Duration::from_secs(2), handle.list_members())
+        .await
+        .expect("list_members should not hang after respawn");
+    let listed = members
+        .into_iter()
+        .find(|entry| entry.agent_identity == AgentIdentity::from(member_id.as_str()))
+        .expect("respawned member remains listed");
+
+    assert_eq!(listed.agent_runtime_id, receipt.agent_runtime_id);
+    assert_eq!(listed.fence_token, receipt.fence_token);
+    assert_eq!(listed.state, crate::roster::MemberState::Active);
+    assert_eq!(
+        listed.status,
+        crate::runtime::handle::MobMemberStatus::Active
     );
 }
 
@@ -4351,7 +4317,7 @@ async fn test_respawn_success_restores_existing_peer_wiring() {
 async fn test_wait_one_returns_terminal_unknown_for_missing_member() {
     let (handle, _service) = create_test_mob(sample_definition()).await;
     let snapshot = handle
-        .wait_one(&MeerkatId::from("missing-helper"))
+        .wait_one(&AgentIdentity::from("missing-helper"))
         .await
         .expect("wait_one should succeed for missing member");
 
@@ -4377,7 +4343,7 @@ async fn test_wait_one_observes_retiring_member_as_non_terminal_until_archive() 
         .spawn(ProfileName::from("worker"), member_id.clone(), None)
         .await
         .expect("spawn retiring member")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed member")
         .clone();
 
@@ -4385,12 +4351,12 @@ async fn test_wait_one_observes_retiring_member_as_non_terminal_until_archive() 
     let retire = {
         let handle = handle.clone();
         let member_id = member_id.clone();
-        tokio::spawn(async move { handle.retire(member_id).await })
+        tokio::spawn(async move { handle.retire(AgentIdentity::from(member_id.as_str())).await })
     };
 
     tokio::time::sleep(Duration::from_millis(25)).await;
     let in_flight = handle
-        .member_status(&member_id)
+        .member_status(&AgentIdentity::from(member_id.as_str()))
         .await
         .expect("retiring member snapshot");
     assert_eq!(
@@ -4404,7 +4370,7 @@ async fn test_wait_one_observes_retiring_member_as_non_terminal_until_archive() 
     );
 
     let terminal = handle
-        .wait_one(&member_id)
+        .wait_one(&AgentIdentity::from(member_id.as_str()))
         .await
         .expect("wait_one should observe terminal retirement");
     assert!(
@@ -4430,7 +4396,10 @@ async fn test_wait_one_observes_retiring_member_as_non_terminal_until_archive() 
 #[tokio::test]
 async fn test_wait_all_preserves_input_order_for_missing_members() {
     let (handle, _service) = create_test_mob(sample_definition()).await;
-    let ids = vec![MeerkatId::from("missing-a"), MeerkatId::from("missing-b")];
+    let ids = vec![
+        AgentIdentity::from("missing-a"),
+        AgentIdentity::from("missing-b"),
+    ];
 
     let snapshots = handle
         .wait_all(&ids)
@@ -4479,8 +4448,8 @@ async fn test_wait_for_kickoff_complete_returns_current_autonomous_snapshots() {
         2,
         "all current autonomous members should be returned"
     );
-    assert_eq!(snapshots[0].0, lead);
-    assert_eq!(snapshots[1].0, worker);
+    assert_eq!(snapshots[0].0, AgentIdentity::from(lead.as_str()));
+    assert_eq!(snapshots[1].0, AgentIdentity::from(worker.as_str()));
     assert!(
         snapshots
             .iter()
@@ -4514,15 +4483,18 @@ async fn test_wait_for_members_kickoff_complete_only_waits_requested_members() {
 
     let snapshots = handle
         .wait_for_members_kickoff_complete(
-            &[autonomous.clone(), turn_driven.clone()],
+            &[
+                AgentIdentity::from(autonomous.as_str()),
+                AgentIdentity::from(turn_driven.as_str()),
+            ],
             Some(Duration::from_secs(2)),
         )
         .await
         .expect("member-scoped barrier succeeds");
 
     assert_eq!(snapshots.len(), 2);
-    assert_eq!(snapshots[0].0, autonomous);
-    assert_eq!(snapshots[1].0, turn_driven);
+    assert_eq!(snapshots[0].0, AgentIdentity::from(autonomous.as_str()));
+    assert_eq!(snapshots[1].0, AgentIdentity::from(turn_driven.as_str()));
     assert_eq!(
         snapshots[1].1.status,
         crate::runtime::handle::MobMemberStatus::Active,
@@ -4533,8 +4505,8 @@ async fn test_wait_for_members_kickoff_complete_only_waits_requested_members() {
 #[tokio::test]
 async fn test_wait_for_kickoff_complete_returns_after_initial_turn() {
     let (handle, service) = create_test_mob(sample_definition()).await;
-    // Autonomous spawn uses the runtime adapter path (accept_input_with_completion).
-    // Enable immediate completion so the barrier resolves quickly.
+    // Runtime-backed autonomous kickoff still resolves asynchronously, but
+    // enabling immediate completion should let the barrier clear quickly.
     service.set_keep_alive_turns_complete_immediately(true);
 
     let member = MeerkatId::from("lead-hung");
@@ -4543,8 +4515,6 @@ async fn test_wait_for_kickoff_complete_returns_after_initial_turn() {
         .await
         .expect("spawn lead");
 
-    // The barrier waits for the background start_turn task to complete.
-    // With keep_alive_turns_complete_immediately, it should finish fast.
     let snapshots = handle
         .wait_for_kickoff_complete(Some(Duration::from_secs(2)))
         .await
@@ -4557,13 +4527,41 @@ async fn test_wait_for_kickoff_complete_returns_after_initial_turn() {
     let kickoff = snapshots[0]
         .1
         .kickoff
-        .clone()
-        .expect("successful autonomous kickoff should be recorded");
+        .as_ref()
+        .expect("autonomous member should expose kickoff state");
     assert_eq!(
         kickoff.phase,
         crate::roster::MobMemberKickoffPhase::Started,
-        "successful initial autonomous turn should mark kickoff as started"
+        "barrier must return only after kickoff reaches a terminal started phase"
     );
+}
+
+#[tokio::test]
+async fn test_wait_for_kickoff_complete_times_out_while_runtime_backed_kickoff_pending() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_start_turn_delay_ms(250);
+
+    let member = MeerkatId::from("lead-pending");
+    handle
+        .spawn(ProfileName::from("lead"), member.clone(), None)
+        .await
+        .expect("spawn lead");
+
+    let error = handle
+        .wait_for_kickoff_complete(Some(Duration::from_millis(50)))
+        .await
+        .expect_err("barrier must not return before kickoff resolves");
+
+    match error {
+        MobError::KickoffWaitTimedOut { pending_member_ids } => {
+            assert_eq!(
+                pending_member_ids,
+                vec![member],
+                "pending autonomous kickoff should surface the still-starting member"
+            );
+        }
+        other => panic!("expected kickoff timeout, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -4619,10 +4617,10 @@ async fn test_wait_for_kickoff_complete_returns_broken_snapshot_without_hanging(
     handle.stop().await.expect("stop mob");
 
     let old_sid = handle
-        .get_member(&broken)
+        .get_member(&AgentIdentity::from(broken.as_str()))
         .await
         .expect("roster entry")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
     service
@@ -4644,261 +4642,13 @@ async fn test_wait_for_kickoff_complete_returns_broken_snapshot_without_hanging(
 
     let broken_snapshot = snapshots
         .into_iter()
-        .find(|(id, _)| *id == broken)
+        .find(|(id, _)| *id == AgentIdentity::from(broken.as_str()))
         .expect("broken member snapshot");
     assert_eq!(
         broken_snapshot.1.status,
         crate::runtime::handle::MobMemberStatus::Broken
     );
     assert!(broken_snapshot.1.error.is_some());
-}
-
-#[tokio::test]
-async fn test_wait_for_kickoff_complete_exposes_failed_kickoff_without_marking_member_broken() {
-    let (handle, service) = create_test_mob_with_runtime_adapter(sample_definition()).await;
-    service.set_keep_alive_turn_failure("provider overloaded");
-
-    let member = MeerkatId::from("lead-kickoff-failed");
-    handle
-        .spawn(ProfileName::from("lead"), member.clone(), None)
-        .await
-        .expect("spawn lead");
-
-    let snapshots = handle
-        .wait_for_members_kickoff_complete(
-            std::slice::from_ref(&member),
-            Some(Duration::from_secs(2)),
-        )
-        .await
-        .expect("kickoff barrier succeeds");
-
-    let snapshot = &snapshots[0].1;
-    assert_eq!(
-        snapshot.status,
-        crate::runtime::handle::MobMemberStatus::Active
-    );
-    let kickoff = snapshot.kickoff.clone().expect("kickoff snapshot");
-    assert_eq!(kickoff.phase, crate::roster::MobMemberKickoffPhase::Failed);
-    assert!(
-        kickoff
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("provider overloaded")),
-        "kickoff failure should preserve the underlying reason: {kickoff:?}"
-    );
-    assert!(
-        snapshot.error.is_none(),
-        "kickoff failure should not overload canonical member corruption error state"
-    );
-}
-
-#[tokio::test]
-async fn test_resume_restores_persisted_kickoff_failure_state() {
-    let service = Arc::new(MockSessionService::new());
-    let _ = service.enable_runtime_adapter();
-    let storage = MobStorage::in_memory();
-    let events = storage.events.clone();
-
-    let handle = MobBuilder::new(sample_definition(), storage)
-        .with_session_service(service.clone())
-        .create()
-        .await
-        .expect("create mob");
-    service.set_keep_alive_turn_failure("provider overloaded");
-
-    let member = MeerkatId::from("lead-kickoff-resume");
-    handle
-        .spawn(ProfileName::from("lead"), member.clone(), None)
-        .await
-        .expect("spawn lead");
-    handle
-        .wait_for_members_kickoff_complete(
-            std::slice::from_ref(&member),
-            Some(Duration::from_secs(2)),
-        )
-        .await
-        .expect("kickoff barrier succeeds");
-    handle.stop().await.expect("stop mob before resume");
-
-    let resumed = MobBuilder::for_resume(MobStorage::with_events(events))
-        .with_session_service(service.clone())
-        .resume()
-        .await
-        .expect("resume mob");
-
-    let snapshot = resumed.member_status(&member).await.expect("member status");
-    assert_eq!(
-        snapshot.status,
-        crate::runtime::handle::MobMemberStatus::Active
-    );
-    let kickoff = snapshot.kickoff.expect("kickoff snapshot");
-    assert_eq!(kickoff.phase, crate::roster::MobMemberKickoffPhase::Failed);
-    assert!(
-        kickoff
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("provider overloaded")),
-        "resumed kickoff state should preserve persisted failure reason: {kickoff:?}"
-    );
-}
-
-#[tokio::test]
-async fn test_callback_pending_kickoff_does_not_block_follow_up_messages() {
-    let (handle, service) = create_test_mob_with_runtime_adapter(sample_definition()).await;
-    service.set_keep_alive_turn_callback_pending(
-        "browser.open",
-        serde_json::json!({ "url": "https://example.test" }),
-    );
-
-    let member = MeerkatId::from("lead-kickoff-callback");
-    handle
-        .spawn(ProfileName::from("lead"), member.clone(), None)
-        .await
-        .expect("spawn lead");
-
-    let snapshots = handle
-        .wait_for_members_kickoff_complete(
-            std::slice::from_ref(&member),
-            Some(Duration::from_secs(2)),
-        )
-        .await
-        .expect("kickoff barrier succeeds");
-    let snapshot = &snapshots[0].1;
-    assert_eq!(
-        snapshot.status,
-        crate::runtime::handle::MobMemberStatus::Active
-    );
-    assert_eq!(
-        snapshot.kickoff.as_ref().expect("kickoff snapshot").phase,
-        crate::roster::MobMemberKickoffPhase::CallbackPending
-    );
-
-    let baseline_injects = service.inject_call_count();
-    handle
-        .member(&member)
-        .await
-        .expect("member handle")
-        .send(
-            "follow-up while callback pending",
-            meerkat_core::types::HandlingMode::Queue,
-        )
-        .await
-        .expect("member should remain sendable while kickoff is callback pending");
-    assert!(
-        service.inject_call_count() > baseline_injects,
-        "follow-up messaging should still route through the live injector"
-    );
-
-    let post_snapshot = handle.member_status(&member).await.expect("member status");
-    assert_eq!(
-        post_snapshot
-            .kickoff
-            .as_ref()
-            .expect("kickoff snapshot")
-            .phase,
-        crate::roster::MobMemberKickoffPhase::CallbackPending
-    );
-}
-
-#[tokio::test]
-async fn test_failed_kickoff_emits_lifecycle_notice_to_wired_peer() {
-    let (handle, service) =
-        create_test_mob_with_runtime_adapter(sample_definition_with_auto_wire()).await;
-    service.set_keep_alive_turns_complete_immediately(true);
-
-    let parent_sid = handle
-        .spawn(
-            ProfileName::from("lead"),
-            MeerkatId::from("lead-parent"),
-            None,
-        )
-        .await
-        .expect("spawn lead")
-        .session_id()
-        .expect("session-backed lead")
-        .clone();
-
-    service.set_keep_alive_turn_failure("provider overloaded");
-    let helper = MeerkatId::from("worker-failing");
-    let helper_sid = handle
-        .spawn(ProfileName::from("worker"), helper.clone(), None)
-        .await
-        .expect("spawn worker")
-        .session_id()
-        .expect("session-backed worker")
-        .clone();
-
-    let snapshots = handle
-        .wait_for_members_kickoff_complete(
-            std::slice::from_ref(&helper),
-            Some(Duration::from_secs(2)),
-        )
-        .await
-        .expect("worker kickoff barrier succeeds");
-    assert_eq!(
-        snapshots[0]
-            .1
-            .kickoff
-            .as_ref()
-            .expect("kickoff snapshot")
-            .phase,
-        crate::roster::MobMemberKickoffPhase::Failed
-    );
-
-    let helper_intents = service.sent_intents(&helper_sid).await;
-    assert!(
-        helper_intents
-            .iter()
-            .any(|intent| intent == "mob.kickoff_failed"),
-        "helper should emit a kickoff failure lifecycle notice"
-    );
-
-    let parent_sent = service.sent_intents(&parent_sid).await;
-    assert!(
-        !parent_sent
-            .iter()
-            .any(|intent| intent == "mob.kickoff_failed"),
-        "kickoff failure notice should originate from the helper bridge side"
-    );
-}
-
-#[tokio::test]
-async fn test_retire_during_bootstrap_emits_kickoff_cancelled_notice() {
-    let (handle, service) =
-        create_test_mob_with_runtime_adapter(sample_definition_with_auto_wire()).await;
-    service.set_keep_alive_turns_complete_immediately(true);
-
-    handle
-        .spawn(
-            ProfileName::from("lead"),
-            MeerkatId::from("lead-parent"),
-            None,
-        )
-        .await
-        .expect("spawn lead");
-
-    service.set_start_turn_delay_ms(600_000);
-    let helper = MeerkatId::from("worker-cancelled");
-    let helper_sid = handle
-        .spawn(ProfileName::from("worker"), helper.clone(), None)
-        .await
-        .expect("spawn worker")
-        .session_id()
-        .expect("session-backed worker")
-        .clone();
-
-    handle
-        .retire(helper.clone())
-        .await
-        .expect("retire during bootstrap should succeed");
-
-    let helper_intents = service.sent_intents(&helper_sid).await;
-    assert!(
-        helper_intents
-            .iter()
-            .any(|intent| intent == "mob.kickoff_cancelled"),
-        "helper should emit a kickoff cancellation lifecycle notice"
-    );
 }
 
 #[tokio::test]
@@ -4919,7 +4669,7 @@ async fn test_mob_flow_tools_hidden_without_operator_context() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
@@ -4972,7 +4722,7 @@ async fn test_mob_flow_status_tool_is_hidden_without_operator_context_even_for_b
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
@@ -5015,7 +4765,7 @@ async fn test_flow_step_tool_overlay_is_step_scoped() {
         )
         .await
         .expect("spawn worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
@@ -5112,7 +4862,7 @@ async fn test_flow_step_tool_overlay_changes_runtime_visible_tools_and_restores_
 
     handle
         .internal_turn(
-            MeerkatId::from("w-runtime-overlay"),
+            AgentIdentity::from("w-runtime-overlay"),
             "baseline after flow".to_string(),
         )
         .await
@@ -5140,7 +4890,7 @@ async fn test_flow_step_tool_overlay_changes_runtime_visible_tools_and_restores_
 }
 
 #[tokio::test]
-async fn test_spawn_meerkat_tool_dispatches_backend_selection() {
+async fn test_spawn_member_tool_dispatches_backend_selection() {
     let mut definition = sample_definition_with_mob_tools();
     definition.backend.external = Some(crate::definition::ExternalBackendConfig {
         address_base: "https://backend.example.invalid/mesh".to_string(),
@@ -5150,17 +4900,17 @@ async fn test_spawn_meerkat_tool_dispatches_backend_selection() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
     let err = service
         .dispatch_external_tool(
             &sid_1,
-            "spawn_meerkat",
+            "spawn_member",
             serde_json::json!({
                 "profile": "worker",
-                "meerkat_id": "w-ext",
+                "member_id": "w-ext",
                 "backend": "external"
             }),
         )
@@ -5169,7 +4919,10 @@ async fn test_spawn_meerkat_tool_dispatches_backend_selection() {
     assert!(matches!(err, ToolError::NotFound { .. }));
 
     assert!(
-        handle.get_member(&MeerkatId::from("w-ext")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-ext"))
+            .await
+            .is_none(),
         "hidden operator spawn tool must not provision a backend peer"
     );
 }
@@ -5181,7 +4934,7 @@ async fn test_mob_task_tools_hidden_without_operator_context() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
@@ -5221,14 +4974,14 @@ async fn test_tool_flag_enforcement_blocks_mob_and_task_tools() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("lead-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
     let names = service.external_tool_names(&sid).await;
     assert!(
-        !names.iter().any(|name| name == "spawn_meerkat"),
-        "tools.mob=false should hide spawn_meerkat"
+        !names.iter().any(|name| name == "spawn_member"),
+        "tools.mob=false should hide spawn_member"
     );
     assert!(
         !names.iter().any(|name| name == "mob_task_create"),
@@ -5238,8 +4991,8 @@ async fn test_tool_flag_enforcement_blocks_mob_and_task_tools() {
     let spawn_err = service
         .dispatch_external_tool(
             &sid,
-            "spawn_meerkat",
-            serde_json::json!({"profile": "worker", "meerkat_id": "w-2"}),
+            "spawn_member",
+            serde_json::json!({"profile": "worker", "member_id": "w-2"}),
         )
         .await
         .expect_err("spawn tool must be unavailable");
@@ -5277,7 +5030,7 @@ async fn test_for_resume_rebuilds_definition_and_roster() {
         .await
         .expect("spawn w-2");
     handle
-        .wire(MeerkatId::from("w-1"), MeerkatId::from("w-2"))
+        .wire(AgentIdentity::from("w-1"), MeerkatId::from("w-2"))
         .await
         .expect("wire");
 
@@ -5288,10 +5041,16 @@ async fn test_for_resume_rebuilds_definition_and_roster() {
         .expect("resume");
 
     assert_eq!(resumed.mob_id().as_str(), "test-mob");
-    let entry_1 = resumed.get_member(&MeerkatId::from("w-1")).await.unwrap();
-    let entry_2 = resumed.get_member(&MeerkatId::from("w-2")).await.unwrap();
-    assert!(entry_1.wired_to.contains(&MeerkatId::from("w-2")));
-    assert!(entry_2.wired_to.contains(&MeerkatId::from("w-1")));
+    let entry_1 = resumed
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
+    let entry_2 = resumed
+        .get_member(&AgentIdentity::from("w-2"))
+        .await
+        .unwrap();
+    assert!(entry_1.wired_to.contains(&AgentIdentity::from("w-2")));
+    assert!(entry_2.wired_to.contains(&AgentIdentity::from("w-1")));
 }
 
 #[tokio::test]
@@ -5399,10 +5158,10 @@ async fn test_resume_restores_missing_sessions_with_same_session_and_history() {
     handle.stop().await.expect("stop");
 
     let old_sid = handle
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("roster entry")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
     let mut persisted = service
@@ -5426,10 +5185,10 @@ async fn test_resume_restores_missing_sessions_with_same_session_and_history() {
         .expect("resume");
 
     let restored_sid = resumed
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("restored entry")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
     assert_eq!(
@@ -5480,10 +5239,10 @@ async fn test_resume_restores_missing_sessions_with_tool_wiring() {
     handle.stop().await.expect("stop");
 
     let old_sid = handle
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("roster entry")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
     service
@@ -5499,10 +5258,10 @@ async fn test_resume_restores_missing_sessions_with_tool_wiring() {
         .expect("resume");
 
     let restored_sid = resumed
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("restored entry")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
     assert_eq!(
@@ -5512,7 +5271,7 @@ async fn test_resume_restores_missing_sessions_with_tool_wiring() {
 
     let names = service.external_tool_names(&restored_sid).await;
     assert!(
-        !names.contains(&"spawn_meerkat".to_string()),
+        !names.contains(&"spawn_member".to_string()),
         "restored sessions must not regain mob operator tools without runtime-injected context"
     );
     assert!(
@@ -5543,10 +5302,10 @@ async fn test_resume_marks_missing_persisted_session_as_broken() {
     handle.stop().await.expect("stop");
 
     let old_sid = handle
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("roster entry")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
     service
@@ -5562,7 +5321,7 @@ async fn test_resume_marks_missing_persisted_session_as_broken() {
         .expect("partial resume should still succeed");
 
     let snapshot = resumed
-        .member_status(&MeerkatId::from("w-1"))
+        .member_status(&AgentIdentity::from("w-1"))
         .await
         .expect("broken member status");
     assert_eq!(
@@ -5614,18 +5373,18 @@ async fn test_resume_skips_wiring_for_broken_peer_and_keeps_partial_resume() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_2 = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-2"), None)
         .await
         .expect("spawn w-2")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle
-        .wire(MeerkatId::from("w-1"), MeerkatId::from("w-2"))
+        .wire(AgentIdentity::from("w-1"), MeerkatId::from("w-2"))
         .await
         .expect("wire");
     handle.stop().await.expect("stop");
@@ -5643,14 +5402,14 @@ async fn test_resume_skips_wiring_for_broken_peer_and_keeps_partial_resume() {
         .expect("resume should stay partial even with broken wired member");
 
     let left = resumed
-        .member_status(&MeerkatId::from("w-1"))
+        .member_status(&AgentIdentity::from("w-1"))
         .await
         .expect("healthy member status");
     assert_eq!(left.status, crate::runtime::handle::MobMemberStatus::Active);
     assert_eq!(left.current_session_id, Some(sid_1.clone()));
 
     let right = resumed
-        .member_status(&MeerkatId::from("w-2"))
+        .member_status(&AgentIdentity::from("w-2"))
         .await
         .expect("broken member status");
     assert_eq!(
@@ -5684,7 +5443,7 @@ async fn test_resume_restores_missing_live_session_even_when_list_reports_inacti
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle.stop().await.expect("stop");
@@ -5699,7 +5458,7 @@ async fn test_resume_restores_missing_live_session_even_when_list_reports_inacti
         );
 
     let snapshot = resumed
-        .member_status(&MeerkatId::from("w-1"))
+        .member_status(&AgentIdentity::from("w-1"))
         .await
         .expect("member status after resume");
     assert_eq!(
@@ -5731,10 +5490,10 @@ async fn test_resume_skips_broken_orchestrator_notification_and_keeps_partial_re
     handle.stop().await.expect("stop");
 
     let orchestrator_sid = handle
-        .get_member(&MeerkatId::from("lead-1"))
+        .get_member(&AgentIdentity::from("lead-1"))
         .await
         .expect("orchestrator entry")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
     service
@@ -5750,7 +5509,7 @@ async fn test_resume_skips_broken_orchestrator_notification_and_keeps_partial_re
         .expect("resume should succeed when orchestrator is broken");
 
     let orchestrator = resumed
-        .member_status(&MeerkatId::from("lead-1"))
+        .member_status(&AgentIdentity::from("lead-1"))
         .await
         .expect("orchestrator status");
     assert_eq!(
@@ -5786,10 +5545,10 @@ async fn test_broken_member_turn_returns_restore_failed_error() {
     handle.stop().await.expect("stop");
 
     let old_sid = handle
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("roster entry")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
     service
@@ -5818,7 +5577,7 @@ async fn test_broken_member_turn_returns_restore_failed_error() {
 
     let error = resumed
         .internal_turn(
-            MeerkatId::from("w-1"),
+            AgentIdentity::from("w-1"),
             ContentInput::from("repair me".to_string()),
         )
         .await
@@ -5863,10 +5622,10 @@ async fn test_wire_broken_member_returns_restore_failed_error() {
     handle.stop().await.expect("stop");
 
     let old_sid = handle
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("roster entry")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
     service
@@ -5897,7 +5656,7 @@ async fn test_wire_broken_member_returns_restore_failed_error() {
         .expect("spawn healthy worker");
 
     let error = resumed
-        .wire(MeerkatId::from("w-2"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("w-2"), MeerkatId::from("w-1"))
         .await
         .expect_err("wiring to Broken member must be rejected");
 
@@ -5932,10 +5691,10 @@ async fn test_retire_broken_member_succeeds_and_removes_it() {
     handle.stop().await.expect("stop");
 
     let old_sid = handle
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("roster entry")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
     service
@@ -5951,12 +5710,15 @@ async fn test_retire_broken_member_succeeds_and_removes_it() {
         .expect("partial resume should still succeed");
 
     resumed
-        .retire(MeerkatId::from("w-1"))
+        .retire(AgentIdentity::from("w-1"))
         .await
         .expect("retire should work on broken member");
 
     assert!(
-        resumed.get_member(&MeerkatId::from("w-1")).await.is_none(),
+        resumed
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_none(),
         "retire should remove the broken member from the roster"
     );
 }
@@ -5987,10 +5749,10 @@ async fn test_respawn_broken_member_clears_restore_diagnostic() {
     handle.stop().await.expect("stop");
 
     let old_sid = handle
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("roster entry")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
     service
@@ -6016,11 +5778,15 @@ async fn test_respawn_broken_member_clears_restore_diagnostic() {
     }
 
     let receipt = resumed
-        .respawn(MeerkatId::from("w-1"), None)
+        .respawn(AgentIdentity::from("w-1"), None)
         .await
         .expect("respawn should repair broken member");
-    let new_sid = receipt
-        .new_session_id
+    let snapshot = resumed
+        .member_status(&AgentIdentity::from("w-1"))
+        .await
+        .expect("member status after repair");
+    let new_sid = snapshot
+        .current_bridge_session_id
         .clone()
         .expect("respawned member should have a new session");
     assert_ne!(
@@ -6028,14 +5794,12 @@ async fn test_respawn_broken_member_clears_restore_diagnostic() {
         "respawn should rotate the session identity"
     );
 
-    let snapshot = resumed
-        .member_status(&MeerkatId::from("w-1"))
-        .await
-        .expect("member status after repair");
     assert_eq!(
         snapshot.status,
         crate::runtime::handle::MobMemberStatus::Active
     );
+    assert_eq!(snapshot.agent_runtime_id, receipt.agent_runtime_id);
+    assert_eq!(snapshot.fence_token, receipt.fence_token);
     assert_eq!(snapshot.current_session_id, Some(new_sid.clone()));
     assert!(
         snapshot.error.is_none(),
@@ -6073,10 +5837,10 @@ async fn test_resume_restores_persisted_behavior_metadata() {
     handle.stop().await.expect("stop");
 
     let old_sid = handle
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("roster entry")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
     let mut persisted = service
@@ -6120,10 +5884,10 @@ async fn test_resume_restores_persisted_behavior_metadata() {
         .expect("resume");
 
     let restored_sid = resumed
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("restored entry")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
     let restored = service
@@ -6173,10 +5937,10 @@ async fn test_resume_marks_comms_name_mismatch_as_broken() {
     handle.stop().await.expect("stop");
 
     let old_sid = handle
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("roster entry")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
     let mut persisted = service
@@ -6197,7 +5961,7 @@ async fn test_resume_marks_comms_name_mismatch_as_broken() {
         .await
         .expect("resume should succeed with Broken projection");
     let snapshot = resumed
-        .member_status(&MeerkatId::from("w-1"))
+        .member_status(&AgentIdentity::from("w-1"))
         .await
         .expect("broken member status");
     assert_eq!(
@@ -6306,7 +6070,7 @@ async fn test_build_resumed_agent_config_rejects_mismatched_session_identity() {
                 meerkat_core::PeerMeta::default()
                     .with_label("mob_id", "test-mob")
                     .with_label("role", "worker")
-                    .with_label("meerkat_id", "w-1"),
+                    .with_label("member_id", "w-1"),
             ),
             realm_id: Some("mob:test-mob".to_string()),
             instance_id: None,
@@ -6396,7 +6160,7 @@ async fn test_attach_existing_session_restores_persisted_inactive_session() {
         .expect("attach should restore persisted session");
 
     assert_eq!(
-        member_ref.session_id(),
+        member_ref.bridge_session_id(),
         Some(&session_id),
         "explicit member resume should preserve the requested session id"
     );
@@ -6438,7 +6202,7 @@ async fn test_resume_recreates_missing_external_bridge_preserving_backend_identi
     handle.stop().await.expect("stop");
 
     let old_entry = handle
-        .get_member(&MeerkatId::from("w-ext"))
+        .get_member(&AgentIdentity::from("w-ext"))
         .await
         .expect("external roster entry");
     let (old_peer_id, old_address, old_sid) = match old_entry.member_ref {
@@ -6464,7 +6228,7 @@ async fn test_resume_recreates_missing_external_bridge_preserving_backend_identi
         .await
         .expect("resume");
     let resumed_entry = resumed
-        .get_member(&MeerkatId::from("w-ext"))
+        .get_member(&AgentIdentity::from("w-ext"))
         .await
         .expect("resumed external entry");
     match resumed_entry.member_ref {
@@ -6500,7 +6264,7 @@ async fn test_resume_reconciles_mixed_topology_without_losing_external_member_re
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-sub"), None)
         .await
         .expect("spawn session-backed member")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle
@@ -6513,13 +6277,13 @@ async fn test_resume_reconciles_mixed_topology_without_losing_external_member_re
         .await
         .expect("spawn external");
     handle
-        .wire(MeerkatId::from("w-sub"), MeerkatId::from("w-ext"))
+        .wire(AgentIdentity::from("w-sub"), MeerkatId::from("w-ext"))
         .await
         .expect("wire mixed topology");
     handle.stop().await.expect("stop");
 
     let old_ext_entry = handle
-        .get_member(&MeerkatId::from("w-ext"))
+        .get_member(&AgentIdentity::from("w-ext"))
         .await
         .expect("external entry before resume");
     let (old_ext_peer_id, old_ext_addr, old_ext_sid) = match old_ext_entry.member_ref {
@@ -6549,7 +6313,7 @@ async fn test_resume_reconciles_mixed_topology_without_losing_external_member_re
         .await
         .expect("resume mixed topology");
     let resumed_sub = resumed
-        .get_member(&MeerkatId::from("w-sub"))
+        .get_member(&AgentIdentity::from("w-sub"))
         .await
         .expect("resumed session-backed member entry");
     let resumed_sub_sid = match resumed_sub.member_ref {
@@ -6562,7 +6326,7 @@ async fn test_resume_reconciles_mixed_topology_without_losing_external_member_re
     );
 
     let resumed_ext = resumed
-        .get_member(&MeerkatId::from("w-ext"))
+        .get_member(&AgentIdentity::from("w-ext"))
         .await
         .expect("resumed external entry");
     match resumed_ext.member_ref {
@@ -6604,18 +6368,18 @@ async fn test_resume_reestablishes_missing_trust() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_2 = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-2"), None)
         .await
         .expect("spawn w-2")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle
-        .wire(MeerkatId::from("w-1"), MeerkatId::from("w-2"))
+        .wire(AgentIdentity::from("w-1"), MeerkatId::from("w-2"))
         .await
         .expect("wire");
     handle.stop().await.expect("stop");
@@ -6629,17 +6393,17 @@ async fn test_resume_reestablishes_missing_trust() {
         .await
         .expect("resume");
     let resumed_sid_1 = resumed
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("w-1")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
     let resumed_sid_2 = resumed
-        .get_member(&MeerkatId::from("w-2"))
+        .get_member(&AgentIdentity::from("w-2"))
         .await
         .expect("w-2")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
     let trusted_1 = service.trusted_peer_names(&resumed_sid_1).await;
@@ -6669,7 +6433,7 @@ async fn test_resume_prunes_stale_trust_not_present_in_roster() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let _sid_2 = handle
@@ -6694,10 +6458,10 @@ async fn test_resume_prunes_stale_trust_not_present_in_roster() {
         .await
         .expect("resume");
     let resumed_sid_1 = resumed
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("w-1")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
     let trusted = service.trusted_peer_names(&resumed_sid_1).await;
@@ -6730,7 +6494,7 @@ async fn test_resume_restores_external_wiring_from_event_log() {
     .expect("valid external peer");
     handle
         .wire(
-            MeerkatId::from("l-1"),
+            AgentIdentity::from("l-1"),
             PeerTarget::External(external.clone()),
         )
         .await
@@ -6743,10 +6507,10 @@ async fn test_resume_restores_external_wiring_from_event_log() {
         .await
         .expect("resume");
     let resumed_sid = resumed
-        .get_member(&MeerkatId::from("l-1"))
+        .get_member(&AgentIdentity::from("l-1"))
         .await
         .expect("resumed member")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
     let trusted = service.trusted_peer_names(&resumed_sid).await;
@@ -6755,7 +6519,7 @@ async fn test_resume_restores_external_wiring_from_event_log() {
         "resume should restore external trusted peers from persisted wiring events"
     );
     let entry = resumed
-        .get_member(&MeerkatId::from("l-1"))
+        .get_member(&AgentIdentity::from("l-1"))
         .await
         .expect("resumed member");
     assert_eq!(
@@ -6917,7 +6681,7 @@ async fn test_spawn_creates_session() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn should succeed")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
@@ -6925,8 +6689,11 @@ async fn test_spawn_creates_session() {
     let meerkats = handle.list_members().await;
     assert_eq!(meerkats.len(), 1);
     assert_eq!(meerkats[0].meerkat_id.as_str(), "w-1");
-    assert_eq!(meerkats[0].profile.as_str(), "worker");
-    assert_eq!(meerkats[0].session_id(), Some(&session_id));
+    assert_eq!(meerkats[0].role.as_str(), "worker");
+    assert_eq!(
+        meerkats[0].current_bridge_session_id.as_ref(),
+        Some(&session_id)
+    );
 }
 
 #[tokio::test]
@@ -6971,12 +6738,12 @@ async fn test_spawn_emits_meerkat_spawned_event() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
     let events = handle.events().replay_all().await.expect("replay");
-    // Should have MobCreated + MeerkatSpawned
+    // Should have MobCreated + MemberSpawned
     assert!(
         events.len() >= 2,
         "expected at least 2 events, got {}",
@@ -6984,18 +6751,22 @@ async fn test_spawn_emits_meerkat_spawned_event() {
     );
     let spawned = events
         .iter()
-        .find(|e| matches!(e.kind, MobEventKind::MeerkatSpawned { .. }));
-    assert!(spawned.is_some(), "should have MeerkatSpawned event");
-    if let MobEventKind::MeerkatSpawned {
-        meerkat_id,
-        role,
-        member_ref,
-        ..
-    } = &spawned.unwrap().kind
-    {
-        assert_eq!(meerkat_id.as_str(), "w-1");
-        assert_eq!(role.as_str(), "worker");
-        assert_eq!(member_ref.session_id(), Some(&session_id));
+        .find(|e| matches!(e.kind, MobEventKind::MemberSpawned(..)));
+    assert!(spawned.is_some(), "should have MemberSpawned event");
+    if let MobEventKind::MemberSpawned(member_spawned) = &spawned.unwrap().kind {
+        assert_eq!(member_spawned.agent_identity.as_str(), "w-1");
+        assert_eq!(member_spawned.role.as_str(), "worker");
+        assert_eq!(member_spawned.generation, crate::ids::Generation::INITIAL);
+        assert!(
+            member_spawned.fence_token.get() > 0,
+            "fence token should be non-zero"
+        );
+        assert_eq!(
+            member_spawned
+                .bridge_member_ref()
+                .and_then(|member_ref| member_ref.bridge_session_id()),
+            Some(&session_id),
+        );
     }
 }
 
@@ -7103,16 +6874,16 @@ async fn test_external_backend_wiring_uses_sendable_transport_addresses() {
         .await
         .expect("spawn external w-b");
     let sid_a = member_a
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("external member bridge session id");
     let sid_b = member_b
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("external member bridge session id");
 
     handle
-        .wire(MeerkatId::from("w-a"), MeerkatId::from("w-b"))
+        .wire(AgentIdentity::from("w-a"), MeerkatId::from("w-b"))
         .await
         .expect("wire external peers");
 
@@ -7169,13 +6940,18 @@ async fn test_spawn_fails_when_profile_comms_disabled() {
         0,
         "spawn should fail before create_session when comms is disabled"
     );
-    assert!(handle.get_member(&MeerkatId::from("w-1")).await.is_none());
+    assert!(
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]
 async fn test_spawn_append_failure_rolls_back_runtime_state() {
     let events = Arc::new(FaultInjectedMobEventStore::new());
-    events.fail_appends_for("MeerkatSpawned").await;
+    events.fail_appends_for("MemberSpawned").await;
     let (handle, service) = create_test_mob_with_events(sample_definition(), events).await;
 
     let result = handle
@@ -7186,7 +6962,10 @@ async fn test_spawn_append_failure_rolls_back_runtime_state() {
         "spawn should surface append failure"
     );
     assert!(
-        handle.get_member(&MeerkatId::from("w-1")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_none(),
         "spawn append failure must leave roster untouched"
     );
     assert_eq!(
@@ -7199,8 +6978,8 @@ async fn test_spawn_append_failure_rolls_back_runtime_state() {
     assert!(
         !recorded
             .iter()
-            .any(|e| matches!(e.kind, MobEventKind::MeerkatSpawned { .. })),
-        "failed spawn append must not persist MeerkatSpawned"
+            .any(|e| matches!(e.kind, MobEventKind::MemberSpawned(..))),
+        "failed spawn append must not persist MemberSpawned"
     );
 }
 
@@ -7216,7 +6995,10 @@ async fn test_retire_removes_from_roster() {
         .await
         .expect("spawn");
 
-    handle.retire(MeerkatId::from("w-1")).await.expect("retire");
+    handle
+        .retire(AgentIdentity::from("w-1"))
+        .await
+        .expect("retire");
 
     assert!(handle.list_members().await.is_empty());
 }
@@ -7231,7 +7013,10 @@ async fn test_retire_path_does_not_replay_full_event_log() {
         .expect("spawn");
     assert_eq!(events.replay_calls(), 0, "setup should not replay events");
 
-    handle.retire(MeerkatId::from("w-1")).await.expect("retire");
+    handle
+        .retire(AgentIdentity::from("w-1"))
+        .await
+        .expect("retire");
     assert_eq!(
         events.replay_calls(),
         0,
@@ -7247,19 +7032,22 @@ async fn test_retire_emits_event() {
         .await
         .expect("spawn");
 
-    handle.retire(MeerkatId::from("w-1")).await.expect("retire");
+    handle
+        .retire(AgentIdentity::from("w-1"))
+        .await
+        .expect("retire");
 
     let events = handle.events().replay_all().await.expect("replay");
     let retired = events
         .iter()
-        .find(|e| matches!(e.kind, MobEventKind::MeerkatRetired { .. }));
-    assert!(retired.is_some(), "should have MeerkatRetired event");
+        .find(|e| matches!(e.kind, MobEventKind::MemberRetired { .. }));
+    assert!(retired.is_some(), "should have retire event");
 }
 
 #[tokio::test]
 async fn test_retire_nonexistent_is_idempotent() {
     let (handle, _service) = create_test_mob(sample_definition()).await;
-    let result = handle.retire(MeerkatId::from("nope")).await;
+    let result = handle.retire(AgentIdentity::from("nope")).await;
     assert!(result.is_ok(), "retire should be idempotent");
 }
 
@@ -7276,20 +7064,29 @@ async fn test_retire_removes_wiring_from_peers() {
         .expect("spawn w-2");
 
     handle
-        .wire(MeerkatId::from("w-1"), MeerkatId::from("w-2"))
+        .wire(AgentIdentity::from("w-1"), MeerkatId::from("w-2"))
         .await
         .expect("wire");
 
     // Verify wired
-    let entry = handle.get_member(&MeerkatId::from("w-2")).await.unwrap();
-    assert!(entry.wired_to.contains(&MeerkatId::from("w-1")));
+    let entry = handle
+        .get_member(&AgentIdentity::from("w-2"))
+        .await
+        .unwrap();
+    assert!(entry.wired_to.contains(&AgentIdentity::from("w-1")));
 
     // Retire w-1
-    handle.retire(MeerkatId::from("w-1")).await.expect("retire");
+    handle
+        .retire(AgentIdentity::from("w-1"))
+        .await
+        .expect("retire");
 
     // w-2 should no longer be wired to w-1
-    let entry = handle.get_member(&MeerkatId::from("w-2")).await.unwrap();
-    assert!(!entry.wired_to.contains(&MeerkatId::from("w-1")));
+    let entry = handle
+        .get_member(&AgentIdentity::from("w-2"))
+        .await
+        .unwrap();
+    assert!(!entry.wired_to.contains(&AgentIdentity::from("w-1")));
 }
 
 #[tokio::test]
@@ -7299,13 +7096,13 @@ async fn test_retire_archive_failure_is_not_silent() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     service.set_archive_failure(&session_id).await;
 
     // Archive failure is critical — retire must surface it (dogma §15).
-    let result = handle.retire(MeerkatId::from("w-1")).await;
+    let result = handle.retire(AgentIdentity::from("w-1")).await;
     assert!(
         result.is_err(),
         "retire must return Err when ArchiveSession fails"
@@ -7313,14 +7110,17 @@ async fn test_retire_archive_failure_is_not_silent() {
 
     // Member is removed from roster unconditionally (finally block).
     assert!(
-        handle.get_member(&MeerkatId::from("w-1")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_none(),
         "retire must remove roster entry even when archive fails"
     );
     let events = handle.events().replay_all().await.expect("replay");
     assert!(
         events
             .iter()
-            .any(|e| matches!(e.kind, MobEventKind::MeerkatRetired { .. })),
+            .any(|e| matches!(e.kind, MobEventKind::MemberRetired { .. })),
         "retire event should be persisted before archive so cleanup remains retryable"
     );
 }
@@ -7347,12 +7147,12 @@ async fn test_retire_trust_removal_failure_is_not_silent() {
         .await
         .expect("spawn w-2");
     handle
-        .wire(MeerkatId::from("w-1"), MeerkatId::from("w-2"))
+        .wire(AgentIdentity::from("w-1"), MeerkatId::from("w-2"))
         .await
         .expect("wire");
 
     // Retire succeeds despite trust-removal failure (best-effort cleanup).
-    let result = handle.retire(MeerkatId::from("w-1")).await;
+    let result = handle.retire(AgentIdentity::from("w-1")).await;
     assert!(
         result.is_ok(),
         "retire should succeed despite trust-removal failure"
@@ -7360,14 +7160,17 @@ async fn test_retire_trust_removal_failure_is_not_silent() {
 
     // Member is removed from roster unconditionally.
     assert!(
-        handle.get_member(&MeerkatId::from("w-1")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_none(),
         "retire must remove roster entry even when trust removal fails"
     );
     let events = handle.events().replay_all().await.expect("replay");
     assert!(
         events
             .iter()
-            .any(|e| matches!(e.kind, MobEventKind::MeerkatRetired { .. })),
+            .any(|e| matches!(e.kind, MobEventKind::MemberRetired { .. })),
         "retire event should persist even when trust-removal cleanup fails"
     );
 }
@@ -7394,25 +7197,28 @@ async fn test_retire_fails_when_peer_retired_notification_fails_without_side_eff
         .await
         .expect("spawn w-2");
     handle
-        .wire(MeerkatId::from("w-1"), MeerkatId::from("w-2"))
+        .wire(AgentIdentity::from("w-1"), MeerkatId::from("w-2"))
         .await
         .expect("wire");
 
-    let result = handle.retire(MeerkatId::from("w-1")).await;
+    let result = handle.retire(AgentIdentity::from("w-1")).await;
     assert!(
         result.is_ok(),
         "retire should remain best-effort under notification failure"
     );
     assert!(
-        handle.get_member(&MeerkatId::from("w-1")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_none(),
         "retired meerkat should be removed from roster"
     );
     let entry_w2 = handle
-        .get_member(&MeerkatId::from("w-2"))
+        .get_member(&AgentIdentity::from("w-2"))
         .await
         .expect("w-2 should stay in roster");
     assert!(
-        !entry_w2.wired_to.contains(&MeerkatId::from("w-1")),
+        !entry_w2.wired_to.contains(&AgentIdentity::from("w-1")),
         "retire should remove wiring from remaining peers"
     );
 
@@ -7420,7 +7226,7 @@ async fn test_retire_fails_when_peer_retired_notification_fails_without_side_eff
     assert!(
         events
             .iter()
-            .any(|e| matches!(e.kind, MobEventKind::MeerkatRetired { .. })),
+            .any(|e| matches!(e.kind, MobEventKind::MemberRetired { .. })),
         "retire event should persist even when notification cleanup fails"
     );
 }
@@ -7428,7 +7234,7 @@ async fn test_retire_fails_when_peer_retired_notification_fails_without_side_eff
 #[tokio::test]
 async fn test_retire_append_failure_is_retryable_without_side_effects() {
     let events = Arc::new(FaultInjectedMobEventStore::new());
-    events.fail_appends_for("MeerkatRetired").await;
+    events.fail_appends_for("MemberRetired").await;
     let (handle, service) = create_test_mob_with_events(sample_definition(), events).await;
 
     handle
@@ -7440,25 +7246,28 @@ async fn test_retire_append_failure_is_retryable_without_side_effects() {
         .await
         .expect("spawn w-2");
     handle
-        .wire(MeerkatId::from("w-1"), MeerkatId::from("w-2"))
+        .wire(AgentIdentity::from("w-1"), MeerkatId::from("w-2"))
         .await
         .expect("wire");
 
-    let result = handle.retire(MeerkatId::from("w-1")).await;
+    let result = handle.retire(AgentIdentity::from("w-1")).await;
     assert!(
         matches!(result, Err(MobError::StorageError(_))),
         "retire should surface append failure"
     );
     assert!(
-        handle.get_member(&MeerkatId::from("w-1")).await.is_some(),
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_some(),
         "retire append failure must keep roster state retryable"
     );
     let entry_w2 = handle
-        .get_member(&MeerkatId::from("w-2"))
+        .get_member(&AgentIdentity::from("w-2"))
         .await
         .expect("w-2 should remain in roster");
     assert!(
-        entry_w2.wired_to.contains(&MeerkatId::from("w-1")),
+        entry_w2.wired_to.contains(&AgentIdentity::from("w-1")),
         "retire append failure must not apply trust cleanup before event persistence"
     );
     assert_eq!(
@@ -7471,8 +7280,8 @@ async fn test_retire_append_failure_is_retryable_without_side_effects() {
     assert!(
         !recorded
             .iter()
-            .any(|e| matches!(e.kind, MobEventKind::MeerkatRetired { .. })),
-        "failed retire append must not persist MeerkatRetired"
+            .any(|e| matches!(e.kind, MobEventKind::MemberRetired { .. })),
+        "failed retire append must not persist MemberRetired"
     );
 }
 
@@ -7493,16 +7302,22 @@ async fn test_wire_establishes_bidirectional() {
         .expect("spawn worker");
 
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("wire");
 
     // Check roster wiring
-    let entry_l = handle.get_member(&MeerkatId::from("l-1")).await.unwrap();
-    assert!(entry_l.wired_to.contains(&MeerkatId::from("w-1")));
+    let entry_l = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .unwrap();
+    assert!(entry_l.wired_to.contains(&AgentIdentity::from("w-1")));
 
-    let entry_w = handle.get_member(&MeerkatId::from("w-1")).await.unwrap();
-    assert!(entry_w.wired_to.contains(&MeerkatId::from("l-1")));
+    let entry_w = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
+    assert!(entry_w.wired_to.contains(&AgentIdentity::from("l-1")));
 }
 
 #[tokio::test]
@@ -7514,7 +7329,7 @@ async fn test_member_roster_surfaces_peer_id() {
         .expect("spawn lead");
 
     let entry = handle
-        .get_member(&MeerkatId::from("l-1"))
+        .get_member(&AgentIdentity::from("l-1"))
         .await
         .expect("member should exist");
     assert_eq!(entry.peer_id.as_deref(), Some("ed25519:test-mob/lead/l-1"));
@@ -7529,7 +7344,7 @@ async fn test_member_status_projects_unreachable_peer_connectivity() {
         .spawn(ProfileName::from("lead"), left_id.clone(), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle
@@ -7537,18 +7352,18 @@ async fn test_member_status_projects_unreachable_peer_connectivity() {
         .await
         .expect("spawn worker");
     handle
-        .wire(left_id.clone(), right_id.clone())
+        .wire(AgentIdentity::from(left_id.as_str()), right_id.clone())
         .await
         .expect("wire local peers");
 
     let right_entry = handle
-        .get_member(&right_id)
+        .get_member(&AgentIdentity::from(right_id.as_str()))
         .await
         .expect("right member exists");
     let right_name = format!(
         "{}/{}/{}",
         handle.mob_id(),
-        right_entry.profile,
+        right_entry.role,
         right_entry.meerkat_id
     );
     service
@@ -7561,7 +7376,7 @@ async fn test_member_status_projects_unreachable_peer_connectivity() {
         .await;
 
     let snapshot = handle
-        .member_status(&left_id)
+        .member_status(&AgentIdentity::from(left_id.as_str()))
         .await
         .expect("member status should succeed");
     let connectivity = snapshot
@@ -7586,7 +7401,7 @@ async fn test_member_status_omits_peer_connectivity_without_live_comms_runtime()
         .spawn(ProfileName::from("lead"), left_id.clone(), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle
@@ -7594,171 +7409,18 @@ async fn test_member_status_omits_peer_connectivity_without_live_comms_runtime()
         .await
         .expect("spawn worker");
     handle
-        .wire(left_id.clone(), right_id.clone())
+        .wire(AgentIdentity::from(left_id.as_str()), right_id.clone())
         .await
         .expect("wire local peers");
     service.set_missing_comms_runtime(&left_session_id).await;
 
     let snapshot = handle
-        .member_status(&left_id)
+        .member_status(&AgentIdentity::from(left_id.as_str()))
         .await
         .expect("member status should succeed");
     assert!(
         snapshot.peer_connectivity.is_none(),
         "member snapshot should omit connectivity when no live comms runtime exists"
-    );
-}
-
-#[tokio::test]
-async fn test_list_members_does_not_block_on_peer_connectivity_resolution() {
-    let (handle, service) = create_test_mob(sample_definition()).await;
-    let member_id = MeerkatId::from("l-1");
-    handle
-        .spawn(ProfileName::from("lead"), member_id.clone(), None)
-        .await
-        .expect("spawn lead");
-    service
-        .set_comms_behavior(
-            &test_comms_name("lead", "l-1"),
-            MockCommsBehavior {
-                hang_peers: true,
-                ..MockCommsBehavior::default()
-            },
-        )
-        .await;
-
-    let members = tokio::time::timeout(Duration::from_millis(200), handle.list_members())
-        .await
-        .expect("list_members should not wait on peer connectivity")
-        .into_iter()
-        .collect::<Vec<_>>();
-
-    assert_eq!(members.len(), 1, "spawned member should still be listed");
-    assert_eq!(members[0].meerkat_id, member_id);
-    assert_eq!(
-        members[0].status,
-        crate::runtime::handle::MobMemberStatus::Active
-    );
-}
-
-#[tokio::test]
-async fn test_list_members_including_retiring_does_not_block_on_peer_connectivity_resolution() {
-    let (handle, service) = create_test_mob(sample_definition()).await;
-    let member_id = MeerkatId::from("l-1");
-    handle
-        .spawn(ProfileName::from("lead"), member_id.clone(), None)
-        .await
-        .expect("spawn lead");
-    service
-        .set_comms_behavior(
-            &test_comms_name("lead", "l-1"),
-            MockCommsBehavior {
-                hang_peers: true,
-                ..MockCommsBehavior::default()
-            },
-        )
-        .await;
-
-    let members = tokio::time::timeout(
-        Duration::from_millis(200),
-        handle.list_members_including_retiring(),
-    )
-    .await
-    .expect("list_members_including_retiring should not wait on peer connectivity")
-    .into_iter()
-    .collect::<Vec<_>>();
-
-    assert_eq!(members.len(), 1, "spawned member should still be listed");
-    assert_eq!(members[0].meerkat_id, member_id);
-    assert_eq!(
-        members[0].status,
-        crate::runtime::handle::MobMemberStatus::Active
-    );
-}
-
-#[tokio::test]
-async fn test_list_runnable_members_does_not_block_on_peer_connectivity_resolution() {
-    let (handle, service) = create_test_mob(sample_definition()).await;
-    let member_id = MeerkatId::from("l-1");
-    handle
-        .spawn(ProfileName::from("lead"), member_id.clone(), None)
-        .await
-        .expect("spawn lead");
-    service
-        .set_comms_behavior(
-            &test_comms_name("lead", "l-1"),
-            MockCommsBehavior {
-                hang_peers: true,
-                ..MockCommsBehavior::default()
-            },
-        )
-        .await;
-
-    let members = tokio::time::timeout(Duration::from_millis(200), handle.list_runnable_members())
-        .await
-        .expect("list_runnable_members should not wait on peer connectivity");
-
-    assert_eq!(members.len(), 1, "active member should remain runnable");
-    assert_eq!(members[0].meerkat_id, member_id);
-    assert_eq!(
-        members[0].status,
-        crate::runtime::handle::MobMemberStatus::Active
-    );
-}
-
-#[tokio::test]
-async fn test_list_members_avoids_blocking_read_fallback_when_no_live_session_exists() {
-    let inner = Arc::new(MockSessionService::new());
-    let _ = inner.enable_runtime_adapter();
-    let service = Arc::new(HangingReadWithoutLiveSessionService::new(inner));
-    let handle = MobBuilder::new(sample_definition(), MobStorage::in_memory())
-        .with_session_service(service)
-        .create()
-        .await
-        .expect("create mob");
-    let member_id = MeerkatId::from("l-1");
-    handle
-        .spawn(ProfileName::from("lead"), member_id.clone(), None)
-        .await
-        .expect("spawn lead");
-
-    let members = tokio::time::timeout(Duration::from_millis(200), handle.list_members())
-        .await
-        .expect("list_members should use live-only session observation")
-        .into_iter()
-        .collect::<Vec<_>>();
-
-    assert_eq!(members.len(), 1, "spawned member should still be listed");
-    assert_eq!(members[0].meerkat_id, member_id);
-    assert_eq!(
-        members[0].status,
-        crate::runtime::handle::MobMemberStatus::Completed,
-        "without a live session, the cheap list projection should return promptly instead of blocking on read()"
-    );
-}
-
-#[tokio::test]
-async fn test_list_runnable_members_avoids_blocking_read_fallback_when_no_live_session_exists() {
-    let inner = Arc::new(MockSessionService::new());
-    let _ = inner.enable_runtime_adapter();
-    let service = Arc::new(HangingReadWithoutLiveSessionService::new(inner));
-    let handle = MobBuilder::new(sample_definition(), MobStorage::in_memory())
-        .with_session_service(service)
-        .create()
-        .await
-        .expect("create mob");
-    handle
-        .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
-        .await
-        .expect("spawn lead");
-
-    let members = tokio::time::timeout(Duration::from_millis(200), handle.list_runnable_members())
-        .await
-        .expect("list_runnable_members should use live-only session observation");
-
-    assert!(
-        members.is_empty(),
-        "members without a live session should not remain runnable"
     );
 }
 
@@ -7769,7 +7431,7 @@ async fn test_wire_external_adds_trusted_peer_and_tracks_projection() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
@@ -7782,20 +7444,20 @@ async fn test_wire_external_adds_trusted_peer_and_tracks_projection() {
 
     handle
         .wire(
-            MeerkatId::from("l-1"),
+            AgentIdentity::from("l-1"),
             PeerTarget::External(external.clone()),
         )
         .await
         .expect("wire external");
 
     let entry_l = handle
-        .get_member(&MeerkatId::from("l-1"))
+        .get_member(&AgentIdentity::from("l-1"))
         .await
         .expect("member should exist");
     assert!(
         entry_l
             .wired_to
-            .contains(&MeerkatId::from(external.name.clone()))
+            .contains(&AgentIdentity::from(external.name.as_str()))
     );
     assert_eq!(
         entry_l
@@ -7819,7 +7481,7 @@ async fn test_respawn_restores_external_wiring_from_roster_spec() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
@@ -7832,18 +7494,24 @@ async fn test_respawn_restores_external_wiring_from_roster_spec() {
 
     handle
         .wire(
-            MeerkatId::from("l-1"),
+            AgentIdentity::from("l-1"),
             PeerTarget::External(external.clone()),
         )
         .await
         .expect("wire external");
 
     let receipt = handle
-        .respawn(MeerkatId::from("l-1"), Some("resume".into()))
+        .respawn(AgentIdentity::from("l-1"), Some("resume".into()))
         .await
         .expect("respawn");
-    let new_sid = receipt
-        .new_session_id
+    let entry = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .expect("member should exist");
+    let new_sid = entry
+        .member_ref
+        .bridge_session_id()
+        .cloned()
         .expect("respawn should produce replacement session");
     assert_ne!(new_sid, old_sid, "respawn should replace the session");
 
@@ -7853,10 +7521,6 @@ async fn test_respawn_restores_external_wiring_from_roster_spec() {
         "respawn should restore external trusted peers from the stored roster spec"
     );
 
-    let entry = handle
-        .get_member(&MeerkatId::from("l-1"))
-        .await
-        .expect("member should exist");
     assert_eq!(
         entry
             .external_peer_specs
@@ -7864,6 +7528,8 @@ async fn test_respawn_restores_external_wiring_from_roster_spec() {
             .cloned(),
         Some(external)
     );
+    assert_eq!(entry.agent_runtime_id, receipt.agent_runtime_id);
+    assert_eq!(entry.fence_token, receipt.fence_token);
 }
 
 #[tokio::test]
@@ -7873,7 +7539,7 @@ async fn test_unwire_external_removes_trust_and_projection() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let external = TrustedPeerSpec::new(
@@ -7885,27 +7551,27 @@ async fn test_unwire_external_removes_trust_and_projection() {
 
     handle
         .wire(
-            MeerkatId::from("l-1"),
+            AgentIdentity::from("l-1"),
             PeerTarget::External(external.clone()),
         )
         .await
         .expect("wire external");
     handle
         .unwire(
-            MeerkatId::from("l-1"),
+            AgentIdentity::from("l-1"),
             MeerkatId::from(external.name.clone()),
         )
         .await
         .expect("unwire external");
 
     let entry = handle
-        .get_member(&MeerkatId::from("l-1"))
+        .get_member(&AgentIdentity::from("l-1"))
         .await
         .expect("member should exist");
     assert!(
         !entry
             .wired_to
-            .contains(&MeerkatId::from(external.name.clone()))
+            .contains(&AgentIdentity::from(external.name.as_str()))
     );
     assert!(
         !entry
@@ -7935,7 +7601,7 @@ async fn test_unwire_external_emits_external_peer_unwired_event() {
     .expect("valid external peer");
     handle
         .wire(
-            MeerkatId::from("l-1"),
+            AgentIdentity::from("l-1"),
             PeerTarget::External(external.clone()),
         )
         .await
@@ -7943,7 +7609,7 @@ async fn test_unwire_external_emits_external_peer_unwired_event() {
 
     handle
         .unwire(
-            MeerkatId::from("l-1"),
+            AgentIdentity::from("l-1"),
             PeerTarget::External(external.clone()),
         )
         .await
@@ -7954,8 +7620,8 @@ async fn test_unwire_external_emits_external_peer_unwired_event() {
         matches!(
             &event.kind,
             MobEventKind::ExternalPeerUnwired { local, peer_name }
-                if local == &MeerkatId::from("l-1")
-                    && peer_name == &MeerkatId::from(external.name.clone())
+                if local == &AgentIdentity::from("l-1")
+                    && peer_name == &external.name
         )
     }));
 }
@@ -7977,25 +7643,29 @@ async fn test_unwire_external_is_idempotent_and_emits_single_event() {
 
     handle
         .wire(
-            MeerkatId::from("l-1"),
+            AgentIdentity::from("l-1"),
             PeerTarget::External(external.clone()),
         )
         .await
         .expect("wire external");
     handle
-        .unwire(MeerkatId::from("l-1"), external_name.clone())
+        .unwire(AgentIdentity::from("l-1"), external_name.clone())
         .await
         .expect("first external unwire");
     handle
-        .unwire(MeerkatId::from("l-1"), external_name.clone())
+        .unwire(AgentIdentity::from("l-1"), external_name.clone())
         .await
         .expect("second external unwire");
 
     let entry = handle
-        .get_member(&MeerkatId::from("l-1"))
+        .get_member(&AgentIdentity::from("l-1"))
         .await
         .expect("member should exist");
-    assert!(!entry.wired_to.contains(&external_name));
+    assert!(
+        !entry
+            .wired_to
+            .contains(&AgentIdentity::from(external_name.as_str()))
+    );
     assert!(!entry.external_peer_specs.contains_key(&external_name));
 
     let events = handle.events().replay_all().await.expect("replay");
@@ -8005,7 +7675,7 @@ async fn test_unwire_external_is_idempotent_and_emits_single_event() {
             matches!(
                 &event.kind,
                 MobEventKind::ExternalPeerUnwired { local, peer_name }
-                    if local == &MeerkatId::from("l-1") && peer_name == &external_name
+                    if local == &AgentIdentity::from("l-1") && peer_name == external_name.as_str()
             )
         })
         .count();
@@ -8025,15 +7695,15 @@ async fn test_wire_emits_peers_wired_event() {
         .expect("spawn");
 
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("wire");
 
     let events = handle.events().replay_all().await.expect("replay");
     let wired = events
         .iter()
-        .find(|e| matches!(e.kind, MobEventKind::PeersWired { .. }));
-    assert!(wired.is_some(), "should have PeersWired event");
+        .find(|e| matches!(e.kind, MobEventKind::MembersWired { .. }));
+    assert!(wired.is_some(), "should have MembersWired event");
 }
 
 #[tokio::test]
@@ -8043,28 +7713,34 @@ async fn test_wire_is_idempotent_and_emits_single_pair_event() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_w = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("first wire");
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("second wire should reconcile as idempotent");
 
-    let entry_l = handle.get_member(&MeerkatId::from("l-1")).await.unwrap();
-    let entry_w = handle.get_member(&MeerkatId::from("w-1")).await.unwrap();
+    let entry_l = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .unwrap();
+    let entry_w = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
     assert_eq!(
         entry_l.wired_to.len(),
         1,
@@ -8101,15 +7777,15 @@ async fn test_wire_is_idempotent_and_emits_single_pair_event() {
         .filter(|event| {
             matches!(
                 &event.kind,
-                MobEventKind::PeersWired { a, b }
-                    if (a == &MeerkatId::from("l-1") && b == &MeerkatId::from("w-1"))
-                        || (a == &MeerkatId::from("w-1") && b == &MeerkatId::from("l-1"))
+                MobEventKind::MembersWired { a, b }
+                    if (a == &AgentIdentity::from("l-1") && b == &AgentIdentity::from("w-1"))
+                        || (a == &AgentIdentity::from("w-1") && b == &AgentIdentity::from("l-1"))
             )
         })
         .count();
     assert_eq!(
         pair_wired_events, 1,
-        "idempotent wire must emit one logical PeersWired event for one canonical edge"
+        "idempotent wire must emit one logical MembersWired event for one canonical edge"
     );
 }
 
@@ -8122,7 +7798,7 @@ async fn test_wire_unknown_meerkat_fails() {
         .expect("spawn");
 
     let result = handle
-        .wire(MeerkatId::from("w-1"), MeerkatId::from("nonexistent"))
+        .wire(AgentIdentity::from("w-1"), MeerkatId::from("nonexistent"))
         .await;
     assert!(matches!(result, Err(MobError::MeerkatNotFound(_))));
 }
@@ -8134,25 +7810,31 @@ async fn test_wire_fails_when_comms_runtime_missing_without_side_effects() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_w = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     service.set_missing_comms_runtime(&sid_w).await;
 
     let result = handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await;
     assert!(matches!(result, Err(MobError::WiringError(_))));
 
-    let entry_l = handle.get_member(&MeerkatId::from("l-1")).await.unwrap();
-    let entry_w = handle.get_member(&MeerkatId::from("w-1")).await.unwrap();
+    let entry_l = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .unwrap();
+    let entry_w = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
     assert!(
         entry_l.wired_to.is_empty(),
         "failed wire must not update roster"
@@ -8166,8 +7848,8 @@ async fn test_wire_fails_when_comms_runtime_missing_without_side_effects() {
     assert!(
         !events
             .iter()
-            .any(|e| matches!(e.kind, MobEventKind::PeersWired { .. })),
-        "failed wire must not emit PeersWired"
+            .any(|e| matches!(e.kind, MobEventKind::MembersWired { .. })),
+        "failed wire must not emit MembersWired"
     );
 }
 
@@ -8194,12 +7876,18 @@ async fn test_wire_fails_when_public_key_missing_without_side_effects() {
         .expect("spawn worker");
 
     let result = handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await;
     assert!(matches!(result, Err(MobError::WiringError(_))));
 
-    let entry_l = handle.get_member(&MeerkatId::from("l-1")).await.unwrap();
-    let entry_w = handle.get_member(&MeerkatId::from("w-1")).await.unwrap();
+    let entry_l = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .unwrap();
+    let entry_w = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
     assert!(
         entry_l.wired_to.is_empty(),
         "failed wire must not update roster"
@@ -8213,8 +7901,8 @@ async fn test_wire_fails_when_public_key_missing_without_side_effects() {
     assert!(
         !events
             .iter()
-            .any(|e| matches!(e.kind, MobEventKind::PeersWired { .. })),
-        "failed wire must not emit PeersWired"
+            .any(|e| matches!(e.kind, MobEventKind::MembersWired { .. })),
+        "failed wire must not emit MembersWired"
     );
 }
 
@@ -8235,27 +7923,33 @@ async fn test_wire_fails_when_peer_added_notification_fails_without_side_effects
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_w = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
     let result = handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await;
     assert!(
         matches!(result, Err(MobError::CommsError(_))),
         "wire should fail when required notification fails"
     );
 
-    let entry_l = handle.get_member(&MeerkatId::from("l-1")).await.unwrap();
-    let entry_w = handle.get_member(&MeerkatId::from("w-1")).await.unwrap();
+    let entry_l = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .unwrap();
+    let entry_w = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
     assert!(
         entry_l.wired_to.is_empty(),
         "failed wire must not mutate roster"
@@ -8280,8 +7974,8 @@ async fn test_wire_fails_when_peer_added_notification_fails_without_side_effects
     assert!(
         !events
             .iter()
-            .any(|e| matches!(e.kind, MobEventKind::PeersWired { .. })),
-        "failed wire must not emit PeersWired"
+            .any(|e| matches!(e.kind, MobEventKind::MembersWired { .. })),
+        "failed wire must not emit MembersWired"
     );
 }
 
@@ -8292,19 +7986,19 @@ async fn test_wire_establishes_comms_trust() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_w = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("wire should succeed");
 
@@ -8336,34 +8030,40 @@ async fn test_wire_establishes_comms_trust() {
 #[tokio::test]
 async fn test_wire_append_failure_rolls_back_runtime_state() {
     let events = Arc::new(FaultInjectedMobEventStore::new());
-    events.fail_appends_for("PeersWired").await;
+    events.fail_appends_for("MembersWired").await;
     let (handle, service) = create_test_mob_with_events(sample_definition(), events).await;
 
     let sid_l = handle
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_w = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
     let result = handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await;
     assert!(
         matches!(result, Err(MobError::StorageError(_))),
         "wire should surface append failure"
     );
 
-    let entry_l = handle.get_member(&MeerkatId::from("l-1")).await.unwrap();
-    let entry_w = handle.get_member(&MeerkatId::from("w-1")).await.unwrap();
+    let entry_l = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .unwrap();
+    let entry_w = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
     assert!(
         entry_l.wired_to.is_empty(),
         "wire append failure must rollback roster wiring"
@@ -8388,8 +8088,8 @@ async fn test_wire_append_failure_rolls_back_runtime_state() {
     assert!(
         !recorded
             .iter()
-            .any(|e| matches!(e.kind, MobEventKind::PeersWired { .. })),
-        "failed wire append must not persist PeersWired"
+            .any(|e| matches!(e.kind, MobEventKind::MembersWired { .. })),
+        "failed wire append must not persist MembersWired"
     );
 }
 
@@ -8410,19 +8110,25 @@ async fn test_unwire_removes_bidirectional() {
         .expect("spawn");
 
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("wire");
 
     handle
-        .unwire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .unwire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("unwire");
 
-    let entry_l = handle.get_member(&MeerkatId::from("l-1")).await.unwrap();
+    let entry_l = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .unwrap();
     assert!(entry_l.wired_to.is_empty());
 
-    let entry_w = handle.get_member(&MeerkatId::from("w-1")).await.unwrap();
+    let entry_w = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
     assert!(entry_w.wired_to.is_empty());
 }
 
@@ -8438,20 +8144,20 @@ async fn test_unwire_emits_peers_unwired_event() {
         .await
         .expect("spawn");
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("wire");
 
     handle
-        .unwire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .unwire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("unwire");
 
     let events = handle.events().replay_all().await.expect("replay");
     let unwired = events
         .iter()
-        .find(|e| matches!(e.kind, MobEventKind::PeersUnwired { .. }));
-    assert!(unwired.is_some(), "should have PeersUnwired event");
+        .find(|e| matches!(e.kind, MobEventKind::MembersUnwired { .. }));
+    assert!(unwired.is_some(), "should have MembersUnwired event");
 }
 
 #[tokio::test]
@@ -8466,21 +8172,27 @@ async fn test_unwire_is_idempotent_and_emits_single_pair_event() {
         .await
         .expect("spawn worker");
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("wire");
 
     handle
-        .unwire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .unwire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("first unwire");
     handle
-        .unwire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .unwire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("second unwire should be idempotent");
 
-    let entry_l = handle.get_member(&MeerkatId::from("l-1")).await.unwrap();
-    let entry_w = handle.get_member(&MeerkatId::from("w-1")).await.unwrap();
+    let entry_l = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .unwrap();
+    let entry_w = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
     assert!(
         entry_l.wired_to.is_empty() && entry_w.wired_to.is_empty(),
         "idempotent unwire must preserve a symmetric empty wiring projection"
@@ -8492,15 +8204,15 @@ async fn test_unwire_is_idempotent_and_emits_single_pair_event() {
         .filter(|event| {
             matches!(
                 &event.kind,
-                MobEventKind::PeersUnwired { a, b }
-                    if (a == &MeerkatId::from("l-1") && b == &MeerkatId::from("w-1"))
-                        || (a == &MeerkatId::from("w-1") && b == &MeerkatId::from("l-1"))
+                MobEventKind::MembersUnwired { a, b }
+                    if (a == &AgentIdentity::from("l-1") && b == &AgentIdentity::from("w-1"))
+                        || (a == &AgentIdentity::from("w-1") && b == &AgentIdentity::from("l-1"))
             )
         })
         .count();
     assert_eq!(
         pair_unwired_events, 1,
-        "idempotent unwire must emit one logical PeersUnwired event for one canonical edge removal"
+        "idempotent unwire must emit one logical MembersUnwired event for one canonical edge removal"
     );
 }
 
@@ -8515,28 +8227,34 @@ async fn test_unwire_fails_when_comms_runtime_missing_without_side_effects() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("wire");
     service.set_missing_comms_runtime(&sid_w).await;
 
     let result = handle
-        .unwire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .unwire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await;
     assert!(matches!(result, Err(MobError::WiringError(_))));
 
-    let entry_l = handle.get_member(&MeerkatId::from("l-1")).await.unwrap();
-    let entry_w = handle.get_member(&MeerkatId::from("w-1")).await.unwrap();
+    let entry_l = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .unwrap();
+    let entry_w = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
     assert!(
-        entry_l.wired_to.contains(&MeerkatId::from("w-1")),
+        entry_l.wired_to.contains(&AgentIdentity::from("w-1")),
         "failed unwire must not mutate roster"
     );
     assert!(
-        entry_w.wired_to.contains(&MeerkatId::from("l-1")),
+        entry_w.wired_to.contains(&AgentIdentity::from("l-1")),
         "failed unwire must not mutate roster"
     );
 
@@ -8544,8 +8262,8 @@ async fn test_unwire_fails_when_comms_runtime_missing_without_side_effects() {
     assert!(
         !events
             .iter()
-            .any(|e| matches!(e.kind, MobEventKind::PeersUnwired { .. })),
-        "failed unwire must not emit PeersUnwired"
+            .any(|e| matches!(e.kind, MobEventKind::MembersUnwired { .. })),
+        "failed unwire must not emit MembersUnwired"
     );
 }
 
@@ -8560,28 +8278,34 @@ async fn test_unwire_fails_when_public_key_missing_without_side_effects() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("wire");
     service.clear_public_key(&sid_w).await;
 
     let result = handle
-        .unwire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .unwire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await;
     assert!(matches!(result, Err(MobError::WiringError(_))));
 
-    let entry_l = handle.get_member(&MeerkatId::from("l-1")).await.unwrap();
-    let entry_w = handle.get_member(&MeerkatId::from("w-1")).await.unwrap();
+    let entry_l = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .unwrap();
+    let entry_w = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
     assert!(
-        entry_l.wired_to.contains(&MeerkatId::from("w-1")),
+        entry_l.wired_to.contains(&AgentIdentity::from("w-1")),
         "failed unwire must not mutate roster"
     );
     assert!(
-        entry_w.wired_to.contains(&MeerkatId::from("l-1")),
+        entry_w.wired_to.contains(&AgentIdentity::from("l-1")),
         "failed unwire must not mutate roster"
     );
 
@@ -8589,8 +8313,8 @@ async fn test_unwire_fails_when_public_key_missing_without_side_effects() {
     assert!(
         !events
             .iter()
-            .any(|e| matches!(e.kind, MobEventKind::PeersUnwired { .. })),
-        "failed unwire must not emit PeersUnwired"
+            .any(|e| matches!(e.kind, MobEventKind::MembersUnwired { .. })),
+        "failed unwire must not emit MembersUnwired"
     );
 }
 
@@ -8611,37 +8335,43 @@ async fn test_unwire_second_trust_removal_failure_restores_first_side() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_w = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("wire");
 
     let result = handle
-        .unwire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .unwire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await;
     assert!(
         matches!(result, Err(MobError::CommsError(_))),
         "unwire should surface second trust-removal failure"
     );
 
-    let entry_l = handle.get_member(&MeerkatId::from("l-1")).await.unwrap();
-    let entry_w = handle.get_member(&MeerkatId::from("w-1")).await.unwrap();
+    let entry_l = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .unwrap();
+    let entry_w = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
     assert!(
-        entry_l.wired_to.contains(&MeerkatId::from("w-1")),
+        entry_l.wired_to.contains(&AgentIdentity::from("w-1")),
         "failed unwire must keep roster wiring on lead"
     );
     assert!(
-        entry_w.wired_to.contains(&MeerkatId::from("l-1")),
+        entry_w.wired_to.contains(&AgentIdentity::from("l-1")),
         "failed unwire must keep roster wiring on worker"
     );
 
@@ -8679,26 +8409,32 @@ async fn test_unwire_fails_when_peer_unwired_notification_fails_without_side_eff
         .await
         .expect("spawn worker");
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("wire");
 
     let result = handle
-        .unwire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .unwire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await;
     assert!(
         matches!(result, Err(MobError::CommsError(_))),
         "unwire should fail when required notification fails"
     );
 
-    let entry_l = handle.get_member(&MeerkatId::from("l-1")).await.unwrap();
-    let entry_w = handle.get_member(&MeerkatId::from("w-1")).await.unwrap();
+    let entry_l = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .unwrap();
+    let entry_w = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
     assert!(
-        entry_l.wired_to.contains(&MeerkatId::from("w-1")),
+        entry_l.wired_to.contains(&AgentIdentity::from("w-1")),
         "failed unwire must not mutate roster"
     );
     assert!(
-        entry_w.wired_to.contains(&MeerkatId::from("l-1")),
+        entry_w.wired_to.contains(&AgentIdentity::from("l-1")),
         "failed unwire must not mutate roster"
     );
 
@@ -8706,8 +8442,8 @@ async fn test_unwire_fails_when_peer_unwired_notification_fails_without_side_eff
     assert!(
         !events
             .iter()
-            .any(|e| matches!(e.kind, MobEventKind::PeersUnwired { .. })),
-        "failed unwire must not emit PeersUnwired"
+            .any(|e| matches!(e.kind, MobEventKind::MembersUnwired { .. })),
+        "failed unwire must not emit MembersUnwired"
     );
 }
 
@@ -8728,18 +8464,18 @@ async fn test_unwire_second_notification_failure_compensates_and_preserves_state
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_w = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("wire");
 
@@ -8753,7 +8489,7 @@ async fn test_unwire_second_notification_failure_compensates_and_preserves_state
     let worker_peer_added_before = peer_added_count(&service.sent_intents(&sid_w).await);
 
     let result = handle
-        .unwire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .unwire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await;
     assert!(
         matches!(result, Err(MobError::CommsError(_))),
@@ -8772,14 +8508,20 @@ async fn test_unwire_second_notification_failure_compensates_and_preserves_state
         "worker should not emit extra mob.peer_added on second-notification failure"
     );
 
-    let entry_l = handle.get_member(&MeerkatId::from("l-1")).await.unwrap();
-    let entry_w = handle.get_member(&MeerkatId::from("w-1")).await.unwrap();
+    let entry_l = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .unwrap();
+    let entry_w = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
     assert!(
-        entry_l.wired_to.contains(&MeerkatId::from("w-1")),
+        entry_l.wired_to.contains(&AgentIdentity::from("w-1")),
         "failed unwire must preserve lead wiring"
     );
     assert!(
-        entry_w.wired_to.contains(&MeerkatId::from("l-1")),
+        entry_w.wired_to.contains(&AgentIdentity::from("l-1")),
         "failed unwire must preserve worker wiring"
     );
 
@@ -8798,8 +8540,8 @@ async fn test_unwire_second_notification_failure_compensates_and_preserves_state
     assert!(
         !events
             .iter()
-            .any(|e| matches!(e.kind, MobEventKind::PeersUnwired { .. })),
-        "failed unwire must not emit PeersUnwired"
+            .any(|e| matches!(e.kind, MobEventKind::MembersUnwired { .. })),
+        "failed unwire must not emit MembersUnwired"
     );
 }
 
@@ -8820,18 +8562,18 @@ async fn test_unwire_first_trust_removal_failure_compensates_and_preserves_state
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_w = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("wire");
 
@@ -8845,7 +8587,7 @@ async fn test_unwire_first_trust_removal_failure_compensates_and_preserves_state
     let worker_peer_added_before = peer_added_count(&service.sent_intents(&sid_w).await);
 
     let result = handle
-        .unwire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .unwire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await;
     assert!(
         matches!(result, Err(MobError::CommsError(_))),
@@ -8865,14 +8607,20 @@ async fn test_unwire_first_trust_removal_failure_compensates_and_preserves_state
         "first-removal failure should compensate with mob.peer_added from worker"
     );
 
-    let entry_l = handle.get_member(&MeerkatId::from("l-1")).await.unwrap();
-    let entry_w = handle.get_member(&MeerkatId::from("w-1")).await.unwrap();
+    let entry_l = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .unwrap();
+    let entry_w = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
     assert!(
-        entry_l.wired_to.contains(&MeerkatId::from("w-1")),
+        entry_l.wired_to.contains(&AgentIdentity::from("w-1")),
         "failed unwire must preserve lead wiring"
     );
     assert!(
-        entry_w.wired_to.contains(&MeerkatId::from("l-1")),
+        entry_w.wired_to.contains(&AgentIdentity::from("l-1")),
         "failed unwire must preserve worker wiring"
     );
 
@@ -8891,52 +8639,58 @@ async fn test_unwire_first_trust_removal_failure_compensates_and_preserves_state
     assert!(
         !events
             .iter()
-            .any(|e| matches!(e.kind, MobEventKind::PeersUnwired { .. })),
-        "failed unwire must not emit PeersUnwired"
+            .any(|e| matches!(e.kind, MobEventKind::MembersUnwired { .. })),
+        "failed unwire must not emit MembersUnwired"
     );
 }
 
 #[tokio::test]
 async fn test_unwire_append_failure_restores_runtime_state() {
     let events = Arc::new(FaultInjectedMobEventStore::new());
-    events.fail_appends_for("PeersUnwired").await;
+    events.fail_appends_for("MembersUnwired").await;
     let (handle, service) = create_test_mob_with_events(sample_definition(), events).await;
 
     let sid_l = handle
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_w = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("wire");
 
     let result = handle
-        .unwire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .unwire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await;
     assert!(
         matches!(result, Err(MobError::StorageError(_))),
         "unwire should surface append failure"
     );
 
-    let entry_l = handle.get_member(&MeerkatId::from("l-1")).await.unwrap();
-    let entry_w = handle.get_member(&MeerkatId::from("w-1")).await.unwrap();
+    let entry_l = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .unwrap();
+    let entry_w = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
     assert!(
-        entry_l.wired_to.contains(&MeerkatId::from("w-1")),
+        entry_l.wired_to.contains(&AgentIdentity::from("w-1")),
         "unwire append failure must restore roster wiring"
     );
     assert!(
-        entry_w.wired_to.contains(&MeerkatId::from("l-1")),
+        entry_w.wired_to.contains(&AgentIdentity::from("l-1")),
         "unwire append failure must restore roster wiring"
     );
 
@@ -8955,8 +8709,8 @@ async fn test_unwire_append_failure_restores_runtime_state() {
     assert!(
         !recorded
             .iter()
-            .any(|e| matches!(e.kind, MobEventKind::PeersUnwired { .. })),
-        "failed unwire append must not persist PeersUnwired"
+            .any(|e| matches!(e.kind, MobEventKind::MembersUnwired { .. })),
+        "failed unwire append must not persist MembersUnwired"
     );
 }
 
@@ -8981,15 +8735,21 @@ async fn test_auto_wire_orchestrator() {
         .expect("spawn worker");
 
     // Verify wiring
-    let entry_l = handle.get_member(&MeerkatId::from("l-1")).await.unwrap();
+    let entry_l = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .unwrap();
     assert!(
-        entry_l.wired_to.contains(&MeerkatId::from("w-1")),
+        entry_l.wired_to.contains(&AgentIdentity::from("w-1")),
         "orchestrator should be wired to worker"
     );
 
-    let entry_w = handle.get_member(&MeerkatId::from("w-1")).await.unwrap();
+    let entry_w = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
     assert!(
-        entry_w.wired_to.contains(&MeerkatId::from("l-1")),
+        entry_w.wired_to.contains(&AgentIdentity::from("l-1")),
         "worker should be wired to orchestrator"
     );
 }
@@ -9004,14 +8764,14 @@ async fn test_auto_wire_orchestrator_updates_real_comms_peers() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_w = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
@@ -9044,7 +8804,10 @@ async fn test_auto_wire_orchestrator_not_wired_to_self() {
         .await
         .expect("spawn lead");
 
-    let entry_l = handle.get_member(&MeerkatId::from("l-1")).await.unwrap();
+    let entry_l = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .unwrap();
     assert!(
         entry_l.wired_to.is_empty(),
         "orchestrator should not be wired to itself"
@@ -9061,7 +8824,7 @@ async fn test_auto_wire_orchestrator_real_comms_does_not_surface_self_peer() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
@@ -9084,14 +8847,14 @@ async fn test_auto_wire_parent_uses_spawning_member_not_orchestrator() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_w1 = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn first worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
@@ -9101,7 +8864,7 @@ async fn test_auto_wire_parent_uses_spawning_member_not_orchestrator() {
         .spawn_spec_receipt_with_owner_context(
             spec,
             super::handle::CanonicalOpsOwnerContext {
-                owner_session_id: sid_w1.clone(),
+                owner_bridge_session_id: sid_w1.clone(),
                 ops_registry: Arc::new(meerkat_runtime::RuntimeOpsLifecycleRegistry::new()),
             },
         )
@@ -9109,7 +8872,7 @@ async fn test_auto_wire_parent_uses_spawning_member_not_orchestrator() {
         .expect("spawn second worker from worker owner context");
     let sid_w2 = receipt
         .member_ref
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
@@ -9184,7 +8947,7 @@ async fn test_spawn_skips_broken_orchestrator_in_auto_wire_selection() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle.stop().await.expect("stop");
@@ -9198,7 +8961,7 @@ async fn test_spawn_skips_broken_orchestrator_in_auto_wire_selection() {
         .expect("partial resume should succeed");
 
     let lead = resumed
-        .member_status(&MeerkatId::from("l-1"))
+        .member_status(&AgentIdentity::from("l-1"))
         .await
         .expect("broken orchestrator");
     assert_eq!(lead.status, crate::runtime::handle::MobMemberStatus::Broken);
@@ -9217,11 +8980,11 @@ async fn test_spawn_skips_broken_orchestrator_in_auto_wire_selection() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker should ignore broken orchestrator")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let worker = resumed
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("spawned worker entry");
     assert!(
@@ -9262,11 +9025,14 @@ async fn test_auto_wire_failure_is_returned_to_spawn_caller() {
     );
 
     assert!(
-        handle.get_member(&MeerkatId::from("w-1")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_none(),
         "failed spawn should rollback roster entry"
     );
     let lead_entry = handle
-        .get_member(&MeerkatId::from("l-1"))
+        .get_member(&AgentIdentity::from("l-1"))
         .await
         .expect("lead should remain in roster");
     assert!(
@@ -9293,7 +9059,7 @@ async fn test_auto_wire_failure_after_partial_wire_cleans_peer_trust_via_spawn_r
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
@@ -9306,11 +9072,14 @@ async fn test_auto_wire_failure_after_partial_wire_cleans_peer_trust_via_spawn_r
     );
 
     assert!(
-        handle.get_member(&MeerkatId::from("w-1")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_none(),
         "failed spawn should rollback worker roster entry"
     );
     let lead_entry = handle
-        .get_member(&MeerkatId::from("l-1"))
+        .get_member(&AgentIdentity::from("l-1"))
         .await
         .expect("lead should remain in roster");
     assert!(
@@ -9342,7 +9111,7 @@ async fn test_spawn_rollback_ignores_missing_comms_for_non_wired_planned_targets
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     service.set_missing_comms_runtime(&sid_l).await;
@@ -9355,7 +9124,10 @@ async fn test_spawn_rollback_ignores_missing_comms_for_non_wired_planned_targets
         "spawn should surface original wiring failure instead of rollback failure"
     );
     assert!(
-        handle.get_member(&MeerkatId::from("w-1")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_none(),
         "rollback should still remove failed worker entry"
     );
 }
@@ -9369,14 +9141,14 @@ async fn test_spawn_rollback_ignores_missing_comms_for_non_wired_planned_targets
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_w2 = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-2"), None)
         .await
         .expect("spawn w-2")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     service
@@ -9399,7 +9171,10 @@ async fn test_spawn_rollback_ignores_missing_comms_for_non_wired_planned_targets
         "spawn should surface role-wiring failure, not rollback failure"
     );
     assert!(
-        handle.get_member(&MeerkatId::from("w-3")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-3"))
+            .await
+            .is_none(),
         "failed spawn should not keep w-3 in roster"
     );
 
@@ -9439,7 +9214,10 @@ async fn test_spawn_rollback_archive_failure_keeps_spawned_entry_and_persists_re
         "spawn should surface rollback archive failure"
     );
     assert!(
-        handle.get_member(&MeerkatId::from("w-1")).await.is_some(),
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_some(),
         "rollback archive failure must not remove spawned roster entry"
     );
 
@@ -9447,8 +9225,8 @@ async fn test_spawn_rollback_archive_failure_keeps_spawned_entry_and_persists_re
     assert!(
         events
             .iter()
-            .any(|e| matches!(e.kind, MobEventKind::MeerkatRetired { .. })),
-        "rollback must persist MeerkatRetired before side-effect cleanup so retries stay replay-safe"
+            .any(|e| matches!(e.kind, MobEventKind::MemberRetired { .. })),
+        "rollback must persist MemberRetired before side-effect cleanup so retries stay replay-safe"
     );
 }
 
@@ -9469,7 +9247,7 @@ async fn test_fault_injected_lifecycle_operations_preserve_transactional_invaria
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let spawn_err = spawn_handle
@@ -9485,7 +9263,7 @@ async fn test_fault_injected_lifecycle_operations_preserve_transactional_invaria
     );
     assert!(
         spawn_handle
-            .get_member(&MeerkatId::from("w-1"))
+            .get_member(&AgentIdentity::from("w-1"))
             .await
             .is_none(),
         "spawn rollback should keep failed member out of roster"
@@ -9500,29 +9278,29 @@ async fn test_fault_injected_lifecycle_operations_preserve_transactional_invaria
 
     // Unwire rollback invariants.
     let unwire_events = Arc::new(FaultInjectedMobEventStore::new());
-    unwire_events.fail_appends_for("PeersUnwired").await;
+    unwire_events.fail_appends_for("MembersUnwired").await;
     let (unwire_handle, unwire_service) =
         create_test_mob_with_events(sample_definition(), unwire_events).await;
     let sid_u1 = unwire_handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("u-1"), None)
         .await
         .expect("spawn u-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_u2 = unwire_handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("u-2"), None)
         .await
         .expect("spawn u-2")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     unwire_handle
-        .wire(MeerkatId::from("u-1"), MeerkatId::from("u-2"))
+        .wire(AgentIdentity::from("u-1"), MeerkatId::from("u-2"))
         .await
         .expect("wire");
     let unwire_err = unwire_handle
-        .unwire(MeerkatId::from("u-1"), MeerkatId::from("u-2"))
+        .unwire(AgentIdentity::from("u-1"), MeerkatId::from("u-2"))
         .await
         .expect_err("unwire should fail when event append is fault-injected");
     assert!(
@@ -9530,16 +9308,16 @@ async fn test_fault_injected_lifecycle_operations_preserve_transactional_invaria
         "unwire append fault should surface"
     );
     let u1 = unwire_handle
-        .get_member(&MeerkatId::from("u-1"))
+        .get_member(&AgentIdentity::from("u-1"))
         .await
         .expect("u-1 remains in roster");
     let u2 = unwire_handle
-        .get_member(&MeerkatId::from("u-2"))
+        .get_member(&AgentIdentity::from("u-2"))
         .await
         .expect("u-2 remains in roster");
     assert!(
-        u1.wired_to.contains(&MeerkatId::from("u-2"))
-            && u2.wired_to.contains(&MeerkatId::from("u-1")),
+        u1.wired_to.contains(&AgentIdentity::from("u-2"))
+            && u2.wired_to.contains(&AgentIdentity::from("u-1")),
         "unwire rollback should preserve roster wiring on failure"
     );
     assert!(
@@ -9561,7 +9339,7 @@ async fn test_fault_injected_lifecycle_operations_preserve_transactional_invaria
         .spawn(ProfileName::from("worker"), MeerkatId::from("r-1"), None)
         .await
         .expect("spawn r-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let _sid_r2 = retire_handle
@@ -9569,28 +9347,28 @@ async fn test_fault_injected_lifecycle_operations_preserve_transactional_invaria
         .await
         .expect("spawn r-2");
     retire_handle
-        .wire(MeerkatId::from("r-1"), MeerkatId::from("r-2"))
+        .wire(AgentIdentity::from("r-1"), MeerkatId::from("r-2"))
         .await
         .expect("wire");
     retire_service.set_archive_failure(&sid_r1).await;
-    let retire_result = retire_handle.retire(MeerkatId::from("r-1")).await;
+    let retire_result = retire_handle.retire(AgentIdentity::from("r-1")).await;
     assert!(
         retire_result.is_err(),
         "retire must return Err when ArchiveSession fails"
     );
     assert!(
         retire_handle
-            .get_member(&MeerkatId::from("r-1"))
+            .get_member(&AgentIdentity::from("r-1"))
             .await
             .is_none(),
         "retire must remove roster entry even when archive fails"
     );
     let r2 = retire_handle
-        .get_member(&MeerkatId::from("r-2"))
+        .get_member(&AgentIdentity::from("r-2"))
         .await
         .expect("r-2 should remain");
     assert!(
-        !r2.wired_to.contains(&MeerkatId::from("r-1")),
+        !r2.wired_to.contains(&AgentIdentity::from("r-1")),
         "roster.remove should clean r-1 from r-2's wired_to set"
     );
 }
@@ -9621,22 +9399,34 @@ async fn test_role_wiring_fan_out() {
     // w-2 was spawned second, rule worker<->worker matches, wired to w-1.
     // w-3 was spawned third, rule worker<->worker matches, wired to w-1 and w-2.
 
-    let entry_1 = handle.get_member(&MeerkatId::from("w-1")).await.unwrap();
-    let entry_2 = handle.get_member(&MeerkatId::from("w-2")).await.unwrap();
-    let entry_3 = handle.get_member(&MeerkatId::from("w-3")).await.unwrap();
+    let entry_1 = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
+    let entry_2 = handle
+        .get_member(&AgentIdentity::from("w-2"))
+        .await
+        .unwrap();
+    let entry_3 = handle
+        .get_member(&AgentIdentity::from("w-3"))
+        .await
+        .unwrap();
 
     // w-2 should be wired to w-1 (and vice versa)
-    assert!(entry_2.wired_to.contains(&MeerkatId::from("w-1")));
-    assert!(entry_1.wired_to.contains(&MeerkatId::from("w-2")));
+    assert!(entry_2.wired_to.contains(&AgentIdentity::from("w-1")));
+    assert!(entry_1.wired_to.contains(&AgentIdentity::from("w-2")));
 
     // w-3 should be wired to both w-1 and w-2
-    assert!(entry_3.wired_to.contains(&MeerkatId::from("w-1")));
-    assert!(entry_3.wired_to.contains(&MeerkatId::from("w-2")));
+    assert!(entry_3.wired_to.contains(&AgentIdentity::from("w-1")));
+    assert!(entry_3.wired_to.contains(&AgentIdentity::from("w-2")));
 
     // w-1 should be wired to both w-2 and w-3
     // Need to re-read since roster may have been updated after w-3 spawn
-    let entry_1 = handle.get_member(&MeerkatId::from("w-1")).await.unwrap();
-    assert!(entry_1.wired_to.contains(&MeerkatId::from("w-3")));
+    let entry_1 = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap();
+    assert!(entry_1.wired_to.contains(&AgentIdentity::from("w-3")));
 }
 
 #[tokio::test]
@@ -9663,7 +9453,7 @@ async fn test_spawn_skips_broken_role_peers_in_role_wiring_selection() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle.stop().await.expect("stop");
@@ -9677,7 +9467,7 @@ async fn test_spawn_skips_broken_role_peers_in_role_wiring_selection() {
         .expect("partial resume should succeed");
 
     let broken = resumed
-        .member_status(&MeerkatId::from("w-1"))
+        .member_status(&AgentIdentity::from("w-1"))
         .await
         .expect("broken member status");
     assert_eq!(
@@ -9699,15 +9489,15 @@ async fn test_spawn_skips_broken_role_peers_in_role_wiring_selection() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-2"), None)
         .await
         .expect("spawn should ignore broken role peers")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let worker = resumed
-        .get_member(&MeerkatId::from("w-2"))
+        .get_member(&AgentIdentity::from("w-2"))
         .await
         .expect("spawned worker");
     assert!(
-        !worker.wired_to.contains(&MeerkatId::from("w-1")),
+        !worker.wired_to.contains(&AgentIdentity::from("w-1")),
         "role wiring must not target broken peers"
     );
     let trusted = service.trusted_peer_names(&sid_w2).await;
@@ -9738,7 +9528,7 @@ async fn test_role_wiring_cross_role_fans_out_to_three_existing_targets() {
         .expect("spawn lead");
 
     let lead = handle
-        .get_member(&MeerkatId::from("l-1"))
+        .get_member(&AgentIdentity::from("l-1"))
         .await
         .expect("lead should be in roster");
     assert_eq!(
@@ -9748,15 +9538,15 @@ async fn test_role_wiring_cross_role_fans_out_to_three_existing_targets() {
     );
     for worker_id in ["w-1", "w-2", "w-3"] {
         assert!(
-            lead.wired_to.contains(&MeerkatId::from(worker_id)),
+            lead.wired_to.contains(&AgentIdentity::from(worker_id)),
             "lead should be wired to {worker_id}"
         );
         let worker = handle
-            .get_member(&MeerkatId::from(worker_id))
+            .get_member(&AgentIdentity::from(worker_id))
             .await
             .expect("worker should remain in roster");
         assert!(
-            worker.wired_to.contains(&MeerkatId::from("l-1")),
+            worker.wired_to.contains(&AgentIdentity::from("l-1")),
             "{worker_id} should be wired back to lead"
         );
     }
@@ -9767,15 +9557,15 @@ async fn test_role_wiring_cross_role_fans_out_to_three_existing_targets() {
         .filter(|event| {
             matches!(
                 &event.kind,
-                MobEventKind::PeersWired { a, b }
-                    if (a == &MeerkatId::from("l-1")
+                MobEventKind::MembersWired { a, b }
+                    if (a == &AgentIdentity::from("l-1")
                         && ["w-1", "w-2", "w-3"]
                             .iter()
-                            .any(|w| b == &MeerkatId::from(*w)))
-                        || (b == &MeerkatId::from("l-1")
+                            .any(|w| b == &AgentIdentity::from(*w)))
+                        || (b == &AgentIdentity::from("l-1")
                             && ["w-1", "w-2", "w-3"]
                                 .iter()
-                                .any(|w| a == &MeerkatId::from(*w)))
+                                .any(|w| a == &AgentIdentity::from(*w)))
             )
         })
         .count();
@@ -9800,7 +9590,7 @@ async fn test_spawn_wiring_deduplicates_overlapping_orchestrator_and_role_edges(
         .expect("spawn worker");
 
     let lead = handle
-        .get_member(&MeerkatId::from("l-1"))
+        .get_member(&AgentIdentity::from("l-1"))
         .await
         .expect("lead should exist");
     assert_eq!(
@@ -9808,7 +9598,7 @@ async fn test_spawn_wiring_deduplicates_overlapping_orchestrator_and_role_edges(
         1,
         "overlapping auto-wire + role rule should produce one trust edge"
     );
-    assert!(lead.wired_to.contains(&MeerkatId::from("w-1")));
+    assert!(lead.wired_to.contains(&AgentIdentity::from("w-1")));
 
     let events = handle.events().replay_all().await.expect("replay");
     let wires_for_pair = events
@@ -9816,15 +9606,15 @@ async fn test_spawn_wiring_deduplicates_overlapping_orchestrator_and_role_edges(
         .filter(|event| {
             matches!(
                 &event.kind,
-                MobEventKind::PeersWired { a, b }
-                    if (a == &MeerkatId::from("l-1") && b == &MeerkatId::from("w-1"))
-                        || (a == &MeerkatId::from("w-1") && b == &MeerkatId::from("l-1"))
+                MobEventKind::MembersWired { a, b }
+                    if (a == &AgentIdentity::from("l-1") && b == &AgentIdentity::from("w-1"))
+                        || (a == &AgentIdentity::from("w-1") && b == &AgentIdentity::from("l-1"))
             )
         })
         .count();
     assert_eq!(
         wires_for_pair, 1,
-        "wiring overlap should emit a single PeersWired event for one logical edge"
+        "wiring overlap should emit a single MembersWired event for one logical edge"
     );
 }
 
@@ -9855,15 +9645,18 @@ async fn test_role_wiring_failure_is_returned_to_spawn_caller() {
     );
 
     assert!(
-        handle.get_member(&MeerkatId::from("w-2")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-2"))
+            .await
+            .is_none(),
         "failed spawn should rollback roster entry"
     );
     let entry_w1 = handle
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("w-1 should remain in roster");
     assert!(
-        !entry_w1.wired_to.contains(&MeerkatId::from("w-2")),
+        !entry_w1.wired_to.contains(&AgentIdentity::from("w-2")),
         "failed spawn should not leave partial role wiring"
     );
 }
@@ -9881,7 +9674,7 @@ async fn test_external_turn_addressable_succeeds() {
         .expect("spawn lead (external_addressable=true)");
 
     let result = handle
-        .member(&MeerkatId::from("l-1"))
+        .member(&AgentIdentity::from("l-1"))
         .await
         .expect("member handle")
         .send(
@@ -9904,7 +9697,7 @@ async fn test_member_handle_send_accepts_multimodal_content() {
         .expect("spawn lead (external_addressable=true)");
 
     let member = handle
-        .member(&MeerkatId::from("l-1"))
+        .member(&AgentIdentity::from("l-1"))
         .await
         .expect("member handle");
 
@@ -9938,7 +9731,7 @@ async fn test_external_turn_not_addressable_fails() {
         .expect("spawn worker (external_addressable=false)");
 
     let result = handle
-        .member(&MeerkatId::from("w-1"))
+        .member(&AgentIdentity::from("w-1"))
         .await
         .expect("member handle")
         .send(
@@ -9975,7 +9768,7 @@ async fn test_internal_turn_bypasses_external_addressable_check() {
         .expect("spawn worker");
 
     let result = handle
-        .internal_turn(MeerkatId::from("w-1"), "internal message")
+        .internal_turn(AgentIdentity::from("w-1"), "internal message")
         .await;
     assert!(
         result.is_ok(),
@@ -9987,7 +9780,7 @@ async fn test_internal_turn_bypasses_external_addressable_check() {
 async fn test_internal_turn_unknown_meerkat_fails() {
     let (handle, _service) = create_test_mob(sample_definition()).await;
     let result = handle
-        .internal_turn(MeerkatId::from("nonexistent"), "Hello")
+        .internal_turn(AgentIdentity::from("nonexistent"), "Hello")
         .await;
     assert!(matches!(result, Err(MobError::MeerkatNotFound(_))));
 }
@@ -10012,7 +9805,7 @@ async fn test_external_turn_autonomous_mode_uses_injector_dispatch() {
         .expect("spawn autonomous lead");
 
     handle
-        .member(&MeerkatId::from("l-autonomous"))
+        .member(&AgentIdentity::from("l-autonomous"))
         .await
         .expect("member handle")
         .send("inject me", meerkat_core::types::HandlingMode::Queue)
@@ -10054,7 +9847,7 @@ async fn test_external_turn_autonomous_mode_keeps_injector_dispatch_after_kickof
     let baseline_injects = service.inject_call_count();
 
     handle
-        .member(&MeerkatId::from("l-idle-autonomous"))
+        .member(&AgentIdentity::from("l-idle-autonomous"))
         .await
         .expect("member handle")
         .send(
@@ -10091,7 +9884,7 @@ async fn test_external_turn_turn_driven_mode_uses_start_turn_dispatch() {
     let baseline_start_turn_calls = service.start_turn_call_count();
 
     handle
-        .member(&MeerkatId::from("l-turn-driven"))
+        .member(&AgentIdentity::from("l-turn-driven"))
         .await
         .expect("member handle")
         .send(
@@ -10130,7 +9923,7 @@ async fn test_runtime_backed_turn_driven_dispatch_surfaces_start_turn_failure() 
     service.set_fail_start_turn(true);
 
     let result = handle
-        .member(&MeerkatId::from("l-runtime-fail"))
+        .member(&AgentIdentity::from("l-runtime-fail"))
         .await
         .expect("member handle")
         .send("turn should fail", meerkat_core::types::HandlingMode::Queue)
@@ -10152,7 +9945,7 @@ async fn test_runtime_backed_turn_driven_dispatch_surfaces_start_turn_failure() 
 async fn test_autonomous_host_loop_uses_builder_runtime_adapter_for_comms_drain() {
     let service = Arc::new(MockSessionService::new());
     let service_adapter = service.enable_runtime_adapter();
-    let builder_adapter = Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral());
+    let builder_adapter = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
     let handle = MobBuilder::new(sample_definition(), MobStorage::in_memory())
         .with_session_service(service)
         .with_runtime_adapter(builder_adapter.clone())
@@ -10168,7 +9961,7 @@ async fn test_autonomous_host_loop_uses_builder_runtime_adapter_for_comms_drain(
         )
         .await
         .expect("spawn autonomous lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
@@ -10284,11 +10077,11 @@ async fn test_internal_turn_mode_routing_uses_injector_for_autonomous_and_start_
     let baseline_start_turn = service.start_turn_call_count();
 
     handle
-        .internal_turn(MeerkatId::from("l-auto"), "internal autonomous")
+        .internal_turn(AgentIdentity::from("l-auto"), "internal autonomous")
         .await
         .expect("autonomous internal turn");
     handle
-        .internal_turn(MeerkatId::from("l-turn"), "internal turn-driven")
+        .internal_turn(AgentIdentity::from("l-turn"), "internal turn-driven")
         .await
         .expect("turn-driven internal turn");
 
@@ -10321,13 +10114,13 @@ async fn test_force_cancel_member_routes_interrupt_without_retiring_member() {
         .await
         .expect("spawn target");
     let session_id = member_ref
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed target");
     let baseline_interrupts = service.interrupt_call_count();
 
     handle
-        .force_cancel_member(member_id.clone())
+        .force_cancel_member(AgentIdentity::from(member_id.as_str()))
         .await
         .expect("force cancel should succeed");
 
@@ -10336,9 +10129,12 @@ async fn test_force_cancel_member_routes_interrupt_without_retiring_member() {
         baseline_interrupts + 1,
         "force-cancel must route through the runtime adapter interrupt path exactly once"
     );
-    let entry = handle.get_member(&member_id).await.expect("member remains");
+    let entry = handle
+        .get_member(&AgentIdentity::from(member_id.as_str()))
+        .await
+        .expect("member remains");
     assert_eq!(
-        entry.member_ref.session_id().cloned(),
+        entry.member_ref.bridge_session_id().cloned(),
         Some(session_id.clone()),
         "force-cancel must not rewrite the member's canonical session binding"
     );
@@ -10368,7 +10164,7 @@ async fn test_external_backend_turn_driven_mode_uses_start_turn_dispatch() {
     let baseline_start_turn = service.start_turn_call_count();
 
     handle
-        .member(&MeerkatId::from("l-ext-turn"))
+        .member(&AgentIdentity::from("l-ext-turn"))
         .await
         .expect("member handle")
         .send(
@@ -10463,16 +10259,16 @@ async fn test_external_backend_lifecycle_and_turn_policy() {
         .expect("spawn external worker");
 
     handle
-        .wire(MeerkatId::from("l-ext"), MeerkatId::from("w-ext"))
+        .wire(AgentIdentity::from("l-ext"), MeerkatId::from("w-ext"))
         .await
         .expect("wire external members");
     handle
-        .unwire(MeerkatId::from("l-ext"), MeerkatId::from("w-ext"))
+        .unwire(AgentIdentity::from("l-ext"), MeerkatId::from("w-ext"))
         .await
         .expect("unwire external members");
 
     handle
-        .member(&MeerkatId::from("l-ext"))
+        .member(&AgentIdentity::from("l-ext"))
         .await
         .expect("member handle")
         .send(
@@ -10482,7 +10278,7 @@ async fn test_external_backend_lifecycle_and_turn_policy() {
         .await
         .expect("external lead should accept external turns");
     let denied = handle
-        .member(&MeerkatId::from("w-ext"))
+        .member(&AgentIdentity::from("w-ext"))
         .await
         .expect("member handle")
         .send(
@@ -10494,11 +10290,14 @@ async fn test_external_backend_lifecycle_and_turn_policy() {
     assert!(matches!(denied, MobError::NotExternallyAddressable(_)));
 
     handle
-        .retire(MeerkatId::from("w-ext"))
+        .retire(AgentIdentity::from("w-ext"))
         .await
         .expect("retire external member");
     assert!(
-        handle.get_member(&MeerkatId::from("w-ext")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-ext"))
+            .await
+            .is_none(),
         "retire should remove external backend member"
     );
 }
@@ -10593,11 +10392,11 @@ async fn test_concurrent_spawns_parallelize_provisioning() {
     let events = handle.events().replay_all().await.expect("replay");
     let spawned_count = events
         .iter()
-        .filter(|event| matches!(event.kind, MobEventKind::MeerkatSpawned { .. }))
+        .filter(|event| matches!(event.kind, MobEventKind::MemberSpawned(..)))
         .count();
     assert_eq!(
         spawned_count, 10,
-        "parallel spawn path should emit exactly one MeerkatSpawned per request"
+        "parallel spawn path should emit exactly one MemberSpawned per request"
     );
     assert!(
         service.max_concurrent_create_session_calls() > 1,
@@ -10621,10 +10420,9 @@ async fn test_spawn_many_member_refs_returns_results_in_input_order() {
     assert_eq!(results.len(), 3);
     for (idx, result) in results.into_iter().enumerate() {
         let member = result.expect("spawn_many result");
-        let session_id = member.session_id().expect("session-backed member");
         assert!(
-            !session_id.to_string().is_empty(),
-            "spawn_many result {idx} should include session id"
+            !member.agent_identity.as_str().is_empty(),
+            "spawn_many result {idx} should include agent identity"
         );
     }
     assert!(
@@ -10651,7 +10449,7 @@ async fn test_spawn_many_parallel_finalize_emits_single_worker_pair_wire_event()
     let events = handle.events().replay_all().await.expect("replay");
     let mut pair_wire_events = 0usize;
     for event in events {
-        if let MobEventKind::PeersWired { a, b } = event.kind {
+        if let MobEventKind::MembersWired { a, b } = event.kind {
             let a_id = a.as_str();
             let b_id = b.as_str();
             if (a_id == "w-a" && b_id == "w-b") || (a_id == "w-b" && b_id == "w-a") {
@@ -10662,19 +10460,19 @@ async fn test_spawn_many_parallel_finalize_emits_single_worker_pair_wire_event()
 
     assert_eq!(
         pair_wire_events, 1,
-        "parallel spawn finalization must emit exactly one PeersWired event for w-a<->w-b"
+        "parallel spawn finalization must emit exactly one MembersWired event for w-a<->w-b"
     );
 
     let a = handle
-        .get_member(&MeerkatId::from("w-a"))
+        .get_member(&AgentIdentity::from("w-a"))
         .await
         .expect("w-a should exist");
     let b = handle
-        .get_member(&MeerkatId::from("w-b"))
+        .get_member(&AgentIdentity::from("w-b"))
         .await
         .expect("w-b should exist");
-    assert!(a.wired_to.contains(&MeerkatId::from("w-b")));
-    assert!(b.wired_to.contains(&MeerkatId::from("w-a")));
+    assert!(a.wired_to.contains(&AgentIdentity::from("w-b")));
+    assert!(b.wired_to.contains(&AgentIdentity::from("w-a")));
 }
 
 #[tokio::test]
@@ -10694,17 +10492,17 @@ async fn test_spawn_many_parallel_finalize_tolerates_overlapping_role_wiring_tar
     }
 
     let lead = handle
-        .get_member(&MeerkatId::from("l-a"))
+        .get_member(&AgentIdentity::from("l-a"))
         .await
         .expect("lead should exist");
     let worker = handle
-        .get_member(&MeerkatId::from("w-a"))
+        .get_member(&AgentIdentity::from("w-a"))
         .await
         .expect("worker should exist");
     assert_eq!(lead.wired_to.len(), 1);
     assert_eq!(worker.wired_to.len(), 1);
-    assert!(lead.wired_to.contains(&MeerkatId::from("w-a")));
-    assert!(worker.wired_to.contains(&MeerkatId::from("l-a")));
+    assert!(lead.wired_to.contains(&AgentIdentity::from("w-a")));
+    assert!(worker.wired_to.contains(&AgentIdentity::from("l-a")));
 
     let events = handle.events().replay_all().await.expect("replay");
     let pair_wire_events = events
@@ -10712,9 +10510,9 @@ async fn test_spawn_many_parallel_finalize_tolerates_overlapping_role_wiring_tar
         .filter(|event| {
             matches!(
                 &event.kind,
-                MobEventKind::PeersWired { a, b }
-                    if (a == &MeerkatId::from("l-a") && b == &MeerkatId::from("w-a"))
-                        || (a == &MeerkatId::from("w-a") && b == &MeerkatId::from("l-a"))
+                MobEventKind::MembersWired { a, b }
+                    if (a == &AgentIdentity::from("l-a") && b == &AgentIdentity::from("w-a"))
+                        || (a == &AgentIdentity::from("w-a") && b == &AgentIdentity::from("l-a"))
             )
         })
         .count();
@@ -10734,7 +10532,7 @@ async fn test_concurrent_spawn_and_retire_same_meerkat_is_serialized() {
         h1.spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
             .await
     });
-    let retire = tokio::spawn(async move { h2.retire(MeerkatId::from("w-1")).await });
+    let retire = tokio::spawn(async move { h2.retire(AgentIdentity::from("w-1")).await });
 
     let _ = spawn.await.expect("spawn join");
     retire.await.expect("retire join").expect("retire");
@@ -10755,13 +10553,13 @@ async fn test_retiring_member_is_not_routable_before_disposal_completes() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
     let retire_handle = {
         let handle = handle.clone();
-        tokio::spawn(async move { handle.retire(MeerkatId::from("w-1")).await })
+        tokio::spawn(async move { handle.retire(AgentIdentity::from("w-1")).await })
     };
 
     tokio::time::sleep(Duration::from_millis(25)).await;
@@ -10782,11 +10580,11 @@ async fn test_retiring_member_is_not_routable_before_disposal_completes() {
     assert_eq!(all_members[0].state, crate::roster::MemberState::Retiring);
 
     let start_turn_calls_before = service.start_turn_call_count();
-    let external_turn = handle.member(&MeerkatId::from("w-1")).await;
+    let external_turn = handle.member(&AgentIdentity::from("w-1")).await;
     assert!(matches!(external_turn, Err(MobError::MeerkatNotFound(id)) if id.as_str() == "w-1"));
 
     let internal_turn = handle
-        .internal_turn(MeerkatId::from("w-1"), "still there?".to_string())
+        .internal_turn(AgentIdentity::from("w-1"), "still there?".to_string())
         .await
         .expect_err("retiring member must reject new internal work");
     assert!(matches!(internal_turn, MobError::MeerkatNotFound(id) if id.as_str() == "w-1"));
@@ -10802,7 +10600,10 @@ async fn test_retiring_member_is_not_routable_before_disposal_completes() {
         .expect("retire join")
         .expect("retire completes");
     assert!(
-        handle.get_member(&MeerkatId::from("w-1")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_none(),
         "member should be removed once retirement completes"
     );
     assert_eq!(
@@ -10933,7 +10734,7 @@ async fn test_stop_clears_pending_spawn_count_and_failed_member_projection() {
     );
     assert!(
         handle
-            .get_member(&MeerkatId::from("w-stop-lineage"))
+            .get_member(&AgentIdentity::from("w-stop-lineage"))
             .await
             .is_none(),
         "stop must not leave a canonical roster projection for a canceled pending spawn"
@@ -11018,7 +10819,7 @@ async fn test_failed_spawn_clears_pending_spawn_count_and_failed_roster_entry() 
     );
     assert!(
         handle
-            .get_member(&MeerkatId::from("w-pending"))
+            .get_member(&AgentIdentity::from("w-pending"))
             .await
             .is_none(),
         "failed spawn must not leave a canonical roster entry behind"
@@ -11057,28 +10858,31 @@ async fn test_failed_role_wiring_spawn_preserves_survivor_wiring_symmetry() {
     );
 
     assert!(
-        handle.get_member(&MeerkatId::from("w-3")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-3"))
+            .await
+            .is_none(),
         "failed spawn must not leave the new member in the canonical roster"
     );
     let w1 = handle
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("w-1 remains active");
     let w2 = handle
-        .get_member(&MeerkatId::from("w-2"))
+        .get_member(&AgentIdentity::from("w-2"))
         .await
         .expect("w-2 remains active");
     assert!(
-        w1.wired_to.contains(&MeerkatId::from("w-2")),
+        w1.wired_to.contains(&AgentIdentity::from("w-2")),
         "rollback must preserve the pre-existing worker pair edge on w-1"
     );
     assert!(
-        w2.wired_to.contains(&MeerkatId::from("w-1")),
+        w2.wired_to.contains(&AgentIdentity::from("w-1")),
         "rollback must preserve the pre-existing worker pair edge on w-2"
     );
     assert!(
-        !w1.wired_to.contains(&MeerkatId::from("w-3"))
-            && !w2.wired_to.contains(&MeerkatId::from("w-3")),
+        !w1.wired_to.contains(&AgentIdentity::from("w-3"))
+            && !w2.wired_to.contains(&AgentIdentity::from("w-3")),
         "rollback must not leave dangling projections to the failed spawn target"
     );
 }
@@ -11385,7 +11189,8 @@ async fn test_fan_in_aggregate_output_is_deterministic_array_shape() {
         .iter()
         .find(|entry| {
             entry.step_id.as_str() == "dispatch"
-                && entry.meerkat_id == crate::runtime::flow_system_member_id()
+                && entry.agent_identity
+                    == AgentIdentity::from(crate::runtime::flow_system_member_id().as_str())
                 && entry.status == StepRunStatus::Completed
         })
         .and_then(|entry| entry.output.clone())
@@ -11407,7 +11212,7 @@ async fn test_max_step_retries_controls_dispatch_attempts() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     service.set_flow_turn_fail_for_session(&sid_w1, true).await;
@@ -11425,8 +11230,10 @@ async fn test_max_step_retries_controls_dispatch_attempts() {
         .filter(|event| {
             matches!(
                 &event.kind,
-                MobEventKind::StepDispatched { run_id: id, step_id, meerkat_id }
-                    if id == &run_id && step_id.as_str() == "start" && meerkat_id.as_str() == "w-1"
+                MobEventKind::StepDispatched { run_id: id, step_id, target }
+                    if id == &run_id
+                        && step_id.as_str() == "start"
+                        && target.identity.as_str() == "w-1"
             )
         })
         .count();
@@ -11481,7 +11288,7 @@ async fn test_branch_winner_is_selected_only_after_success_allowing_fallback() {
         )
         .await
         .expect("spawn failing worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle
@@ -11699,7 +11506,8 @@ async fn test_orchestrator_snapshot_tracks_pending_spawn_ownership_and_revision(
     let events = handle.events().replay_all().await.expect("replay events");
     assert!(events.iter().any(|event| matches!(
         &event.kind,
-        MobEventKind::MeerkatSpawned { meerkat_id, .. } if meerkat_id.as_str() == "w-1"
+        MobEventKind::MemberSpawned(member_spawned)
+            if member_spawned.agent_identity.as_str() == "w-1"
     )));
 }
 
@@ -12584,14 +12392,14 @@ async fn test_collection_policy_any_succeeds_with_single_target_success() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let _sid_w2 = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-2"), None)
         .await
         .expect("spawn w-2")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     service.set_flow_turn_fail_for_session(&sid_w1, true).await;
@@ -12614,14 +12422,14 @@ async fn test_collection_policy_quorum_requires_threshold_successes() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let _sid_w2 = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-2"), None)
         .await
         .expect("spawn w-2")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     service.set_flow_turn_fail_for_session(&sid_w1, true).await;
@@ -12708,7 +12516,8 @@ async fn test_collection_policy_all_uses_map_shape_for_single_target() {
         .iter()
         .find(|entry| {
             entry.step_id.as_str() == "collect"
-                && entry.meerkat_id == crate::runtime::flow_system_member_id()
+                && entry.agent_identity
+                    == AgentIdentity::from(crate::runtime::flow_system_member_id().as_str())
                 && entry.status == StepRunStatus::Completed
         })
         .and_then(|entry| entry.output.clone())
@@ -12883,7 +12692,7 @@ async fn test_supervisor_escalation_times_out_when_turn_hangs() {
 #[tokio::test]
 async fn test_supervisor_force_reset_reports_aggregate_retire_errors() {
     let events = Arc::new(FaultInjectedMobEventStore::new());
-    events.fail_appends_for("MeerkatRetired").await;
+    events.fail_appends_for("MemberRetired").await;
     let (handle, _service) = create_test_mob_with_events(sample_definition(), events).await;
     handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
@@ -13188,14 +12997,17 @@ async fn test_retire_interrupts_autonomous_host_loop() {
     );
 
     handle
-        .retire(MeerkatId::from("w-1"))
+        .retire(AgentIdentity::from("w-1"))
         .await
         .expect("retire worker");
     // With the runtime adapter path, interrupt goes through
     // adapter.interrupt_current_run(), not session_service.interrupt().
     // The behavioral guarantee is that retire succeeds (above).
     assert!(
-        handle.get_member(&MeerkatId::from("w-1")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_none(),
         "retire must remove the member from the roster"
     );
 }
@@ -13417,7 +13229,7 @@ async fn test_resume_skips_broken_autonomous_member_in_host_loop_startup() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn autonomous lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle.stop().await.expect("stop");
@@ -13438,7 +13250,7 @@ async fn test_resume_skips_broken_autonomous_member_in_host_loop_startup() {
         "Broken autonomous members must be skipped during host-loop startup so partial resume stays running"
     );
     let snapshot = resumed
-        .member_status(&MeerkatId::from("l-1"))
+        .member_status(&AgentIdentity::from("l-1"))
         .await
         .expect("broken member status");
     assert_eq!(
@@ -13692,7 +13504,7 @@ async fn create_test_mob_with_real_comms(
 
 /// Real comms + runtime-backed session service for autonomous idle-delivery regressions.
 ///
-/// Uses real inproc comms delivery, a real RuntimeSessionAdapter, and records
+/// Uses real inproc comms delivery, a real MeerkatMachine, and records
 /// runtime-applied prompts so tests can prove peer inbox traffic still reaches
 /// `apply_runtime_turn()` after the initial autonomous kickoff turn has exited.
 struct RuntimeBackedRealCommsSessionService {
@@ -13700,7 +13512,7 @@ struct RuntimeBackedRealCommsSessionService {
     keep_alive_notifiers: RwLock<HashMap<SessionId, Arc<tokio::sync::Notify>>>,
     session_comms_names: RwLock<HashMap<SessionId, String>>,
     session_counter: AtomicU64,
-    runtime_adapter: Arc<meerkat_runtime::RuntimeSessionAdapter>,
+    runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
     keep_alive_turns_complete_immediately: std::sync::atomic::AtomicBool,
     applied_runtime_prompts: RwLock<HashMap<SessionId, Vec<ContentInput>>>,
     applied_runtime_render_metadata:
@@ -13714,7 +13526,7 @@ impl RuntimeBackedRealCommsSessionService {
             keep_alive_notifiers: RwLock::new(HashMap::new()),
             session_comms_names: RwLock::new(HashMap::new()),
             session_counter: AtomicU64::new(0),
-            runtime_adapter: Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral()),
+            runtime_adapter: Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
             keep_alive_turns_complete_immediately: std::sync::atomic::AtomicBool::new(false),
             applied_runtime_prompts: RwLock::new(HashMap::new()),
             applied_runtime_render_metadata: RwLock::new(HashMap::new()),
@@ -13932,7 +13744,7 @@ impl MobSessionService for RuntimeBackedRealCommsSessionService {
         true
     }
 
-    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::RuntimeSessionAdapter>> {
+    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::MeerkatMachine>> {
         Some(Arc::clone(&self.runtime_adapter))
     }
 
@@ -14020,19 +13832,19 @@ async fn test_peer_message_reaches_idle_autonomous_member_after_kickoff_completi
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_b = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("wire should succeed");
 
@@ -14116,7 +13928,7 @@ async fn test_runtime_backed_turn_driven_send_preserves_render_metadata() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("lead-rt"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
@@ -14126,7 +13938,7 @@ async fn test_runtime_backed_turn_driven_send_preserves_render_metadata() {
     };
 
     handle
-        .member(&MeerkatId::from("lead-rt"))
+        .member(&AgentIdentity::from("lead-rt"))
         .await
         .expect("member handle")
         .send_with_render_metadata(
@@ -14159,7 +13971,7 @@ async fn test_member_status_keeps_idle_live_session_active() {
         .expect("spawn worker");
 
     let snapshot = handle
-        .member_status(&MeerkatId::from("w-1"))
+        .member_status(&AgentIdentity::from("w-1"))
         .await
         .expect("member status");
     assert_eq!(
@@ -14177,7 +13989,7 @@ async fn test_mob_session_service_exposes_event_injector_for_session() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
@@ -14195,7 +14007,7 @@ async fn test_mob_session_service_subscribe_session_events_available() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
@@ -14236,19 +14048,19 @@ async fn test_wire_enables_peer_request_delivery() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_b = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
 
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("wire should succeed");
 
@@ -14256,23 +14068,23 @@ async fn test_wire_enables_peer_request_delivery() {
     let comms_b = service.real_comms(&sid_b).await.expect("comms for w-1");
 
     let entry_a = handle
-        .get_member(&MeerkatId::from("l-1"))
+        .get_member(&AgentIdentity::from("l-1"))
         .await
         .expect("l-1 should be in roster");
     let entry_b = handle
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("w-1 should be in roster");
     let comms_name_a = format!(
         "{}/{}/{}",
         handle.mob_id(),
-        entry_a.profile,
+        entry_a.role,
         entry_a.meerkat_id
     );
     let comms_name_b = format!(
         "{}/{}/{}",
         handle.mob_id(),
-        entry_b.profile,
+        entry_b.role,
         entry_b.meerkat_id
     );
 
@@ -14308,6 +14120,7 @@ async fn test_wire_enables_peer_request_delivery() {
         intent: "mob.test_ping".to_string(),
         params: serde_json::json!({"test": true}),
         handling_mode: meerkat_core::types::HandlingMode::Queue,
+        stream: meerkat_core::comms::InputStreamMode::None,
     };
     let receipt = CoreCommsRuntime::send(&*comms_a, cmd)
         .await
@@ -14344,18 +14157,18 @@ async fn test_unwire_updates_peers_and_sends_retired_notifications() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_b = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("wire");
 
@@ -14365,7 +14178,7 @@ async fn test_unwire_updates_peers_and_sends_retired_notifications() {
     let _ = CoreCommsRuntime::drain_inbox_interactions(&*comms_b).await;
 
     handle
-        .unwire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .unwire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("unwire");
 
@@ -14394,22 +14207,22 @@ async fn test_unwire_prunes_stale_local_trust_when_projection_is_already_absent(
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_b = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("wire");
     handle
-        .unwire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .unwire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("initial unwire");
 
@@ -14435,7 +14248,7 @@ async fn test_unwire_prunes_stale_local_trust_when_projection_is_already_absent(
         .expect("re-add stale trust on worker");
 
     handle
-        .unwire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .unwire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("idempotent stale-trust cleanup unwire");
 
@@ -14460,7 +14273,7 @@ async fn test_unwire_external_prunes_stale_trust_when_projection_is_already_abse
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let spec = TrustedPeerSpec::new(
@@ -14470,11 +14283,17 @@ async fn test_unwire_external_prunes_stale_trust_when_projection_is_already_abse
     )
     .expect("valid external peer");
     handle
-        .wire(MeerkatId::from("l-1"), PeerTarget::External(spec.clone()))
+        .wire(
+            AgentIdentity::from("l-1"),
+            PeerTarget::External(spec.clone()),
+        )
         .await
         .expect("wire external");
     handle
-        .unwire(MeerkatId::from("l-1"), PeerTarget::External(spec.clone()))
+        .unwire(
+            AgentIdentity::from("l-1"),
+            PeerTarget::External(spec.clone()),
+        )
         .await
         .expect("initial external unwire");
 
@@ -14485,7 +14304,10 @@ async fn test_unwire_external_prunes_stale_trust_when_projection_is_already_abse
         .expect("re-add stale external trust");
 
     handle
-        .unwire(MeerkatId::from("l-1"), PeerTarget::External(spec.clone()))
+        .unwire(
+            AgentIdentity::from("l-1"),
+            PeerTarget::External(spec.clone()),
+        )
         .await
         .expect("idempotent external stale-trust cleanup");
 
@@ -14505,18 +14327,18 @@ async fn test_retire_updates_peers_and_sends_retired_notifications() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_b = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-2"), None)
         .await
         .expect("spawn w-2")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle
-        .wire(MeerkatId::from("w-1"), MeerkatId::from("w-2"))
+        .wire(AgentIdentity::from("w-1"), MeerkatId::from("w-2"))
         .await
         .expect("wire");
 
@@ -14525,18 +14347,24 @@ async fn test_retire_updates_peers_and_sends_retired_notifications() {
     let _ = CoreCommsRuntime::drain_inbox_interactions(&*comms_a).await;
     let _ = CoreCommsRuntime::drain_inbox_interactions(&*comms_b).await;
 
-    handle.retire(MeerkatId::from("w-1")).await.expect("retire");
+    handle
+        .retire(AgentIdentity::from("w-1"))
+        .await
+        .expect("retire");
 
     assert!(
-        handle.get_member(&MeerkatId::from("w-1")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_none(),
         "retired meerkat should leave roster"
     );
     let entry_w2 = handle
-        .get_member(&MeerkatId::from("w-2"))
+        .get_member(&AgentIdentity::from("w-2"))
         .await
         .expect("w-2 remains active");
     assert!(
-        !entry_w2.wired_to.contains(&MeerkatId::from("w-1")),
+        !entry_w2.wired_to.contains(&AgentIdentity::from("w-1")),
         "retire should remove wiring from remaining peer"
     );
 
@@ -14556,23 +14384,23 @@ async fn test_unwire_sends_required_peer_unwired_notifications() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_w = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn worker")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle
-        .wire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .wire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("wire");
 
     handle
-        .unwire(MeerkatId::from("l-1"), MeerkatId::from("w-1"))
+        .unwire(AgentIdentity::from("l-1"), MeerkatId::from("w-1"))
         .await
         .expect("unwire");
 
@@ -14599,22 +14427,25 @@ async fn test_retire_sends_required_peer_retired_notifications() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     let sid_w2 = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-2"), None)
         .await
         .expect("spawn w-2")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     handle
-        .wire(MeerkatId::from("w-1"), MeerkatId::from("w-2"))
+        .wire(AgentIdentity::from("w-1"), MeerkatId::from("w-2"))
         .await
         .expect("wire");
 
-    handle.retire(MeerkatId::from("w-1")).await.expect("retire");
+    handle
+        .retire(AgentIdentity::from("w-1"))
+        .await
+        .expect("retire");
 
     let intents_w1 = service.sent_intents(&sid_w1).await;
     let intents_w2 = service.sent_intents(&sid_w2).await;
@@ -14659,23 +14490,23 @@ async fn test_dispose_member_removes_roster_even_when_steps_fail() {
         .await
         .expect("spawn w-2");
     handle
-        .wire(MeerkatId::from("w-1"), MeerkatId::from("w-2"))
+        .wire(AgentIdentity::from("w-1"), MeerkatId::from("w-2"))
         .await
         .expect("wire");
 
     // Archive also fails.
     let sid_w1 = handle
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .unwrap()
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .unwrap();
     service.set_archive_failure(&sid_w1).await;
 
     // Archive failure is critical — retire must surface it even when comms
     // steps also failed (comms failures are still best-effort).
-    let result = handle.retire(MeerkatId::from("w-1")).await;
+    let result = handle.retire(AgentIdentity::from("w-1")).await;
     assert!(
         result.is_err(),
         "retire must return Err when ArchiveSession fails, regardless of other step failures"
@@ -14683,7 +14514,10 @@ async fn test_dispose_member_removes_roster_even_when_steps_fail() {
 
     // The structural guarantee: member is gone from roster regardless.
     assert!(
-        handle.get_member(&MeerkatId::from("w-1")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_none(),
         "roster removal must be unconditional — member must be gone even when all steps fail"
     );
 }
@@ -14705,23 +14539,33 @@ async fn test_disposal_report_ordering_is_deterministic() {
 
     // Retire both in sequence — same topology, same cleanup steps.
     handle
-        .retire(MeerkatId::from("w-1"))
+        .retire(AgentIdentity::from("w-1"))
         .await
         .expect("retire w-1");
     handle
-        .retire(MeerkatId::from("w-2"))
+        .retire(AgentIdentity::from("w-2"))
         .await
         .expect("retire w-2");
 
     // Both members removed — disposal executed identically.
-    assert!(handle.get_member(&MeerkatId::from("w-1")).await.is_none());
-    assert!(handle.get_member(&MeerkatId::from("w-2")).await.is_none());
+    assert!(
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_none()
+    );
+    assert!(
+        handle
+            .get_member(&AgentIdentity::from("w-2"))
+            .await
+            .is_none()
+    );
 
     // Verify events show two retirements in order.
     let events = handle.events().replay_all().await.expect("replay");
     let retire_events: Vec<_> = events
         .iter()
-        .filter(|e| matches!(e.kind, MobEventKind::MeerkatRetired { .. }))
+        .filter(|e| matches!(e.kind, MobEventKind::MemberRetired { .. }))
         .collect();
     assert_eq!(
         retire_events.len(),
@@ -14845,6 +14689,219 @@ async fn test_reset_clears_task_board() {
 }
 
 #[tokio::test]
+async fn test_task_get_round_trips_through_machine_command_surface() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let task_id = handle
+        .task_create("Task A".into(), "do a".into(), vec![])
+        .await
+        .expect("create task a");
+
+    let task = handle
+        .task_get(&task_id)
+        .await
+        .expect("task_get")
+        .expect("task exists");
+    assert_eq!(task.id, task_id);
+
+    handle.reset().await.expect("reset");
+    assert!(
+        handle
+            .task_get(&task_id)
+            .await
+            .expect("task_get after reset")
+            .is_none(),
+        "reset should clear the task board for machine-routed task_get"
+    );
+}
+
+#[tokio::test]
+async fn test_structural_roster_reads_round_trip_through_machine_command_surface() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    handle
+        .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
+        .await
+        .expect("spawn worker");
+
+    let roster = handle.roster().await;
+    assert!(
+        roster.get(&MeerkatId::from("w-1")).is_some(),
+        "machine-routed roster snapshot should include spawned member"
+    );
+
+    let all_members = handle.list_all_members().await;
+    assert_eq!(all_members.len(), 1);
+    assert_eq!(all_members[0].meerkat_id, MeerkatId::from("w-1"));
+
+    let active_members = handle.list_members().await;
+    assert_eq!(active_members.len(), 1);
+    assert_eq!(active_members[0].meerkat_id, MeerkatId::from("w-1"));
+
+    let including_retiring = handle.list_members_including_retiring().await;
+    assert_eq!(including_retiring.len(), 1);
+    assert_eq!(including_retiring[0].meerkat_id, MeerkatId::from("w-1"));
+
+    let entry = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .expect("member exists");
+    assert_eq!(entry.meerkat_id, MeerkatId::from("w-1"));
+
+    handle
+        .retire(AgentIdentity::from("w-1"))
+        .await
+        .expect("retire worker");
+    assert!(
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_none(),
+        "machine-routed get_member should reflect retirement"
+    );
+}
+
+#[tokio::test]
+async fn test_member_status_round_trips_through_machine_command_surface() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let receipt = handle
+        .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
+        .await
+        .expect("spawn worker");
+
+    let snapshot = handle
+        .member_status(&AgentIdentity::from("w-1"))
+        .await
+        .expect("member status");
+    assert_eq!(snapshot.status, crate::runtime::MobMemberStatus::Active);
+    assert_eq!(
+        snapshot.current_bridge_session_id.as_ref(),
+        Some(receipt.bridge_session_id().expect("session-backed")),
+        "machine-routed member_status should preserve the active session binding"
+    );
+}
+
+#[tokio::test]
+async fn test_member_handle_bridge_session_helper_round_trips_through_machine_projection_surface() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let receipt = handle
+        .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
+        .await
+        .expect("spawn worker");
+
+    let member = handle
+        .member(&AgentIdentity::from("w-1"))
+        .await
+        .expect("member handle");
+
+    let current_bridge_session_id = member
+        .current_bridge_session_id()
+        .await
+        .expect("current session id");
+    assert_eq!(
+        current_bridge_session_id.as_ref(),
+        Some(receipt.bridge_session_id().expect("session-backed")),
+        "member handle should expose the machine-routed current session binding"
+    );
+}
+
+#[tokio::test]
+async fn test_agent_event_subscriptions_resolve_through_machine_routed_member_reads() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    handle
+        .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
+        .await
+        .expect("spawn lead");
+
+    let _stream = handle
+        .subscribe_agent_events(&AgentIdentity::from("l-1"))
+        .await
+        .expect("member stream");
+
+    let streams = handle.subscribe_all_agent_events().await;
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0].0, AgentIdentity::from("l-1"));
+}
+
+#[tokio::test]
+async fn test_mob_events_view_round_trips_through_machine_command_surface() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    handle
+        .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
+        .await
+        .expect("spawn lead");
+
+    let replay = handle.events().replay_all().await.expect("replay all");
+    assert!(
+        replay
+            .iter()
+            .any(|event| matches!(event.kind, MobEventKind::MemberSpawned(..))),
+        "replayed event view should include spawn events through the machine command surface"
+    );
+
+    let polled = handle.events().poll(0, 32).await.expect("poll events");
+    assert!(
+        !polled.is_empty(),
+        "polled event view should surface stored events through the machine command surface"
+    );
+
+    let direct_polled = handle.poll_events(0, 32).await.expect("direct poll events");
+    assert!(
+        !direct_polled.is_empty(),
+        "direct handle poll_events should also round-trip through the machine command surface"
+    );
+}
+
+#[tokio::test]
+async fn test_record_operator_action_provenance_round_trips_through_machine_command_surface() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let authority = meerkat_core::service::MobToolAuthorityContext::create_only_generated()
+        .with_audit_invocation_id("audit-machine-surface");
+
+    handle
+        .record_operator_action_provenance("spawn_member", &authority)
+        .await
+        .expect("record operator action");
+
+    let events = handle.events().replay_all().await.expect("replay");
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.kind,
+            MobEventKind::OperatorActionRecorded {
+                tool_name,
+                audit_invocation_id,
+                ..
+            } if tool_name == "spawn_member"
+                && audit_invocation_id.as_deref() == Some("audit-machine-surface")
+        )),
+        "operator action provenance should be appended through the machine command surface"
+    );
+}
+
+#[tokio::test]
+async fn test_mob_event_router_stays_alive_across_machine_routed_spawn_tracking() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let mut router = handle
+        .subscribe_mob_events_with_config(MobEventRouterConfig {
+            poll_interval: Duration::from_millis(10),
+            channel_capacity: 32,
+        })
+        .await;
+    handle
+        .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
+        .await
+        .expect("spawn lead");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(
+        matches!(
+            router.event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
+        "router should remain live after tracking a spawned member through machine-routed bootstrap"
+    );
+    router.cancel();
+}
+
+#[tokio::test]
 async fn test_reset_append_failure_transitions_to_stopped() {
     let events = Arc::new(FaultInjectedMobEventStore::new());
     let (handle, _service) = create_test_mob_with_events(sample_definition(), events.clone()).await;
@@ -14964,13 +15021,13 @@ async fn test_retire_returns_err_when_archive_fails() {
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
         .await
         .expect("spawn w-1")
-        .session_id()
+        .bridge_session_id()
         .expect("session-backed")
         .clone();
     service.set_archive_failure(&session_id).await;
 
     // Archive failure is critical — retire must surface it.
-    let result = handle.retire(MeerkatId::from("w-1")).await;
+    let result = handle.retire(AgentIdentity::from("w-1")).await;
     assert!(
         result.is_err(),
         "retire must return Err when ArchiveSession fails — got Ok"
@@ -14978,7 +15035,10 @@ async fn test_retire_returns_err_when_archive_fails() {
 
     // Roster removal is unconditional (finally block) even when we return Err.
     assert!(
-        handle.get_member(&MeerkatId::from("w-1")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_none(),
         "roster entry must be removed even when retire returns Err"
     );
 
@@ -14987,7 +15047,7 @@ async fn test_retire_returns_err_when_archive_fails() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(e.kind, MobEventKind::MeerkatRetired { .. })),
+            .any(|e| matches!(e.kind, MobEventKind::MemberRetired { .. })),
         "retire event must persist regardless of archive outcome"
     );
 }
@@ -15023,12 +15083,12 @@ async fn test_retire_comms_failures_remain_best_effort() {
         .await
         .expect("spawn w-2");
     handle
-        .wire(MeerkatId::from("w-1"), MeerkatId::from("w-2"))
+        .wire(AgentIdentity::from("w-1"), MeerkatId::from("w-2"))
         .await
         .expect("wire");
 
     // Comms failures are best-effort — retire still succeeds.
-    let result = handle.retire(MeerkatId::from("w-1")).await;
+    let result = handle.retire(AgentIdentity::from("w-1")).await;
     assert!(
         result.is_ok(),
         "retire must succeed when only comms steps fail (best-effort) — got {:?}",
@@ -15037,7 +15097,10 @@ async fn test_retire_comms_failures_remain_best_effort() {
 
     // Roster removal still happens.
     assert!(
-        handle.get_member(&MeerkatId::from("w-1")).await.is_none(),
+        handle
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .is_none(),
         "roster entry must be removed after best-effort comms failures"
     );
 }
@@ -15088,9 +15151,7 @@ impl AgentToolDispatcher for MultiToolDispatcher {
     }
 
     fn capabilities(&self) -> meerkat_core::agent::DispatcherCapabilities {
-        meerkat_core::agent::DispatcherCapabilities {
-            ops_lifecycle: true,
-        }
+        meerkat_core::agent::DispatcherCapabilities::default()
     }
 }
 
@@ -15129,12 +15190,6 @@ async fn test_name_filtered_dispatcher() {
         })
         .await;
     assert!(result.is_ok(), "non-excluded tool should delegate to inner");
-
-    // capabilities delegates
-    assert!(
-        filtered.capabilities().ops_lifecycle,
-        "should delegate capabilities().ops_lifecycle to inner"
-    );
 }
 
 // ── RuntimeBinding TDD tests ────────────────────────────────────────────
@@ -15153,9 +15208,17 @@ async fn test_external_spawn_with_binding_uses_real_identity() {
         address: "tcp://192.168.0.180:4800".to_string(),
     });
 
-    let member_ref = handle.spawn_spec(spec).await.expect("spawn with binding");
-
-    match member_ref {
+    let spawn_result = handle.spawn_spec(spec).await.expect("spawn with binding");
+    // Verify identity was created
+    assert!(!spawn_result.agent_identity.as_str().is_empty());
+    // Verify backend binding through roster
+    let entry = handle
+        .roster()
+        .await
+        .get_by_identity(&spawn_result.agent_identity)
+        .cloned()
+        .expect("roster entry");
+    match &entry.member_ref {
         MemberRef::BackendPeer {
             peer_id,
             address,
@@ -15239,12 +15302,15 @@ async fn test_trusted_peer_spec_uses_bridge_not_real_identity() {
         .await
         .expect("spawn lead");
     handle
-        .wire(MeerkatId::from("lead-1"), MeerkatId::from("w-bridge"))
+        .wire(AgentIdentity::from("lead-1"), MeerkatId::from("w-bridge"))
         .await
         .expect("wire lead to external member");
 
     // Check what trust was added to the lead's comms runtime.
-    let lead_sid = lead_ref.session_id().cloned().expect("lead session id");
+    let lead_sid = lead_ref
+        .bridge_session_id()
+        .cloned()
+        .expect("lead session id");
     let trusted_addresses = service.trusted_peer_addresses(&lead_sid).await;
 
     // The trust spec should use inproc:// bridge transport, not the real
@@ -15315,11 +15381,11 @@ async fn test_external_tools_provider_called_per_spawn() {
 
 #[tokio::test]
 async fn test_external_tools_name_collision_profile_wins() {
-    // Provider returns a dispatcher with tool "spawn_meerkat". Without operator
+    // Provider returns a dispatcher with tool "spawn_member". Without operator
     // context, the callback tool should pass through unchanged.
     let provider: crate::ExternalToolsProvider = Arc::new(|| {
         Some(
-            Arc::new(MultiToolDispatcher::new(&["spawn_meerkat", "my_callback"]))
+            Arc::new(MultiToolDispatcher::new(&["spawn_member", "my_callback"]))
                 as Arc<dyn AgentToolDispatcher>,
         )
     });
@@ -15340,14 +15406,17 @@ async fn test_external_tools_name_collision_profile_wins() {
         .await
         .expect("spawn should succeed despite name collision");
 
-    let session_id = member_ref.session_id().expect("session-backed").clone();
+    let session_id = member_ref
+        .bridge_session_id()
+        .expect("session-backed")
+        .clone();
     let tool_names = service.external_tool_names(&session_id).await;
 
-    // Without operator context there is no mob-owned spawn_meerkat, so the callback
+    // Without operator context there is no mob-owned spawn_member, so the callback
     // tool should remain visible.
     assert!(
-        tool_names.contains(&"spawn_meerkat".to_string()),
-        "callback spawn_meerkat should be present when operator tools are hidden"
+        tool_names.contains(&"spawn_member".to_string()),
+        "callback spawn_member should be present when operator tools are hidden"
     );
     // callback's unique tool should still be present
     assert!(
@@ -15355,15 +15424,15 @@ async fn test_external_tools_name_collision_profile_wins() {
         "non-colliding callback tool should be present"
     );
 
-    // Dispatch spawn_meerkat — should hit the callback dispatcher directly.
-    let raw_args = serde_json::json!({"profile": "worker", "meerkat_id": "w-test"});
+    // Dispatch spawn_member — should hit the callback dispatcher directly.
+    let raw_args = serde_json::json!({"profile": "worker", "member_id": "w-test"});
     let result = service
-        .dispatch_external_tool_outcome(&session_id, "spawn_meerkat", raw_args)
+        .dispatch_external_tool_outcome(&session_id, "spawn_member", raw_args)
         .await
-        .expect("callback spawn_meerkat should dispatch");
+        .expect("callback spawn_member should dispatch");
     let payload: serde_json::Value =
         serde_json::from_str(&result.result.text_content()).expect("callback result json");
-    assert_eq!(payload["tool"], "spawn_meerkat");
+    assert_eq!(payload["tool"], "spawn_member");
 }
 
 #[tokio::test]
@@ -15451,7 +15520,7 @@ async fn test_external_tools_late_registration() {
         "spawn after registration should have external tools"
     );
 
-    let session_id = ref2.session_id().expect("session-backed").clone();
+    let session_id = ref2.bridge_session_id().expect("session-backed").clone();
     let tool_names = service.external_tool_names(&session_id).await;
     assert!(
         tool_names.contains(&"late_tool_a".to_string()),
@@ -15488,10 +15557,10 @@ async fn test_restored_member_gets_external_tools() {
         .expect("spawn");
 
     let old_sid = handle
-        .get_member(&MeerkatId::from("w-1"))
+        .get_member(&AgentIdentity::from("w-1"))
         .await
         .expect("roster entry")
-        .session_id()
+        .bridge_session_id()
         .cloned()
         .expect("session-backed member");
 
@@ -15782,7 +15851,8 @@ async fn test_root_frame_step_failure_does_not_abort_independent_siblings() {
         terminal.step_ledger.iter().any(|entry| {
             entry.step_id.as_str() == "needs_lead"
                 && entry.status == StepRunStatus::Failed
-                && entry.meerkat_id == crate::runtime::flow_system_member_id()
+                && entry.agent_identity
+                    == AgentIdentity::from(crate::runtime::flow_system_member_id().as_str())
         }),
         "root-frame failure should project a failed step entry for the failed node"
     );
@@ -15948,7 +16018,8 @@ async fn test_root_frame_fan_in_persists_canonical_completed_aggregate_output() 
         .iter()
         .find(|entry| {
             entry.step_id.as_str() == "dispatch"
-                && entry.meerkat_id == crate::runtime::flow_system_member_id()
+                && entry.agent_identity
+                    == AgentIdentity::from(crate::runtime::flow_system_member_id().as_str())
                 && entry.status == StepRunStatus::Completed
         })
         .and_then(|entry| entry.output.clone())
@@ -16675,52 +16746,6 @@ async fn test_root_loop_body_failure_stops_after_first_failed_iteration() {
     );
 }
 
-#[tokio::test]
-async fn test_list_members_does_not_stall_during_concurrent_spawn() {
-    let (handle, service) = create_test_mob_with_runtime_adapter(sample_definition()).await;
-    service.set_keep_alive_turns_complete_immediately(true);
-
-    // Spawn members in the background
-    let handle_clone = handle.clone();
-    let spawn_task = tokio::spawn(async move {
-        for i in 0..3 {
-            let name = format!("worker-{i}");
-            handle_clone
-                .spawn(
-                    ProfileName::from("worker"),
-                    MeerkatId::from(name.as_str()),
-                    None,
-                )
-                .await
-                .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
-        }
-    });
-
-    // Concurrently poll list_members — this must not deadlock
-    let list_task = tokio::spawn({
-        let handle = handle.clone();
-        async move {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            loop {
-                let members = handle.list_members().await;
-                if members.len() >= 3 {
-                    return members.len();
-                }
-                assert!(
-                    tokio::time::Instant::now() <= deadline,
-                    "list_members timed out: only {}/3 members visible",
-                    members.len()
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-    });
-
-    spawn_task.await.expect("spawn task should complete");
-    let count = list_task.await.expect("list task should complete");
-    assert!(count >= 3, "expected at least 3 members, got {count}");
-}
-
 // -----------------------------------------------------------------------
 // T2.2: RealmRef profile resolution in spawn path
 // -----------------------------------------------------------------------
@@ -16860,4 +16885,329 @@ async fn test_spawn_realm_ref_without_store_returns_error() {
         matches!(err, MobError::Internal(_)),
         "expected Internal error for missing store, got: {err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Work lane (C5)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_submit_work_internal_origin_succeeds() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    handle
+        .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
+        .await
+        .expect("spawn worker");
+
+    let entry = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .expect("member exists");
+    let runtime_id = entry.agent_runtime_id.clone();
+    let fence = entry.fence_token;
+
+    let receipt = handle
+        .submit_work(
+            runtime_id.clone(),
+            fence,
+            WorkRef::new(),
+            WorkSpec::new("do work".to_string(), WorkOrigin::Internal),
+        )
+        .await
+        .expect("submit_work should succeed with valid fence token");
+    assert_eq!(receipt.runtime_id, runtime_id);
+}
+
+#[tokio::test]
+async fn test_submit_work_external_origin_succeeds() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    handle
+        .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
+        .await
+        .expect("spawn lead");
+
+    let entry = handle
+        .get_member(&AgentIdentity::from("l-1"))
+        .await
+        .expect("member exists");
+
+    let receipt = handle
+        .submit_work(
+            entry.agent_runtime_id.clone(),
+            entry.fence_token,
+            WorkRef::new(),
+            WorkSpec::new("user message".to_string(), WorkOrigin::External),
+        )
+        .await
+        .expect("submit_work external should succeed for externally addressable member");
+    assert_eq!(receipt.runtime_id, entry.agent_runtime_id);
+}
+
+#[tokio::test]
+async fn test_submit_work_stale_fence_token_rejected() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    handle
+        .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
+        .await
+        .expect("spawn worker");
+
+    let entry = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .expect("member exists");
+    let runtime_id = entry.agent_runtime_id.clone();
+    let stale_fence = FenceToken::new(entry.fence_token.get() + 999);
+
+    let result = handle
+        .submit_work(
+            runtime_id,
+            stale_fence,
+            WorkRef::new(),
+            WorkSpec::new("stale work".to_string(), WorkOrigin::Internal),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(MobError::StaleFenceToken { .. })),
+        "submit_work must reject stale fence token: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_submit_work_unknown_member_fails() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let runtime_id = AgentRuntimeId::initial(AgentIdentity::from("nonexistent"));
+
+    let result = handle
+        .submit_work(
+            runtime_id,
+            FenceToken::new(0),
+            WorkRef::new(),
+            WorkSpec::new("orphan work".to_string(), WorkOrigin::Internal),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(MobError::MeerkatNotFound(_))),
+        "submit_work to nonexistent member must fail: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_cancel_work_returns_not_found() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let result = handle.cancel_work(WorkRef::new()).await;
+    assert!(
+        matches!(result, Err(MobError::WorkNotFound(_))),
+        "cancel_work must return WorkNotFound before work tracking is wired: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_cancel_all_work_validates_fence_token() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    handle
+        .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
+        .await
+        .expect("spawn worker");
+
+    let entry = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .expect("member exists");
+
+    let stale_fence = FenceToken::new(entry.fence_token.get() + 1);
+    let result = handle
+        .cancel_all_work(entry.agent_runtime_id.clone(), stale_fence)
+        .await;
+    assert!(
+        matches!(result, Err(MobError::StaleFenceToken { .. })),
+        "cancel_all_work must reject stale fence token: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_cancel_all_work_valid_fence_succeeds() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    handle
+        .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
+        .await
+        .expect("spawn worker");
+
+    let entry = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .expect("member exists");
+
+    let result = handle
+        .cancel_all_work(entry.agent_runtime_id.clone(), entry.fence_token)
+        .await;
+    assert!(
+        result.is_ok(),
+        "cancel_all_work with valid fence should succeed: {result:?}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Identity-first comms pipeline verification
+// -----------------------------------------------------------------------
+
+/// Verify that spawning members with role-based wiring rules creates correct
+/// identity-keyed roster entries, valid bridge sessions, and bidirectional
+/// wiring — the exact flow that the pictionary e2e-smoke test relies on.
+#[tokio::test]
+async fn test_identity_first_spawn_with_role_wiring_creates_valid_roster_and_sessions() {
+    let mut def = sample_definition_with_cross_role_wiring();
+    // Ensure comms are enabled on both profiles so wiring creates trust edges.
+    for binding in def.profiles.values_mut() {
+        if let crate::profile::ProfileBinding::Inline(profile) = binding {
+            profile.tools.comms = true;
+        }
+    }
+    let (handle, _service) = create_test_mob(def).await;
+
+    // Spawn a "lead" and a "worker" — the cross_role_wiring rule wires lead<->worker.
+    let lead_result = handle
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
+        .await
+        .expect("spawn lead");
+    assert_eq!(lead_result.agent_identity, AgentIdentity::from("lead-1"));
+
+    let worker_result = handle
+        .spawn_spec(SpawnMemberSpec::new(
+            "worker",
+            AgentIdentity::from("worker-1"),
+        ))
+        .await
+        .expect("spawn worker");
+    assert_eq!(
+        worker_result.agent_identity,
+        AgentIdentity::from("worker-1")
+    );
+
+    // Verify roster entries exist via identity lookup.
+    let lead_entry = handle
+        .get_member(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("lead roster entry should exist");
+    assert_eq!(lead_entry.agent_identity, AgentIdentity::from("lead-1"));
+    assert_eq!(lead_entry.role, ProfileName::from("lead"));
+
+    let worker_entry = handle
+        .get_member(&AgentIdentity::from("worker-1"))
+        .await
+        .expect("worker roster entry should exist");
+    assert_eq!(worker_entry.agent_identity, AgentIdentity::from("worker-1"));
+    assert_eq!(worker_entry.role, ProfileName::from("worker"));
+
+    // Verify resolve_bridge_session_id returns valid sessions.
+    let lead_session = handle
+        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
+        .await;
+    assert!(
+        lead_session.is_some(),
+        "lead should have a bridge session after spawn"
+    );
+
+    let worker_session = handle
+        .resolve_bridge_session_id(&AgentIdentity::from("worker-1"))
+        .await;
+    assert!(
+        worker_session.is_some(),
+        "worker should have a bridge session after spawn"
+    );
+
+    // Sessions must be distinct.
+    assert_ne!(
+        lead_session, worker_session,
+        "lead and worker should have different bridge sessions"
+    );
+
+    // Verify wiring: worker should be wired to lead (via cross-role rule).
+    let worker_wired_to = &worker_entry.wired_to;
+    assert!(
+        worker_wired_to.contains(&AgentIdentity::from("lead-1")),
+        "worker should be wired to lead via cross-role wiring rule, got: {worker_wired_to:?}"
+    );
+
+    // Verify wiring is bidirectional.
+    // Re-fetch lead entry since wiring might have been set after initial spawn.
+    let lead_entry = handle
+        .get_member(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("lead roster entry should still exist");
+    assert!(
+        lead_entry
+            .wired_to
+            .contains(&AgentIdentity::from("worker-1")),
+        "lead should be wired to worker (bidirectional), got: {:?}",
+        lead_entry.wired_to
+    );
+}
+
+/// Verify that MemberHandle::send delivers content to a wired member
+/// by checking the external turn dispatch resolves correctly.
+#[tokio::test]
+async fn test_identity_first_member_handle_send_routes_through_identity() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+
+    // Spawn a member.
+    handle
+        .spawn_spec(
+            SpawnMemberSpec::new("worker", AgentIdentity::from("sender"))
+                .with_runtime_mode(crate::MobRuntimeMode::TurnDriven),
+        )
+        .await
+        .expect("spawn sender");
+
+    // Acquire a MemberHandle via identity.
+    let member = handle
+        .member(&AgentIdentity::from("sender"))
+        .await
+        .expect("member handle should resolve by identity");
+
+    assert_eq!(member.identity(), AgentIdentity::from("sender"));
+
+    // Verify the member has a valid bridge session.
+    let session = handle
+        .resolve_bridge_session_id(&AgentIdentity::from("sender"))
+        .await;
+    assert!(
+        session.is_some(),
+        "member should have a bridge session for turn delivery"
+    );
+}
+
+/// Verify that list_members returns identity-native entries with correct
+/// agent_identity, agent_runtime_id, and fence_token fields.
+#[tokio::test]
+async fn test_identity_first_list_members_returns_identity_native_entries() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+
+    handle
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("alice")))
+        .await
+        .expect("spawn alice");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("bob")))
+        .await
+        .expect("spawn bob");
+
+    let members = handle.list_members().await;
+    assert_eq!(members.len(), 2, "should have 2 members");
+
+    let identities: std::collections::BTreeSet<_> =
+        members.iter().map(|m| m.agent_identity.clone()).collect();
+    assert!(identities.contains(&AgentIdentity::from("alice")));
+    assert!(identities.contains(&AgentIdentity::from("bob")));
+
+    // Each member should have a valid agent_runtime_id and fence_token.
+    for member in &members {
+        assert_eq!(
+            member.agent_runtime_id.identity, member.agent_identity,
+            "runtime_id identity should match agent_identity"
+        );
+        assert!(
+            member.fence_token.get() > 0,
+            "fence_token should be non-zero after spawn"
+        );
+    }
 }

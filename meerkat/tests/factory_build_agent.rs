@@ -14,6 +14,7 @@ use futures::stream;
 use meerkat::BuildAgentError;
 use meerkat::{AgentBuildConfig, AgentFactory, LlmDoneOutcome, LlmEvent, LlmRequest};
 use meerkat_client::{LlmClient, TestClient};
+#[cfg(feature = "comms")]
 use meerkat_comms::{CommsRuntime, ResolvedCommsConfig, TrustedPeer, identity::Keypair};
 use meerkat_core::service::{MobToolAuthorityContext, OpaquePrincipalToken};
 use meerkat_core::{
@@ -116,11 +117,13 @@ impl AgentToolDispatcher for EmptyDispatcher {
     }
 }
 
+#[cfg_attr(not(feature = "comms"), allow(dead_code))]
 struct NamedDispatcher {
     tools: Arc<[Arc<ToolDef>]>,
 }
 
 impl NamedDispatcher {
+    #[cfg_attr(not(feature = "comms"), allow(dead_code))]
     fn new(name: &str) -> Self {
         Self {
             tools: Arc::from(vec![Arc::new(ToolDef {
@@ -167,6 +170,7 @@ impl meerkat_core::service::MobToolsFactory for RecordingMobToolsFactory {
     }
 }
 
+#[cfg_attr(not(feature = "comms"), allow(dead_code))]
 struct StaticMobToolsFactory {
     dispatcher: Arc<dyn AgentToolDispatcher>,
 }
@@ -535,6 +539,7 @@ async fn build_agent_without_scheduler_keeps_injected_scheduler_tools_hidden() {
     );
 }
 
+#[cfg(feature = "comms")]
 #[tokio::test]
 async fn build_agent_composes_scheduler_alongside_comms_and_mob() {
     let temp = tempfile::tempdir().unwrap();
@@ -559,12 +564,15 @@ async fn build_agent_composes_scheduler_alongside_comms_and_mob() {
             .await
             .unwrap(),
     );
-    comms_runtime.upsert_trusted_peer(TrustedPeer {
-        name: "peer-a".into(),
-        pubkey: Keypair::generate().public_key(),
-        addr: "tcp://127.0.0.1:9999".into(),
-        meta: Default::default(),
-    });
+    comms_runtime
+        .register_trusted_peer(TrustedPeer {
+            name: "peer-a".into(),
+            pubkey: Keypair::generate().public_key(),
+            addr: "tcp://127.0.0.1:9999".into(),
+            meta: Default::default(),
+        })
+        .await
+        .unwrap();
     let factory = temp_factory(&temp)
         .comms(true)
         .with_comms_runtime(comms_runtime)
@@ -1865,12 +1873,15 @@ async fn shared_comms_runtime_skipped_when_comms_name_set() {
     let _shared_pubkey = shared_runtime.public_key().to_peer_id();
 
     // Add a sentinel peer to the shared runtime so we can detect reuse.
-    shared_runtime.upsert_trusted_peer(meerkat_comms::TrustedPeer {
-        name: "sentinel".into(),
-        pubkey: meerkat_comms::identity::Keypair::generate().public_key(),
-        addr: "tcp://127.0.0.1:9999".into(),
-        meta: meerkat_comms::PeerMeta::default(),
-    });
+    shared_runtime
+        .register_trusted_peer(meerkat_comms::TrustedPeer {
+            name: "sentinel".into(),
+            pubkey: meerkat_comms::identity::Keypair::generate().public_key(),
+            addr: "tcp://127.0.0.1:9999".into(),
+            meta: meerkat_comms::PeerMeta::default(),
+        })
+        .await
+        .unwrap();
 
     let factory = temp_factory(&temp).with_comms_runtime(shared_runtime);
     let config = Config::default();

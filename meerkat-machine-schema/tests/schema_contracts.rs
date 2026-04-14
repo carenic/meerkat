@@ -1,79 +1,57 @@
 use std::collections::BTreeMap;
 
-use meerkat_machine_schema::catalog::{
-    flow_frame_machine, flow_run_machine, loop_iteration_machine, mob_bundle_composition,
-    mob_lifecycle_machine, mob_orchestrator_machine, ops_lifecycle_machine,
-    ops_runtime_bundle_composition, peer_comms_machine, peer_directory_reachability_machine,
-    peer_runtime_bundle_composition, runtime_control_machine, runtime_ingress_machine,
-    runtime_pipeline_composition, turn_execution_machine,
-};
 use meerkat_machine_schema::{
-    CompositionSchemaError, EffectDisposition, FeedbackFieldBinding, FeedbackFieldSource,
-    FeedbackInputRef, ProtocolGenerationMode, ProtocolHelperReturnShape, ProtocolRustBinding,
-    Route, RouteBindingSource, RouteDelivery, RouteFieldBinding, RouteTarget,
-    canonical_composition_schemas, canonical_machine_schemas, input_lifecycle_machine,
+    CompositionSchemaError, canonical_composition_coverage_manifests,
+    canonical_composition_schemas, canonical_machine_coverage_manifests, canonical_machine_schemas,
+    meerkat_machine, meerkat_mob_seam_composition, mob_machine, occurrence_lifecycle_machine,
+    schedule_lifecycle_machine,
 };
 
-fn test_protocol_rust(mode: ProtocolGenerationMode) -> ProtocolRustBinding {
-    ProtocolRustBinding {
-        module_path: "meerkat-core/src/generated/protocol_test.rs".into(),
-        generation_mode: mode.clone(),
-        required_imports: vec![],
-        authority_type_path: Some("crate::test::Authority".into()),
-        mutator_trait_path: Some("crate::test::Mutator".into()),
-        input_enum_path: Some("crate::test::Input".into()),
-        effect_enum_path: Some("crate::test::Effect".into()),
-        transition_type_path: Some("crate::test::Transition".into()),
-        error_type_path: Some("crate::test::Error".into()),
-        executor_trigger_input_variant: if matches!(mode, ProtocolGenerationMode::Executor) {
-            Some("Trigger".into())
-        } else {
-            None
-        },
-        bridge_source_type_path: if matches!(mode, ProtocolGenerationMode::ShellBridge) {
-            Some("crate::test::BridgeToken".into())
-        } else {
-            None
-        },
-        helper_return_shape: ProtocolHelperReturnShape::EffectsAndObligation,
-    }
-}
-
-fn feedback_input(machine_instance: &str, input_variant: &str) -> FeedbackInputRef {
-    FeedbackInputRef {
-        machine_instance: machine_instance.into(),
-        input_variant: input_variant.into(),
-        field_bindings: vec![FeedbackFieldBinding {
-            input_field: "op_id".into(),
-            source: FeedbackFieldSource::ObligationField("op_id".into()),
-        }],
-    }
-}
-
 #[test]
-fn validates_mob_orchestrator_style_machine() {
-    let schema = mob_orchestrator_machine();
+fn canonical_machine_registry_contains_only_two_kernel_and_perimeter_entries() {
+    let names = canonical_machine_schemas()
+        .into_iter()
+        .map(|schema| schema.machine)
+        .collect::<Vec<_>>();
 
-    assert_eq!(schema.machine, "MobOrchestratorMachine");
-    assert_eq!(schema.rust.crate_name, "meerkat-mob");
-    assert_eq!(schema.rust.module, "generated::mob_orchestrator");
-    assert!(
-        schema
-            .transitions
-            .iter()
-            .any(|transition| transition.name == "InitializeOrchestrator")
+    assert_eq!(
+        names,
+        vec![
+            "MeerkatMachine",
+            "MobMachine",
+            "ScheduleLifecycleMachine",
+            "OccurrenceLifecycleMachine"
+        ]
     );
-    assert_eq!(schema.validate(), Ok(()));
+
+    for absorbed in [
+        "SessionTurnAdmissionMachine",
+        "SessionToolVisibilityMachine",
+        "PeerDirectoryReachabilityMachine",
+    ] {
+        assert!(
+            !names.iter().any(|name| name == absorbed),
+            "{absorbed} should be absorbed into canonical kernels, not published separately"
+        );
+    }
 }
 
 #[test]
-fn validates_input_lifecycle_machine_definition() {
-    assert_eq!(input_lifecycle_machine().validate(), Ok(()));
-}
+fn canonical_composition_registry_contains_kernel_seam_and_schedule_perimeter_entries() {
+    let names = canonical_composition_schemas()
+        .into_iter()
+        .map(|schema| schema.name)
+        .collect::<Vec<_>>();
 
-#[test]
-fn validates_mob_lifecycle_machine_definition() {
-    assert_eq!(mob_lifecycle_machine().validate(), Ok(()));
+    assert_eq!(
+        names,
+        vec![
+            "meerkat_mob_seam",
+            "schedule_bundle",
+            "schedule_runtime_bundle",
+            "schedule_mob_bundle",
+        ]
+    );
 }
 
 #[test]
@@ -89,72 +67,49 @@ fn canonical_machine_registry_is_individually_valid() {
 }
 
 #[test]
-fn validates_flow_run_machine_definition() {
-    assert_eq!(flow_run_machine().validate(), Ok(()));
+fn canonical_composition_registry_is_individually_valid() {
+    let canonical_machines = canonical_machine_schemas();
+    let canonical_machine_refs = canonical_machines.iter().collect::<Vec<_>>();
+
+    for schema in canonical_composition_schemas() {
+        assert_eq!(
+            schema.validate_against(&canonical_machine_refs),
+            Ok(()),
+            "composition {} should validate against the canonical machine set",
+            schema.name
+        );
+    }
 }
 
 #[test]
-fn validates_flow_frame_machine_definition() {
-    assert_eq!(flow_frame_machine().validate(), Ok(()));
-}
+fn kernel_seam_rejects_type_mismatched_route_binding() {
+    let meerkat = meerkat_machine();
+    let mob = mob_machine();
+    let mut composition = meerkat_mob_seam_composition();
+    let route_idx = composition
+        .routes
+        .iter()
+        .position(|route| route.name == "binding_request_reaches_meerkat");
+    assert!(route_idx.is_some(), "binding request route");
+    let Some(route_idx) = route_idx else {
+        return;
+    };
+    let route = &mut composition.routes[route_idx];
+    let generation_binding_idx = route
+        .bindings
+        .iter()
+        .position(|binding| binding.to_field == "generation");
+    assert!(generation_binding_idx.is_some(), "generation binding");
+    let Some(generation_binding_idx) = generation_binding_idx else {
+        return;
+    };
+    let generation_binding = &mut route.bindings[generation_binding_idx];
+    generation_binding.source = meerkat_machine_schema::RouteBindingSource::Field {
+        from_field: "fence_token".into(),
+        allow_named_alias: false,
+    };
 
-#[test]
-fn validates_loop_iteration_machine_definition() {
-    assert_eq!(loop_iteration_machine().validate(), Ok(()));
-}
-
-#[test]
-fn validates_ops_lifecycle_machine_definition() {
-    assert_eq!(ops_lifecycle_machine().validate(), Ok(()));
-}
-
-#[test]
-fn validates_peer_directory_reachability_machine_definition() {
-    assert_eq!(peer_directory_reachability_machine().validate(), Ok(()));
-}
-
-#[test]
-fn validates_runtime_pipeline_composition() {
-    let runtime_control = runtime_control_machine();
-    let runtime_ingress = runtime_ingress_machine();
-    let turn_execution = turn_execution_machine();
-    let composition = runtime_pipeline_composition();
-
-    assert_eq!(
-        composition.validate_against(&[&runtime_control, &runtime_ingress, &turn_execution]),
-        Ok(())
-    );
-}
-
-#[test]
-fn rejects_route_with_type_mismatch() {
-    let runtime_control = runtime_control_machine();
-    let runtime_ingress = runtime_ingress_machine();
-    let turn_execution = turn_execution_machine();
-    let mut composition = runtime_pipeline_composition();
-    composition.routes.push(Route {
-        name: "bad_boundary_sequence_into_run_id".into(),
-        from_machine: "runtime_ingress".into(),
-        effect_variant: "ReadyForRun".into(),
-        to: RouteTarget {
-            machine: "turn_execution".into(),
-            input_variant: "StartConversationRun".into(),
-        },
-        bindings: vec![RouteFieldBinding {
-            to_field: "run_id".into(),
-            source: RouteBindingSource::Field {
-                from_field: "contributing_input_ids".into(),
-                allow_named_alias: false,
-            },
-        }],
-        delivery: RouteDelivery::Immediate,
-    });
-    composition.witnesses[0]
-        .expected_routes
-        .push("bad_boundary_sequence_into_run_id".into());
-
-    let result =
-        composition.validate_against(&[&runtime_control, &runtime_ingress, &turn_execution]);
+    let result = composition.validate_against(&[&meerkat, &mob]);
     assert!(matches!(
         result,
         Err(CompositionSchemaError::RouteFieldTypeMismatch { .. }
@@ -163,50 +118,8 @@ fn rejects_route_with_type_mismatch() {
 }
 
 #[test]
-fn rejects_missing_failure_outcome_route() {
-    let runtime_control = runtime_control_machine();
-    let runtime_ingress = runtime_ingress_machine();
-    let turn_execution = turn_execution_machine();
-    let mut composition = runtime_pipeline_composition();
-    composition
-        .routes
-        .retain(|route| route.name != "execution_failure_updates_ingress");
-    for witness in &mut composition.witnesses {
-        witness
-            .expected_routes
-            .retain(|route| route != "execution_failure_updates_ingress");
-    }
-
-    let result =
-        composition.validate_against(&[&runtime_control, &runtime_ingress, &turn_execution]);
-    assert!(matches!(
-        result,
-        Err(CompositionSchemaError::MissingOutcomeRoute { .. })
-    ));
-}
-
-#[test]
-fn rejects_missing_scheduler_rule() {
-    let runtime_control = runtime_control_machine();
-    let runtime_ingress = runtime_ingress_machine();
-    let turn_execution = turn_execution_machine();
-    let mut composition = runtime_pipeline_composition();
-    composition.scheduler_rules.clear();
-    for witness in &mut composition.witnesses {
-        witness.expected_scheduler_rules.clear();
-    }
-
-    let result =
-        composition.validate_against(&[&runtime_control, &runtime_ingress, &turn_execution]);
-    assert!(matches!(
-        result,
-        Err(CompositionSchemaError::MissingRequiredSchedulerRule { .. })
-    ));
-}
-
-#[test]
-fn rejects_zero_deep_domain_override() {
-    let mut composition = runtime_pipeline_composition();
+fn kernel_seam_rejects_zero_named_domain_override() {
+    let mut composition = meerkat_mob_seam_composition();
     composition.deep_domain_overrides = BTreeMap::from([("WorkIdValues".into(), 0)]);
 
     let result = composition.validate();
@@ -217,1300 +130,655 @@ fn rejects_zero_deep_domain_override() {
 }
 
 #[test]
-fn validates_peer_runtime_bundle_with_alias_and_literal_bindings() {
-    let peer_comms = peer_comms_machine();
-    let runtime_control = runtime_control_machine();
-    let runtime_ingress = runtime_ingress_machine();
-    let composition = peer_runtime_bundle_composition();
+fn schedule_and_occurrence_machines_stay_in_canonical_coverage_manifests() {
+    let machine_names = canonical_machine_schemas()
+        .into_iter()
+        .map(|schema| schema.machine)
+        .collect::<Vec<_>>();
+    let coverage_names = canonical_machine_coverage_manifests()
+        .into_iter()
+        .map(|manifest| manifest.machine)
+        .collect::<Vec<_>>();
 
-    assert_eq!(
-        composition.validate_against(&[&peer_comms, &runtime_control, &runtime_ingress]),
-        Ok(())
-    );
-}
-
-#[test]
-fn validates_ops_runtime_bundle_with_alias_and_literal_bindings() {
-    let ops_lifecycle = ops_lifecycle_machine();
-    let runtime_control = runtime_control_machine();
-    let runtime_ingress = runtime_ingress_machine();
-    let turn_execution = turn_execution_machine();
-    let composition = ops_runtime_bundle_composition();
-
-    assert_eq!(
-        composition.validate_against(&[
-            &ops_lifecycle,
-            &runtime_control,
-            &runtime_ingress,
-            &turn_execution,
-        ]),
-        Ok(())
-    );
-}
-
-#[test]
-fn rejects_unsupported_route_literal_expression() {
-    let peer_comms = peer_comms_machine();
-    let runtime_control = runtime_control_machine();
-    let runtime_ingress = runtime_ingress_machine();
-    let mut composition = peer_runtime_bundle_composition();
-    composition.routes[0].bindings[1].source =
-        RouteBindingSource::Literal(meerkat_machine_schema::Expr::Field("not_allowed".into()));
-
-    let result = composition.validate_against(&[&peer_comms, &runtime_control, &runtime_ingress]);
-    assert!(matches!(
-        result,
-        Err(CompositionSchemaError::UnsupportedRouteLiteral { .. })
-    ));
-}
-
-#[test]
-fn validates_mob_bundle_skeleton_routes() {
-    let composition = mob_bundle_composition();
-    let machines = canonical_machine_schemas();
-    let machine_refs: Vec<&_> = machines
-        .iter()
-        .filter(|schema| {
-            composition
-                .machines
-                .iter()
-                .any(|instance| instance.machine_name == schema.machine)
-        })
-        .collect();
-
-    assert_eq!(composition.validate_against(&machine_refs), Ok(()));
-}
-
-/// Closed-world audit gate: every Routed effect in every closed-world composition that
-/// contains both producer and consumer machine types must have a corresponding route.
-/// This runs in `cargo rct` as an automated verification that route coverage is complete.
-#[test]
-fn closed_world_audit_all_routed_effects_have_routes() {
-    let machines = canonical_machine_schemas();
-    let compositions = canonical_composition_schemas();
-
-    let mut failures = Vec::new();
-    for composition in &compositions {
-        if !composition.closed_world {
-            continue;
-        }
-
-        let machine_refs: Vec<&_> = machines
-            .iter()
-            .filter(|m| {
-                composition
-                    .machines
-                    .iter()
-                    .any(|inst| inst.machine_name == m.machine)
-            })
-            .collect();
-
-        if let Err(e) = composition.validate_against(&machine_refs) {
-            failures.push(format!("  {}: {}", composition.name, e));
-        }
+    for name in [
+        schedule_lifecycle_machine().machine,
+        occurrence_lifecycle_machine().machine,
+    ] {
+        assert!(
+            machine_names.iter().any(|machine| machine == &name),
+            "{name} should remain canonical"
+        );
+        assert!(
+            coverage_names.iter().any(|machine| machine == &name),
+            "{name} should retain coverage metadata"
+        );
     }
-    assert!(
-        failures.is_empty(),
-        "closed-world route audit failures:\n{}",
-        failures.join("\n")
-    );
-}
-
-/// Negative test: a Routed effect with no corresponding route in a closed-world
-/// composition must produce a MissingRoutedEffect error.
-#[test]
-fn rejects_routed_effect_without_route_in_closed_world_composition() {
-    use indexmap::IndexMap;
-    use meerkat_machine_schema::{
-        ActorKind, ActorSchema, CompositionSchema, EffectDispositionRule, EffectEmit, EntryInput,
-        EnumSchema, InitSchema, MachineInstance, MachineSchema, RustBinding, StateSchema,
-        VariantSchema,
-    };
-
-    let producer = MachineSchema {
-        machine: "ProducerMachine".into(),
-        version: 1,
-        rust: RustBinding {
-            crate_name: "test".into(),
-            module: "test::producer".into(),
-        },
-        state: StateSchema {
-            phase: EnumSchema {
-                name: "ProducerState".into(),
-                variants: vec![VariantSchema {
-                    name: "Ready".into(),
-                    fields: vec![],
-                }],
-            },
-            fields: vec![],
-            init: InitSchema {
-                phase: "Ready".into(),
-                fields: vec![],
-            },
-            terminal_phases: vec![],
-        },
-        inputs: EnumSchema {
-            name: "ProducerInput".into(),
-            variants: vec![VariantSchema {
-                name: "Go".into(),
-                fields: vec![],
-            }],
-        },
-        effects: EnumSchema {
-            name: "ProducerEffect".into(),
-            variants: vec![VariantSchema {
-                name: "Handoff".into(),
-                fields: vec![],
-            }],
-        },
-        helpers: vec![],
-        derived: vec![],
-        invariants: vec![],
-        transitions: vec![meerkat_machine_schema::TransitionSchema {
-            name: "Go".into(),
-            from: vec!["Ready".into()],
-            on: meerkat_machine_schema::InputMatch {
-                variant: "Go".into(),
-                bindings: vec![],
-            },
-            guards: vec![],
-            updates: vec![],
-            to: "Ready".into(),
-            emit: vec![EffectEmit {
-                variant: "Handoff".into(),
-                fields: IndexMap::new(),
-            }],
-        }],
-        ci_step_limit: None,
-        effect_dispositions: vec![EffectDispositionRule {
-            effect_variant: "Handoff".into(),
-            disposition: EffectDisposition::Routed {
-                consumer_machines: vec!["ConsumerMachine".into()],
-            },
-            handoff_protocol: None,
-        }],
-    };
-
-    let consumer = MachineSchema {
-        machine: "ConsumerMachine".into(),
-        version: 1,
-        rust: RustBinding {
-            crate_name: "test".into(),
-            module: "test::consumer".into(),
-        },
-        state: StateSchema {
-            phase: EnumSchema {
-                name: "ConsumerState".into(),
-                variants: vec![VariantSchema {
-                    name: "Idle".into(),
-                    fields: vec![],
-                }],
-            },
-            fields: vec![],
-            init: InitSchema {
-                phase: "Idle".into(),
-                fields: vec![],
-            },
-            terminal_phases: vec![],
-        },
-        inputs: EnumSchema {
-            name: "ConsumerInput".into(),
-            variants: vec![VariantSchema {
-                name: "Receive".into(),
-                fields: vec![],
-            }],
-        },
-        effects: EnumSchema {
-            name: "ConsumerEffect".into(),
-            variants: vec![],
-        },
-        helpers: vec![],
-        derived: vec![],
-        invariants: vec![],
-        transitions: vec![],
-        ci_step_limit: None,
-        effect_dispositions: vec![],
-    };
-
-    let composition = CompositionSchema {
-        name: "test_missing_route".into(),
-        machines: vec![
-            MachineInstance {
-                instance_id: "producer".into(),
-                machine_name: "ProducerMachine".into(),
-                actor: "actor_a".into(),
-            },
-            MachineInstance {
-                instance_id: "consumer".into(),
-                machine_name: "ConsumerMachine".into(),
-                actor: "actor_b".into(),
-            },
-        ],
-        actors: vec![
-            ActorSchema {
-                name: "actor_a".into(),
-                kind: ActorKind::Machine,
-            },
-            ActorSchema {
-                name: "actor_b".into(),
-                kind: ActorKind::Machine,
-            },
-        ],
-        handoff_protocols: vec![],
-        entry_inputs: vec![EntryInput {
-            name: "go".into(),
-            machine: "producer".into(),
-            input_variant: "Go".into(),
-        }],
-        routes: vec![], // deliberately empty — should fail
-        route_target_selectors: vec![],
-        driver: None,
-        transaction_plans: vec![],
-        actor_priorities: vec![],
-        scheduler_rules: vec![],
-        invariants: vec![],
-        witnesses: vec![],
-        deep_domain_cardinality: 1,
-        deep_domain_overrides: BTreeMap::new(),
-        witness_domain_cardinality: 1,
-        ci_limits: None,
-        closed_world: true,
-    };
-
-    let result = composition.validate_against(&[&producer, &consumer]);
-    assert!(
-        matches!(
-            result,
-            Err(CompositionSchemaError::MissingRoutedEffect { .. })
-        ),
-        "expected MissingRoutedEffect error, got: {result:?}"
-    );
 }
 
 #[test]
-fn handoff_protocol_accepted_on_local_effect() {
-    use meerkat_machine_schema::{
-        EffectDispositionRule, EnumSchema, InitSchema, MachineSchema, RustBinding, StateSchema,
-        VariantSchema,
-    };
-
-    let schema = MachineSchema {
-        machine: "TestMachine".into(),
-        version: 1,
-        rust: RustBinding {
-            crate_name: "test".into(),
-            module: "test::handoff".into(),
-        },
-        state: StateSchema {
-            phase: EnumSchema {
-                name: "Phase".into(),
-                variants: vec![VariantSchema {
-                    name: "Ready".into(),
-                    fields: vec![],
-                }],
-            },
-            fields: vec![],
-            init: InitSchema {
-                phase: "Ready".into(),
-                fields: vec![],
-            },
-            terminal_phases: vec![],
-        },
-        inputs: EnumSchema {
-            name: "Input".into(),
-            variants: vec![VariantSchema {
-                name: "Trigger".into(),
-                fields: vec![],
-            }],
-        },
-        effects: EnumSchema {
-            name: "Effect".into(),
-            variants: vec![VariantSchema {
-                name: "DoSomething".into(),
-                fields: vec![],
-            }],
-        },
-        helpers: vec![],
-        derived: vec![],
-        invariants: vec![],
-        transitions: vec![],
-        ci_step_limit: None,
-        effect_dispositions: vec![EffectDispositionRule {
-            effect_variant: "DoSomething".into(),
-            disposition: EffectDisposition::Local,
-            handoff_protocol: Some("my_protocol".into()),
-        }],
-    };
-
-    assert_eq!(schema.validate(), Ok(()));
-}
-
-#[test]
-fn handoff_protocol_accepted_on_external_effect() {
-    use meerkat_machine_schema::{
-        EffectDispositionRule, EnumSchema, InitSchema, MachineSchema, RustBinding, StateSchema,
-        VariantSchema,
-    };
-
-    let schema = MachineSchema {
-        machine: "TestMachine".into(),
-        version: 1,
-        rust: RustBinding {
-            crate_name: "test".into(),
-            module: "test::handoff_ext".into(),
-        },
-        state: StateSchema {
-            phase: EnumSchema {
-                name: "Phase".into(),
-                variants: vec![VariantSchema {
-                    name: "Ready".into(),
-                    fields: vec![],
-                }],
-            },
-            fields: vec![],
-            init: InitSchema {
-                phase: "Ready".into(),
-                fields: vec![],
-            },
-            terminal_phases: vec![],
-        },
-        inputs: EnumSchema {
-            name: "Input".into(),
-            variants: vec![VariantSchema {
-                name: "Trigger".into(),
-                fields: vec![],
-            }],
-        },
-        effects: EnumSchema {
-            name: "Effect".into(),
-            variants: vec![VariantSchema {
-                name: "Notify".into(),
-                fields: vec![],
-            }],
-        },
-        helpers: vec![],
-        derived: vec![],
-        invariants: vec![],
-        transitions: vec![],
-        ci_step_limit: None,
-        effect_dispositions: vec![EffectDispositionRule {
-            effect_variant: "Notify".into(),
-            disposition: EffectDisposition::External,
-            handoff_protocol: Some("notify_protocol".into()),
-        }],
-    };
-
-    assert_eq!(schema.validate(), Ok(()));
-}
-
-#[test]
-fn handoff_protocol_rejected_on_routed_effect() {
-    use meerkat_machine_schema::{
-        EffectDispositionRule, EnumSchema, InitSchema, MachineSchema, MachineSchemaError,
-        RustBinding, StateSchema, VariantSchema,
-    };
-
-    let schema = MachineSchema {
-        machine: "TestMachine".into(),
-        version: 1,
-        rust: RustBinding {
-            crate_name: "test".into(),
-            module: "test::handoff_routed".into(),
-        },
-        state: StateSchema {
-            phase: EnumSchema {
-                name: "Phase".into(),
-                variants: vec![VariantSchema {
-                    name: "Ready".into(),
-                    fields: vec![],
-                }],
-            },
-            fields: vec![],
-            init: InitSchema {
-                phase: "Ready".into(),
-                fields: vec![],
-            },
-            terminal_phases: vec![],
-        },
-        inputs: EnumSchema {
-            name: "Input".into(),
-            variants: vec![],
-        },
-        effects: EnumSchema {
-            name: "Effect".into(),
-            variants: vec![VariantSchema {
-                name: "Route".into(),
-                fields: vec![],
-            }],
-        },
-        helpers: vec![],
-        derived: vec![],
-        invariants: vec![],
-        transitions: vec![],
-        ci_step_limit: None,
-        effect_dispositions: vec![EffectDispositionRule {
-            effect_variant: "Route".into(),
-            disposition: EffectDisposition::Routed {
-                consumer_machines: vec!["SomeConsumer".into()],
-            },
-            handoff_protocol: Some("bad_protocol".into()),
-        }],
-    };
+fn kernel_seam_retains_coverage_metadata() {
+    let coverage_names = canonical_composition_coverage_manifests()
+        .into_iter()
+        .map(|manifest| manifest.composition)
+        .collect::<Vec<_>>();
 
     assert_eq!(
-        schema.validate(),
-        Err(MachineSchemaError::HandoffProtocolOnRoutedEffect {
-            variant: "Route".into(),
-        })
+        coverage_names,
+        vec![
+            "meerkat_mob_seam",
+            "schedule_bundle",
+            "schedule_runtime_bundle",
+            "schedule_mob_bundle",
+        ]
     );
 }
 
 #[test]
-fn actor_kind_owner_accepted_in_composition() {
-    use meerkat_machine_schema::{ActorKind, ActorSchema, CompositionSchema, MachineInstance};
-    use std::collections::BTreeMap;
+fn meerkat_machine_absorbs_runtime_ingress_turn_tool_and_peer_domains() {
+    let schema = meerkat_machine();
+    let input_names = schema
+        .inputs
+        .variants
+        .iter()
+        .map(|variant| variant.name.as_str())
+        .collect::<Vec<_>>();
+    let signal_names = schema
+        .signals
+        .variants
+        .iter()
+        .map(|variant| variant.name.as_str())
+        .collect::<Vec<_>>();
+    let effect_names = schema
+        .effects
+        .variants
+        .iter()
+        .map(|variant| variant.name.as_str())
+        .collect::<Vec<_>>();
 
-    // Owner actors are allowed in the composition but cannot own machine instances
-    let composition = CompositionSchema {
-        name: "test_owner_actor".into(),
-        machines: vec![MachineInstance {
-            instance_id: "some_machine".into(),
-            machine_name: "SomeMachine".into(),
-            actor: "machine_actor".into(),
-        }],
-        actors: vec![
-            ActorSchema {
-                name: "machine_actor".into(),
-                kind: ActorKind::Machine,
-            },
-            ActorSchema {
-                name: "session_host".into(),
-                kind: ActorKind::Owner,
-            },
-        ],
-        handoff_protocols: vec![],
-        entry_inputs: vec![],
-        routes: vec![],
-        route_target_selectors: vec![],
-        driver: None,
-        transaction_plans: vec![],
-        actor_priorities: vec![],
-        scheduler_rules: vec![],
-        invariants: vec![],
-        witnesses: vec![],
-        deep_domain_cardinality: 1,
-        deep_domain_overrides: BTreeMap::new(),
-        witness_domain_cardinality: 1,
-        ci_limits: None,
-        closed_world: false,
-    };
+    for required in [
+        "EnsureSessionWithExecutor",
+        "SetSilentIntents",
+        "Ingest",
+        "PublishEvent",
+        "AcceptWithCompletion",
+        "AcceptWithoutWake",
+        "Prepare",
+        "Commit",
+        "Fail",
+        "InterruptCurrentRun",
+        "CancelAfterBoundary",
+    ] {
+        assert!(
+            input_names.iter().any(|name| name == &required),
+            "MeerkatMachine should absorb input {required}"
+        );
+    }
 
-    assert_eq!(composition.validate(), Ok(()));
+    for required in [
+        "EnsureDrainRunning",
+        "ClassifyExternalEnvelope",
+        "ClassifyPlainEvent",
+        "RegisterOperation",
+        "StartConversationRun",
+        "StageAdd",
+        "StageRemove",
+        "StageReload",
+        "PendingSucceeded",
+        "SnapshotAligned",
+        "ReconcileResolvedDirectory",
+        "StagePersistentFilter",
+        "RequestDeferredTools",
+    ] {
+        assert!(
+            signal_names.iter().any(|name| name == &required),
+            "MeerkatMachine should absorb signal {required}"
+        );
+    }
+
+    for required in [
+        "ResolveAdmission",
+        "SubmitAdmittedIngressEffect",
+        "SubmitRunPrimitive",
+        "SubmitOpEvent",
+        "EnqueueClassifiedEntry",
+        "SpawnDrainTask",
+        "EmitExternalToolDelta",
+        "CommittedVisibleSetPublished",
+    ] {
+        assert!(
+            effect_names.iter().any(|name| name == &required),
+            "MeerkatMachine should absorb effect {required}"
+        );
+    }
 }
 
 #[test]
-fn machine_instance_with_owner_actor_rejected() {
-    use meerkat_machine_schema::{
-        ActorKind, ActorSchema, CompositionSchema, CompositionSchemaError, MachineInstance,
-    };
-    use std::collections::BTreeMap;
+fn meerkat_machine_merges_turn_admission_tool_visibility_and_peer_directory_state() {
+    let schema = meerkat_machine();
+    let field_names = schema
+        .state
+        .fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect::<Vec<_>>();
+    let transition_names = schema
+        .transitions
+        .iter()
+        .map(|transition| transition.name.as_str())
+        .collect::<Vec<_>>();
+    let effect_names = schema
+        .effects
+        .variants
+        .iter()
+        .map(|variant| variant.name.as_str())
+        .collect::<Vec<_>>();
 
-    let composition = CompositionSchema {
-        name: "test_owner_mismatch".into(),
-        machines: vec![MachineInstance {
-            instance_id: "some_machine".into(),
-            machine_name: "SomeMachine".into(),
-            actor: "owner_actor".into(),
-        }],
-        actors: vec![ActorSchema {
-            name: "owner_actor".into(),
-            kind: ActorKind::Owner,
-        }],
-        handoff_protocols: vec![],
-        entry_inputs: vec![],
-        routes: vec![],
-        route_target_selectors: vec![],
-        driver: None,
-        transaction_plans: vec![],
-        actor_priorities: vec![],
-        scheduler_rules: vec![],
-        invariants: vec![],
-        witnesses: vec![],
-        deep_domain_cardinality: 1,
-        deep_domain_overrides: BTreeMap::new(),
-        witness_domain_cardinality: 1,
-        ci_limits: None,
-        closed_world: false,
-    };
+    for required in [
+        "interrupt_pending",
+        "shutdown_pending",
+        "inherited_base_filter",
+        "active_filter",
+        "staged_filter",
+        "active_requested_deferred_names",
+        "staged_requested_deferred_names",
+        "requested_witnesses",
+        "filter_witnesses",
+        "active_visibility_revision",
+        "staged_visibility_revision",
+        "committed_visibility_revision",
+        "resolved_peer_keys",
+        "peer_reachability",
+        "peer_last_reason",
+    ] {
+        assert!(
+            field_names.iter().any(|name| name == &required),
+            "MeerkatMachine state should retain absorbed field {required}"
+        );
+    }
 
-    assert_eq!(
-        composition.validate(),
-        Err(CompositionSchemaError::ActorKindMismatch {
-            actor: "owner_actor".into(),
-            expected: ActorKind::Machine,
-            actual: ActorKind::Owner,
-        })
-    );
+    for required in [
+        "InterruptCurrentRun",
+        "CancelAfterBoundary",
+        "SetPeerIngressContextAttached",
+        "SetPeerIngressContextRunning",
+        "NotifyDrainExitedAttached",
+        "NotifyDrainExitedRunning",
+        "EnsureDrainRunningAttached",
+        "EnsureDrainRunningRunning",
+        "AcceptWithCompletionAttached",
+        "AcceptWithCompletionRunning",
+        "AcceptWithoutWakeAttached",
+        "AcceptWithoutWakeRunning",
+        "IngestAttached",
+        "IngestRunning",
+        "PublishEventAttached",
+        "PublishEventRunning",
+        "StagePersistentFilterAttached",
+        "StagePersistentFilterRunning",
+        "RequestDeferredToolsAttached",
+        "RequestDeferredToolsRunning",
+        "BoundaryAppliedPromote",
+        "StageAddAttached",
+        "StageAddRunning",
+        "StageRemoveAttached",
+        "StageRemoveRunning",
+        "StageReloadAttached",
+        "StageReloadRunning",
+        "ApplySurfaceBoundaryAttached",
+        "ApplySurfaceBoundaryRunning",
+        "PendingSucceededAttached",
+        "PendingSucceededRunning",
+        "FinalizeRemovalCleanAttached",
+        "FinalizeRemovalCleanRunning",
+        "PublishCommittedVisibleSetAttached",
+        "PublishCommittedVisibleSetRunning",
+        "ReconcileResolvedDirectoryAttached",
+        "ReconcileResolvedDirectoryRunning",
+        "RecordSendSucceededAttached",
+        "RecordSendSucceededRunning",
+        "RecordSendFailedAttached",
+        "RecordSendFailedRunning",
+    ] {
+        assert!(
+            transition_names.iter().any(|name| name == &required),
+            "MeerkatMachine should expose absorbed transition {required}"
+        );
+    }
+
+    for required in ["WakeInterrupt", "CommittedVisibleSetPublished"] {
+        assert!(
+            effect_names.iter().any(|name| name == &required),
+            "MeerkatMachine should retain absorbed effect {required}"
+        );
+    }
 }
 
 #[test]
-fn handoff_protocol_valid_round_trip() {
-    use meerkat_machine_schema::{
-        ActorKind, ActorSchema, ClosurePolicy, CompositionSchema, EffectDisposition,
-        EffectDispositionRule, EffectHandoffProtocol, EnumSchema, FieldSchema, InitSchema,
-        MachineInstance, MachineSchema, ProtocolGenerationMode, RustBinding, StateSchema, TypeRef,
-        VariantSchema,
-    };
-    use std::collections::BTreeMap;
+fn mob_machine_absorbs_flow_orchestrator_runtime_bridge_and_public_command_domains() {
+    let schema = mob_machine();
+    let input_names = schema
+        .inputs
+        .variants
+        .iter()
+        .map(|variant| variant.name.as_str())
+        .collect::<Vec<_>>();
+    let signal_names = schema
+        .signals
+        .variants
+        .iter()
+        .map(|variant| variant.name.as_str())
+        .collect::<Vec<_>>();
+    let effect_names = schema
+        .effects
+        .variants
+        .iter()
+        .map(|variant| variant.name.as_str())
+        .collect::<Vec<_>>();
 
-    let producer_machine = MachineSchema {
-        machine: "ProducerMachine".into(),
-        version: 1,
-        rust: RustBinding {
-            crate_name: "test".into(),
-            module: "test::producer".into(),
-        },
-        state: StateSchema {
-            phase: EnumSchema {
-                name: "ProducerPhase".into(),
-                variants: vec![
-                    VariantSchema {
-                        name: "Running".into(),
-                        fields: vec![],
-                    },
-                    VariantSchema {
-                        name: "Done".into(),
-                        fields: vec![],
-                    },
-                ],
-            },
-            fields: vec![],
-            init: InitSchema {
-                phase: "Running".into(),
-                fields: vec![],
-            },
-            terminal_phases: vec!["Done".into()],
-        },
-        inputs: EnumSchema {
-            name: "ProducerInput".into(),
-            variants: vec![
-                VariantSchema {
-                    name: "Trigger".into(),
-                    fields: vec![],
-                },
-                VariantSchema {
-                    name: "Ack".into(),
-                    fields: vec![FieldSchema {
-                        name: "op_id".into(),
-                        ty: TypeRef::String,
-                    }],
-                },
-            ],
-        },
-        effects: EnumSchema {
-            name: "ProducerEffect".into(),
-            variants: vec![VariantSchema {
-                name: "RequestWork".into(),
-                fields: vec![FieldSchema {
-                    name: "op_id".into(),
-                    ty: TypeRef::String,
-                }],
-            }],
-        },
-        helpers: vec![],
-        derived: vec![],
-        invariants: vec![],
-        transitions: vec![],
-        ci_step_limit: None,
-        effect_dispositions: vec![EffectDispositionRule {
-            effect_variant: "RequestWork".into(),
-            disposition: EffectDisposition::External,
-            handoff_protocol: Some("work_handoff".into()),
-        }],
-    };
+    for required in [
+        "RunFlow",
+        "CancelFlow",
+        "CancelWork",
+        "CancelAllWork",
+        "Wire",
+        "Unwire",
+        "ExternalTurn",
+        "InternalTurn",
+        "TaskCreate",
+        "TaskUpdate",
+        "SubscribeMobEvents",
+    ] {
+        assert!(
+            input_names.iter().any(|name| name == &required),
+            "MobMachine should absorb input {required}"
+        );
+    }
 
-    let composition = CompositionSchema {
-        name: "test_handoff_valid".into(),
-        machines: vec![MachineInstance {
-            instance_id: "producer".into(),
-            machine_name: "ProducerMachine".into(),
-            actor: "machine_actor".into(),
-        }],
-        actors: vec![
-            ActorSchema {
-                name: "machine_actor".into(),
-                kind: ActorKind::Machine,
-            },
-            ActorSchema {
-                name: "host".into(),
-                kind: ActorKind::Owner,
-            },
-        ],
-        handoff_protocols: vec![EffectHandoffProtocol {
-            name: "work_handoff".into(),
-            producer_instance: "producer".into(),
-            effect_variant: "RequestWork".into(),
-            realizing_actor: "host".into(),
-            correlation_fields: vec!["op_id".into()],
-            obligation_fields: vec!["op_id".into()],
-            allowed_feedback_inputs: vec![feedback_input("producer", "Ack")],
-            closure_policy: ClosurePolicy::AckRequired,
-            liveness_annotation: None,
-            rust: test_protocol_rust(ProtocolGenerationMode::Executor),
-        }],
-        entry_inputs: vec![],
-        routes: vec![],
-        route_target_selectors: vec![],
-        driver: None,
-        transaction_plans: vec![],
-        actor_priorities: vec![],
-        scheduler_rules: vec![],
-        invariants: vec![],
-        witnesses: vec![],
-        deep_domain_cardinality: 1,
-        deep_domain_overrides: BTreeMap::new(),
-        witness_domain_cardinality: 1,
-        ci_limits: None,
-        closed_world: false,
-    };
+    for required in [
+        "StageSpawn",
+        "KickoffStarted",
+        "RuntimeRunSubmitted",
+        "CreateRun",
+        "RegisterTargets",
+        "StartRootFrame",
+        "StartLoop",
+        "BodyFrameCompleted",
+        "UntilConditionFailed",
+    ] {
+        assert!(
+            signal_names.iter().any(|name| name == &required),
+            "MobMachine should absorb signal {required}"
+        );
+    }
 
-    let result = composition.validate_against(&[&producer_machine]);
-    assert!(
-        result.is_ok(),
-        "valid handoff protocol should pass: {result:?}"
-    );
+    for required in [
+        "EmitFlowRunNotice",
+        "PersistStepOutput",
+        "AdmitStepWork",
+        "NotifyCoordinator",
+        "AdmitKickoffTurn",
+        "RequestBodyFrameStart",
+        "LoopCompleted",
+        "EmitTaskNotice",
+    ] {
+        assert!(
+            effect_names.iter().any(|name| name == &required),
+            "MobMachine should absorb effect {required}"
+        );
+    }
 }
 
 #[test]
-fn handoff_protocol_unknown_producer() {
-    use meerkat_machine_schema::{
-        ActorKind, ActorSchema, ClosurePolicy, CompositionSchema, EffectHandoffProtocol,
-        MachineInstance, ProtocolGenerationMode,
-    };
-    use std::collections::BTreeMap;
+fn mob_machine_merges_flow_task_wiring_and_runtime_bridge_state() {
+    let schema = mob_machine();
+    let field_names = schema
+        .state
+        .fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect::<Vec<_>>();
+    let transition_names = schema
+        .transitions
+        .iter()
+        .map(|transition| transition.name.as_str())
+        .collect::<Vec<_>>();
 
-    let composition = CompositionSchema {
-        name: "test_unknown_producer".into(),
-        machines: vec![MachineInstance {
-            instance_id: "real_machine".into(),
-            machine_name: "M".into(),
-            actor: "actor_a".into(),
-        }],
-        actors: vec![
-            ActorSchema {
-                name: "actor_a".into(),
-                kind: ActorKind::Machine,
-            },
-            ActorSchema {
-                name: "host".into(),
-                kind: ActorKind::Owner,
-            },
-        ],
-        handoff_protocols: vec![EffectHandoffProtocol {
-            name: "bad_proto".into(),
-            producer_instance: "nonexistent".into(),
-            effect_variant: "E".into(),
-            realizing_actor: "host".into(),
-            correlation_fields: vec![],
-            obligation_fields: vec![],
-            allowed_feedback_inputs: vec![],
-            closure_policy: ClosurePolicy::AckRequired,
-            liveness_annotation: None,
-            rust: test_protocol_rust(ProtocolGenerationMode::Executor),
-        }],
-        entry_inputs: vec![],
-        routes: vec![],
-        route_target_selectors: vec![],
-        driver: None,
-        transaction_plans: vec![],
-        actor_priorities: vec![],
-        scheduler_rules: vec![],
-        invariants: vec![],
-        witnesses: vec![],
-        deep_domain_cardinality: 1,
-        deep_domain_overrides: BTreeMap::new(),
-        witness_domain_cardinality: 1,
-        ci_limits: None,
-        closed_world: false,
-    };
+    for required in [
+        "pending_spawn_count",
+        "retiring_member_count",
+        "wiring_edge_count",
+        "task_count",
+        "event_subscription_count",
+        "active_frame_count",
+        "active_loop_count",
+        "coordinator_bound",
+        "kickoff_pending",
+    ] {
+        assert!(
+            field_names.iter().any(|name| name == &required),
+            "MobMachine state should retain absorbed field {required}"
+        );
+    }
 
-    assert_eq!(
-        composition.validate(),
-        Err(CompositionSchemaError::UnknownHandoffProducer {
-            protocol: "bad_proto".into(),
-            instance: "nonexistent".into(),
-        })
-    );
+    for required in [
+        "RetireRunning",
+        "RetireAllRunning",
+        "WireRunning",
+        "UnwireRunning",
+        "StageSpawnRunning",
+        "CompleteSpawnRunning",
+        "TaskCreateRunning",
+        "BindCoordinatorRunning",
+        "RunFlowRunning",
+        "StartFlowRunning",
+        "CreateRunRunning",
+        "StartRunRunning",
+        "CompleteFlowRunning",
+        "StartRootFrameRunning",
+        "FrameTerminatedRunning",
+        "StartLoopRunning",
+        "BodyFrameCompletedRunning",
+        "BodyFrameFailedRunning",
+        "BodyFrameCanceledRunning",
+        "UntilConditionFailedRunning",
+        "FinishRunRunning",
+        "ObserveRuntimeRetired",
+        "DestroyMob",
+        "ObserveRuntimeDestroyed",
+        "SubscribeMobEventsRunning",
+    ] {
+        assert!(
+            transition_names.iter().any(|name| name == &required),
+            "MobMachine should expose absorbed transition {required}"
+        );
+    }
 }
 
 #[test]
-fn handoff_protocol_actor_not_owner() {
-    use meerkat_machine_schema::{
-        ActorKind, ActorSchema, ClosurePolicy, CompositionSchema, EffectHandoffProtocol,
-        MachineInstance, ProtocolGenerationMode,
-    };
-    use std::collections::BTreeMap;
+fn meerkat_runtime_command_surface_is_fully_accounted_for_by_canonical_schema_inputs() {
+    let schema = meerkat_machine();
+    let input_names = schema
+        .inputs
+        .variants
+        .iter()
+        .map(|variant| variant.name.as_str())
+        .collect::<Vec<_>>();
 
-    let composition = CompositionSchema {
-        name: "test_actor_not_owner".into(),
-        machines: vec![MachineInstance {
-            instance_id: "producer".into(),
-            machine_name: "M".into(),
-            actor: "actor_a".into(),
-        }],
-        actors: vec![
-            ActorSchema {
-                name: "actor_a".into(),
-                kind: ActorKind::Machine,
-            },
-            ActorSchema {
-                name: "also_machine".into(),
-                kind: ActorKind::Machine,
-            },
-        ],
-        handoff_protocols: vec![EffectHandoffProtocol {
-            name: "bad_proto".into(),
-            producer_instance: "producer".into(),
-            effect_variant: "E".into(),
-            realizing_actor: "also_machine".into(),
-            correlation_fields: vec![],
-            obligation_fields: vec![],
-            allowed_feedback_inputs: vec![],
-            closure_policy: ClosurePolicy::AckRequired,
-            liveness_annotation: None,
-            rust: test_protocol_rust(ProtocolGenerationMode::Executor),
-        }],
-        entry_inputs: vec![],
-        routes: vec![],
-        route_target_selectors: vec![],
-        driver: None,
-        transaction_plans: vec![],
-        actor_priorities: vec![],
-        scheduler_rules: vec![],
-        invariants: vec![],
-        witnesses: vec![],
-        deep_domain_cardinality: 1,
-        deep_domain_overrides: BTreeMap::new(),
-        witness_domain_cardinality: 1,
-        ci_limits: None,
-        closed_world: false,
-    };
-
-    assert_eq!(
-        composition.validate(),
-        Err(CompositionSchemaError::HandoffActorNotOwner {
-            protocol: "bad_proto".into(),
-            actor: "also_machine".into(),
-        })
-    );
+    for required in [
+        "RegisterSession",
+        "UnregisterSession",
+        "EnsureSessionWithExecutor",
+        "SetSilentIntents",
+        "InterruptCurrentRun",
+        "CancelAfterBoundary",
+        "StopRuntimeExecutor",
+        "ContainsSession",
+        "SessionHasExecutor",
+        "SessionHasComms",
+        "OpsLifecycleRegistry",
+        "PrepareBindings",
+        "InputState",
+        "ListActiveInputs",
+        "PublishCommittedVisibleSet",
+        "SetPeerIngressContext",
+        "NotifyDrainExited",
+        "AbortAll",
+        "Abort",
+        "Wait",
+        "Ingest",
+        "PublishEvent",
+        "RuntimeState",
+        "LoadBoundaryReceipt",
+        "AcceptWithCompletion",
+        "AcceptWithoutWake",
+        "Prepare",
+        "Commit",
+        "Fail",
+        "Retire",
+        "Recycle",
+        "Reset",
+        "Recover",
+        "Destroy",
+    ] {
+        assert!(
+            input_names.iter().any(|name| name == &required),
+            "MeerkatMachine canonical schema should account for runtime command/input {required}"
+        );
+    }
 }
 
 #[test]
-fn handoff_protocol_unknown_feedback_machine() {
-    use meerkat_machine_schema::{
-        ActorKind, ActorSchema, ClosurePolicy, CompositionSchema, EffectHandoffProtocol,
-        MachineInstance, ProtocolGenerationMode,
-    };
-    use std::collections::BTreeMap;
+fn mob_runtime_command_surface_is_fully_accounted_for_by_canonical_schema_inputs() {
+    let schema = mob_machine();
+    let input_names = schema
+        .inputs
+        .variants
+        .iter()
+        .map(|variant| variant.name.as_str())
+        .collect::<Vec<_>>();
 
-    let composition = CompositionSchema {
-        name: "test_unknown_feedback_machine".into(),
-        machines: vec![MachineInstance {
-            instance_id: "producer".into(),
-            machine_name: "M".into(),
-            actor: "actor_a".into(),
-        }],
-        actors: vec![
-            ActorSchema {
-                name: "actor_a".into(),
-                kind: ActorKind::Machine,
-            },
-            ActorSchema {
-                name: "host".into(),
-                kind: ActorKind::Owner,
-            },
-        ],
-        handoff_protocols: vec![EffectHandoffProtocol {
-            name: "bad_proto".into(),
-            producer_instance: "producer".into(),
-            effect_variant: "E".into(),
-            realizing_actor: "host".into(),
-            correlation_fields: vec![],
-            obligation_fields: vec![],
-            allowed_feedback_inputs: vec![feedback_input("nonexistent", "Ack")],
-            closure_policy: ClosurePolicy::AckRequired,
-            liveness_annotation: None,
-            rust: test_protocol_rust(ProtocolGenerationMode::Executor),
-        }],
-        entry_inputs: vec![],
-        routes: vec![],
-        route_target_selectors: vec![],
-        driver: None,
-        transaction_plans: vec![],
-        actor_priorities: vec![],
-        scheduler_rules: vec![],
-        invariants: vec![],
-        witnesses: vec![],
-        deep_domain_cardinality: 1,
-        deep_domain_overrides: BTreeMap::new(),
-        witness_domain_cardinality: 1,
-        ci_limits: None,
-        closed_world: false,
-    };
+    for required in [
+        "RunFlow",
+        "CancelFlow",
+        "FlowStatus",
+        "Spawn",
+        "Retire",
+        "Respawn",
+        "RetireAll",
+        "Wire",
+        "Unwire",
+        "ExternalTurn",
+        "InternalTurn",
+        "SubmitWork",
+        "CancelWork",
+        "CancelAllWork",
+        "Stop",
+        "Resume",
+        "Complete",
+        "Reset",
+        "Destroy",
+        "TaskCreate",
+        "TaskUpdate",
+        "TaskList",
+        "TaskGet",
+        "McpServerStates",
+        "RosterSnapshot",
+        "ListMembers",
+        "ListMembersIncludingRetiring",
+        "ListAllMembers",
+        "MemberStatus",
+        "SubscribeAgentEvents",
+        "SubscribeAllAgentEvents",
+        "SubscribeMobEvents",
+        "PollEvents",
+        "ReplayAllEvents",
+        "RecordOperatorActionProvenance",
+        "GetMember",
+        "SetSpawnPolicy",
+        "Shutdown",
+        "ForceCancel",
+    ] {
+        assert!(
+            input_names.iter().any(|name| name == &required),
+            "MobMachine canonical schema should account for runtime command/input {required}"
+        );
+    }
 
-    assert_eq!(
-        composition.validate(),
-        Err(CompositionSchemaError::UnknownHandoffFeedbackMachine {
-            protocol: "bad_proto".into(),
-            machine: "nonexistent".into(),
-        })
-    );
+    for intentionally_test_only in ["FlowTrackerCounts", "OrchestratorSnapshot"] {
+        assert!(
+            !input_names
+                .iter()
+                .any(|name| name == &intentionally_test_only),
+            "MobMachine canonical schema should not publish test-only diagnostic input {intentionally_test_only}"
+        );
+    }
 }
 
 #[test]
-fn handoff_protocol_unknown_effect_cross_schema() {
-    use meerkat_machine_schema::{
-        ActorKind, ActorSchema, ClosurePolicy, CompositionSchema, EffectDisposition,
-        EffectDispositionRule, EffectHandoffProtocol, EnumSchema, InitSchema, MachineInstance,
-        MachineSchema, ProtocolGenerationMode, RustBinding, StateSchema, VariantSchema,
-    };
-    use std::collections::BTreeMap;
+fn every_mutating_meerkat_runtime_command_has_transition_coverage() {
+    let schema = meerkat_machine();
+    let transitioned_inputs = schema
+        .transitions
+        .iter()
+        .map(|transition| transition.on.variant.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
 
-    let producer_machine = MachineSchema {
-        machine: "ProducerMachine".into(),
-        version: 1,
-        rust: RustBinding {
-            crate_name: "test".into(),
-            module: "test::producer".into(),
-        },
-        state: StateSchema {
-            phase: EnumSchema {
-                name: "Phase".into(),
-                variants: vec![VariantSchema {
-                    name: "Ready".into(),
-                    fields: vec![],
-                }],
-            },
-            fields: vec![],
-            init: InitSchema {
-                phase: "Ready".into(),
-                fields: vec![],
-            },
-            terminal_phases: vec![],
-        },
-        inputs: EnumSchema {
-            name: "Input".into(),
-            variants: vec![VariantSchema {
-                name: "Trigger".into(),
-                fields: vec![],
-            }],
-        },
-        effects: EnumSchema {
-            name: "Effect".into(),
-            variants: vec![VariantSchema {
-                name: "RealEffect".into(),
-                fields: vec![],
-            }],
-        },
-        helpers: vec![],
-        derived: vec![],
-        invariants: vec![],
-        transitions: vec![],
-        ci_step_limit: None,
-        effect_dispositions: vec![EffectDispositionRule {
-            effect_variant: "RealEffect".into(),
-            disposition: EffectDisposition::External,
-            handoff_protocol: Some("proto".into()),
-        }],
-    };
-
-    let composition = CompositionSchema {
-        name: "test_unknown_effect".into(),
-        machines: vec![MachineInstance {
-            instance_id: "producer".into(),
-            machine_name: "ProducerMachine".into(),
-            actor: "actor_a".into(),
-        }],
-        actors: vec![
-            ActorSchema {
-                name: "actor_a".into(),
-                kind: ActorKind::Machine,
-            },
-            ActorSchema {
-                name: "host".into(),
-                kind: ActorKind::Owner,
-            },
-        ],
-        handoff_protocols: vec![EffectHandoffProtocol {
-            name: "proto".into(),
-            producer_instance: "producer".into(),
-            effect_variant: "NonexistentEffect".into(),
-            realizing_actor: "host".into(),
-            correlation_fields: vec![],
-            obligation_fields: vec![],
-            allowed_feedback_inputs: vec![],
-            closure_policy: ClosurePolicy::AckRequired,
-            liveness_annotation: None,
-            rust: test_protocol_rust(ProtocolGenerationMode::Executor),
-        }],
-        entry_inputs: vec![],
-        routes: vec![],
-        route_target_selectors: vec![],
-        driver: None,
-        transaction_plans: vec![],
-        actor_priorities: vec![],
-        scheduler_rules: vec![],
-        invariants: vec![],
-        witnesses: vec![],
-        deep_domain_cardinality: 1,
-        deep_domain_overrides: BTreeMap::new(),
-        witness_domain_cardinality: 1,
-        ci_limits: None,
-        closed_world: false,
-    };
-
-    assert_eq!(
-        composition.validate_against(&[&producer_machine]),
-        Err(CompositionSchemaError::UnknownHandoffEffect {
-            protocol: "proto".into(),
-            effect: "NonexistentEffect".into(),
-        })
-    );
+    for required in [
+        "RegisterSession",
+        "UnregisterSession",
+        "EnsureSessionWithExecutor",
+        "SetSilentIntents",
+        "InterruptCurrentRun",
+        "CancelAfterBoundary",
+        "StopRuntimeExecutor",
+        "PrepareBindings",
+        "PublishCommittedVisibleSet",
+        "SetPeerIngressContext",
+        "NotifyDrainExited",
+        "AbortAll",
+        "Abort",
+        "Ingest",
+        "PublishEvent",
+        "Retire",
+        "Recycle",
+        "Reset",
+        "Recover",
+        "Destroy",
+        "AcceptWithCompletion",
+        "AcceptWithoutWake",
+        "Prepare",
+        "Commit",
+        "Fail",
+    ] {
+        assert!(
+            transitioned_inputs.contains(required),
+            "MeerkatMachine should model mutating runtime command {required} with at least one transition",
+        );
+    }
 }
 
 #[test]
-fn handoff_protocol_terminal_closure_requires_terminal_phases() {
-    use meerkat_machine_schema::{
-        ActorKind, ActorSchema, ClosurePolicy, CompositionSchema, EffectDisposition,
-        EffectDispositionRule, EffectHandoffProtocol, EnumSchema, FieldSchema, InitSchema,
-        MachineInstance, MachineSchema, ProtocolGenerationMode, RustBinding, StateSchema, TypeRef,
-        VariantSchema,
-    };
-    use std::collections::BTreeMap;
+fn every_mutating_mob_runtime_command_has_transition_coverage() {
+    let schema = mob_machine();
+    let transitioned_inputs = schema
+        .transitions
+        .iter()
+        .map(|transition| transition.on.variant.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
 
-    let producer_machine = MachineSchema {
-        machine: "ProducerMachine".into(),
-        version: 1,
-        rust: RustBinding {
-            crate_name: "test".into(),
-            module: "test::producer".into(),
-        },
-        state: StateSchema {
-            phase: EnumSchema {
-                name: "Phase".into(),
-                variants: vec![VariantSchema {
-                    name: "Running".into(),
-                    fields: vec![],
-                }],
-            },
-            fields: vec![],
-            init: InitSchema {
-                phase: "Running".into(),
-                fields: vec![],
-            },
-            terminal_phases: vec![], // no terminal phases
-        },
-        inputs: EnumSchema {
-            name: "Input".into(),
-            variants: vec![VariantSchema {
-                name: "Trigger".into(),
-                fields: vec![],
-            }],
-        },
-        effects: EnumSchema {
-            name: "Effect".into(),
-            variants: vec![VariantSchema {
-                name: "Work".into(),
-                fields: vec![FieldSchema {
-                    name: "id".into(),
-                    ty: TypeRef::String,
-                }],
-            }],
-        },
-        helpers: vec![],
-        derived: vec![],
-        invariants: vec![],
-        transitions: vec![],
-        ci_step_limit: None,
-        effect_dispositions: vec![EffectDispositionRule {
-            effect_variant: "Work".into(),
-            disposition: EffectDisposition::External,
-            handoff_protocol: Some("terminal_proto".into()),
-        }],
-    };
-
-    let composition = CompositionSchema {
-        name: "test_terminal_closure".into(),
-        machines: vec![MachineInstance {
-            instance_id: "producer".into(),
-            machine_name: "ProducerMachine".into(),
-            actor: "actor_a".into(),
-        }],
-        actors: vec![
-            ActorSchema {
-                name: "actor_a".into(),
-                kind: ActorKind::Machine,
-            },
-            ActorSchema {
-                name: "host".into(),
-                kind: ActorKind::Owner,
-            },
-        ],
-        handoff_protocols: vec![EffectHandoffProtocol {
-            name: "terminal_proto".into(),
-            producer_instance: "producer".into(),
-            effect_variant: "Work".into(),
-            realizing_actor: "host".into(),
-            correlation_fields: vec!["id".into()],
-            obligation_fields: vec!["id".into()],
-            allowed_feedback_inputs: vec![],
-            closure_policy: ClosurePolicy::TerminalClosure,
-            liveness_annotation: None,
-            rust: test_protocol_rust(ProtocolGenerationMode::Executor),
-        }],
-        entry_inputs: vec![],
-        routes: vec![],
-        route_target_selectors: vec![],
-        driver: None,
-        transaction_plans: vec![],
-        actor_priorities: vec![],
-        scheduler_rules: vec![],
-        invariants: vec![],
-        witnesses: vec![],
-        deep_domain_cardinality: 1,
-        deep_domain_overrides: BTreeMap::new(),
-        witness_domain_cardinality: 1,
-        ci_limits: None,
-        closed_world: false,
-    };
-
-    assert_eq!(
-        composition.validate_against(&[&producer_machine]),
-        Err(
-            CompositionSchemaError::TerminalClosureRequiresTerminalPhases {
-                protocol: "terminal_proto".into(),
-                producer_instance: "producer".into(),
-            }
-        )
-    );
+    for required in [
+        "RunFlow",
+        "CancelFlow",
+        "Spawn",
+        "Retire",
+        "Respawn",
+        "RetireAll",
+        "Wire",
+        "Unwire",
+        "ExternalTurn",
+        "InternalTurn",
+        "SubmitWork",
+        "CancelWork",
+        "CancelAllWork",
+        "Stop",
+        "Resume",
+        "Complete",
+        "Reset",
+        "Destroy",
+        "TaskCreate",
+        "TaskUpdate",
+        "SubscribeAgentEvents",
+        "SubscribeAllAgentEvents",
+        "SubscribeMobEvents",
+        "RecordOperatorActionProvenance",
+        "SetSpawnPolicy",
+        "Shutdown",
+        "ForceCancel",
+    ] {
+        assert!(
+            transitioned_inputs.contains(required),
+            "MobMachine should model mutating runtime command {required} with at least one transition",
+        );
+    }
 }
 
 #[test]
-fn closed_world_rejects_missing_handoff_protocol() {
-    use meerkat_machine_schema::{
-        ActorKind, ActorSchema, CompositionSchema, EffectDisposition, EffectDispositionRule,
-        EnumSchema, InitSchema, MachineInstance, MachineSchema, RustBinding, StateSchema,
-        VariantSchema,
-    };
-    use std::collections::BTreeMap;
+fn every_query_runtime_command_has_transition_coverage() {
+    let meerkat = meerkat_machine();
+    let meerkat_transitioned = meerkat
+        .transitions
+        .iter()
+        .map(|transition| transition.on.variant.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for required in [
+        "ContainsSession",
+        "SessionHasExecutor",
+        "SessionHasComms",
+        "OpsLifecycleRegistry",
+        "InputState",
+        "ListActiveInputs",
+        "RuntimeState",
+        "LoadBoundaryReceipt",
+        "Wait",
+    ] {
+        assert!(
+            meerkat_transitioned.contains(required),
+            "MeerkatMachine query command {required} should have transition coverage"
+        );
+    }
 
-    let producer_machine = MachineSchema {
-        machine: "ProducerMachine".into(),
-        version: 1,
-        rust: RustBinding {
-            crate_name: "test".into(),
-            module: "test::producer".into(),
-        },
-        state: StateSchema {
-            phase: EnumSchema {
-                name: "Phase".into(),
-                variants: vec![VariantSchema {
-                    name: "Ready".into(),
-                    fields: vec![],
-                }],
-            },
-            fields: vec![],
-            init: InitSchema {
-                phase: "Ready".into(),
-                fields: vec![],
-            },
-            terminal_phases: vec![],
-        },
-        inputs: EnumSchema {
-            name: "Input".into(),
-            variants: vec![],
-        },
-        effects: EnumSchema {
-            name: "Effect".into(),
-            variants: vec![VariantSchema {
-                name: "Work".into(),
-                fields: vec![],
-            }],
-        },
-        helpers: vec![],
-        derived: vec![],
-        invariants: vec![],
-        transitions: vec![],
-        ci_step_limit: None,
-        effect_dispositions: vec![EffectDispositionRule {
-            effect_variant: "Work".into(),
-            disposition: EffectDisposition::External,
-            handoff_protocol: Some("missing_proto".into()),
-        }],
-    };
-
-    let composition = CompositionSchema {
-        name: "test_closed_world_missing_handoff".into(),
-        machines: vec![MachineInstance {
-            instance_id: "producer".into(),
-            machine_name: "ProducerMachine".into(),
-            actor: "actor_a".into(),
-        }],
-        actors: vec![ActorSchema {
-            name: "actor_a".into(),
-            kind: ActorKind::Machine,
-        }],
-        handoff_protocols: vec![], // deliberately empty — should fail
-        entry_inputs: vec![],
-        routes: vec![],
-        route_target_selectors: vec![],
-        driver: None,
-        transaction_plans: vec![],
-        actor_priorities: vec![],
-        scheduler_rules: vec![],
-        invariants: vec![],
-        witnesses: vec![],
-        deep_domain_cardinality: 1,
-        deep_domain_overrides: BTreeMap::new(),
-        witness_domain_cardinality: 1,
-        ci_limits: None,
-        closed_world: true,
-    };
-
-    assert_eq!(
-        composition.validate_against(&[&producer_machine]),
-        Err(CompositionSchemaError::MissingHandoffProtocol {
-            from_instance: "producer".into(),
-            effect_variant: "Work".into(),
-            expected_protocol: "missing_proto".into(),
-        })
-    );
+    let mob = mob_machine();
+    let mob_transitioned = mob
+        .transitions
+        .iter()
+        .map(|transition| transition.on.variant.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for required in [
+        "FlowStatus",
+        "TaskList",
+        "TaskGet",
+        "McpServerStates",
+        "RosterSnapshot",
+        "ListMembers",
+        "ListMembersIncludingRetiring",
+        "ListAllMembers",
+        "MemberStatus",
+        "PollEvents",
+        "ReplayAllEvents",
+        "GetMember",
+    ] {
+        assert!(
+            mob_transitioned.contains(required),
+            "MobMachine query command {required} should have transition coverage"
+        );
+    }
 }
 
 #[test]
-fn closed_world_accepts_handoff_protocol_present() {
-    use meerkat_machine_schema::{
-        ActorKind, ActorSchema, ClosurePolicy, CompositionSchema, EffectDisposition,
-        EffectDispositionRule, EffectHandoffProtocol, EnumSchema, FieldSchema, InitSchema,
-        MachineInstance, MachineSchema, ProtocolGenerationMode, RustBinding, StateSchema, TypeRef,
-        VariantSchema,
-    };
-    use std::collections::BTreeMap;
+fn every_canonical_input_variant_has_transition_coverage() {
+    for schema in canonical_machine_schemas() {
+        let input_names = schema
+            .inputs
+            .variants
+            .iter()
+            .map(|variant| variant.name.as_str())
+            .collect::<Vec<_>>();
+        let transitioned_inputs = schema
+            .transitions
+            .iter()
+            .map(|transition| transition.on.variant.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
 
-    let producer_machine = MachineSchema {
-        machine: "ProducerMachine".into(),
-        version: 1,
-        rust: RustBinding {
-            crate_name: "test".into(),
-            module: "test::producer".into(),
-        },
-        state: StateSchema {
-            phase: EnumSchema {
-                name: "Phase".into(),
-                variants: vec![
-                    VariantSchema {
-                        name: "Running".into(),
-                        fields: vec![],
-                    },
-                    VariantSchema {
-                        name: "Done".into(),
-                        fields: vec![],
-                    },
-                ],
-            },
-            fields: vec![],
-            init: InitSchema {
-                phase: "Running".into(),
-                fields: vec![],
-            },
-            terminal_phases: vec!["Done".into()],
-        },
-        inputs: EnumSchema {
-            name: "Input".into(),
-            variants: vec![
-                VariantSchema {
-                    name: "Trigger".into(),
-                    fields: vec![],
-                },
-                VariantSchema {
-                    name: "Ack".into(),
-                    fields: vec![FieldSchema {
-                        name: "op_id".into(),
-                        ty: TypeRef::String,
-                    }],
-                },
-            ],
-        },
-        effects: EnumSchema {
-            name: "Effect".into(),
-            variants: vec![VariantSchema {
-                name: "Work".into(),
-                fields: vec![FieldSchema {
-                    name: "op_id".into(),
-                    ty: TypeRef::String,
-                }],
-            }],
-        },
-        helpers: vec![],
-        derived: vec![],
-        invariants: vec![],
-        transitions: vec![],
-        ci_step_limit: None,
-        effect_dispositions: vec![EffectDispositionRule {
-            effect_variant: "Work".into(),
-            disposition: EffectDisposition::External,
-            handoff_protocol: Some("work_proto".into()),
-        }],
-    };
+        let missing = input_names
+            .into_iter()
+            .filter(|input| !transitioned_inputs.contains(input))
+            .collect::<Vec<_>>();
 
-    let composition = CompositionSchema {
-        name: "test_closed_world_handoff_ok".into(),
-        machines: vec![MachineInstance {
-            instance_id: "producer".into(),
-            machine_name: "ProducerMachine".into(),
-            actor: "actor_a".into(),
-        }],
-        actors: vec![
-            ActorSchema {
-                name: "actor_a".into(),
-                kind: ActorKind::Machine,
-            },
-            ActorSchema {
-                name: "host".into(),
-                kind: ActorKind::Owner,
-            },
-        ],
-        handoff_protocols: vec![EffectHandoffProtocol {
-            name: "work_proto".into(),
-            producer_instance: "producer".into(),
-            effect_variant: "Work".into(),
-            realizing_actor: "host".into(),
-            correlation_fields: vec!["op_id".into()],
-            obligation_fields: vec!["op_id".into()],
-            allowed_feedback_inputs: vec![feedback_input("producer", "Ack")],
-            closure_policy: ClosurePolicy::AckRequired,
-            liveness_annotation: None,
-            rust: test_protocol_rust(ProtocolGenerationMode::Executor),
-        }],
-        entry_inputs: vec![],
-        routes: vec![],
-        route_target_selectors: vec![],
-        driver: None,
-        transaction_plans: vec![],
-        actor_priorities: vec![],
-        scheduler_rules: vec![],
-        invariants: vec![],
-        witnesses: vec![],
-        deep_domain_cardinality: 1,
-        deep_domain_overrides: BTreeMap::new(),
-        witness_domain_cardinality: 1,
-        ci_limits: None,
-        closed_world: true,
-    };
-
-    let result = composition.validate_against(&[&producer_machine]);
-    assert!(
-        result.is_ok(),
-        "closed-world with matching handoff protocol should pass: {result:?}"
-    );
+        assert!(
+            missing.is_empty(),
+            "machine {} should model every input with at least one transition; missing: {:?}",
+            schema.machine,
+            missing
+        );
+    }
 }

@@ -401,10 +401,11 @@ class EventEnvelope:
 
 @dataclass(frozen=True, slots=True)
 class AttributedEvent:
-    """Mob event annotated with the emitting member identity."""
+    """Mob event annotated with the emitting member runtime identity."""
 
     source: str = ""
-    profile: str = ""
+    source_fence_token: int | None = None
+    role: str = ""
     envelope: EventEnvelope = field(default_factory=EventEnvelope)
 
 

@@ -59,7 +59,7 @@ Surface binaries:
 
 | Trait | Purpose | Implementors |
 |-------|---------|-------------|
-| `RuntimeControlPlane` | Multi-session runtime control (ingest, retire, respawn, reset, recover, destroy) | `RuntimeSessionAdapter` |
+| `RuntimeControlPlane` | Multi-session runtime control (ingest, retire, respawn, reset, recover, destroy) | `MeerkatMachine` |
 | `RuntimeDriver` | Per-session input lifecycle (accept, run events, control, recover, retire, destroy) | `EphemeralRuntimeDriver`, `PersistentRuntimeDriver` |
 
 ### Session traits (defined in meerkat-session)
@@ -86,9 +86,9 @@ Surface binaries:
 | `MemberLaunchMode` | Fresh / Resume / Fork (how to start a member) |
 | `ForkContext` | FullHistory (CoW) / LastMessages(n) (how much history to fork) |
 | `BudgetSplitPolicy` | Equal / Proportional / Remaining / Fixed(u64) |
-| `MobMemberSnapshot` | Status, output, error, timestamps, tokens, is_final, peer_metadata |
+| `MobMemberSnapshot` | status, agent_runtime_id, fence_token, output_preview, error, tokens_used, is_final, peer_connectivity, kickoff |
 | `FrameSpec` / `FlowNodeSpec` / `RepeatUntilSpec` | Frame-based flow graphs and repeat-until loop nodes |
-| `MobDefinition.owner_session_id` / `MobDefinition.is_implicit` | Session-scoped mob ownership, access control, implicit cleanup |
+| `MobDefinition.owner_bridge_session_id` / `MobDefinition.is_implicit` | Session-scoped mob ownership, access control, implicit cleanup |
 
 ### Multimodal types (defined in meerkat-core)
 
@@ -170,10 +170,10 @@ MobHandle::spawn(spec)
   ├── add to roster, compute wiring targets
   └── do_wire() for each target pair
 
-MobHandle::respawn(meerkat_id)
+MobHandle::respawn(identity: AgentIdentity)
   ├── retire existing member (archive session, remove from roster)
   ├── enqueue spawn with same identity/profile/labels/mode
-  └── new session ID, peer wiring needs re-establishment
+  └── new FenceToken issued, peer wiring needs re-establishment
 
 MobHandle::run_flow(flow_id, params)
   ├── create MobRun record
@@ -183,13 +183,13 @@ MobHandle::run_flow(flow_id, params)
 ```
 
 - `mob/create` is definition-only; prefabs are gone.
-- `delegate` / implicit mobs are tracked by canonical `owner_session_id` + `is_implicit` fields and cleaned up by `destroy_session_mobs()`.
+- `delegate` / implicit mobs are tracked by canonical `owner_bridge_session_id` + `is_implicit` fields and cleaned up by `destroy_session_mobs()`.
 
 ## Post-0.5.0 Deltas
 
 - `SessionStore` moved into `meerkat-core`; `meerkat-store` now re-exports and implements it.
-- Agent delegation tools are mob-backed and session-scoped via `owner_session_id` / `is_implicit`; operator authority is injected, not ambient.
+- Agent delegation tools are mob-backed and session-scoped via `owner_bridge_session_id` / `is_implicit`; operator authority is injected, not ambient.
 - Tooling persistence is tri-state via `ToolCategoryOverride`; resume paths must preserve `Inherit`.
 - Mob persistence switched to SQLite/WAL; the previous exclusive-handle mob store is gone.
-- Flow loops are machine-backed through `FlowFrameMachine`, `LoopIterationMachine`, and the generated `flow_frame_loop` composition.
+- Flow loops are machine-backed through `FlowFrameKernel`, `LoopIterationKernel` (internal sub-machines of MobMachine), and the `FlowFrameEngine` runtime.
 - `FlowEngine::execute_step_with_all_guards()` is the single canonical step path for both flat and frame execution.

@@ -1,7 +1,7 @@
 //! Meerkat Mob - Multi-agent orchestration runtime.
 //!
-//! This crate provides the runtime for orchestrating multiple Meerkat agents
-//! (meerkats) as a collaborative mob. It handles spawning, wiring, lifecycle
+//! This crate provides the runtime for orchestrating multiple agents as a
+//! collaborative mob. It handles member spawning, wiring, lifecycle
 //! management, and shared task coordination.
 //!
 //! # Architecture
@@ -12,7 +12,6 @@
 //! Key types:
 //! - [`MobDefinition`] - Describes mob structure (profiles, wiring, skills)
 //! - [`MobEvent`] / [`MobEventKind`] - Structural state changes
-//! - [`Roster`] - Projected view of active meerkats
 //! - [`TaskBoard`] - Projected view of shared tasks
 //! - [`MobEventStore`] - Persistence trait for mob events
 //! - [`MobStorage`] - Storage bundle for a mob
@@ -36,15 +35,16 @@ pub mod tokio {
 }
 
 pub mod backend;
-pub mod build;
+mod build;
 pub mod definition;
 pub mod error;
 pub mod event;
 mod generated;
 pub mod ids;
 pub mod launch;
+mod mob_machine;
 pub mod profile;
-pub mod roster;
+mod roster;
 pub mod run;
 pub mod runtime;
 pub mod runtime_mode;
@@ -59,17 +59,17 @@ pub mod validate;
 pub use backend::{MobBackendKind, RuntimeBinding};
 pub use definition::MobDefinition;
 pub use error::MobError;
-pub use event::{AttributedEvent, MemberRef, MobEvent, MobEventKind, NewMobEvent};
+pub use event::{AttributedEvent, MobEvent, MobEventKind, NewMobEvent};
 pub use ids::{
-    BranchId, FlowId, FlowNodeId, FrameId, LoopId, LoopInstanceId, MeerkatId, MobId, ProfileName,
-    RunId, StepId, TaskId,
+    AgentIdentity, AgentRuntimeId, BranchId, FenceToken, FlowId, FlowNodeId, FrameId, Generation,
+    LoopId, LoopInstanceId, MobId, ProfileName, RunId, StepId, TaskId, WorkOrigin, WorkRef,
+    WorkSpec,
 };
-pub use launch::{BudgetSplitPolicy, ForkContext, MemberLaunchMode};
+pub use launch::{BudgetSplitPolicy, ForkContext};
+#[doc(hidden)]
+pub use mob_machine::canonical_mob_machine_command_manifest;
 pub use profile::{Profile, ProfileBinding, ProfileSource, SpawnTooling, ToolConfig};
-pub use roster::{
-    MemberState, MobMemberKickoffPhase, MobMemberKickoffSnapshot, Roster, RosterAddEntry,
-    RosterEntry,
-};
+pub use roster::{MemberState, MobMemberKickoffPhase, MobMemberKickoffSnapshot};
 pub use run::{
     FailureLedgerEntry, FlowContext, FlowRunConfig, FrameSnapshot, LoopContextHistory,
     LoopIterationLedgerEntry, LoopSnapshot, MobRun, MobRunStatus, StepLedgerEntry, StepRunStatus,
@@ -79,10 +79,9 @@ pub use runtime::{FlowFrameKernel, FlowFrameMutator};
 pub use runtime::{FlowTurnExecutor, FlowTurnOutcome, FlowTurnTicket, TimeoutDisposition};
 pub use runtime::{
     HelperOptions, HelperResult, MemberDeliveryReceipt, MemberHandle, MemberRespawnReceipt,
-    MemberSessionRef, MobBuilder, MobEventRouterConfig, MobEventRouterHandle, MobHandle,
-    MobMemberSnapshot, MobMemberStatus, MobPeerConnectivitySnapshot, MobRespawnError,
-    MobSessionService, MobState, MobUnreachablePeer, PeerTarget, SpawnMemberSpec, SpawnPolicy,
-    SpawnSpec,
+    MobBuilder, MobEventRouterConfig, MobEventRouterHandle, MobHandle, MobMemberSnapshot,
+    MobMemberStatus, MobPeerConnectivitySnapshot, MobRespawnError, MobSessionService, MobState,
+    MobUnreachablePeer, PeerTarget, SpawnMemberSpec, SpawnPolicy, SpawnResult, SpawnSpec,
 };
 pub use runtime::{SchedulerGrant, pump_schedulers_to_exhaustion};
 pub use runtime_mode::MobRuntimeMode;
@@ -102,6 +101,8 @@ pub use tasks::{MobTask, TaskBoard, TaskStatus};
 pub use validate::{
     Diagnostic, DiagnosticCode, DiagnosticSeverity, partition_diagnostics, validate_definition,
 };
+
+pub(crate) use ids::MeerkatId;
 
 /// Closure called at each member spawn to get a fresh snapshot of external tools.
 ///

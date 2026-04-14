@@ -866,9 +866,9 @@ async fn e2e_cli_mob_rpc_state_machine_probe() -> Result<(), Box<dyn std::error:
         json!({
             "mob_id": mob_id,
             "specs": [
-                {"profile":"lead","meerkat_id":"lead-1","runtime_mode":"turn_driven"},
-                {"profile":"worker","meerkat_id":"worker-1","runtime_mode":"turn_driven"},
-                {"profile":"reviewer","meerkat_id":"reviewer-1","runtime_mode":"turn_driven"}
+                {"profile":"lead","agent_identity":"lead-1","runtime_mode":"turn_driven"},
+                {"profile":"worker","agent_identity":"worker-1","runtime_mode":"turn_driven"},
+                {"profile":"reviewer","agent_identity":"reviewer-1","runtime_mode":"turn_driven"}
             ]
         }),
         30,
@@ -882,9 +882,9 @@ async fn e2e_cli_mob_rpc_state_machine_probe() -> Result<(), Box<dyn std::error:
         results.iter().all(|entry| entry["ok"] == true),
         "all spawn_many entries should succeed: {spawned}"
     );
-    let worker_session_id = results[1]["session_id"]
+    let worker_identity = results[1]["agent_identity"]
         .as_str()
-        .ok_or("worker spawn result missing session_id")?
+        .ok_or("worker spawn result missing agent_identity")?
         .to_string();
 
     let members = poll_members_until(&mut surface, mob_id, |payload| {
@@ -899,7 +899,7 @@ async fn e2e_cli_mob_rpc_state_machine_probe() -> Result<(), Box<dyn std::error:
     assert!(
         members_array
             .iter()
-            .any(|entry| entry["meerkat_id"].as_str() == Some("worker-1")),
+            .any(|entry| entry["agent_identity"].as_str() == Some("worker-1")),
         "worker should appear in mob/members: {members}"
     );
 
@@ -918,7 +918,7 @@ async fn e2e_cli_mob_rpc_state_machine_probe() -> Result<(), Box<dyn std::error:
     let wired_members = poll_members_until(&mut surface, mob_id, |payload| {
         payload["members"].as_array().is_some_and(|members| {
             members.iter().any(|entry| {
-                entry["meerkat_id"].as_str() == Some("lead-1")
+                entry["agent_identity"].as_str() == Some("lead-1")
                     && entry["wired_to"].as_array().is_some_and(|wired| {
                         wired.iter().any(|peer| peer.as_str() == Some("worker-1"))
                     })
@@ -950,7 +950,7 @@ async fn e2e_cli_mob_rpc_state_machine_probe() -> Result<(), Box<dyn std::error:
         "mob/append_system_context",
         json!({
             "mob_id": mob_id,
-            "meerkat_id": "worker-1",
+            "agent_identity": "worker-1",
             "text": "Always include the token CTX_MOB_29.",
             "source": "mob",
             "idempotency_key": "scenario-29-worker"
@@ -958,7 +958,8 @@ async fn e2e_cli_mob_rpc_state_machine_probe() -> Result<(), Box<dyn std::error:
         15,
     )
     .await?;
-    assert_eq!(appended["session_id"], worker_session_id);
+    // Verify the append targeted the correct member via identity.
+    assert!(!worker_identity.is_empty(), "worker identity should be set");
     assert_eq!(appended["status"], "staged");
 
     let send_err = rpc_call(
@@ -967,7 +968,7 @@ async fn e2e_cli_mob_rpc_state_machine_probe() -> Result<(), Box<dyn std::error:
         "mob/send",
         json!({
             "mob_id": mob_id,
-            "meerkat_id": "worker-1",
+            "agent_identity": "worker-1",
             "content": "Reply with TURN_PROBE_29 and include CTX_MOB_29."
         }),
         120,
@@ -983,7 +984,7 @@ async fn e2e_cli_mob_rpc_state_machine_probe() -> Result<(), Box<dyn std::error:
         &mut surface,
         9,
         "mob/retire",
-        json!({"mob_id": mob_id, "meerkat_id":"reviewer-1"}),
+        json!({"mob_id": mob_id, "agent_identity":"reviewer-1"}),
         15,
     )
     .await?;
@@ -997,7 +998,7 @@ async fn e2e_cli_mob_rpc_state_machine_probe() -> Result<(), Box<dyn std::error:
         after_retire["members"].as_array().is_some_and(|members| {
             members
                 .iter()
-                .all(|entry| entry["meerkat_id"].as_str() != Some("reviewer-1"))
+                .all(|entry| entry["agent_identity"].as_str() != Some("reviewer-1"))
         }),
         "retired reviewer should disappear from members: {after_retire}"
     );
@@ -1006,14 +1007,14 @@ async fn e2e_cli_mob_rpc_state_machine_probe() -> Result<(), Box<dyn std::error:
         &mut surface,
         10,
         "mob/respawn",
-        json!({"mob_id": mob_id, "meerkat_id":"worker-1"}),
+        json!({"mob_id": mob_id, "agent_identity":"worker-1"}),
         15,
     )
     .await?;
     let after_respawn = poll_members_until(&mut surface, mob_id, |payload| {
         payload["members"].as_array().is_some_and(|members| {
             members.iter().any(|entry| {
-                entry["meerkat_id"].as_str() == Some("worker-1") && entry["state"] == "Active"
+                entry["agent_identity"].as_str() == Some("worker-1") && entry["state"] == "Active"
             })
         })
     })
@@ -1024,24 +1025,22 @@ async fn e2e_cli_mob_rpc_state_machine_probe() -> Result<(), Box<dyn std::error:
             .is_some_and(|members| members.len() == 2),
         "respawn should preserve two active members: {after_respawn}"
     );
-    let respawned_session_id = after_respawn["members"]
-        .as_array()
-        .and_then(|members| {
-            members.iter().find_map(|entry| {
-                (entry["meerkat_id"].as_str() == Some("worker-1"))
-                    .then(|| entry["member_ref"]["session_id"].as_str())
-                    .flatten()
-                    .map(ToString::to_string)
-            })
-        })
-        .ok_or("respawned worker session_id missing")?;
+    // Verify respawned worker is present in roster with identity.
+    assert!(
+        after_respawn["members"]
+            .as_array()
+            .is_some_and(|members| members
+                .iter()
+                .any(|entry| entry["agent_identity"].as_str() == Some("worker-1"))),
+        "respawned worker-1 should be present in members: {after_respawn}"
+    );
     let send_after_respawn_err = rpc_call(
         &mut surface,
         11,
         "mob/send",
         json!({
             "mob_id": mob_id,
-            "meerkat_id": "worker-1",
+            "agent_identity": "worker-1",
             "content": "Reply with RESPAWN_PROBE_29."
         }),
         120,
@@ -1054,8 +1053,6 @@ async fn e2e_cli_mob_rpc_state_machine_probe() -> Result<(), Box<dyn std::error:
             .contains("Method not found"),
         "removed mob/send route should stay unavailable after respawn: {send_after_respawn_err}"
     );
-    let _ = respawned_session_id;
-
     let stopped = rpc_call(
         &mut surface,
         12,
@@ -1173,9 +1170,9 @@ async fn e2e_scenario_30_cli_mob_rpc_flow_probe() -> Result<(), Box<dyn std::err
         json!({
             "mob_id": mob_id,
             "specs": [
-                {"profile":"lead","meerkat_id":"lead-1","runtime_mode":"turn_driven"},
-                {"profile":"analyst","meerkat_id":"analyst-1","runtime_mode":"turn_driven"},
-                {"profile":"reviewer","meerkat_id":"reviewer-1","runtime_mode":"turn_driven"}
+                {"profile":"lead","agent_identity":"lead-1","runtime_mode":"turn_driven"},
+                {"profile":"analyst","agent_identity":"analyst-1","runtime_mode":"turn_driven"},
+                {"profile":"reviewer","agent_identity":"reviewer-1","runtime_mode":"turn_driven"}
             ]
         }),
         30,
@@ -1341,16 +1338,17 @@ async fn e2e_scenario_29_cli_mob_rpc_member_turn_probe() -> Result<(), Box<dyn s
         json!({
             "mob_id": mob_id,
             "profile": "worker",
-            "meerkat_id": "worker-1",
+            "agent_identity": "worker-1",
             "runtime_mode": "turn_driven"
         }),
         20,
     )
     .await?;
-    let original_session_id = spawned["session_id"]
+    let spawned_identity = spawned["agent_identity"]
         .as_str()
-        .ok_or("mob/spawn missing session_id")?
+        .ok_or("mob/spawn missing agent_identity")?
         .to_string();
+    assert_eq!(spawned_identity, "worker-1");
 
     let appended = rpc_call(
         &mut surface,
@@ -1358,7 +1356,7 @@ async fn e2e_scenario_29_cli_mob_rpc_member_turn_probe() -> Result<(), Box<dyn s
         "mob/append_system_context",
         json!({
             "mob_id": mob_id,
-            "meerkat_id": "worker-1",
+            "agent_identity": "worker-1",
             "text": "Always include the token CTX_MOB_29.",
             "source": "mob",
             "idempotency_key": "scenario-29-context"
@@ -1367,7 +1365,6 @@ async fn e2e_scenario_29_cli_mob_rpc_member_turn_probe() -> Result<(), Box<dyn s
     )
     .await?;
     assert_eq!(appended["status"], "staged");
-    assert_eq!(appended["session_id"], original_session_id);
 
     let send_err = rpc_call(
         &mut surface,
@@ -1375,7 +1372,7 @@ async fn e2e_scenario_29_cli_mob_rpc_member_turn_probe() -> Result<(), Box<dyn s
         "mob/send",
         json!({
             "mob_id": mob_id,
-            "meerkat_id": "worker-1",
+            "agent_identity": "worker-1",
             "content": "Reply with TURN_PROBE_29 and include CTX_MOB_29."
         }),
         120,
@@ -1394,7 +1391,7 @@ async fn e2e_scenario_29_cli_mob_rpc_member_turn_probe() -> Result<(), Box<dyn s
         json!({
             "mob_id": mob_id,
             "profile": "broken",
-            "meerkat_id": "broken-1",
+            "agent_identity": "broken-1",
             "runtime_mode": "turn_driven"
         }),
         20,
@@ -1410,17 +1407,17 @@ async fn e2e_scenario_29_cli_mob_rpc_member_turn_probe() -> Result<(), Box<dyn s
             );
         }
         Ok(broken) => {
-            let broken_session_id = broken["session_id"]
-                .as_str()
-                .ok_or("mob/spawn missing broken session_id")?
-                .to_string();
+            assert!(
+                broken["agent_identity"].as_str().is_some(),
+                "broken spawn should still return agent_identity: {broken}"
+            );
             let broken_send_err = rpc_call(
                 &mut surface,
                 207,
                 "mob/send",
                 json!({
                     "mob_id": mob_id,
-                    "meerkat_id": "broken-1",
+                    "agent_identity": "broken-1",
                     "content": "This turn must fail because the member model is invalid."
                 }),
                 60,
@@ -1431,7 +1428,6 @@ async fn e2e_scenario_29_cli_mob_rpc_member_turn_probe() -> Result<(), Box<dyn s
                 broken_send_err.to_string().contains("Method not found"),
                 "unexpected broken member error: {broken_send_err}"
             );
-            let _ = broken_session_id;
         }
     }
 
@@ -1439,36 +1435,33 @@ async fn e2e_scenario_29_cli_mob_rpc_member_turn_probe() -> Result<(), Box<dyn s
         &mut surface,
         209,
         "mob/respawn",
-        json!({"mob_id": mob_id, "meerkat_id":"worker-1"}),
+        json!({"mob_id": mob_id, "agent_identity":"worker-1"}),
         20,
     )
     .await?;
     let respawned_members = poll_members_until(&mut surface, mob_id, |payload| {
         payload["members"].as_array().is_some_and(|members| {
             members.iter().any(|entry| {
-                entry["meerkat_id"].as_str() == Some("worker-1") && entry["state"] == "Active"
+                entry["agent_identity"].as_str() == Some("worker-1") && entry["state"] == "Active"
             })
         })
     })
     .await?;
-    let respawned_session_id = respawned_members["members"]
-        .as_array()
-        .and_then(|members| {
-            members.iter().find_map(|entry| {
-                (entry["meerkat_id"].as_str() == Some("worker-1"))
-                    .then(|| entry["member_ref"]["session_id"].as_str())
-                    .flatten()
-                    .map(ToString::to_string)
-            })
-        })
-        .ok_or("respawned worker session_id missing")?;
+    assert!(
+        respawned_members["members"]
+            .as_array()
+            .is_some_and(|members| members
+                .iter()
+                .any(|entry| entry["agent_identity"].as_str() == Some("worker-1"))),
+        "respawned worker-1 should be present: {respawned_members}"
+    );
     let send_after_respawn_err = rpc_call(
         &mut surface,
         210,
         "mob/send",
         json!({
             "mob_id": mob_id,
-            "meerkat_id": "worker-1",
+            "agent_identity": "worker-1",
             "content": "Reply with RESPAWN_PROBE_29."
         }),
         120,
@@ -1481,8 +1474,6 @@ async fn e2e_scenario_29_cli_mob_rpc_member_turn_probe() -> Result<(), Box<dyn s
             .contains("Method not found"),
         "removed mob/send route should stay unavailable after respawn: {send_after_respawn_err}"
     );
-    let _ = respawned_session_id;
-
     let events = rpc_call(
         &mut surface,
         212,

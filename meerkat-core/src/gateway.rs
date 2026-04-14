@@ -460,7 +460,7 @@ impl AgentToolDispatcher for ToolGateway {
     fn bind_ops_lifecycle(
         self: Arc<Self>,
         registry: Arc<dyn crate::ops_lifecycle::OpsLifecycleRegistry>,
-        owner_session_id: crate::types::SessionId,
+        owner_bridge_session_id: crate::types::SessionId,
     ) -> Result<crate::agent::BindOutcome, crate::agent::OpsLifecycleBindError> {
         let owned = Arc::try_unwrap(self)
             .map_err(|_| crate::agent::OpsLifecycleBindError::SharedOwnership)?;
@@ -473,7 +473,7 @@ impl AgentToolDispatcher for ToolGateway {
             {
                 let outcome = entry
                     .dispatcher
-                    .bind_ops_lifecycle(Arc::clone(&registry), owner_session_id.clone())?;
+                    .bind_ops_lifecycle(Arc::clone(&registry), owner_bridge_session_id.clone())?;
                 if outcome.was_bound() {
                     any_bound = true;
                 }
@@ -504,6 +504,12 @@ impl AgentToolDispatcher for ToolGateway {
         self.entries
             .iter()
             .find_map(|e| e.dispatcher.completion_enrichment())
+    }
+
+    fn external_tool_surface_snapshot(&self) -> Option<crate::ExternalToolSurfaceSnapshot> {
+        self.entries
+            .iter()
+            .find_map(|entry| entry.dispatcher.external_tool_surface_snapshot())
     }
 
     /// Aggregate external updates across all dispatcher entries.
@@ -715,10 +721,16 @@ impl AgentToolDispatcher for DynamicToolComposite {
         result.into()
     }
 
+    fn external_tool_surface_snapshot(&self) -> Option<crate::ExternalToolSurfaceSnapshot> {
+        self.dispatchers
+            .iter()
+            .find_map(|dispatcher| dispatcher.external_tool_surface_snapshot())
+    }
+
     fn bind_ops_lifecycle(
         self: Arc<Self>,
         registry: Arc<dyn crate::ops_lifecycle::OpsLifecycleRegistry>,
-        owner_session_id: crate::types::SessionId,
+        owner_bridge_session_id: crate::types::SessionId,
     ) -> Result<crate::agent::BindOutcome, crate::agent::OpsLifecycleBindError> {
         let owned = Arc::try_unwrap(self)
             .map_err(|_| crate::agent::OpsLifecycleBindError::SharedOwnership)?;
@@ -727,7 +739,7 @@ impl AgentToolDispatcher for DynamicToolComposite {
         for d in owned.dispatchers {
             if d.capabilities().ops_lifecycle && Arc::strong_count(&d) == 1 {
                 let outcome =
-                    d.bind_ops_lifecycle(Arc::clone(&registry), owner_session_id.clone())?;
+                    d.bind_ops_lifecycle(Arc::clone(&registry), owner_bridge_session_id.clone())?;
                 if outcome.was_bound() {
                     any_bound = true;
                 }

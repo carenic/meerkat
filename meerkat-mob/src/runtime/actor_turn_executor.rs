@@ -290,7 +290,7 @@ impl FlowTurnExecutor for ActorFlowTurnExecutor {
     ) -> Result<FlowTurnTicket, MobError> {
         let entry = self
             .handle
-            .get_member(target)
+            .get_member_by_meerkat_id(target)
             .await
             .ok_or_else(|| MobError::MeerkatNotFound(target.clone()))?;
 
@@ -298,12 +298,10 @@ impl FlowTurnExecutor for ActorFlowTurnExecutor {
         let scoped_event_tx = self.handle.flow_streams.lock().await.get(run_id).cloned();
         let scope_frame = StreamScopeFrame::MobMember {
             flow_run_id: run_id.to_string(),
-            member_ref: target.to_string(),
-            session_id: entry
-                .member_ref
-                .session_id()
-                .map(std::string::ToString::to_string)
-                .unwrap_or_default(),
+            agent_identity: entry.agent_identity.to_string(),
+            agent_runtime_id: Some(entry.agent_runtime_id.to_string()),
+            fence_token: Some(entry.fence_token.get()),
+            generation: Some(entry.agent_runtime_id.generation.get()),
         };
         let bridge_handle = match entry.runtime_mode {
             crate::MobRuntimeMode::AutonomousHost => {
@@ -313,14 +311,14 @@ impl FlowTurnExecutor for ActorFlowTurnExecutor {
                          use turn_driven runtime mode for steps with allowed_tools/blocked_tools"
                     )));
                 }
-                let session_id = entry.member_ref.session_id().ok_or_else(|| {
+                let bridge_session_id = entry.member_ref.bridge_session_id().ok_or_else(|| {
                     MobError::Internal(format!(
                         "autonomous flow dispatch requires session-backed member ref for '{target}'"
                     ))
                 })?;
                 let injector = self
                     .provisioner
-                    .interaction_event_injector(session_id)
+                    .interaction_event_injector(bridge_session_id)
                     .await
                     .ok_or_else(|| {
                         MobError::Internal(format!(

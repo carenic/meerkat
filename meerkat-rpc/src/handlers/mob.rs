@@ -10,12 +10,13 @@ use super::{RpcResponseExt, parse_params};
 use crate::error;
 use crate::protocol::{RpcId, RpcResponse};
 use crate::session_runtime::SessionRuntime;
-use meerkat_contracts::{MobCreateParams, MobCreateResult};
+use meerkat::surface::RequestContext;
+use meerkat_contracts::{MobCreateParams, MobCreateResult, WireAgentRuntimeId};
 use meerkat_core::service::AppendSystemContextRequest;
-use meerkat_core::types::{ContentInput, SessionId};
+use meerkat_core::types::ContentInput;
 use meerkat_mob::{
-    FlowId, MeerkatId, MemberRespawnReceipt, MobBackendKind, MobId, MobRespawnError,
-    MobRuntimeMode, RunId, SpawnMemberSpec,
+    AgentIdentity, FlowId, MemberRespawnReceipt, MobBackendKind, MobId, MobRespawnError,
+    MobRuntimeMode, RunId, SpawnMemberSpec, SpawnResult,
 };
 use meerkat_mob_mcp::MobMcpState;
 use std::collections::BTreeMap;
@@ -32,6 +33,15 @@ fn parse_mob_id(id: Option<RpcId>, raw: &str) -> Result<MobId, RpcResponse> {
         return Err(invalid_params(id, "mob_id must not be empty"));
     }
     Ok(MobId::from(raw))
+}
+
+fn spawn_result_payload(mob_id: &MobId, result: &SpawnResult) -> serde_json::Value {
+    serde_json::json!({
+        "mob_id": mob_id,
+        "agent_identity": result.agent_identity,
+        "agent_runtime_id": result.agent_runtime_id,
+        "fence_token": result.fence_token,
+    })
 }
 
 pub async fn handle_create(
@@ -130,15 +140,13 @@ pub async fn handle_members(
 pub struct MobSpawnParams {
     pub mob_id: String,
     pub profile: String,
-    pub meerkat_id: String,
+    pub agent_identity: String,
     #[serde(default)]
     pub initial_message: Option<ContentInput>,
     #[serde(default)]
     pub runtime_mode: Option<MobRuntimeMode>,
     #[serde(default)]
     pub backend: Option<MobBackendKind>,
-    #[serde(default)]
-    pub resume_session_id: Option<String>,
     #[serde(default)]
     pub labels: Option<BTreeMap<String, String>>,
     #[serde(default)]
@@ -160,31 +168,15 @@ pub async fn handle_spawn(
         Ok(m) => m,
         Err(resp) => return resp,
     };
-    let mut spec = SpawnMemberSpec::new(params.profile.as_str(), params.meerkat_id.as_str());
+    let mut spec = SpawnMemberSpec::new(params.profile.as_str(), params.agent_identity.as_str());
     spec.initial_message = params.initial_message;
     spec.runtime_mode = params.runtime_mode;
     spec.backend = params.backend;
     spec.context = params.context;
     spec.labels = params.labels;
-    if let Some(session_id) = params.resume_session_id {
-        match SessionId::parse(&session_id) {
-            Ok(sid) => {
-                spec = spec.with_resume_session_id(sid);
-            }
-            Err(err) => return invalid_params(id, format!("Invalid resume_session_id: {err}")),
-        }
-    }
     spec.additional_instructions = params.additional_instructions;
     match state.mob_spawn_spec(&mob_id, spec).await {
-        Ok(member_ref) => RpcResponse::success(
-            id,
-            serde_json::json!({
-                "mob_id": mob_id,
-                "meerkat_id": params.meerkat_id,
-                "member_ref": member_ref,
-                "session_id": member_ref.session_id(),
-            }),
-        ),
+        Ok(spawn_result) => RpcResponse::success(id, spawn_result_payload(&mob_id, &spawn_result)),
         Err(err) => invalid_params(id, err.to_string()),
     }
 }
@@ -203,15 +195,13 @@ pub struct MobSpawnManyParams {
 #[derive(Debug, Deserialize)]
 pub struct MobSpawnSpecParams {
     pub profile: String,
-    pub meerkat_id: String,
+    pub agent_identity: String,
     #[serde(default)]
     pub initial_message: Option<ContentInput>,
     #[serde(default)]
     pub runtime_mode: Option<MobRuntimeMode>,
     #[serde(default)]
     pub backend: Option<MobBackendKind>,
-    #[serde(default)]
-    pub resume_session_id: Option<String>,
     #[serde(default)]
     pub labels: Option<BTreeMap<String, String>>,
     #[serde(default)]
@@ -224,9 +214,11 @@ pub struct MobSpawnSpecParams {
 struct SpawnManyResultEntry {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    member_ref: Option<serde_json::Value>,
+    agent_identity: Option<meerkat_mob::AgentIdentity>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    session_id: Option<String>,
+    agent_runtime_id: Option<meerkat_mob::AgentRuntimeId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fence_token: Option<meerkat_mob::FenceToken>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -248,25 +240,12 @@ pub async fn handle_spawn_many(
 
     let mut specs = Vec::with_capacity(params.specs.len());
     for s in &params.specs {
-        let mut spec = SpawnMemberSpec::new(s.profile.as_str(), s.meerkat_id.as_str());
+        let mut spec = SpawnMemberSpec::new(s.profile.as_str(), s.agent_identity.as_str());
         spec.initial_message = s.initial_message.clone();
         spec.runtime_mode = s.runtime_mode;
         spec.backend = s.backend;
         spec.context = s.context.clone();
         spec.labels = s.labels.clone();
-        if let Some(raw) = &s.resume_session_id {
-            match SessionId::parse(raw) {
-                Ok(sid) => {
-                    spec = spec.with_resume_session_id(sid);
-                }
-                Err(err) => {
-                    return invalid_params(
-                        id,
-                        format!("Invalid resume_session_id for {}: {err}", s.meerkat_id),
-                    );
-                }
-            }
-        }
         spec.additional_instructions = s.additional_instructions.clone();
         specs.push(spec);
     }
@@ -276,18 +255,18 @@ pub async fn handle_spawn_many(
             let entries: Vec<SpawnManyResultEntry> = results
                 .into_iter()
                 .map(|r| match r {
-                    Ok(member_ref) => SpawnManyResultEntry {
+                    Ok(spawn_result) => SpawnManyResultEntry {
                         ok: true,
-                        session_id: member_ref
-                            .session_id()
-                            .map(std::string::ToString::to_string),
-                        member_ref: serde_json::to_value(&member_ref).ok(),
+                        agent_identity: Some(spawn_result.agent_identity),
+                        agent_runtime_id: Some(spawn_result.agent_runtime_id),
+                        fence_token: Some(spawn_result.fence_token),
                         error: None,
                     },
                     Err(err) => SpawnManyResultEntry {
                         ok: false,
-                        member_ref: None,
-                        session_id: None,
+                        agent_identity: None,
+                        agent_runtime_id: None,
+                        fence_token: None,
                         error: Some(err.to_string()),
                     },
                 })
@@ -301,7 +280,7 @@ pub async fn handle_spawn_many(
 #[derive(Debug, Deserialize)]
 pub struct MobMemberParams {
     pub mob_id: String,
-    pub meerkat_id: String,
+    pub agent_identity: String,
 }
 
 pub async fn handle_retire(
@@ -318,7 +297,7 @@ pub async fn handle_retire(
         Err(resp) => return resp,
     };
     match state
-        .mob_retire(&mob_id, MeerkatId::from(params.meerkat_id.as_str()))
+        .mob_retire(&mob_id, AgentIdentity::from(params.agent_identity.as_str()))
         .await
     {
         Ok(()) => RpcResponse::success(id, serde_json::json!({"retired": true})),
@@ -329,7 +308,7 @@ pub async fn handle_retire(
 #[derive(Debug, Deserialize)]
 pub struct MobRespawnParams {
     pub mob_id: String,
-    pub meerkat_id: String,
+    pub agent_identity: String,
     #[serde(default)]
     pub initial_message: Option<ContentInput>,
 }
@@ -350,7 +329,7 @@ pub async fn handle_respawn(
     match state
         .mob_respawn(
             &mob_id,
-            MeerkatId::from(params.meerkat_id.as_str()),
+            AgentIdentity::from(params.agent_identity.as_str()),
             params.initial_message,
         )
         .await
@@ -414,7 +393,7 @@ pub async fn handle_wire(
     match state
         .mob_wire(
             &mob_id,
-            MeerkatId::from(params.member.as_str()),
+            AgentIdentity::from(params.member.as_str()),
             params.peer,
         )
         .await
@@ -440,7 +419,7 @@ pub async fn handle_unwire(
     match state
         .mob_unwire(
             &mob_id,
-            MeerkatId::from(params.member.as_str()),
+            AgentIdentity::from(params.member.as_str()),
             params.peer,
         )
         .await
@@ -489,7 +468,7 @@ pub async fn handle_lifecycle(
 #[derive(Debug, Deserialize)]
 pub struct MobAppendSystemContextParams {
     pub mob_id: String,
-    pub meerkat_id: String,
+    pub agent_identity: String,
     pub text: String,
     #[serde(default)]
     pub source: Option<String>,
@@ -513,7 +492,7 @@ pub async fn handle_member_send(
         Ok(m) => m,
         Err(resp) => return resp,
     };
-    let meerkat_id = MeerkatId::from(params.meerkat_id.as_str());
+    let agent_identity = AgentIdentity::from(params.agent_identity.as_str());
     let content = match ContentInput::try_from(params.content) {
         Ok(content) => content,
         Err(error) => return invalid_params(id, error),
@@ -521,7 +500,7 @@ pub async fn handle_member_send(
     match state
         .mob_member_send(
             &mob_id,
-            meerkat_id.clone(),
+            agent_identity.clone(),
             content,
             params.handling_mode.into(),
             params.render_metadata.map(Into::into),
@@ -532,8 +511,12 @@ pub async fn handle_member_send(
             id,
             MobMemberSendResult {
                 mob_id: mob_id.to_string(),
-                member_id: receipt.member_id.to_string(),
-                session_id: receipt.session_id,
+                agent_identity: receipt.identity.to_string(),
+                agent_runtime_id: WireAgentRuntimeId {
+                    identity: receipt.agent_runtime_id.identity.to_string(),
+                    generation: receipt.agent_runtime_id.generation.get(),
+                },
+                fence_token: receipt.fence_token.get(),
                 handling_mode: receipt.handling_mode.into(),
             },
         ),
@@ -555,11 +538,11 @@ pub async fn handle_append_system_context(
         Ok(m) => m,
         Err(resp) => return resp,
     };
-    let meerkat_id = MeerkatId::from(params.meerkat_id.as_str());
+    let agent_identity = AgentIdentity::from(params.agent_identity.as_str());
     match state
         .mob_append_system_context(
             &mob_id,
-            &meerkat_id,
+            &agent_identity,
             AppendSystemContextRequest {
                 text: params.text,
                 source: params.source,
@@ -568,12 +551,11 @@ pub async fn handle_append_system_context(
         )
         .await
     {
-        Ok((session_id, result)) => RpcResponse::success(
+        Ok((_bridge_session_id, result)) => RpcResponse::success(
             id,
             serde_json::json!({
                 "mob_id": mob_id,
-                "meerkat_id": meerkat_id,
-                "session_id": session_id,
+                "agent_identity": agent_identity,
                 "status": result.status,
             }),
         ),
@@ -743,7 +725,7 @@ pub struct MobSpawnHelperParams {
     pub mob_id: String,
     pub prompt: String,
     #[serde(default)]
-    pub meerkat_id: Option<String>,
+    pub agent_identity: Option<String>,
     #[serde(default, alias = "profile_name")]
     pub role_name: Option<String>,
     #[serde(default)]
@@ -765,9 +747,9 @@ pub async fn handle_spawn_helper(
         Ok(m) => m,
         Err(resp) => return resp,
     };
-    let meerkat_id = MeerkatId::from(
+    let agent_identity = AgentIdentity::from(
         params
-            .meerkat_id
+            .agent_identity
             .unwrap_or_else(|| format!("helper-{}", uuid::Uuid::new_v4())),
     );
     let mut options = meerkat_mob::HelperOptions::default();
@@ -777,7 +759,7 @@ pub async fn handle_spawn_helper(
     options.runtime_mode = params.runtime_mode;
     options.backend = params.backend;
     match state
-        .mob_spawn_helper(&mob_id, meerkat_id, params.prompt, options)
+        .mob_spawn_helper(&mob_id, agent_identity, params.prompt, options)
         .await
     {
         Ok(result) => RpcResponse::success(
@@ -785,7 +767,9 @@ pub async fn handle_spawn_helper(
             serde_json::json!({
                 "output": result.output,
                 "tokens_used": result.tokens_used,
-                "session_id": result.session_id,
+                "agent_identity": result.agent_identity,
+                "agent_runtime_id": result.agent_runtime_id,
+                "fence_token": result.fence_token,
             }),
         ),
         Err(err) => invalid_params(id, err.to_string()),
@@ -802,7 +786,7 @@ pub struct MobForkHelperParams {
     pub source_member_id: String,
     pub prompt: String,
     #[serde(default)]
-    pub meerkat_id: Option<String>,
+    pub agent_identity: Option<String>,
     #[serde(default, alias = "profile_name")]
     pub role_name: Option<String>,
     #[serde(default)]
@@ -826,10 +810,10 @@ pub async fn handle_fork_helper(
         Ok(m) => m,
         Err(resp) => return resp,
     };
-    let source_member_id = MeerkatId::from(params.source_member_id.as_str());
-    let meerkat_id = MeerkatId::from(
+    let source_identity = AgentIdentity::from(params.source_member_id.as_str());
+    let agent_identity = AgentIdentity::from(
         params
-            .meerkat_id
+            .agent_identity
             .unwrap_or_else(|| format!("fork-{}", uuid::Uuid::new_v4())),
     );
     let fork_context = params
@@ -844,8 +828,8 @@ pub async fn handle_fork_helper(
     match state
         .mob_fork_helper(
             &mob_id,
-            &source_member_id,
-            meerkat_id,
+            &source_identity,
+            agent_identity,
             params.prompt,
             fork_context,
             options,
@@ -857,7 +841,9 @@ pub async fn handle_fork_helper(
             serde_json::json!({
                 "output": result.output,
                 "tokens_used": result.tokens_used,
-                "session_id": result.session_id,
+                "agent_identity": result.agent_identity,
+                "agent_runtime_id": result.agent_runtime_id,
+                "fence_token": result.fence_token,
             }),
         ),
         Err(err) => invalid_params(id, err.to_string()),
@@ -882,7 +868,7 @@ pub async fn handle_force_cancel(
         Err(resp) => return resp,
     };
     match state
-        .mob_force_cancel(&mob_id, MeerkatId::from(params.meerkat_id.as_str()))
+        .mob_force_cancel(&mob_id, AgentIdentity::from(params.agent_identity.as_str()))
         .await
     {
         Ok(()) => RpcResponse::success(id, serde_json::json!({"cancelled": true})),
@@ -908,7 +894,10 @@ pub async fn handle_member_status(
         Err(resp) => return resp,
     };
     match state
-        .mob_member_status(&mob_id, &MeerkatId::from(params.meerkat_id.as_str()))
+        .mob_member_status(
+            &mob_id,
+            &AgentIdentity::from(params.agent_identity.as_str()),
+        )
         .await
     {
         Ok(snapshot) => RpcResponse::success(id, serde_json::json!(snapshot)),
@@ -945,7 +934,7 @@ pub async fn handle_wait_kickoff(
 
     let member_ids = params.member_ids.map(|ids| {
         ids.into_iter()
-            .map(|member_id| MeerkatId::from(member_id.as_str()))
+            .map(|member_id| AgentIdentity::from(member_id.as_str()))
             .collect::<Vec<_>>()
     });
 
@@ -1069,25 +1058,101 @@ pub async fn handle_profile_delete(
     }
 }
 
+// ---------------------------------------------------------------------------
+// mob/turn_start — identity-native turn routing
+// ---------------------------------------------------------------------------
+
+/// Parameters for `mob/turn_start`.
+///
+/// Resolves `agent_identity` to the backing bridge session and delegates to
+/// the standard `turn/start` handler. This is the identity-first replacement
+/// for extracting `session_id` from spawn responses.
+#[derive(Debug, Deserialize)]
+pub struct MobTurnStartParams {
+    pub mob_id: String,
+    pub agent_identity: String,
+    pub prompt: serde_json::Value,
+    /// All optional turn/start overrides are forwarded transparently.
+    #[serde(flatten)]
+    pub turn_overrides: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Handle `mob/turn_start` — resolve identity to session and delegate to turn/start.
+pub async fn handle_mob_turn_start(
+    id: Option<RpcId>,
+    params: Option<&RawValue>,
+    state: &Arc<MobMcpState>,
+    runtime: Arc<SessionRuntime>,
+    notification_sink: &crate::router::NotificationSink,
+    runtime_adapter: &meerkat_runtime::MeerkatMachine,
+    request_context: Option<RequestContext>,
+) -> RpcResponse {
+    let mob_params: MobTurnStartParams = match parse_params(params) {
+        Ok(p) => p,
+        Err(resp) => return resp.with_id(id),
+    };
+    let mob_id = match parse_mob_id(id.clone(), &mob_params.mob_id) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    let identity = AgentIdentity::from(mob_params.agent_identity.as_str());
+
+    // Resolve identity → bridge session ID.
+    let handle = match state.handle_for(&mob_id).await {
+        Ok(h) => h,
+        Err(err) => return invalid_params(id, err.to_string()),
+    };
+    let session_id = match handle.resolve_bridge_session_id(&identity).await {
+        Some(sid) => sid,
+        None => {
+            return invalid_params(
+                id,
+                format!("member '{identity}' has no active bridge session in mob '{mob_id}'"),
+            );
+        }
+    };
+
+    // Build a turn/start-compatible JSON blob with the resolved session_id.
+    let mut turn_params = mob_params.turn_overrides;
+    turn_params.insert(
+        "session_id".to_string(),
+        serde_json::Value::String(session_id.to_string()),
+    );
+    turn_params.insert("prompt".to_string(), mob_params.prompt);
+    let raw_json = serde_json::to_string(&turn_params).unwrap_or_default();
+    let raw_value = RawValue::from_string(raw_json).ok();
+
+    super::turn::handle_start(
+        id,
+        raw_value.as_deref(),
+        runtime,
+        notification_sink,
+        runtime_adapter,
+        request_context,
+    )
+    .await
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use meerkat_core::types::SessionId;
+    use meerkat_mob::{AgentIdentity, AgentRuntimeId, FenceToken};
 
     #[test]
     fn respawn_result_preserves_receipt_on_topology_restore_failure()
     -> Result<(), Box<dyn std::error::Error>> {
         let receipt = MemberRespawnReceipt::new(
-            MeerkatId::from("worker"),
-            Some(SessionId::new()),
-            Some(SessionId::new()),
+            AgentIdentity::from("worker"),
+            AgentRuntimeId::initial(AgentIdentity::from("worker")),
+            FenceToken::new(3),
+            FenceToken::new(4),
         );
         let response = respawn_result_response(
             Some(RpcId::Num(42)),
             Err(MobRespawnError::TopologyRestoreFailed {
                 receipt: receipt.clone(),
-                failed_peer_ids: vec![MeerkatId::from("peer-a"), MeerkatId::from("peer-b")],
+                failed_peer_ids: vec![AgentIdentity::from("peer-a"), AgentIdentity::from("peer-b")],
             }),
         );
 
@@ -1100,7 +1165,7 @@ mod tests {
         };
         let value: serde_json::Value = serde_json::from_str(raw.get())?;
         assert_eq!(value["status"], "topology_restore_failed");
-        assert_eq!(value["receipt"]["member_id"], receipt.member_id.to_string());
+        assert_eq!(value["receipt"]["identity"], receipt.identity.to_string());
         assert_eq!(
             value["failed_peer_ids"],
             serde_json::json!(["peer-a", "peer-b"])
@@ -1118,12 +1183,12 @@ mod tests {
         });
         let params: MobWireParams = serde_json::from_value(value)?;
         assert_eq!(
-            MeerkatId::from(params.member.as_str()),
-            MeerkatId::from("worker-a")
+            AgentIdentity::from(params.member.as_str()),
+            AgentIdentity::from("worker-a")
         );
         assert_eq!(
             params.peer,
-            meerkat_mob::PeerTarget::Local(MeerkatId::from("worker-b"))
+            meerkat_mob::PeerTarget::Local(AgentIdentity::from("worker-b"))
         );
         Ok(())
     }

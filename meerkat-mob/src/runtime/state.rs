@@ -62,7 +62,7 @@ impl std::fmt::Display for MobState {
 pub(super) enum MobCommand {
     Spawn {
         spec: Box<super::handle::SpawnMemberSpec>,
-        owner_session_id: Option<SessionId>,
+        owner_bridge_session_id: Option<SessionId>,
         ops_registry: Option<Arc<dyn meerkat_core::ops_lifecycle::OpsLifecycleRegistry>>,
         reply_tx: oneshot::Sender<Result<super::handle::MemberSpawnReceipt, MobError>>,
     },
@@ -105,10 +105,6 @@ pub(super) enum MobCommand {
         meerkat_id: MeerkatId,
         content: ContentInput,
         reply_tx: oneshot::Sender<Result<SessionId, MobError>>,
-    },
-    KickoffBarrierSnapshot {
-        meerkat_ids: Vec<MeerkatId>,
-        reply_tx: oneshot::Sender<Vec<(MeerkatId, tokio::sync::watch::Receiver<bool>)>>,
     },
     KickoffOutcomeResolved {
         meerkat_id: MeerkatId,
@@ -167,7 +163,37 @@ pub(super) enum MobCommand {
     TaskUpdate {
         task_id: TaskId,
         status: TaskStatus,
-        owner: Option<MeerkatId>,
+        owner: Option<AgentIdentity>,
+        reply_tx: oneshot::Sender<Result<(), MobError>>,
+    },
+    TaskList {
+        reply_tx: oneshot::Sender<Vec<MobTask>>,
+    },
+    TaskGet {
+        task_id: TaskId,
+        reply_tx: oneshot::Sender<Option<MobTask>>,
+    },
+    McpServerStates {
+        reply_tx: oneshot::Sender<BTreeMap<String, bool>>,
+    },
+    SubscribeAgentEvents {
+        meerkat_id: MeerkatId,
+        reply_tx: oneshot::Sender<Result<EventStream, MobError>>,
+    },
+    SubscribeAllAgentEvents {
+        reply_tx: oneshot::Sender<Vec<(MeerkatId, EventStream)>>,
+    },
+    PollEvents {
+        after_cursor: u64,
+        limit: usize,
+        reply_tx: oneshot::Sender<Result<Vec<crate::event::MobEvent>, MobError>>,
+    },
+    ReplayAllEvents {
+        reply_tx: oneshot::Sender<Result<Vec<crate::event::MobEvent>, MobError>>,
+    },
+    RecordOperatorActionProvenance {
+        tool_name: String,
+        authority_context: meerkat_core::service::MobToolAuthorityContext,
         reply_tx: oneshot::Sender<Result<(), MobError>>,
     },
     ForceCancel {

@@ -52,7 +52,7 @@ rkat-mcp --realm team-alpha
 
 Meerkat uses an explicit runtime-binding contract:
 
-- runtime-backed surfaces should call `RuntimeSessionAdapter::prepare_bindings(session_id)`
+- runtime-backed surfaces should call `MeerkatMachine::prepare_bindings(session_id)`
 - those bindings flow into `SessionBuildOptions.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings)`
 - standalone/testing/embedded paths should opt into `RuntimeBuildMode::StandaloneEphemeral` explicitly
 
@@ -68,11 +68,11 @@ Use this mental model when helping users:
 - `MobBackendKind` (definition/profile level): `Session` or `External` — declares what kind of backend a mob uses
 - `RuntimeBinding` (spawn/provision level): `Session` or `External { peer_id, address }` — binds a specific member to a concrete runtime
 
-External members must provide `RuntimeBinding::External` at spawn time with the real process comms identity. The provisioner uses this for `MemberRef::BackendPeer.peer_id` and `.address` instead of deriving from the placeholder session.
+External members must provide `RuntimeBinding::External` at spawn time with the real process comms identity. The provisioner uses that backend peer binding for the concrete `peer_id` and `address` instead of deriving them from the placeholder session.
 
 The bridge session (placeholder) still exists for lifecycle transport (notifications, kickoff events) within the orchestrator process. `trusted_peer_spec` uses the bridge key for transport trust, not `BackendPeer.peer_id` (which is the real identity).
 
-This is the first step toward identity-first mobs where `MeerkatId` is the durable identity and everything else (session, comms, runtime) is a hidden binding detail.
+This is the first step toward identity-first mobs where `AgentIdentity` is the durable member identity and everything else (runtime incarnation, comms, bridge/session transport) is hidden binding detail.
 
 ## Surfaces
 
@@ -99,7 +99,7 @@ For detailed mob behavior across all surfaces, load: `references/mobs.md`.
 - Spawned mob members use deferred initial turn semantics; mob actor lifecycle starts autonomous loops explicitly after spawn registration.
 - Mob persistence is SQLite/WAL-backed (`MobStorage::persistent()` opens `SqliteMobStores`). In-memory storage is used for tests and WASM. The previous exclusive-handle mob store has been removed.
 - Prefabs are gone. All mob creation uses `MobDefinition` only (CLI, REST, RPC, MCP, SDKs).
-- Agent-facing delegation tools (`delegate`, `mob_create`, `mob_destroy`, `mob_spawn_member`, `mob_retire_member`, `mob_check_member`, `mob_list_members`, `mob_list`, `mob_wire`, `mob_unwire`) are provided by `AgentMobToolSurface` in `meerkat-mob-mcp`. These tools let agents spawn and manage sub-agents through implicit session-owned mobs, and create/remove peer-to-peer comms links between members.
+- Agent-facing delegation tools (`delegate`, `mob_create`, `mob_destroy`, `mob_spawn_member`, `mob_retire_member`, `mob_check_member`, `mob_list_members`, `mob_list`, `mob_wire`, `mob_unwire`) are provided by `AgentMobToolSurface` in `meerkat-mob-mcp`. These tools let agents spawn and manage mob members through implicit session-owned mobs, and create/remove peer-to-peer comms links between members.
 - Portable mob artifacts are available through mobpack (`rkat mob pack/deploy/inspect/validate`) and browser deployment (`rkat mob web build`).
 
 ### Mob lifecycle (standard/default usage)
@@ -117,15 +117,14 @@ Where needed, direct lifecycle commands are available as operational compatibili
 rkat mob create --definition <path>
 rkat mob list
 rkat mob status <mob_id>
-rkat mob spawn <mob_id> <profile> <meerkat_id>
-rkat mob retire <mob_id> <meerkat_id>
-rkat mob respawn <mob_id> <meerkat_id> [--message <msg>]
+rkat mob spawn-helper <mob_id> <prompt> [--agent-identity <id>] [--profile <profile>]
+rkat mob member-status <mob_id> <agent_identity>
+rkat mob respawn <mob_id> <agent_identity> [--message <msg>]
 rkat mob wire <mob_id> <a> <b>
 rkat mob unwire <mob_id> <a> <b>
-rkat mob turn <mob_id> <meerkat_id> <message>
-rkat mob stop|resume|complete <mob_id>
-rkat mob events <mob_id> [--member <meerkat_id>]
-rkat mob destroy <mob_id>
+rkat mob force-cancel <mob_id> <agent_identity>
+rkat mob run-flow <mob_id> --flow <flow_id> [--params <json>]
+rkat mob wait-kickoff <mob_id> [--member <agent_identity>...]
 ```
 
 ### Mobpack + web build quick paths
@@ -172,7 +171,7 @@ const runtime = await MeerkatRuntime.init(wasm, {
   anthropicBaseUrl: 'http://localhost:3100/anthropic',
 });
 const mob = await runtime.createMob(definition);
-await mob.spawn([{ profile: 'worker', meerkat_id: 'w1' }]);
+await mob.spawn([{ profile: 'worker', agent_identity: 'w1' }]);
 ```
 
 **Architecture:**
@@ -283,7 +282,7 @@ OccurrenceLifecycleAuthority — authority-backed occurrence state transitions
 ScheduleStore           — persistence (Memory, SQLite)
 ```
 
-**Delivery**: The driver claims due occurrences, probes target availability, dispatches delivery (creates session + runs prompt), and monitors completion. The schedule host surface (`meerkat/src/surface/schedule_host.rs`) bridges delivery to `RuntimeSessionAdapter`.
+**Delivery**: The driver claims due occurrences, probes target availability, dispatches delivery (creates session + runs prompt), and monitors completion. The schedule host surface (`meerkat/src/surface/schedule_host.rs`) bridges delivery to `MeerkatMachine`.
 
 **Planning**: On create/update/resume, `ScheduleService` projects occurrences within a horizon (30 days or 64 occurrences). Old occurrences are superseded atomically via `atomic_plan_mutation()`.
 
@@ -515,7 +514,7 @@ Runtime epoch state (ops lifecycle, completion feed entries, consumer cursors) c
 
 Recovery contract: bounded-loss, no invisible completions, possible duplicate notices. Terminal transitions are persisted via a bounded persistence channel; the loss window is the time between channel send and store commit.
 
-Key types: `PersistedOpsSnapshot`, `EpochCursorState`, `EpochCursorSnapshot`. Recovery seam: `RuntimeSessionAdapter::recover_or_create_ops_state()`.
+Key types: `PersistedOpsSnapshot`, `EpochCursorState`, `EpochCursorSnapshot`. Recovery seam: `MeerkatMachine::recover_or_create_ops_state()`.
 
 ### Skills
 

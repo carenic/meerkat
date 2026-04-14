@@ -13,14 +13,17 @@ mod state;
 
 use crate::budget::Budget;
 use crate::comms::{
-    CommsCommand, EventStream, PeerDirectoryEntry, SendError, SendReceipt, StreamError,
-    StreamScope, TrustedPeerSpec,
+    CommsCommand, EventStream, PeerDirectoryEntry, SendAndStreamError, SendError, SendReceipt,
+    StreamError, StreamScope, TrustedPeerSpec,
 };
 use crate::compact::SessionCompactionCadence;
+use crate::completion_feed::CompletionSeq;
 use crate::config::{AgentConfig, HookRunOverrides};
 use crate::error::AgentError;
 use crate::event::ExternalToolDelta;
 use crate::hooks::HookEngine;
+use crate::lifecycle::RunId;
+use crate::ops::OperationId;
 use crate::ops_lifecycle::{OperationKind, OperationStatus, OperationTerminalOutcome};
 use crate::retry::RetryPolicy;
 use crate::schema::{CompiledSchema, SchemaError};
@@ -33,6 +36,9 @@ use crate::tool_catalog::{
     select_catalog_mode_from_snapshot,
 };
 use crate::tool_scope::ToolScope;
+use crate::turn_execution_authority::{
+    ContentShape, TurnPhase, TurnPrimitiveKind, TurnTerminalOutcome,
+};
 use crate::types::{
     AssistantBlock, BlockAssistantMessage, Message, OutputSchema, StopReason, ToolCallView,
     ToolDef, Usage,
@@ -45,16 +51,6 @@ use std::sync::Arc;
 
 pub use builder::AgentBuilder;
 pub use runner::AgentRunner;
-
-/// Special error prefix to signal tool calls that must be routed externally.
-///
-/// DEPRECATED: Use `ToolError::CallbackPending` or `AgentError::CallbackPending` instead.
-/// This constant is kept for backward compatibility but will be removed in a future version.
-#[deprecated(
-    since = "0.2.0",
-    note = "Use ToolError::CallbackPending or AgentError::CallbackPending instead"
-)]
-pub const CALLBACK_TOOL_PREFIX: &str = "CALLBACK_TOOL_PENDING:";
 
 /// Trait for LLM clients that can be used with the agent
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -130,6 +126,34 @@ impl LlmStreamResult {
     pub fn into_parts(self) -> (Vec<AssistantBlock>, StopReason, Usage) {
         (self.blocks, self.stop_reason, self.usage)
     }
+}
+
+/// Diagnostic snapshot of the core agent's live execution state.
+///
+/// This is an observational surface over the existing agent loop and
+/// `TurnExecutionAuthority`. It does not create new semantic ownership; it
+/// exposes the current canonical turn-execution truth for MeerkatMachine
+/// mapping work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentExecutionSnapshot {
+    pub loop_state: LoopState,
+    pub turn_phase: TurnPhase,
+    pub active_run_id: Option<RunId>,
+    pub primitive_kind: TurnPrimitiveKind,
+    pub admitted_content_shape: Option<ContentShape>,
+    pub vision_enabled: bool,
+    pub image_tool_results_enabled: bool,
+    pub tool_calls_pending: u32,
+    pub pending_operation_ids: Option<Vec<OperationId>>,
+    pub barrier_operation_ids: Vec<OperationId>,
+    pub has_barrier_ops: bool,
+    pub barrier_satisfied: bool,
+    pub boundary_count: u32,
+    pub cancel_after_boundary: bool,
+    pub terminal_outcome: TurnTerminalOutcome,
+    pub extraction_attempts: u32,
+    pub max_extraction_retries: u32,
+    pub applied_cursor: CompletionSeq,
 }
 
 /// Result of polling for external tool updates.
@@ -267,6 +291,15 @@ pub trait AgentToolDispatcher: Send + Sync {
         ExternalToolUpdate::default()
     }
 
+    /// Snapshot the live external tool-surface machine state, if supported.
+    ///
+    /// This is a hidden diagnostic surface for MeerkatMachine mapping work.
+    /// Dispatchers that do not own dynamic external tool mutation should
+    /// return `None`.
+    fn external_tool_surface_snapshot(&self) -> Option<crate::ExternalToolSurfaceSnapshot> {
+        None
+    }
+
     /// Query which optional bindings this dispatcher supports.
     fn capabilities(&self) -> DispatcherCapabilities {
         DispatcherCapabilities::default()
@@ -275,11 +308,14 @@ pub trait AgentToolDispatcher: Send + Sync {
     /// Bind a session-canonical ops registry into this dispatcher.
     ///
     /// Dispatchers that emit session-visible `AsyncOpRef`s must route those
-    /// operation IDs into the bound registry. Default returns Unsupported.
+    /// operation IDs into the bound registry. Under the identity-first Mob
+    /// regime the owner binding passed here is the canonical bridge session
+    /// binding, even though many compatibility surfaces still spell it
+    /// `session_id`. Default returns Unsupported.
     fn bind_ops_lifecycle(
         self: Arc<Self>,
         _registry: Arc<dyn crate::ops_lifecycle::OpsLifecycleRegistry>,
-        _owner_session_id: crate::types::SessionId,
+        _owner_bridge_session_id: crate::types::SessionId,
     ) -> Result<BindOutcome, OpsLifecycleBindError> {
         Err(OpsLifecycleBindError::Unsupported)
     }
@@ -398,6 +434,10 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher for Filtered
         self.inner.poll_external_updates().await
     }
 
+    fn external_tool_surface_snapshot(&self) -> Option<crate::ExternalToolSurfaceSnapshot> {
+        self.inner.external_tool_surface_snapshot()
+    }
+
     fn capabilities(&self) -> DispatcherCapabilities {
         self.inner.capabilities()
     }
@@ -405,11 +445,13 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher for Filtered
     fn bind_ops_lifecycle(
         self: Arc<Self>,
         registry: Arc<dyn crate::ops_lifecycle::OpsLifecycleRegistry>,
-        owner_session_id: crate::types::SessionId,
+        owner_bridge_session_id: crate::types::SessionId,
     ) -> Result<BindOutcome, OpsLifecycleBindError> {
         let owned = Arc::try_unwrap(self).map_err(|_| OpsLifecycleBindError::SharedOwnership)?;
         if Arc::strong_count(&owned.inner) == 1 {
-            let outcome = owned.inner.bind_ops_lifecycle(registry, owner_session_id)?;
+            let outcome = owned
+                .inner
+                .bind_ops_lifecycle(registry, owner_bridge_session_id)?;
             let bound = outcome.was_bound();
             let d = outcome.into_dispatcher();
             Ok(if bound {
@@ -528,6 +570,7 @@ pub trait CommsRuntime: Send + Sync {
     fn stream(&self, scope: StreamScope) -> Result<EventStream, StreamError> {
         let scope_desc = match scope {
             StreamScope::Session(session_id) => format!("session {session_id}"),
+            StreamScope::Interaction(interaction_id) => format!("interaction {}", interaction_id.0),
         };
         Err(StreamError::NotFound(scope_desc))
     }
@@ -542,6 +585,20 @@ pub trait CommsRuntime: Send + Sync {
     /// Implementations can override this to avoid materializing a full peer list.
     async fn peer_count(&self) -> usize {
         self.peers().await.len()
+    }
+
+    #[doc(hidden)]
+    async fn send_and_stream(
+        &self,
+        cmd: CommsCommand,
+    ) -> Result<(SendReceipt, EventStream), SendAndStreamError> {
+        let receipt = self.send(cmd).await?;
+        Err(SendAndStreamError::StreamAttach {
+            receipt,
+            error: StreamError::Internal(
+                "send_and_stream is not implemented for this runtime".to_string(),
+            ),
+        })
     }
 
     /// Drain comms inbox and return messages formatted for the LLM
@@ -616,10 +673,66 @@ pub trait CommsRuntime: Send + Sync {
     /// terminal events to the tap.
     fn mark_interaction_complete(&self, _id: &crate::interaction::InteractionId) {}
 
-    /// Drain machine-authored peer/event ingress candidates.
+    /// Drain classified inbox interactions.
     ///
-    /// Runtime-backed peer ingress must route through this canonical seam.
-    async fn drain_peer_input_candidates(&self) -> Vec<crate::interaction::PeerInputCandidate>;
+    /// Returns interactions with pre-computed classification from ingress.
+    /// The host loop routes on the stored `PeerInputClass` instead of
+    /// re-classifying after drain.
+    ///
+    /// Default returns `Unsupported`. Comms-enabled runtimes must override.
+    async fn drain_classified_inbox_interactions(
+        &self,
+    ) -> Result<Vec<crate::interaction::ClassifiedInboxInteraction>, CommsCapabilityError> {
+        Err(CommsCapabilityError::Unsupported(
+            "drain_classified_inbox_interactions".to_string(),
+        ))
+    }
+
+    /// Drain canonical peer/event ingress candidates.
+    ///
+    /// This remains the live runtime drain bridge for call sites that consume
+    /// the `PeerInputCandidate` noun directly. The underlying drain unit is
+    /// identical to `ClassifiedInboxInteraction`, so the default
+    /// implementation simply forwards the classified drain path.
+    async fn drain_peer_input_candidates(&self) -> Vec<crate::interaction::PeerInputCandidate> {
+        self.drain_classified_inbox_interactions()
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Snapshot the currently queued peer-ingress surface without draining it.
+    ///
+    /// This is a hidden diagnostic capability used while mapping the internal
+    /// MeerkatMachine boundary onto existing comms ownership.
+    async fn peer_ingress_queue_snapshot(
+        &self,
+    ) -> Result<crate::interaction::PeerIngressQueueSnapshot, CommsCapabilityError> {
+        Err(CommsCapabilityError::Unsupported(
+            "peer_ingress_queue_snapshot".to_string(),
+        ))
+    }
+
+    /// Snapshot the current peer runtime surface for MeerkatMachine mapping.
+    ///
+    /// This extends the queued ingress snapshot with the local trust membership
+    /// that governs peer admission.
+    async fn peer_ingress_runtime_snapshot(
+        &self,
+    ) -> Result<crate::interaction::PeerIngressRuntimeSnapshot, CommsCapabilityError> {
+        Err(CommsCapabilityError::Unsupported(
+            "peer_ingress_runtime_snapshot".to_string(),
+        ))
+    }
+
+    /// Get a notification that fires only for actionable peer input.
+    ///
+    /// Default returns `Unsupported`. Comms-enabled runtimes must override.
+    /// Used by the factory to bridge into `WaitTool` interrupt.
+    fn actionable_input_notify(&self) -> Result<Arc<tokio::sync::Notify>, CommsCapabilityError> {
+        Err(CommsCapabilityError::Unsupported(
+            "actionable_input_notify".to_string(),
+        ))
+    }
 }
 
 /// The main Agent struct
@@ -702,6 +815,8 @@ where
         Option<Arc<std::sync::RwLock<crate::service::MobToolAuthorityContext>>>,
     /// Machine authority for turn-execution state transitions (RMAT).
     pub(crate) turn_authority: crate::turn_execution_authority::TurnExecutionAuthority,
+    /// Shared live flag for cancellation at the next turn boundary.
+    pub(crate) cancel_after_boundary_requested: Arc<std::sync::atomic::AtomicBool>,
     /// Optional resolver for model-specific operational defaults (e.g., call timeout).
     /// Consulted at each LLM call for hot-swap-aware profile default resolution.
     pub(crate) model_defaults_resolver:
@@ -744,10 +859,6 @@ mod tests {
 
         fn inbox_notify(&self) -> std::sync::Arc<Notify> {
             self.notify.clone()
-        }
-
-        async fn drain_peer_input_candidates(&self) -> Vec<crate::interaction::PeerInputCandidate> {
-            Vec::new()
         }
     }
 

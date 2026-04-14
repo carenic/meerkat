@@ -19,13 +19,13 @@ mod tokio {
 use async_trait::async_trait;
 
 use meerkat_client::LlmClient;
-use meerkat_contracts::MobDefinitionInput;
+use meerkat_contracts::{MobDefinitionInput, MobPeerTarget};
 use meerkat_core::AppendSystemContextStatus;
 use meerkat_core::ScopedAgentEvent;
 use meerkat_core::agent::{AgentToolDispatcher, CommsRuntime as CoreCommsRuntime};
 use meerkat_core::comms::{CommsCommand, SendError, SendReceipt, TrustedPeerSpec};
 use meerkat_core::error::ToolError;
-use meerkat_core::interaction::InteractionId;
+use meerkat_core::interaction::{InteractionId, PeerInputCandidate};
 use meerkat_core::service::{
     AppendSystemContextRequest, AppendSystemContextResult, CreateSessionRequest,
     SessionControlError, SessionError, SessionHistoryPage, SessionHistoryQuery, SessionInfo,
@@ -39,7 +39,7 @@ use meerkat_core::types::{
 };
 use meerkat_core::{AgentEvent, EventEnvelope, EventStream, Provider, StreamError};
 use meerkat_mob::{
-    FlowId, MeerkatId, MobBackendKind, MobBuilder, MobDefinition, MobError, MobHandle, MobId,
+    AgentIdentity, FlowId, MobBackendKind, MobBuilder, MobDefinition, MobError, MobHandle, MobId,
     MobRuntimeMode, MobSessionService, MobState, MobStorage, ProfileName, RunId, SpawnMemberSpec,
 };
 use serde::Deserialize;
@@ -64,7 +64,7 @@ type DefaultLlmClientProvider = Arc<dyn Fn() -> Option<Arc<dyn LlmClient>> + Sen
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct KickoffMemberSnapshot {
-    pub meerkat_id: MeerkatId,
+    pub agent_identity: AgentIdentity,
     #[serde(flatten)]
     pub snapshot: meerkat_mob::MobMemberSnapshot,
 }
@@ -95,7 +95,7 @@ fn persisted_mob_binding(session: &meerkat_core::Session) -> Option<meerkat_mob:
 /// In-memory MCP state for multiple mobs.
 pub struct MobMcpState {
     session_service: Arc<dyn MobSessionService>,
-    runtime_adapter: Option<Arc<meerkat_runtime::RuntimeSessionAdapter>>,
+    runtime_adapter: Option<Arc<meerkat_runtime::MeerkatMachine>>,
     default_llm_client: Option<Arc<dyn LlmClient>>,
     default_llm_client_provider: Option<DefaultLlmClientProvider>,
     external_tools_provider: Option<meerkat_mob::ExternalToolsProvider>,
@@ -122,7 +122,7 @@ impl MobMcpState {
 
     pub fn new_with_runtime_adapter(
         session_service: Arc<dyn MobSessionService>,
-        runtime_adapter: Option<Arc<meerkat_runtime::RuntimeSessionAdapter>>,
+        runtime_adapter: Option<Arc<meerkat_runtime::MeerkatMachine>>,
     ) -> Self {
         Self {
             session_service,
@@ -354,7 +354,9 @@ impl MobMcpState {
                 }
             }
 
-            let _ = self.scavenge_orphaned_session_scoped_mobs_inner().await;
+            let _ = self
+                .scavenge_orphaned_bridge_session_scoped_mobs_inner()
+                .await;
             Ok(())
         }
     }
@@ -469,7 +471,8 @@ impl MobMcpState {
     }
 
     /// Destroy a mob. Rejects implicit delegation mobs — use
-    /// [`destroy_session_mobs`](Self::destroy_session_mobs) for session cleanup.
+    /// [`destroy_bridge_session_mobs`](Self::destroy_bridge_session_mobs) for
+    /// bridge-session cleanup.
     pub async fn mob_destroy(&self, mob_id: &MobId) -> Result<(), MobError> {
         if self.is_implicit_mob(mob_id).await {
             return Err(MobError::Internal(
@@ -523,11 +526,11 @@ impl MobMcpState {
         &self,
         mob_id: &MobId,
         profile: ProfileName,
-        meerkat_id: MeerkatId,
+        identity: AgentIdentity,
         runtime_mode: Option<MobRuntimeMode>,
         backend: Option<MobBackendKind>,
-    ) -> Result<meerkat_mob::MemberRef, MobError> {
-        let mut spec = SpawnMemberSpec::new(profile, meerkat_id);
+    ) -> Result<meerkat_mob::SpawnResult, MobError> {
+        let mut spec = SpawnMemberSpec::new(profile, identity);
         spec.runtime_mode = runtime_mode;
         spec.backend = backend;
         self.mob_spawn_spec(mob_id, spec).await
@@ -537,29 +540,30 @@ impl MobMcpState {
         &self,
         mob_id: &MobId,
         spec: SpawnMemberSpec,
-    ) -> Result<meerkat_mob::MemberRef, MobError> {
-        let member_ref = self.handle_for(mob_id).await?.spawn_spec(spec).await?;
-        Ok(member_ref)
+    ) -> Result<meerkat_mob::SpawnResult, MobError> {
+        self.handle_for(mob_id).await?.spawn_spec(spec).await
     }
 
     pub async fn mob_spawn_many(
         &self,
         mob_id: &MobId,
         specs: Vec<SpawnMemberSpec>,
-    ) -> Result<Vec<Result<meerkat_mob::MemberRef, MobError>>, MobError> {
+    ) -> Result<Vec<Result<meerkat_mob::SpawnResult, MobError>>, MobError> {
         Ok(self.handle_for(mob_id).await?.spawn_many(specs).await)
     }
 
-    pub async fn mob_retire(&self, mob_id: &MobId, meerkat_id: MeerkatId) -> Result<(), MobError> {
-        self.handle_for(mob_id)
-            .await?
-            .retire(meerkat_id.clone())
-            .await
+    pub async fn mob_retire(
+        &self,
+        mob_id: &MobId,
+        identity: AgentIdentity,
+    ) -> Result<(), MobError> {
+        self.handle_for(mob_id).await?.retire(identity).await
     }
 
-    pub async fn retire_member_by_session_id(
+    #[doc(hidden)]
+    pub async fn retire_member_by_bridge_session_id(
         &self,
-        session_id: &SessionId,
+        bridge_session_id: &SessionId,
     ) -> Result<(), MobError> {
         self.ensure_restored().await?;
         // Derive membership from authoritative live mob roster state rather than
@@ -568,61 +572,55 @@ impl MobMcpState {
         let mob_ids = self.mobs.read().await.keys().cloned().collect::<Vec<_>>();
         let mut resolved = None;
         for mob_id in mob_ids {
-            let members = self.handle_for(&mob_id).await?.list_all_members().await;
-            if let Some(member) = members.into_iter().find(|member| {
-                member
-                    .member_ref
-                    .session_id()
-                    .is_some_and(|candidate| candidate == session_id)
-            }) {
-                resolved = Some((mob_id, member.meerkat_id));
+            let roster = self.handle_for(&mob_id).await?.roster().await;
+            if let Some(entry) = roster.find_by_bridge_session_id(bridge_session_id) {
+                resolved = Some((mob_id, entry.agent_identity.clone()));
                 break;
             }
         }
-        let Some((mob_id, meerkat_id)) = resolved else {
-            if self.owns_persisted_session(session_id).await {
+        let Some((mob_id, identity)) = resolved else {
+            if self.owns_persisted_bridge_session(bridge_session_id).await {
                 return self
                     .session_service()
-                    .archive(session_id)
+                    .archive(bridge_session_id)
                     .await
                     .map_err(|error| {
                         MobError::Internal(format!(
-                            "failed to archive persisted mob-owned session '{session_id}': {error}"
+                            "failed to archive persisted mob-owned bridge session '{bridge_session_id}': {error}"
                         ))
                     });
             }
             return Err(MobError::Internal(format!(
-                "session not found in any live mob authority: {session_id}"
+                "bridge session not found in any live mob authority: {bridge_session_id}"
             )));
         };
-        self.mob_retire(&mob_id, meerkat_id).await
+        self.mob_retire(&mob_id, identity).await
     }
 
-    pub async fn owns_live_session(&self, session_id: &SessionId) -> bool {
-        if !self.ensure_restored_best_effort("owns_live_session").await {
+    #[doc(hidden)]
+    pub async fn owns_live_bridge_session(&self, bridge_session_id: &SessionId) -> bool {
+        if !self
+            .ensure_restored_best_effort("owns_live_bridge_session")
+            .await
+        {
             return false;
         }
         let mob_ids = self.mobs.read().await.keys().cloned().collect::<Vec<_>>();
         for mob_id in mob_ids {
-            if let Ok(handle) = self.handle_for(&mob_id).await {
-                let members = handle.list_all_members().await;
-                if members.into_iter().any(|member| {
-                    member
-                        .member_ref
-                        .session_id()
-                        .is_some_and(|candidate| candidate == session_id)
-                }) {
-                    return true;
-                }
+            if let Ok(handle) = self.handle_for(&mob_id).await
+                && handle.roster().await.has_bridge_session(bridge_session_id)
+            {
+                return true;
             }
         }
         false
     }
 
-    pub async fn owns_persisted_session(&self, session_id: &SessionId) -> bool {
+    #[doc(hidden)]
+    pub async fn owns_persisted_bridge_session(&self, bridge_session_id: &SessionId) -> bool {
         let Some(session) = self
             .session_service()
-            .load_persisted_session(session_id)
+            .load_persisted_session(bridge_session_id)
             .await
             .ok()
             .flatten()
@@ -634,15 +632,10 @@ impl MobMcpState {
             return false;
         };
         match self.handle_for(&mob_id).await {
-            Ok(handle) => handle.list_all_members().await.into_iter().any(|member| {
-                member
-                    .member_ref
-                    .session_id()
-                    .is_some_and(|candidate| candidate == session_id)
-            }),
+            Ok(handle) => handle.roster().await.has_bridge_session(bridge_session_id),
             Err(_) => {
                 self.session_service()
-                    .session_belongs_to_mob(session_id, &mob_id)
+                    .session_belongs_to_mob(bridge_session_id, &mob_id)
                     .await
             }
         }
@@ -651,7 +644,7 @@ impl MobMcpState {
     pub async fn mob_wire(
         &self,
         mob_id: &MobId,
-        local: MeerkatId,
+        local: AgentIdentity,
         target: meerkat_mob::PeerTarget,
     ) -> Result<(), MobError> {
         self.handle_for(mob_id).await?.wire(local, target).await
@@ -660,7 +653,7 @@ impl MobMcpState {
     pub async fn mob_unwire(
         &self,
         mob_id: &MobId,
-        local: MeerkatId,
+        local: AgentIdentity,
         target: meerkat_mob::PeerTarget,
     ) -> Result<(), MobError> {
         self.handle_for(mob_id).await?.unwire(local, target).await
@@ -680,40 +673,39 @@ impl MobMcpState {
     pub async fn mob_append_system_context(
         &self,
         mob_id: &MobId,
-        meerkat_id: &MeerkatId,
+        identity: &AgentIdentity,
         req: AppendSystemContextRequest,
     ) -> Result<(SessionId, AppendSystemContextResult), SessionControlError> {
-        let members: Vec<meerkat_mob::runtime::MobMemberListEntry> = self
-            .mob_list_members(mob_id)
+        let handle =
+            self.handle_for(mob_id)
+                .await
+                .map_err(|error| SessionControlError::InvalidRequest {
+                    message: error.to_string(),
+                })?;
+        let bridge_session_id = handle
+            .resolve_bridge_session_id(identity)
             .await
-            .map_err(|error| SessionControlError::InvalidRequest {
-                message: error.to_string(),
-            })?;
-        let session_id = members
-            .into_iter()
-            .find(|member| member.meerkat_id == *meerkat_id)
-            .and_then(|member| member.member_ref.session_id().cloned())
             .ok_or_else(|| SessionControlError::InvalidRequest {
-                message: format!("member has no session: {meerkat_id}"),
+                message: format!("member has no session: {identity}"),
             })?;
         let result = self
             .session_service()
-            .append_system_context(&session_id, req)
+            .append_system_context(&bridge_session_id, req)
             .await?;
-        Ok((session_id, result))
+        Ok((bridge_session_id, result))
     }
 
     pub async fn mob_member_send(
         &self,
         mob_id: &MobId,
-        meerkat_id: MeerkatId,
+        identity: AgentIdentity,
         content: ContentInput,
         handling_mode: HandlingMode,
         render_metadata: Option<RenderMetadata>,
     ) -> Result<meerkat_mob::MemberDeliveryReceipt, MobError> {
         self.handle_for(mob_id)
             .await?
-            .member(&meerkat_id)
+            .member(&identity)
             .await?
             .send_with_render_metadata(content, handling_mode, render_metadata)
             .await
@@ -778,39 +770,36 @@ impl MobMcpState {
     pub async fn mob_respawn(
         &self,
         mob_id: &MobId,
-        meerkat_id: MeerkatId,
+        identity: AgentIdentity,
         initial_message: Option<meerkat_core::types::ContentInput>,
     ) -> Result<meerkat_mob::MemberRespawnReceipt, meerkat_mob::MobRespawnError> {
         let handle = self.handle_for(mob_id).await?;
-        handle.respawn(meerkat_id, initial_message).await
+        handle.respawn(identity, initial_message).await
     }
 
     pub async fn mob_force_cancel(
         &self,
         mob_id: &MobId,
-        meerkat_id: MeerkatId,
+        identity: AgentIdentity,
     ) -> Result<(), MobError> {
         self.handle_for(mob_id)
             .await?
-            .force_cancel_member(meerkat_id)
+            .force_cancel_member(identity)
             .await
     }
 
     pub async fn mob_member_status(
         &self,
         mob_id: &MobId,
-        meerkat_id: &MeerkatId,
+        identity: &AgentIdentity,
     ) -> Result<meerkat_mob::MobMemberSnapshot, MobError> {
-        self.handle_for(mob_id)
-            .await?
-            .member_status(meerkat_id)
-            .await
+        self.handle_for(mob_id).await?.member_status(identity).await
     }
 
     pub async fn mob_wait_kickoff(
         &self,
         mob_id: &MobId,
-        member_ids: Option<Vec<MeerkatId>>,
+        member_ids: Option<Vec<AgentIdentity>>,
         timeout_ms: Option<u64>,
     ) -> Result<Vec<KickoffMemberSnapshot>, MobError> {
         let handle = self.handle_for(mob_id).await?;
@@ -825,8 +814,8 @@ impl MobMcpState {
         };
         Ok(snapshots
             .into_iter()
-            .map(|(meerkat_id, snapshot)| KickoffMemberSnapshot {
-                meerkat_id,
+            .map(|(identity, snapshot)| KickoffMemberSnapshot {
+                agent_identity: identity,
                 snapshot,
             })
             .collect())
@@ -835,28 +824,28 @@ impl MobMcpState {
     pub async fn mob_spawn_helper(
         &self,
         mob_id: &MobId,
-        meerkat_id: MeerkatId,
+        identity: AgentIdentity,
         prompt: String,
         options: meerkat_mob::HelperOptions,
     ) -> Result<meerkat_mob::HelperResult, MobError> {
         self.handle_for(mob_id)
             .await?
-            .spawn_helper(meerkat_id, prompt, options)
+            .spawn_helper(identity, prompt, options)
             .await
     }
 
     pub async fn mob_fork_helper(
         &self,
         mob_id: &MobId,
-        source_member_id: &MeerkatId,
-        meerkat_id: MeerkatId,
+        source_identity: &AgentIdentity,
+        identity: AgentIdentity,
         prompt: String,
         fork_context: meerkat_mob::ForkContext,
         options: meerkat_mob::HelperOptions,
     ) -> Result<meerkat_mob::HelperResult, MobError> {
         self.handle_for(mob_id)
             .await?
-            .fork_helper(source_member_id, meerkat_id, prompt, fork_context, options)
+            .fork_helper(source_identity, identity, prompt, fork_context, options)
             .await
     }
 
@@ -865,35 +854,43 @@ impl MobMcpState {
         &self,
         mob_id: &MobId,
     ) -> Result<meerkat_mob::MobEventRouterHandle, MobError> {
-        Ok(self.handle_for(mob_id).await?.subscribe_mob_events())
+        Ok(self.handle_for(mob_id).await?.subscribe_mob_events().await)
     }
 
     /// Subscribe to agent-level events for a specific member.
     pub async fn subscribe_agent_events(
         &self,
         mob_id: &MobId,
-        meerkat_id: &MeerkatId,
+        identity: &AgentIdentity,
     ) -> Result<meerkat_core::comms::EventStream, MobError> {
         self.handle_for(mob_id)
             .await?
-            .subscribe_agent_events(meerkat_id)
+            .subscribe_agent_events(identity)
             .await
     }
 
-    /// Find the implicit delegation mob for the given session, if one exists.
+    /// Find the implicit delegation mob for the given bridge session, if one exists.
     ///
     /// Scans the in-memory mob registry for a mob whose definition has
-    /// `is_implicit == true` and `owner_session_id` matching the given session ID.
+    /// `is_implicit == true` and an owner bridge-session index matching the
+    /// given bridge session ID.
     /// Does NOT match explicit mobs that merely share the same owner.
-    pub async fn find_implicit_mob(&self, session_id: &str) -> Option<MobId> {
-        if !self.ensure_restored_best_effort("find_implicit_mob").await {
+    #[doc(hidden)]
+    pub async fn find_implicit_mob_for_bridge_session(
+        &self,
+        bridge_session_id: &str,
+    ) -> Option<MobId> {
+        if !self
+            .ensure_restored_best_effort("find_implicit_mob_for_bridge_session")
+            .await
+        {
             return None;
         }
         let mobs = self.mobs.read().await;
         mobs.iter()
             .find(|(_, m)| {
                 let def = m.handle.definition();
-                def.is_implicit && def.is_owned_by_session(session_id)
+                def.is_implicit && def.has_owner_bridge_session_index(bridge_session_id)
             })
             .map(|(id, _)| id.clone())
     }
@@ -901,6 +898,7 @@ impl MobMcpState {
     /// Check whether the given mob is an implicit delegation mob.
     ///
     /// Checks the canonical `is_implicit` field on the mob definition.
+    #[doc(hidden)]
     pub async fn is_implicit_mob(&self, mob_id: &MobId) -> bool {
         if !self.ensure_restored_best_effort("is_implicit_mob").await {
             return false;
@@ -911,10 +909,12 @@ impl MobMcpState {
             .unwrap_or(false)
     }
 
-    /// Find all mobs indexed to the given session (both implicit and explicit).
-    pub async fn find_mobs_for_session(&self, session_id: &str) -> Vec<MobId> {
+    /// Find all mobs indexed to the given owner bridge session
+    /// (both implicit and explicit).
+    #[doc(hidden)]
+    pub async fn find_mobs_for_bridge_session(&self, bridge_session_id: &str) -> Vec<MobId> {
         if !self
-            .ensure_restored_best_effort("find_mobs_for_session")
+            .ensure_restored_best_effort("find_mobs_for_bridge_session")
             .await
         {
             return Vec::new();
@@ -922,7 +922,10 @@ impl MobMcpState {
         let mobs = self.mobs.read().await;
         mobs.iter()
             .filter_map(|(id, m)| {
-                if m.handle.definition().is_owned_by_session(session_id) {
+                if m.handle
+                    .definition()
+                    .has_owner_bridge_session_index(bridge_session_id)
+                {
                     Some(id.clone())
                 } else {
                     None
@@ -931,9 +934,9 @@ impl MobMcpState {
             .collect()
     }
 
-    async fn find_session_scoped_mobs(&self, session_id: &str) -> Vec<MobId> {
+    async fn find_bridge_session_scoped_mobs(&self, bridge_session_id: &str) -> Vec<MobId> {
         if !self
-            .ensure_restored_best_effort("find_session_scoped_mobs")
+            .ensure_restored_best_effort("find_bridge_session_scoped_mobs")
             .await
         {
             return Vec::new();
@@ -941,7 +944,10 @@ impl MobMcpState {
         let mobs = self.mobs.read().await;
         mobs.iter()
             .filter_map(|(id, m)| {
-                if m.handle.definition().is_session_scoped_to(session_id) {
+                if m.handle
+                    .definition()
+                    .is_cleanup_scoped_to_owner_bridge_session(bridge_session_id)
+                {
                     Some(id.clone())
                 } else {
                     None
@@ -953,7 +959,7 @@ impl MobMcpState {
     async fn implicit_mob_matches_session_model(
         &self,
         mob_id: &MobId,
-        session_id: &str,
+        bridge_session_id: &str,
         model: &str,
     ) -> bool {
         let delegate_profile = ProfileName::from("delegate");
@@ -961,7 +967,7 @@ impl MobMcpState {
         mobs.get(mob_id).is_some_and(|managed| {
             let definition = managed.handle.definition();
             definition.is_implicit
-                && definition.is_owned_by_session(session_id)
+                && definition.has_owner_bridge_session_index(bridge_session_id)
                 && definition
                     .resolve_inline_profile(&delegate_profile)
                     .is_some_and(|profile| profile.model == model)
@@ -969,38 +975,42 @@ impl MobMcpState {
     }
 
     /// Ensure the canonical implicit delegation mob exists for the given
-    /// session/model pair.
+    /// owner bridge session/model pair.
     ///
     /// This is the sole owner of implicit-mob model reconciliation. Tool
     /// surfaces may provide a cached mob-id hint for the fast path, but they
     /// must not destroy or recreate mobs themselves.
+    #[doc(hidden)]
     pub async fn ensure_implicit_mob_for_model(
         &self,
-        session_id: &str,
+        bridge_session_id: &str,
         model: &str,
         cached_mob_id: Option<&MobId>,
     ) -> Result<(MobId, bool), MobError> {
         if let Some(cached_mob_id) = cached_mob_id
             && self
-                .implicit_mob_matches_session_model(cached_mob_id, session_id, model)
+                .implicit_mob_matches_session_model(cached_mob_id, bridge_session_id, model)
                 .await
         {
             return Ok((cached_mob_id.clone(), false));
         }
 
-        // Get or create a per-session lock
+        // Get or create a per-owner-bridge-session lock
         let session_lock = {
             let mut locks = self.implicit_mob_locks.lock().await;
             locks
-                .entry(session_id.to_string())
+                .entry(bridge_session_id.to_string())
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
         let _guard = session_lock.lock().await;
 
-        if let Some(mob_id) = self.find_implicit_mob(session_id).await {
+        if let Some(mob_id) = self
+            .find_implicit_mob_for_bridge_session(bridge_session_id)
+            .await
+        {
             if self
-                .implicit_mob_matches_session_model(&mob_id, session_id, model)
+                .implicit_mob_matches_session_model(&mob_id, bridge_session_id, model)
                 .await
             {
                 return Ok((mob_id, false));
@@ -1009,33 +1019,42 @@ impl MobMcpState {
         }
 
         let mob_id = self
-            .mob_create_definition(MobDefinition::implicit(session_id, model))
+            .mob_create_definition(MobDefinition::implicit(bridge_session_id, model))
             .await?;
         Ok((mob_id, true))
     }
 
-    /// Get or create the implicit delegation mob for the given session.
+    /// Get or create the implicit delegation mob for the given owner bridge
+    /// session.
     ///
-    /// Uses a per-session mutex to ensure single-flight creation: the first
+    /// Uses a per-bridge-session mutex to ensure single-flight creation: the first
     /// caller creates the mob, concurrent callers block and receive the same
-    /// mob ID. The mob is indexed to the owning session and marked session-scoped.
-    pub async fn get_or_create_implicit_mob(
+    /// mob ID. The mob is indexed to the owning bridge session and marked
+    /// bridge-session-scoped.
+    #[doc(hidden)]
+    pub async fn get_or_create_implicit_mob_for_bridge_session(
         &self,
-        session_id: &str,
+        bridge_session_id: &str,
         model: &str,
     ) -> Result<MobId, MobError> {
-        self.ensure_implicit_mob_for_model(session_id, model, None)
+        self.ensure_implicit_mob_for_model(bridge_session_id, model, None)
             .await
             .map(|(mob_id, _created)| mob_id)
     }
 
-    /// Destroy all session-scoped mobs for the given session.
+    /// Destroy all bridge-session-scoped mobs for the given owner bridge session.
     ///
     /// Called during session archive to clean up mobs whose cleanup truth is
-    /// `DestroyOnOwnerArchive`. `owner_session_id` alone is not sufficient.
-    pub async fn destroy_session_mobs(&self, session_id: &str) -> Result<(), MobError> {
+    /// `DestroyOnOwnerArchive`. Owner indexing alone is not sufficient.
+    #[doc(hidden)]
+    pub async fn destroy_bridge_session_mobs(
+        &self,
+        bridge_session_id: &str,
+    ) -> Result<(), MobError> {
         self.ensure_restored().await?;
-        let mob_ids = self.find_session_scoped_mobs(session_id).await;
+        let mob_ids = self
+            .find_bridge_session_scoped_mobs(bridge_session_id)
+            .await;
         if mob_ids.is_empty() {
             return Ok(());
         }
@@ -1043,35 +1062,44 @@ impl MobMcpState {
             if let Err(error) = self.mob_destroy_unchecked(mob_id).await {
                 tracing::warn!(
                     mob_id = %mob_id,
-                    session_id = %session_id,
+                    bridge_session_id = %bridge_session_id,
                     error = %error,
-                    "failed to destroy session-scoped mob during cleanup"
+                    "failed to destroy bridge-session-scoped mob during cleanup"
                 );
             }
         }
-        // Prune the per-session lock to avoid unbounded growth in long-lived processes.
+        // Prune the per-bridge-session lock to avoid unbounded growth in long-lived processes.
         let mut locks = self.implicit_mob_locks.lock().await;
-        locks.remove(session_id);
+        locks.remove(bridge_session_id);
         Ok(())
     }
 
-    /// Scavenge orphaned session-scoped mobs whose owning sessions no longer exist.
+    /// Scavenge orphaned bridge-session-scoped mobs whose owning sessions no
+    /// longer exist.
     ///
     /// Called during hydration at startup. For each mob marked
-    /// `DestroyOnOwnerArchive`, checks whether the indexed owning session still
-    /// exists. If not, destroys the mob. Returns the list of scavenged mob IDs.
-    pub async fn scavenge_orphaned_session_scoped_mobs(&self) -> Vec<MobId> {
+    /// `DestroyOnOwnerArchive`, checks whether the indexed owning bridge session
+    /// still exists. If not, destroys the mob. Returns the list of scavenged
+    /// mob IDs.
+    #[doc(hidden)]
+    pub async fn scavenge_orphaned_bridge_session_scoped_mobs(&self) -> Vec<MobId> {
         if !self
-            .ensure_restored_best_effort("scavenge_orphaned_session_scoped_mobs")
+            .ensure_restored_best_effort("scavenge_orphaned_bridge_session_scoped_mobs")
             .await
         {
             return Vec::new();
         }
-        self.scavenge_orphaned_session_scoped_mobs_inner().await
+        self.scavenge_orphaned_bridge_session_scoped_mobs_inner()
+            .await
     }
 
-    async fn scavenge_orphaned_session_scoped_mobs_inner(&self) -> Vec<MobId> {
-        // Collect session-scoped cleanup candidates under a read lock.
+    /// Compatibility wrapper for callers that still use session-centric naming.
+    pub async fn scavenge_orphaned_session_scoped_mobs(&self) -> Vec<MobId> {
+        self.scavenge_orphaned_bridge_session_scoped_mobs().await
+    }
+
+    async fn scavenge_orphaned_bridge_session_scoped_mobs_inner(&self) -> Vec<MobId> {
+        // Collect bridge-session-scoped cleanup candidates under a read lock.
         let candidates: Vec<(MobId, String)> = {
             let mobs = self.mobs.read().await;
             mobs.iter()
@@ -1081,9 +1109,8 @@ impl MobMcpState {
                         == meerkat_mob::definition::SessionCleanupPolicy::DestroyOnOwnerArchive
                     {
                         definition
-                            .owner_session_id
-                            .as_ref()
-                            .map(|sid| (id.clone(), sid.clone()))
+                            .owner_bridge_session_index()
+                            .map(|sid| (id.clone(), sid.to_string()))
                     } else {
                         None
                     }
@@ -1092,12 +1119,12 @@ impl MobMcpState {
         };
 
         let mut scavenged = Vec::new();
-        for (mob_id, session_id) in candidates {
-            let session_id = match SessionId::parse(&session_id) {
+        for (mob_id, bridge_session_id) in candidates {
+            let bridge_session_id = match SessionId::parse(&bridge_session_id) {
                 Ok(id) => id,
                 Err(_) => continue,
             };
-            let is_orphan = match self.session_service.read(&session_id).await {
+            let is_orphan = match self.session_service.read(&bridge_session_id).await {
                 Ok(_) => false,
                 Err(SessionError::NotFound { .. }) => true,
                 Err(_) => false, // Unknown error — don't scavenge
@@ -1106,20 +1133,20 @@ impl MobMcpState {
                 if let Err(error) = self.mob_destroy_unchecked_loaded(&mob_id).await {
                     tracing::warn!(
                         mob_id = %mob_id,
-                        session_id = %session_id,
+                        bridge_session_id = %bridge_session_id,
                         error = %error,
-                        "failed to scavenge orphaned session-scoped mob"
+                        "failed to scavenge orphaned bridge-session-scoped mob"
                     );
                 } else {
                     tracing::info!(
                         mob_id = %mob_id,
-                        session_id = %session_id,
-                        "scavenged orphaned session-scoped mob"
+                        bridge_session_id = %bridge_session_id,
+                        "scavenged orphaned bridge-session-scoped mob"
                     );
                     scavenged.push(mob_id);
-                    // Prune per-session lock to avoid unbounded growth.
+                    // Prune per-bridge-session lock to avoid unbounded growth.
                     let mut locks = self.implicit_mob_locks.lock().await;
-                    locks.remove(&session_id.to_string());
+                    locks.remove(&bridge_session_id.to_string());
                 }
             }
         }
@@ -1216,7 +1243,7 @@ impl MobMcpState {
     pub fn new_in_memory() -> Arc<Self> {
         let state = Self::new_with_runtime_adapter(
             Arc::new(LocalSessionService::new()),
-            Some(Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral())),
+            Some(Arc::new(meerkat_runtime::MeerkatMachine::ephemeral())),
         );
         Arc::new(state)
     }
@@ -1257,6 +1284,7 @@ impl CoreCommsRuntime for LocalCommsRuntime {
     async fn send(&self, _cmd: CommsCommand) -> Result<SendReceipt, SendError> {
         Ok(SendReceipt::InputAccepted {
             interaction_id: InteractionId(uuid::Uuid::nil()),
+            stream_reserved: false,
         })
     }
 
@@ -1268,7 +1296,7 @@ impl CoreCommsRuntime for LocalCommsRuntime {
         self.notify.clone()
     }
 
-    async fn drain_peer_input_candidates(&self) -> Vec<meerkat_core::PeerInputCandidate> {
+    async fn drain_peer_input_candidates(&self) -> Vec<PeerInputCandidate> {
         Vec::new()
     }
 }
@@ -1622,9 +1650,9 @@ impl MobSessionService for LocalSessionService {
         true
     }
 
-    fn runtime_adapter(&self) -> Option<std::sync::Arc<meerkat_runtime::RuntimeSessionAdapter>> {
+    fn runtime_adapter(&self) -> Option<std::sync::Arc<meerkat_runtime::MeerkatMachine>> {
         Some(std::sync::Arc::new(
-            meerkat_runtime::RuntimeSessionAdapter::ephemeral(),
+            meerkat_runtime::MeerkatMachine::ephemeral(),
         ))
     }
 
@@ -1721,12 +1749,12 @@ impl MobMcpDispatcher {
                 &format!("Cancel an in-flight flow run by run_id. {COMMON}"),
                 json!({"type":"object","properties":{"mob_id":{"type":"string"},"run_id":{"type":"string"}},"required":["mob_id","run_id"]}),
             ),
-            // ── Member-level (meerkat_*) ───────────────────────────────
+            // ── Member-level (mob_* member ops) ────────────────────────
             tool(
-                "meerkat_spawn",
-                &format!("Spawn one or more meerkats. Required: mob_id, specs[].profile, specs[].meerkat_id. \
+                "mob_spawn_member",
+                &format!("Spawn one or more mob members. Required: mob_id, specs[].profile, specs[].agent_identity. \
                      Optional per-spec: backend=session|external, runtime_mode=autonomous_host|turn_driven, \
-                     initial_message, resume_session_id, labels (key-value map), context (opaque JSON). {COMMON}"),
+                     initial_message, labels (key-value map), context (opaque JSON). {COMMON}"),
                 json!({
                     "type":"object",
                     "properties":{
@@ -1737,15 +1765,14 @@ impl MobMcpDispatcher {
                                 "type":"object",
                                 "properties":{
                                     "profile":{"type":"string"},
-                                    "meerkat_id":{"type":"string"},
+                                    "agent_identity":{"type":"string"},
                                     "initial_message": content_input_schema(),
                                     "backend":{"type":"string","enum":["session","external"]},
                                     "runtime_mode":{"type":"string","enum":["autonomous_host","turn_driven"]},
-                                    "resume_session_id":{"type":"string"},
                                     "labels":{"type":"object","additionalProperties":{"type":"string"}},
                                     "context":{"type":"object"}
                                 },
-                                "required":["profile","meerkat_id"]
+                                "required":["profile","agent_identity"]
                             }
                         }
                     },
@@ -1753,39 +1780,71 @@ impl MobMcpDispatcher {
                 }),
             ),
             tool(
-                "meerkat_retire",
-                &format!("Retire a spawned meerkat by ID. {COMMON}"),
-                json!({"type":"object","properties":{"mob_id":{"type":"string"},"meerkat_id":{"type":"string"}},"required":["mob_id","meerkat_id"]}),
+                "mob_retire_member",
+                &format!("Retire a spawned mob member by identity. {COMMON}"),
+                json!({"type":"object","properties":{"mob_id":{"type":"string"},"agent_identity":{"type":"string"}},"required":["mob_id","agent_identity"]}),
             ),
             tool(
-                "meerkat_list",
-                &format!("List current meerkats in a mob. {COMMON}"),
+                "mob_list_members",
+                &format!("List current members in a mob. {COMMON}"),
                 json!({"type":"object","properties":{"mob_id":{"type":"string"}},"required":["mob_id"]}),
             ),
             tool(
-                "meerkat_wire",
-                &format!("Wire or unwire bidirectional trust between two meerkats. \
+                "mob_wire",
+                &format!("Wire or unwire bidirectional trust between a local member and a peer target. \
                      action: wire | unwire. {COMMON}"),
-                json!({"type":"object","properties":{"mob_id":{"type":"string"},"a":{"type":"string"},"b":{"type":"string"},"action":{"type":"string","enum":["wire","unwire"]}},"required":["mob_id","a","b","action"]}),
+                json!({
+                    "type":"object",
+                    "properties":{
+                        "mob_id":{"type":"string"},
+                        "agent_identity":{"type":"string"},
+                        "peer":{
+                            "oneOf":[
+                                {
+                                    "type":"object",
+                                    "properties":{"local":{"type":"string"}},
+                                    "required":["local"]
+                                },
+                                {
+                                    "type":"object",
+                                    "properties":{
+                                        "external":{
+                                            "type":"object",
+                                            "properties":{
+                                                "name":{"type":"string"},
+                                                "peer_id":{"type":"string"},
+                                                "address":{"type":"string"}
+                                            },
+                                            "required":["name","peer_id","address"]
+                                        }
+                                    },
+                                    "required":["external"]
+                                }
+                            ]
+                        },
+                        "action":{"type":"string","enum":["wire","unwire"]}
+                    },
+                    "required":["mob_id","agent_identity","peer","action"]
+                }),
             ),
             tool(
                 "mob_respawn",
-                &format!("Retire and re-spawn a meerkat with the same profile. \
-                     Required: mob_id, meerkat_id. Optional: initial_message. \
-                     Returns a receipt with old/new session IDs. {COMMON}"),
-                json!({"type":"object","properties":{"mob_id":{"type":"string"},"meerkat_id":{"type":"string"},"initial_message": content_input_schema()},"required":["mob_id","meerkat_id"]}),
+                &format!("Retire and re-spawn a member with the same profile. \
+                     Required: mob_id, agent_identity. Optional: initial_message. \
+                     Returns an identity-native respawn receipt. {COMMON}"),
+                json!({"type":"object","properties":{"mob_id":{"type":"string"},"agent_identity":{"type":"string"},"initial_message": content_input_schema()},"required":["mob_id","agent_identity"]}),
             ),
             tool(
-                "meerkat_force_cancel",
-                &format!("Force-cancel a meerkat's in-flight turn. Unlike retire, this \
+                "mob_force_cancel",
+                &format!("Force-cancel a member's in-flight turn. Unlike retire, this \
                      interrupts immediately without graceful shutdown. {COMMON}"),
-                json!({"type":"object","properties":{"mob_id":{"type":"string"},"meerkat_id":{"type":"string"}},"required":["mob_id","meerkat_id"]}),
+                json!({"type":"object","properties":{"mob_id":{"type":"string"},"agent_identity":{"type":"string"}},"required":["mob_id","agent_identity"]}),
             ),
             tool(
-                "meerkat_status",
-                &format!("Get execution status snapshot for a meerkat. Returns status, \
+                "mob_member_status",
+                &format!("Get execution status snapshot for a member. Returns status, \
                      output_preview, tokens_used, and is_final. {COMMON}"),
-                json!({"type":"object","properties":{"mob_id":{"type":"string"},"meerkat_id":{"type":"string"}},"required":["mob_id","meerkat_id"]}),
+                json!({"type":"object","properties":{"mob_id":{"type":"string"},"agent_identity":{"type":"string"}},"required":["mob_id","agent_identity"]}),
             ),
             tool(
                 "mob_wait_kickoff",
@@ -1883,7 +1942,7 @@ struct MobIdArgs {
 #[derive(Deserialize)]
 struct MobSpawnMeerkatArgs {
     profile: String,
-    meerkat_id: String,
+    agent_identity: String,
     #[serde(default)]
     initial_message: Option<ContentInput>,
     #[serde(default)]
@@ -1892,8 +1951,6 @@ struct MobSpawnMeerkatArgs {
     binding: Option<meerkat_mob::RuntimeBinding>,
     #[serde(default)]
     runtime_mode: Option<MobRuntimeMode>,
-    #[serde(default)]
-    resume_session_id: Option<String>,
     #[serde(default)]
     labels: Option<BTreeMap<String, String>>,
     #[serde(default)]
@@ -1909,43 +1966,33 @@ struct SpawnManyMeerkatsArgs {
 #[derive(Deserialize)]
 struct RetireArgs {
     mob_id: String,
-    meerkat_id: String,
+    agent_identity: String,
 }
 #[derive(Deserialize)]
 struct WireActionArgs {
     mob_id: String,
-    #[serde(default)]
-    local: Option<String>,
-    #[serde(default)]
-    target: Option<meerkat_mob::PeerTarget>,
-    #[serde(default)]
-    a: Option<String>,
-    #[serde(default)]
-    b: Option<String>,
+    agent_identity: String,
+    peer: MobPeerTarget,
     action: String,
 }
 
 impl WireActionArgs {
-    fn resolve(self) -> Result<(String, MeerkatId, meerkat_mob::PeerTarget, String), String> {
-        let action = self.action;
-        match (self.local, self.target, self.a, self.b) {
-            (Some(local), Some(target), None, None) => {
-                Ok((self.mob_id, MeerkatId::from(local), target, action))
-            }
-            (None, None, Some(a), Some(b)) => Ok((
-                self.mob_id,
-                MeerkatId::from(a),
-                meerkat_mob::PeerTarget::Local(MeerkatId::from(b)),
-                action,
-            )),
-            (Some(_) | None, Some(_), Some(_), Some(_))
-            | (Some(_), Some(_), Some(_), None)
-            | (Some(_), Some(_), None, Some(_))
-            | (Some(_), None, Some(_), Some(_)) => {
-                Err("provide either {local, target} or legacy {a, b}, but not both".to_string())
-            }
-            _ => Err("wire action requires either {local, target} or legacy {a, b}".to_string()),
-        }
+    fn resolve(self) -> Result<(String, AgentIdentity, meerkat_mob::PeerTarget, String), String> {
+        Ok((
+            self.mob_id,
+            AgentIdentity::from(self.agent_identity),
+            match self.peer {
+                MobPeerTarget::Local(member_id) => meerkat_mob::PeerTarget::Local(member_id.into()),
+                MobPeerTarget::External(spec) => {
+                    meerkat_mob::PeerTarget::External(TrustedPeerSpec {
+                        name: spec.name,
+                        peer_id: spec.peer_id,
+                        address: spec.address,
+                    })
+                }
+            },
+            self.action,
+        ))
     }
 }
 #[derive(Deserialize)]
@@ -1971,19 +2018,19 @@ struct EventsArgs {
 #[derive(Deserialize)]
 struct RespawnArgs {
     mob_id: String,
-    meerkat_id: String,
+    agent_identity: String,
     #[serde(default)]
     initial_message: Option<ContentInput>,
 }
 #[derive(Deserialize)]
 struct ForceCancelArgs {
     mob_id: String,
-    meerkat_id: String,
+    agent_identity: String,
 }
 #[derive(Deserialize)]
 struct MeerkatStatusArgs {
     mob_id: String,
-    meerkat_id: String,
+    agent_identity: String,
 }
 #[derive(Deserialize)]
 struct WaitKickoffArgs {
@@ -2143,7 +2190,7 @@ impl AgentToolDispatcher for MobMcpDispatcher {
                 encode(call, json!({"ok": true}))
             }
             // ── Member-level ───────────────────────────────────────────
-            "meerkat_spawn" => {
+            "mob_spawn_member" => {
                 let args: SpawnManyMeerkatsArgs = call
                     .parse_args()
                     .map_err(|e| ToolError::invalid_arguments(call.name, e.to_string()))?;
@@ -2151,40 +2198,36 @@ impl AgentToolDispatcher for MobMcpDispatcher {
                     .specs
                     .into_iter()
                     .map(|spec| {
-                        let mut s = SpawnMemberSpec::new(spec.profile, spec.meerkat_id);
+                        let mut s = SpawnMemberSpec::new(spec.profile, spec.agent_identity);
                         s.initial_message = spec.initial_message;
                         s.runtime_mode = spec.runtime_mode;
                         s.backend = spec.backend;
                         s.binding = spec.binding;
                         s.context = spec.context;
                         s.labels = spec.labels;
-                        if let Some(sid_str) = spec.resume_session_id {
-                            let sid = SessionId::parse(&sid_str).map_err(|e| {
-                                ToolError::invalid_arguments(
-                                    call.name,
-                                    format!("invalid resume_session_id: {e}"),
-                                )
-                            })?;
-                            s = s.with_resume_session_id(sid);
-                        }
                         s.additional_instructions = spec.additional_instructions;
                         Ok(s)
                     })
                     .collect::<Result<Vec<_>, ToolError>>()?;
-                // Single-spec fast path returns flat member_ref; multi-spec returns results array.
+                // Single-spec fast path returns flat result; multi-spec returns results array.
                 if specs.len() == 1 {
                     // SAFETY: len checked above
                     let Some(spec) = specs.into_iter().next() else {
                         unreachable!()
                     };
-                    let member_ref = self
+                    let spawn_result = self
                         .state
                         .mob_spawn_spec(&MobId::from(args.mob_id), spec)
                         .await
                         .map_err(|e| map_mob_err(call, e))?;
                     encode(
                         call,
-                        json!({"ok": true, "member_ref": member_ref, "session_id": member_ref.session_id()}),
+                        json!({
+                            "ok": true,
+                            "agent_identity": spawn_result.agent_identity,
+                            "agent_runtime_id": spawn_result.agent_runtime_id,
+                            "fence_token": spawn_result.fence_token,
+                        }),
                     )
                 } else {
                     let results = self
@@ -2194,32 +2237,40 @@ impl AgentToolDispatcher for MobMcpDispatcher {
                         .map_err(|e| map_mob_err(call, e))?;
                     let results = results
                         .into_iter()
-                        .map(|result| match result {
-                            Ok(member_ref) => json!({
-                                "ok": true,
-                                "member_ref": member_ref,
-                                "session_id": member_ref.session_id(),
-                            }),
-                            Err(error) => json!({
-                                "ok": false,
-                                "error": error.to_string(),
-                            }),
-                        })
+                        .map(
+                            |result: Result<meerkat_mob::SpawnResult, meerkat_mob::MobError>| {
+                                match result {
+                                    Ok(spawn_result) => json!({
+                                        "ok": true,
+                                        "agent_identity": spawn_result.agent_identity,
+                                        "agent_runtime_id": spawn_result.agent_runtime_id,
+                                        "fence_token": spawn_result.fence_token,
+                                    }),
+                                    Err(error) => json!({
+                                        "ok": false,
+                                        "error": error.to_string(),
+                                    }),
+                                }
+                            },
+                        )
                         .collect::<Vec<_>>();
                     encode(call, json!({"results": results}))
                 }
             }
-            "meerkat_retire" => {
+            "mob_retire_member" => {
                 let args: RetireArgs = call
                     .parse_args()
                     .map_err(|e| ToolError::invalid_arguments(call.name, e.to_string()))?;
                 self.state
-                    .mob_retire(&MobId::from(args.mob_id), MeerkatId::from(args.meerkat_id))
+                    .mob_retire(
+                        &MobId::from(args.mob_id),
+                        AgentIdentity::from(args.agent_identity),
+                    )
                     .await
                     .map_err(|e| map_mob_err(call, e))?;
                 encode(call, json!({"ok": true}))
             }
-            "meerkat_list" => {
+            "mob_list_members" => {
                 let args: MobIdArgs = call
                     .parse_args()
                     .map_err(|e| ToolError::invalid_arguments(call.name, e.to_string()))?;
@@ -2230,7 +2281,7 @@ impl AgentToolDispatcher for MobMcpDispatcher {
                     .map_err(|e| map_mob_err(call, e))?;
                 encode(call, json!({"members": rows}))
             }
-            "meerkat_wire" => {
+            "mob_wire" => {
                 let args: WireActionArgs = call
                     .parse_args()
                     .map_err(|e| ToolError::invalid_arguments(call.name, e.to_string()))?;
@@ -2262,12 +2313,11 @@ impl AgentToolDispatcher for MobMcpDispatcher {
                 let args: RespawnArgs = call
                     .parse_args()
                     .map_err(|e| ToolError::invalid_arguments(call.name, e.to_string()))?;
-                let meerkat_id_str = args.meerkat_id;
                 match self
                     .state
                     .mob_respawn(
                         &MobId::from(args.mob_id),
-                        MeerkatId::from(meerkat_id_str.as_str()),
+                        AgentIdentity::from(args.agent_identity.as_str()),
                         args.initial_message,
                     )
                     .await
@@ -2293,23 +2343,29 @@ impl AgentToolDispatcher for MobMcpDispatcher {
                     Err(e) => return Err(map_mob_err(call, MobError::Internal(e.to_string()))),
                 }
             }
-            "meerkat_force_cancel" => {
+            "mob_force_cancel" => {
                 let args: ForceCancelArgs = call
                     .parse_args()
                     .map_err(|e| ToolError::invalid_arguments(call.name, e.to_string()))?;
                 self.state
-                    .mob_force_cancel(&MobId::from(args.mob_id), MeerkatId::from(args.meerkat_id))
+                    .mob_force_cancel(
+                        &MobId::from(args.mob_id),
+                        AgentIdentity::from(args.agent_identity),
+                    )
                     .await
                     .map_err(|e| map_mob_err(call, e))?;
                 encode(call, json!({"ok": true}))
             }
-            "meerkat_status" => {
+            "mob_member_status" => {
                 let args: MeerkatStatusArgs = call
                     .parse_args()
                     .map_err(|e| ToolError::invalid_arguments(call.name, e.to_string()))?;
                 let snapshot = self
                     .state
-                    .mob_member_status(&MobId::from(args.mob_id), &MeerkatId::from(args.meerkat_id))
+                    .mob_member_status(
+                        &MobId::from(args.mob_id),
+                        &AgentIdentity::from(args.agent_identity),
+                    )
                     .await
                     .map_err(|e| map_mob_err(call, e))?;
                 encode(call, json!(snapshot))
@@ -2320,7 +2376,7 @@ impl AgentToolDispatcher for MobMcpDispatcher {
                     .map_err(|e| ToolError::invalid_arguments(call.name, e.to_string()))?;
                 let member_ids = args.member_ids.map(|ids| {
                     ids.into_iter()
-                        .map(|id| MeerkatId::from(id.as_str()))
+                        .map(|id| AgentIdentity::from(id.as_str()))
                         .collect::<Vec<_>>()
                 });
                 let members = self
@@ -2459,6 +2515,7 @@ mod tests {
     use meerkat_core::event_injector::{
         EventInjector, EventInjectorError, InteractionSubscription, SubscribableInjector,
     };
+    use meerkat_core::interaction::PeerInputCandidate;
     use meerkat_core::service::InitialTurnPolicy;
     use meerkat_core::service::SessionService;
     use meerkat_core::service::{
@@ -2553,6 +2610,7 @@ mod tests {
         async fn send(&self, _cmd: CommsCommand) -> Result<SendReceipt, SendError> {
             Ok(SendReceipt::InputAccepted {
                 interaction_id: meerkat_core::interaction::InteractionId(uuid::Uuid::nil()),
+                stream_reserved: false,
             })
         }
 
@@ -2564,7 +2622,7 @@ mod tests {
             self.notify.clone()
         }
 
-        async fn drain_peer_input_candidates(&self) -> Vec<meerkat_core::PeerInputCandidate> {
+        async fn drain_peer_input_candidates(&self) -> Vec<PeerInputCandidate> {
             Vec::new()
         }
     }
@@ -2575,7 +2633,7 @@ mod tests {
         keep_alive_notifiers: RwLock<HashMap<SessionId, Arc<Notify>>>,
         counter: AtomicU64,
         start_turn_delay_ms: AtomicU64,
-        runtime_adapter: Arc<meerkat_runtime::RuntimeSessionAdapter>,
+        runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
     }
 
     impl MockSessionSvc {
@@ -2586,7 +2644,7 @@ mod tests {
                 keep_alive_notifiers: RwLock::new(HashMap::new()),
                 counter: AtomicU64::new(0),
                 start_turn_delay_ms: AtomicU64::new(0),
-                runtime_adapter: Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral()),
+                runtime_adapter: Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
             }
         }
 
@@ -2819,7 +2877,7 @@ mod tests {
             true
         }
 
-        fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::RuntimeSessionAdapter>> {
+        fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::MeerkatMachine>> {
             Some(self.runtime_adapter.clone())
         }
 
@@ -3192,13 +3250,13 @@ mod tests {
                 "mob_run_flow",
                 "mob_flow_status",
                 "mob_cancel_flow",
-                "meerkat_spawn",
-                "meerkat_retire",
-                "meerkat_list",
-                "meerkat_wire",
+                "mob_spawn_member",
+                "mob_retire_member",
+                "mob_list_members",
+                "mob_wire",
                 "mob_respawn",
-                "meerkat_force_cancel",
-                "meerkat_status",
+                "mob_force_cancel",
+                "mob_member_status",
                 "mob_wait_kickoff",
             ]
         );
@@ -3258,13 +3316,13 @@ mod tests {
         svc.insert_persisted_session(spoofed).await;
 
         assert!(
-            !state.owns_persisted_session(&spoofed_id).await,
+            !state.owns_persisted_bridge_session(&spoofed_id).await,
             "persisted session routing must verify real mob membership instead of trusting comms_name shape"
         );
     }
 
     #[tokio::test]
-    async fn test_owns_persisted_session_accepts_mob_marked_session_without_live_handle() {
+    async fn test_owns_persisted_bridge_session_accepts_mob_marked_session_without_live_handle() {
         let svc = Arc::new(MockSessionSvc::new());
         let session_service: Arc<dyn meerkat_mob::MobSessionService> = svc.clone();
         let state = Arc::new(MobMcpState::new(session_service));
@@ -3298,13 +3356,13 @@ mod tests {
         svc.insert_persisted_session(persisted).await;
 
         assert!(
-            state.owns_persisted_session(&persisted_id).await,
+            state.owns_persisted_bridge_session(&persisted_id).await,
             "persisted mob members must still route through mob ownership after restart even before a live handle is rehydrated"
         );
     }
 
     #[tokio::test]
-    async fn test_retire_member_by_session_id_falls_back_to_archiving_persisted_member() {
+    async fn test_retire_member_by_bridge_session_id_falls_back_to_archiving_persisted_member() {
         let svc = Arc::new(MockSessionSvc::new());
         let session_service: Arc<dyn meerkat_mob::MobSessionService> = svc.clone();
         let state = Arc::new(MobMcpState::new(session_service));
@@ -3338,7 +3396,7 @@ mod tests {
         svc.insert_persisted_session(persisted).await;
 
         state
-            .retire_member_by_session_id(&persisted_id)
+            .retire_member_by_bridge_session_id(&persisted_id)
             .await
             .expect("persisted mob sessions should archive cleanly even without a live handle");
         assert!(
@@ -3415,19 +3473,19 @@ mod tests {
 
         call_tool(
             &d,
-            "meerkat_spawn",
-            json!({"mob_id": a, "specs":[{"profile":"worker", "meerkat_id":"wa", "runtime_mode":"turn_driven"}]}),
+            "mob_spawn_member",
+            json!({"mob_id": a, "specs":[{"profile":"worker", "agent_identity":"wa", "runtime_mode":"turn_driven"}]}),
         )
         .await;
         call_tool(
             &d,
-            "meerkat_spawn",
-            json!({"mob_id": b, "specs":[{"profile":"worker", "meerkat_id":"wb", "runtime_mode":"turn_driven"}]}),
+            "mob_spawn_member",
+            json!({"mob_id": b, "specs":[{"profile":"worker", "agent_identity":"wb", "runtime_mode":"turn_driven"}]}),
         )
         .await;
 
-        let la = call_tool(&d, "meerkat_list", json!({"mob_id": a})).await;
-        let lb = call_tool(&d, "meerkat_list", json!({"mob_id": b})).await;
+        let la = call_tool(&d, "mob_list_members", json!({"mob_id": a})).await;
+        let lb = call_tool(&d, "mob_list_members", json!({"mob_id": b})).await;
         assert_eq!(la["members"].as_array().unwrap().len(), 1); // wa
         assert_eq!(lb["members"].as_array().unwrap().len(), 1); // wb
 
@@ -3457,43 +3515,43 @@ mod tests {
             .to_string();
         call_tool(
             &d,
-            "meerkat_spawn",
-            json!({"mob_id": mob_id, "specs":[{"profile":"lead", "meerkat_id":"lead", "runtime_mode":"turn_driven"}]}),
+            "mob_spawn_member",
+            json!({"mob_id": mob_id, "specs":[{"profile":"lead", "agent_identity":"lead", "runtime_mode":"turn_driven"}]}),
         )
         .await;
         call_tool(
             &d,
-            "meerkat_spawn",
-            json!({"mob_id": mob_id, "specs":[{"profile":"worker", "meerkat_id":"w1", "runtime_mode":"turn_driven"}]}),
+            "mob_spawn_member",
+            json!({"mob_id": mob_id, "specs":[{"profile":"worker", "agent_identity":"w1", "runtime_mode":"turn_driven"}]}),
         )
         .await;
         call_tool(
             &d,
-            "meerkat_spawn",
-            json!({"mob_id": mob_id, "specs":[{"profile":"worker", "meerkat_id":"w2", "runtime_mode":"turn_driven"}]}),
+            "mob_spawn_member",
+            json!({"mob_id": mob_id, "specs":[{"profile":"worker", "agent_identity":"w2", "runtime_mode":"turn_driven"}]}),
         )
         .await;
         call_tool(
             &d,
-            "meerkat_wire",
-            json!({"mob_id": mob_id, "a":"w1", "b":"w2", "action":"wire"}),
+            "mob_wire",
+            json!({"mob_id": mob_id, "agent_identity":"w1", "peer":{"local":"w2"}, "action":"wire"}),
         )
         .await;
-        let listed = call_tool(&d, "meerkat_list", json!({"mob_id": mob_id})).await;
+        let listed = call_tool(&d, "mob_list_members", json!({"mob_id": mob_id})).await;
         assert_eq!(
             listed["members"].as_array().map(std::vec::Vec::len),
             Some(3)
         );
         call_tool(
             &d,
-            "meerkat_wire",
-            json!({"mob_id": mob_id, "a":"w1", "b":"w2", "action":"unwire"}),
+            "mob_wire",
+            json!({"mob_id": mob_id, "agent_identity":"w1", "peer":{"local":"w2"}, "action":"unwire"}),
         )
         .await;
         call_tool(
             &d,
-            "meerkat_retire",
-            json!({"mob_id": mob_id, "meerkat_id":"w2"}),
+            "mob_retire_member",
+            json!({"mob_id": mob_id, "agent_identity":"w2"}),
         )
         .await;
         call_tool(
@@ -3510,10 +3568,8 @@ mod tests {
         .await;
         let events = events["events"].as_array().cloned().unwrap_or_default();
         assert!(
-            events
-                .iter()
-                .any(|e| e["kind"]["type"] == "meerkat_spawned"),
-            "expected structural events to include meerkat_spawned"
+            events.iter().any(|e| e["kind"]["type"] == "member_spawned"),
+            "expected structural events to include member_spawned"
         );
         assert!(
             events.iter().any(|e| e["kind"]["type"] == "mob_completed"),
@@ -3541,26 +3597,26 @@ mod tests {
             .to_string();
         call_tool(
             &d,
-            "meerkat_spawn",
-            json!({"mob_id": mob_id, "specs":[{"profile":"lead", "meerkat_id":"lead", "runtime_mode":"turn_driven"}]}),
+            "mob_spawn_member",
+            json!({"mob_id": mob_id, "specs":[{"profile":"lead", "agent_identity":"lead", "runtime_mode":"turn_driven"}]}),
         )
         .await;
         call_tool(
             &d,
-            "meerkat_spawn",
-            json!({"mob_id": mob_id, "specs":[{"profile":"worker", "meerkat_id":"w1", "runtime_mode":"turn_driven"}]}),
+            "mob_spawn_member",
+            json!({"mob_id": mob_id, "specs":[{"profile":"worker", "agent_identity":"w1", "runtime_mode":"turn_driven"}]}),
         )
         .await;
         call_tool(
             &d,
-            "meerkat_spawn",
-            json!({"mob_id": mob_id, "specs":[{"profile":"worker", "meerkat_id":"w2", "runtime_mode":"turn_driven"}]}),
+            "mob_spawn_member",
+            json!({"mob_id": mob_id, "specs":[{"profile":"worker", "agent_identity":"w2", "runtime_mode":"turn_driven"}]}),
         )
         .await;
         call_tool(
             &d,
-            "meerkat_wire",
-            json!({"mob_id": mob_id, "a":"w1", "b":"w2", "action":"wire"}),
+            "mob_wire",
+            json!({"mob_id": mob_id, "agent_identity":"w1", "peer":{"local":"w2"}, "action":"wire"}),
         )
         .await;
         call_tool(
@@ -3575,7 +3631,7 @@ mod tests {
             json!({"mob_id": mob_id, "action":"resume"}),
         )
         .await;
-        let members = call_tool(&d, "meerkat_list", json!({"mob_id": mob_id})).await;
+        let members = call_tool(&d, "mob_list_members", json!({"mob_id": mob_id})).await;
         assert_eq!(members["members"].as_array().unwrap().len(), 3); // lead + 2 workers
         let status = call_tool(&d, "mob_list", json!({"mob_id": mob_id})).await;
         assert_eq!(status["status"], "Running");
@@ -3610,8 +3666,8 @@ mod tests {
 
         call_tool(
             &d,
-            "meerkat_spawn",
-            json!({"mob_id": mob_id, "specs":[{"profile":"worker", "meerkat_id":"w1"}]}),
+            "mob_spawn_member",
+            json!({"mob_id": mob_id, "specs":[{"profile":"worker", "agent_identity":"w1"}]}),
         )
         .await;
 
@@ -3744,14 +3800,14 @@ mod tests {
 
         let spawned = call_tool(
             &d,
-            "meerkat_spawn",
+            "mob_spawn_member",
             json!({
                 "mob_id": mob_id,
-                "specs": [{"profile": "worker", "meerkat_id": "w-ext", "binding": {"kind": "external", "peer_id": "test-key:w-ext", "address": "tcp://test.invalid/w-ext"}}]
+                "specs": [{"profile": "worker", "agent_identity": "w-ext", "binding": {"kind": "external", "peer_id": "test-key:w-ext", "address": "tcp://test.invalid/w-ext"}}]
             }),
         )
         .await;
-        assert_eq!(spawned["member_ref"]["kind"], "backend_peer");
+        assert_eq!(spawned["agent_identity"], "w-ext");
     }
 
     #[tokio::test]
@@ -3765,32 +3821,32 @@ mod tests {
 
         call_tool(
             &d,
-            "meerkat_spawn",
+            "mob_spawn_member",
             json!({
                 "mob_id": mob_id,
-                "specs": [{"profile": "lead", "meerkat_id": "lead-default"}]
+                "specs": [{"profile": "lead", "agent_identity": "lead-default"}]
             }),
         )
         .await;
         call_tool(
             &d,
-            "meerkat_spawn",
+            "mob_spawn_member",
             json!({
                 "mob_id": mob_id,
-                "specs": [{"profile": "worker", "meerkat_id": "worker-turn", "runtime_mode": "turn_driven"}]
+                "specs": [{"profile": "worker", "agent_identity": "worker-turn", "runtime_mode": "turn_driven"}]
             }),
         )
         .await;
 
-        let listed = call_tool(&d, "meerkat_list", json!({"mob_id": mob_id})).await;
+        let listed = call_tool(&d, "mob_list_members", json!({"mob_id": mob_id})).await;
         let members = listed["members"].as_array().cloned().unwrap_or_default();
         let lead_mode = members
             .iter()
-            .find(|m| m["meerkat_id"] == "lead-default")
+            .find(|m| m["agent_identity"] == "lead-default")
             .and_then(|m| m["runtime_mode"].as_str());
         let worker_mode = members
             .iter()
-            .find(|m| m["meerkat_id"] == "worker-turn")
+            .find(|m| m["agent_identity"] == "worker-turn")
             .and_then(|m| m["runtime_mode"].as_str());
 
         assert_eq!(lead_mode, Some("autonomous_host"));
@@ -3808,12 +3864,12 @@ mod tests {
 
         let spawned = call_tool(
             &d,
-            "meerkat_spawn",
+            "mob_spawn_member",
             json!({
                 "mob_id": mob_id,
                 "specs": [
-                    {"profile":"worker","meerkat_id":"w-many-a"},
-                    {"profile":"worker","meerkat_id":"w-many-b"}
+                    {"profile":"worker","agent_identity":"w-many-a"},
+                    {"profile":"worker","agent_identity":"w-many-b"}
                 ]
             }),
         )
@@ -3825,13 +3881,13 @@ mod tests {
             "all batch spawn rows should succeed"
         );
 
-        let listed = call_tool(&d, "meerkat_list", json!({"mob_id": mob_id})).await;
+        let listed = call_tool(&d, "mob_list_members", json!({"mob_id": mob_id})).await;
         let ids = listed["members"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|m| m["meerkat_id"].as_str().map(ToString::to_string))
+            .filter_map(|m| m["agent_identity"].as_str().map(ToString::to_string))
             .collect::<std::collections::BTreeSet<_>>();
         assert!(ids.contains("w-many-a"));
         assert!(ids.contains("w-many-b"));
@@ -3847,12 +3903,12 @@ mod tests {
         let mob_id = created["mob_id"].as_str().unwrap().to_string();
         call_tool(
             &d,
-            "meerkat_spawn",
+            "mob_spawn_member",
             json!({
                 "mob_id": mob_id,
                 "specs": [
-                    {"profile":"lead","meerkat_id":"lead-kickoff","runtime_mode":"turn_driven"},
-                    {"profile":"worker","meerkat_id":"worker-kickoff","runtime_mode":"turn_driven"}
+                    {"profile":"lead","agent_identity":"lead-kickoff","runtime_mode":"turn_driven"},
+                    {"profile":"worker","agent_identity":"worker-kickoff","runtime_mode":"turn_driven"}
                 ]
             }),
         )
@@ -3870,8 +3926,8 @@ mod tests {
         .await;
         let members = waited["members"].as_array().expect("members array");
         assert_eq!(members.len(), 2);
-        assert_eq!(members[0]["meerkat_id"], "lead-kickoff");
-        assert_eq!(members[1]["meerkat_id"], "worker-kickoff");
+        assert_eq!(members[0]["agent_identity"], "lead-kickoff");
+        assert_eq!(members[1]["agent_identity"], "worker-kickoff");
     }
 
     #[tokio::test]
@@ -3886,12 +3942,12 @@ mod tests {
         let mob_id = created["mob_id"].as_str().unwrap().to_string();
         call_tool(
             &d,
-            "meerkat_spawn",
+            "mob_spawn_member",
             json!({
                 "mob_id": mob_id,
                 "specs": [
-                    {"profile":"lead","meerkat_id":"kickoff-lead","runtime_mode":"turn_driven"},
-                    {"profile":"worker","meerkat_id":"kickoff-worker","runtime_mode":"turn_driven"}
+                    {"profile":"lead","agent_identity":"kickoff-lead","runtime_mode":"turn_driven"},
+                    {"profile":"worker","agent_identity":"kickoff-worker","runtime_mode":"turn_driven"}
                 ]
             }),
         )
@@ -3911,8 +3967,8 @@ mod tests {
         .await;
         let members = waited["members"].as_array().expect("members array");
         assert_eq!(members.len(), 2);
-        assert_eq!(members[0]["meerkat_id"], "kickoff-lead");
-        assert_eq!(members[1]["meerkat_id"], "kickoff-worker");
+        assert_eq!(members[0]["agent_identity"], "kickoff-lead");
+        assert_eq!(members[1]["agent_identity"], "kickoff-worker");
     }
 
     #[tokio::test]
@@ -4016,7 +4072,12 @@ mod tests {
     #[tokio::test]
     async fn test_find_implicit_mob_returns_none_when_no_implicit_mob() {
         let state = MobMcpState::new_in_memory();
-        assert!(state.find_implicit_mob("nonexistent").await.is_none());
+        assert!(
+            state
+                .find_implicit_mob_for_bridge_session("nonexistent")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -4026,16 +4087,16 @@ mod tests {
         let sid = session_id.to_string();
 
         let mob_id_1 = state
-            .get_or_create_implicit_mob(&sid, "claude-sonnet-4-5")
+            .get_or_create_implicit_mob_for_bridge_session(&sid, "claude-sonnet-4-5")
             .await
             .unwrap();
         let mob_id_2 = state
-            .get_or_create_implicit_mob(&sid, "claude-sonnet-4-5")
+            .get_or_create_implicit_mob_for_bridge_session(&sid, "claude-sonnet-4-5")
             .await
             .unwrap();
         assert_eq!(mob_id_1, mob_id_2, "second call must return same mob_id");
 
-        let found = state.find_implicit_mob(&sid).await;
+        let found = state.find_implicit_mob_for_bridge_session(&sid).await;
         assert_eq!(found, Some(mob_id_1));
     }
 
@@ -4046,11 +4107,11 @@ mod tests {
         let sid_b = SessionId::new().to_string();
 
         let mob_a = state
-            .get_or_create_implicit_mob(&sid_a, "claude-sonnet-4-5")
+            .get_or_create_implicit_mob_for_bridge_session(&sid_a, "claude-sonnet-4-5")
             .await
             .unwrap();
         let mob_b = state
-            .get_or_create_implicit_mob(&sid_b, "claude-sonnet-4-5")
+            .get_or_create_implicit_mob_for_bridge_session(&sid_b, "claude-sonnet-4-5")
             .await
             .unwrap();
         assert_ne!(mob_a, mob_b, "different sessions must get different mobs");
@@ -4062,7 +4123,7 @@ mod tests {
         let sid = SessionId::new().to_string();
 
         let old_mob_id = state
-            .get_or_create_implicit_mob(&sid, "claude-sonnet-4-5")
+            .get_or_create_implicit_mob_for_bridge_session(&sid, "claude-sonnet-4-5")
             .await
             .expect("create initial implicit mob");
         let old_handle = state
@@ -4088,7 +4149,7 @@ mod tests {
 
         assert!(created, "model mismatch should force a fresh implicit mob");
         assert_eq!(
-            state.find_implicit_mob(&sid).await,
+            state.find_implicit_mob_for_bridge_session(&sid).await,
             Some(new_mob_id.clone()),
             "session should now point at the reconciled implicit mob"
         );
@@ -4120,7 +4181,7 @@ mod tests {
         // Create an implicit mob
         let sid = SessionId::new().to_string();
         let implicit_id = state
-            .get_or_create_implicit_mob(&sid, "claude-sonnet-4-5")
+            .get_or_create_implicit_mob_for_bridge_session(&sid, "claude-sonnet-4-5")
             .await
             .unwrap();
 
@@ -4155,24 +4216,9 @@ mod tests {
                 provider_params: None,
             }),
         );
-        MobDefinition {
-            id: MobId::from(mob_id),
-            orchestrator: None,
-            profiles: explicit_profiles,
-            mcp_servers: BTreeMap::new(),
-            wiring: meerkat_mob::definition::WiringRules::default(),
-            skills: BTreeMap::new(),
-            backend: meerkat_mob::definition::BackendConfig::default(),
-            flows: BTreeMap::new(),
-            topology: None,
-            supervisor: None,
-            limits: None,
-            spawn_policy: None,
-            event_router: None,
-            owner_session_id: None,
-            session_cleanup_policy: meerkat_mob::definition::SessionCleanupPolicy::Manual,
-            is_implicit: false,
-        }
+        let mut definition = MobDefinition::explicit(MobId::from(mob_id));
+        definition.profiles = explicit_profiles;
+        definition
     }
 
     fn sample_realm_profile(model: &str) -> meerkat_mob::Profile {
@@ -4207,7 +4253,7 @@ mod tests {
             .mob_spawn(
                 &mob_id,
                 ProfileName::from("worker"),
-                MeerkatId::from("worker-1"),
+                AgentIdentity::from("worker-1"),
                 Some(MobRuntimeMode::TurnDriven),
                 None,
             )
@@ -4219,13 +4265,18 @@ mod tests {
                 .with_persistent_storage_root(Some(root.path().to_path_buf())),
         );
         let status = restored
-            .mob_member_status(&mob_id, &MeerkatId::from("worker-1"))
+            .mob_member_status(&mob_id, &AgentIdentity::from("worker-1"))
             .await
             .expect("restore member status");
         assert_eq!(status.status, meerkat_mob::MobMemberStatus::Active);
+        // Verify the member has a live bridge-session binding via the handle.
+        let handle = restored.handle_for(&mob_id).await.expect("mob handle");
         assert!(
-            status.current_session_id.is_some(),
-            "restored member should still have a live session binding"
+            handle
+                .resolve_bridge_session_id(&AgentIdentity::from("worker-1"))
+                .await
+                .is_some(),
+            "restored member should still have a live bridge-session binding"
         );
 
         let mobs = restored.mob_list().await;
@@ -4313,56 +4364,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_destroy_session_mobs_cleans_up() {
+    async fn test_destroy_bridge_session_mobs_cleans_up() {
         let state = MobMcpState::new_in_memory();
         let sid = SessionId::new().to_string();
 
         let _mob_id = state
-            .get_or_create_implicit_mob(&sid, "claude-sonnet-4-5")
+            .get_or_create_implicit_mob_for_bridge_session(&sid, "claude-sonnet-4-5")
             .await
             .unwrap();
-        assert!(state.find_implicit_mob(&sid).await.is_some());
+        assert!(
+            state
+                .find_implicit_mob_for_bridge_session(&sid)
+                .await
+                .is_some()
+        );
 
-        state.destroy_session_mobs(&sid).await.unwrap();
-        assert!(state.find_implicit_mob(&sid).await.is_none());
+        state.destroy_bridge_session_mobs(&sid).await.unwrap();
+        assert!(
+            state
+                .find_implicit_mob_for_bridge_session(&sid)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
-    async fn test_destroy_session_mobs_uses_cleanup_policy_not_owner_index() {
+    async fn test_destroy_bridge_session_mobs_uses_cleanup_policy_not_owner_index() {
         let state = MobMcpState::new_in_memory();
         let sid = SessionId::new().to_string();
 
         let mut manual = explicit_definition("manual-owner-index");
-        manual.owner_session_id = Some(sid.clone());
+        manual.set_owner_bridge_session_lookup_index(sid.clone());
         let manual_id = state
             .mob_create_definition(manual)
             .await
             .expect("create manual owner-indexed mob");
 
-        let mut session_scoped = explicit_definition("session-scoped-owner");
-        session_scoped.mark_session_scoped(&sid);
-        let session_scoped_id = state
-            .mob_create_definition(session_scoped)
+        let mut bridge_session_scoped = explicit_definition("bridge-session-scoped-owner");
+        bridge_session_scoped.mark_owner_bridge_session_indexed(&sid);
+        let bridge_session_scoped_id = state
+            .mob_create_definition(bridge_session_scoped)
             .await
-            .expect("create session-scoped mob");
+            .expect("create bridge-session-scoped mob");
 
-        state.destroy_session_mobs(&sid).await.unwrap();
+        state.destroy_bridge_session_mobs(&sid).await.unwrap();
 
         assert!(
             state.handle_for(&manual_id).await.is_ok(),
-            "owner_session_id alone must not make a mob eligible for cleanup"
+            "owner bridge-session indexing alone must not make a mob eligible for cleanup"
         );
         assert!(
-            state.handle_for(&session_scoped_id).await.is_err(),
+            state.handle_for(&bridge_session_scoped_id).await.is_err(),
             "DestroyOnOwnerArchive must remain the cleanup truth"
         );
     }
 
     #[tokio::test]
-    async fn test_destroy_session_mobs_noop_when_none() {
+    async fn test_destroy_bridge_session_mobs_noop_when_none() {
         let state = MobMcpState::new_in_memory();
         // Should succeed even when no implicit mob exists
-        state.destroy_session_mobs("nonexistent").await.unwrap();
+        state
+            .destroy_bridge_session_mobs("nonexistent")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -4376,7 +4440,7 @@ mod tests {
             let s = state.clone();
             let sid = sid.clone();
             handles.push(tokio::spawn(async move {
-                s.get_or_create_implicit_mob(&sid, "claude-sonnet-4-5")
+                s.get_or_create_implicit_mob_for_bridge_session(&sid, "claude-sonnet-4-5")
                     .await
                     .unwrap()
             }));
@@ -4400,7 +4464,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scavenge_orphaned_session_scoped_mobs() {
+    async fn test_scavenge_orphaned_bridge_session_scoped_mobs() {
         let svc = Arc::new(MockSessionSvc::new());
         let state = Arc::new(MobMcpState::new(svc.clone()));
 
@@ -4423,35 +4487,86 @@ mod tests {
             .unwrap();
         let sid = result.session_id.to_string();
         let mob_id = state
-            .get_or_create_implicit_mob(&sid, "claude-sonnet-4-5")
+            .get_or_create_implicit_mob_for_bridge_session(&sid, "claude-sonnet-4-5")
             .await
             .unwrap();
 
         // Also create a manual owner-indexed explicit mob that should survive scavenging.
         let mut manual = explicit_definition("manual-owner-index");
-        manual.owner_session_id = Some(sid.clone());
+        manual.set_owner_bridge_session_lookup_index(sid.clone());
         let manual_id = state
             .mob_create_definition(manual)
             .await
             .expect("create manual owner-indexed mob");
 
         // Session exists — scavenge should find nothing.
-        let scavenged = state.scavenge_orphaned_session_scoped_mobs().await;
+        let scavenged = state.scavenge_orphaned_bridge_session_scoped_mobs().await;
         assert!(scavenged.is_empty(), "no orphans while session exists");
 
         // Archive the session — now the mob is orphaned
         svc.archive(&result.session_id).await.unwrap();
 
-        // Scavenge should find and destroy the session-scoped orphan, but not
+        // Scavenge should find and destroy the bridge-session-scoped orphan, but not
         // the manual owner-indexed mob.
-        let scavenged = state.scavenge_orphaned_session_scoped_mobs().await;
+        let scavenged = state.scavenge_orphaned_bridge_session_scoped_mobs().await;
         assert_eq!(scavenged, vec![mob_id.clone()]);
 
         // Mob should be gone
-        assert!(state.find_implicit_mob(&sid).await.is_none());
+        assert!(
+            state
+                .find_implicit_mob_for_bridge_session(&sid)
+                .await
+                .is_none()
+        );
         assert!(
             state.handle_for(&manual_id).await.is_ok(),
             "manual owner-indexed mob must survive orphan scavenging"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scavenge_orphaned_bridge_session_scoped_mobs_honors_bridge_owner_index() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let state = Arc::new(MobMcpState::new(svc.clone()));
+
+        let result = svc
+            .create_session(CreateSessionRequest {
+                model: "claude-sonnet-4-5".to_string(),
+                prompt: ContentInput::from("test"),
+                render_metadata: None,
+                system_prompt: None,
+                max_tokens: None,
+                event_tx: None,
+                skill_references: None,
+                initial_turn: meerkat_core::service::InitialTurnPolicy::RunImmediately,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+                build: None,
+                labels: None,
+            })
+            .await
+            .unwrap();
+        let sid = result.session_id.to_string();
+
+        let mut bridge_owned = explicit_definition("bridge-owned-orphan");
+        bridge_owned.mark_owner_bridge_session_indexed(&sid);
+        let bridge_owned_id = state
+            .mob_create_definition(bridge_owned)
+            .await
+            .expect("create bridge-owned bridge-session-scoped mob");
+
+        let scavenged = state.scavenge_orphaned_bridge_session_scoped_mobs().await;
+        assert!(
+            scavenged.is_empty(),
+            "session exists, so bridge-owned mob must not scavenge"
+        );
+
+        svc.archive(&result.session_id).await.unwrap();
+
+        let scavenged = state.scavenge_orphaned_bridge_session_scoped_mobs().await;
+        assert_eq!(scavenged, vec![bridge_owned_id.clone()]);
+        assert!(
+            state.handle_for(&bridge_owned_id).await.is_err(),
+            "bridge-owned bridge-session-scoped mob must be scavenged once the bridge session disappears"
         );
     }
 
@@ -4461,7 +4576,7 @@ mod tests {
         let sid = SessionId::new().to_string();
 
         let mob_id = state
-            .get_or_create_implicit_mob(&sid, "claude-sonnet-4-5")
+            .get_or_create_implicit_mob_for_bridge_session(&sid, "claude-sonnet-4-5")
             .await
             .unwrap();
         let handle = state.handle_for(&mob_id).await.unwrap();
@@ -4470,9 +4585,9 @@ mod tests {
             "implicit mob must have auto_wire_orchestrator set"
         );
         assert_eq!(
-            handle.definition().owner_session_id.as_deref(),
+            handle.definition().owner_bridge_session_index(),
             Some(sid.as_str()),
-            "implicit mob must have correct owner_session_id"
+            "implicit mob must have correct owner_bridge_session_id"
         );
     }
 

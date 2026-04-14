@@ -79,8 +79,7 @@ const sessionState: SessionState = {
 
 const mobAppendSystemContextResult: MobAppendSystemContextResult = {
   mob_id: 'mob-1',
-  meerkat_id: 'worker-1',
-  session_id: '00000000-0000-0000-0000-000000000001',
+  agent_identity: 'worker-1',
   status: 'staged',
 };
 
@@ -106,7 +105,7 @@ const mobDef: MobDefinition = {
 
 const spawnSpec: SpawnSpec = {
   profile: 'worker',
-  meerkat_id: 'w1',
+  agent_identity: 'w1',
   runtime_mode: 'autonomous_host',
   initial_message: 'Hello',
   labels: { role: 'worker' },
@@ -168,16 +167,24 @@ function handleEvent(event: AgentEvent): string {
       return event.reference;
     case 'interaction_complete':
       return event.result;
+    case 'interaction_callback_pending':
+      return `${event.tool_name}:${event.interaction_id}`;
     case 'interaction_failed':
       return event.error;
     case 'stream_truncated':
       return event.reason;
     case 'tool_config_changed':
       return event.payload.target;
+    case 'background_job_completed':
+      return `${event.display_name}:${event.status}`;
     case 'reasoning_delta':
       return event.delta;
     case 'reasoning_complete':
       return event.content;
+    default: {
+      const _exhaustive: never = event;
+      return _exhaustive;
+    }
   }
 }
 

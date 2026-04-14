@@ -110,15 +110,6 @@ pub enum MessageIntent {
     /// Peer retired lifecycle event (mob.peer_retired)
     #[serde(rename = "mob.peer_retired")]
     PeerRetired,
-    /// Peer unwired lifecycle event (mob.peer_unwired)
-    #[serde(rename = "mob.peer_unwired")]
-    PeerUnwired,
-    /// Helper kickoff failed lifecycle event (mob.kickoff_failed)
-    #[serde(rename = "mob.kickoff_failed")]
-    KickoffFailed,
-    /// Helper kickoff cancelled lifecycle event (mob.kickoff_cancelled)
-    #[serde(rename = "mob.kickoff_cancelled")]
-    KickoffCancelled,
     /// Custom intent for user-defined operations
     #[serde(untagged)]
     Custom(String),
@@ -142,9 +133,6 @@ impl MessageIntent {
             Self::Query => "query",
             Self::PeerAdded => "mob.peer_added",
             Self::PeerRetired => "mob.peer_retired",
-            Self::PeerUnwired => "mob.peer_unwired",
-            Self::KickoffFailed => "mob.kickoff_failed",
-            Self::KickoffCancelled => "mob.kickoff_cancelled",
             Self::Custom(s) => s.as_str(),
         }
     }
@@ -162,9 +150,6 @@ impl From<String> for MessageIntent {
             "query" => Self::Query,
             "mob.peer_added" => Self::PeerAdded,
             "mob.peer_retired" => Self::PeerRetired,
-            "mob.peer_unwired" => Self::PeerUnwired,
-            "mob.kickoff_failed" => Self::KickoffFailed,
-            "mob.kickoff_cancelled" => Self::KickoffCancelled,
             _ => Self::Custom(s),
         }
     }
@@ -260,89 +245,10 @@ pub struct CommsMessage {
 }
 
 impl CommsMessage {
-    /// Create a CommsMessage from an InboxItem and trusted peers list.
-    /// Resolves sender only from trusted peers.
-    ///
-    /// Returns `None` if:
-    /// - The item is not an External envelope
-    /// - The sender cannot be resolved and `require_peer_auth` is enabled
-    /// - The message kind is Ack (acks are not injected into session)
-    pub fn from_inbox_item(
-        item: &InboxItem,
-        trusted_peers: &TrustedPeers,
-        require_peer_auth: bool,
+    pub(crate) fn from_external_with_resolved_peer(
+        envelope: &crate::Envelope,
+        from_peer: String,
     ) -> Option<Self> {
-        let envelope = match item {
-            InboxItem::External { envelope } => envelope,
-            InboxItem::PlainEvent { .. } => return None,
-        };
-
-        // Resolve peer name from pubkey
-        let from_peer = match trusted_peers
-            .get_peer(&envelope.from)
-            .map(|peer| peer.name.clone())
-        {
-            Some(name) => name,
-            None if require_peer_auth => return None,
-            None => InprocRegistry::global()
-                .get_name_by_pubkey(&envelope.from)
-                .unwrap_or_else(|| envelope.from.to_peer_id()),
-        };
-
-        // Convert MessageKind to CommsContent
-        let content = match &envelope.kind {
-            MessageKind::Message { body, blocks, .. } => CommsContent::Message {
-                body: body.clone(),
-                blocks: blocks.clone(),
-            },
-            MessageKind::Request { intent, params, .. } => CommsContent::Request {
-                request_id: envelope.id,
-                intent: MessageIntent::from(intent.as_str()),
-                params: params.clone(),
-            },
-            MessageKind::Response {
-                in_reply_to,
-                status,
-                result,
-                ..
-            } => CommsContent::Response {
-                in_reply_to: *in_reply_to,
-                status: (*status).into(),
-                result: result.clone(),
-            },
-            MessageKind::Ack { .. } => return None, // Don't inject acks
-        };
-
-        Some(CommsMessage {
-            envelope_id: envelope.id,
-            from_peer,
-            from_pubkey: envelope.from,
-            content,
-        })
-    }
-
-    /// Create a `CommsMessage` from a classified inbox entry.
-    ///
-    /// Uses the ingress-stored `from_peer` identity instead of re-resolving
-    /// against live trust state, preserving snapshot semantics: a message
-    /// accepted at ingress cannot disappear or change identity if the peer
-    /// is removed/renamed before drain.
-    ///
-    /// Returns `None` for non-External items, PlainEvent, and Ack messages.
-    pub(crate) fn from_classified_entry(
-        entry: &crate::inbox::ClassifiedInboxEntry,
-    ) -> Option<Self> {
-        let envelope = match &entry.item {
-            InboxItem::External { envelope } => envelope,
-            InboxItem::PlainEvent { .. } => return None,
-        };
-
-        let from_peer = entry.from_peer.clone().unwrap_or_else(|| {
-            InprocRegistry::global()
-                .get_name_by_pubkey(&envelope.from)
-                .unwrap_or_else(|| envelope.from.to_peer_id())
-        });
-
         let content = match &envelope.kind {
             MessageKind::Message { body, blocks, .. } => CommsContent::Message {
                 body: body.clone(),
@@ -372,6 +278,63 @@ impl CommsMessage {
             from_pubkey: envelope.from,
             content,
         })
+    }
+
+    /// Create a CommsMessage from an InboxItem and trusted peers list.
+    /// Resolves sender only from trusted peers.
+    ///
+    /// Returns `None` if:
+    /// - The item is not an External envelope
+    /// - The sender cannot be resolved and `require_peer_auth` is enabled
+    /// - The message kind is Ack (acks are not injected into session)
+    pub fn from_inbox_item(
+        item: &InboxItem,
+        trusted_peers: &TrustedPeers,
+        require_peer_auth: bool,
+    ) -> Option<Self> {
+        let envelope = match item {
+            InboxItem::External { envelope } => envelope,
+            InboxItem::PlainEvent { .. } => return None,
+        };
+
+        // Resolve peer name from pubkey
+        let from_peer = match trusted_peers
+            .get_peer(&envelope.from)
+            .map(|peer| peer.name.clone())
+        {
+            Some(name) => name,
+            None if require_peer_auth => return None,
+            None => InprocRegistry::global()
+                .get_name_by_pubkey(&envelope.from)
+                .unwrap_or_else(|| envelope.from.to_peer_id()),
+        };
+
+        Self::from_external_with_resolved_peer(envelope, from_peer)
+    }
+
+    /// Create a `CommsMessage` from a classified inbox entry.
+    ///
+    /// Uses the ingress-stored `from_peer` identity instead of re-resolving
+    /// against live trust state, preserving snapshot semantics: a message
+    /// accepted at ingress cannot disappear or change identity if the peer
+    /// is removed/renamed before drain.
+    ///
+    /// Returns `None` for non-External items, PlainEvent, and Ack messages.
+    pub(crate) fn from_classified_entry(
+        entry: &crate::inbox::ClassifiedInboxEntry,
+    ) -> Option<Self> {
+        let envelope = match &entry.item {
+            InboxItem::External { envelope } => envelope,
+            InboxItem::PlainEvent { .. } => return None,
+        };
+
+        let from_peer = entry.from_peer.clone().unwrap_or_else(|| {
+            InprocRegistry::global()
+                .get_name_by_pubkey(&envelope.from)
+                .unwrap_or_else(|| envelope.from.to_peer_id())
+        });
+
+        Self::from_external_with_resolved_peer(envelope, from_peer)
     }
 
     /// Format this message as text suitable for injection into an LLM session.

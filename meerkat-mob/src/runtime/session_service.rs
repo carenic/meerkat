@@ -1,5 +1,10 @@
 use super::*;
+use meerkat_core::AgentExecutionSnapshot;
+use meerkat_core::CommsCapabilityError;
+use meerkat_core::ExternalToolSurfaceSnapshot;
+use meerkat_core::PeerIngressRuntimeSnapshot;
 use meerkat_core::Session;
+use meerkat_core::ToolScopeSnapshot;
 use meerkat_core::lifecycle::core_executor::CoreApplyOutput;
 use meerkat_core::lifecycle::run_primitive::RunApplyBoundary;
 use meerkat_core::lifecycle::run_receipt::RunBoundaryReceipt;
@@ -71,25 +76,25 @@ fn session_has_persisted_mob_binding(session: &Session, mob_id: &MobId) -> bool 
 }
 
 fn ephemeral_runtime_adapter_cache()
--> &'static Mutex<HashMap<usize, Weak<meerkat_runtime::RuntimeSessionAdapter>>> {
-    static CACHE: OnceLock<Mutex<HashMap<usize, Weak<meerkat_runtime::RuntimeSessionAdapter>>>> =
+-> &'static Mutex<HashMap<usize, Weak<meerkat_runtime::MeerkatMachine>>> {
+    static CACHE: OnceLock<Mutex<HashMap<usize, Weak<meerkat_runtime::MeerkatMachine>>>> =
         OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn persistent_runtime_adapter_cache()
--> &'static Mutex<HashMap<usize, Weak<meerkat_runtime::RuntimeSessionAdapter>>> {
-    static CACHE: OnceLock<Mutex<HashMap<usize, Weak<meerkat_runtime::RuntimeSessionAdapter>>>> =
+-> &'static Mutex<HashMap<usize, Weak<meerkat_runtime::MeerkatMachine>>> {
+    static CACHE: OnceLock<Mutex<HashMap<usize, Weak<meerkat_runtime::MeerkatMachine>>>> =
         OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn cached_runtime_adapter(
-    cache: &'static Mutex<HashMap<usize, Weak<meerkat_runtime::RuntimeSessionAdapter>>>,
+    cache: &'static Mutex<HashMap<usize, Weak<meerkat_runtime::MeerkatMachine>>>,
     key: usize,
-    init: impl FnOnce() -> Arc<meerkat_runtime::RuntimeSessionAdapter>,
-) -> Arc<meerkat_runtime::RuntimeSessionAdapter> {
+    init: impl FnOnce() -> Arc<meerkat_runtime::MeerkatMachine>,
+) -> Arc<meerkat_runtime::MeerkatMachine> {
     let mut cache = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -129,8 +134,36 @@ pub trait MobSessionService:
         false
     }
 
-    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::RuntimeSessionAdapter>> {
+    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::MeerkatMachine>> {
         None
+    }
+
+    async fn execution_snapshot(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Option<AgentExecutionSnapshot>, SessionError> {
+        Ok(None)
+    }
+
+    async fn tool_scope_snapshot(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Option<ToolScopeSnapshot>, SessionError> {
+        Ok(None)
+    }
+
+    async fn external_tool_surface_snapshot(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Option<ExternalToolSurfaceSnapshot>, SessionError> {
+        Ok(None)
+    }
+
+    async fn peer_ingress_runtime_snapshot(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Option<PeerIngressRuntimeSnapshot>, SessionError> {
+        Ok(None)
     }
 
     /// Whether a listed session belongs to the given mob for reconciliation.
@@ -188,13 +221,51 @@ where
         false
     }
 
-    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::RuntimeSessionAdapter>> {
+    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::MeerkatMachine>> {
         let key = std::ptr::from_ref(self) as usize;
         Some(cached_runtime_adapter(
             ephemeral_runtime_adapter_cache(),
             key,
-            || Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral()),
+            || Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
         ))
+    }
+
+    async fn execution_snapshot(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<AgentExecutionSnapshot>, SessionError> {
+        meerkat_session::EphemeralSessionService::<B>::execution_snapshot(self, session_id).await
+    }
+
+    async fn tool_scope_snapshot(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<ToolScopeSnapshot>, SessionError> {
+        meerkat_session::EphemeralSessionService::<B>::tool_scope_snapshot(self, session_id).await
+    }
+
+    async fn external_tool_surface_snapshot(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<ExternalToolSurfaceSnapshot>, SessionError> {
+        meerkat_session::EphemeralSessionService::<B>::external_tool_surface_snapshot(
+            self, session_id,
+        )
+        .await
+    }
+
+    async fn peer_ingress_runtime_snapshot(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<PeerIngressRuntimeSnapshot>, SessionError> {
+        let Some(runtime) = self.comms_runtime(session_id).await else {
+            return Ok(None);
+        };
+
+        match runtime.peer_ingress_runtime_snapshot().await {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(CommsCapabilityError::Unsupported(_)) => Ok(None),
+        }
     }
 
     async fn subscribe_session_events(
@@ -254,7 +325,7 @@ where
         true
     }
 
-    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::RuntimeSessionAdapter>> {
+    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::MeerkatMachine>> {
         #[cfg(target_arch = "wasm32")]
         {
             None
@@ -264,12 +335,50 @@ where
             let key = std::ptr::from_ref(self) as usize;
             self.runtime_store().map(|store| {
                 cached_runtime_adapter(persistent_runtime_adapter_cache(), key, || {
-                    Arc::new(meerkat_runtime::RuntimeSessionAdapter::persistent(
+                    Arc::new(meerkat_runtime::MeerkatMachine::persistent(
                         store,
                         self.blob_store(),
                     ))
                 })
             })
+        }
+    }
+
+    async fn execution_snapshot(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<AgentExecutionSnapshot>, SessionError> {
+        meerkat_session::PersistentSessionService::<B>::execution_snapshot(self, session_id).await
+    }
+
+    async fn tool_scope_snapshot(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<ToolScopeSnapshot>, SessionError> {
+        meerkat_session::PersistentSessionService::<B>::tool_scope_snapshot(self, session_id).await
+    }
+
+    async fn external_tool_surface_snapshot(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<ExternalToolSurfaceSnapshot>, SessionError> {
+        meerkat_session::PersistentSessionService::<B>::external_tool_surface_snapshot(
+            self, session_id,
+        )
+        .await
+    }
+
+    async fn peer_ingress_runtime_snapshot(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<PeerIngressRuntimeSnapshot>, SessionError> {
+        let Some(runtime) = self.comms_runtime(session_id).await else {
+            return Ok(None);
+        };
+
+        match runtime.peer_ingress_runtime_snapshot().await {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(CommsCapabilityError::Unsupported(_)) => Ok(None),
         }
     }
 

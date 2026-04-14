@@ -10,7 +10,7 @@ use std::time::Duration;
 use meerkat::surface::{RequestContext, request_action};
 
 use meerkat_mob::definition::FlowSpec;
-use meerkat_mob::ids::{FlowId, MeerkatId, MobId};
+use meerkat_mob::ids::{AgentIdentity, FlowId, MobId};
 use meerkat_mob::{MobDefinition, MobRun, MobRunStatus, SpawnMemberSpec, StepRunStatus};
 
 use crate::state::ForceState;
@@ -126,11 +126,10 @@ pub async fn handle(
 
     if !mob_exists {
         // Override the mob id when resuming with a new mob
-        let definition = if resuming {
-            MobDefinition { id: mob_id.clone(), ..definition }
-        } else {
-            definition
-        };
+        let mut definition = definition;
+        if resuming {
+            definition.id = mob_id.clone();
+        }
 
         // Create mob
         state
@@ -532,7 +531,7 @@ async fn run_comms(
         .mob_state
         .mob_member_send(
             mob_id,
-            MeerkatId::from(orchestrator),
+            AgentIdentity::from(orchestrator),
             task.to_string().into(),
             meerkat_core::types::HandlingMode::Queue,
             None,
@@ -607,7 +606,7 @@ async fn run_comms(
                 // Always update on RunCompleted (even empty) so we know the
                 // orchestrator ran. Prefer non-empty results; TextComplete
                 // overwrites if it carries content.
-                if attributed.source.as_str() == orchestrator {
+                if attributed.source.identity.as_str() == orchestrator {
                     match &attributed.envelope.payload {
                         AgentEvent::RunCompleted { result, .. } => {
                             if !result.is_empty() {

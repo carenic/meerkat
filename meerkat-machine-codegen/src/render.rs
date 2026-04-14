@@ -21,7 +21,7 @@ macro_rules! pushln {
 #[cfg(not(test))]
 use meerkat_machine_schema::{
     CompositionCoverageManifest, CompositionInvariantKind, CompositionSchema,
-    MachineCoverageManifest, RouteDelivery, SchedulerRule, SemanticCoverageEntry,
+    MachineCoverageManifest, RouteDelivery, RouteTargetKind, SchedulerRule, SemanticCoverageEntry,
 };
 use meerkat_machine_schema::{
     EffectEmit, EnumSchema, Expr, FieldInit, FieldSchema, Guard, HelperSchema, MachineSchema,
@@ -87,6 +87,7 @@ pub fn render_machine_module(schema: &MachineSchema) -> String {
     out.push('\n');
 
     render_enum_section(&mut out, "INPUTS", &schema.inputs);
+    render_enum_section(&mut out, "SIGNALS", &schema.signals);
     render_enum_section(&mut out, "EFFECTS", &schema.effects);
 
     render_helpers_section(&mut out, "HELPERS", &schema.helpers);
@@ -123,12 +124,16 @@ pub fn render_composition_module(schema: &CompositionSchema) -> String {
     for route in &schema.routes {
         pushln!(
             &mut out,
-            "  {} == {}.{} -> {}.{} [{}]",
+            "  {} == {}.{} -> {}.{} ({}) [{}]",
             route.name,
             route.from_machine,
             route.effect_variant,
             route.to.machine,
             route.to.input_variant,
+            match route.to.kind {
+                RouteTargetKind::Input => "Input",
+                RouteTargetKind::Signal => "Signal",
+            },
             render_route_delivery(&route.delivery)
         );
         if !route.bindings.is_empty() {
@@ -315,7 +320,7 @@ pub fn render_machine_kernel_module(schema: &MachineSchema) -> String {
     pushln!(&mut out, "use crate::runtime::{{");
     pushln!(
         &mut out,
-        "    GeneratedMachineKernel, KernelInput, KernelState, KernelValue, TransitionOutcome, TransitionRefusal,"
+        "    GeneratedMachineKernel, KernelInput, KernelSignal, KernelState, KernelValue, TransitionOutcome, TransitionRefusal,"
     );
     pushln!(&mut out, "}};");
     pushln!(&mut out);
@@ -347,6 +352,16 @@ pub fn render_machine_kernel_module(schema: &MachineSchema) -> String {
     pushln!(&mut out, "    kernel().transition(state, input)");
     pushln!(&mut out, "}}");
     pushln!(&mut out);
+    pushln!(&mut out, "pub fn transition_signal(");
+    pushln!(&mut out, "    state: &KernelState,");
+    pushln!(&mut out, "    signal: &KernelSignal,");
+    pushln!(
+        &mut out,
+        ") -> Result<TransitionOutcome, TransitionRefusal> {{"
+    );
+    pushln!(&mut out, "    kernel().transition_signal(state, signal)");
+    pushln!(&mut out, "}}");
+    pushln!(&mut out);
     pushln!(&mut out, "pub fn evaluate_helper(");
     pushln!(&mut out, "    state: &KernelState,");
     pushln!(&mut out, "    helper_name: &str,");
@@ -375,6 +390,11 @@ pub fn render_generated_kernel_mod(schemas: &[MachineSchema]) -> String {
         .iter()
         .map(|schema| machine_slug(&schema.machine))
         .collect();
+    for compatibility_slug in ["flow_frame", "flow_run", "loop_iteration"] {
+        if !module_slugs.iter().any(|slug| slug == compatibility_slug) {
+            module_slugs.push(compatibility_slug.to_string());
+        }
+    }
     module_slugs.sort();
     for slug in module_slugs {
         pushln!(&mut out, "pub mod {slug};");
@@ -945,7 +965,8 @@ mod tests {
     use super::render_machine_module;
     use meerkat_machine_schema::{
         EffectEmit, EnumSchema, Expr, FieldInit, FieldSchema, InitSchema, InputMatch,
-        MachineSchema, RustBinding, StateSchema, TransitionSchema, TypeRef, Update, VariantSchema,
+        MachineSchema, RustBinding, StateSchema, TransitionSchema, TriggerKind, TypeRef, Update,
+        VariantSchema,
     };
 
     fn turn_execution_fixture() -> MachineSchema {
@@ -1018,6 +1039,10 @@ mod tests {
                     },
                 ],
             },
+            signals: EnumSchema {
+                name: "TurnExecutionSignal".to_owned(),
+                variants: vec![],
+            },
             effects: EnumSchema {
                 name: "TurnExecutionEffect".to_owned(),
                 variants: vec![VariantSchema {
@@ -1042,6 +1067,7 @@ mod tests {
                     name: "StartConversationRun".to_owned(),
                     from: vec!["Idle".to_owned()],
                     on: InputMatch {
+                        kind: TriggerKind::Input,
                         variant: "StartConversationRun".to_owned(),
                         bindings: vec!["run_id".to_owned()],
                     },
@@ -1054,6 +1080,7 @@ mod tests {
                     name: "PrimitiveAppliedConversationTurn".to_owned(),
                     from: vec!["Running".to_owned()],
                     on: InputMatch {
+                        kind: TriggerKind::Input,
                         variant: "PrimitiveAppliedConversationTurn".to_owned(),
                         bindings: vec!["run_id".to_owned()],
                     },
@@ -1083,6 +1110,7 @@ mod tests {
                     name: "BoundaryComplete".to_owned(),
                     from: vec!["AwaitingBoundary".to_owned()],
                     on: InputMatch {
+                        kind: TriggerKind::Input,
                         variant: "BoundaryComplete".to_owned(),
                         bindings: vec![],
                     },
@@ -1095,6 +1123,7 @@ mod tests {
                     name: "AcknowledgeTerminalFromCancelled".to_owned(),
                     from: vec!["Cancelled".to_owned()],
                     on: InputMatch {
+                        kind: TriggerKind::Input,
                         variant: "AcknowledgeTerminalFromCancelled".to_owned(),
                         bindings: vec![],
                     },

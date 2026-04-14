@@ -3,7 +3,7 @@
 use super::session::WireContentInput;
 use meerkat_core::OutputSchema;
 use meerkat_core::{
-    HandlingMode, SessionId,
+    HandlingMode,
     types::{RenderClass, RenderMetadata, RenderSalience},
 };
 use serde::{Deserialize, Serialize};
@@ -383,9 +383,9 @@ const fn default_event_router_buffer_size() -> usize {
 /// Public mob definition input for `mob/create`.
 ///
 /// This mirrors the public creation contract shape. Runtime-owned lifecycle and
-/// bookkeeping fields such as `owner_session_id`, `session_cleanup_policy`,
-/// `is_implicit`, and internal-only profile tool bundles are intentionally not
-/// part of this schema.
+/// bookkeeping fields such as internal owner/runtime bindings,
+/// `session_cleanup_policy`, `is_implicit`, and internal-only profile tool
+/// bundles are intentionally not part of this schema.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -489,7 +489,7 @@ pub struct MobUnwireResult {
 #[serde(deny_unknown_fields)]
 pub struct MobMemberSendParams {
     pub mob_id: String,
-    pub meerkat_id: String,
+    pub agent_identity: String,
     pub content: WireContentInput,
     #[serde(default)]
     pub handling_mode: WireHandlingMode,
@@ -500,11 +500,22 @@ pub struct MobMemberSendParams {
 /// Response payload for host-side mob member delivery.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct WireAgentRuntimeId {
+    pub identity: String,
+    pub generation: u64,
+}
+
+/// Response payload for host-side mob member delivery.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MobMemberSendResult {
     pub mob_id: String,
-    pub member_id: String,
-    #[cfg_attr(feature = "schema", schemars(with = "String"))]
-    pub session_id: SessionId,
+    /// Identity-native member identity (0.6).
+    pub agent_identity: String,
+    /// Identity-native runtime ID for this incarnation (0.6).
+    pub agent_runtime_id: WireAgentRuntimeId,
+    /// Fence token for the current incarnation (0.6).
+    pub fence_token: u64,
     pub handling_mode: WireHandlingMode,
 }
 
@@ -676,7 +687,7 @@ mod tests {
         let err = serde_json::from_value::<MobCreateParams>(serde_json::json!({
             "definition": {
                 "id": "mob-1",
-                "owner_session_id": "session-123",
+                "owner_runtime_binding": "runtime:worker:0",
                 "profiles": {
                     "worker": { "model": "claude-sonnet-4-6" }
                 }
@@ -685,7 +696,28 @@ mod tests {
         .expect_err("reserved runtime lifecycle fields must be rejected");
 
         assert!(
-            err.to_string().contains("unknown field `owner_session_id`"),
+            err.to_string()
+                .contains("unknown field `owner_runtime_binding`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn mob_create_params_reject_reserved_runtime_bridge_owner_field() {
+        let err = serde_json::from_value::<MobCreateParams>(serde_json::json!({
+            "definition": {
+                "id": "mob-1",
+                "owner_transport_binding": "transport:worker:0",
+                "profiles": {
+                    "worker": { "model": "claude-sonnet-4-6" }
+                }
+            }
+        }))
+        .expect_err("reserved runtime bridge owner field must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("unknown field `owner_transport_binding`"),
             "unexpected error: {err}"
         );
     }

@@ -1,11 +1,12 @@
 //! Comms inbox drain task.
 //!
 //! Standalone tokio task that drains `CommsRuntime` inbox and feeds typed
-//! `Input` values into `RuntimeSessionAdapter`. Replaces the old
+//! `Input` values into `MeerkatMachine`. Replaces the old
 //! `RuntimeCommsBridge` (comms_sink.rs) which implemented the now-removed
 //! `RuntimeInputSink` trait on `meerkat-core`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use meerkat_core::agent::CommsRuntime;
 use meerkat_core::event::AgentEvent;
@@ -15,12 +16,15 @@ use meerkat_core::types::SessionId;
 
 use meerkat_core::comms_drain_lifecycle_authority::DrainExitReason;
 
-use crate::comms_bridge::peer_input_candidate_to_runtime_input;
+use crate::comms_bridge::classified_interaction_to_runtime_input;
 use crate::completion::CompletionOutcome;
 use crate::identifiers::LogicalRuntimeId;
+use crate::meerkat_machine::MeerkatMachine;
 use crate::service_ext::SessionServiceRuntimeExt as _;
-use crate::session_adapter::RuntimeSessionAdapter;
 use crate::tokio::sync::mpsc;
+
+/// Default idle timeout for session-backed comms drains.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Spawn a background task that drains the comms inbox and routes
 /// classified interactions through the runtime adapter.
@@ -28,10 +32,12 @@ use crate::tokio::sync::mpsc;
 /// The task runs until the comms runtime signals DISMISS or the returned
 /// `JoinHandle` is aborted by the drain lifecycle authority.
 pub fn spawn_comms_drain(
-    adapter: Arc<RuntimeSessionAdapter>,
+    adapter: Arc<MeerkatMachine>,
     session_id: SessionId,
     comms_runtime: Arc<dyn CommsRuntime>,
+    idle_timeout: Option<Duration>,
 ) -> crate::tokio::task::JoinHandle<()> {
+    let timeout_dur = idle_timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT);
     let runtime_id = LogicalRuntimeId::new(session_id.to_string());
 
     crate::tokio::spawn(async move {
@@ -62,7 +68,16 @@ pub fn spawn_comms_drain(
                         .await;
                     return;
                 }
-                notified.await;
+                if crate::tokio::time::timeout(timeout_dur, notified)
+                    .await
+                    .is_err()
+                {
+                    tracing::info!("comms_drain: idle timeout expired, stopping");
+                    adapter
+                        .notify_comms_drain_exited(&session_id, DrainExitReason::IdleTimeout)
+                        .await;
+                    return;
+                }
                 continue;
             }
 
@@ -78,7 +93,8 @@ pub fn spawn_comms_drain(
                         // Lifecycle events must be injected as session context
                         // so the LLM knows when peers connect/disconnect.
                         // comms_drain is the sole keep-alive inbox consumer.
-                        let input = peer_input_candidate_to_runtime_input(&candidate, &runtime_id);
+                        let input =
+                            classified_interaction_to_runtime_input(&candidate, &runtime_id);
                         if let Err(err) = adapter.accept_input(&session_id, input).await {
                             tracing::warn!(
                                 error = %err,
@@ -109,7 +125,7 @@ pub fn spawn_comms_drain(
                             let interaction_id = candidate.interaction.id;
                             let subscriber = comms_runtime.interaction_subscriber(&interaction_id);
                             let content_input =
-                                peer_input_candidate_to_runtime_input(&candidate, &runtime_id);
+                                classified_interaction_to_runtime_input(&candidate, &runtime_id);
                             let result = adapter
                                 .accept_input_with_completion(&session_id, content_input)
                                 .await;
@@ -137,7 +153,7 @@ pub fn spawn_comms_drain(
                         } else {
                             // Progress response — route as peer input for checkpoint-style handling.
                             let input =
-                                peer_input_candidate_to_runtime_input(&candidate, &runtime_id);
+                                classified_interaction_to_runtime_input(&candidate, &runtime_id);
                             if let Err(err) = adapter.accept_input(&session_id, input).await {
                                 tracing::warn!(
                                     error = %err,
@@ -155,7 +171,8 @@ pub fn spawn_comms_drain(
                         // Route through the adapter as a peer input.
                         let interaction_id = candidate.interaction.id;
                         let subscriber = comms_runtime.interaction_subscriber(&interaction_id);
-                        let input = peer_input_candidate_to_runtime_input(&candidate, &runtime_id);
+                        let input =
+                            classified_interaction_to_runtime_input(&candidate, &runtime_id);
                         let result = adapter
                             .accept_input_with_completion(&session_id, input)
                             .await;

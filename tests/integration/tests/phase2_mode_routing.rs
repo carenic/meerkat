@@ -19,8 +19,8 @@ use meerkat_core::types::{
 };
 use meerkat_core::{InteractionId, PlainEventSource, Provider};
 use meerkat_mob::{
-    MeerkatId, MobBackendKind, MobBuilder, MobDefinition, MobId, MobRuntimeMode, MobSessionService,
-    MobStorage, ProfileName,
+    AgentIdentity, MobBackendKind, MobBuilder, MobDefinition, MobId, MobRuntimeMode,
+    MobSessionService, MobStorage, SpawnMemberSpec,
 };
 use tokio::sync::{Notify, RwLock};
 
@@ -29,7 +29,7 @@ struct MockSessionService {
     keep_alive_notifiers: RwLock<HashMap<SessionId, Arc<Notify>>>,
     start_turn_calls: AtomicU64,
     inject_calls: Arc<AtomicU64>,
-    runtime_adapter: Arc<meerkat_runtime::RuntimeSessionAdapter>,
+    runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
 }
 
 impl Default for MockSessionService {
@@ -39,7 +39,7 @@ impl Default for MockSessionService {
             keep_alive_notifiers: RwLock::new(HashMap::new()),
             start_turn_calls: AtomicU64::new(0),
             inject_calls: Arc::new(AtomicU64::new(0)),
-            runtime_adapter: Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral()),
+            runtime_adapter: Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
         }
     }
 }
@@ -257,7 +257,7 @@ impl MobSessionService for MockSessionService {
         true
     }
 
-    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::RuntimeSessionAdapter>> {
+    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::MeerkatMachine>> {
         Some(self.runtime_adapter.clone())
     }
 
@@ -308,35 +308,27 @@ async fn test_phase2_external_turn_routing_by_runtime_mode() {
         .expect("create");
 
     handle
-        .spawn(
-            ProfileName::from("lead"),
-            MeerkatId::from("lead-auto"),
-            None,
-        )
+        .spawn_spec(SpawnMemberSpec::new("lead", "lead-auto"))
         .await
         .expect("spawn autonomous");
+    let mut turn_spec = SpawnMemberSpec::new("lead", "lead-turn");
+    turn_spec.runtime_mode = Some(MobRuntimeMode::TurnDriven);
     handle
-        .spawn_with_options(
-            ProfileName::from("lead"),
-            MeerkatId::from("lead-turn"),
-            None,
-            Some(MobRuntimeMode::TurnDriven),
-            None,
-        )
+        .spawn_spec(turn_spec)
         .await
         .expect("spawn turn-driven");
     let start_before = service.start_turn_calls.load(Ordering::Relaxed);
     let inject_before = service.inject_calls.load(Ordering::Relaxed);
 
     handle
-        .member(&MeerkatId::from("lead-auto"))
+        .member(&AgentIdentity::from("lead-auto"))
         .await
         .expect("member auto")
         .send("auto".to_string(), meerkat_core::types::HandlingMode::Queue)
         .await
         .expect("external autonomous");
     handle
-        .member(&MeerkatId::from("lead-turn"))
+        .member(&AgentIdentity::from("lead-turn"))
         .await
         .expect("member turn")
         .send("turn".to_string(), meerkat_core::types::HandlingMode::Queue)

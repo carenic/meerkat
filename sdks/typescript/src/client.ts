@@ -27,6 +27,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import type { SpawnOptions } from "node:child_process";
+import { once } from "node:events";
 import {
   chmodSync,
   existsSync,
@@ -36,6 +37,7 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline";
 import { Buffer } from "node:buffer";
 import { MeerkatError, CapabilityUnavailableError } from "./generated/errors.js";
@@ -83,6 +85,7 @@ import type {
   MobProfile,
   MobProfileDeleteResult,
   MobProfileLookupResult,
+  MobSpawnResult,
   MobSpawnManyResultEntry,
   MobStatus,
   MobSummary,
@@ -131,6 +134,31 @@ interface PlatformTarget {
   target: string;
   archiveExt: "tar.gz" | "zip";
   binaryName: string;
+}
+
+function parseAgentRuntimeId(raw: unknown): { value: string; generation?: number } {
+  if (typeof raw === "string") {
+    return { value: raw };
+  }
+  if (raw && typeof raw === "object") {
+    const record = raw as Record<string, unknown>;
+    const identity =
+      record.identity != null
+        ? String(record.identity)
+        : (record.agent_identity != null ? String(record.agent_identity) : "");
+    const generationRaw = record.generation;
+    const generation =
+      typeof generationRaw === "number" && Number.isFinite(generationRaw)
+        ? generationRaw
+        : undefined;
+    if (identity.length > 0 && generation !== undefined) {
+      return { value: `${identity}:${generation}`, generation };
+    }
+    if (identity.length > 0) {
+      return { value: identity, generation };
+    }
+  }
+  return { value: "" };
 }
 
 /** Options for connecting to the rkat-rpc runtime. */
@@ -302,9 +330,21 @@ export class MeerkatClient {
       this.rl.close();
       this.rl = null;
     }
-    if (this.process) {
-      this.process.kill();
-      this.process = null;
+    const process = this.process;
+    this.process = null;
+    if (process) {
+      process.stdin?.end();
+      const closed = once(process, "close").catch(() => []);
+      process.kill();
+      const timeout = delay(5000).then(() => "timeout");
+      const outcome = await Promise.race([closed, timeout]);
+      if (outcome === "timeout" && process.exitCode == null && process.signalCode == null) {
+        process.kill("SIGKILL");
+        await closed.catch(() => {});
+      }
+      process.stdin?.destroy();
+      process.stdout?.destroy();
+      process.stderr?.destroy();
     }
     for (const [, pending] of this.pendingRequests) {
       pending.reject(new MeerkatError("CLIENT_CLOSED", "Client closed"));
@@ -728,66 +768,85 @@ export class MeerkatClient {
   async listMobMembers(mobId: string): Promise<MobMember[]> {
     const result = await this.request("mob/members", { mob_id: mobId });
     const members = (result.members as Array<Record<string, unknown>>) ?? [];
-    return members.map((member) => ({
-      meerkatId: String(member.meerkat_id ?? member.meerkatId ?? ""),
-      profile: String(member.profile_name ?? member.profile ?? ""),
-      memberRef: (member.member_ref as Record<string, unknown> | undefined),
-      peerId: member.peer_id != null ? String(member.peer_id) : undefined,
-      externalPeerSpecs:
-        member.external_peer_specs && typeof member.external_peer_specs === "object"
+    return members.map((member) => {
+      const agentIdentity = String(member.agent_identity ?? "");
+      const runtime = parseAgentRuntimeId(member.agent_runtime_id);
+      const fenceToken =
+        typeof member.fence_token === "number" && Number.isFinite(member.fence_token)
+          ? member.fence_token
+          : undefined;
+      if (!agentIdentity || !runtime.value || fenceToken === undefined) {
+        throw new MeerkatError(
+          "INVALID_RESPONSE",
+          "Invalid mob/members response: missing identity-native member fields",
+        );
+      }
+      return {
+        agentIdentity,
+        agentRuntimeId: runtime.value,
+        fenceToken,
+        generation: runtime.generation,
+        profile: String(member.profile_name ?? member.profile ?? ""),
+        peerId: member.peer_id != null ? String(member.peer_id) : undefined,
+        externalPeerSpecs:
+          member.external_peer_specs && typeof member.external_peer_specs === "object"
+            ? Object.fromEntries(
+                Object.entries(member.external_peer_specs as Record<string, unknown>).map(
+                  ([key, value]) => [key, (value ?? {}) as Record<string, unknown>],
+                ),
+              )
+            : undefined,
+        runtimeMode: member.runtime_mode != null ? String(member.runtime_mode) : undefined,
+        state: member.state != null ? String(member.state) : undefined,
+        wiredTo: Array.isArray(member.wired_to)
+          ? member.wired_to.map((peer) => String(peer))
+          : undefined,
+        labels: member.labels && typeof member.labels === "object"
           ? Object.fromEntries(
-              Object.entries(member.external_peer_specs as Record<string, unknown>).map(
-                ([key, value]) => [key, (value ?? {}) as Record<string, unknown>],
-              ),
+              Object.entries(member.labels as Record<string, unknown>).map(([key, value]) => [key, String(value)]),
             )
           : undefined,
-      runtimeMode: member.runtime_mode != null ? String(member.runtime_mode) : undefined,
-      state: member.state != null ? String(member.state) : undefined,
-      wiredTo: Array.isArray(member.wired_to)
-        ? member.wired_to.map((peer) => String(peer))
-        : undefined,
-      labels: member.labels && typeof member.labels === 'object'
-        ? Object.fromEntries(Object.entries(member.labels as Record<string, unknown>).map(([key, value]) => [key, String(value)]))
-        : undefined,
-      status: member.status != null ? String(member.status) : undefined,
-      error: member.error != null ? String(member.error) : undefined,
-      isFinal: member.is_final != null ? Boolean(member.is_final) : undefined,
-      currentSessionId:
-        member.current_session_id != null ? String(member.current_session_id) : undefined,
-      sessionId: member.member_ref && typeof member.member_ref === 'object'
-        ? (member.member_ref as Record<string, unknown>).session_id != null
-          ? String((member.member_ref as Record<string, unknown>).session_id)
-          : undefined
-        : undefined,
-    }));
+        status: member.status != null ? String(member.status) : undefined,
+        error: member.error != null ? String(member.error) : undefined,
+        isFinal: member.is_final != null ? Boolean(member.is_final) : undefined,
+        currentRuntimeId: runtime.value || undefined,
+        currentFenceToken: fenceToken || undefined,
+      };
+    });
   }
 
   async sendMobMemberContent(
     mobId: string,
-    meerkatId: string,
+    agentIdentity: string,
     content: string | ContentBlock[],
     options?: MemberSendOptions,
   ): Promise<MemberDeliveryReceipt> {
     const result = await this.request("mob/member_send", {
       mob_id: mobId,
-      meerkat_id: meerkatId,
+      agent_identity: agentIdentity,
       content,
       handling_mode: options?.handlingMode,
       render_metadata: options?.renderMetadata,
     });
-    const sessionId = result.session_id;
-    if (typeof sessionId !== "string" || sessionId.length === 0) {
+    const runtime = parseAgentRuntimeId(result.agent_runtime_id);
+    const fenceToken =
+      typeof result.fence_token === "number" && Number.isFinite(result.fence_token)
+        ? result.fence_token
+        : undefined;
+    if (!runtime.value || fenceToken === undefined) {
       throw new MeerkatError(
         "INVALID_RESPONSE",
-        "Invalid mob/member_send response: missing session_id",
+        "Invalid mob/member_send response: missing runtime identity fields",
       );
     }
     return {
-      memberId:
-        typeof result.member_id === "string" && result.member_id.length > 0
-          ? result.member_id
-          : meerkatId,
-      sessionId,
+      agentIdentity:
+        typeof result.agent_identity === "string" && result.agent_identity.length > 0
+          ? result.agent_identity
+          : agentIdentity,
+      agentRuntimeId: runtime.value,
+      fenceToken,
+      ...(runtime.generation !== undefined ? { generation: runtime.generation } : {}),
       handlingMode:
         result.handling_mode === "steer" || result.handling_mode === "queue"
           ? result.handling_mode
@@ -798,19 +857,39 @@ export class MeerkatClient {
   async spawnMobMember(
     mobId: string,
     options: SpawnSpec,
-  ): Promise<Record<string, unknown>> {
-    return this.request("mob/spawn", {
+  ): Promise<MobSpawnResult> {
+    const result = await this.request("mob/spawn", {
       mob_id: mobId,
       profile: options.profile,
-      meerkat_id: options.meerkatId,
+      agent_identity: options.agentIdentity,
       initial_message: options.initialMessage,
       runtime_mode: options.runtimeMode,
       backend: options.backend,
-      resume_session_id: options.resumeSessionId,
       labels: options.labels,
       context: options.context,
       additional_instructions: options.additionalInstructions,
     });
+    const runtime = parseAgentRuntimeId(result.agent_runtime_id);
+    const fenceToken =
+      typeof result.fence_token === "number" && Number.isFinite(result.fence_token)
+        ? result.fence_token
+        : undefined;
+    if (!runtime.value || fenceToken === undefined) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        "Invalid mob/spawn response: missing runtime identity fields",
+      );
+    }
+    return {
+      mobId: String(result.mob_id ?? mobId),
+      agentIdentity:
+        typeof result.agent_identity === "string" && result.agent_identity.length > 0
+          ? result.agent_identity
+          : options.agentIdentity,
+      agentRuntimeId: runtime.value,
+      fenceToken,
+      generation: runtime.generation,
+    };
   }
 
   async spawnMobMembers(
@@ -821,11 +900,10 @@ export class MeerkatClient {
       mob_id: mobId,
       specs: specs.map((spec) => ({
         profile: spec.profile,
-        meerkat_id: spec.meerkatId,
+        agent_identity: spec.agentIdentity,
         initial_message: spec.initialMessage,
         runtime_mode: spec.runtimeMode,
         backend: spec.backend,
-        resume_session_id: spec.resumeSessionId,
         labels: spec.labels,
         context: spec.context,
         additional_instructions: spec.additionalInstructions,
@@ -834,37 +912,57 @@ export class MeerkatClient {
     const entries = Array.isArray(result.results)
       ? (result.results as Array<Record<string, unknown>>)
       : [];
-    return entries.map((entry) => ({
-      ok: Boolean(entry.ok),
-      memberRef:
-        entry.member_ref && typeof entry.member_ref === "object"
-          ? (entry.member_ref as Record<string, unknown>)
-          : undefined,
-      sessionId: entry.session_id != null ? String(entry.session_id) : undefined,
-      error: entry.error != null ? String(entry.error) : undefined,
-    }));
+    return entries.map((entry) => {
+      const ok = Boolean(entry.ok);
+      const agentIdentity =
+        entry.agent_identity != null ? String(entry.agent_identity) : undefined;
+      const runtime = parseAgentRuntimeId(entry.agent_runtime_id);
+      const fenceToken =
+        typeof entry.fence_token === "number" && Number.isFinite(entry.fence_token)
+          ? entry.fence_token
+          : undefined;
+      if (ok && (!agentIdentity || !runtime.value || fenceToken === undefined)) {
+        throw new MeerkatError(
+          "INVALID_RESPONSE",
+          "Invalid mob/spawn_many response: successful entry missing runtime identity fields",
+        );
+      }
+      return {
+        ok,
+        agentIdentity,
+        agentRuntimeId: runtime.value || undefined,
+        fenceToken,
+        generation: runtime.generation,
+        error: entry.error != null ? String(entry.error) : undefined,
+      };
+    });
   }
 
-  async retireMobMember(mobId: string, meerkatId: string): Promise<void> {
-    await this.request("mob/retire", { mob_id: mobId, meerkat_id: meerkatId });
+  async retireMobMember(mobId: string, agentIdentity: string): Promise<void> {
+    await this.request("mob/retire", {
+      mob_id: mobId,
+      agent_identity: agentIdentity,
+    });
   }
 
   async respawnMobMember(
     mobId: string,
-    meerkatId: string,
+    agentIdentity: string,
     initialMessage?: string | ContentBlock[],
   ): Promise<{
     status: "completed" | "topology_restore_failed";
     receipt: {
-      memberId: string;
-      oldSessionId?: string;
-      newSessionId?: string;
+      agentIdentity: string;
+      agentRuntimeId: string;
+      previousFenceToken: number;
+      fenceToken: number;
+      generation?: number;
     };
     failedPeerIds?: string[];
   }> {
     const result = await this.request("mob/respawn", {
       mob_id: mobId,
-      meerkat_id: meerkatId,
+      agent_identity: agentIdentity,
       initial_message: initialMessage,
     });
     const status = String(result.status ?? "completed");
@@ -878,52 +976,94 @@ export class MeerkatClient {
         "Invalid mob/respawn response: missing receipt",
       );
     }
+    const runtime = parseAgentRuntimeId(receipt.agent_runtime_id);
+    if (!runtime.value) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        "Invalid mob/respawn response: receipt missing runtime identity",
+      );
+    }
     return {
       status: status === "topology_restore_failed" ? "topology_restore_failed" : "completed",
       receipt: {
-        memberId: String(receipt.member_id ?? meerkatId),
-        oldSessionId:
-          receipt.old_session_id != null ? String(receipt.old_session_id) : undefined,
-        newSessionId:
-          receipt.new_session_id != null ? String(receipt.new_session_id) : undefined,
+        agentIdentity:
+          receipt.identity != null ? String(receipt.identity) : agentIdentity,
+        agentRuntimeId: runtime.value,
+        previousFenceToken: Number(receipt.previous_fence_token ?? 0),
+        fenceToken: Number(receipt.fence_token ?? 0),
+        generation: runtime.generation,
       },
       failedPeerIds: rawFailed.map((peerId) => String(peerId)),
     };
   }
 
-  async forceCancelMobMember(mobId: string, meerkatId: string): Promise<void> {
-    await this.request("mob/force_cancel", { mob_id: mobId, meerkat_id: meerkatId });
+  async forceCancelMobMember(mobId: string, agentIdentity: string): Promise<void> {
+    await this.request("mob/force_cancel", {
+      mob_id: mobId,
+      agent_identity: agentIdentity,
+    });
+  }
+
+  async mobTurnStart(
+    mobId: string,
+    agentIdentity: string,
+    prompt: string,
+    overrides?: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    return await this.request("mob/turn_start", {
+      mob_id: mobId,
+      agent_identity: agentIdentity,
+      prompt,
+      ...overrides,
+    });
   }
 
   async mobMemberStatus(
     mobId: string,
-    meerkatId: string,
+    agentIdentity: string,
   ): Promise<{
     status: string;
+    agentRuntimeId: string;
+    fenceToken: number;
+    generation?: number;
     outputPreview?: string;
     error?: string;
     tokensUsed: number;
     isFinal: boolean;
-    currentSessionId?: string;
     peerConnectivity?: {
       reachablePeerCount: number;
       unknownPeerCount: number;
       unreachablePeers: Array<{ peer: string; reason?: string }>;
     };
   }> {
-    const result = await this.request("mob/member_status", { mob_id: mobId, meerkat_id: meerkatId });
+    const result = await this.request("mob/member_status", {
+      mob_id: mobId,
+      agent_identity: agentIdentity,
+    });
     const rawConnectivity =
       result.peer_connectivity && typeof result.peer_connectivity === "object"
         ? (result.peer_connectivity as Record<string, unknown>)
         : undefined;
+    const runtime = parseAgentRuntimeId(result.agent_runtime_id);
+    const fenceToken =
+      typeof result.fence_token === "number" && Number.isFinite(result.fence_token)
+        ? result.fence_token
+        : undefined;
+    if (!runtime.value || fenceToken === undefined) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        "Invalid mob/member_status response: missing runtime identity fields",
+      );
+    }
     return {
       status: String(result.status ?? "unknown"),
+      agentRuntimeId: runtime.value,
+      fenceToken,
+      generation: runtime.generation,
       outputPreview: result.output_preview != null ? String(result.output_preview) : undefined,
       error: result.error != null ? String(result.error) : undefined,
       tokensUsed: Number(result.tokens_used ?? 0),
       isFinal: Boolean(result.is_final),
-      currentSessionId:
-        result.current_session_id != null ? String(result.current_session_id) : undefined,
       peerConnectivity: rawConnectivity
         ? {
             reachablePeerCount: Number(rawConnectivity.reachable_peer_count ?? 0),
@@ -959,20 +1099,33 @@ export class MeerkatClient {
     return members.map((entry) => {
       const member =
         entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
+      const agentIdentity = String(member.agent_identity ?? "");
+      const runtime = parseAgentRuntimeId(member.agent_runtime_id);
+      const fenceToken =
+        typeof member.fence_token === "number" && Number.isFinite(member.fence_token)
+          ? member.fence_token
+          : undefined;
+      if (!agentIdentity || !runtime.value || fenceToken === undefined) {
+        throw new MeerkatError(
+          "INVALID_RESPONSE",
+          "Invalid mob/wait_kickoff response: member missing runtime identity fields",
+        );
+      }
       const rawConnectivity =
         member.peer_connectivity && typeof member.peer_connectivity === "object"
           ? (member.peer_connectivity as Record<string, unknown>)
           : undefined;
       return {
-        meerkatId: String(member.meerkat_id ?? ""),
+        agentIdentity,
+        agentRuntimeId: runtime.value,
+        fenceToken,
+        generation: runtime.generation,
         status: String(member.status ?? "unknown"),
         outputPreview:
           member.output_preview != null ? String(member.output_preview) : undefined,
         error: member.error != null ? String(member.error) : undefined,
         tokensUsed: Number(member.tokens_used ?? 0),
         isFinal: Boolean(member.is_final),
-        currentSessionId:
-          member.current_session_id != null ? String(member.current_session_id) : undefined,
         peerConnectivity: rawConnectivity
           ? {
               reachablePeerCount: Number(rawConnectivity.reachable_peer_count ?? 0),
@@ -1004,26 +1157,53 @@ export class MeerkatClient {
     mobId: string,
     prompt: string,
     options?: {
-      meerkatId?: string;
+      agentIdentity?: string;
       roleName?: string;
       profileName?: string;
       runtimeMode?: string;
       backend?: string;
     },
-  ): Promise<{ output?: string; tokensUsed: number; sessionId?: string }> {
+  ): Promise<{
+    output?: string;
+    tokensUsed: number;
+    agentIdentity: string;
+    agentRuntimeId: string;
+    fenceToken: number;
+    generation?: number;
+  }> {
     const roleName = options?.roleName ?? options?.profileName;
     const result = await this.request("mob/spawn_helper", {
       mob_id: mobId,
       prompt,
-      meerkat_id: options?.meerkatId,
+      agent_identity: options?.agentIdentity,
       role_name: roleName,
       runtime_mode: options?.runtimeMode,
       backend: options?.backend,
     });
+    const runtime = parseAgentRuntimeId(result.agent_runtime_id);
+    if (!runtime.value) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        "Invalid mob/spawn_helper response: missing runtime identity",
+      );
+    }
+    const resultIdentity =
+      typeof result.agent_identity === "string" && result.agent_identity.length > 0
+        ? result.agent_identity
+        : options?.agentIdentity;
+    if (!resultIdentity) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        "Invalid mob/spawn_helper response: missing agent identity",
+      );
+    }
     return {
       output: result.output != null ? String(result.output) : undefined,
       tokensUsed: Number(result.tokens_used ?? 0),
-      sessionId: result.session_id != null ? String(result.session_id) : undefined,
+      agentIdentity: resultIdentity,
+      agentRuntimeId: runtime.value,
+      fenceToken: Number(result.fence_token ?? 0),
+      generation: runtime.generation,
     };
   }
 
@@ -1032,29 +1212,56 @@ export class MeerkatClient {
     sourceMemberId: string,
     prompt: string,
     options?: {
-      meerkatId?: string;
+      agentIdentity?: string;
       roleName?: string;
       profileName?: string;
       forkContext?: Record<string, unknown>;
       runtimeMode?: string;
       backend?: string;
     },
-  ): Promise<{ output?: string; tokensUsed: number; sessionId?: string }> {
+  ): Promise<{
+    output?: string;
+    tokensUsed: number;
+    agentIdentity: string;
+    agentRuntimeId: string;
+    fenceToken: number;
+    generation?: number;
+  }> {
     const roleName = options?.roleName ?? options?.profileName;
     const result = await this.request("mob/fork_helper", {
       mob_id: mobId,
       source_member_id: sourceMemberId,
       prompt,
-      meerkat_id: options?.meerkatId,
+      agent_identity: options?.agentIdentity,
       role_name: roleName,
       fork_context: options?.forkContext,
       runtime_mode: options?.runtimeMode,
       backend: options?.backend,
     });
+    const runtime = parseAgentRuntimeId(result.agent_runtime_id);
+    if (!runtime.value) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        "Invalid mob/fork_helper response: missing runtime identity",
+      );
+    }
+    const resultIdentity =
+      typeof result.agent_identity === "string" && result.agent_identity.length > 0
+        ? result.agent_identity
+        : options?.agentIdentity;
+    if (!resultIdentity) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        "Invalid mob/fork_helper response: missing agent identity",
+      );
+    }
     return {
       output: result.output != null ? String(result.output) : undefined,
       tokensUsed: Number(result.tokens_used ?? 0),
-      sessionId: result.session_id != null ? String(result.session_id) : undefined,
+      agentIdentity: resultIdentity,
+      agentRuntimeId: runtime.value,
+      fenceToken: Number(result.fence_token ?? 0),
+      generation: runtime.generation,
     };
   }
 
@@ -1080,13 +1287,13 @@ export class MeerkatClient {
 
   async appendMobSystemContext(
     mobId: string,
-    meerkatId: string,
+    agentIdentity: string,
     text: string,
     options?: { source?: string; idempotencyKey?: string },
   ): Promise<Record<string, unknown>> {
     return this.request("mob/append_system_context", {
       mob_id: mobId,
-      meerkat_id: meerkatId,
+      agent_identity: agentIdentity,
       text,
       source: options?.source,
       idempotency_key: options?.idempotencyKey,
@@ -1187,10 +1394,10 @@ export class MeerkatClient {
     );
   }
 
-  async subscribeMobMemberEvents(mobId: string, meerkatId: string): Promise<EventSubscription<AgentEventEnvelope>> {
+  async subscribeMobMemberEvents(mobId: string, agentIdentity: string): Promise<EventSubscription<AgentEventEnvelope>> {
     return this.openEventSubscription(
       "mob/stream_open",
-      { mob_id: mobId, member_id: meerkatId },
+      { mob_id: mobId, agent_identity: agentIdentity },
       "mob/stream_close",
       MeerkatClient.parseAgentEventEnvelope,
     );

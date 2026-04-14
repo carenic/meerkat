@@ -13,7 +13,7 @@ pub struct MobBuilder {
     mode: BuilderMode,
     storage: MobStorage,
     session_service: Option<Arc<dyn MobSessionService>>,
-    runtime_adapter: Option<Arc<meerkat_runtime::RuntimeSessionAdapter>>,
+    runtime_adapter: Option<Arc<meerkat_runtime::MeerkatMachine>>,
     allow_ephemeral_sessions: bool,
     notify_orchestrator_on_resume: bool,
     tool_bundles: BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
@@ -113,10 +113,7 @@ impl MobBuilder {
     /// When set, this override is used consistently by both provisioning and
     /// autonomous-host comms-drain ingress instead of re-deriving an adapter
     /// from the session service at runtime.
-    pub fn with_runtime_adapter(
-        mut self,
-        adapter: Arc<meerkat_runtime::RuntimeSessionAdapter>,
-    ) -> Self {
+    pub fn with_runtime_adapter(mut self, adapter: Arc<meerkat_runtime::MeerkatMachine>) -> Self {
         self.runtime_adapter = Some(adapter);
         self
     }
@@ -407,11 +404,9 @@ impl MobBuilder {
         let preview_handle = MobHandle {
             command_tx: command_tx.clone(),
             roster: roster_state.clone(),
-            task_board: task_board_state.clone(),
             definition: definition.clone(),
             state: state.clone(),
             events: storage.events.clone(),
-            mcp_servers: mcp_servers.clone(),
             flow_streams: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             session_service: session_service.clone(),
             restore_diagnostics,
@@ -474,7 +469,7 @@ impl MobBuilder {
         definition: &Arc<MobDefinition>,
         roster: &mut Roster,
         session_service: &Arc<dyn MobSessionService>,
-        runtime_adapter: Option<Arc<meerkat_runtime::RuntimeSessionAdapter>>,
+        runtime_adapter: Option<Arc<meerkat_runtime::MeerkatMachine>>,
         notify_orchestrator_on_resume: bool,
         default_llm_client: Option<Arc<dyn LlmClient>>,
         tool_bundles: &BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
@@ -507,7 +502,7 @@ impl MobBuilder {
         let roster_entries = roster.list().cloned().collect::<Vec<_>>();
         let roster_session_ids = roster_entries
             .iter()
-            .filter_map(|entry| entry.session_id().cloned())
+            .filter_map(|entry| entry.bridge_session_id().cloned())
             .collect::<std::collections::HashSet<_>>();
 
         // Archive orphan sessions that are active but not present in the event-projected roster.
@@ -521,19 +516,19 @@ impl MobBuilder {
                 return Err(error.into());
             }
         }
-        // Recreate missing sessions referenced by MeerkatSpawned events.
+        // Recreate missing sessions referenced by MemberSpawned events.
         for entry in &roster_entries {
-            let Some(session_id) = entry.session_id().cloned() else {
+            let Some(bridge_session_id) = entry.bridge_session_id().cloned() else {
                 continue;
             };
-            if active_ids.contains(&session_id) {
+            if active_ids.contains(&bridge_session_id) {
                 continue;
             }
             let record_restore_failure = |reason: String| async {
                 tool_handle.restore_diagnostics.write().await.insert(
                     entry.meerkat_id.clone(),
                     super::handle::RestoreFailureDiagnostic {
-                        session_id: session_id.clone(),
+                        bridge_session_id: bridge_session_id.clone(),
                         reason,
                     },
                 );
@@ -542,11 +537,12 @@ impl MobBuilder {
             if matches!(entry.member_ref, MemberRef::Session { .. })
                 && session_service.supports_persistent_sessions()
             {
-                let Some(stored_session) =
-                    session_service.load_persisted_session(&session_id).await?
+                let Some(stored_session) = session_service
+                    .load_persisted_session(&bridge_session_id)
+                    .await?
                 else {
                     record_restore_failure(format!(
-                        "missing durable session snapshot for '{session_id}'"
+                        "missing durable session snapshot for '{bridge_session_id}'"
                     ))
                     .await;
                     continue;
@@ -556,7 +552,7 @@ impl MobBuilder {
                     p.clone()
                 } else {
                     definition
-                        .resolve_profile(&entry.profile, realm_profile_store.as_ref())
+                        .resolve_profile(&entry.role, realm_profile_store.as_ref())
                         .await?
                 };
                 let profile = &profile;
@@ -565,7 +561,7 @@ impl MobBuilder {
                     build::build_resumed_agent_config(build::BuildResumedAgentConfigParams {
                         base: build::BuildAgentConfigParams {
                             mob_id: &definition.id,
-                            profile_name: &entry.profile,
+                            profile_name: &entry.role,
                             meerkat_id: &entry.meerkat_id,
                             profile,
                             definition,
@@ -583,7 +579,7 @@ impl MobBuilder {
                             mob_tool_access_context: crate::build::MobToolAccessContext::None,
                             inherited_tool_filter: None,
                         },
-                        expected_session_id: &session_id,
+                        expected_session_id: &bridge_session_id,
                         resumed_session: stored_session,
                     })
                     .await;
@@ -602,12 +598,14 @@ impl MobBuilder {
                 resumed_config.llm_client_override = Some(reconcile_client);
                 let prompt = format!(
                     "You have been spawned as '{}' (role: {}) in mob '{}'.",
-                    entry.meerkat_id, entry.profile, definition.id
+                    entry.meerkat_id, entry.role, definition.id
                 );
                 let req = build::to_create_session_request(&resumed_config, prompt.into());
                 match session_service.create_session(req).await {
                     Ok(created) => {
-                        let _ = roster.set_session_id(&entry.meerkat_id, created.session_id);
+                        let created_bridge_session_id = created.session_id;
+                        let _ = roster
+                            .set_bridge_session_id(&entry.meerkat_id, created_bridge_session_id);
                         tool_handle
                             .restore_diagnostics
                             .write()
@@ -616,7 +614,7 @@ impl MobBuilder {
                     }
                     Err(error) => {
                         record_restore_failure(format!(
-                            "failed to restore durable session '{session_id}': {error}"
+                            "failed to restore durable session '{bridge_session_id}': {error}"
                         ))
                         .await;
                     }
@@ -625,12 +623,12 @@ impl MobBuilder {
                 // Ephemeral services can still fall back to fresh-create.
             }
             let profile = definition
-                .resolve_profile(&entry.profile, realm_profile_store.as_ref())
+                .resolve_profile(&entry.role, realm_profile_store.as_ref())
                 .await?;
             let default_ext_fresh = default_external_tools_provider.as_ref().and_then(|p| p());
             let mut config = build::build_agent_config(build::BuildAgentConfigParams {
                 mob_id: &definition.id,
-                profile_name: &entry.profile,
+                profile_name: &entry.role,
                 meerkat_id: &entry.meerkat_id,
                 profile: &profile,
                 definition,
@@ -660,11 +658,12 @@ impl MobBuilder {
             config.llm_client_override = Some(reconcile_client);
             let prompt = format!(
                 "You have been spawned as '{}' (role: {}) in mob '{}'.",
-                entry.meerkat_id, entry.profile, definition.id
+                entry.meerkat_id, entry.role, definition.id
             );
             let req = build::to_create_session_request(&config, prompt.into());
             let created = session_service.create_session(req).await?;
-            let _ = roster.set_session_id(&entry.meerkat_id, created.session_id);
+            let created_bridge_session_id = created.session_id;
+            let _ = roster.set_bridge_session_id(&entry.meerkat_id, created_bridge_session_id);
             tool_handle
                 .restore_diagnostics
                 .write()
@@ -706,18 +705,19 @@ impl MobBuilder {
             let _ = roster.set_peer_id(&entry.meerkat_id, Some(key_a.clone()));
             let mut desired_specs = Vec::new();
 
-            for peer_id in &entry.wired_to {
-                if let Some(spec) = entry.external_peer_specs.get(peer_id) {
+            for peer_identity in &entry.wired_to {
+                let peer_meerkat_id = MeerkatId::from(peer_identity.as_str());
+                if let Some(spec) = entry.external_peer_specs.get(&peer_meerkat_id) {
                     desired_specs.push(spec.clone());
                     continue;
                 }
-                let peer_entry = roster.get(peer_id).cloned().ok_or_else(|| {
+                let peer_entry = roster.get(&peer_meerkat_id).cloned().ok_or_else(|| {
                     MobError::WiringError(format!(
                         "resume wiring target '{}' missing for '{}'",
-                        peer_id, entry.meerkat_id
+                        peer_identity, entry.meerkat_id
                     ))
                 })?;
-                if broken_members.contains(peer_id) {
+                if broken_members.contains(&peer_meerkat_id) {
                     continue;
                 }
                 let comms_b = provisioner
@@ -726,18 +726,18 @@ impl MobBuilder {
                     .ok_or_else(|| {
                         MobError::WiringError(format!(
                             "resume requires comms runtime for '{}' -> '{}'",
-                            entry.meerkat_id, peer_id
+                            entry.meerkat_id, peer_identity
                         ))
                     })?;
                 let key_b = comms_b.public_key().ok_or_else(|| {
                     MobError::WiringError(format!(
                         "resume requires public key for '{}' -> '{}'",
-                        entry.meerkat_id, peer_id
+                        entry.meerkat_id, peer_identity
                     ))
                 })?;
                 let name_b = format!(
                     "{}/{}/{}",
-                    definition.id, peer_entry.profile, peer_entry.meerkat_id
+                    definition.id, peer_entry.role, peer_entry.meerkat_id
                 );
                 desired_specs.push(
                     provisioner
@@ -777,7 +777,7 @@ impl MobBuilder {
                 .map(|entry| entry.wired_to.len())
                 .sum::<usize>()
                 / 2;
-            let session_id = orchestrator_entry.session_id().ok_or_else(|| {
+            let bridge_session_id = orchestrator_entry.bridge_session_id().ok_or_else(|| {
                 MobError::Internal(
                     "orchestrator entry missing session-backed member ref".to_string(),
                 )
@@ -788,12 +788,15 @@ impl MobBuilder {
             );
             match orchestrator_entry.runtime_mode {
                 crate::MobRuntimeMode::AutonomousHost => {
-                    let injector = session_service.event_injector(session_id).await.ok_or_else(|| {
-                        MobError::Internal(format!(
-                            "orchestrator '{}' missing event injector during resume notification",
-                            orchestrator_entry.meerkat_id
-                        ))
-                    })?;
+                    let injector = session_service
+                        .event_injector(bridge_session_id)
+                        .await
+                        .ok_or_else(|| {
+                            MobError::Internal(format!(
+                                "orchestrator '{}' missing event injector during resume notification",
+                                orchestrator_entry.meerkat_id
+                            ))
+                        })?;
                     injector
                         .inject(
                             resume_message.into(),
@@ -840,7 +843,7 @@ impl MobBuilder {
         events: Arc<dyn MobEventStore>,
         run_store: Arc<dyn MobRunStore>,
         session_service: Arc<dyn MobSessionService>,
-        runtime_adapter: Option<Arc<meerkat_runtime::RuntimeSessionAdapter>>,
+        runtime_adapter: Option<Arc<meerkat_runtime::MeerkatMachine>>,
         tool_bundles: BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
         default_llm_client: Option<Arc<dyn LlmClient>>,
         default_external_tools_provider: Option<crate::ExternalToolsProvider>,
@@ -898,7 +901,7 @@ impl MobBuilder {
         events: Arc<dyn MobEventStore>,
         run_store: Arc<dyn MobRunStore>,
         session_service: Arc<dyn MobSessionService>,
-        runtime_adapter: Option<Arc<meerkat_runtime::RuntimeSessionAdapter>>,
+        runtime_adapter: Option<Arc<meerkat_runtime::MeerkatMachine>>,
         tool_bundles: BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
         default_llm_client: Option<Arc<dyn LlmClient>>,
         default_external_tools_provider: Option<crate::ExternalToolsProvider>,
@@ -918,11 +921,9 @@ impl MobBuilder {
         let handle = MobHandle {
             command_tx: command_tx.clone(),
             roster: roster.clone(),
-            task_board: task_board.clone(),
             definition: definition.clone(),
             state: state.clone(),
             events: events.clone(),
-            mcp_servers: mcp_servers.clone(),
             flow_streams: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             session_service: handle_session_service.clone(),
             restore_diagnostics: restore_diagnostics.clone(),
@@ -1026,6 +1027,7 @@ impl MobBuilder {
             retired_event_index: Arc::new(RwLock::new(HashSet::new())),
             autonomous_initial_turns: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             next_spawn_ticket: 0,
+            next_fence_token: std::sync::atomic::AtomicU64::new(1),
             pending_spawns: PendingSpawnLineage::new(),
             edge_locks: Arc::new(super::edge_locks::EdgeLockRegistry::new()),
             lifecycle_tasks: tokio::task::JoinSet::new(),

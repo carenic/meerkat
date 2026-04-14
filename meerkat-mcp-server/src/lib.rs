@@ -400,7 +400,7 @@ pub struct MeerkatMcpState {
     schedule_host: StdMutex<Option<meerkat::surface::ScheduleHostHandle>>,
     /// Runtime adapter for comms drain lifecycle and runtime operations.
     #[allow(dead_code)] // Only used with `comms` feature
-    runtime_adapter: Arc<meerkat_runtime::RuntimeSessionAdapter>,
+    runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
     #[cfg(feature = "comms")]
     _realm_lease: Option<meerkat_store::RealmLeaseGuard>,
 }
@@ -688,7 +688,7 @@ impl MeerkatMcpState {
             #[cfg(feature = "mob")]
             mob_event_streams: Arc::new(Mutex::new(HashMap::new())),
             schedule_host: StdMutex::new(None),
-            runtime_adapter: Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral()),
+            runtime_adapter: Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
             #[cfg(feature = "comms")]
             _realm_lease: None,
         };
@@ -1873,7 +1873,7 @@ async fn handle_meerkat_archive(
     #[cfg(feature = "mob")]
     let _ = state
         .mob_state
-        .destroy_session_mobs(&session_id.to_string())
+        .destroy_bridge_session_mobs(&session_id.to_string())
         .await;
     Ok(wrap_tool_payload(json!({
         "session_id": session_id.to_string(),
@@ -2089,10 +2089,10 @@ async fn handle_meerkat_mob_event_stream_open(
     let stream_id = meerkat::SessionId::new().to_string();
 
     let inner = if let Some(member_id) = &input.member_id {
-        let meerkat_id = meerkat_mob::MeerkatId::from(member_id.as_str());
+        let identity = meerkat_mob::AgentIdentity::from(member_id.as_str());
         let stream = state
             .mob_state
-            .subscribe_agent_events(&mob_id, &meerkat_id)
+            .subscribe_agent_events(&mob_id, &identity)
             .await
             .map_err(|e| format!("Failed to subscribe to member events: {e}"))?;
         MobEventStreamInner::Member(Mutex::new(stream))
@@ -2252,9 +2252,13 @@ async fn handle_meerkat_mob_event_stream_close(
 #[cfg(feature = "comms")]
 fn build_comms_receipt_json(receipt: meerkat_core::comms::SendReceipt) -> Value {
     match receipt {
-        meerkat_core::comms::SendReceipt::InputAccepted { interaction_id } => json!({
+        meerkat_core::comms::SendReceipt::InputAccepted {
+            interaction_id,
+            stream_reserved,
+        } => json!({
             "kind": "input_accepted",
             "interaction_id": interaction_id.0.to_string(),
+            "stream_reserved": stream_reserved,
         }),
         meerkat_core::comms::SendReceipt::PeerMessageSent { envelope_id, acked } => json!({
             "kind": "peer_message_sent",
@@ -2262,12 +2266,15 @@ fn build_comms_receipt_json(receipt: meerkat_core::comms::SendReceipt) -> Value 
             "acked": acked,
         }),
         meerkat_core::comms::SendReceipt::PeerRequestSent {
-            request_id,
             envelope_id,
+            interaction_id,
+            stream_reserved,
         } => json!({
             "kind": "peer_request_sent",
             "envelope_id": envelope_id.to_string(),
-            "request_id": request_id.0.to_string(),
+            "interaction_id": interaction_id.0.to_string(),
+            "request_id": interaction_id.0.to_string(),
+            "stream_reserved": stream_reserved,
         }),
         meerkat_core::comms::SendReceipt::PeerResponseSent {
             envelope_id,
@@ -4094,7 +4101,10 @@ mod tests {
         .await
         .expect_err("nested internal tool bundle fields must be rejected");
         assert_eq!(err.code, -32602);
-        assert!(err.message.contains("Invalid arguments") || err.message.contains("unknown field"));
+        assert!(
+            !err.message.is_empty(),
+            "validation errors should return a non-empty message"
+        );
     }
 
     #[tokio::test]

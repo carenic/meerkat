@@ -3,7 +3,6 @@ use meerkat_contracts::{
     MobCreateParams, MobMemberSendParams, MobPeerTarget, MobUnwireParams, MobWireParams,
     WireContentInput, WireMobBackendKind, WireMobRuntimeMode, WireRuntimeBinding,
 };
-use meerkat_core::error::invalid_session_id_message;
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -11,6 +10,14 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
+
+fn spawn_result_payload(result: &meerkat_mob::SpawnResult) -> Value {
+    json!({
+        "agent_identity": result.agent_identity,
+        "agent_runtime_id": result.agent_runtime_id,
+        "fence_token": result.fence_token,
+    })
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -30,7 +37,7 @@ struct MeerkatMobLifecycleInput {
 struct MeerkatMobSpawnInput {
     mob_id: String,
     profile: String,
-    meerkat_id: String,
+    agent_identity: String,
     #[serde(default)]
     initial_message: Option<WireContentInput>,
     #[serde(default)]
@@ -39,8 +46,6 @@ struct MeerkatMobSpawnInput {
     backend: Option<WireMobBackendKind>,
     #[serde(default)]
     binding: Option<WireRuntimeBinding>,
-    #[serde(default)]
-    resume_session_id: Option<String>,
     #[serde(default)]
     labels: Option<BTreeMap<String, String>>,
     #[serde(default)]
@@ -60,7 +65,7 @@ struct MeerkatMobSpawnManyInput {
 #[serde(deny_unknown_fields)]
 struct MeerkatMobSpawnInputSpec {
     profile: String,
-    meerkat_id: String,
+    agent_identity: String,
     #[serde(default)]
     initial_message: Option<WireContentInput>,
     #[serde(default)]
@@ -69,8 +74,6 @@ struct MeerkatMobSpawnInputSpec {
     backend: Option<WireMobBackendKind>,
     #[serde(default)]
     binding: Option<WireRuntimeBinding>,
-    #[serde(default)]
-    resume_session_id: Option<String>,
     #[serde(default)]
     labels: Option<BTreeMap<String, String>>,
     #[serde(default)]
@@ -83,14 +86,14 @@ struct MeerkatMobSpawnInputSpec {
 #[serde(deny_unknown_fields)]
 struct MeerkatMobMemberInput {
     mob_id: String,
-    meerkat_id: String,
+    agent_identity: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct MeerkatMobRespawnInput {
     mob_id: String,
-    meerkat_id: String,
+    agent_identity: String,
     #[serde(default)]
     initial_message: Option<WireContentInput>,
 }
@@ -99,7 +102,7 @@ struct MeerkatMobRespawnInput {
 #[serde(deny_unknown_fields)]
 struct MeerkatMobAppendSystemContextInput {
     mob_id: String,
-    meerkat_id: String,
+    agent_identity: String,
     text: String,
     #[serde(default)]
     source: Option<String>,
@@ -446,26 +449,22 @@ pub async fn handle_public_tools_call(
             let mob_id = parse_mob_id(&input.mob_id)?;
             let spec = build_spawn_spec(
                 input.profile,
-                input.meerkat_id.clone(),
+                input.agent_identity.clone(),
                 input.initial_message,
                 input.runtime_mode,
                 input.backend,
                 input.binding,
-                input.resume_session_id,
                 input.labels,
                 input.context,
                 input.additional_instructions,
             )?;
-            let member_ref = state
+            let spawn_result = state
                 .mob_spawn_spec(&mob_id, spec)
                 .await
                 .map_err(|err| McpToolError::invalid_params(err.to_string()))?;
-            Ok(json!({
-                "mob_id": mob_id,
-                "meerkat_id": input.meerkat_id,
-                "member_ref": member_ref,
-                "session_id": member_ref.session_id(),
-            }))
+            let mut payload = spawn_result_payload(&spawn_result);
+            payload["mob_id"] = json!(mob_id);
+            Ok(payload)
         }
         "meerkat_mob_spawn_many" => {
             let input: MeerkatMobSpawnManyInput = parse_args(arguments)?;
@@ -476,12 +475,11 @@ pub async fn handle_public_tools_call(
                 .map(|spec| {
                     build_spawn_spec(
                         spec.profile,
-                        spec.meerkat_id,
+                        spec.agent_identity,
                         spec.initial_message,
                         spec.runtime_mode,
                         spec.backend,
                         spec.binding,
-                        spec.resume_session_id,
                         spec.labels,
                         spec.context,
                         spec.additional_instructions,
@@ -493,12 +491,12 @@ pub async fn handle_public_tools_call(
                 .await
                 .map_err(|err| McpToolError::invalid_params(err.to_string()))?;
             Ok(json!({
-                "results": results.into_iter().map(|result| match result {
-                    Ok(member_ref) => json!({
-                        "ok": true,
-                        "member_ref": member_ref,
-                        "session_id": member_ref.session_id().map(std::string::ToString::to_string),
-                    }),
+                "results": results.into_iter().map(|result: Result<meerkat_mob::SpawnResult, meerkat_mob::MobError>| match result {
+                    Ok(spawn_result) => {
+                        let mut payload = spawn_result_payload(&spawn_result);
+                        payload["ok"] = json!(true);
+                        payload
+                    }
                     Err(error) => json!({
                         "ok": false,
                         "error": error.to_string(),
@@ -512,7 +510,7 @@ pub async fn handle_public_tools_call(
             state
                 .mob_retire(
                     &mob_id,
-                    meerkat_mob::MeerkatId::from(input.meerkat_id.as_str()),
+                    meerkat_mob::AgentIdentity::from(input.agent_identity.as_str()),
                 )
                 .await
                 .map_err(|err| McpToolError::invalid_params(err.to_string()))?;
@@ -528,7 +526,7 @@ pub async fn handle_public_tools_call(
             match state
                 .mob_respawn(
                     &mob_id,
-                    meerkat_mob::MeerkatId::from(input.meerkat_id.as_str()),
+                    meerkat_mob::AgentIdentity::from(input.agent_identity.as_str()),
                     initial_message,
                 )
                 .await
@@ -557,7 +555,7 @@ pub async fn handle_public_tools_call(
             state
                 .mob_wire(
                     &mob_id,
-                    meerkat_mob::MeerkatId::from(input.member.as_str()),
+                    meerkat_mob::AgentIdentity::from(input.member.as_str()),
                     peer_target_from_wire(input.peer),
                 )
                 .await
@@ -570,7 +568,7 @@ pub async fn handle_public_tools_call(
             state
                 .mob_unwire(
                     &mob_id,
-                    meerkat_mob::MeerkatId::from(input.member.as_str()),
+                    meerkat_mob::AgentIdentity::from(input.member.as_str()),
                     peer_target_from_wire(input.peer),
                 )
                 .await
@@ -584,7 +582,7 @@ pub async fn handle_public_tools_call(
             let receipt = state
                 .mob_member_send(
                     &mob_id,
-                    meerkat_mob::MeerkatId::from(input.meerkat_id.as_str()),
+                    meerkat_mob::AgentIdentity::from(input.agent_identity.as_str()),
                     content,
                     input.handling_mode.into(),
                     input.render_metadata.map(Into::into),
@@ -593,19 +591,20 @@ pub async fn handle_public_tools_call(
                 .map_err(|err| McpToolError::invalid_params(err.to_string()))?;
             Ok(json!({
                 "mob_id": mob_id,
-                "member_id": receipt.member_id,
-                "session_id": receipt.session_id,
+                "agent_identity": receipt.identity,
+                "agent_runtime_id": receipt.agent_runtime_id,
+                "fence_token": receipt.fence_token,
                 "handling_mode": input.handling_mode,
             }))
         }
         "meerkat_mob_append_system_context" => {
             let input: MeerkatMobAppendSystemContextInput = parse_args(arguments)?;
             let mob_id = parse_mob_id(&input.mob_id)?;
-            let meerkat_id = meerkat_mob::MeerkatId::from(input.meerkat_id.as_str());
-            let (session_id, result) = state
+            let agent_identity = meerkat_mob::AgentIdentity::from(input.agent_identity.as_str());
+            let (_bridge_session_id, result) = state
                 .mob_append_system_context(
                     &mob_id,
-                    &meerkat_id,
+                    &agent_identity,
                     meerkat_core::service::AppendSystemContextRequest {
                         text: input.text,
                         source: input.source,
@@ -616,8 +615,7 @@ pub async fn handle_public_tools_call(
                 .map_err(|err| McpToolError::invalid_params(err.to_string()))?;
             Ok(json!({
                 "mob_id": mob_id,
-                "meerkat_id": meerkat_id,
-                "session_id": session_id,
+                "agent_identity": agent_identity,
                 "status": result.status,
             }))
         }
@@ -678,7 +676,7 @@ pub async fn handle_public_tools_call(
             state
                 .mob_force_cancel(
                     &mob_id,
-                    meerkat_mob::MeerkatId::from(input.meerkat_id.as_str()),
+                    meerkat_mob::AgentIdentity::from(input.agent_identity.as_str()),
                 )
                 .await
                 .map_err(|err| McpToolError::invalid_params(err.to_string()))?;
@@ -690,7 +688,7 @@ pub async fn handle_public_tools_call(
             let snapshot = state
                 .mob_member_status(
                     &mob_id,
-                    &meerkat_mob::MeerkatId::from(input.meerkat_id.as_str()),
+                    &meerkat_mob::AgentIdentity::from(input.agent_identity.as_str()),
                 )
                 .await
                 .map_err(|err| McpToolError::invalid_params(err.to_string()))?;
@@ -701,7 +699,7 @@ pub async fn handle_public_tools_call(
             let mob_id = parse_mob_id(&input.mob_id)?;
             let member_ids = input.member_ids.map(|ids| {
                 ids.into_iter()
-                    .map(|member_id| meerkat_mob::MeerkatId::from(member_id.as_str()))
+                    .map(|member_id| meerkat_mob::AgentIdentity::from(member_id.as_str()))
                     .collect::<Vec<_>>()
             });
             let members = state
@@ -796,9 +794,7 @@ fn content_input_from_wire(
 
 fn peer_target_from_wire(peer: MobPeerTarget) -> meerkat_mob::PeerTarget {
     match peer {
-        MobPeerTarget::Local(member_id) => {
-            meerkat_mob::PeerTarget::Local(meerkat_mob::MeerkatId::from(member_id.as_str()))
-        }
+        MobPeerTarget::Local(member_id) => meerkat_mob::PeerTarget::Local(member_id.into()),
         MobPeerTarget::External(spec) => {
             meerkat_mob::PeerTarget::External(meerkat_core::comms::TrustedPeerSpec {
                 name: spec.name,
@@ -826,17 +822,16 @@ fn backend_kind_from_wire(kind: WireMobBackendKind) -> meerkat_mob::MobBackendKi
 #[allow(clippy::too_many_arguments)]
 fn build_spawn_spec(
     profile: String,
-    meerkat_id: String,
+    agent_identity: String,
     initial_message: Option<WireContentInput>,
     runtime_mode: Option<WireMobRuntimeMode>,
     backend: Option<WireMobBackendKind>,
     binding: Option<WireRuntimeBinding>,
-    resume_session_id: Option<String>,
     labels: Option<BTreeMap<String, String>>,
     context: Option<Value>,
     additional_instructions: Option<Vec<String>>,
 ) -> Result<meerkat_mob::SpawnMemberSpec, McpToolError> {
-    let mut spec = meerkat_mob::SpawnMemberSpec::new(profile.as_str(), meerkat_id.as_str());
+    let mut spec = meerkat_mob::SpawnMemberSpec::new(profile.as_str(), agent_identity.as_str());
     spec.initial_message = initial_message.map(content_input_from_wire).transpose()?;
     spec.runtime_mode = runtime_mode.map(runtime_mode_from_wire);
     // Resolve binding: explicit binding takes precedence over legacy backend tag.
@@ -869,12 +864,6 @@ fn build_spawn_spec(
     spec.labels = labels;
     spec.context = context;
     spec.additional_instructions = additional_instructions;
-    if let Some(session_id) = resume_session_id {
-        let parsed = meerkat_core::types::SessionId::parse(&session_id)
-            .map_err(invalid_session_id_message)
-            .map_err(McpToolError::invalid_params)?;
-        spec = spec.with_resume_session_id(parsed);
-    }
     Ok(spec)
 }
 

@@ -18,7 +18,7 @@
 //!   terminal_outcome, queue, steer_queue, current_run, current_run_contributors,
 //!   last_run, last_boundary_sequence, wake_requested, process_requested,
 //!   silent_intent_overrides
-//! - 7 effects: IngressAccepted, ReadyForRun, InputLifecycleNotice,
+//! - 8 effects: IngressAccepted, ReadyForRun, InputLifecycleNotice,
 //!   WakeRuntime, RequestImmediateProcessing, CompletionResolved,
 //!   IngressNotice, SilentIntentApplied
 
@@ -194,6 +194,8 @@ pub enum RuntimeIngressEffect {
     },
     /// The runtime should be woken (idle -> running).
     WakeRuntime,
+    /// Interrupt cooperative yielding points within the running turn.
+    InterruptYielding,
     /// Immediate processing requested (steer/immediate drain).
     RequestImmediateProcessing,
     /// An input reached a terminal outcome.
@@ -457,6 +459,21 @@ impl RuntimeIngressAuthority {
     /// Policy snapshot for a specific work ID.
     pub fn policy_snapshot(&self, work_id: &InputId) -> Option<&PolicyDecision> {
         self.fields.policy_snapshot.get(work_id)
+    }
+
+    /// Content shape for a specific work ID.
+    pub fn content_shape(&self, work_id: &InputId) -> Option<ContentShape> {
+        self.fields.content_shape.get(work_id).cloned()
+    }
+
+    /// Request ID for a specific work ID.
+    pub fn request_id(&self, work_id: &InputId) -> Option<RequestId> {
+        self.fields.request_id.get(work_id).cloned().flatten()
+    }
+
+    /// Reservation key for a specific work ID.
+    pub fn reservation_key(&self, work_id: &InputId) -> Option<ReservationKey> {
+        self.fields.reservation_key.get(work_id).cloned().flatten()
     }
 
     /// Whether a wake was requested.
@@ -811,8 +828,10 @@ impl RuntimeIngressAuthority {
         // batching, but must remain passive unless the input kind explicitly
         // requests immediate processing (for example a steer override or a
         // continuation wake).
-        fields.wake_requested =
-            matches!(policy.wake_mode, crate::WakeMode::WakeIfIdle) || request_immediate_processing;
+        fields.wake_requested = matches!(
+            policy.wake_mode,
+            crate::WakeMode::WakeIfIdle | crate::WakeMode::InterruptYielding
+        ) || request_immediate_processing;
         fields.process_requested = request_immediate_processing;
 
         effects.push(RuntimeIngressEffect::IngressAccepted {
@@ -826,6 +845,10 @@ impl RuntimeIngressAuthority {
         match policy.wake_mode {
             crate::WakeMode::WakeIfIdle => {
                 effects.push(RuntimeIngressEffect::WakeRuntime);
+            }
+            crate::WakeMode::InterruptYielding => {
+                effects.push(RuntimeIngressEffect::WakeRuntime);
+                effects.push(RuntimeIngressEffect::InterruptYielding);
             }
             crate::WakeMode::None => {}
         }

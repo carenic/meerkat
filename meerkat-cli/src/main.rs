@@ -1286,9 +1286,9 @@ enum MobCommands {
         mob_id: String,
         /// Task prompt for the helper
         prompt: String,
-        /// Meerkat ID for the helper (auto-generated if omitted)
+        /// Agent identity for the helper (auto-generated if omitted)
         #[arg(long)]
-        meerkat_id: Option<String>,
+        agent_identity: Option<String>,
         /// Profile to use
         #[arg(long)]
         profile: Option<String>,
@@ -1304,9 +1304,9 @@ enum MobCommands {
         source_member: String,
         /// Task prompt for the forked helper
         prompt: String,
-        /// Meerkat ID for the helper (auto-generated if omitted)
+        /// Agent identity for the helper (auto-generated if omitted)
         #[arg(long)]
-        meerkat_id: Option<String>,
+        agent_identity: Option<String>,
         /// Profile to use
         #[arg(long)]
         profile: Option<String>,
@@ -1324,8 +1324,8 @@ enum MobCommands {
     MemberStatus {
         /// Mob ID
         mob_id: String,
-        /// Meerkat ID of the member
-        meerkat_id: String,
+        /// Agent identity of the member
+        agent_identity: String,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -1334,15 +1334,15 @@ enum MobCommands {
     ForceCancel {
         /// Mob ID
         mob_id: String,
-        /// Meerkat ID of the member to cancel
-        meerkat_id: String,
+        /// Agent identity of the member to cancel
+        agent_identity: String,
     },
     /// Retire and respawn a mob member with the same profile.
     Respawn {
         /// Mob ID
         mob_id: String,
-        /// Meerkat ID to respawn
-        meerkat_id: String,
+        /// Agent identity to respawn
+        agent_identity: String,
         /// Initial message for the respawned member
         #[arg(long)]
         initial_message: Option<String>,
@@ -2682,7 +2682,7 @@ struct CliRuntimeExecutor {
     persistent_service:
         Option<Arc<meerkat::PersistentSessionService<meerkat::FactoryAgentBuilder>>>,
     session_id: meerkat_core::types::SessionId,
-    runtime_adapter: Arc<meerkat_runtime::RuntimeSessionAdapter>,
+    runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
     event_tx: Option<mpsc::Sender<EventEnvelope<AgentEvent>>>,
 }
 
@@ -2967,7 +2967,7 @@ impl meerkat_mob::MobSessionService for RunMobSessionService {
         true
     }
 
-    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::RuntimeSessionAdapter>> {
+    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::MeerkatMachine>> {
         <EphemeralSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::runtime_adapter(
             &self.inner,
         )
@@ -3434,7 +3434,7 @@ async fn run_agent(
         CliOutputPipeline::new(stream, verbose, stream_policy.clone(), primary_scope_path)?;
 
     // Create ephemeral runtime adapter and prepare epoch-local bindings.
-    let runtime_adapter = std::sync::Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral());
+    let runtime_adapter = std::sync::Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
     let bindings = runtime_adapter
         .prepare_bindings(session_id.clone())
         .await
@@ -4163,7 +4163,7 @@ async fn build_cli_persistent_service(
     config: Config,
 ) -> anyhow::Result<(
     Arc<meerkat::PersistentSessionService<FactoryAgentBuilder>>,
-    Arc<meerkat_runtime::RuntimeSessionAdapter>,
+    Arc<meerkat_runtime::MeerkatMachine>,
 )> {
     let (manifest, persistence) = create_persistence_bundle(scope).await?;
     build_cli_persistent_service_from_bundle(scope, config, manifest, persistence)
@@ -4176,7 +4176,7 @@ fn build_cli_persistent_service_from_bundle(
     persistence: PersistenceBundle,
 ) -> anyhow::Result<(
     Arc<meerkat::PersistentSessionService<FactoryAgentBuilder>>,
-    Arc<meerkat_runtime::RuntimeSessionAdapter>,
+    Arc<meerkat_runtime::MeerkatMachine>,
 )> {
     let surface =
         get_or_create_cli_persistent_surface_from_bundle(scope, config, manifest, persistence)?;
@@ -4309,14 +4309,14 @@ type CliPersistentService = meerkat::PersistentSessionService<FactoryAgentBuilde
 
 struct CliPersistentSurfaceState {
     service: Arc<CliPersistentService>,
-    runtime_adapter: Arc<meerkat_runtime::RuntimeSessionAdapter>,
+    runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
     _schedule_host: Option<meerkat::surface::ScheduleHostHandle>,
 }
 
 #[derive(Clone)]
 struct CliScheduleSessionHost {
     service: Arc<CliPersistentService>,
-    runtime_adapter: Arc<meerkat_runtime::RuntimeSessionAdapter>,
+    runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
 }
 
 impl CliScheduleSessionHost {
@@ -4866,7 +4866,7 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
         true
     }
 
-    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::RuntimeSessionAdapter>> {
+    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::MeerkatMachine>> {
         <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::runtime_adapter(
             &self.inner,
         )
@@ -5749,7 +5749,7 @@ type LlmClientProvider =
 async fn hydrate_mob_state(
     scope: &RuntimeScope,
     session_service: Arc<dyn meerkat_mob::MobSessionService>,
-    runtime_adapter: Option<Arc<meerkat_runtime::RuntimeSessionAdapter>>,
+    runtime_adapter: Option<Arc<meerkat_runtime::MeerkatMachine>>,
     default_llm_client_provider: Option<LlmClientProvider>,
     external_tools_provider: Option<meerkat_mob::ExternalToolsProvider>,
     seeded_handles: std::collections::BTreeMap<String, meerkat_mob::MobHandle>,
@@ -6056,11 +6056,11 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
         MobCommands::SpawnHelper {
             mob_id,
             prompt,
-            meerkat_id,
+            agent_identity,
             profile,
             json,
         } => {
-            let mid = meerkat_mob::MeerkatId::from(meerkat_id.unwrap_or_else(|| {
+            let mid = meerkat_mob::AgentIdentity::from(agent_identity.unwrap_or_else(|| {
                 format!(
                     "helper-{}",
                     std::time::SystemTime::now()
@@ -6090,7 +6090,8 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
                     serde_json::to_string_pretty(&serde_json::json!({
                         "output": result.output,
                         "tokens_used": result.tokens_used,
-                        "session_id": result.session_id,
+                        "agent_identity": result.agent_identity.as_str(),
+                        "fence_token": result.fence_token.get(),
                     }))?
                 );
             } else if let Some(output) = &result.output {
@@ -6102,13 +6103,13 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
             mob_id,
             source_member,
             prompt,
-            meerkat_id,
+            agent_identity,
             profile,
             fork_context,
             last_messages,
             json,
         } => {
-            let mid = meerkat_mob::MeerkatId::from(meerkat_id.unwrap_or_else(|| {
+            let mid = meerkat_mob::AgentIdentity::from(agent_identity.unwrap_or_else(|| {
                 format!(
                     "fork-{}",
                     std::time::SystemTime::now()
@@ -6117,7 +6118,7 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
                         .unwrap_or(0)
                 )
             }));
-            let source_id = meerkat_mob::MeerkatId::from(source_member);
+            let source_id = meerkat_mob::AgentIdentity::from(source_member);
             let ctx = match fork_context.as_str() {
                 "last-messages" => {
                     let count = last_messages.unwrap_or(10);
@@ -6148,7 +6149,8 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
                     serde_json::to_string_pretty(&serde_json::json!({
                         "output": result.output,
                         "tokens_used": result.tokens_used,
-                        "session_id": result.session_id,
+                        "agent_identity": result.agent_identity.as_str(),
+                        "fence_token": result.fence_token.get(),
                     }))?
                 );
             } else if let Some(output) = &result.output {
@@ -6158,13 +6160,13 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
         }
         MobCommands::MemberStatus {
             mob_id,
-            meerkat_id,
+            agent_identity,
             json,
         } => {
             let snapshot = state
                 .mob_member_status(
                     &meerkat_mob::MobId::from(mob_id),
-                    &meerkat_mob::MeerkatId::from(meerkat_id),
+                    &meerkat_mob::AgentIdentity::from(agent_identity),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -6192,11 +6194,14 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
             }
             Ok(())
         }
-        MobCommands::ForceCancel { mob_id, meerkat_id } => {
+        MobCommands::ForceCancel {
+            mob_id,
+            agent_identity,
+        } => {
             state
                 .mob_force_cancel(
                     &meerkat_mob::MobId::from(mob_id.clone()),
-                    meerkat_mob::MeerkatId::from(meerkat_id),
+                    meerkat_mob::AgentIdentity::from(agent_identity),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -6207,13 +6212,13 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
         }
         MobCommands::Respawn {
             mob_id,
-            meerkat_id,
+            agent_identity,
             initial_message,
         } => {
             let receipt = state
                 .mob_respawn(
                     &meerkat_mob::MobId::from(mob_id.clone()),
-                    meerkat_mob::MeerkatId::from(meerkat_id),
+                    meerkat_mob::AgentIdentity::from(agent_identity),
                     initial_message.map(meerkat_core::ContentInput::from),
                 )
                 .await
@@ -6238,7 +6243,7 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
             let member_ids = (!member_ids.is_empty()).then(|| {
                 member_ids
                     .into_iter()
-                    .map(|id| meerkat_mob::MeerkatId::from(id.as_str()))
+                    .map(|id| meerkat_mob::AgentIdentity::from(id.as_str()))
                     .collect::<Vec<_>>()
             });
             let members = state
@@ -6261,7 +6266,7 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
                 for member in members {
                     println!(
                         "{}\tstatus={:?}\tis_final={}",
-                        member.meerkat_id, member.snapshot.status, member.snapshot.is_final
+                        member.agent_identity, member.snapshot.status, member.snapshot.is_final
                     );
                 }
             }
@@ -6846,7 +6851,7 @@ async fn execute_mob_deploy_internal(
             let roster = handle.roster().await;
             if let Some(entry) = roster.by_profile(&orchestrator.profile).next() {
                 handle
-                    .member(&entry.meerkat_id)
+                    .member(&entry.agent_identity)
                     .await
                     .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?
                     .send(prompt.to_string(), meerkat_core::types::HandlingMode::Queue)
@@ -7143,7 +7148,7 @@ where
         let roster = handle.roster().await;
         if let Some(entry) = roster.by_profile(&orchestrator.profile).next() {
             handle
-                .member(&entry.meerkat_id)
+                .member(&entry.agent_identity)
                 .await
                 .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?
                 .send(prompt.to_string(), meerkat_core::types::HandlingMode::Queue)
@@ -7309,7 +7314,7 @@ mod tests {
     use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
     use meerkat_core::comms::{CommsCommand, SendError, SendReceipt, TrustedPeerSpec};
     use meerkat_core::error::ToolError;
-    use meerkat_core::interaction::InteractionId;
+    use meerkat_core::interaction::{InteractionId, PeerInputCandidate};
     use meerkat_core::service::{
         SessionError, SessionInfo, SessionSummary, SessionUsage, SessionView, StartTurnRequest,
     };
@@ -7387,7 +7392,7 @@ mod tests {
             }],
         )
         .expect("stream pipeline should build");
-        let runtime_adapter = Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral());
+        let runtime_adapter = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
         let service: Arc<dyn meerkat_core::service::SessionService> =
             Arc::new(CapturingEventTurnService::new(session_id.clone()));
         let executor = Box::new(CliRuntimeExecutor {
@@ -7451,7 +7456,7 @@ mod tests {
             }],
         )
         .expect("stream pipeline should build");
-        let runtime_adapter = Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral());
+        let runtime_adapter = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
         let service: Arc<dyn meerkat_core::service::SessionService> =
             Arc::new(CapturingEventTurnService::new(session_id.clone()));
         let executor = Box::new(CliRuntimeExecutor {
@@ -7693,7 +7698,10 @@ mod tests {
             let interaction_id: InteractionId =
                 serde_json::from_str("\"00000000-0000-0000-0000-000000000000\"")
                     .expect("interaction id literal should parse");
-            Ok(SendReceipt::InputAccepted { interaction_id })
+            Ok(SendReceipt::InputAccepted {
+                interaction_id,
+                stream_reserved: false,
+            })
         }
 
         async fn drain_messages(&self) -> Vec<String> {
@@ -7704,7 +7712,7 @@ mod tests {
             self.notify.clone()
         }
 
-        async fn drain_peer_input_candidates(&self) -> Vec<meerkat_core::PeerInputCandidate> {
+        async fn drain_peer_input_candidates(&self) -> Vec<PeerInputCandidate> {
             Vec::new()
         }
     }
@@ -7886,8 +7894,8 @@ mod tests {
             true
         }
 
-        fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::RuntimeSessionAdapter>> {
-            Some(Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral()))
+        fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::MeerkatMachine>> {
+            Some(Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()))
         }
 
         async fn session_belongs_to_mob(
@@ -8040,7 +8048,7 @@ mod tests {
     async fn test_cli_runtime_executor_forwards_stream_events_to_runtime_backed_turns() {
         let session_id = SessionId::new();
         let service = Arc::new(CapturingEventTurnService::new(session_id.clone()));
-        let runtime_adapter = Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral());
+        let runtime_adapter = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
         let (event_tx, mut event_rx) = mpsc::channel::<EventEnvelope<AgentEvent>>(8);
         let mut executor = CliRuntimeExecutor {
             service: service.clone(),
@@ -8336,6 +8344,7 @@ mod tests {
             allow_self_session,
             blocks: _,
             handling_mode: _,
+            stream: _,
         } = cmd
         else {
             return Err("unexpected command parsed for input payload".into());
@@ -8349,14 +8358,30 @@ mod tests {
 
     #[cfg(feature = "comms")]
     #[test]
-    fn test_parse_comms_send_payload_peer_request_rejects_removed_stream_field() {
+    fn test_parse_comms_send_payload_peer_request_accepts_reserve_interaction_stream() {
         let session_id = SessionId::new();
-        let err = parse_comms_send_payload(
+        let cmd = parse_comms_send_payload(
             r#"{"kind":"peer_request","to":"agent-b","intent":"help","params":{"topic":"x"},"handling_mode":"queue","stream":"reserve_interaction"}"#,
             &session_id,
         )
-        .expect_err("peer request stream field should be rejected");
-        assert!(err.to_string().contains("removed_unsupported_field"));
+        .expect("peer request reserve_interaction stream should be accepted");
+        assert!(
+            matches!(cmd, meerkat_core::comms::CommsCommand::PeerRequest { .. }),
+            "unexpected command parsed for peer request payload: {cmd:?}"
+        );
+        let (stream, handling_mode) = match cmd {
+            meerkat_core::comms::CommsCommand::PeerRequest {
+                stream,
+                handling_mode,
+                ..
+            } => (stream, handling_mode),
+            _ => unreachable!("asserted above"),
+        };
+        assert_eq!(
+            stream,
+            meerkat_core::comms::InputStreamMode::ReserveInteraction
+        );
+        assert_eq!(handling_mode, meerkat_core::HandlingMode::Queue);
     }
 
     #[cfg(feature = "comms")]
@@ -9921,7 +9946,7 @@ printf '\0\141\163\155' > "$out_dir/runtime_bg.wasm"
         let names: std::collections::BTreeSet<String> =
             composed.tools().iter().map(|t| t.name.clone()).collect();
         assert!(names.contains("mob_create"));
-        assert!(names.contains("meerkat_spawn"));
+        assert!(names.contains("mob_spawn_member"));
     }
 
     #[tokio::test]
@@ -10135,10 +10160,10 @@ printf '\0\141\163\155' > "$out_dir/runtime_bg.wasm"
         call_tool_json(
             &dispatcher_a,
             "t-spawn-a",
-            "meerkat_spawn",
+            "mob_spawn_member",
             serde_json::json!({
                 "mob_id": mob_id,
-                "specs": [{"profile": "lead", "meerkat_id": "lead-1", "runtime_mode": "turn_driven"}]
+                "specs": [{"profile": "lead", "agent_identity": "lead-1", "runtime_mode": "turn_driven"}]
             }),
         )
         .await;
@@ -10168,10 +10193,10 @@ printf '\0\141\163\155' > "$out_dir/runtime_bg.wasm"
         call_tool_json(
             &dispatcher_b,
             "t-spawn-b",
-            "meerkat_spawn",
+            "mob_spawn_member",
             serde_json::json!({
                 "mob_id": created["mob_id"].as_str().expect("mob id"),
-                "specs": [{"profile": "worker", "meerkat_id": "worker-1", "runtime_mode": "turn_driven"}]
+                "specs": [{"profile": "worker", "agent_identity": "worker-1", "runtime_mode": "turn_driven"}]
             }),
         )
         .await;
@@ -10205,10 +10230,10 @@ printf '\0\141\163\155' > "$out_dir/runtime_bg.wasm"
         call_tool_json(
             &dispatcher,
             "t-spawn-turn",
-            "meerkat_spawn",
+            "mob_spawn_member",
             serde_json::json!({
                 "mob_id": mob_id,
-                "specs": [{"profile": "lead", "meerkat_id": "lead-turn", "runtime_mode": "turn_driven"}]
+                "specs": [{"profile": "lead", "agent_identity": "lead-turn", "runtime_mode": "turn_driven"}]
             }),
         )
         .await;
@@ -10216,14 +10241,14 @@ printf '\0\141\163\155' > "$out_dir/runtime_bg.wasm"
         let listed = call_tool_json(
             &dispatcher,
             "t-list-runtime",
-            "meerkat_list",
+            "mob_list_members",
             serde_json::json!({"mob_id": mob_id}),
         )
         .await;
         let members = listed["members"].as_array().cloned().unwrap_or_default();
         let lead_mode = members
             .iter()
-            .find(|m| m["meerkat_id"] == "lead-turn")
+            .find(|m| m["agent_identity"] == "lead-turn")
             .and_then(|m| m["runtime_mode"].as_str());
 
         assert_eq!(lead_mode, Some("turn_driven"));

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
@@ -70,6 +70,13 @@ struct CompletedCommand {
     output: String,
 }
 
+#[derive(Clone, Debug)]
+enum PreCommandState {
+    Running,
+    Done,
+    Failed(String),
+}
+
 pub async fn run_catalog_scenario(id: u16) -> Result<(), String> {
     let Some(spec) = scenario_spec(id) else {
         return Err(format!("unknown live/smoke scenario id {id}"));
@@ -128,6 +135,7 @@ async fn run_spec(spec: &'static Spec) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(clippy::await_holding_lock)] // Lock is explicitly dropped before await
 async fn run_pre_command(
     entry: CommandEntry,
     cwd: &Path,
@@ -144,16 +152,35 @@ async fn run_pre_command(
         command_display(entry.command),
         env_signature
     );
-    {
+    loop {
         let mut completed = completed_pre_commands().lock().unwrap();
-        if !completed.insert(key) {
-            return Ok(());
+        match completed.get(&key) {
+            Some(PreCommandState::Done) => return Ok(()),
+            Some(PreCommandState::Failed(error)) => return Err(error.clone()),
+            Some(PreCommandState::Running) => {
+                drop(completed);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            None => {
+                completed.insert(key.clone(), PreCommandState::Running);
+                break;
+            }
         }
     }
 
-    run_command(entry.command, cwd, env_overrides, entry.spec.timeout_secs)
+    let result = run_command(entry.command, cwd, env_overrides, entry.spec.timeout_secs)
         .await
-        .map(|_| ())
+        .map(|_| ());
+    let mut completed = completed_pre_commands().lock().unwrap();
+    match &result {
+        Ok(()) => {
+            completed.insert(key, PreCommandState::Done);
+        }
+        Err(error) => {
+            completed.insert(key, PreCommandState::Failed(error.clone()));
+        }
+    }
+    result
 }
 
 async fn run_command(
@@ -242,7 +269,7 @@ fn build_commands(
             test_name,
         } => Box::leak(
             vec![
-                "python3",
+                compatible_python_bin().unwrap_or("python3"),
                 "-m",
                 "pytest",
                 "-v",
@@ -366,6 +393,12 @@ fn prereq_failure(spec: &Spec) -> Option<String> {
         }
     }
     for binary in spec.required_bins {
+        if *binary == "python3" {
+            if compatible_python_bin().is_none() {
+                failures.push("missing compatible python >=3.10".to_string());
+            }
+            continue;
+        }
         if *binary == "cargo" {
             if !repo_cargo().exists() {
                 failures.push(format!(
@@ -412,6 +445,11 @@ fn scenario_env(spec: &Spec) -> Result<Vec<(String, String)>, String> {
                 .to_string(),
         );
     }
+    if matches!(spec.command, CommandSpec::Pytest { .. })
+        && let Some(python) = compatible_python_bin()
+    {
+        env.insert("MEERKAT_PYTHON_BIN".to_string(), python.to_string());
+    }
     Ok(env.into_iter().collect())
 }
 
@@ -446,6 +484,39 @@ fn repo_cargo() -> &'static Path {
     REPO_CARGO
         .get_or_init(|| workspace_root().join("scripts").join("repo-cargo"))
         .as_path()
+}
+
+fn compatible_python_bin() -> Option<&'static str> {
+    static PYTHON_BIN: OnceLock<Option<String>> = OnceLock::new();
+    PYTHON_BIN
+        .get_or_init(|| {
+            for candidate in ["python3.11", "python3.10", "python3", "python"] {
+                let output = std::process::Command::new(candidate)
+                    .args([
+                        "-c",
+                        "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')",
+                    ])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .output();
+                let Ok(output) = output else {
+                    continue;
+                };
+                if !output.status.success() {
+                    continue;
+                }
+                let version = String::from_utf8_lossy(&output.stdout);
+                let mut parts = version.trim().split('.');
+                let major = parts.next().and_then(|part| part.parse::<u32>().ok());
+                let minor = parts.next().and_then(|part| part.parse::<u32>().ok());
+                if matches!((major, minor), (Some(major), Some(minor)) if (major, minor) >= (3, 10))
+                {
+                    return Some(candidate.to_string());
+                }
+            }
+            None
+        })
+        .as_deref()
 }
 
 fn cargo_target_dir() -> Result<PathBuf, String> {
@@ -483,9 +554,9 @@ fn strict_prereqs_enabled() -> bool {
     )
 }
 
-fn completed_pre_commands() -> &'static Mutex<HashSet<String>> {
-    static PRE_COMMANDS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    PRE_COMMANDS.get_or_init(|| Mutex::new(HashSet::new()))
+fn completed_pre_commands() -> &'static Mutex<HashMap<String, PreCommandState>> {
+    static PRE_COMMANDS: OnceLock<Mutex<HashMap<String, PreCommandState>>> = OnceLock::new();
+    PRE_COMMANDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn command_display(command: &[&str]) -> String {
@@ -947,7 +1018,7 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
                 &[
                     "/bin/sh",
                     "-c",
-                    "python3 -c 'import pytest, pytest_asyncio' >/dev/null 2>&1 || python3 -m pip install -e \".[dev]\"",
+                    "${MEERKAT_PYTHON_BIN:-python3} -c 'import pytest, pytest_asyncio' >/dev/null 2>&1 || ${MEERKAT_PYTHON_BIN:-python3} -m pip install -e \".[dev]\"",
                 ],
                 &[
                     "cargo",
@@ -979,7 +1050,7 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
                 &[
                     "/bin/sh",
                     "-c",
-                    "python3 -c 'import pytest, pytest_asyncio' >/dev/null 2>&1 || python3 -m pip install -e \".[dev]\"",
+                    "${MEERKAT_PYTHON_BIN:-python3} -c 'import pytest, pytest_asyncio' >/dev/null 2>&1 || ${MEERKAT_PYTHON_BIN:-python3} -m pip install -e \".[dev]\"",
                 ],
                 &[
                     "cargo",
@@ -1011,7 +1082,7 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
                 &[
                     "/bin/sh",
                     "-c",
-                    "python3 -c 'import pytest, pytest_asyncio' >/dev/null 2>&1 || python3 -m pip install -e \".[dev]\"",
+                    "${MEERKAT_PYTHON_BIN:-python3} -c 'import pytest, pytest_asyncio' >/dev/null 2>&1 || ${MEERKAT_PYTHON_BIN:-python3} -m pip install -e \".[dev]\"",
                 ],
                 &[
                     "cargo",
@@ -1046,7 +1117,7 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
                 &[
                     "/bin/sh",
                     "-c",
-                    "python3 -c 'import pytest, pytest_asyncio' >/dev/null 2>&1 || python3 -m pip install -e \".[dev]\"",
+                    "${MEERKAT_PYTHON_BIN:-python3} -c 'import pytest, pytest_asyncio' >/dev/null 2>&1 || ${MEERKAT_PYTHON_BIN:-python3} -m pip install -e \".[dev]\"",
                 ],
                 &[
                     "cargo",
@@ -1414,9 +1485,41 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
             required_env: &[&["RKAT_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"]],
             required_bins: &["cargo"],
             cwd: ".",
-            env: &[],
+            env: &[
+                (
+                    "RKAT_TEST_BIN_RKAT",
+                    "{cargo_target_dir}/e2e-bins/scenario-54/rkat",
+                ),
+                (
+                    "RKAT_TEST_BIN_RKAT_RPC",
+                    "{cargo_target_dir}/e2e-bins/scenario-54/rkat-rpc",
+                ),
+            ],
             cargo_bin_env: &[],
-            pre_commands: &[],
+            pre_commands: &[
+                &["cargo", "build", "-p", "rkat", "--bin", "rkat"],
+                &[
+                    "cargo",
+                    "build",
+                    "-p",
+                    "meerkat-rpc",
+                    "--bin",
+                    "rkat-rpc",
+                    "--features",
+                    "mob",
+                ],
+                &["mkdir", "-p", "{cargo_target_dir}/e2e-bins/scenario-54"],
+                &[
+                    "cp",
+                    "{cargo_target_dir}/debug/rkat",
+                    "{cargo_target_dir}/e2e-bins/scenario-54/rkat",
+                ],
+                &[
+                    "cp",
+                    "{cargo_target_dir}/debug/rkat-rpc",
+                    "{cargo_target_dir}/e2e-bins/scenario-54/rkat-rpc",
+                ],
+            ],
             command: CommandSpec::CargoTest {
                 package: "meerkat-integration-tests",
                 test_target: "smoke_shared_realm",
@@ -1436,9 +1539,60 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
             ],
             required_bins: &["cargo"],
             cwd: ".",
-            env: &[],
+            env: &[
+                (
+                    "RKAT_TEST_BIN_RKAT",
+                    "{cargo_target_dir}/e2e-bins/scenario-55/rkat",
+                ),
+                (
+                    "RKAT_TEST_BIN_RKAT_RPC",
+                    "{cargo_target_dir}/e2e-bins/scenario-55/rkat-rpc",
+                ),
+                (
+                    "RKAT_TEST_BIN_RKAT_REST",
+                    "{cargo_target_dir}/e2e-bins/scenario-55/rkat-rest",
+                ),
+            ],
             cargo_bin_env: &[],
-            pre_commands: &[],
+            pre_commands: &[
+                &["cargo", "build", "-p", "rkat", "--bin", "rkat"],
+                &[
+                    "cargo",
+                    "build",
+                    "-p",
+                    "meerkat-rpc",
+                    "--bin",
+                    "rkat-rpc",
+                    "--features",
+                    "mob",
+                ],
+                &[
+                    "cargo",
+                    "build",
+                    "-p",
+                    "meerkat-rest",
+                    "--bin",
+                    "rkat-rest",
+                    "--features",
+                    "mob",
+                ],
+                &["mkdir", "-p", "{cargo_target_dir}/e2e-bins/scenario-55"],
+                &[
+                    "cp",
+                    "{cargo_target_dir}/debug/rkat",
+                    "{cargo_target_dir}/e2e-bins/scenario-55/rkat",
+                ],
+                &[
+                    "cp",
+                    "{cargo_target_dir}/debug/rkat-rpc",
+                    "{cargo_target_dir}/e2e-bins/scenario-55/rkat-rpc",
+                ],
+                &[
+                    "cp",
+                    "{cargo_target_dir}/debug/rkat-rest",
+                    "{cargo_target_dir}/e2e-bins/scenario-55/rkat-rest",
+                ],
+            ],
             command: CommandSpec::CargoTest {
                 package: "meerkat-integration-tests",
                 test_target: "smoke_shared_realm",
@@ -1458,27 +1612,45 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
             env: &[
                 (
                     "RKAT_TEST_BIN_RKAT_RPC",
-                    "{cargo_target_dir}/e2e-bins/rkat-rpc-scenario-56",
+                    "{cargo_target_dir}/e2e-bins/scenario-56/rkat-rpc",
                 ),
                 (
                     "RKAT_TEST_BIN_RKAT_REST",
-                    "{cargo_target_dir}/e2e-bins/rkat-rest-scenario-56",
+                    "{cargo_target_dir}/e2e-bins/scenario-56/rkat-rest",
                 ),
             ],
             cargo_bin_env: &[],
             pre_commands: &[
-                &["cargo", "build", "-p", "meerkat-rpc", "--bin", "rkat-rpc"],
-                &["cargo", "build", "-p", "meerkat-rest", "--bin", "rkat-rest"],
-                &["mkdir", "-p", "{cargo_target_dir}/e2e-bins"],
+                &[
+                    "cargo",
+                    "build",
+                    "-p",
+                    "meerkat-rpc",
+                    "--bin",
+                    "rkat-rpc",
+                    "--features",
+                    "mob",
+                ],
+                &[
+                    "cargo",
+                    "build",
+                    "-p",
+                    "meerkat-rest",
+                    "--bin",
+                    "rkat-rest",
+                    "--features",
+                    "mob",
+                ],
+                &["mkdir", "-p", "{cargo_target_dir}/e2e-bins/scenario-56"],
                 &[
                     "cp",
                     "{cargo_target_dir}/debug/rkat-rpc",
-                    "{cargo_target_dir}/e2e-bins/rkat-rpc-scenario-56",
+                    "{cargo_target_dir}/e2e-bins/scenario-56/rkat-rpc",
                 ],
                 &[
                     "cp",
                     "{cargo_target_dir}/debug/rkat-rest",
-                    "{cargo_target_dir}/e2e-bins/rkat-rest-scenario-56",
+                    "{cargo_target_dir}/e2e-bins/scenario-56/rkat-rest",
                 ],
             ],
             command: CommandSpec::CargoTest {
@@ -1658,27 +1830,31 @@ fn suite_spec(name: &str) -> Option<&'static Spec> {
             env: &[
                 (
                     "RKAT_TEST_BIN_RKAT_RPC",
-                    "{cargo_target_dir}/e2e-bins/rkat-rpc-system-rpc-rest-rpc",
+                    "{cargo_target_dir}/e2e-bins/system-rpc-rest-rpc/rkat-rpc",
                 ),
                 (
                     "RKAT_TEST_BIN_RKAT_REST",
-                    "{cargo_target_dir}/e2e-bins/rkat-rest-system-rpc-rest-rpc",
+                    "{cargo_target_dir}/e2e-bins/system-rpc-rest-rpc/rkat-rest",
                 ),
             ],
             cargo_bin_env: &[],
             pre_commands: &[
                 &["cargo", "build", "-p", "meerkat-rpc", "--bin", "rkat-rpc"],
                 &["cargo", "build", "-p", "meerkat-rest", "--bin", "rkat-rest"],
-                &["mkdir", "-p", "{cargo_target_dir}/e2e-bins"],
+                &[
+                    "mkdir",
+                    "-p",
+                    "{cargo_target_dir}/e2e-bins/system-rpc-rest-rpc",
+                ],
                 &[
                     "cp",
                     "{cargo_target_dir}/debug/rkat-rpc",
-                    "{cargo_target_dir}/e2e-bins/rkat-rpc-system-rpc-rest-rpc",
+                    "{cargo_target_dir}/e2e-bins/system-rpc-rest-rpc/rkat-rpc",
                 ],
                 &[
                     "cp",
                     "{cargo_target_dir}/debug/rkat-rest",
-                    "{cargo_target_dir}/e2e-bins/rkat-rest-system-rpc-rest-rpc",
+                    "{cargo_target_dir}/e2e-bins/system-rpc-rest-rpc/rkat-rest",
                 ],
             ],
             command: CommandSpec::CargoTest {
@@ -1700,27 +1876,31 @@ fn suite_spec(name: &str) -> Option<&'static Spec> {
             env: &[
                 (
                     "RKAT_TEST_BIN_RKAT",
-                    "{cargo_target_dir}/e2e-bins/rkat-system-cli-rpc-cli",
+                    "{cargo_target_dir}/e2e-bins/system-cli-rpc-cli/rkat",
                 ),
                 (
                     "RKAT_TEST_BIN_RKAT_RPC",
-                    "{cargo_target_dir}/e2e-bins/rkat-rpc-system-cli-rpc-cli",
+                    "{cargo_target_dir}/e2e-bins/system-cli-rpc-cli/rkat-rpc",
                 ),
             ],
             cargo_bin_env: &[],
             pre_commands: &[
                 &["cargo", "build", "-p", "rkat", "--bin", "rkat"],
                 &["cargo", "build", "-p", "meerkat-rpc", "--bin", "rkat-rpc"],
-                &["mkdir", "-p", "{cargo_target_dir}/e2e-bins"],
+                &[
+                    "mkdir",
+                    "-p",
+                    "{cargo_target_dir}/e2e-bins/system-cli-rpc-cli",
+                ],
                 &[
                     "cp",
                     "{cargo_target_dir}/debug/rkat",
-                    "{cargo_target_dir}/e2e-bins/rkat-system-cli-rpc-cli",
+                    "{cargo_target_dir}/e2e-bins/system-cli-rpc-cli/rkat",
                 ],
                 &[
                     "cp",
                     "{cargo_target_dir}/debug/rkat-rpc",
-                    "{cargo_target_dir}/e2e-bins/rkat-rpc-system-cli-rpc-cli",
+                    "{cargo_target_dir}/e2e-bins/system-cli-rpc-cli/rkat-rpc",
                 ],
             ],
             command: CommandSpec::CargoTest {
@@ -1742,27 +1922,31 @@ fn suite_spec(name: &str) -> Option<&'static Spec> {
             env: &[
                 (
                     "RKAT_TEST_BIN_RKAT",
-                    "{cargo_target_dir}/e2e-bins/rkat-system-cli-rest-cli",
+                    "{cargo_target_dir}/e2e-bins/system-cli-rest-cli/rkat",
                 ),
                 (
                     "RKAT_TEST_BIN_RKAT_REST",
-                    "{cargo_target_dir}/e2e-bins/rkat-rest-system-cli-rest-cli",
+                    "{cargo_target_dir}/e2e-bins/system-cli-rest-cli/rkat-rest",
                 ),
             ],
             cargo_bin_env: &[],
             pre_commands: &[
                 &["cargo", "build", "-p", "rkat", "--bin", "rkat"],
                 &["cargo", "build", "-p", "meerkat-rest", "--bin", "rkat-rest"],
-                &["mkdir", "-p", "{cargo_target_dir}/e2e-bins"],
+                &[
+                    "mkdir",
+                    "-p",
+                    "{cargo_target_dir}/e2e-bins/system-cli-rest-cli",
+                ],
                 &[
                     "cp",
                     "{cargo_target_dir}/debug/rkat",
-                    "{cargo_target_dir}/e2e-bins/rkat-system-cli-rest-cli",
+                    "{cargo_target_dir}/e2e-bins/system-cli-rest-cli/rkat",
                 ],
                 &[
                     "cp",
                     "{cargo_target_dir}/debug/rkat-rest",
-                    "{cargo_target_dir}/e2e-bins/rkat-rest-system-cli-rest-cli",
+                    "{cargo_target_dir}/e2e-bins/system-cli-rest-cli/rkat-rest",
                 ],
             ],
             command: CommandSpec::CargoTest {

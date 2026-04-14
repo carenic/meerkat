@@ -4,8 +4,8 @@ use meerkat_core::lifecycle::core_executor::{CoreApplyOutput, CoreExecutor, Core
 use meerkat_core::lifecycle::run_control::RunControlCommand;
 use meerkat_core::lifecycle::run_primitive::RunPrimitive;
 use meerkat_core::service::SessionService;
-use meerkat_runtime::session_adapter::RuntimeBindingsError;
-use meerkat_runtime::{RuntimeDriverError, RuntimeSessionAdapter};
+use meerkat_runtime::meerkat_machine::RuntimeBindingsError;
+use meerkat_runtime::{MeerkatMachine, RuntimeDriverError};
 
 #[cfg(all(test, feature = "jsonl-store", not(target_arch = "wasm32")))]
 use crate::JsonlStore;
@@ -35,7 +35,7 @@ pub enum SurfaceRuntimeMaterializeError {
 
 pub fn wire_runtime_bindings(
     service: &mut PersistentSessionService<FactoryAgentBuilder>,
-    adapter: &Arc<RuntimeSessionAdapter>,
+    adapter: &Arc<MeerkatMachine>,
 ) {
     let adapter = Arc::clone(adapter);
     service.set_runtime_bindings_provider(Arc::new(move |session_id| {
@@ -46,7 +46,7 @@ pub fn wire_runtime_bindings(
 
 pub async fn materialize_session<F>(
     service: &Arc<PersistentSessionService<FactoryAgentBuilder>>,
-    adapter: &Arc<RuntimeSessionAdapter>,
+    adapter: &Arc<MeerkatMachine>,
     session: Session,
     mut request: CreateSessionRequest,
     executor_factory: F,
@@ -91,7 +91,7 @@ where
 
 #[cfg(feature = "comms")]
 pub async fn configure_peer_ingress(
-    adapter: &Arc<RuntimeSessionAdapter>,
+    adapter: &Arc<MeerkatMachine>,
     service: &Arc<PersistentSessionService<FactoryAgentBuilder>>,
     session_id: &SessionId,
     keep_alive: bool,
@@ -104,7 +104,7 @@ pub async fn configure_peer_ingress(
 
 pub fn default_persistent_executor(
     service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
-    adapter: Arc<RuntimeSessionAdapter>,
+    adapter: Arc<MeerkatMachine>,
     session_id: SessionId,
 ) -> Box<dyn CoreExecutor> {
     Box::new(PersistentRuntimeExecutor::new(service, adapter, session_id))
@@ -112,14 +112,14 @@ pub fn default_persistent_executor(
 
 pub struct PersistentRuntimeExecutor {
     service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
-    adapter: Arc<RuntimeSessionAdapter>,
+    adapter: Arc<MeerkatMachine>,
     session_id: SessionId,
 }
 
 impl PersistentRuntimeExecutor {
     pub fn new(
         service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
-        adapter: Arc<RuntimeSessionAdapter>,
+        adapter: Arc<MeerkatMachine>,
         session_id: SessionId,
     ) -> Self {
         Self {
@@ -177,6 +177,13 @@ impl CoreExecutor for PersistentRuntimeExecutor {
             RunControlCommand::CancelCurrentRun { .. } => self
                 .service
                 .interrupt(&self.session_id)
+                .await
+                .map_err(|error| CoreExecutorError::ControlFailed {
+                    reason: error.to_string(),
+                }),
+            RunControlCommand::CancelAfterBoundary { .. } => self
+                .service
+                .cancel_after_boundary(&self.session_id)
                 .await
                 .map_err(|error| CoreExecutorError::ControlFailed {
                     reason: error.to_string(),
@@ -263,7 +270,7 @@ mod tests {
         temp: &TempDir,
     ) -> (
         Arc<PersistentSessionService<FactoryAgentBuilder>>,
-        Arc<RuntimeSessionAdapter>,
+        Arc<MeerkatMachine>,
     ) {
         build_test_service_with_runtime(temp, None).await
     }
@@ -274,7 +281,7 @@ mod tests {
         #[cfg(not(feature = "comms"))] _shared_runtime: Option<()>,
     ) -> (
         Arc<PersistentSessionService<FactoryAgentBuilder>>,
-        Arc<RuntimeSessionAdapter>,
+        Arc<MeerkatMachine>,
     ) {
         let persistence = build_default_persistence(temp.path().join("sessions"))
             .await
@@ -299,7 +306,7 @@ mod tests {
     }
 
     async fn expect_prompt_completion(
-        adapter: &Arc<RuntimeSessionAdapter>,
+        adapter: &Arc<MeerkatMachine>,
         session_id: &SessionId,
         prompt: &str,
     ) {
@@ -532,6 +539,45 @@ mod tests {
             })
             .await
             .expect_err("cancel without an active run must surface the interrupt error");
+
+        service
+            .discard_live_session(&result.session_id)
+            .await
+            .expect("discard live session");
+        adapter.unregister_session(&result.session_id).await;
+    }
+
+    #[tokio::test]
+    async fn persistent_runtime_executor_cancel_after_boundary_surfaces_no_active_run() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (service, adapter) = build_test_service(&temp).await;
+        let result = materialize_session(
+            &service,
+            &adapter,
+            Session::new(),
+            make_request(SessionBuildOptions::default()),
+            {
+                let service = Arc::clone(&service);
+                let adapter = Arc::clone(&adapter);
+                move |session_id| default_persistent_executor(service, adapter, session_id)
+            },
+        )
+        .await
+        .expect("materialize session");
+
+        let mut executor = PersistentRuntimeExecutor::new(
+            Arc::clone(&service),
+            Arc::clone(&adapter),
+            result.session_id.clone(),
+        );
+        executor
+            .control(RunControlCommand::CancelAfterBoundary {
+                reason: "test boundary cancel".to_string(),
+            })
+            .await
+            .expect_err(
+                "boundary cancel without an active run must surface the session running-state error",
+            );
 
         service
             .discard_live_session(&result.session_id)

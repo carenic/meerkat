@@ -64,10 +64,12 @@ impl AgentToolDispatcher for NameFilteredDispatcher {
     fn bind_ops_lifecycle(
         self: Arc<Self>,
         registry: Arc<dyn OpsLifecycleRegistry>,
-        owner_session_id: SessionId,
+        owner_bridge_session_id: SessionId,
     ) -> Result<BindOutcome, OpsLifecycleBindError> {
         let owned = Arc::try_unwrap(self).map_err(|_| OpsLifecycleBindError::SharedOwnership)?;
-        let outcome = owned.inner.bind_ops_lifecycle(registry, owner_session_id)?;
+        let outcome = owned
+            .inner
+            .bind_ops_lifecycle(registry, owner_bridge_session_id)?;
         let bound = outcome.was_bound();
         let inner = outcome.into_dispatcher();
         let wrapper = Arc::new(NameFilteredDispatcher {
@@ -160,7 +162,7 @@ struct MobOperatorToolDispatcher {
     handle: MobHandle,
     authority_context: MobToolAuthorityContext,
     tools: Arc<[Arc<ToolDef>]>,
-    owner_session_id: Option<SessionId>,
+    owner_bridge_session_id: Option<SessionId>,
     ops_registry: Option<Arc<dyn OpsLifecycleRegistry>>,
 }
 
@@ -174,15 +176,16 @@ impl MobOperatorToolDispatcher {
         let mut defs: Vec<Arc<ToolDef>> = Vec::new();
         if enable_mob {
             defs.push(tool_def(
-                TOOL_SPAWN_MEERKAT,
-                "Spawn a meerkat from a profile. Supports fresh, resume, or fork launch modes.",
+                TOOL_SPAWN_MEMBER,
+                "Spawn a mob member from a profile. Supports fresh, resume, or fork launch modes.",
                 json!({
                     "type": "object",
                     "properties": {
                         "profile": {"type": "string"},
-                        "meerkat_id": {"type": "string"},
+                        "member_id": {"type": "string"},
                         "initial_message": content_input_schema(),
-                        "resume_session_id": {"type": "string", "description": "Deprecated: use launch_mode.resume instead"},
+                        "resume_bridge_session_id": {"type": "string", "description": "Preferred compatibility field for resume bridge bindings when launch_mode is omitted"},
+                        "resume_session_id": {"type": "string", "description": "Deprecated: use resume_bridge_session_id or launch_mode.resume instead"},
                         "backend": {"type": "string", "enum": ["session", "external"]},
                         "runtime_mode": {"type": "string", "enum": ["autonomous_host", "turn_driven"]},
                         "launch_mode": {
@@ -199,13 +202,13 @@ impl MobOperatorToolDispatcher {
                         },
                         "auto_wire_parent": {"type": "boolean", "description": "Auto-wire to spawner after spawn"}
                     },
-                    "required": ["profile", "meerkat_id"]
+                    "required": ["profile", "member_id"]
                 }),
                 ToolSourceKind::Mob,
             ));
             defs.push(tool_def(
-                TOOL_SPAWN_MANY_MEERKATS,
-                "Spawn multiple meerkats in one call. Returns per-item results in input order.",
+                TOOL_SPAWN_MANY_MEMBERS,
+                "Spawn multiple mob members in one call. Returns per-item results in input order.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -215,13 +218,14 @@ impl MobOperatorToolDispatcher {
                                 "type": "object",
                                 "properties": {
                                     "profile": {"type": "string"},
-                                    "meerkat_id": {"type": "string"},
+                                    "member_id": {"type": "string"},
                                     "initial_message": content_input_schema(),
+                                    "resume_bridge_session_id": {"type": "string"},
                                     "resume_session_id": {"type": "string"},
                                     "backend": {"type": "string", "enum": ["session", "external"]},
                                     "runtime_mode": {"type": "string", "enum": ["autonomous_host", "turn_driven"]}
                                 },
-                                "required": ["profile", "meerkat_id"]
+                                "required": ["profile", "member_id"]
                             }
                         }
                     },
@@ -230,38 +234,44 @@ impl MobOperatorToolDispatcher {
                 ToolSourceKind::Mob,
             ));
             defs.push(tool_def(
-                TOOL_RETIRE_MEERKAT,
-                "Retire a meerkat and archive its session",
+                TOOL_RETIRE_MEMBER,
+                "Retire a member and archive its session.",
                 json!({
                     "type": "object",
-                    "properties": {"meerkat_id": {"type": "string"}},
-                    "required": ["meerkat_id"]
+                    "properties": {"member_id": {"type": "string"}},
+                    "required": ["member_id"]
                 }),
                 ToolSourceKind::Mob,
             ));
             defs.push(tool_def(
-                TOOL_WIRE_PEERS,
-                "Wire two meerkats with bidirectional trust",
+                TOOL_WIRE_MEMBERS,
+                "Wire two mob members with bidirectional trust.",
                 json!({
                     "type": "object",
-                    "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
-                    "required": ["a", "b"]
+                    "properties": {
+                        "member_id": {"type": "string"},
+                        "peer_member_id": {"type": "string"}
+                    },
+                    "required": ["member_id", "peer_member_id"]
                 }),
                 ToolSourceKind::Mob,
             ));
             defs.push(tool_def(
-                TOOL_UNWIRE_PEERS,
-                "Unwire two meerkats and revoke bidirectional trust",
+                TOOL_UNWIRE_MEMBERS,
+                "Unwire two mob members and revoke bidirectional trust.",
                 json!({
                     "type": "object",
-                    "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
-                    "required": ["a", "b"]
+                    "properties": {
+                        "member_id": {"type": "string"},
+                        "peer_member_id": {"type": "string"}
+                    },
+                    "required": ["member_id", "peer_member_id"]
                 }),
                 ToolSourceKind::Mob,
             ));
             defs.push(tool_def(
-                TOOL_LIST_MEERKATS,
-                "List all active meerkats. Response includes meerkat_id, profile, member_ref, peer_id, session_id, wired_to, external_peer_specs.",
+                TOOL_LIST_MEMBERS,
+                "List all active mob members. Response includes identity-native lifecycle and runtime fields.",
                 json!({
                     "type": "object",
                     "properties": {}
@@ -315,26 +325,26 @@ impl MobOperatorToolDispatcher {
                 ToolSourceKind::Mob,
             ));
             defs.push(tool_def(
-                TOOL_FORCE_CANCEL_MEERKAT,
-                "Force-cancel a meerkat's in-flight turn. Does not retire the member.",
+                TOOL_FORCE_CANCEL_MEMBER,
+                "Force-cancel a member's in-flight turn. Does not retire the member.",
                 json!({
                     "type": "object",
                     "properties": {
-                        "meerkat_id": {"type": "string"}
+                        "member_id": {"type": "string"}
                     },
-                    "required": ["meerkat_id"]
+                    "required": ["member_id"]
                 }),
                 ToolSourceKind::Mob,
             ));
             defs.push(tool_def(
-                TOOL_MEERKAT_STATUS,
-                "Get a meerkat's execution status snapshot including output preview and token usage.",
+                TOOL_MEMBER_STATUS,
+                "Get a member's execution status snapshot including output preview and token usage.",
                 json!({
                     "type": "object",
                     "properties": {
-                        "meerkat_id": {"type": "string"}
+                        "member_id": {"type": "string"}
                     },
-                    "required": ["meerkat_id"]
+                    "required": ["member_id"]
                 }),
                 ToolSourceKind::Mob,
             ));
@@ -396,7 +406,7 @@ impl MobOperatorToolDispatcher {
             handle,
             authority_context,
             tools: defs.into(),
-            owner_session_id: None,
+            owner_bridge_session_id: None,
             ops_registry: None,
         }
     }
@@ -432,6 +442,38 @@ impl MobOperatorToolDispatcher {
             async_ops,
             session_effects: vec![],
         })
+    }
+
+    fn spawn_result_payload(result: &super::SpawnResult) -> serde_json::Value {
+        json!({
+            "agent_identity": result.agent_identity,
+            "agent_runtime_id": result.agent_runtime_id,
+            "fence_token": result.fence_token,
+        })
+    }
+
+    fn member_list_entry_result_payload(
+        entry: &MobMemberListEntry,
+    ) -> Result<serde_json::Value, ToolError> {
+        serde_json::to_value(entry).map_err(|error| {
+            ToolError::execution_failed(format!("encode member list entry: {error}"))
+        })
+    }
+
+    async fn spawn_result_payload_for_identity(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<serde_json::Value, MobError> {
+        let entry = self.handle.get_member(identity).await.ok_or_else(|| {
+            MobError::Internal(format!(
+                "spawn succeeded but roster entry missing for '{identity}'"
+            ))
+        })?;
+        Ok(Self::spawn_result_payload(&super::SpawnResult::new(
+            entry.agent_identity,
+            entry.agent_runtime_id,
+            entry.fence_token,
+        )))
     }
 
     async fn record_successful_operator_action(&self, tool_name: &str) {
@@ -500,11 +542,13 @@ fn content_input_schema() -> serde_json::Value {
 }
 
 #[derive(Deserialize)]
-struct SpawnMeerkatArgs {
+struct SpawnMemberArgs {
     profile: String,
-    meerkat_id: String,
+    member_id: String,
     #[serde(default)]
     initial_message: Option<ContentInput>,
+    #[serde(default)]
+    resume_bridge_session_id: Option<meerkat_core::types::SessionId>,
     #[serde(default)]
     resume_session_id: Option<meerkat_core::types::SessionId>,
     #[serde(default)]
@@ -523,28 +567,28 @@ struct SpawnMeerkatArgs {
 
 #[derive(Deserialize)]
 struct ForceCancelArgs {
-    meerkat_id: String,
+    member_id: String,
 }
 
 #[derive(Deserialize)]
-struct MeerkatStatusArgs {
-    meerkat_id: String,
+struct MemberStatusArgs {
+    member_id: String,
 }
 
 #[derive(Deserialize)]
-struct SpawnManyMeerkatsArgs {
-    specs: Vec<SpawnMeerkatArgs>,
+struct SpawnManyMembersArgs {
+    specs: Vec<SpawnMemberArgs>,
 }
 
 #[derive(Deserialize)]
-struct RetireMeerkatArgs {
-    meerkat_id: String,
+struct RetireMemberArgs {
+    member_id: String,
 }
 
 #[derive(Deserialize)]
-struct WirePeersArgs {
-    a: String,
-    b: String,
+struct WireMembersArgs {
+    member_id: String,
+    peer_member_id: String,
 }
 
 #[derive(Deserialize)]
@@ -594,13 +638,14 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
             self.ensure_current_mob_scope(call.name)?;
         }
         match call.name {
-            TOOL_SPAWN_MEERKAT => {
-                let args: SpawnMeerkatArgs = call
+            TOOL_SPAWN_MEMBER => {
+                let args: SpawnMemberArgs = call
                     .parse_args()
                     .map_err(|error| ToolError::invalid_arguments(call.name, error.to_string()))?;
+                let agent_identity = AgentIdentity::from(args.member_id.as_str());
                 let mut spec = SpawnMemberSpec::from_wire(
                     args.profile,
-                    args.meerkat_id,
+                    args.member_id,
                     args.initial_message,
                     args.runtime_mode,
                     args.backend,
@@ -609,8 +654,10 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                 // then legacy resume_session_id, then default (Fresh).
                 if let Some(launch_mode) = args.launch_mode {
                     spec = spec.with_launch_mode(launch_mode);
-                } else if let Some(session_id) = args.resume_session_id {
-                    spec = spec.with_resume_session_id(session_id);
+                } else if let Some(session_id) =
+                    args.resume_bridge_session_id.or(args.resume_session_id)
+                {
+                    spec = spec.with_resume_bridge_session_id(session_id);
                 }
                 if let Some(policy) = args.tool_access_policy {
                     spec = spec.with_tool_access_policy(policy);
@@ -621,64 +668,65 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                 if let Some(auto_wire) = args.auto_wire_parent {
                     spec = spec.with_auto_wire_parent(auto_wire);
                 }
-                let (result, async_ops) = match (&self.owner_session_id, &self.ops_registry) {
-                    (Some(owner_session_id), Some(ops_registry)) => {
+                let (result, async_ops) = match (&self.owner_bridge_session_id, &self.ops_registry)
+                {
+                    (Some(owner_bridge_session_id), Some(ops_registry)) => {
                         let receipt = self
                             .handle
                             .spawn_spec_receipt_with_owner_context(
                                 spec,
                                 super::handle::CanonicalOpsOwnerContext {
-                                    owner_session_id: owner_session_id.clone(),
+                                    owner_bridge_session_id: owner_bridge_session_id.clone(),
                                     ops_registry: Arc::clone(ops_registry),
                                 },
                             )
                             .await
                             .map_err(|error| Self::map_mob_error(call, error))?;
-                        (
-                            json!({
-                                "member_ref": receipt.member_ref,
-                                "session_id": receipt.member_ref.session_id(),
-                            }),
-                            vec![AsyncOpRef::detached(receipt.operation_id)],
-                        )
+                        let result = self
+                            .spawn_result_payload_for_identity(&agent_identity)
+                            .await
+                            .map_err(|error| Self::map_mob_error(call, error))?;
+                        (result, vec![AsyncOpRef::detached(receipt.operation_id)])
                     }
                     _ => {
-                        let member_ref = self
+                        let spawn_result = self
                             .handle
                             .spawn_spec(spec)
                             .await
                             .map_err(|error| Self::map_mob_error(call, error))?;
-                        (
-                            json!({
-                                "member_ref": member_ref,
-                                "session_id": member_ref.session_id(),
-                            }),
-                            Vec::new(),
-                        )
+                        let result = Self::spawn_result_payload(&spawn_result);
+                        (result, Vec::new())
                     }
                 };
                 self.record_successful_operator_action(call.name).await;
                 Self::encode_result_with_async_ops(call, result, async_ops)
             }
-            TOOL_SPAWN_MANY_MEERKATS => {
-                let args: SpawnManyMeerkatsArgs = call
+            TOOL_SPAWN_MANY_MEMBERS => {
+                let args: SpawnManyMembersArgs = call
                     .parse_args()
                     .map_err(|error| ToolError::invalid_arguments(call.name, error.to_string()))?;
+                let identities = args
+                    .specs
+                    .iter()
+                    .map(|spec| AgentIdentity::from(spec.member_id.as_str()))
+                    .collect::<Vec<_>>();
                 let specs = args
                     .specs
                     .into_iter()
                     .map(|spec| {
                         let mut spawn_spec = SpawnMemberSpec::from_wire(
                             spec.profile,
-                            spec.meerkat_id,
+                            spec.member_id,
                             spec.initial_message,
                             spec.runtime_mode,
                             spec.backend,
                         );
                         if let Some(launch_mode) = spec.launch_mode {
                             spawn_spec = spawn_spec.with_launch_mode(launch_mode);
-                        } else if let Some(session_id) = spec.resume_session_id {
-                            spawn_spec = spawn_spec.with_resume_session_id(session_id);
+                        } else if let Some(session_id) =
+                            spec.resume_bridge_session_id.or(spec.resume_session_id)
+                        {
+                            spawn_spec = spawn_spec.with_resume_bridge_session_id(session_id);
                         }
                         if let Some(policy) = spec.tool_access_policy {
                             spawn_spec = spawn_spec.with_tool_access_policy(policy);
@@ -692,14 +740,15 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                         spawn_spec
                     })
                     .collect::<Vec<_>>();
-                let (results, async_ops) = match (&self.owner_session_id, &self.ops_registry) {
-                    (Some(owner_session_id), Some(ops_registry)) => {
+                let (results, async_ops) = match (&self.owner_bridge_session_id, &self.ops_registry)
+                {
+                    (Some(owner_bridge_session_id), Some(ops_registry)) => {
                         let receipts = self
                             .handle
                             .spawn_many_receipts_with_owner_context(
                                 specs,
                                 super::handle::CanonicalOpsOwnerContext {
-                                    owner_session_id: owner_session_id.clone(),
+                                    owner_bridge_session_id: owner_bridge_session_id.clone(),
                                     ops_registry: Arc::clone(ops_registry),
                                 },
                             )
@@ -709,20 +758,25 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                             .filter_map(|result| result.as_ref().ok())
                             .map(|receipt| AsyncOpRef::detached(receipt.operation_id.clone()))
                             .collect::<Vec<_>>();
-                        let results = receipts
-                            .into_iter()
-                            .map(|result| match result {
-                                Ok(receipt) => json!({
-                                    "ok": true,
-                                    "member_ref": receipt.member_ref,
-                                    "session_id": receipt.member_ref.session_id(),
-                                }),
-                                Err(error) => json!({
-                                    "ok": false,
-                                    "error": error.to_string(),
-                                }),
-                            })
-                            .collect::<Vec<_>>();
+                        let mut results = Vec::with_capacity(receipts.len());
+                        for (result, identity) in receipts.into_iter().zip(identities.into_iter()) {
+                            match result {
+                                Ok(_receipt) => {
+                                    let mut payload = self
+                                        .spawn_result_payload_for_identity(&identity)
+                                        .await
+                                        .map_err(|error| Self::map_mob_error(call, error))?;
+                                    payload["ok"] = json!(true);
+                                    results.push(payload);
+                                }
+                                Err(error) => {
+                                    results.push(json!({
+                                        "ok": false,
+                                        "error": error.to_string(),
+                                    }));
+                                }
+                            }
+                        }
                         (results, async_ops)
                     }
                     _ => {
@@ -732,11 +786,11 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                             .await
                             .into_iter()
                             .map(|result| match result {
-                                Ok(member_ref) => json!({
-                                    "ok": true,
-                                    "member_ref": member_ref,
-                                    "session_id": member_ref.session_id(),
-                                }),
+                                Ok(spawn_result) => {
+                                    let mut payload = Self::spawn_result_payload(&spawn_result);
+                                    payload["ok"] = json!(true);
+                                    payload
+                                }
                                 Err(error) => json!({
                                     "ok": false,
                                     "error": error.to_string(),
@@ -749,61 +803,52 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                 self.record_successful_operator_action(call.name).await;
                 Self::encode_result_with_async_ops(call, json!({ "results": results }), async_ops)
             }
-            TOOL_RETIRE_MEERKAT => {
-                let args: RetireMeerkatArgs = call
+            TOOL_RETIRE_MEMBER => {
+                let args: RetireMemberArgs = call
                     .parse_args()
                     .map_err(|error| ToolError::invalid_arguments(call.name, error.to_string()))?;
                 self.handle
-                    .retire(MeerkatId::from(args.meerkat_id))
+                    .retire(AgentIdentity::from(args.member_id))
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
                 self.record_successful_operator_action(call.name).await;
                 Self::encode_result(call, json!({"ok": true}))
             }
-            TOOL_WIRE_PEERS => {
-                let args: WirePeersArgs = call
+            TOOL_WIRE_MEMBERS => {
+                let args: WireMembersArgs = call
                     .parse_args()
                     .map_err(|error| ToolError::invalid_arguments(call.name, error.to_string()))?;
                 self.handle
-                    .wire(MeerkatId::from(args.a), MeerkatId::from(args.b))
+                    .wire(
+                        AgentIdentity::from(args.member_id),
+                        AgentIdentity::from(args.peer_member_id),
+                    )
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
                 self.record_successful_operator_action(call.name).await;
                 Self::encode_result(call, json!({"ok": true}))
             }
-            TOOL_UNWIRE_PEERS => {
-                let args: WirePeersArgs = call
+            TOOL_UNWIRE_MEMBERS => {
+                let args: WireMembersArgs = call
                     .parse_args()
                     .map_err(|error| ToolError::invalid_arguments(call.name, error.to_string()))?;
                 self.handle
-                    .unwire(MeerkatId::from(args.a), MeerkatId::from(args.b))
+                    .unwire(
+                        AgentIdentity::from(args.member_id),
+                        AgentIdentity::from(args.peer_member_id),
+                    )
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
                 self.record_successful_operator_action(call.name).await;
                 Self::encode_result(call, json!({"ok": true}))
             }
-            TOOL_LIST_MEERKATS => {
-                let meerkats = self.handle.list_members().await;
-                let meerkats = meerkats
+            TOOL_LIST_MEMBERS => {
+                let members = self.handle.list_members().await;
+                let members = members
                     .into_iter()
-                    .map(|entry| {
-                        json!({
-                            "meerkat_id": entry.meerkat_id,
-                            "profile": entry.profile,
-                            "runtime_mode": entry.runtime_mode,
-                            "member_ref": entry.member_ref,
-                            "peer_id": entry.peer_id,
-                            "session_id": entry.session_id(),
-                            "wired_to": entry.wired_to,
-                            "external_peer_specs": entry.external_peer_specs,
-                            "status": entry.status,
-                            "error": entry.error,
-                            "is_final": entry.is_final,
-                            "current_session_id": entry.current_session_id,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                Self::encode_result(call, json!({ "meerkats": meerkats }))
+                    .map(|entry| Self::member_list_entry_result_payload(&entry))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Self::encode_result(call, json!({ "members": members }))
             }
             TOOL_MOB_LIST_FLOWS => {
                 let flows = self.handle.list_flows();
@@ -874,7 +919,11 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                     .parse_args()
                     .map_err(|error| ToolError::invalid_arguments(call.name, error.to_string()))?;
                 self.handle
-                    .task_update(args.task_id, args.status, args.owner.map(MeerkatId::from))
+                    .task_update(
+                        args.task_id,
+                        args.status,
+                        args.owner.map(AgentIdentity::from),
+                    )
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
                 self.record_successful_operator_action(call.name).await;
@@ -891,24 +940,24 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                     .map_err(|error| Self::map_mob_error(call, error))?;
                 Self::encode_result(call, json!({ "task": task }))
             }
-            TOOL_FORCE_CANCEL_MEERKAT => {
+            TOOL_FORCE_CANCEL_MEMBER => {
                 let args: ForceCancelArgs = call
                     .parse_args()
                     .map_err(|error| ToolError::invalid_arguments(call.name, error.to_string()))?;
                 self.handle
-                    .force_cancel_member(MeerkatId::from(args.meerkat_id))
+                    .force_cancel_member(AgentIdentity::from(args.member_id))
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
                 self.record_successful_operator_action(call.name).await;
                 Self::encode_result(call, json!({"ok": true}))
             }
-            TOOL_MEERKAT_STATUS => {
-                let args: MeerkatStatusArgs = call
+            TOOL_MEMBER_STATUS => {
+                let args: MemberStatusArgs = call
                     .parse_args()
                     .map_err(|error| ToolError::invalid_arguments(call.name, error.to_string()))?;
                 let snapshot = self
                     .handle
-                    .member_status(&MeerkatId::from(args.meerkat_id))
+                    .member_status(&AgentIdentity::from(args.member_id))
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
                 Self::encode_result(call, json!(snapshot))
@@ -926,7 +975,7 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
     fn bind_ops_lifecycle(
         self: Arc<Self>,
         registry: Arc<dyn OpsLifecycleRegistry>,
-        owner_session_id: SessionId,
+        owner_bridge_session_id: SessionId,
     ) -> Result<BindOutcome, OpsLifecycleBindError> {
         if Arc::strong_count(&self) != 1 {
             return Err(OpsLifecycleBindError::SharedOwnership);
@@ -936,20 +985,20 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
             handle: this.handle,
             authority_context: this.authority_context,
             tools: this.tools,
-            owner_session_id: Some(owner_session_id),
+            owner_bridge_session_id: Some(owner_bridge_session_id),
             ops_registry: Some(registry),
         })))
     }
 }
 
-const TOOL_SPAWN_MEERKAT: &str = "spawn_meerkat";
-const TOOL_SPAWN_MANY_MEERKATS: &str = "spawn_many_meerkats";
-const TOOL_RETIRE_MEERKAT: &str = "retire_meerkat";
-const TOOL_FORCE_CANCEL_MEERKAT: &str = "force_cancel_meerkat";
-const TOOL_MEERKAT_STATUS: &str = "meerkat_status";
-const TOOL_WIRE_PEERS: &str = "wire_peers";
-const TOOL_UNWIRE_PEERS: &str = "unwire_peers";
-const TOOL_LIST_MEERKATS: &str = "list_meerkats";
+const TOOL_SPAWN_MEMBER: &str = "spawn_member";
+const TOOL_SPAWN_MANY_MEMBERS: &str = "spawn_many_members";
+const TOOL_RETIRE_MEMBER: &str = "retire_member";
+const TOOL_FORCE_CANCEL_MEMBER: &str = "force_cancel_member";
+const TOOL_MEMBER_STATUS: &str = "member_status";
+const TOOL_WIRE_MEMBERS: &str = "wire_members";
+const TOOL_UNWIRE_MEMBERS: &str = "unwire_members";
+const TOOL_LIST_MEMBERS: &str = "list_members";
 const TOOL_MOB_LIST_FLOWS: &str = "mob_list_flows";
 const TOOL_MOB_RUN_FLOW: &str = "mob_run_flow";
 const TOOL_MOB_FLOW_STATUS: &str = "mob_flow_status";

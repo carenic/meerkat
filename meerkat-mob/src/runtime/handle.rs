@@ -1,5 +1,6 @@
 use super::*;
 use crate::MobRuntimeMode;
+use crate::mob_machine::{MobMachineCommand, MobMachineCommandResult};
 use crate::roster::MobMemberKickoffSnapshot;
 use crate::runtime::mob_member_lifecycle_authority::{
     CanonicalMemberSnapshotMaterial, CanonicalMemberStatus, CanonicalSessionObservation,
@@ -7,7 +8,6 @@ use crate::runtime::mob_member_lifecycle_authority::{
 };
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
-use futures::stream::{FuturesUnordered, StreamExt};
 use meerkat_core::comms::{
     PeerDirectoryEntry, PeerReachability, PeerReachabilityReason, TrustedPeerSpec,
 };
@@ -32,7 +32,7 @@ enum PeerConnectivityProjection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionObservationProjection {
-    LiveOnly,
+    Omit,
     Full,
 }
 
@@ -42,6 +42,10 @@ enum SessionObservationProjection {
 pub struct MobMemberSnapshot {
     /// Current lifecycle status.
     pub status: MobMemberStatus,
+    /// Identity-native runtime ID for this incarnation.
+    pub agent_runtime_id: AgentRuntimeId,
+    /// Fence token for the current incarnation.
+    pub fence_token: FenceToken,
     /// Preview of the last assistant output (if any).
     pub output_preview: Option<String>,
     /// Error description (if the member errored).
@@ -50,8 +54,12 @@ pub struct MobMemberSnapshot {
     pub tokens_used: u64,
     /// Whether the member has reached a terminal state.
     pub is_final: bool,
-    /// Current session ID (if a session bridge exists).
-    pub current_session_id: Option<SessionId>,
+    /// Bridge-internal session binding — compatibility alias for the current bridge session.
+    #[serde(skip)]
+    pub(crate) current_session_id: Option<SessionId>,
+    /// Bridge-internal session binding — not part of the public identity contract.
+    #[serde(skip)]
+    pub(crate) current_bridge_session_id: Option<SessionId>,
     /// Live comms connectivity for currently wired peers, when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_connectivity: Option<MobPeerConnectivitySnapshot>,
@@ -60,35 +68,65 @@ pub struct MobMemberSnapshot {
     pub kickoff: Option<MobMemberKickoffSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl MobMemberSnapshot {
+    pub(crate) fn with_current_bridge_session_id(
+        mut self,
+        current_bridge_session_id: Option<SessionId>,
+    ) -> Self {
+        self.current_session_id = current_bridge_session_id.clone();
+        self.current_bridge_session_id = current_bridge_session_id;
+        self
+    }
+
+    pub(crate) fn current_bridge_session_id(&self) -> Option<&SessionId> {
+        self.current_bridge_session_id.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct MobMemberListEntry {
-    pub meerkat_id: MeerkatId,
-    pub profile: ProfileName,
-    pub member_ref: MemberRef,
+    /// Canonical member identity.
+    pub agent_identity: AgentIdentity,
+    /// Identity-native runtime ID for this incarnation.
+    pub agent_runtime_id: AgentRuntimeId,
+    /// Fence token for the current incarnation.
+    pub fence_token: FenceToken,
+    /// Member role (profile name).
+    pub role: ProfileName,
     pub runtime_mode: MobRuntimeMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer_id: Option<String>,
     #[serde(default)]
     pub state: crate::roster::MemberState,
-    pub wired_to: BTreeSet<MeerkatId>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub external_peer_specs: BTreeMap<MeerkatId, TrustedPeerSpec>,
+    pub wired_to: BTreeSet<AgentIdentity>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
     pub status: MobMemberStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub is_final: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub current_session_id: Option<SessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kickoff: Option<MobMemberKickoffSnapshot>,
+    // --- Bridge internals (pub(crate)) ---
+    #[serde(skip)]
+    pub(crate) meerkat_id: MeerkatId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) peer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) external_peer_specs: BTreeMap<MeerkatId, TrustedPeerSpec>,
+    #[serde(skip)]
+    pub(crate) current_session_id: Option<SessionId>,
+    #[serde(skip)]
+    pub(crate) current_bridge_session_id: Option<SessionId>,
 }
 
 impl MobMemberListEntry {
-    pub fn session_id(&self) -> Option<&SessionId> {
-        self.member_ref.session_id()
+    pub(crate) fn with_current_bridge_session_id(
+        mut self,
+        current_bridge_session_id: Option<SessionId>,
+    ) -> Self {
+        self.current_session_id = current_bridge_session_id.clone();
+        self.current_bridge_session_id = current_bridge_session_id;
+        self
     }
 }
 
@@ -131,23 +169,27 @@ pub enum MobMemberStatus {
 #[non_exhaustive]
 pub struct MemberRespawnReceipt {
     /// The member identity that was respawned.
-    pub member_id: MeerkatId,
-    /// Session ID of the retired (old) session.
-    pub old_session_id: Option<SessionId>,
-    /// Session ID of the newly spawned session.
-    pub new_session_id: Option<SessionId>,
+    pub identity: AgentIdentity,
+    /// Runtime id for the current incarnation after respawn completes.
+    pub agent_runtime_id: AgentRuntimeId,
+    /// Fence token for the superseded incarnation.
+    pub previous_fence_token: FenceToken,
+    /// Fence token for the current incarnation.
+    pub fence_token: FenceToken,
 }
 
 impl MemberRespawnReceipt {
     pub fn new(
-        member_id: MeerkatId,
-        old_session_id: Option<SessionId>,
-        new_session_id: Option<SessionId>,
+        identity: AgentIdentity,
+        agent_runtime_id: AgentRuntimeId,
+        previous_fence_token: FenceToken,
+        fence_token: FenceToken,
     ) -> Self {
         Self {
-            member_id,
-            old_session_id,
-            new_session_id,
+            identity,
+            agent_runtime_id,
+            previous_fence_token,
+            fence_token,
         }
     }
 }
@@ -162,9 +204,38 @@ pub(crate) struct MemberSpawnReceipt {
     pub(crate) operation_id: OperationId,
 }
 
+/// Public result from a successful member spawn.
+///
+/// Carries identity-native fields only — no session IDs or internal refs.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct SpawnResult {
+    /// Stable member identity.
+    pub agent_identity: AgentIdentity,
+    /// Identity-native runtime ID for this incarnation.
+    pub agent_runtime_id: AgentRuntimeId,
+    /// Fence token for stale-command rejection.
+    pub fence_token: FenceToken,
+}
+
+impl SpawnResult {
+    /// Create a new spawn result from identity-native fields.
+    pub fn new(
+        agent_identity: AgentIdentity,
+        agent_runtime_id: AgentRuntimeId,
+        fence_token: FenceToken,
+    ) -> Self {
+        Self {
+            agent_identity,
+            agent_runtime_id,
+            fence_token,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct CanonicalOpsOwnerContext {
-    pub(crate) owner_session_id: SessionId,
+    pub(crate) owner_bridge_session_id: SessionId,
     pub(crate) ops_registry: Arc<dyn OpsLifecycleRegistry>,
 }
 
@@ -173,22 +244,22 @@ pub(crate) struct CanonicalOpsOwnerContext {
 #[non_exhaustive]
 pub enum MobRespawnError {
     /// Member has no current session bridge to retire.
-    #[error("no current session bridge for member {member_id}")]
-    NoSessionBridge { member_id: MeerkatId },
+    #[error("no current session bridge for member {identity}")]
+    NoSessionBridge { identity: AgentIdentity },
 
     /// Spawn failed after the old member was retired.
-    #[error("spawn failed after retire for member {member_id}: {reason}")]
+    #[error("spawn failed after retire for member {identity}: {reason}")]
     SpawnAfterRetire {
-        member_id: MeerkatId,
+        identity: AgentIdentity,
         reason: String,
     },
 
     /// Topology restore failed after replacement spawn.
     /// The replacement receipt is carried so callers can still use the new session.
-    #[error("topology restore failed for member {}: {} peer(s) failed", receipt.member_id, failed_peer_ids.len())]
+    #[error("topology restore failed for member {}: {} peer(s) failed", receipt.identity, failed_peer_ids.len())]
     TopologyRestoreFailed {
         receipt: MemberRespawnReceipt,
-        failed_peer_ids: Vec<MeerkatId>,
+        failed_peer_ids: Vec<AgentIdentity>,
     },
 
     /// An underlying mob error occurred before mutation.
@@ -200,22 +271,24 @@ pub enum MobRespawnError {
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct MemberDeliveryReceipt {
-    /// The member that received the message.
-    pub member_id: MeerkatId,
-    /// The session ID the message was delivered to.
-    pub session_id: SessionId,
+    /// The member identity.
+    pub identity: AgentIdentity,
+    /// Runtime id for the incarnation that accepted the work.
+    pub agent_runtime_id: AgentRuntimeId,
+    /// Fence token for the incarnation that accepted the work.
+    pub fence_token: FenceToken,
     /// How the message was handled.
     pub handling_mode: HandlingMode,
 }
 
-/// Reference to a member's current session bridge.
+/// Receipt confirming that a unit of work was accepted by the work lane.
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
-pub struct MemberSessionRef {
-    /// The member identity.
-    pub member_id: MeerkatId,
-    /// The current session ID.
-    pub session_id: SessionId,
+pub struct WorkDeliveryReceipt {
+    /// The work reference for the submitted unit.
+    pub work_ref: WorkRef,
+    /// The runtime ID of the target member.
+    pub runtime_id: AgentRuntimeId,
 }
 
 /// Options for helper convenience spawns.
@@ -233,15 +306,19 @@ pub struct HelperOptions {
 }
 
 /// Result from a helper spawn-and-wait operation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct HelperResult {
     /// The member's final output text.
     pub output: Option<String>,
     /// Total tokens used by the helper.
     pub tokens_used: u64,
-    /// The session ID that was used.
-    pub session_id: Option<meerkat_core::types::SessionId>,
+    /// Stable member identity for the helper run.
+    pub agent_identity: AgentIdentity,
+    /// Runtime id for the helper incarnation.
+    pub agent_runtime_id: AgentRuntimeId,
+    /// Fence token for the helper incarnation.
+    pub fence_token: FenceToken,
 }
 
 /// Target for a wire operation from a local mob member.
@@ -249,13 +326,19 @@ pub struct HelperResult {
 #[serde(rename_all = "snake_case")]
 pub enum PeerTarget {
     /// Another member in the same mob roster.
-    Local(MeerkatId),
+    Local(AgentIdentity),
     /// A trusted peer that lives outside the local mob roster.
     External(TrustedPeerSpec),
 }
 
 impl From<MeerkatId> for PeerTarget {
     fn from(value: MeerkatId) -> Self {
+        Self::Local(AgentIdentity::from(value.as_str()))
+    }
+}
+
+impl From<AgentIdentity> for PeerTarget {
+    fn from(value: AgentIdentity) -> Self {
         Self::Local(value)
     }
 }
@@ -291,10 +374,6 @@ impl MobMemberTerminalClassifier {
                 | MobMemberTerminalClass::TerminalCompleted
         )
     }
-
-    fn has_canonical_member(material: &CanonicalMemberSnapshotMaterial) -> bool {
-        material.member_present
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -304,17 +383,18 @@ impl MobMemberTerminalClassifier {
 /// Clone-cheap, thread-safe handle for interacting with a running mob.
 ///
 /// All mutation commands are sent through an mpsc channel to the actor.
-/// Read-only operations (roster, state) bypass the actor and read from
-/// shared `Arc` state directly.
+/// Public orchestration, event, and task surfaces are routed through the
+/// top-level machine command seam. A few immutable/shared projections still
+/// read canonical shared state directly inside that seam's implementation.
+/// The persisted event ledger is also retained here for terminal read-only
+/// fallback after `Destroy`, when the actor has exited by contract.
 #[derive(Clone)]
 pub struct MobHandle {
     pub(super) command_tx: mpsc::Sender<MobCommand>,
     pub(super) roster: Arc<RwLock<RosterAuthority>>,
-    pub(super) task_board: Arc<RwLock<TaskBoard>>,
     pub(super) definition: Arc<MobDefinition>,
     pub(super) state: Arc<AtomicU8>,
     pub(super) events: Arc<dyn MobEventStore>,
-    pub(super) mcp_servers: Arc<tokio::sync::Mutex<BTreeMap<String, actor::McpServerEntry>>>,
     pub(super) flow_streams:
         Arc<tokio::sync::Mutex<BTreeMap<RunId, mpsc::Sender<meerkat_core::ScopedAgentEvent>>>>,
     pub(super) session_service: Arc<dyn MobSessionService>,
@@ -323,7 +403,7 @@ pub struct MobHandle {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RestoreFailureDiagnostic {
-    pub(crate) session_id: SessionId,
+    pub(crate) bridge_session_id: SessionId,
     pub(crate) reason: String,
 }
 
@@ -340,7 +420,7 @@ pub struct MemberHandle {
 
 #[derive(Clone)]
 pub struct MobEventsView {
-    inner: Arc<dyn MobEventStore>,
+    handle: MobHandle,
 }
 
 /// Spawn request for first-class batch member provisioning.
@@ -352,7 +432,7 @@ pub struct SpawnMemberSpec {
     /// When `tooling` is present it controls model/tool resolution;
     /// `role_name` remains a roster/topology label.
     pub role_name: ProfileName,
-    pub meerkat_id: MeerkatId,
+    pub identity: AgentIdentity,
     pub initial_message: Option<ContentInput>,
     pub runtime_mode: Option<crate::MobRuntimeMode>,
     pub backend: Option<MobBackendKind>,
@@ -365,7 +445,7 @@ pub struct SpawnMemberSpec {
     /// Application-defined labels for this member.
     pub labels: Option<std::collections::BTreeMap<String, String>>,
     /// How this member should be launched (fresh, resume, or fork).
-    pub launch_mode: crate::launch::MemberLaunchMode,
+    pub(crate) launch_mode: crate::launch::MemberLaunchMode,
     /// Tool access policy for this member.
     pub tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
     /// How to split budget from the orchestrator to this member.
@@ -391,10 +471,10 @@ pub struct SpawnMemberSpec {
 }
 
 impl SpawnMemberSpec {
-    pub fn new(profile: impl Into<ProfileName>, meerkat_id: impl Into<MeerkatId>) -> Self {
+    pub fn new(profile: impl Into<ProfileName>, identity: impl Into<AgentIdentity>) -> Self {
         Self {
             role_name: profile.into(),
-            meerkat_id: meerkat_id.into(),
+            identity: identity.into(),
             initial_message: None,
             runtime_mode: None,
             backend: None,
@@ -442,16 +522,18 @@ impl SpawnMemberSpec {
         self
     }
 
-    /// Set launch mode to resume an existing session.
-    ///
-    /// This is a convenience method equivalent to setting
-    /// `launch_mode = MemberLaunchMode::Resume { session_id }`.
-    pub fn with_resume_session_id(mut self, id: meerkat_core::types::SessionId) -> Self {
-        self.launch_mode = crate::launch::MemberLaunchMode::Resume { session_id: id };
+    /// Set launch mode to resume an existing bridge session.
+    pub(crate) fn with_resume_bridge_session_id(
+        mut self,
+        id: meerkat_core::types::SessionId,
+    ) -> Self {
+        self.launch_mode = crate::launch::MemberLaunchMode::Resume {
+            bridge_session_id: id,
+        };
         self
     }
 
-    pub fn with_launch_mode(mut self, mode: crate::launch::MemberLaunchMode) -> Self {
+    pub(crate) fn with_launch_mode(mut self, mode: crate::launch::MemberLaunchMode) -> Self {
         self.launch_mode = mode;
         self
     }
@@ -478,24 +560,16 @@ impl SpawnMemberSpec {
 
     pub fn from_wire(
         profile: String,
-        meerkat_id: String,
+        agent_identity: String,
         initial_message: Option<ContentInput>,
         runtime_mode: Option<crate::MobRuntimeMode>,
         backend: Option<MobBackendKind>,
     ) -> Self {
-        let mut spec = Self::new(profile, meerkat_id);
+        let mut spec = Self::new(profile, agent_identity);
         spec.initial_message = initial_message;
         spec.runtime_mode = runtime_mode;
         spec.backend = backend;
         spec
-    }
-
-    /// Extract the resume session ID if the launch mode is `Resume`.
-    pub fn resume_session_id(&self) -> Option<&meerkat_core::types::SessionId> {
-        match &self.launch_mode {
-            crate::launch::MemberLaunchMode::Resume { session_id } => Some(session_id),
-            _ => None,
-        }
     }
 }
 
@@ -505,14 +579,32 @@ impl MobEventsView {
         after_cursor: u64,
         limit: usize,
     ) -> Result<Vec<crate::event::MobEvent>, MobError> {
-        self.inner
-            .poll(after_cursor, limit)
-            .await
-            .map_err(MobError::from)
+        match self
+            .handle
+            .execute_machine_command(MobMachineCommand::PollEvents {
+                after_cursor,
+                limit,
+            })
+            .await?
+        {
+            MobMachineCommandResult::MobEvents(events) => Ok(events),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
     }
 
     pub async fn replay_all(&self) -> Result<Vec<crate::event::MobEvent>, MobError> {
-        self.inner.replay_all().await.map_err(MobError::from)
+        match self
+            .handle
+            .execute_machine_command(MobMachineCommand::ReplayAllEvents)
+            .await?
+        {
+            MobMachineCommandResult::MobEvents(events) => Ok(events),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
     }
 }
 
@@ -531,8 +623,422 @@ impl MobHandle {
     fn restore_failure_error(meerkat_id: &MeerkatId, diag: RestoreFailureDiagnostic) -> MobError {
         MobError::MemberRestoreFailed {
             member_id: meerkat_id.clone(),
-            session_id: diag.session_id,
+            session_id: diag.bridge_session_id,
             reason: diag.reason,
+        }
+    }
+
+    async fn send_actor_command<R>(
+        &self,
+        build: impl FnOnce(oneshot::Sender<R>) -> MobCommand,
+    ) -> Result<R, MobError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(build(reply_tx))
+            .await
+            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| MobError::Internal("actor reply dropped".into()))
+    }
+
+    async fn execute_machine_command(
+        &self,
+        command: MobMachineCommand,
+    ) -> Result<MobMachineCommandResult, MobError> {
+        match command {
+            MobMachineCommand::RunFlow {
+                flow_id,
+                activation_params,
+                scoped_event_tx,
+            } => {
+                let run_id = self
+                    .send_actor_command(|reply_tx| MobCommand::RunFlow {
+                        flow_id,
+                        activation_params,
+                        scoped_event_tx,
+                        reply_tx,
+                    })
+                    .await??;
+                Ok(MobMachineCommandResult::RunId(run_id))
+            }
+            MobMachineCommand::CancelFlow { run_id } => {
+                self.send_actor_command(|reply_tx| MobCommand::CancelFlow { run_id, reply_tx })
+                    .await??;
+                Ok(MobMachineCommandResult::Unit)
+            }
+            MobMachineCommand::FlowStatus { run_id } => {
+                let status = self
+                    .send_actor_command(|reply_tx| MobCommand::FlowStatus { run_id, reply_tx })
+                    .await??;
+                Ok(MobMachineCommandResult::FlowStatus(status))
+            }
+            MobMachineCommand::Spawn {
+                spec,
+                owner_context,
+            } => {
+                let (owner_bridge_session_id, ops_registry) = match owner_context {
+                    Some(ctx) => (Some(ctx.owner_bridge_session_id), Some(ctx.ops_registry)),
+                    None => (None, None),
+                };
+                let receipt = self
+                    .send_actor_command(|reply_tx| MobCommand::Spawn {
+                        spec,
+                        owner_bridge_session_id,
+                        ops_registry,
+                        reply_tx,
+                    })
+                    .await??;
+                Ok(MobMachineCommandResult::SpawnReceipt(receipt))
+            }
+            MobMachineCommand::Retire { meerkat_id } => {
+                self.send_actor_command(|reply_tx| MobCommand::Retire {
+                    meerkat_id,
+                    reply_tx,
+                })
+                .await??;
+                Ok(MobMachineCommandResult::Unit)
+            }
+            MobMachineCommand::Respawn {
+                meerkat_id,
+                initial_message,
+            } => {
+                let receipt = self
+                    .send_actor_command(|reply_tx| MobCommand::Respawn {
+                        meerkat_id,
+                        initial_message,
+                        reply_tx,
+                    })
+                    .await?;
+                Ok(MobMachineCommandResult::Respawn(receipt))
+            }
+            MobMachineCommand::RetireAll => {
+                self.send_actor_command(|reply_tx| MobCommand::RetireAll { reply_tx })
+                    .await??;
+                Ok(MobMachineCommandResult::Unit)
+            }
+            MobMachineCommand::Wire { local, target } => {
+                self.send_actor_command(|reply_tx| MobCommand::Wire {
+                    local,
+                    target,
+                    reply_tx,
+                })
+                .await??;
+                Ok(MobMachineCommandResult::Unit)
+            }
+            MobMachineCommand::Unwire { local, target } => {
+                self.send_actor_command(|reply_tx| MobCommand::Unwire {
+                    local,
+                    target,
+                    reply_tx,
+                })
+                .await??;
+                Ok(MobMachineCommandResult::Unit)
+            }
+            MobMachineCommand::ExternalTurn {
+                meerkat_id,
+                content,
+                handling_mode,
+                render_metadata,
+            } => {
+                let bridge_session_id = self
+                    .send_actor_command(|reply_tx| MobCommand::ExternalTurn {
+                        meerkat_id,
+                        content,
+                        handling_mode,
+                        render_metadata,
+                        reply_tx,
+                    })
+                    .await??;
+                Ok(MobMachineCommandResult::BridgeSessionId(bridge_session_id))
+            }
+            MobMachineCommand::InternalTurn {
+                meerkat_id,
+                content,
+            } => {
+                let bridge_session_id = self
+                    .send_actor_command(|reply_tx| MobCommand::InternalTurn {
+                        meerkat_id,
+                        content,
+                        reply_tx,
+                    })
+                    .await??;
+                Ok(MobMachineCommandResult::BridgeSessionId(bridge_session_id))
+            }
+            MobMachineCommand::SubmitWork {
+                runtime_id,
+                fence_token,
+                work_ref,
+                spec,
+            } => {
+                let meerkat_id = MeerkatId::from(runtime_id.identity.as_str());
+                let entry = self
+                    .roster
+                    .read()
+                    .await
+                    .entry(&meerkat_id)
+                    .ok_or_else(|| MobError::MeerkatNotFound(meerkat_id.clone()))?;
+                if entry.fence_token != fence_token {
+                    return Err(MobError::StaleFenceToken {
+                        runtime_id,
+                        expected: entry.fence_token,
+                        actual: fence_token,
+                    });
+                }
+                let content = meerkat_core::types::ContentInput::from(spec.content);
+                let bridge_session_id = match spec.origin {
+                    WorkOrigin::External => {
+                        self.send_actor_command(|reply_tx| MobCommand::ExternalTurn {
+                            meerkat_id,
+                            content,
+                            handling_mode: HandlingMode::Queue,
+                            render_metadata: None,
+                            reply_tx,
+                        })
+                        .await??
+                    }
+                    WorkOrigin::Internal => {
+                        self.send_actor_command(|reply_tx| MobCommand::InternalTurn {
+                            meerkat_id,
+                            content,
+                            reply_tx,
+                        })
+                        .await??
+                    }
+                };
+                let _ = bridge_session_id;
+                Ok(MobMachineCommandResult::WorkReceipt { work_ref })
+            }
+            MobMachineCommand::CancelWork { work_ref } => {
+                // Work tracking ledger is introduced in C7. Until then,
+                // individual work cancellation is not supported.
+                Err(MobError::WorkNotFound(work_ref))
+            }
+            MobMachineCommand::CancelAllWork {
+                runtime_id,
+                fence_token,
+            } => {
+                let meerkat_id = MeerkatId::from(runtime_id.identity.as_str());
+                let entry = self
+                    .roster
+                    .read()
+                    .await
+                    .entry(&meerkat_id)
+                    .ok_or_else(|| MobError::MeerkatNotFound(meerkat_id.clone()))?;
+                if entry.fence_token != fence_token {
+                    return Err(MobError::StaleFenceToken {
+                        runtime_id,
+                        expected: entry.fence_token,
+                        actual: fence_token,
+                    });
+                }
+                self.send_actor_command(|reply_tx| MobCommand::ForceCancel {
+                    meerkat_id,
+                    reply_tx,
+                })
+                .await??;
+                Ok(MobMachineCommandResult::Unit)
+            }
+            MobMachineCommand::Stop => {
+                self.send_actor_command(|reply_tx| MobCommand::Stop { reply_tx })
+                    .await??;
+                Ok(MobMachineCommandResult::Unit)
+            }
+            MobMachineCommand::Resume => {
+                self.send_actor_command(|reply_tx| MobCommand::ResumeLifecycle { reply_tx })
+                    .await??;
+                Ok(MobMachineCommandResult::Unit)
+            }
+            MobMachineCommand::Complete => {
+                self.send_actor_command(|reply_tx| MobCommand::Complete { reply_tx })
+                    .await??;
+                Ok(MobMachineCommandResult::Unit)
+            }
+            MobMachineCommand::Reset => {
+                self.send_actor_command(|reply_tx| MobCommand::Reset { reply_tx })
+                    .await??;
+                Ok(MobMachineCommandResult::Unit)
+            }
+            MobMachineCommand::Destroy => {
+                self.send_actor_command(|reply_tx| MobCommand::Destroy { reply_tx })
+                    .await??;
+                Ok(MobMachineCommandResult::Unit)
+            }
+            MobMachineCommand::TaskCreate {
+                subject,
+                description,
+                blocked_by,
+            } => {
+                let task_id = self
+                    .send_actor_command(|reply_tx| MobCommand::TaskCreate {
+                        subject,
+                        description,
+                        blocked_by,
+                        reply_tx,
+                    })
+                    .await??;
+                Ok(MobMachineCommandResult::TaskId(task_id))
+            }
+            MobMachineCommand::TaskUpdate {
+                task_id,
+                status,
+                owner,
+            } => {
+                self.send_actor_command(|reply_tx| MobCommand::TaskUpdate {
+                    task_id,
+                    status,
+                    owner,
+                    reply_tx,
+                })
+                .await??;
+                Ok(MobMachineCommandResult::Unit)
+            }
+            MobMachineCommand::TaskList => {
+                let tasks = self
+                    .send_actor_command(|reply_tx| MobCommand::TaskList { reply_tx })
+                    .await?;
+                Ok(MobMachineCommandResult::TaskList(tasks))
+            }
+            MobMachineCommand::TaskGet { task_id } => {
+                let task = self
+                    .send_actor_command(|reply_tx| MobCommand::TaskGet { task_id, reply_tx })
+                    .await?;
+                Ok(MobMachineCommandResult::TaskGet(task))
+            }
+            MobMachineCommand::McpServerStates => {
+                let states = self
+                    .send_actor_command(|reply_tx| MobCommand::McpServerStates { reply_tx })
+                    .await?;
+                Ok(MobMachineCommandResult::McpServerStates(states))
+            }
+            MobMachineCommand::RosterSnapshot => {
+                let roster = self.roster.read().await.snapshot();
+                Ok(MobMachineCommandResult::RosterSnapshot(roster))
+            }
+            MobMachineCommand::ListMembers => {
+                let entries: Vec<_> = {
+                    let roster = self.roster.read().await;
+                    roster.list().cloned().collect()
+                };
+                let members = self.project_member_list(entries.iter()).await;
+                Ok(MobMachineCommandResult::ListMembers(members))
+            }
+            MobMachineCommand::ListMembersIncludingRetiring => {
+                let entries: Vec<_> = {
+                    let roster = self.roster.read().await;
+                    roster.list_all().cloned().collect()
+                };
+                let members = self.project_member_list(entries.iter()).await;
+                Ok(MobMachineCommandResult::ListMembersIncludingRetiring(
+                    members,
+                ))
+            }
+            MobMachineCommand::ListAllMembers => {
+                let members = self.roster.read().await.list_all().cloned().collect();
+                Ok(MobMachineCommandResult::ListAllMembers(members))
+            }
+            MobMachineCommand::MemberStatus { meerkat_id } => {
+                let snapshot = self.canonical_member_snapshot_material(&meerkat_id).await;
+                Ok(MobMachineCommandResult::MemberStatus(
+                    snapshot.to_snapshot(),
+                ))
+            }
+            MobMachineCommand::SubscribeAgentEvents { meerkat_id } => {
+                let stream = self
+                    .send_actor_command(|reply_tx| MobCommand::SubscribeAgentEvents {
+                        meerkat_id,
+                        reply_tx,
+                    })
+                    .await??;
+                Ok(MobMachineCommandResult::EventStream(stream))
+            }
+            MobMachineCommand::SubscribeAllAgentEvents => {
+                let streams = self
+                    .send_actor_command(|reply_tx| MobCommand::SubscribeAllAgentEvents { reply_tx })
+                    .await?;
+                Ok(MobMachineCommandResult::AllAgentEventStreams(streams))
+            }
+            MobMachineCommand::SubscribeMobEvents { config } => {
+                Ok(MobMachineCommandResult::MobEventRouter(
+                    super::event_router::spawn_event_router(self.clone(), config),
+                ))
+            }
+            MobMachineCommand::PollEvents {
+                after_cursor,
+                limit,
+            } => {
+                let events = if self.status() == MobState::Destroyed {
+                    self.events
+                        .poll(after_cursor, limit)
+                        .await
+                        .map_err(MobError::from)?
+                } else {
+                    self.send_actor_command(|reply_tx| MobCommand::PollEvents {
+                        after_cursor,
+                        limit,
+                        reply_tx,
+                    })
+                    .await??
+                };
+                Ok(MobMachineCommandResult::MobEvents(events))
+            }
+            MobMachineCommand::ReplayAllEvents => {
+                let events = if self.status() == MobState::Destroyed {
+                    self.events.replay_all().await.map_err(MobError::from)?
+                } else {
+                    self.send_actor_command(|reply_tx| MobCommand::ReplayAllEvents { reply_tx })
+                        .await??
+                };
+                Ok(MobMachineCommandResult::MobEvents(events))
+            }
+            MobMachineCommand::RecordOperatorActionProvenance {
+                tool_name,
+                authority_context,
+            } => {
+                self.send_actor_command(|reply_tx| MobCommand::RecordOperatorActionProvenance {
+                    tool_name,
+                    authority_context,
+                    reply_tx,
+                })
+                .await??;
+                Ok(MobMachineCommandResult::Unit)
+            }
+            MobMachineCommand::GetMember { meerkat_id } => {
+                let member = self.roster.read().await.entry(&meerkat_id);
+                Ok(MobMachineCommandResult::GetMember(member))
+            }
+            #[cfg(test)]
+            MobMachineCommand::FlowTrackerCounts => {
+                let counts = self
+                    .send_actor_command(|reply_tx| MobCommand::FlowTrackerCounts { reply_tx })
+                    .await?;
+                Ok(MobMachineCommandResult::FlowTrackerCounts(counts))
+            }
+            #[cfg(test)]
+            MobMachineCommand::OrchestratorSnapshot => {
+                let snapshot = self
+                    .send_actor_command(|reply_tx| MobCommand::OrchestratorSnapshot { reply_tx })
+                    .await?;
+                Ok(MobMachineCommandResult::OrchestratorSnapshot(snapshot))
+            }
+            MobMachineCommand::SetSpawnPolicy { policy } => {
+                self.send_actor_command(|reply_tx| MobCommand::SetSpawnPolicy { policy, reply_tx })
+                    .await?;
+                Ok(MobMachineCommandResult::Unit)
+            }
+            MobMachineCommand::Shutdown => {
+                self.send_actor_command(|reply_tx| MobCommand::Shutdown { reply_tx })
+                    .await??;
+                Ok(MobMachineCommandResult::Unit)
+            }
+            MobMachineCommand::ForceCancel { meerkat_id } => {
+                self.send_actor_command(|reply_tx| MobCommand::ForceCancel {
+                    meerkat_id,
+                    reply_tx,
+                })
+                .await??;
+                Ok(MobMachineCommandResult::Unit)
+            }
         }
     }
 
@@ -542,10 +1048,18 @@ impl MobHandle {
         after_cursor: u64,
         limit: usize,
     ) -> Result<Vec<crate::event::MobEvent>, MobError> {
-        self.events
-            .poll(after_cursor, limit)
-            .await
-            .map_err(MobError::from)
+        match self
+            .execute_machine_command(MobMachineCommand::PollEvents {
+                after_cursor,
+                limit,
+            })
+            .await?
+        {
+            MobMachineCommandResult::MobEvents(events) => Ok(events),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
     }
 
     /// Current mob lifecycle state (lock-free read).
@@ -565,23 +1079,33 @@ impl MobHandle {
 
     /// Snapshot of the current roster.
     pub async fn roster(&self) -> Roster {
-        self.roster.read().await.snapshot()
+        match self
+            .execute_machine_command(MobMachineCommand::RosterSnapshot)
+            .await
+        {
+            Ok(MobMachineCommandResult::RosterSnapshot(roster)) => roster,
+            Ok(_) => {
+                tracing::error!("unexpected command result variant");
+                Default::default()
+            }
+            Err(_) => Roster::new(),
+        }
     }
 
     fn derived_comms_name(&self, entry: &RosterEntry) -> String {
-        format!(
-            "{}/{}/{}",
-            self.definition.id, entry.profile, entry.meerkat_id
-        )
+        format!("{}/{}/{}", self.definition.id, entry.role, entry.meerkat_id)
     }
 
     async fn resolve_peer_connectivity(
         &self,
         entry: &RosterEntry,
-        session_id: &SessionId,
+        bridge_session_id: &SessionId,
         roster_snapshot: &Roster,
     ) -> Option<MobPeerConnectivitySnapshot> {
-        let comms = self.session_service.comms_runtime(session_id).await?;
+        let comms = self
+            .session_service
+            .comms_runtime(bridge_session_id)
+            .await?;
         let peers = comms.peers().await;
         let peers_by_id: HashMap<&str, &PeerDirectoryEntry> = peers
             .iter()
@@ -597,22 +1121,24 @@ impl MobHandle {
         let mut unreachable_peers = Vec::new();
 
         for wired_peer in &entry.wired_to {
-            let matched = if let Some(spec) = entry.external_peer_specs.get(wired_peer) {
+            let wired_peer_meerkat = MeerkatId::from(wired_peer.as_str());
+            let matched = if let Some(spec) = entry.external_peer_specs.get(&wired_peer_meerkat) {
                 peers_by_id
                     .get(spec.peer_id.as_str())
                     .copied()
                     .or_else(|| peers_by_name.get(spec.name.as_str()).copied())
             } else {
-                let local_entry = roster_snapshot.get(wired_peer);
-                let live_peer_id =
-                    match local_entry.and_then(|peer_entry| peer_entry.member_ref.session_id()) {
-                        Some(target_session_id) => self
-                            .session_service
-                            .comms_runtime(target_session_id)
-                            .await
-                            .and_then(|runtime| runtime.public_key()),
-                        None => None,
-                    };
+                let local_entry = roster_snapshot.get(&wired_peer_meerkat);
+                let live_peer_id = match local_entry
+                    .and_then(|peer_entry| peer_entry.member_ref.bridge_session_id())
+                {
+                    Some(target_session_id) => self
+                        .session_service
+                        .comms_runtime(target_session_id)
+                        .await
+                        .and_then(|runtime| runtime.public_key()),
+                    None => None,
+                };
                 live_peer_id
                     .as_deref()
                     .and_then(|peer_id| peers_by_id.get(peer_id).copied())
@@ -657,8 +1183,17 @@ impl MobHandle {
     /// For low-level structural roster visibility without runtime projection,
     /// use [`list_all_members`](Self::list_all_members).
     pub async fn list_members(&self) -> Vec<MobMemberListEntry> {
-        self.project_member_list(self.roster.read().await.list())
+        match self
+            .execute_machine_command(MobMachineCommand::ListMembers)
             .await
+        {
+            Ok(MobMachineCommandResult::ListMembers(entries)) => entries,
+            Ok(_) => {
+                tracing::error!("unexpected command result variant");
+                Default::default()
+            }
+            Err(_) => Vec::new(),
+        }
     }
 
     /// List all members including those in `Retiring` state, with canonical
@@ -668,8 +1203,17 @@ impl MobHandle {
     /// live peer-connectivity fanout. Use [`member_status`](Self::member_status)
     /// for deep per-member inspection including live comms reachability.
     pub async fn list_members_including_retiring(&self) -> Vec<MobMemberListEntry> {
-        self.project_member_list(self.roster.read().await.list_all())
+        match self
+            .execute_machine_command(MobMachineCommand::ListMembersIncludingRetiring)
             .await
+        {
+            Ok(MobMachineCommandResult::ListMembersIncludingRetiring(entries)) => entries,
+            Ok(_) => {
+                tracing::error!("unexpected command result variant");
+                Default::default()
+            }
+            Err(_) => Vec::new(),
+        }
     }
 
     async fn project_member_list<'a>(
@@ -683,39 +1227,29 @@ impl MobHandle {
                 .canonical_member_list_material(&entry.meerkat_id)
                 .await
                 .to_snapshot();
-            let snapshot = Some(snapshot);
-            let (status, error, is_final, current_session_id, kickoff) = match snapshot {
-                Some(snapshot) => (
-                    snapshot.status,
-                    snapshot.error,
-                    snapshot.is_final,
-                    snapshot.current_session_id,
-                    snapshot.kickoff,
-                ),
-                None => (
-                    MobMemberStatus::Unknown,
-                    None,
-                    true,
-                    entry.session_id().cloned(),
-                    None,
-                ),
-            };
-            projected.push(MobMemberListEntry {
-                meerkat_id: entry.meerkat_id,
-                profile: entry.profile,
-                member_ref: entry.member_ref,
-                runtime_mode: entry.runtime_mode,
-                peer_id: entry.peer_id,
-                state: entry.state,
-                wired_to: entry.wired_to,
-                external_peer_specs: entry.external_peer_specs,
-                labels: entry.labels,
-                status,
-                error,
-                is_final,
-                current_session_id,
-                kickoff,
-            });
+            let current_bridge_session_id = snapshot.current_bridge_session_id().cloned();
+            projected.push(
+                MobMemberListEntry {
+                    agent_identity: entry.agent_identity,
+                    agent_runtime_id: entry.agent_runtime_id,
+                    fence_token: entry.fence_token,
+                    role: entry.role,
+                    meerkat_id: entry.meerkat_id,
+                    runtime_mode: entry.runtime_mode,
+                    peer_id: entry.peer_id,
+                    state: entry.state,
+                    wired_to: entry.wired_to,
+                    external_peer_specs: entry.external_peer_specs,
+                    labels: entry.labels,
+                    status: snapshot.status,
+                    error: snapshot.error,
+                    is_final: snapshot.is_final,
+                    current_session_id: None,
+                    current_bridge_session_id: None,
+                    kickoff: snapshot.kickoff,
+                }
+                .with_current_bridge_session_id(current_bridge_session_id),
+            );
         }
         projected
     }
@@ -741,744 +1275,17 @@ impl MobHandle {
     /// `Retiring`. Use this for observability and membership inspection where
     /// in-flight retires should be visible.
     pub async fn list_all_members(&self) -> Vec<RosterEntry> {
-        self.roster.read().await.list_all().cloned().collect()
-    }
-
-    /// Get a specific member entry.
-    pub async fn get_member(&self, meerkat_id: &MeerkatId) -> Option<RosterEntry> {
-        self.roster.read().await.get(meerkat_id).cloned()
-    }
-
-    /// Acquire a capability-bearing handle for a specific active member.
-    pub async fn member(&self, meerkat_id: &MeerkatId) -> Result<MemberHandle, MobError> {
-        if let Some(diag) = self.restore_failure_for(meerkat_id).await {
-            return Err(Self::restore_failure_error(meerkat_id, diag));
-        }
-        let entry = self
-            .get_member(meerkat_id)
+        match self
+            .execute_machine_command(MobMachineCommand::ListAllMembers)
             .await
-            .ok_or_else(|| MobError::MeerkatNotFound(meerkat_id.clone()))?;
-        if entry.state != crate::roster::MemberState::Active {
-            return Err(MobError::MeerkatNotFound(meerkat_id.clone()));
-        }
-        Ok(MemberHandle {
-            mob: self.clone(),
-            meerkat_id: meerkat_id.clone(),
-        })
-    }
-
-    /// Access a read-only events view for polling/replay.
-    pub fn events(&self) -> MobEventsView {
-        MobEventsView {
-            inner: self.events.clone(),
-        }
-    }
-
-    /// Append a dispatcher-owned operator provenance projection.
-    ///
-    /// This is audit/projection data only. It must never become
-    /// authorization truth.
-    pub async fn record_operator_action_provenance(
-        &self,
-        tool_name: &str,
-        authority_context: &MobToolAuthorityContext,
-    ) -> Result<(), MobError> {
-        self.events
-            .append(NewMobEvent {
-                mob_id: self.definition.id.clone(),
-                timestamp: None,
-                kind: MobEventKind::OperatorActionRecorded {
-                    tool_name: tool_name.to_string(),
-                    principal_token: authority_context.principal_token().clone(),
-                    caller_provenance: authority_context.caller_provenance().cloned(),
-                    audit_invocation_id: authority_context
-                        .audit_invocation_id()
-                        .map(ToOwned::to_owned),
-                },
-            })
-            .await
-            .map(|_| ())
-            .map_err(MobError::from)
-    }
-
-    /// Subscribe to agent-level events for a specific meerkat.
-    ///
-    /// Looks up the meerkat's session ID from the roster, then subscribes
-    /// to the session-level event stream via [`MobSessionService`].
-    ///
-    /// Returns `MobError::MeerkatNotFound` if the meerkat is not in the
-    /// roster or has no session ID.
-    pub async fn subscribe_agent_events(
-        &self,
-        meerkat_id: &MeerkatId,
-    ) -> Result<EventStream, MobError> {
-        let session_id = {
-            let roster = self.roster.read().await;
-            roster
-                .session_id(meerkat_id)
-                .cloned()
-                .ok_or_else(|| MobError::MeerkatNotFound(meerkat_id.clone()))?
-        };
-        SessionService::subscribe_session_events(self.session_service.as_ref(), &session_id)
-            .await
-            .map_err(|e| {
-                MobError::Internal(format!(
-                    "failed to subscribe to agent events for '{meerkat_id}': {e}"
-                ))
-            })
-    }
-
-    /// Subscribe to agent events for all active members (point-in-time snapshot).
-    ///
-    /// Returns one stream per active member that has a session ID. Members
-    /// spawned after this call are not included — use [`subscribe_mob_events`]
-    /// for a continuously updated view.
-    pub async fn subscribe_all_agent_events(&self) -> Vec<(MeerkatId, EventStream)> {
-        let entries: Vec<_> = {
-            let roster = self.roster.read().await;
-            roster
-                .list()
-                .filter_map(|e| {
-                    e.member_ref
-                        .session_id()
-                        .map(|sid| (e.meerkat_id.clone(), sid.clone()))
-                })
-                .collect()
-        };
-        let mut streams = Vec::with_capacity(entries.len());
-        for (meerkat_id, session_id) in entries {
-            if let Ok(stream) =
-                SessionService::subscribe_session_events(self.session_service.as_ref(), &session_id)
-                    .await
-            {
-                streams.push((meerkat_id, stream));
+        {
+            Ok(MobMachineCommandResult::ListAllMembers(entries)) => entries,
+            Ok(_) => {
+                tracing::error!("unexpected command result variant");
+                Default::default()
             }
+            Err(_) => Vec::new(),
         }
-        streams
-    }
-
-    /// Subscribe to a continuously-updated, mob-level event bus.
-    ///
-    /// Spawns an independent task that merges per-member session streams,
-    /// tags each event with [`AttributedEvent`], and tracks roster changes
-    /// (spawns/retires) automatically. Drop the returned handle to stop
-    /// the router.
-    pub fn subscribe_mob_events(&self) -> super::event_router::MobEventRouterHandle {
-        self.subscribe_mob_events_with_config(super::event_router::MobEventRouterConfig::default())
-    }
-
-    /// Like [`subscribe_mob_events`](Self::subscribe_mob_events) with explicit config.
-    pub fn subscribe_mob_events_with_config(
-        &self,
-        config: super::event_router::MobEventRouterConfig,
-    ) -> super::event_router::MobEventRouterHandle {
-        super::event_router::spawn_event_router(
-            self.session_service.clone(),
-            self.events.clone(),
-            self.roster.clone(),
-            config,
-        )
-    }
-
-    /// Snapshot of MCP server lifecycle state tracked by this runtime.
-    pub async fn mcp_server_states(&self) -> BTreeMap<String, bool> {
-        self.mcp_servers
-            .lock()
-            .await
-            .iter()
-            .map(|(name, entry)| (name.clone(), entry.running))
-            .collect()
-    }
-
-    /// Start a flow run and return its run ID.
-    pub async fn run_flow(
-        &self,
-        flow_id: FlowId,
-        params: serde_json::Value,
-    ) -> Result<RunId, MobError> {
-        self.run_flow_with_stream(flow_id, params, None).await
-    }
-
-    /// Start a flow run with an optional scoped stream sink.
-    pub async fn run_flow_with_stream(
-        &self,
-        flow_id: FlowId,
-        params: serde_json::Value,
-        scoped_event_tx: Option<mpsc::Sender<meerkat_core::ScopedAgentEvent>>,
-    ) -> Result<RunId, MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::RunFlow {
-                flow_id,
-                activation_params: params,
-                scoped_event_tx,
-                reply_tx,
-            })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
-    }
-
-    /// Request cancellation of an in-flight flow run.
-    pub async fn cancel_flow(&self, run_id: RunId) -> Result<(), MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::CancelFlow { run_id, reply_tx })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
-    }
-
-    /// Fetch a flow run snapshot from the run store.
-    pub async fn flow_status(&self, run_id: RunId) -> Result<Option<MobRun>, MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::FlowStatus { run_id, reply_tx })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
-    }
-
-    /// List all configured flow IDs in this mob definition.
-    pub fn list_flows(&self) -> Vec<FlowId> {
-        self.definition.flows.keys().cloned().collect()
-    }
-
-    /// Spawn a new member from a profile and return its member reference.
-    pub async fn spawn(
-        &self,
-        profile_name: ProfileName,
-        meerkat_id: MeerkatId,
-        initial_message: Option<ContentInput>,
-    ) -> Result<MemberRef, MobError> {
-        self.spawn_with_options(profile_name, meerkat_id, initial_message, None, None)
-            .await
-    }
-
-    /// Spawn a new member with an explicit runtime binding.
-    pub async fn spawn_with_binding(
-        &self,
-        profile_name: ProfileName,
-        meerkat_id: MeerkatId,
-        initial_message: Option<ContentInput>,
-        binding: crate::RuntimeBinding,
-    ) -> Result<MemberRef, MobError> {
-        let mut spec = SpawnMemberSpec::new(profile_name, meerkat_id);
-        spec.initial_message = initial_message;
-        spec.binding = Some(binding);
-        self.spawn_spec(spec).await
-    }
-
-    /// Spawn a new member from a profile with explicit backend override.
-    pub async fn spawn_with_backend(
-        &self,
-        profile_name: ProfileName,
-        meerkat_id: MeerkatId,
-        initial_message: Option<ContentInput>,
-        backend: Option<MobBackendKind>,
-    ) -> Result<MemberRef, MobError> {
-        self.spawn_with_options(profile_name, meerkat_id, initial_message, None, backend)
-            .await
-    }
-
-    /// Spawn a new member from a profile with explicit runtime mode/backend overrides.
-    pub async fn spawn_with_options(
-        &self,
-        profile_name: ProfileName,
-        meerkat_id: MeerkatId,
-        initial_message: Option<ContentInput>,
-        runtime_mode: Option<crate::MobRuntimeMode>,
-        backend: Option<MobBackendKind>,
-    ) -> Result<MemberRef, MobError> {
-        let mut spec = SpawnMemberSpec::new(profile_name, meerkat_id);
-        spec.initial_message = initial_message;
-        spec.runtime_mode = runtime_mode;
-        spec.backend = backend;
-        self.spawn_spec(spec).await
-    }
-
-    /// Attach an existing session by reusing the mob spawn control-plane path.
-    pub async fn attach_existing_session(
-        &self,
-        profile_name: ProfileName,
-        meerkat_id: MeerkatId,
-        session_id: meerkat_core::types::SessionId,
-        runtime_mode: Option<crate::MobRuntimeMode>,
-        backend: Option<MobBackendKind>,
-    ) -> Result<MemberRef, MobError> {
-        let mut spec = SpawnMemberSpec::new(profile_name, meerkat_id);
-        spec.launch_mode = crate::launch::MemberLaunchMode::Resume { session_id };
-        spec.runtime_mode = runtime_mode;
-        spec.backend = backend;
-        self.spawn_spec(spec).await
-    }
-
-    /// Attach an existing session as the mob orchestrator.
-    pub async fn attach_existing_session_as_orchestrator(
-        &self,
-        profile_name: ProfileName,
-        meerkat_id: MeerkatId,
-        session_id: meerkat_core::types::SessionId,
-    ) -> Result<MemberRef, MobError> {
-        self.attach_existing_session(profile_name, meerkat_id, session_id, None, None)
-            .await
-    }
-
-    /// Attach an existing session as a regular mob member.
-    pub async fn attach_existing_session_as_member(
-        &self,
-        profile_name: ProfileName,
-        meerkat_id: MeerkatId,
-        session_id: meerkat_core::types::SessionId,
-    ) -> Result<MemberRef, MobError> {
-        self.attach_existing_session(profile_name, meerkat_id, session_id, None, None)
-            .await
-    }
-
-    /// Spawn a member from a fully-specified [`SpawnMemberSpec`].
-    pub async fn spawn_spec(&self, spec: SpawnMemberSpec) -> Result<MemberRef, MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::Spawn {
-                spec: Box::new(spec),
-                owner_session_id: None,
-                ops_registry: None,
-                reply_tx,
-            })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
-            .map(|receipt| receipt.member_ref)
-    }
-
-    pub(super) async fn spawn_spec_receipt_with_owner_context(
-        &self,
-        spec: SpawnMemberSpec,
-        owner_context: CanonicalOpsOwnerContext,
-    ) -> Result<MemberSpawnReceipt, MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::Spawn {
-                spec: Box::new(spec),
-                owner_session_id: Some(owner_context.owner_session_id),
-                ops_registry: Some(owner_context.ops_registry),
-                reply_tx,
-            })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
-    }
-
-    /// Spawn multiple members in parallel.
-    ///
-    /// Results preserve input order.
-    pub async fn spawn_many(
-        &self,
-        specs: Vec<SpawnMemberSpec>,
-    ) -> Vec<Result<MemberRef, MobError>> {
-        futures::future::join_all(specs.into_iter().map(|spec| self.spawn_spec(spec))).await
-    }
-
-    pub(super) async fn spawn_many_receipts_with_owner_context(
-        &self,
-        specs: Vec<SpawnMemberSpec>,
-        owner_context: CanonicalOpsOwnerContext,
-    ) -> Vec<Result<MemberSpawnReceipt, MobError>> {
-        futures::future::join_all(
-            specs.into_iter().map(|spec| {
-                self.spawn_spec_receipt_with_owner_context(spec, owner_context.clone())
-            }),
-        )
-        .await
-    }
-
-    /// Retire a member, archiving its session and removing trust.
-    pub async fn retire(&self, meerkat_id: MeerkatId) -> Result<(), MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::Retire {
-                meerkat_id,
-                reply_tx,
-            })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
-    }
-
-    /// Retire a member and respawn with the same profile, labels, wiring, and mode.
-    ///
-    /// This is a helper convenience over primitive mob behavior, not a
-    /// machine-owned primitive. Returns a receipt on full success, or a
-    /// structured error on failure. No rollback is attempted after retire.
-    pub async fn respawn(
-        &self,
-        meerkat_id: MeerkatId,
-        initial_message: Option<ContentInput>,
-    ) -> Result<MemberRespawnReceipt, MobRespawnError> {
-        let old_session_id_before = self
-            .canonical_member_list_material(&meerkat_id)
-            .await
-            .current_session_id;
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::Respawn {
-                meerkat_id,
-                initial_message,
-                reply_tx,
-            })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        let reply = reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?;
-        let mut receipt = match reply {
-            Ok(receipt) => receipt,
-            Err(MobRespawnError::TopologyRestoreFailed {
-                mut receipt,
-                failed_peer_ids,
-            }) => {
-                if receipt.old_session_id.is_none() {
-                    receipt.old_session_id = old_session_id_before;
-                }
-                let post_material = self
-                    .canonical_member_list_material(&receipt.member_id)
-                    .await;
-                if MobMemberTerminalClassifier::has_canonical_member(&post_material) {
-                    receipt.new_session_id = post_material.current_session_id;
-                }
-                return Err(MobRespawnError::TopologyRestoreFailed {
-                    receipt,
-                    failed_peer_ids,
-                });
-            }
-            Err(err) => return Err(err),
-        };
-        if receipt.old_session_id.is_none() {
-            receipt.old_session_id = old_session_id_before;
-        }
-        let post_material = self
-            .canonical_member_list_material(&receipt.member_id)
-            .await;
-        if MobMemberTerminalClassifier::has_canonical_member(&post_material) {
-            receipt.new_session_id = post_material.current_session_id;
-        }
-        Ok(receipt)
-    }
-
-    /// Retire all roster members concurrently in a single actor command.
-    pub async fn retire_all(&self) -> Result<(), MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::RetireAll { reply_tx })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
-    }
-
-    /// Wire a local member to either another local member or an external peer.
-    pub async fn wire<T>(&self, local: MeerkatId, target: T) -> Result<(), MobError>
-    where
-        T: Into<PeerTarget>,
-    {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::Wire {
-                local,
-                target: target.into(),
-                reply_tx,
-            })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
-    }
-
-    /// Unwire a local member from either another local member or an external peer.
-    pub async fn unwire<T>(&self, local: MeerkatId, target: T) -> Result<(), MobError>
-    where
-        T: Into<PeerTarget>,
-    {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::Unwire {
-                local,
-                target: target.into(),
-                reply_tx,
-            })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
-    }
-
-    /// Compatibility wrapper for internal-turn submission.
-    ///
-    /// Prefer [`MobHandle::member`] plus [`MemberHandle::internal_turn`] for
-    /// the target 0.5 API shape.
-    pub async fn internal_turn(
-        &self,
-        meerkat_id: MeerkatId,
-        message: impl Into<meerkat_core::types::ContentInput>,
-    ) -> Result<MemberDeliveryReceipt, MobError> {
-        let session_id = self
-            .internal_turn_for_member(meerkat_id.clone(), message.into())
-            .await?;
-        Ok(MemberDeliveryReceipt {
-            member_id: meerkat_id,
-            session_id,
-            handling_mode: HandlingMode::Queue,
-        })
-    }
-
-    pub(super) async fn external_turn_for_member(
-        &self,
-        meerkat_id: MeerkatId,
-        message: meerkat_core::types::ContentInput,
-        handling_mode: HandlingMode,
-        render_metadata: Option<RenderMetadata>,
-    ) -> Result<meerkat_core::types::SessionId, MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::ExternalTurn {
-                meerkat_id,
-                content: message,
-                handling_mode,
-                render_metadata,
-                reply_tx,
-            })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
-    }
-
-    pub(super) async fn internal_turn_for_member(
-        &self,
-        meerkat_id: MeerkatId,
-        message: meerkat_core::types::ContentInput,
-    ) -> Result<SessionId, MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::InternalTurn {
-                meerkat_id,
-                content: message,
-                reply_tx,
-            })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
-    }
-
-    /// Transition Running -> Stopped. Mutation commands are rejected while stopped.
-    pub async fn stop(&self) -> Result<(), MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::Stop { reply_tx })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
-    }
-
-    /// Transition Stopped -> Running.
-    pub async fn resume(&self) -> Result<(), MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::ResumeLifecycle { reply_tx })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
-    }
-
-    /// Archive all members, emit MobCompleted, and transition to Completed.
-    pub async fn complete(&self) -> Result<(), MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::Complete { reply_tx })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
-    }
-
-    /// Wipe all runtime state and transition back to `Running`.
-    ///
-    /// Like `destroy()` but keeps the actor alive and transitions to `Running`
-    /// instead of `Destroyed`. The handle remains usable after reset.
-    pub async fn reset(&self) -> Result<(), MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::Reset { reply_tx })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
-    }
-
-    /// Retire active members, clear persisted mob storage, and terminate the actor.
-    pub async fn destroy(&self) -> Result<(), MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::Destroy { reply_tx })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
-    }
-
-    /// Create a task in the shared mob task board.
-    pub async fn task_create(
-        &self,
-        subject: String,
-        description: String,
-        blocked_by: Vec<TaskId>,
-    ) -> Result<TaskId, MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::TaskCreate {
-                subject,
-                description,
-                blocked_by,
-                reply_tx,
-            })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
-    }
-
-    /// Update task status/owner in the shared mob task board.
-    pub async fn task_update(
-        &self,
-        task_id: TaskId,
-        status: TaskStatus,
-        owner: Option<MeerkatId>,
-    ) -> Result<(), MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::TaskUpdate {
-                task_id,
-                status,
-                owner,
-                reply_tx,
-            })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
-    }
-
-    /// List tasks from the in-memory task board projection.
-    pub async fn task_list(&self) -> Result<Vec<MobTask>, MobError> {
-        Ok(self.task_board.read().await.list().cloned().collect())
-    }
-
-    /// Get a task by ID from the in-memory task board projection.
-    pub async fn task_get(&self, task_id: &TaskId) -> Result<Option<MobTask>, MobError> {
-        Ok(self.task_board.read().await.get(task_id).cloned())
-    }
-
-    #[cfg(test)]
-    pub async fn debug_flow_tracker_counts(&self) -> Result<(usize, usize), MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::FlowTrackerCounts { reply_tx })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))
-    }
-
-    #[cfg(test)]
-    pub async fn debug_orchestrator_snapshot(
-        &self,
-    ) -> Result<super::MobOrchestratorSnapshot, MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::OrchestratorSnapshot { reply_tx })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))
-    }
-
-    /// Set or clear the spawn policy for automatic member provisioning.
-    ///
-    /// When set, external turns targeting an unknown meerkat ID will
-    /// consult the policy before returning `MeerkatNotFound`.
-    pub async fn set_spawn_policy(
-        &self,
-        policy: Option<Arc<dyn super::spawn_policy::SpawnPolicy>>,
-    ) -> Result<(), MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::SetSpawnPolicy { policy, reply_tx })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?;
-        Ok(())
-    }
-
-    /// Shut down the actor. After this, no more commands are accepted.
-    pub async fn shutdown(&self) -> Result<(), MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::Shutdown { reply_tx })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))??;
-        Ok(())
-    }
-
-    /// Force-cancel a member's in-flight turn via session interrupt.
-    ///
-    /// Unlike [`retire`](Self::retire), this does not archive the session or
-    /// remove the member from the roster — it only cancels the current turn.
-    pub async fn force_cancel_member(&self, meerkat_id: MeerkatId) -> Result<(), MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::ForceCancel {
-                meerkat_id,
-                reply_tx,
-            })
-            .await
-            .map_err(|_| MobError::Internal("actor task dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))?
     }
 
     async fn canonical_member_list_material(
@@ -1488,7 +1295,7 @@ impl MobHandle {
         self.canonical_member_material(
             meerkat_id,
             PeerConnectivityProjection::Omit,
-            SessionObservationProjection::LiveOnly,
+            SessionObservationProjection::Omit,
         )
         .await
     }
@@ -1511,16 +1318,14 @@ impl MobHandle {
         connectivity: PeerConnectivityProjection,
         observation: SessionObservationProjection,
     ) -> CanonicalMemberSnapshotMaterial {
-        // Canonical helper-surface classification is derived only from roster
-        // membership/state plus session-service activity, never side tables.
-        let (roster_snapshot, roster_entry, roster_state, current_session_id) = {
+        let (roster_snapshot, roster_entry, roster_state, current_bridge_session_id) = {
             let roster = self.roster.read().await;
             match roster.get(meerkat_id) {
                 Some(entry) => (
                     roster.snapshot(),
                     Some(entry.clone()),
                     Some(entry.state),
-                    entry.member_ref.session_id().cloned(),
+                    entry.member_ref.bridge_session_id().cloned(),
                 ),
                 None => (roster.snapshot(), None, None, None),
             }
@@ -1541,7 +1346,17 @@ impl MobHandle {
                 restore_failure: Some(diag.reason),
                 output_preview: None,
                 tokens_used: 0,
-                current_session_id: Some(diag.session_id),
+                agent_runtime_id: roster_entry
+                    .as_ref()
+                    .map(|e| e.agent_runtime_id.clone())
+                    .unwrap_or_else(|| {
+                        AgentRuntimeId::initial(AgentIdentity::from(meerkat_id.as_str()))
+                    }),
+                fence_token: roster_entry
+                    .as_ref()
+                    .map(|e| e.fence_token)
+                    .unwrap_or(FenceToken::new(0)),
+                current_bridge_session_id: Some(diag.bridge_session_id),
                 peer_connectivity: None,
                 kickoff: roster_entry
                     .as_ref()
@@ -1549,7 +1364,7 @@ impl MobHandle {
             });
         }
 
-        match (roster_state, current_session_id) {
+        match (roster_state, current_bridge_session_id) {
             (None, _) => MobMemberLifecycleAuthority::materialize(MobMemberLifecycleInput {
                 member_present: false,
                 roster_state: None,
@@ -1557,7 +1372,9 @@ impl MobHandle {
                 restore_failure: None,
                 output_preview: None,
                 tokens_used: 0,
-                current_session_id: None,
+                agent_runtime_id: AgentRuntimeId::initial(AgentIdentity::from(meerkat_id.as_str())),
+                fence_token: FenceToken::new(0),
+                current_bridge_session_id: None,
                 peer_connectivity: None,
                 kickoff: None,
             }),
@@ -1569,38 +1386,30 @@ impl MobHandle {
                     restore_failure: None,
                     output_preview: None,
                     tokens_used: 0,
-                    current_session_id: None,
+                    agent_runtime_id: roster_entry
+                        .as_ref()
+                        .map(|e| e.agent_runtime_id.clone())
+                        .unwrap_or_else(|| {
+                            AgentRuntimeId::initial(AgentIdentity::from(meerkat_id.as_str()))
+                        }),
+                    fence_token: roster_entry
+                        .as_ref()
+                        .map(|e| e.fence_token)
+                        .unwrap_or(FenceToken::new(0)),
+                    current_bridge_session_id: None,
                     peer_connectivity: None,
                     kickoff: roster_entry
                         .as_ref()
                         .and_then(|entry| entry.kickoff.clone()),
                 })
             }
-            (Some(roster_state), Some(session_id)) => {
+            (Some(roster_state), Some(bridge_session_id)) => {
                 let (output_preview, tokens_used, observation) = match observation {
-                    SessionObservationProjection::LiveOnly => {
-                        match self.session_service.has_live_session(&session_id).await {
-                            Ok(false) => (None, 0, CanonicalSessionObservation::Missing),
-                            Ok(true) => match self.session_service.read(&session_id).await {
-                                Ok(view) => (
-                                    view.state.last_assistant_text.clone(),
-                                    view.billing.total_tokens,
-                                    if view.state.is_active {
-                                        CanonicalSessionObservation::Active
-                                    } else {
-                                        CanonicalSessionObservation::Inactive
-                                    },
-                                ),
-                                Err(SessionError::NotFound { .. }) => {
-                                    (None, 0, CanonicalSessionObservation::Unknown)
-                                }
-                                Err(_) => (None, 0, CanonicalSessionObservation::Unknown),
-                            },
-                            Err(_) => (None, 0, CanonicalSessionObservation::Unknown),
-                        }
+                    SessionObservationProjection::Omit => {
+                        (None, 0, CanonicalSessionObservation::Unknown)
                     }
                     SessionObservationProjection::Full => {
-                        match self.session_service.read(&session_id).await {
+                        match self.session_service.read(&bridge_session_id).await {
                             Ok(view) => (
                                 view.state.last_assistant_text.clone(),
                                 view.billing.total_tokens,
@@ -1620,8 +1429,12 @@ impl MobHandle {
                 let peer_connectivity = if connectivity == PeerConnectivityProjection::Include {
                     match roster_entry.as_ref() {
                         Some(entry) => {
-                            self.resolve_peer_connectivity(entry, &session_id, &roster_snapshot)
-                                .await
+                            self.resolve_peer_connectivity(
+                                entry,
+                                &bridge_session_id,
+                                &roster_snapshot,
+                            )
+                            .await
                         }
                         None => None,
                     }
@@ -1635,7 +1448,17 @@ impl MobHandle {
                     restore_failure: None,
                     output_preview,
                     tokens_used,
-                    current_session_id: Some(session_id),
+                    agent_runtime_id: roster_entry
+                        .as_ref()
+                        .map(|e| e.agent_runtime_id.clone())
+                        .unwrap_or_else(|| {
+                            AgentRuntimeId::initial(AgentIdentity::from(meerkat_id.as_str()))
+                        }),
+                    fence_token: roster_entry
+                        .as_ref()
+                        .map(|e| e.fence_token)
+                        .unwrap_or(FenceToken::new(0)),
+                    current_bridge_session_id: Some(bridge_session_id),
                     peer_connectivity,
                     kickoff: roster_entry.and_then(|entry| entry.kickoff),
                 })
@@ -1643,91 +1466,923 @@ impl MobHandle {
         }
     }
 
-    async fn snapshot_kickoff_waiters(
-        &self,
-        meerkat_ids: Vec<MeerkatId>,
-    ) -> Result<Vec<(MeerkatId, tokio::sync::watch::Receiver<bool>)>, MobError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(MobCommand::KickoffBarrierSnapshot {
-                meerkat_ids,
-                reply_tx,
-            })
+    /// Get a specific member entry by identity.
+    pub async fn get_member(&self, identity: &AgentIdentity) -> Option<RosterEntry> {
+        let meerkat_id = MeerkatId::from(identity.as_str());
+        match self
+            .execute_machine_command(MobMachineCommand::GetMember { meerkat_id })
             .await
-            .map_err(|_| MobError::Internal("mob actor dropped".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| MobError::Internal("actor reply dropped".into()))
+        {
+            Ok(MobMachineCommandResult::GetMember(entry)) => entry,
+            Ok(_) => {
+                tracing::error!("unexpected command result variant");
+                Default::default()
+            }
+            Err(_) => None,
+        }
     }
 
-    async fn wait_for_kickoff_receivers(
+    /// Get a specific member entry by legacy MeerkatId (bridge helper).
+    pub(crate) async fn get_member_by_meerkat_id(
+        &self,
+        meerkat_id: &MeerkatId,
+    ) -> Option<RosterEntry> {
+        self.get_member(&AgentIdentity::from(meerkat_id.as_str()))
+            .await
+    }
+
+    /// Resolve the backing bridge session ID for a member by identity.
+    ///
+    /// This is an internal routing helper for surfaces that need to call
+    /// `SessionService` methods on a member's backing session. Returns `None`
+    /// if the member is not found or has no bridge session binding.
+    #[doc(hidden)]
+    pub async fn resolve_bridge_session_id(&self, identity: &AgentIdentity) -> Option<SessionId> {
+        self.get_member(identity)
+            .await
+            .and_then(|entry| entry.member_ref.bridge_session_id().cloned())
+    }
+
+    /// Acquire a capability-bearing handle for a specific active member.
+    pub async fn member(&self, identity: &AgentIdentity) -> Result<MemberHandle, MobError> {
+        let meerkat_id = MeerkatId::from(identity.as_str());
+        if let Some(diag) = self.restore_failure_for(&meerkat_id).await {
+            return Err(Self::restore_failure_error(&meerkat_id, diag));
+        }
+        let entry = self
+            .get_member(identity)
+            .await
+            .ok_or_else(|| MobError::MeerkatNotFound(meerkat_id.clone()))?;
+        if entry.state != crate::roster::MemberState::Active {
+            return Err(MobError::MeerkatNotFound(meerkat_id.clone()));
+        }
+        Ok(MemberHandle {
+            mob: self.clone(),
+            meerkat_id,
+        })
+    }
+
+    /// Access a read-only events view for polling/replay.
+    pub fn events(&self) -> MobEventsView {
+        MobEventsView {
+            handle: self.clone(),
+        }
+    }
+
+    /// Append a dispatcher-owned operator provenance projection.
+    ///
+    /// This is audit/projection data only. It must never become
+    /// authorization truth.
+    pub async fn record_operator_action_provenance(
+        &self,
+        tool_name: &str,
+        authority_context: &MobToolAuthorityContext,
+    ) -> Result<(), MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::RecordOperatorActionProvenance {
+                tool_name: tool_name.to_string(),
+                authority_context: authority_context.clone(),
+            })
+            .await?
+        {
+            MobMachineCommandResult::Unit => Ok(()),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Subscribe to agent-level events for a specific member.
+    ///
+    /// Looks up the member's backing bridge session from the roster, then
+    /// subscribes to the session-level event stream via [`MobSessionService`].
+    ///
+    /// Returns `MobError::MeerkatNotFound` if the member is not in the
+    /// roster or has no backing bridge session.
+    pub async fn subscribe_agent_events(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<EventStream, MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::SubscribeAgentEvents {
+                meerkat_id: MeerkatId::from(identity.as_str()),
+            })
+            .await?
+        {
+            MobMachineCommandResult::EventStream(stream) => Ok(stream),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Subscribe to agent events for all active members (point-in-time snapshot).
+    ///
+    /// Returns one stream per active member that has a live bridge binding. Members
+    /// spawned after this call are not included — use [`subscribe_mob_events`]
+    /// for a continuously updated view.
+    pub async fn subscribe_all_agent_events(&self) -> Vec<(AgentIdentity, EventStream)> {
+        match self
+            .execute_machine_command(MobMachineCommand::SubscribeAllAgentEvents)
+            .await
+        {
+            Ok(MobMachineCommandResult::AllAgentEventStreams(streams)) => streams
+                .into_iter()
+                .map(|(mid, stream)| (AgentIdentity::from(mid.as_str()), stream))
+                .collect(),
+            Ok(_) => {
+                tracing::error!("unexpected command result variant");
+                Default::default()
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Subscribe to a continuously-updated, mob-level event bus.
+    ///
+    /// Spawns an independent task that merges per-member session streams,
+    /// tags each event with [`AttributedEvent`], and tracks roster changes
+    /// (spawns/retires) automatically. Drop the returned handle to stop
+    /// the router.
+    pub async fn subscribe_mob_events(&self) -> super::event_router::MobEventRouterHandle {
+        self.subscribe_mob_events_with_config(super::event_router::MobEventRouterConfig::default())
+            .await
+    }
+
+    /// Like [`subscribe_mob_events`](Self::subscribe_mob_events) with explicit config.
+    pub async fn subscribe_mob_events_with_config(
+        &self,
+        config: super::event_router::MobEventRouterConfig,
+    ) -> super::event_router::MobEventRouterHandle {
+        match self
+            .execute_machine_command(MobMachineCommand::SubscribeMobEvents { config })
+            .await
+        {
+            Ok(MobMachineCommandResult::MobEventRouter(handle)) => handle,
+            Ok(_) => {
+                tracing::error!("unexpected command result variant for subscribe_mob_events");
+                super::event_router::spawn_event_router(self.clone(), config)
+            }
+            Err(_) => super::event_router::spawn_event_router(self.clone(), config),
+        }
+    }
+
+    /// Snapshot of MCP server lifecycle state tracked by this runtime.
+    pub async fn mcp_server_states(&self) -> BTreeMap<String, bool> {
+        match self
+            .execute_machine_command(MobMachineCommand::McpServerStates)
+            .await
+        {
+            Ok(MobMachineCommandResult::McpServerStates(states)) => states,
+            Ok(_) => {
+                tracing::error!("unexpected command result variant");
+                Default::default()
+            }
+            Err(_) => BTreeMap::new(),
+        }
+    }
+
+    /// Start a flow run and return its run ID.
+    pub async fn run_flow(
+        &self,
+        flow_id: FlowId,
+        params: serde_json::Value,
+    ) -> Result<RunId, MobError> {
+        self.run_flow_with_stream(flow_id, params, None).await
+    }
+
+    /// Start a flow run with an optional scoped stream sink.
+    pub async fn run_flow_with_stream(
+        &self,
+        flow_id: FlowId,
+        params: serde_json::Value,
+        scoped_event_tx: Option<mpsc::Sender<meerkat_core::ScopedAgentEvent>>,
+    ) -> Result<RunId, MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::RunFlow {
+                flow_id,
+                activation_params: params,
+                scoped_event_tx,
+            })
+            .await?
+        {
+            MobMachineCommandResult::RunId(run_id) => Ok(run_id),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Request cancellation of an in-flight flow run.
+    pub async fn cancel_flow(&self, run_id: RunId) -> Result<(), MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::CancelFlow { run_id })
+            .await?
+        {
+            MobMachineCommandResult::Unit => Ok(()),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Fetch a flow run snapshot from the run store.
+    pub async fn flow_status(&self, run_id: RunId) -> Result<Option<MobRun>, MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::FlowStatus { run_id })
+            .await?
+        {
+            MobMachineCommandResult::FlowStatus(status) => Ok(status),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// List all configured flow IDs in this mob definition.
+    pub fn list_flows(&self) -> Vec<FlowId> {
+        self.definition.flows.keys().cloned().collect()
+    }
+
+    /// Spawn a new member from a profile and return its member reference.
+    #[cfg(test)]
+    pub(crate) async fn spawn(
+        &self,
+        profile_name: ProfileName,
+        meerkat_id: MeerkatId,
+        initial_message: Option<ContentInput>,
+    ) -> Result<MemberRef, MobError> {
+        self.spawn_with_options(profile_name, meerkat_id, initial_message, None, None)
+            .await
+    }
+
+    /// Spawn a new member with an explicit runtime binding.
+    #[cfg(test)]
+    pub(crate) async fn spawn_with_binding(
+        &self,
+        profile_name: ProfileName,
+        meerkat_id: MeerkatId,
+        initial_message: Option<ContentInput>,
+        binding: crate::RuntimeBinding,
+    ) -> Result<MemberRef, MobError> {
+        let mut spec = SpawnMemberSpec::new(profile_name, meerkat_id);
+        spec.initial_message = initial_message;
+        spec.binding = Some(binding);
+        self.spawn_spec_internal(spec).await
+    }
+
+    /// Spawn a new member from a profile with explicit backend override.
+    #[cfg(test)]
+    pub(crate) async fn spawn_with_backend(
+        &self,
+        profile_name: ProfileName,
+        meerkat_id: MeerkatId,
+        initial_message: Option<ContentInput>,
+        backend: Option<MobBackendKind>,
+    ) -> Result<MemberRef, MobError> {
+        self.spawn_with_options(profile_name, meerkat_id, initial_message, None, backend)
+            .await
+    }
+
+    /// Spawn a new member from a profile with explicit runtime mode/backend overrides.
+    #[cfg(test)]
+    pub(crate) async fn spawn_with_options(
+        &self,
+        profile_name: ProfileName,
+        meerkat_id: MeerkatId,
+        initial_message: Option<ContentInput>,
+        runtime_mode: Option<crate::MobRuntimeMode>,
+        backend: Option<MobBackendKind>,
+    ) -> Result<MemberRef, MobError> {
+        let mut spec = SpawnMemberSpec::new(profile_name, meerkat_id);
+        spec.initial_message = initial_message;
+        spec.runtime_mode = runtime_mode;
+        spec.backend = backend;
+        self.spawn_spec_internal(spec).await
+    }
+
+    /// Attach an existing session by reusing the mob spawn control-plane path.
+    #[cfg(test)]
+    pub(crate) async fn attach_existing_session(
+        &self,
+        profile_name: ProfileName,
+        meerkat_id: MeerkatId,
+        session_id: meerkat_core::types::SessionId,
+        runtime_mode: Option<crate::MobRuntimeMode>,
+        backend: Option<MobBackendKind>,
+    ) -> Result<MemberRef, MobError> {
+        let mut spec = SpawnMemberSpec::new(profile_name, meerkat_id);
+        spec.launch_mode = crate::launch::MemberLaunchMode::Resume {
+            bridge_session_id: session_id,
+        };
+        spec.runtime_mode = runtime_mode;
+        spec.backend = backend;
+        self.spawn_spec_internal(spec).await
+    }
+
+    /// Attach an existing session as a regular mob member.
+    #[cfg(test)]
+    pub(crate) async fn attach_existing_session_as_member(
+        &self,
+        profile_name: ProfileName,
+        meerkat_id: MeerkatId,
+        session_id: meerkat_core::types::SessionId,
+    ) -> Result<MemberRef, MobError> {
+        self.attach_existing_session(profile_name, meerkat_id, session_id, None, None)
+            .await
+    }
+
+    /// Spawn a member from a fully-specified [`SpawnMemberSpec`].
+    pub async fn spawn_spec(&self, spec: SpawnMemberSpec) -> Result<SpawnResult, MobError> {
+        let identity = spec.identity.clone();
+        self.spawn_spec_internal(spec).await?;
+        // The roster is updated synchronously during spawn finalization,
+        // so the entry is guaranteed to be present by the time the reply
+        // arrives.
+        let entry = self.get_member(&identity).await.ok_or_else(|| {
+            MobError::Internal(format!(
+                "spawn succeeded but roster entry missing for '{identity}'"
+            ))
+        })?;
+        Ok(SpawnResult {
+            agent_identity: entry.agent_identity,
+            agent_runtime_id: entry.agent_runtime_id,
+            fence_token: entry.fence_token,
+        })
+    }
+
+    /// Internal spawn that returns the raw `MemberRef` for crate-internal callers.
+    pub(crate) async fn spawn_spec_internal(
+        &self,
+        spec: SpawnMemberSpec,
+    ) -> Result<MemberRef, MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::Spawn {
+                spec: Box::new(spec),
+                owner_context: None,
+            })
+            .await?
+        {
+            MobMachineCommandResult::SpawnReceipt(receipt) => Ok(receipt.member_ref),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    pub(super) async fn spawn_spec_receipt_with_owner_context(
+        &self,
+        spec: SpawnMemberSpec,
+        owner_context: CanonicalOpsOwnerContext,
+    ) -> Result<MemberSpawnReceipt, MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::Spawn {
+                spec: Box::new(spec),
+                owner_context: Some(owner_context),
+            })
+            .await?
+        {
+            MobMachineCommandResult::SpawnReceipt(receipt) => Ok(receipt),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Spawn multiple members in parallel.
+    ///
+    /// Results preserve input order.
+    pub async fn spawn_many(
+        &self,
+        specs: Vec<SpawnMemberSpec>,
+    ) -> Vec<Result<SpawnResult, MobError>> {
+        futures::future::join_all(specs.into_iter().map(|spec| self.spawn_spec(spec))).await
+    }
+
+    pub(super) async fn spawn_many_receipts_with_owner_context(
+        &self,
+        specs: Vec<SpawnMemberSpec>,
+        owner_context: CanonicalOpsOwnerContext,
+    ) -> Vec<Result<MemberSpawnReceipt, MobError>> {
+        futures::future::join_all(
+            specs.into_iter().map(|spec| {
+                self.spawn_spec_receipt_with_owner_context(spec, owner_context.clone())
+            }),
+        )
+        .await
+    }
+
+    /// Retire a member, archiving its session and removing trust.
+    pub async fn retire(&self, identity: AgentIdentity) -> Result<(), MobError> {
+        let meerkat_id = MeerkatId::from(identity.as_str());
+        match self
+            .execute_machine_command(MobMachineCommand::Retire { meerkat_id })
+            .await?
+        {
+            MobMachineCommandResult::Unit => Ok(()),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Retire a member and respawn with the same profile, labels, wiring, and mode.
+    ///
+    /// This is a helper convenience over primitive mob behavior, not a
+    /// machine-owned primitive. Returns a receipt on full success, or a
+    /// structured error on failure. No rollback is attempted after retire.
+    pub async fn respawn(
+        &self,
+        identity: AgentIdentity,
+        initial_message: Option<ContentInput>,
+    ) -> Result<MemberRespawnReceipt, MobRespawnError> {
+        let meerkat_id = MeerkatId::from(identity.as_str());
+        let reply = match self
+            .execute_machine_command(MobMachineCommand::Respawn {
+                meerkat_id,
+                initial_message,
+            })
+            .await?
+        {
+            MobMachineCommandResult::Respawn(reply) => reply,
+            _ => {
+                return Err(MobRespawnError::from(MobError::Internal(
+                    "unexpected command result variant".into(),
+                )));
+            }
+        };
+        match reply {
+            Ok(receipt) => Ok(receipt),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Retire all roster members concurrently in a single actor command.
+    pub async fn retire_all(&self) -> Result<(), MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::RetireAll)
+            .await?
+        {
+            MobMachineCommandResult::Unit => Ok(()),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Wire a local member to either another local member or an external peer.
+    pub async fn wire<T>(&self, local: AgentIdentity, target: T) -> Result<(), MobError>
+    where
+        T: Into<PeerTarget>,
+    {
+        match self
+            .execute_machine_command(MobMachineCommand::Wire {
+                local: MeerkatId::from(local.as_str()),
+                target: target.into(),
+            })
+            .await?
+        {
+            MobMachineCommandResult::Unit => Ok(()),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Unwire a local member from either another local member or an external peer.
+    pub async fn unwire<T>(&self, local: AgentIdentity, target: T) -> Result<(), MobError>
+    where
+        T: Into<PeerTarget>,
+    {
+        match self
+            .execute_machine_command(MobMachineCommand::Unwire {
+                local: MeerkatId::from(local.as_str()),
+                target: target.into(),
+            })
+            .await?
+        {
+            MobMachineCommandResult::Unit => Ok(()),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Compatibility wrapper for internal-turn submission.
+    ///
+    /// Prefer [`MobHandle::member`] plus [`MemberHandle::internal_turn`] for
+    /// the target 0.5 API shape.
+    pub async fn internal_turn(
+        &self,
+        identity: AgentIdentity,
+        message: impl Into<meerkat_core::types::ContentInput>,
+    ) -> Result<MemberDeliveryReceipt, MobError> {
+        let meerkat_id = MeerkatId::from(identity.as_str());
+        self.internal_turn_for_member(meerkat_id.clone(), message.into())
+            .await?;
+        let material = self.canonical_member_list_material(&meerkat_id).await;
+        Ok(MemberDeliveryReceipt {
+            identity,
+            agent_runtime_id: material.agent_runtime_id,
+            fence_token: material.fence_token,
+            handling_mode: HandlingMode::Queue,
+        })
+    }
+
+    pub(super) async fn external_turn_for_member(
+        &self,
+        meerkat_id: MeerkatId,
+        message: meerkat_core::types::ContentInput,
+        handling_mode: HandlingMode,
+        render_metadata: Option<RenderMetadata>,
+    ) -> Result<meerkat_core::types::SessionId, MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::ExternalTurn {
+                meerkat_id,
+                content: message,
+                handling_mode,
+                render_metadata,
+            })
+            .await?
+        {
+            MobMachineCommandResult::BridgeSessionId(bridge_session_id) => Ok(bridge_session_id),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    pub(super) async fn internal_turn_for_member(
+        &self,
+        meerkat_id: MeerkatId,
+        message: meerkat_core::types::ContentInput,
+    ) -> Result<SessionId, MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::InternalTurn {
+                meerkat_id,
+                content: message,
+            })
+            .await?
+        {
+            MobMachineCommandResult::BridgeSessionId(bridge_session_id) => Ok(bridge_session_id),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Work lane
+    // -----------------------------------------------------------------
+
+    /// Submit a unit of work to a mob member.
+    ///
+    /// The fence token is validated against the member's current incarnation at
+    /// the dispatch boundary. If the token is stale (i.e., the member has been
+    /// respawned or reset since the caller obtained the token), the submission
+    /// is rejected with [`MobError::StaleFenceToken`].
+    pub async fn submit_work(
+        &self,
+        runtime_id: AgentRuntimeId,
+        fence_token: FenceToken,
+        work_ref: WorkRef,
+        spec: WorkSpec,
+    ) -> Result<WorkDeliveryReceipt, MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::SubmitWork {
+                runtime_id: runtime_id.clone(),
+                fence_token,
+                work_ref: work_ref.clone(),
+                spec,
+            })
+            .await?
+        {
+            MobMachineCommandResult::WorkReceipt { work_ref: ref_out } => Ok(WorkDeliveryReceipt {
+                work_ref: ref_out,
+                runtime_id,
+            }),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Cancel a previously submitted unit of work.
+    ///
+    /// Returns `Ok(())` if the work was found and cancellation was initiated.
+    /// Returns [`MobError::WorkNotFound`] if no in-flight work with the given
+    /// reference exists.
+    pub async fn cancel_work(&self, work_ref: WorkRef) -> Result<(), MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::CancelWork { work_ref })
+            .await?
+        {
+            MobMachineCommandResult::Unit => Ok(()),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Cancel all in-flight work for a mob member.
+    ///
+    /// The fence token is validated before cancellation proceeds.
+    pub async fn cancel_all_work(
+        &self,
+        runtime_id: AgentRuntimeId,
+        fence_token: FenceToken,
+    ) -> Result<(), MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::CancelAllWork {
+                runtime_id,
+                fence_token,
+            })
+            .await?
+        {
+            MobMachineCommandResult::Unit => Ok(()),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Transition Running -> Stopped. Mutation commands are rejected while stopped.
+    pub async fn stop(&self) -> Result<(), MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::Stop)
+            .await?
+        {
+            MobMachineCommandResult::Unit => Ok(()),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Transition Stopped -> Running.
+    pub async fn resume(&self) -> Result<(), MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::Resume)
+            .await?
+        {
+            MobMachineCommandResult::Unit => Ok(()),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Archive all members, emit MobCompleted, and transition to Completed.
+    pub async fn complete(&self) -> Result<(), MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::Complete)
+            .await?
+        {
+            MobMachineCommandResult::Unit => Ok(()),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Wipe all runtime state and transition back to `Running`.
+    ///
+    /// Like `destroy()` but keeps the actor alive and transitions to `Running`
+    /// instead of `Destroyed`. The handle remains usable after reset.
+    pub async fn reset(&self) -> Result<(), MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::Reset)
+            .await?
+        {
+            MobMachineCommandResult::Unit => Ok(()),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Retire active members, clear persisted mob storage, and terminate the actor.
+    pub async fn destroy(&self) -> Result<(), MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::Destroy)
+            .await?
+        {
+            MobMachineCommandResult::Unit => Ok(()),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Create a task in the shared mob task board.
+    pub async fn task_create(
+        &self,
+        subject: String,
+        description: String,
+        blocked_by: Vec<TaskId>,
+    ) -> Result<TaskId, MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::TaskCreate {
+                subject,
+                description,
+                blocked_by,
+            })
+            .await?
+        {
+            MobMachineCommandResult::TaskId(task_id) => Ok(task_id),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Update task status/owner in the shared mob task board.
+    pub async fn task_update(
+        &self,
+        task_id: TaskId,
+        status: TaskStatus,
+        owner: Option<AgentIdentity>,
+    ) -> Result<(), MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::TaskUpdate {
+                task_id,
+                status,
+                owner,
+            })
+            .await?
+        {
+            MobMachineCommandResult::Unit => Ok(()),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// List tasks from the in-memory task board projection.
+    pub async fn task_list(&self) -> Result<Vec<MobTask>, MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::TaskList)
+            .await?
+        {
+            MobMachineCommandResult::TaskList(tasks) => Ok(tasks),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Get a task by ID from the in-memory task board projection.
+    pub async fn task_get(&self, task_id: &TaskId) -> Result<Option<MobTask>, MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::TaskGet {
+                task_id: task_id.clone(),
+            })
+            .await?
+        {
+            MobMachineCommandResult::TaskGet(task) => Ok(task),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn debug_flow_tracker_counts(&self) -> Result<(usize, usize), MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::FlowTrackerCounts)
+            .await?
+        {
+            MobMachineCommandResult::FlowTrackerCounts(counts) => Ok(counts),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn debug_orchestrator_snapshot(
+        &self,
+    ) -> Result<super::MobOrchestratorSnapshot, MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::OrchestratorSnapshot)
+            .await?
+        {
+            MobMachineCommandResult::OrchestratorSnapshot(snapshot) => Ok(snapshot),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Set or clear the spawn policy for automatic member provisioning.
+    ///
+    /// When set, external turns targeting an unknown member identity will
+    /// consult the policy before returning `MeerkatNotFound`.
+    pub async fn set_spawn_policy(
+        &self,
+        policy: Option<Arc<dyn super::spawn_policy::SpawnPolicy>>,
+    ) -> Result<(), MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::SetSpawnPolicy { policy })
+            .await?
+        {
+            MobMachineCommandResult::Unit => Ok(()),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Shut down the actor. After this, no more commands are accepted.
+    pub async fn shutdown(&self) -> Result<(), MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::Shutdown)
+            .await?
+        {
+            MobMachineCommandResult::Unit => Ok(()),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    /// Force-cancel a member's in-flight turn via session interrupt.
+    ///
+    /// Unlike [`retire`](Self::retire), this does not archive the session or
+    /// remove the member from the roster — it only cancels the current turn.
+    pub async fn force_cancel_member(&self, identity: AgentIdentity) -> Result<(), MobError> {
+        match self
+            .execute_machine_command(MobMachineCommand::ForceCancel {
+                meerkat_id: MeerkatId::from(identity.as_str()),
+            })
+            .await?
+        {
+            MobMachineCommandResult::Unit => Ok(()),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
+    fn kickoff_wait_is_satisfied(entry: &RosterEntry) -> bool {
+        if entry.runtime_mode != crate::MobRuntimeMode::AutonomousHost {
+            return true;
+        }
+
+        match entry.kickoff.as_ref().map(|kickoff| kickoff.phase) {
+            None
+            | Some(
+                MobMemberKickoffPhase::Started
+                | MobMemberKickoffPhase::Failed
+                | MobMemberKickoffPhase::Cancelled,
+            ) => true,
+            Some(
+                MobMemberKickoffPhase::Pending
+                | MobMemberKickoffPhase::Starting
+                | MobMemberKickoffPhase::CallbackPending,
+            ) => false,
+        }
+    }
+
+    async fn wait_for_kickoff_resolution(
         &self,
         target_ids: &[MeerkatId],
-        waiters: Vec<(MeerkatId, tokio::sync::watch::Receiver<bool>)>,
         timeout: Option<Duration>,
     ) -> Result<(), MobError> {
-        if waiters.is_empty() {
+        if target_ids.is_empty() {
             return Ok(());
         }
 
         let deadline = Instant::now() + timeout.unwrap_or(DEFAULT_KICKOFF_WAIT_TIMEOUT);
-        let mut pending = waiters
-            .iter()
-            .map(|(id, _)| id.clone())
-            .collect::<std::collections::HashSet<_>>();
-        let mut futures = FuturesUnordered::new();
+        loop {
+            let entries = self
+                .list_all_members()
+                .await
+                .into_iter()
+                .map(|entry| (entry.meerkat_id.clone(), entry))
+                .collect::<HashMap<_, _>>();
 
-        for (id, mut rx) in waiters {
-            if *rx.borrow() {
-                pending.remove(&id);
-                continue;
+            let pending_member_ids = target_ids
+                .iter()
+                .filter(|id| {
+                    entries
+                        .get(*id)
+                        .is_some_and(|entry| !Self::kickoff_wait_is_satisfied(entry))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+
+            if pending_member_ids.is_empty() {
+                return Ok(());
             }
-            futures.push(async move {
-                loop {
-                    if *rx.borrow() {
-                        break;
-                    }
-                    if rx.changed().await.is_err() {
-                        break;
-                    }
-                }
-                id
-            });
-        }
 
-        while !futures.is_empty() {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                let pending_member_ids = target_ids
-                    .iter()
-                    .filter(|id| pending.contains(*id))
-                    .cloned()
-                    .collect();
                 return Err(MobError::KickoffWaitTimedOut { pending_member_ids });
             }
 
-            let next_fut = futures.next();
-            let sleep_fut = tokio::time::sleep(remaining);
-            futures::pin_mut!(next_fut);
-            futures::pin_mut!(sleep_fut);
-
-            match futures::future::select(next_fut, sleep_fut).await {
-                futures::future::Either::Left((Some(id), _)) => {
-                    pending.remove(&id);
-                }
-                futures::future::Either::Left((None, _)) => break,
-                futures::future::Either::Right(((), _)) => {
-                    let pending_member_ids = target_ids
-                        .iter()
-                        .filter(|id| pending.contains(*id))
-                        .cloned()
-                        .collect();
-                    return Err(MobError::KickoffWaitTimedOut { pending_member_ids });
-                }
-            }
+            tokio::time::sleep(std::cmp::min(remaining, Duration::from_millis(50))).await;
         }
-
-        Ok(())
     }
 
     async fn wait_one_material(
@@ -1749,47 +2404,68 @@ impl MobHandle {
     /// resolves live peer connectivity when a comms runtime is available.
     pub async fn member_status(
         &self,
-        meerkat_id: &MeerkatId,
+        identity: &AgentIdentity,
     ) -> Result<MobMemberSnapshot, MobError> {
-        let material = self.canonical_member_snapshot_material(meerkat_id).await;
-        Ok(material.to_snapshot())
+        match self
+            .execute_machine_command(MobMachineCommand::MemberStatus {
+                meerkat_id: MeerkatId::from(identity.as_str()),
+            })
+            .await?
+        {
+            MobMachineCommandResult::MemberStatus(snapshot) => Ok(snapshot),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
     }
 
-    /// Wait until all autonomous members have been admitted to the runtime.
+    /// Wait until all current autonomous members resolve their initial kickoff.
     ///
-    /// Autonomous members no longer run a separate kickoff turn — their initial
-    /// prompt is injected through the runtime input path at spawn time. This
-    /// method returns member snapshots immediately since admission is synchronous.
+    /// In 0.6 autonomous members no longer run a synthetic second kickoff turn,
+    /// but their initial prompt still resolves asynchronously through the
+    /// runtime-backed input path. This barrier is satisfied once each targeted
+    /// autonomous member leaves `pending` / `starting` / `callback_pending`
+    /// and reaches a terminal kickoff phase.
     pub async fn wait_for_kickoff_complete(
         &self,
         timeout: Option<Duration>,
-    ) -> Result<Vec<(MeerkatId, MobMemberSnapshot)>, MobError> {
+    ) -> Result<Vec<(AgentIdentity, MobMemberSnapshot)>, MobError> {
         let target_ids = self
             .list_all_members()
             .await
             .into_iter()
             .map(|entry| entry.meerkat_id)
             .collect::<Vec<_>>();
-        self.wait_for_members_kickoff_complete(&target_ids, timeout)
-            .await
+        let identities: Vec<AgentIdentity> = target_ids
+            .iter()
+            .map(|id| AgentIdentity::from(id.as_str()))
+            .collect();
+        self.wait_for_kickoff_resolution(&target_ids, timeout)
+            .await?;
+
+        let mut snapshots = Vec::with_capacity(identities.len());
+        for identity in identities {
+            snapshots.push((identity.clone(), self.member_status(&identity).await?));
+        }
+        Ok(snapshots)
     }
 
-    /// Wait until the given autonomous members have been admitted to the runtime.
+    /// Wait until the given members resolve their initial kickoff.
     ///
     /// See [`wait_for_kickoff_complete`](Self::wait_for_kickoff_complete) for details.
     pub async fn wait_for_members_kickoff_complete(
         &self,
-        ids: &[MeerkatId],
+        ids: &[AgentIdentity],
         timeout: Option<Duration>,
-    ) -> Result<Vec<(MeerkatId, MobMemberSnapshot)>, MobError> {
-        let target_ids = ids.to_vec();
-        let waiters = self.snapshot_kickoff_waiters(target_ids.clone()).await?;
-        self.wait_for_kickoff_receivers(&target_ids, waiters, timeout)
+    ) -> Result<Vec<(AgentIdentity, MobMemberSnapshot)>, MobError> {
+        let target_meerkat_ids: Vec<MeerkatId> =
+            ids.iter().map(|id| MeerkatId::from(id.as_str())).collect();
+        self.wait_for_kickoff_resolution(&target_meerkat_ids, timeout)
             .await?;
 
-        let mut snapshots = Vec::with_capacity(target_ids.len());
-        for id in target_ids {
-            snapshots.push((id.clone(), self.member_status(&id).await?));
+        let mut snapshots = Vec::with_capacity(ids.len());
+        for identity in ids {
+            snapshots.push((identity.clone(), self.member_status(identity).await?));
         }
         Ok(snapshots)
     }
@@ -1797,19 +2473,24 @@ impl MobHandle {
     /// Wait for a specific member to reach a terminal state, then return its snapshot.
     ///
     /// Polls canonical member classification until terminal.
-    pub async fn wait_one(&self, meerkat_id: &MeerkatId) -> Result<MobMemberSnapshot, MobError> {
-        let material = self.wait_one_material(meerkat_id).await?;
+    pub async fn wait_one(&self, identity: &AgentIdentity) -> Result<MobMemberSnapshot, MobError> {
+        let meerkat_id = MeerkatId::from(identity.as_str());
+        let material = self.wait_one_material(&meerkat_id).await?;
         Ok(material.to_snapshot())
     }
 
     /// Wait for all specified members to reach terminal states.
     pub async fn wait_all(
         &self,
-        meerkat_ids: &[MeerkatId],
+        identities: &[AgentIdentity],
     ) -> Result<Vec<MobMemberSnapshot>, MobError> {
+        let meerkat_ids: Vec<MeerkatId> = identities
+            .iter()
+            .map(|id| MeerkatId::from(id.as_str()))
+            .collect();
         let futs = meerkat_ids
             .iter()
-            .map(|id| self.wait_one_material(id))
+            .map(|mid| self.wait_one_material(mid))
             .collect::<Vec<_>>();
         let results = futures::future::join_all(futs).await;
         results
@@ -1819,14 +2500,14 @@ impl MobHandle {
     }
 
     /// Collect snapshots for all members that have reached terminal states.
-    pub async fn collect_completed(&self) -> Vec<(MeerkatId, MobMemberSnapshot)> {
+    pub async fn collect_completed(&self) -> Vec<(AgentIdentity, MobMemberSnapshot)> {
         let entries = self.list_all_members().await;
         let mut completed = Vec::new();
         for entry in entries {
-            if let Ok(snapshot) = self.member_status(&entry.meerkat_id).await
+            if let Ok(snapshot) = self.member_status(&entry.agent_identity).await
                 && snapshot.is_final
             {
-                completed.push((entry.meerkat_id, snapshot));
+                completed.push((entry.agent_identity, snapshot));
             }
         }
         completed
@@ -1839,7 +2520,7 @@ impl MobHandle {
     /// snapshot, not full member terminality in the mob lifecycle.
     pub async fn spawn_helper(
         &self,
-        meerkat_id: MeerkatId,
+        identity: AgentIdentity,
         task: impl Into<String>,
         options: HelperOptions,
     ) -> Result<HelperResult, MobError> {
@@ -1850,7 +2531,8 @@ impl MobHandle {
                 MobError::Internal("no profile specified and definition has no profiles".into())
             })?;
         let task_text = task.into();
-        let mut spec = SpawnMemberSpec::new(profile_name, meerkat_id.clone());
+        let meerkat_id = MeerkatId::from(identity.as_str());
+        let mut spec = SpawnMemberSpec::new(profile_name, identity.clone());
         spec.initial_message = Some(task_text.into());
         spec.runtime_mode = Some(
             options
@@ -1863,7 +2545,7 @@ impl MobHandle {
 
         self.spawn_spec(spec).await?;
         let helper_material = self.canonical_member_list_material(&meerkat_id).await;
-        let _ = self.retire(meerkat_id.clone()).await;
+        let _ = self.retire(identity).await;
 
         Ok(helper_material.to_helper_result())
     }
@@ -1874,8 +2556,8 @@ impl MobHandle {
     /// conversation context with the source member.
     pub async fn fork_helper(
         &self,
-        source_member_id: &MeerkatId,
-        meerkat_id: MeerkatId,
+        source_identity: &AgentIdentity,
+        identity: AgentIdentity,
         task: impl Into<String>,
         fork_context: crate::launch::ForkContext,
         options: HelperOptions,
@@ -1887,7 +2569,9 @@ impl MobHandle {
                 MobError::Internal("no profile specified and definition has no profiles".into())
             })?;
         let task_text = task.into();
-        let mut spec = SpawnMemberSpec::new(profile_name, meerkat_id.clone());
+        let meerkat_id = MeerkatId::from(identity.as_str());
+        let source_member_id = MeerkatId::from(source_identity.as_str());
+        let mut spec = SpawnMemberSpec::new(profile_name, identity.clone());
         spec.initial_message = Some(task_text.into());
         spec.runtime_mode = Some(
             options
@@ -1898,22 +2582,22 @@ impl MobHandle {
         spec.tool_access_policy = options.tool_access_policy;
         spec.auto_wire_parent = true;
         spec.launch_mode = crate::launch::MemberLaunchMode::Fork {
-            source_member_id: source_member_id.clone(),
+            source_member_id,
             fork_context,
         };
 
         self.spawn_spec(spec).await?;
         let helper_material = self.canonical_member_list_material(&meerkat_id).await;
-        let _ = self.retire(meerkat_id.clone()).await;
+        let _ = self.retire(identity).await;
 
         Ok(helper_material.to_helper_result())
     }
 }
 
 impl MemberHandle {
-    /// Target member id for this capability.
-    pub fn meerkat_id(&self) -> &MeerkatId {
-        &self.meerkat_id
+    /// Target member identity.
+    pub fn identity(&self) -> AgentIdentity {
+        AgentIdentity::from(self.meerkat_id.as_str())
     }
 
     /// Submit external work to this member through the canonical runtime path.
@@ -1933,8 +2617,7 @@ impl MemberHandle {
         handling_mode: HandlingMode,
         render_metadata: Option<RenderMetadata>,
     ) -> Result<MemberDeliveryReceipt, MobError> {
-        let session_id = self
-            .mob
+        self.mob
             .external_turn_for_member(
                 self.meerkat_id.clone(),
                 content.into(),
@@ -1942,9 +2625,14 @@ impl MemberHandle {
                 render_metadata,
             )
             .await?;
+        let material = self
+            .mob
+            .canonical_member_list_material(&self.meerkat_id)
+            .await;
         Ok(MemberDeliveryReceipt {
-            member_id: self.meerkat_id.clone(),
-            session_id,
+            identity: self.identity(),
+            agent_runtime_id: material.agent_runtime_id,
+            fence_token: material.fence_token,
             handling_mode,
         })
     }
@@ -1954,44 +2642,154 @@ impl MemberHandle {
         &self,
         content: impl Into<meerkat_core::types::ContentInput>,
     ) -> Result<MemberDeliveryReceipt, MobError> {
-        let session_id = self
-            .mob
+        self.mob
             .internal_turn_for_member(self.meerkat_id.clone(), content.into())
             .await?;
+        let material = self
+            .mob
+            .canonical_member_list_material(&self.meerkat_id)
+            .await;
         Ok(MemberDeliveryReceipt {
-            member_id: self.meerkat_id.clone(),
-            session_id,
+            identity: self.identity(),
+            agent_runtime_id: material.agent_runtime_id,
+            fence_token: material.fence_token,
             handling_mode: HandlingMode::Queue,
         })
     }
 
-    /// Current session ID for this member, if a session bridge exists.
-    pub async fn current_session_id(&self) -> Result<Option<SessionId>, MobError> {
-        let roster = self.mob.roster.read().await;
-        Ok(roster
-            .get(&self.meerkat_id)
-            .and_then(|e| e.member_ref.session_id().cloned()))
-    }
-
-    /// Session reference for this member, if a session bridge exists.
-    pub async fn session_ref(&self) -> Result<Option<MemberSessionRef>, MobError> {
-        let roster = self.mob.roster.read().await;
-        Ok(roster
-            .get(&self.meerkat_id)
-            .and_then(|e| e.member_ref.session_id().cloned())
-            .map(|session_id| MemberSessionRef {
-                member_id: self.meerkat_id.clone(),
-                session_id,
-            }))
+    /// Current bridge session ID for this member, if a session bridge exists.
+    #[cfg(test)]
+    pub(crate) async fn current_bridge_session_id(&self) -> Result<Option<SessionId>, MobError> {
+        let status = self.status().await?;
+        Ok(status.current_bridge_session_id().cloned())
     }
 
     /// Get a point-in-time execution snapshot for this member.
     pub async fn status(&self) -> Result<MobMemberSnapshot, MobError> {
-        self.mob.member_status(&self.meerkat_id).await
+        self.mob.member_status(&self.identity()).await
     }
 
     /// Subscribe to this member's agent events.
     pub async fn events(&self) -> Result<EventStream, MobError> {
-        self.mob.subscribe_agent_events(&self.meerkat_id).await
+        self.mob.subscribe_agent_events(&self.identity()).await
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::ids::Generation;
+
+    #[test]
+    fn member_projection_types_omit_bridge_session_fields_in_serialized_output() {
+        let sid = SessionId::new();
+
+        let snapshot = MobMemberSnapshot {
+            status: MobMemberStatus::Active,
+            agent_runtime_id: AgentRuntimeId::initial(AgentIdentity::from("worker")),
+            fence_token: FenceToken::new(0),
+            output_preview: None,
+            error: None,
+            tokens_used: 0,
+            is_final: false,
+            current_session_id: None,
+            current_bridge_session_id: None,
+            peer_connectivity: None,
+            kickoff: None,
+        }
+        .with_current_bridge_session_id(Some(sid.clone()));
+        let snapshot_value =
+            serde_json::to_value(&snapshot).expect("snapshot should serialize to json");
+        // 0.6 clean break: session fields are #[serde(skip)] and must not appear
+        assert!(snapshot_value.get("current_bridge_session_id").is_none());
+        // Identity-native fields must be present
+        assert!(!snapshot_value["agent_runtime_id"].is_null());
+        assert!(!snapshot_value["fence_token"].is_null());
+    }
+
+    #[test]
+    fn canonical_member_material_populates_bridge_binding_from_canonical_state() {
+        let sid = SessionId::new();
+        let snapshot = CanonicalMemberSnapshotMaterial {
+            member_present: true,
+            status: CanonicalMemberStatus::Active,
+            session_observation: CanonicalSessionObservation::Active,
+            error: None,
+            output_preview: None,
+            tokens_used: 0,
+            agent_runtime_id: AgentRuntimeId::initial(AgentIdentity::from("worker")),
+            fence_token: FenceToken::new(0),
+            current_bridge_session_id: Some(sid.clone()),
+            peer_connectivity: None,
+            kickoff: None,
+        }
+        .to_snapshot();
+
+        assert_eq!(snapshot.current_bridge_session_id(), Some(&sid));
+        assert_eq!(snapshot.current_bridge_session_id, Some(sid));
+    }
+
+    #[test]
+    fn member_receipt_types_omit_bridge_session_fields_in_serialized_output() {
+        let runtime_id = AgentRuntimeId::new(AgentIdentity::from("worker"), Generation::new(1));
+        let receipt = MemberRespawnReceipt::new(
+            AgentIdentity::from("worker"),
+            runtime_id.clone(),
+            FenceToken::new(7),
+            FenceToken::new(8),
+        );
+        let receipt_value =
+            serde_json::to_value(&receipt).expect("respawn receipt should serialize to json");
+        assert_eq!(receipt_value["identity"], "worker");
+        assert_eq!(
+            receipt_value["agent_runtime_id"],
+            serde_json::to_value(&runtime_id).expect("runtime id should serialize to json")
+        );
+        assert_eq!(receipt_value["previous_fence_token"], 7);
+        assert_eq!(receipt_value["fence_token"], 8);
+
+        let delivery = MemberDeliveryReceipt {
+            identity: AgentIdentity::from("worker"),
+            agent_runtime_id: runtime_id,
+            fence_token: FenceToken::new(8),
+            handling_mode: HandlingMode::Queue,
+        };
+        let delivery_value =
+            serde_json::to_value(&delivery).expect("delivery receipt should serialize to json");
+        assert_eq!(delivery_value["identity"], "worker");
+        assert_eq!(delivery_value["fence_token"], 8);
+    }
+
+    #[test]
+    fn helper_result_serializes_identity_native_runtime_fields() {
+        let runtime_id = AgentRuntimeId::new(AgentIdentity::from("worker"), Generation::new(2));
+        let result = HelperResult {
+            output: Some("done".to_string()),
+            tokens_used: 7,
+            agent_identity: AgentIdentity::from("worker"),
+            agent_runtime_id: runtime_id.clone(),
+            fence_token: FenceToken::new(9),
+        };
+
+        let value = serde_json::to_value(&result).expect("helper result should serialize to json");
+        assert_eq!(value["agent_identity"], "worker");
+        assert_eq!(
+            value["agent_runtime_id"],
+            serde_json::to_value(&runtime_id).expect("runtime id should serialize to json")
+        );
+        assert_eq!(value["fence_token"], 9);
+        assert!(value.get("session_id").is_none());
+        assert!(value.get("bridge_session_id").is_none());
+    }
+
+    #[test]
+    fn spawn_member_spec_resume_bridge_session_accessors_stay_additive() {
+        let sid = SessionId::new();
+        let spec =
+            SpawnMemberSpec::new("worker", "worker-1").with_resume_bridge_session_id(sid.clone());
+
+        assert_eq!(spec.launch_mode.resume_bridge_session_id(), Some(&sid));
+        assert_eq!(spec.launch_mode.resume_bridge_session_id(), Some(&sid));
     }
 }

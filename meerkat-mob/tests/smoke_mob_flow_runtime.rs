@@ -18,9 +18,9 @@ use meerkat_mob::definition::{
     RepeatUntilSpec, WiringRules,
 };
 use meerkat_mob::{
-    FlowId, LoopId, MeerkatId, MobBuilder, MobDefinition, MobHandle, MobId, MobRun, MobRunStatus,
-    MobRuntimeMode, MobSessionService, MobStorage, Profile, ProfileBinding, ProfileName, StepId,
-    ToolConfig,
+    AgentIdentity, FlowId, LoopId, MobBuilder, MobDefinition, MobHandle, MobId, MobRun,
+    MobRunStatus, MobRuntimeMode, MobSessionService, MobStorage, Profile, ProfileBinding,
+    ProfileName, SpawnMemberSpec, StepId, ToolConfig,
 };
 use meerkat_session::PersistentSessionService;
 use meerkat_store::{JsonlStore, MemoryBlobStore, StoreAdapter};
@@ -449,34 +449,24 @@ fn flow_definition(models: &FlowSmokeModels) -> MobDefinition {
         build_persisted_branch_dual_loops_audit_flow(),
     );
 
-    MobDefinition {
-        id: MobId::from("flow-runtime-smoke"),
-        orchestrator: Some(OrchestratorConfig {
-            profile: ProfileName::from("lead"),
-        }),
-        profiles,
-        mcp_servers: BTreeMap::new(),
-        wiring: WiringRules::default(),
-        skills: BTreeMap::new(),
-        backend: BackendConfig::default(),
-        flows,
-        topology: None,
-        supervisor: None,
-        limits: Some(LimitsSpec {
-            max_flow_duration_ms: Some(300_000),
-            max_step_retries: Some(0),
-            max_orphaned_turns: Some(8),
-            cancel_grace_timeout_ms: Some(1_500),
-            max_active_nodes: Some(4),
-            max_active_frames: Some(4),
-            max_frame_depth: Some(4),
-        }),
-        spawn_policy: None,
-        event_router: None,
-        owner_session_id: None,
-        session_cleanup_policy: meerkat_mob::definition::SessionCleanupPolicy::Manual,
-        is_implicit: false,
-    }
+    let mut definition = MobDefinition::explicit(MobId::from("flow-runtime-smoke"));
+    definition.orchestrator = Some(OrchestratorConfig {
+        profile: ProfileName::from("lead"),
+    });
+    definition.profiles = profiles;
+    definition.wiring = WiringRules::default();
+    definition.backend = BackendConfig::default();
+    definition.flows = flows;
+    definition.limits = Some(LimitsSpec {
+        max_flow_duration_ms: Some(300_000),
+        max_step_retries: Some(0),
+        max_orphaned_turns: Some(8),
+        cancel_grace_timeout_ms: Some(1_500),
+        max_active_nodes: Some(4),
+        max_active_frames: Some(4),
+        max_frame_depth: Some(4),
+    });
+    definition
 }
 
 fn build_fanout_review_loop_flow() -> FlowSpec {
@@ -2448,7 +2438,7 @@ async fn setup_flow_mob(
 
     let session_service = persistent_service(&paths);
     let mob_service: Arc<dyn MobSessionService> = session_service.clone();
-    let runtime_adapter = Arc::new(meerkat_runtime::RuntimeSessionAdapter::ephemeral());
+    let runtime_adapter = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
     let storage =
         MobStorage::persistent(&paths.mob_db_path).expect("create persistent mob storage");
 
@@ -2460,39 +2450,35 @@ async fn setup_flow_mob(
         .expect("create flow smoke mob");
 
     handle
-        .spawn(ProfileName::from("lead"), MeerkatId::from("lead-1"), None)
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
         .await
         .expect("spawn lead");
     handle
-        .spawn(
-            ProfileName::from("worker"),
-            MeerkatId::from("worker-1"),
-            None,
-        )
+        .spawn_spec(SpawnMemberSpec::new(
+            "worker",
+            AgentIdentity::from("worker-1"),
+        ))
         .await
         .expect("spawn worker");
     handle
-        .spawn(
-            ProfileName::from("reviewer"),
-            MeerkatId::from("reviewer-1"),
-            None,
-        )
+        .spawn_spec(SpawnMemberSpec::new(
+            "reviewer",
+            AgentIdentity::from("reviewer-1"),
+        ))
         .await
         .expect("spawn reviewer");
     handle
-        .spawn(
-            ProfileName::from("analyst"),
-            MeerkatId::from("analyst-1"),
-            None,
-        )
+        .spawn_spec(SpawnMemberSpec::new(
+            "analyst",
+            AgentIdentity::from("analyst-1"),
+        ))
         .await
         .expect("spawn analyst-1");
     handle
-        .spawn(
-            ProfileName::from("analyst"),
-            MeerkatId::from("analyst-2"),
-            None,
-        )
+        .spawn_spec(SpawnMemberSpec::new(
+            "analyst",
+            AgentIdentity::from("analyst-2"),
+        ))
         .await
         .expect("spawn analyst-2");
 

@@ -13,10 +13,10 @@ use mdm_tux::{
     load_or_generate_keypair, read_envelope, verify_envelope, write_envelope,
 };
 use meerkat_mob::{
-    MeerkatId, MobBackendKind, MobDefinition, MobId, MobRuntimeMode, Profile, ProfileBinding,
+    AgentIdentity, MobBackendKind, MobDefinition, MobId, MobRuntimeMode, Profile, ProfileBinding,
     ProfileName, RuntimeBinding, SpawnMemberSpec, ToolConfig,
 };
-use meerkat_mob::definition::{BackendConfig, ExternalBackendConfig, SessionCleanupPolicy, WiringRules};
+use meerkat_mob::definition::{BackendConfig, ExternalBackendConfig, WiringRules};
 use meerkat_mob_mcp::{AgentMobToolSurfaceFactory, MobMcpState};
 use meerkat_store::{JsonlStore, MemoryBlobStore, SessionStore};
 use parking_lot::Mutex;
@@ -150,12 +150,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Add a sentinel peer so comms tools are never gated out at build time.
     // Real peers are added dynamically when targets register.
-    hive_comms_runtime.upsert_trusted_peer(meerkat_comms::TrustedPeer {
+    hive_comms_runtime
+        .register_trusted_peer(meerkat_comms::TrustedPeer {
         name: "__sentinel__".into(),
         pubkey: hive_comms_runtime.public_key(),
         addr: "inproc://sentinel".into(),
         meta: meerkat_comms::PeerMeta::default(),
-    });
+        })
+        .await?;
 
     // ── Hive agent: AgentFactory + Config ───────────────────────────────────
     let hive_factory = meerkat::AgentFactory::new(&session_dir)
@@ -324,32 +326,21 @@ async fn main() -> anyhow::Result<()> {
             }),
         );
 
-        let definition = MobDefinition {
-            id: MobId::from("hive-fleet"),
-            orchestrator: None,
-            profiles,
-            mcp_servers: BTreeMap::new(),
-            wiring: WiringRules {
-                auto_wire_orchestrator: true,
-                role_wiring: Vec::new(),
-            },
-            skills: BTreeMap::new(),
-            backend: BackendConfig {
-                default: MobBackendKind::External,
-                external: Some(ExternalBackendConfig {
-                    address_base: format!("tcp://{advertise_ip}:{hive_comms_port}"),
-                }),
-            },
-            flows: BTreeMap::new(),
-            topology: None,
-            supervisor: None,
-            limits: None,
-            spawn_policy: None,
-            event_router: None,
-            owner_session_id: hive_session_id.clone(),
-            session_cleanup_policy: SessionCleanupPolicy::Manual,
-            is_implicit: false,
+        let mut definition = MobDefinition::explicit(MobId::from("hive-fleet"));
+        definition.profiles = profiles;
+        definition.wiring = WiringRules {
+            auto_wire_orchestrator: true,
+            role_wiring: Vec::new(),
         };
+        definition.backend = BackendConfig {
+            default: MobBackendKind::External,
+            external: Some(ExternalBackendConfig {
+                address_base: format!("tcp://{advertise_ip}:{hive_comms_port}"),
+            }),
+        };
+        if let Some(ref bridge_session_id) = hive_session_id {
+            definition.set_owner_bridge_session_lookup_index(bridge_session_id.clone());
+        }
 
         match hive_mob_state_for_kennel
             .mob_create_definition(definition)
@@ -514,14 +505,14 @@ async fn handle_connection(
                         // Always update trusted peer on (re-)registration so the
                         // hive has the target's current comms address.
                         if let Ok(pk) = meerkat_comms::identity::PubKey::from_peer_id(pubkey) {
-                            hive_comms_runtime.upsert_trusted_peer(
-                                meerkat_comms::TrustedPeer {
+                            hive_comms_runtime
+                                .register_trusted_peer(meerkat_comms::TrustedPeer {
                                     name: name.clone(),
                                     pubkey: pk,
                                     addr: direct_addr.clone(),
                                     meta: meerkat_comms::PeerMeta::default(),
-                                },
-                            );
+                                })
+                                .await?;
                         }
 
                         // Spawn target as external mob member in the hive fleet.
@@ -530,7 +521,7 @@ async fn handle_connection(
                         if let Some(mob_id) = &hive_mob_id {
                             let mut spec = SpawnMemberSpec::new(
                                 ProfileName::from("target"),
-                                MeerkatId::from(name.clone()),
+                                AgentIdentity::from(name.clone()),
                             );
                             spec.binding = Some(RuntimeBinding::External {
                                 peer_id: pubkey.clone(),
@@ -796,8 +787,8 @@ async fn handle_connection(
         if let (SessionKind::Target(_), Some(mob_id), Some(name)) =
             (&kind, &hive_mob_id, target_name_for_retire)
         {
-            let member_id = MeerkatId::from(name.clone());
-            match hive_mob_state.mob_retire(mob_id, member_id).await {
+            let member_identity = AgentIdentity::from(name.clone());
+            match hive_mob_state.mob_retire(mob_id, member_identity).await {
                 Ok(()) => eprintln!("[kennel] retired {name} from hive mob"),
                 Err(e) => eprintln!("[kennel] failed to retire {name} from hive mob: {e}"),
             }

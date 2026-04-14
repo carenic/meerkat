@@ -293,7 +293,7 @@ pub struct MethodRouter {
     active_mob_streams: Arc<Mutex<HashMap<Uuid, StreamForwarder>>>,
     #[cfg(feature = "mob")]
     closed_mob_streams: Arc<Mutex<ClosedStreamSet>>,
-    runtime_adapter: Arc<meerkat_runtime::RuntimeSessionAdapter>,
+    runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
 }
 
 impl MethodRouter {
@@ -387,7 +387,7 @@ impl MethodRouter {
     }
 
     /// Get a reference to the runtime adapter for session registration.
-    pub fn runtime_adapter(&self) -> &Arc<meerkat_runtime::RuntimeSessionAdapter> {
+    pub fn runtime_adapter(&self) -> &Arc<meerkat_runtime::MeerkatMachine> {
         &self.runtime_adapter
     }
 
@@ -544,10 +544,7 @@ impl MethodRouter {
 
     /// Replace the default ephemeral runtime adapter with a custom one
     /// (e.g., persistent-backed for durable runtime semantics).
-    pub fn with_runtime_adapter(
-        mut self,
-        adapter: Arc<meerkat_runtime::RuntimeSessionAdapter>,
-    ) -> Self {
+    pub fn with_runtime_adapter(mut self, adapter: Arc<meerkat_runtime::MeerkatMachine>) -> Self {
         self.runtime_adapter = adapter;
         self
     }
@@ -566,8 +563,11 @@ impl MethodRouter {
     // freshest lifecycle state instead of routing off a cached snapshot.
     async fn resolve_session_owner(&self, session_id: &SessionId) -> Option<SessionOwner> {
         #[cfg(feature = "mob")]
-        if self.mob_state.owns_live_session(session_id).await
-            || self.mob_state.owns_persisted_session(session_id).await
+        if self.mob_state.owns_live_bridge_session(session_id).await
+            || self
+                .mob_state
+                .owns_persisted_bridge_session(session_id)
+                .await
         {
             return Some(SessionOwner::Mob);
         }
@@ -752,6 +752,19 @@ impl MethodRouter {
             "mob/unwire" => handlers::mob::handle_unwire(id, params, &self.mob_state).await,
             #[cfg(feature = "mob")]
             "mob/events" => handlers::mob::handle_events(id, params, &self.mob_state).await,
+            #[cfg(feature = "mob")]
+            "mob/turn_start" => {
+                handlers::mob::handle_mob_turn_start(
+                    id,
+                    params,
+                    &self.mob_state,
+                    self.runtime.clone(),
+                    &self.notification_sink,
+                    &self.runtime_adapter,
+                    request_context.clone(),
+                )
+                .await
+            }
             #[cfg(feature = "mob")]
             "mob/member_send" => {
                 handlers::mob::handle_member_send(id, params, &self.mob_state).await
@@ -1168,7 +1181,7 @@ impl MethodRouter {
                     #[cfg(feature = "mob")]
                     let _ = self
                         .mob_state
-                        .destroy_session_mobs(&session_id.to_string())
+                        .destroy_bridge_session_mobs(&session_id.to_string())
                         .await;
                     self.runtime_adapter.unregister_session(&session_id).await;
                     RpcResponse::success(id, json!({"archived": true}))
@@ -1178,7 +1191,7 @@ impl MethodRouter {
             #[cfg(feature = "mob")]
             Some(SessionOwner::Mob) => match self
                 .mob_state
-                .retire_member_by_session_id(&session_id)
+                .retire_member_by_bridge_session_id(&session_id)
                 .await
             {
                 Ok(()) => RpcResponse::success(id, json!({"archived": true})),
@@ -1304,17 +1317,21 @@ impl MethodRouter {
         match comms.send(cmd).await {
             Ok(receipt) => {
                 let result = match receipt {
-                    meerkat_core::comms::SendReceipt::InputAccepted { interaction_id } => {
-                        json!({"kind":"input_accepted","interaction_id": interaction_id.0.to_string()})
+                    meerkat_core::comms::SendReceipt::InputAccepted {
+                        interaction_id,
+                        stream_reserved,
+                    } => {
+                        json!({"kind":"input_accepted","interaction_id": interaction_id.0.to_string(),"stream_reserved": stream_reserved})
                     }
                     meerkat_core::comms::SendReceipt::PeerMessageSent { envelope_id, acked } => {
                         json!({"kind":"peer_message_sent","envelope_id": envelope_id.to_string(),"acked": acked})
                     }
                     meerkat_core::comms::SendReceipt::PeerRequestSent {
-                        request_id,
                         envelope_id,
+                        interaction_id,
+                        stream_reserved,
                     } => {
-                        json!({"kind":"peer_request_sent","envelope_id": envelope_id.to_string(),"request_id": request_id.0.to_string()})
+                        json!({"kind":"peer_request_sent","envelope_id": envelope_id.to_string(),"interaction_id": interaction_id.0.to_string(),"request_id": interaction_id.0.to_string(),"stream_reserved": stream_reserved})
                     }
                     meerkat_core::comms::SendReceipt::PeerResponseSent {
                         envelope_id,
@@ -1695,7 +1712,7 @@ impl MethodRouter {
         struct MobStreamOpenParams {
             mob_id: String,
             #[serde(default)]
-            member_id: Option<String>,
+            agent_identity: Option<String>,
         }
 
         let params = match handlers::parse_params::<MobStreamOpenParams>(params) {
@@ -1723,11 +1740,11 @@ impl MethodRouter {
         let closed_mob_streams = self.closed_mob_streams.clone();
         let stream_id_for_task = stream_id;
 
-        if let Some(member_id_str) = params.member_id {
+        if let Some(agent_identity) = params.agent_identity {
             // Per-member stream: subscribe to a specific member's agent events.
-            let meerkat_id = meerkat_mob::MeerkatId::from(member_id_str.as_str());
+            let identity = meerkat_mob::AgentIdentity::from(agent_identity.as_str());
             let stream: meerkat_core::comms::EventStream =
-                match handle.subscribe_agent_events(&meerkat_id).await {
+                match handle.subscribe_agent_events(&identity).await {
                     Ok(s) => s,
                     Err(e) => {
                         return RpcResponse::error(
@@ -1826,7 +1843,7 @@ impl MethodRouter {
             );
         } else {
             // Mob-wide stream: subscribe to all members' events (attributed).
-            let mut router_handle = handle.subscribe_mob_events();
+            let mut router_handle = handle.subscribe_mob_events().await;
 
             let task = tokio::spawn(async move {
                 let mut stop_rx = stop_rx;
@@ -2164,7 +2181,7 @@ mod tests {
 
     async fn test_router_with_v9_runtime() -> (MethodRouter, mpsc::Receiver<RpcNotification>) {
         let (router, notif_rx) = test_router().await;
-        let runtime_adapter = Arc::new(meerkat_runtime::RuntimeSessionAdapter::persistent(
+        let runtime_adapter = Arc::new(meerkat_runtime::MeerkatMachine::persistent(
             Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
             memory_blob_store(),
         ));
@@ -2284,6 +2301,26 @@ mod tests {
         let sink = NotificationSink::new(notif_tx);
         let router = MethodRouter::new(runtime, config_store, sink);
         (router, notif_rx)
+    }
+
+    /// Resolve the bridge session ID for a mob member via the mob state.
+    ///
+    /// Tests that need a session_id for routing should use this helper instead
+    /// of reading session_id from spawn results (which no longer carry it).
+    #[cfg(feature = "mob")]
+    async fn resolve_mob_bridge_session_id(
+        router: &MethodRouter,
+        mob_id: &str,
+        agent_identity: &str,
+    ) -> String {
+        let mob_id = meerkat_mob::MobId::from(mob_id);
+        let identity = meerkat_mob::AgentIdentity::from(agent_identity);
+        let handle = router.mob_state().handle_for(&mob_id).await.unwrap();
+        handle
+            .resolve_bridge_session_id(&identity)
+            .await
+            .expect("member should have a bridge session binding")
+            .to_string()
     }
 
     #[tokio::test]
@@ -2709,21 +2746,21 @@ mod tests {
                 serde_json::json!({
                     "mob_id": mob_id,
                     "profile": "worker",
-                    "meerkat_id": "worker-1",
+                    "agent_identity": "worker-1",
                     "runtime_mode": "turn_driven"
                 }),
             ))
             .await
             .unwrap();
         let spawned = result_value(&spawn_resp);
-        assert_eq!(spawned["meerkat_id"], "worker-1");
+        assert_eq!(spawned["agent_identity"], "worker-1");
 
         let append_resp = router
             .dispatch(make_request(
                 "mob/append_system_context",
                 serde_json::json!({
                     "mob_id": mob_id,
-                    "meerkat_id": "worker-1",
+                    "agent_identity": "worker-1",
                     "text": "Prioritize the lead.",
                     "source": "mob",
                     "idempotency_key": "ctx-worker-1"
@@ -2769,30 +2806,31 @@ mod tests {
                 serde_json::json!({
                     "mob_id": mob_id,
                     "profile": "worker",
-                    "meerkat_id": "worker-1",
+                    "agent_identity": "worker-1",
                     "runtime_mode": "turn_driven"
                 }),
             ))
             .await
             .unwrap();
         let spawned = result_value(&spawn_resp);
-        assert_eq!(spawned["meerkat_id"], "worker-1");
+        assert_eq!(spawned["agent_identity"], "worker-1");
 
         let send_resp = router
             .dispatch(make_request(
                 "mob/member_send",
                 serde_json::json!({
                     "mob_id": mob_id,
-                    "meerkat_id": "worker-1",
+                    "agent_identity": "worker-1",
                     "content": "Please acknowledge with HOST_ROUTE_OK."
                 }),
             ))
             .await
             .unwrap();
         let sent = result_value(&send_resp);
-        assert_eq!(sent["member_id"], "worker-1");
+        assert_eq!(sent["agent_identity"], "worker-1");
+        assert_eq!(sent["agent_runtime_id"]["identity"], "worker-1");
+        assert_eq!(sent["agent_runtime_id"]["generation"], 0);
         assert_eq!(sent["handling_mode"], "queue");
-        assert!(sent["session_id"].as_str().is_some());
     }
 
     #[cfg(feature = "mob")]
@@ -2829,21 +2867,21 @@ mod tests {
                 serde_json::json!({
                     "mob_id": mob_id,
                     "profile": "worker",
-                    "meerkat_id": "worker-1",
+                    "agent_identity": "worker-1",
                     "runtime_mode": "turn_driven"
                 }),
             ))
             .await
             .unwrap();
         let spawned = result_value(&spawn_resp);
-        assert_eq!(spawned["meerkat_id"], "worker-1");
+        assert_eq!(spawned["agent_identity"], "worker-1");
 
         let send_resp = router
             .dispatch(make_request(
                 "mob/member_send",
                 serde_json::json!({
                     "mob_id": mob_id,
-                    "meerkat_id": "worker-1",
+                    "agent_identity": "worker-1",
                     "content": "Please acknowledge with HOST_ROUTE_STEER.",
                     "handling_mode": "steer"
                 }),
@@ -2892,15 +2930,16 @@ mod tests {
                 serde_json::json!({
                     "mob_id": mob_id,
                     "profile": "worker",
-                    "meerkat_id": "worker-1",
+                    "agent_identity": "worker-1",
                     "runtime_mode": "turn_driven"
                 }),
             ))
             .await
             .unwrap();
         let spawned = result_value(&spawn_resp);
-        let session_id = spawned["session_id"].as_str().unwrap().to_string();
-        assert_eq!(spawned["meerkat_id"], "worker-1");
+        assert_eq!(spawned["agent_identity"], "worker-1");
+        let session_id =
+            resolve_mob_bridge_session_id(&router, "mob-routed-session", "worker-1").await;
 
         let read_resp = router
             .dispatch(make_request(
@@ -2950,22 +2989,20 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let spawn_resp = router
+        let _spawn_resp = router
             .dispatch(make_request(
                 "mob/spawn",
                 serde_json::json!({
                     "mob_id": mob_id,
                     "profile": "worker",
-                    "meerkat_id": "worker-1",
+                    "agent_identity": "worker-1",
                     "runtime_mode": "turn_driven"
                 }),
             ))
             .await
             .unwrap();
-        let session_id = result_value(&spawn_resp)["session_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let session_id =
+            resolve_mob_bridge_session_id(&router, "mob-archived-history", "worker-1").await;
 
         let archive_resp = router
             .dispatch(make_request(
@@ -3019,22 +3056,20 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let spawn_resp = router
+        let _spawn_resp = router
             .dispatch(make_request(
                 "mob/spawn",
                 serde_json::json!({
                     "mob_id": mob_id,
                     "profile": "worker",
-                    "meerkat_id": "worker-1",
+                    "agent_identity": "worker-1",
                     "runtime_mode": "turn_driven"
                 }),
             ))
             .await
             .unwrap();
-        let session_id = result_value(&spawn_resp)["session_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let session_id =
+            resolve_mob_bridge_session_id(&router, "mob-session-stream", "worker-1").await;
 
         let open_resp = router
             .dispatch(make_request(
@@ -3074,22 +3109,20 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let spawn_resp = router
+        let _spawn_resp = router
             .dispatch(make_request(
                 "mob/spawn",
                 serde_json::json!({
                     "mob_id": mob_id,
                     "profile": "worker",
-                    "meerkat_id": "worker-1",
+                    "agent_identity": "worker-1",
                     "runtime_mode": "turn_driven"
                 }),
             ))
             .await
             .unwrap();
-        let session_id = result_value(&spawn_resp)["session_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let session_id =
+            resolve_mob_bridge_session_id(&router, "mob-session-interrupt", "worker-1").await;
 
         let interrupt_resp = router
             .dispatch(make_request(
@@ -3132,22 +3165,20 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let spawn_resp = router
+        let _spawn_resp = router
             .dispatch(make_request(
                 "mob/spawn",
                 serde_json::json!({
                     "mob_id": mob_id,
                     "profile": "worker",
-                    "meerkat_id": "worker-1",
+                    "agent_identity": "worker-1",
                     "runtime_mode": "turn_driven"
                 }),
             ))
             .await
             .unwrap();
-        let session_id = result_value(&spawn_resp)["session_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let session_id =
+            resolve_mob_bridge_session_id(&router, "mob-archive-session", "worker-1").await;
 
         let archive_resp = router
             .dispatch(make_request(
@@ -3209,22 +3240,20 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let spawn_resp = router
+        let _spawn_resp = router
             .dispatch(make_request(
                 "mob/spawn",
                 serde_json::json!({
                     "mob_id": mob_id,
                     "profile": "worker",
-                    "meerkat_id": "worker-1",
+                    "agent_identity": "worker-1",
                     "runtime_mode": "turn_driven"
                 }),
             ))
             .await
             .unwrap();
-        let session_id = result_value(&spawn_resp)["session_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let session_id =
+            resolve_mob_bridge_session_id(&router, "mob-session-read", "worker-1").await;
 
         let read_resp = router
             .dispatch(make_request(
@@ -3279,22 +3308,20 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let spawn_resp = router
+        let _spawn_resp = router
             .dispatch(make_request(
                 "mob/spawn",
                 serde_json::json!({
                     "mob_id": mob_id,
                     "profile": "worker",
-                    "meerkat_id": "worker-1",
+                    "agent_identity": "worker-1",
                     "runtime_mode": "turn_driven"
                 }),
             ))
             .await
             .unwrap();
-        let session_id = result_value(&spawn_resp)["session_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let session_id =
+            resolve_mob_bridge_session_id(&router, "mob-session-history", "worker-1").await;
 
         let history_resp = router
             .dispatch(make_request(
@@ -3347,22 +3374,20 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let spawn_resp = router
+        let _spawn_resp = router
             .dispatch(make_request(
                 "mob/spawn",
                 serde_json::json!({
                     "mob_id": mob_id,
                     "profile": "worker",
-                    "meerkat_id": "worker-1",
+                    "agent_identity": "worker-1",
                     "runtime_mode": "turn_driven"
                 }),
             ))
             .await
             .unwrap();
-        let session_id = result_value(&spawn_resp)["session_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let session_id =
+            resolve_mob_bridge_session_id(&router, "mob-session-inject-context", "worker-1").await;
 
         let inject_resp = router
             .dispatch(make_request(
@@ -3724,22 +3749,20 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let spawn_resp = router
+        let _spawn_resp = router
             .dispatch(make_request(
                 "mob/spawn",
                 serde_json::json!({
                     "mob_id": mob_id,
                     "profile": "worker",
-                    "meerkat_id": "worker-1",
+                    "agent_identity": "worker-1",
                     "runtime_mode": "turn_driven"
                 }),
             ))
             .await
             .unwrap();
-        let session_id = result_value(&spawn_resp)["session_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let session_id =
+            resolve_mob_bridge_session_id(&router, "mob-archive-comms-session", "worker-1").await;
 
         let archive_resp = router
             .dispatch(make_request(
@@ -3811,25 +3834,24 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let spawn_resp = router
+        let _spawn_resp = router
             .dispatch(make_request(
                 "mob/spawn",
                 serde_json::json!({
                     "mob_id": &mob_id,
                     "profile": "lead",
-                    "meerkat_id": "lead-1",
+                    "agent_identity": "lead-1",
                     "runtime_mode": "turn_driven"
                 }),
             ))
             .await
             .unwrap();
-        let session_id = result_value(&spawn_resp)["session_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let session_id =
+            resolve_mob_bridge_session_id(&router, "mob-retiring-send", "lead-1").await;
 
         let archive = {
             let router = router.clone();
+            let session_id = session_id.clone();
             tokio::spawn(async move {
                 router
                     .dispatch(make_request(
@@ -3853,7 +3875,7 @@ mod tests {
         let members_value = result_value(&members_resp);
         let members = members_value["members"].as_array().expect("members array");
         assert_eq!(members.len(), 1, "retiring member should remain observable");
-        assert_eq!(members[0]["meerkat_id"], "lead-1");
+        assert_eq!(members[0]["agent_identity"], "lead-1");
         assert_eq!(members[0]["state"], "Retiring");
 
         let send_resp = router
@@ -3861,7 +3883,7 @@ mod tests {
                 "mob/send",
                 serde_json::json!({
                     "mob_id": &mob_id,
-                    "meerkat_id": "lead-1",
+                    "agent_identity": "lead-1",
                     "content": "do work while retiring"
                 }),
             ))
@@ -3900,22 +3922,20 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let spawn_resp = router
+        let _spawn_resp = router
             .dispatch(make_request(
                 "mob/spawn",
                 serde_json::json!({
                     "mob_id": mob_id,
                     "profile": "worker",
-                    "meerkat_id": "worker-1",
+                    "agent_identity": "worker-1",
                     "runtime_mode": "turn_driven"
                 }),
             ))
             .await
             .unwrap();
-        let session_id = result_value(&spawn_resp)["session_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let session_id =
+            resolve_mob_bridge_session_id(&router, "mob-session-terminal", "worker-1").await;
 
         let open_resp = router
             .dispatch(make_request(
@@ -4231,7 +4251,7 @@ mod tests {
             "mob/send",
             serde_json::json!({
                 "mob_id": "mob-1",
-                "meerkat_id": "worker-1",
+                "agent_identity": "worker-1",
                 "message": "legacy payload"
             }),
         );

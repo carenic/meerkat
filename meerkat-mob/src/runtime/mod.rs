@@ -3,14 +3,23 @@
 //! The mob runtime uses an actor pattern where all mutations (retire, wire,
 //! unwire, etc.) are serialized through a single command channel. Spawn
 //! provisioning is parallelized, then finalized through the same actor.
-//! Read-only operations bypass the actor and read from shared state directly.
+//!
+//! The public `MobHandle` surface is being consolidated behind one top-level
+//! machine command seam. Mutations, event surfaces, and diagnostics are routed
+//! through that seam. Canonical member lifecycle projection remains an
+//! intentional lock-free read path over shared roster/session truth so
+//! `Retiring` and supersession windows stay observable even while disposal work
+//! is in flight.
 
 use crate::backend::MobBackendKind;
 use crate::build;
 use crate::definition::MobDefinition;
 use crate::error::MobError;
 use crate::event::{MemberRef, MobEventKind, NewMobEvent};
-use crate::ids::{FlowId, MeerkatId, MobId, ProfileName, RunId, StepId, TaskId};
+use crate::ids::{
+    AgentIdentity, AgentRuntimeId, FenceToken, FlowId, MeerkatId, MobId, ProfileName, RunId,
+    StepId, TaskId, WorkOrigin, WorkRef, WorkSpec,
+};
 use crate::roster::{Roster, RosterEntry};
 use crate::run::{FlowRunConfig, MobRun};
 use crate::storage::MobStorage;
@@ -26,7 +35,7 @@ use meerkat_core::service::SessionService;
 use meerkat_core::types::{ContentInput, SessionId, ToolCallView, ToolDef, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
@@ -100,11 +109,12 @@ pub use builder::MobBuilder;
 pub use event_router::{MobEventRouterConfig, MobEventRouterHandle};
 pub use flow_frame_kernel::{FlowFrameKernel, FlowFrameMutator};
 pub use flow_run_kernel::{FlowRunKernel, FlowRunMutator};
+pub(crate) use handle::{CanonicalOpsOwnerContext, MemberSpawnReceipt};
 pub use handle::{
     HelperOptions, HelperResult, MemberDeliveryReceipt, MemberHandle, MemberRespawnReceipt,
-    MemberSessionRef, MobEventsView, MobHandle, MobMemberListEntry, MobMemberSnapshot,
-    MobMemberStatus, MobPeerConnectivitySnapshot, MobRespawnError, MobUnreachablePeer, PeerTarget,
-    SpawnMemberSpec,
+    MobEventsView, MobHandle, MobMemberListEntry, MobMemberSnapshot, MobMemberStatus,
+    MobPeerConnectivitySnapshot, MobRespawnError, MobUnreachablePeer, PeerTarget, SpawnMemberSpec,
+    SpawnResult,
 };
 pub use mob_orchestrator_authority::MobOrchestratorSnapshot;
 use pending_spawn_lineage::{PendingSpawnInsertImpact, PendingSpawnLineage};
@@ -115,3 +125,11 @@ pub use session_service::MobSessionService;
 pub use spawn_policy::{SpawnPolicy, SpawnSpec};
 pub use state::MobState;
 pub use turn_executor::{FlowTurnExecutor, FlowTurnOutcome, FlowTurnTicket, TimeoutDisposition};
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct MobFlowTrackerSnapshot {
+    pub run_task_ids: BTreeSet<RunId>,
+    pub cancel_token_ids: BTreeSet<RunId>,
+    pub stream_ids: BTreeSet<RunId>,
+    pub tracked_flows: BTreeMap<RunId, FlowId>,
+}
