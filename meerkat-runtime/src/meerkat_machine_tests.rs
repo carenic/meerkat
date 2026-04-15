@@ -8797,8 +8797,7 @@ async fn meerkat_machine_spine_snapshot_retire_splits_completion_and_wait_all_li
 }
 
 #[tokio::test]
-async fn meerkat_machine_spine_snapshot_retire_clears_steered_waiter_but_leaves_steer_queue_visible()
- {
+async fn meerkat_machine_spine_snapshot_retire_clears_steered_waiter_and_steer_queue() {
     let adapter = MeerkatMachine::ephemeral();
     let session_id = SessionId::new();
 
@@ -8897,10 +8896,9 @@ async fn meerkat_machine_spine_snapshot_retire_clears_steered_waiter_but_leaves_
     assert_eq!(after_retire.control.current_run_id, None);
     assert_eq!(after_retire.inputs.current_run_id, None);
     assert!(after_retire.inputs.queue.is_empty());
-    assert_eq!(
-        after_retire.inputs.steer_queue,
-        vec![input_id.clone()],
-        "retire currently leaves the steered input visible in the steer queue even after the steered completion waiter terminates"
+    assert!(
+        after_retire.inputs.steer_queue.is_empty(),
+        "retire should clear steered queued visibility once ledger-owned abandonment is reconciled back into ingress"
     );
     assert_eq!(after_retire.completion_waiters.input_count, 0);
     assert_eq!(after_retire.completion_waiters.waiter_count, 0);

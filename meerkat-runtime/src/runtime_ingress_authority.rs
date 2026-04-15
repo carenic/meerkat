@@ -81,15 +81,15 @@ pub enum RuntimeIngressInput {
     },
     /// Boundary applied: mark contributors as AppliedPendingConsumption.
     BoundaryApplied {
-        run_id: RunId,
+        contributing_work_ids: Vec<InputId>,
         boundary_sequence: u64,
     },
     /// Run completed: consume all contributors.
-    RunCompleted { run_id: RunId },
+    RunCompleted { contributing_work_ids: Vec<InputId> },
     /// Run failed: rollback staged contributors to queued.
-    RunFailed { run_id: RunId },
+    RunFailed { contributing_work_ids: Vec<InputId> },
     /// Run cancelled: rollback staged contributors to queued.
-    RunCancelled { run_id: RunId },
+    RunCancelled { contributing_work_ids: Vec<InputId> },
     /// Supersede a queued input with a newer one.
     SupersedeQueuedInput {
         new_work_id: InputId,
@@ -267,9 +267,6 @@ struct RuntimeIngressFields {
     terminal_outcome: HashMap<InputId, Option<InputTerminalOutcome>>,
     queue: Vec<InputId>,
     steer_queue: Vec<InputId>,
-    current_run_contributors: Vec<InputId>,
-    last_run: HashMap<InputId, Option<RunId>>,
-    last_boundary_sequence: HashMap<InputId, Option<u64>>,
 }
 
 impl RuntimeIngressFields {
@@ -286,9 +283,6 @@ impl RuntimeIngressFields {
             terminal_outcome: HashMap::new(),
             queue: Vec::new(),
             steer_queue: Vec::new(),
-            current_run_contributors: Vec::new(),
-            last_run: HashMap::new(),
-            last_boundary_sequence: HashMap::new(),
         }
     }
 }
@@ -361,24 +355,6 @@ impl RuntimeIngressAuthority {
         &self.fields.steer_queue
     }
 
-    /// The current run's contributing work IDs.
-    pub fn current_run_contributors(&self) -> &[InputId] {
-        &self.fields.current_run_contributors
-    }
-
-    /// Whether the current contributor set coheres to the provided run ID.
-    ///
-    /// This validates run identity against contributor bookkeeping without
-    /// introducing a second runtime-owned "current run" authority.
-    pub fn contributors_match_run(&self, run_id: &RunId) -> bool {
-        !self.fields.current_run_contributors.is_empty()
-            && self
-                .fields
-                .current_run_contributors
-                .iter()
-                .all(|work_id| self.last_run(work_id) == Some(run_id))
-    }
-
     /// Lifecycle state for a specific work ID.
     pub fn lifecycle_state(&self, work_id: &InputId) -> Option<InputLifecycleState> {
         self.fields.lifecycle.get(work_id).copied()
@@ -410,19 +386,6 @@ impl RuntimeIngressAuthority {
     /// Reservation key for a specific work ID.
     pub fn reservation_key(&self, work_id: &InputId) -> Option<ReservationKey> {
         self.fields.reservation_key.get(work_id).cloned().flatten()
-    }
-
-    /// Last run ID for a specific work ID.
-    pub fn last_run(&self, work_id: &InputId) -> Option<&RunId> {
-        self.fields.last_run.get(work_id).and_then(|o| o.as_ref())
-    }
-
-    /// Last boundary sequence for a specific work ID.
-    pub fn last_boundary_sequence(&self, work_id: &InputId) -> Option<u64> {
-        self.fields
-            .last_boundary_sequence
-            .get(work_id)
-            .and_then(|o| *o)
     }
 
     /// Handling mode for a specific work ID.
@@ -547,15 +510,21 @@ impl RuntimeIngressAuthority {
             } => self.eval_stage_drain_snapshot(run_id, contributing_work_ids),
 
             RuntimeIngressInput::BoundaryApplied {
-                run_id,
+                contributing_work_ids,
                 boundary_sequence,
-            } => self.eval_boundary_applied(run_id, *boundary_sequence),
+            } => self.eval_boundary_applied(contributing_work_ids, *boundary_sequence),
 
-            RuntimeIngressInput::RunCompleted { run_id } => self.eval_run_completed(run_id),
+            RuntimeIngressInput::RunCompleted {
+                contributing_work_ids,
+            } => self.eval_run_completed(contributing_work_ids),
 
-            RuntimeIngressInput::RunFailed { run_id } => self.eval_run_failed(run_id),
+            RuntimeIngressInput::RunFailed {
+                contributing_work_ids,
+            } => self.eval_run_failed(contributing_work_ids),
 
-            RuntimeIngressInput::RunCancelled { run_id } => self.eval_run_cancelled(run_id),
+            RuntimeIngressInput::RunCancelled {
+                contributing_work_ids,
+            } => self.eval_run_cancelled(contributing_work_ids),
 
             RuntimeIngressInput::SupersedeQueuedInput {
                 new_work_id,
@@ -640,8 +609,6 @@ impl RuntimeIngressAuthority {
             .lifecycle
             .insert(work_id.clone(), InputLifecycleState::Queued);
         fields.terminal_outcome.insert(work_id.clone(), None);
-        fields.last_run.insert(work_id.clone(), None);
-        fields.last_boundary_sequence.insert(work_id.clone(), None);
 
         // Route to queue or steer_queue based on handling mode
         match handling_mode {
@@ -775,8 +742,6 @@ impl RuntimeIngressAuthority {
         fields
             .terminal_outcome
             .insert(work_id.clone(), Some(InputTerminalOutcome::Consumed));
-        fields.last_run.insert(work_id.clone(), None);
-        fields.last_boundary_sequence.insert(work_id.clone(), None);
 
         effects.push(RuntimeIngressEffect::IngressAccepted {
             work_id: work_id.clone(),
@@ -803,13 +768,6 @@ impl RuntimeIngressAuthority {
         run_id: &RunId,
         contributing_work_ids: &[InputId],
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
-        // Guard: no_current_run
-        if !self.fields.current_run_contributors.is_empty() {
-            return Err(RuntimeIngressError::GuardFailed {
-                guard: "no_current_run: a run is already in progress".into(),
-            });
-        }
-
         // Guard: contributors_non_empty
         if contributing_work_ids.is_empty() {
             return Err(RuntimeIngressError::GuardFailed {
@@ -853,13 +811,9 @@ impl RuntimeIngressAuthority {
             seq_remove_all(&mut fields.steer_queue, contributing_work_ids);
         }
 
-        // Set current run
-        fields.current_run_contributors = contributing_work_ids.to_vec();
-
         // Transition contributors to Staged and emit per-input StageInput effects
         // so the shell derives per-input lifecycle transitions from this authority.
         for wid in contributing_work_ids {
-            fields.last_run.insert(wid.clone(), Some(run_id.clone()));
             fields
                 .lifecycle
                 .insert(wid.clone(), InputLifecycleState::Staged);
@@ -880,18 +834,17 @@ impl RuntimeIngressAuthority {
 
     fn eval_boundary_applied(
         &self,
-        run_id: &RunId,
-        boundary_sequence: u64,
+        contributing_work_ids: &[InputId],
+        _boundary_sequence: u64,
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
-        // Guard: run_matches_current
-        if !self.contributors_match_run(run_id) {
+        if contributing_work_ids.is_empty() {
             return Err(RuntimeIngressError::GuardFailed {
-                guard: format!("run_matches_current: contributors do not match {run_id:?}"),
+                guard: "current_run_present: no contributors are staged".into(),
             });
         }
 
         // Guard: contributors_are_staged
-        for wid in &self.fields.current_run_contributors {
+        for wid in contributing_work_ids {
             let lifecycle = self.fields.lifecycle.get(wid);
             if lifecycle != Some(&InputLifecycleState::Staged) {
                 return Err(RuntimeIngressError::GuardFailed {
@@ -904,13 +857,10 @@ impl RuntimeIngressAuthority {
         let mut effects = Vec::new();
 
         // Transition contributors to AppliedPendingConsumption
-        for wid in &fields.current_run_contributors.clone() {
+        for wid in contributing_work_ids {
             fields
                 .lifecycle
                 .insert(wid.clone(), InputLifecycleState::AppliedPendingConsumption);
-            fields
-                .last_boundary_sequence
-                .insert(wid.clone(), Some(boundary_sequence));
         }
 
         effects.push(RuntimeIngressEffect::IngressNotice {
@@ -923,17 +873,16 @@ impl RuntimeIngressAuthority {
 
     fn eval_run_completed(
         &self,
-        run_id: &RunId,
+        contributing_work_ids: &[InputId],
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
-        // Guard: run_matches_current
-        if !self.contributors_match_run(run_id) {
+        if contributing_work_ids.is_empty() {
             return Err(RuntimeIngressError::GuardFailed {
-                guard: format!("run_matches_current: contributors do not match {run_id:?}"),
+                guard: "current_run_present: no contributors are staged".into(),
             });
         }
 
         // Guard: contributors_pending_consumption
-        for wid in &self.fields.current_run_contributors {
+        for wid in contributing_work_ids {
             let lifecycle = self.fields.lifecycle.get(wid);
             if lifecycle != Some(&InputLifecycleState::AppliedPendingConsumption) {
                 return Err(RuntimeIngressError::GuardFailed {
@@ -946,7 +895,7 @@ impl RuntimeIngressAuthority {
         let mut effects = Vec::new();
 
         // Consume all contributors
-        for wid in &fields.current_run_contributors.clone() {
+        for wid in contributing_work_ids {
             fields
                 .lifecycle
                 .insert(wid.clone(), InputLifecycleState::Consumed);
@@ -963,20 +912,16 @@ impl RuntimeIngressAuthority {
             });
         }
 
-        // Clear current run
-        fields.current_run_contributors = Vec::new();
-
         Ok((fields, effects))
     }
 
     fn eval_run_failed(
         &self,
-        run_id: &RunId,
+        contributing_work_ids: &[InputId],
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
-        // Guard: run_matches_current
-        if !self.contributors_match_run(run_id) {
+        if contributing_work_ids.is_empty() {
             return Err(RuntimeIngressError::GuardFailed {
-                guard: format!("run_matches_current: contributors do not match {run_id:?}"),
+                guard: "current_run_present: no contributors are staged".into(),
             });
         }
 
@@ -984,7 +929,7 @@ impl RuntimeIngressAuthority {
         let mut effects = Vec::new();
 
         // Rollback staged contributors to Queued and re-enqueue
-        for wid in &fields.current_run_contributors.clone() {
+        for wid in contributing_work_ids {
             let lifecycle = fields.lifecycle.get(wid);
             if lifecycle == Some(&InputLifecycleState::Staged) {
                 fields
@@ -1011,9 +956,6 @@ impl RuntimeIngressAuthority {
             }
         }
 
-        // Clear current run
-        fields.current_run_contributors = Vec::new();
-
         // Wake if there's still work in the queue
         if !fields.queue.is_empty() || !fields.steer_queue.is_empty() {
             effects.push(RuntimeIngressEffect::WakeRuntime);
@@ -1029,13 +971,12 @@ impl RuntimeIngressAuthority {
 
     fn eval_run_cancelled(
         &self,
-        run_id: &RunId,
+        contributing_work_ids: &[InputId],
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Same logic as RunFailed per the schema.
-        // Guard: run_matches_current
-        if !self.contributors_match_run(run_id) {
+        if contributing_work_ids.is_empty() {
             return Err(RuntimeIngressError::GuardFailed {
-                guard: format!("run_matches_current: contributors do not match {run_id:?}"),
+                guard: "current_run_present: no contributors are staged".into(),
             });
         }
 
@@ -1043,7 +984,7 @@ impl RuntimeIngressAuthority {
         let mut effects = Vec::new();
 
         // Rollback staged contributors
-        for wid in &fields.current_run_contributors.clone() {
+        for wid in contributing_work_ids {
             let lifecycle = fields.lifecycle.get(wid);
             if lifecycle == Some(&InputLifecycleState::Staged) {
                 fields
@@ -1068,8 +1009,6 @@ impl RuntimeIngressAuthority {
                 });
             }
         }
-
-        fields.current_run_contributors = Vec::new();
 
         if !fields.queue.is_empty() || !fields.steer_queue.is_empty() {
             effects.push(RuntimeIngressEffect::WakeRuntime);
@@ -1195,13 +1134,6 @@ impl RuntimeIngressAuthority {
     fn eval_reset(
         &self,
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
-        // Guard: no_current_run (can't reset while a run is in progress)
-        if !self.fields.current_run_contributors.is_empty() {
-            return Err(RuntimeIngressError::GuardFailed {
-                guard: "no_current_run: cannot reset while a run is in progress".into(),
-            });
-        }
-
         let mut fields = self.fields.clone();
         let mut effects = Vec::new();
 
@@ -1237,7 +1169,6 @@ impl RuntimeIngressAuthority {
         // Drain queues
         fields.queue.clear();
         fields.steer_queue.clear();
-        fields.current_run_contributors = Vec::new();
         effects.push(RuntimeIngressEffect::IngressNotice {
             kind: "Reset".into(),
             detail: "IngressReset".into(),
@@ -1283,7 +1214,6 @@ impl RuntimeIngressAuthority {
 
         fields.queue.clear();
         fields.steer_queue.clear();
-        fields.current_run_contributors = Vec::new();
         effects.push(RuntimeIngressEffect::IngressNotice {
             kind: "Destroy".into(),
             detail: "IngressDestroyed".into(),
@@ -1328,7 +1258,6 @@ impl RuntimeIngressAuthority {
 
         fields.queue.clear();
         fields.steer_queue.clear();
-        fields.current_run_contributors = Vec::new();
         effects.push(RuntimeIngressEffect::IngressNotice {
             kind: "Stop".into(),
             detail: "IngressStopped".into(),
@@ -1388,32 +1317,6 @@ impl RuntimeIngressAuthority {
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         let mut fields = self.fields.clone();
         let mut effects = Vec::new();
-
-        // Rollback any in-flight staged contributors
-        if !fields.current_run_contributors.is_empty() {
-            for wid in &fields.current_run_contributors.clone() {
-                let lifecycle = fields.lifecycle.get(wid);
-                if lifecycle == Some(&InputLifecycleState::Staged) {
-                    fields
-                        .lifecycle
-                        .insert(wid.clone(), InputLifecycleState::Queued);
-                    let hm = fields.handling_mode.get(wid).copied();
-                    match hm {
-                        Some(HandlingMode::Steer) => {
-                            if !fields.steer_queue.contains(wid) {
-                                fields.steer_queue.insert(0, wid.clone());
-                            }
-                        }
-                        _ => {
-                            if !fields.queue.contains(wid) {
-                                fields.queue.insert(0, wid.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            fields.current_run_contributors = Vec::new();
-        }
 
         // Emit per-input recovery effects for all non-terminal inputs.
         // The authority inspects each input's lifecycle state and policy snapshot
@@ -1660,10 +1563,25 @@ mod tests {
         .expect("admit consumed should succeed")
     }
 
-    fn current_run_for_test(auth: &RuntimeIngressAuthority) -> Option<&RunId> {
-        auth.current_run_contributors()
-            .first()
-            .and_then(|work_id| auth.last_run(work_id))
+    fn current_run_contributors_for_test(auth: &RuntimeIngressAuthority) -> Vec<InputId> {
+        auth.admission_order()
+            .iter()
+            .filter(|work_id| {
+                matches!(
+                    auth.lifecycle_state(work_id),
+                    Some(
+                        InputLifecycleState::Staged
+                            | InputLifecycleState::Applied
+                            | InputLifecycleState::AppliedPendingConsumption
+                    )
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn has_current_run_for_test(auth: &RuntimeIngressAuthority) -> bool {
+        !current_run_contributors_for_test(auth).is_empty()
     }
 
     // ---- Lifecycle-free helper behavior ----
@@ -1673,7 +1591,7 @@ mod tests {
         let auth = RuntimeIngressAuthority::new();
         assert!(auth.queue().is_empty());
         assert!(auth.steer_queue().is_empty());
-        assert!(current_run_for_test(&auth).is_none());
+        assert!(!has_current_run_for_test(&auth));
     }
 
     #[test]
@@ -1914,8 +1832,11 @@ mod tests {
             .expect("stage should succeed");
 
         assert!(auth.queue().is_empty());
-        assert_eq!(current_run_for_test(&auth), Some(&run_id));
-        assert_eq!(auth.current_run_contributors(), &[w1.clone(), w2.clone()]);
+        assert!(has_current_run_for_test(&auth));
+        assert_eq!(
+            current_run_contributors_for_test(&auth),
+            vec![w1.clone(), w2.clone()]
+        );
         assert_eq!(auth.lifecycle_state(&w1), Some(InputLifecycleState::Staged));
         assert_eq!(auth.lifecycle_state(&w2), Some(InputLifecycleState::Staged));
         assert!(
@@ -1926,7 +1847,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_drain_rejected_with_current_run() {
+    fn stage_drain_helper_no_longer_owns_active_run_exclusion() {
         let mut auth = RuntimeIngressAuthority::new();
         let w1 = InputId::new();
         let w2 = InputId::new();
@@ -1940,15 +1861,14 @@ mod tests {
         })
         .unwrap();
 
-        // Try staging w2 while run is in progress
-        let result = auth.apply(RuntimeIngressInput::StageDrainSnapshot {
+        // The helper no longer owns the "one active run at a time" rule; the
+        // top-level Meerkat machine owns it. A second standalone stage call is
+        // therefore legal here as pure queue bookkeeping.
+        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
             run_id: RunId::new(),
             contributing_work_ids: vec![w2],
-        });
-        assert!(matches!(
-            result,
-            Err(RuntimeIngressError::GuardFailed { .. })
-        ));
+        })
+        .expect("standalone helper stage should succeed without control-phase context");
     }
 
     #[test]
@@ -1994,7 +1914,7 @@ mod tests {
 
         let t = auth
             .apply(RuntimeIngressInput::BoundaryApplied {
-                run_id: run_id.clone(),
+                contributing_work_ids: vec![w1.clone()],
                 boundary_sequence: 42,
             })
             .expect("boundary applied should succeed");
@@ -2003,7 +1923,6 @@ mod tests {
             auth.lifecycle_state(&w1),
             Some(InputLifecycleState::AppliedPendingConsumption)
         );
-        assert_eq!(auth.last_boundary_sequence(&w1), Some(42));
         assert!(
             t.effects
                 .iter()
@@ -2012,19 +1931,13 @@ mod tests {
     }
 
     #[test]
-    fn boundary_applied_wrong_run_rejected() {
+    fn boundary_applied_without_staged_contributors_rejected() {
         let mut auth = RuntimeIngressAuthority::new();
         let w1 = InputId::new();
         admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
 
-        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
-            run_id: RunId::new(),
-            contributing_work_ids: vec![w1.clone()],
-        })
-        .unwrap();
-
         let result = auth.apply(RuntimeIngressInput::BoundaryApplied {
-            run_id: RunId::new(), // wrong run
+            contributing_work_ids: vec![w1.clone()],
             boundary_sequence: 1,
         });
         assert!(matches!(
@@ -2048,14 +1961,14 @@ mod tests {
         })
         .unwrap();
         auth.apply(RuntimeIngressInput::BoundaryApplied {
-            run_id: run_id.clone(),
+            contributing_work_ids: vec![w1.clone()],
             boundary_sequence: 1,
         })
         .unwrap();
 
         let t = auth
             .apply(RuntimeIngressInput::RunCompleted {
-                run_id: run_id.clone(),
+                contributing_work_ids: vec![w1.clone()],
             })
             .expect("run completed should succeed");
 
@@ -2063,8 +1976,8 @@ mod tests {
             auth.lifecycle_state(&w1),
             Some(InputLifecycleState::Consumed)
         );
-        assert!(current_run_for_test(&auth).is_none());
-        assert!(auth.current_run_contributors().is_empty());
+        assert!(!has_current_run_for_test(&auth));
+        assert!(current_run_contributors_for_test(&auth).is_empty());
         assert!(t.effects.iter().any(|e| matches!(
             e,
             RuntimeIngressEffect::CompletionResolved {
@@ -2091,13 +2004,13 @@ mod tests {
 
         let transition = auth
             .apply(RuntimeIngressInput::RunFailed {
-                run_id: run_id.clone(),
+                contributing_work_ids: vec![w1.clone()],
             })
             .expect("run failed should succeed");
 
         assert_eq!(auth.lifecycle_state(&w1), Some(InputLifecycleState::Queued));
         assert!(auth.queue().contains(&w1));
-        assert!(current_run_for_test(&auth).is_none());
+        assert!(!has_current_run_for_test(&auth));
         assert!(
             transition
                 .effects
@@ -2118,8 +2031,10 @@ mod tests {
             contributing_work_ids: vec![w1.clone()],
         })
         .unwrap();
-        auth.apply(RuntimeIngressInput::RunFailed { run_id })
-            .unwrap();
+        auth.apply(RuntimeIngressInput::RunFailed {
+            contributing_work_ids: vec![w1.clone()],
+        })
+        .unwrap();
 
         let transition = auth
             .apply(RuntimeIngressInput::ReconcileTerminalInputs {
@@ -2170,7 +2085,7 @@ mod tests {
         .unwrap();
 
         auth.apply(RuntimeIngressInput::RunCancelled {
-            run_id: run_id.clone(),
+            contributing_work_ids: vec![w1.clone()],
         })
         .expect("run cancelled should succeed");
 
@@ -2257,7 +2172,7 @@ mod tests {
             .expect("recover should succeed");
 
         assert_eq!(auth.lifecycle_state(&w1), Some(InputLifecycleState::Queued));
-        assert!(current_run_for_test(&auth).is_none());
+        assert!(!has_current_run_for_test(&auth));
         assert!(auth.queue().contains(&w1));
         assert!(
             transition
@@ -2362,14 +2277,14 @@ mod tests {
 
         // Boundary applied
         auth.apply(RuntimeIngressInput::BoundaryApplied {
-            run_id: run_id.clone(),
+            contributing_work_ids: vec![w1.clone(), w2.clone()],
             boundary_sequence: 1,
         })
         .unwrap();
 
         // Run completed
         auth.apply(RuntimeIngressInput::RunCompleted {
-            run_id: run_id.clone(),
+            contributing_work_ids: vec![w1.clone(), w2.clone()],
         })
         .unwrap();
 
@@ -2381,7 +2296,7 @@ mod tests {
             auth.lifecycle_state(&w2),
             Some(InputLifecycleState::Consumed)
         );
-        assert!(current_run_for_test(&auth).is_none());
+        assert!(!has_current_run_for_test(&auth));
         assert!(auth.queue().is_empty());
     }
 
@@ -2442,22 +2357,23 @@ mod tests {
     }
 
     #[test]
-    fn reset_rejected_during_run() {
+    fn reset_helper_allows_staged_cleanup_without_control_phase() {
         let mut auth = RuntimeIngressAuthority::new();
         let w1 = InputId::new();
         admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
 
         auth.apply(RuntimeIngressInput::StageDrainSnapshot {
             run_id: RunId::new(),
-            contributing_work_ids: vec![w1],
+            contributing_work_ids: vec![w1.clone()],
         })
         .unwrap();
 
-        let result = auth.apply(RuntimeIngressInput::Reset);
-        assert!(matches!(
-            result,
-            Err(RuntimeIngressError::GuardFailed { .. })
-        ));
+        auth.apply(RuntimeIngressInput::Reset)
+            .expect("helper reset should abandon staged work without control-phase context");
+        assert_eq!(
+            auth.lifecycle_state(&w1),
+            Some(InputLifecycleState::Abandoned)
+        );
     }
 
     // ---- Retire does not prevent drain bookkeeping ----
@@ -2479,13 +2395,13 @@ mod tests {
         .unwrap();
 
         auth.apply(RuntimeIngressInput::BoundaryApplied {
-            run_id: run_id.clone(),
+            contributing_work_ids: vec![w1.clone()],
             boundary_sequence: 1,
         })
         .unwrap();
 
         auth.apply(RuntimeIngressInput::RunCompleted {
-            run_id: run_id.clone(),
+            contributing_work_ids: vec![w1.clone()],
         })
         .unwrap();
 
@@ -2503,32 +2419,33 @@ mod tests {
         assert!(auth.can_accept(&RuntimeIngressInput::Retire));
         // Reset from Active with no current run should succeed
         assert!(auth.can_accept(&RuntimeIngressInput::Reset));
-        assert!(current_run_for_test(&auth).is_none());
+        assert!(!has_current_run_for_test(&auth));
     }
 
     #[test]
     fn can_accept_reset_from_active() {
         let auth = RuntimeIngressAuthority::new();
         assert!(auth.can_accept(&RuntimeIngressInput::Reset));
-        assert!(current_run_for_test(&auth).is_none());
+        assert!(!has_current_run_for_test(&auth));
     }
 
     // ---- State unchanged on failure ----
 
     #[test]
-    fn helper_state_unchanged_on_rejected_transition() {
+    fn helper_state_unchanged_on_rejected_prefix_mismatch() {
         let mut auth = RuntimeIngressAuthority::new();
-        let w1 = InputId::new();
-        admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
-        let run_id = RunId::new();
-        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
-            run_id,
-            contributing_work_ids: vec![w1.clone()],
-        })
-        .unwrap();
-        let result = auth.apply(RuntimeIngressInput::Reset);
+        let w_queue = InputId::new();
+        let w_steer = InputId::new();
+        admit_queued(&mut auth, w_queue.clone(), HandlingMode::Queue);
+        admit_queued(&mut auth, w_steer.clone(), HandlingMode::Steer);
+
+        let result = auth.apply(RuntimeIngressInput::StageDrainSnapshot {
+            run_id: RunId::new(),
+            contributing_work_ids: vec![w_queue.clone()],
+        });
         assert!(result.is_err());
-        assert_eq!(auth.current_run_contributors(), &[w1]);
+        assert_eq!(auth.queue(), &[w_queue]);
+        assert_eq!(auth.steer_queue(), &[w_steer]);
     }
 
     // ---- Steer rollback goes to steer_queue ----
@@ -2547,7 +2464,7 @@ mod tests {
         .unwrap();
 
         auth.apply(RuntimeIngressInput::RunFailed {
-            run_id: run_id.clone(),
+            contributing_work_ids: vec![w1.clone()],
         })
         .unwrap();
 

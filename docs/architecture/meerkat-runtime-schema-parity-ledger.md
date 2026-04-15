@@ -202,6 +202,15 @@ Current exact-parity state:
   validates contributor `last_run` metadata directly against the control-owned
   run ID, and the diagnostic spine echoes `current_run_id` from control rather
   than from ingress
+- the ingress helper now also no longer owns contributor-set / per-input
+  run-boundary shadow truth:
+  `current_run_contributors`, helper-side `last_run`, and helper-side
+  `last_boundary_sequence` are gone, run-event calls carry explicit
+  contributor IDs, and the diagnostic spine derives contributor membership plus
+  run/boundary metadata from the canonical input lifecycle ledger instead
+- terminalization now reconciles back into ingress queue visibility from the
+  ledger owner too, so retire/reset/stop/destroy no longer leave ghost queued
+  entries behind after the canonical input state has already moved terminal
 - the formal machine now also models the `Running -> Retired` terminal return
   that live runtime already used during drain/retire flow, and the runtime-side
   return-phase classifier is now a machine-owned helper instead of a

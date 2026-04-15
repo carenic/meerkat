@@ -3292,30 +3292,55 @@ impl MeerkatMachine {
             },
         };
 
-        let admission_order = ingress
+        let admission_order: Vec<MeerkatAdmittedInputSnapshot> = ingress
             .admission_order()
             .iter()
             .cloned()
-            .map(|input_id| MeerkatAdmittedInputSnapshot {
-                content_shape: ingress.content_shape(&input_id),
-                request_id: ingress.request_id(&input_id),
-                reservation_key: ingress.reservation_key(&input_id),
-                handling_mode: ingress.handling_mode(&input_id),
-                lifecycle: ingress.lifecycle_state(&input_id),
-                terminal_outcome: ingress.terminal_outcome(&input_id).cloned(),
-                last_run_id: ingress.last_run(&input_id).cloned(),
-                last_boundary_sequence: ingress.last_boundary_sequence(&input_id),
-                is_prompt: ingress.is_prompt(&input_id),
-                input_id,
+            .map(|input_id| {
+                let ledger_state = driver.ledger().get(&input_id);
+                MeerkatAdmittedInputSnapshot {
+                    content_shape: ingress.content_shape(&input_id),
+                    request_id: ingress.request_id(&input_id),
+                    reservation_key: ingress.reservation_key(&input_id),
+                    handling_mode: ingress.handling_mode(&input_id),
+                    lifecycle: ledger_state.map(crate::input_state::InputState::current_state),
+                    terminal_outcome: ledger_state
+                        .and_then(|state| state.terminal_outcome().cloned()),
+                    last_run_id: ledger_state.and_then(|state| state.last_run_id().cloned()),
+                    last_boundary_sequence: ledger_state
+                        .and_then(crate::input_state::InputState::last_boundary_sequence),
+                    is_prompt: ingress.is_prompt(&input_id),
+                    input_id,
+                }
             })
             .collect();
+
+        let current_run_contributors = if let Some(control_run_id) = &control.current_run_id {
+            admission_order
+                .iter()
+                .filter(|snapshot| {
+                    snapshot.last_run_id.as_ref() == Some(control_run_id)
+                        && matches!(
+                            snapshot.lifecycle,
+                            Some(
+                                crate::input_state::InputLifecycleState::Staged
+                                    | crate::input_state::InputLifecycleState::Applied
+                                    | crate::input_state::InputLifecycleState::AppliedPendingConsumption
+                            )
+                        )
+                })
+                .map(|snapshot| snapshot.input_id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let inputs = MeerkatInputsSnapshot {
             admission_order,
             queue: ingress.queue().to_vec(),
             steer_queue: ingress.steer_queue().to_vec(),
             current_run_id: control.current_run_id.clone(),
-            current_run_contributors: ingress.current_run_contributors().to_vec(),
+            current_run_contributors,
             post_admission_signal: format!("{:?}", driver.post_admission_signal()),
             silent_intent_overrides: driver.silent_comms_intents().into_iter().collect(),
         };

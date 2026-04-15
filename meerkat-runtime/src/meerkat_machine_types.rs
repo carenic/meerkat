@@ -614,14 +614,22 @@ impl MeerkatMachineSpineSnapshot {
             }
         }
 
-        // ContributorLifecycleInvariant: all current_run_contributors must have lifecycle=Staged
+        // ContributorLifecycleInvariant: all current_run_contributors must
+        // still belong to the active run lifecycle slice.
         for cid in &self.inputs.current_run_contributors {
             if let Some(snap) = self
                 .inputs
                 .admission_order
                 .iter()
                 .find(|a| &a.input_id == cid)
-                && snap.lifecycle != Some(InputLifecycleState::Staged)
+                && !matches!(
+                    snap.lifecycle,
+                    Some(
+                        InputLifecycleState::Staged
+                            | InputLifecycleState::Applied
+                            | InputLifecycleState::AppliedPendingConsumption
+                    )
+                )
             {
                 violations.push(format!(
                     "ContributorLifecycleInvariant: contributor {cid} has lifecycle {:?}",
