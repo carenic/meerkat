@@ -68,6 +68,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ListMembersIncludingRetiring`
 - `ListAllMembers`
 - `MemberStatus`
+- `CancelWork`
 - `PollEvents`
 - `ReplayAllEvents`
 - `GetMember`
@@ -594,7 +595,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ### `DestroyFromAny`
 - From: `Running`, `Stopped`, `Completed`
 - On: `Destroy`()
-- Emits: `EmitMemberLifecycleNotice`
 - To: `Destroyed`
 
 ### `RespawnRunning`
@@ -602,30 +602,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `Respawn`(agent_runtime_id)
 - Emits: `ExposePendingSpawn`
 - To: `Running`
-
-### `CancelWorkRunning`
-- From: `Running`
-- On: `CancelWork`(work_id)
-- Emits: `FlowTerminalized`
-- To: `Running`
-
-### `CancelWorkStopped`
-- From: `Stopped`
-- On: `CancelWork`(work_id)
-- Emits: `FlowTerminalized`
-- To: `Stopped`
-
-### `CancelWorkCompleted`
-- From: `Completed`
-- On: `CancelWork`(work_id)
-- Emits: `FlowTerminalized`
-- To: `Completed`
-
-### `CancelWorkDestroyed`
-- From: `Destroyed`
-- On: `CancelWork`(work_id)
-- Emits: `FlowTerminalized`
-- To: `Destroyed`
 
 ### `CancelAllWorkRunning`
 - From: `Running`

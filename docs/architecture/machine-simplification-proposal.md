@@ -60,11 +60,18 @@ Hopcroft-style behavioral quotient over the reachable graph.
   `RequestRuntimeBinding` emission to consume the transition bindings directly,
   so the formal machine no longer stores a generation value purely to replay it
   into a routed seam effect.
+- Moved Mob `CancelWork` into `surface_only_inputs`, because the runtime
+  behavior is keyed to concrete `WorkRef` lineage rather than to a top-level
+  lifecycle transition surface.
 - Removed the Meerkat LLM/capability projection layer
   (`current_llm_identity`, `current_capability_surface`,
   `capability_surface_status`, `capability_base_filter`,
   `inherited_base_filter`) from the formal state while keeping the live runtime
   ownership, exact runtime behavior, and routed seam effects unchanged.
+- Taught the generated closed-world composition models to reject queued
+  external entry packets that are no longer admissible for the current machine
+  state, which removes seam deadlocks without widening the machine transition
+  graphs.
 - Cleared the full phase-exit workspace gates on the rebased branch tip: `./scripts/repo-cargo nextest run --workspace` finished with 4,305 passing tests / 149 skipped, and `./scripts/repo-cargo clippy --workspace -- -D warnings` finished clean after fixing branch-head regressions in tool-visibility boundary change detection, stale semantic-model expectations, and idle-session LLM hot-swap fallback handling.
 - Regenerated machine/composition artifacts and re-ran schema parity, drift, TLC, render, runtime, and owner tests on top of the landed tranches.
 
@@ -104,6 +111,7 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | `Creating` vs `Running` can merge internally | passed / landed | Fresh and resumed mobs already surface `Running`; removed the dead formal `Creating` phase and `Start` signal without changing the public `MobState` enum. |
 | Mob work/task/subscription shadow counters should not stay as top-level formal state | passed / landed | Removed `inflight_work_id`, `task_count`, and `event_subscription_count`; exact Mob parity stayed green and TLC distinct states fell from 4,797 to 1,390 while the raw/phase quotients stayed at 202 / 204. |
 | Mob `current_generation` should not stay as top-level seam-shadow state | passed / landed | Removed `current_generation` and emitted `RequestRuntimeBinding.generation` directly from the transition bindings; exact Mob parity stayed green and the truthful Hopcroft/TLC readout stayed unchanged, proving the field was fully correlated rather than behavior-bearing. |
+| Mob `CancelWork` should stay surfaced without formal transition coverage | passed / landed | Moved `CancelWork` to `surface_only_inputs`; exact Mob parity stayed green, the truthful TLC state space fell from 1,390 to 1,214, and the raw/phase quotients tightened from 202 / 204 to 187 / 189. |
 | Meerkat `Recovering` is a transient / no-op top-level phase | passed / landed | Removed the unreachable top-level `Recovering` phase from the formal model; the internal `RuntimeControlAuthority` still owns recovery/recycle transitions, and TLC state space stayed unchanged. |
 | Meerkat pure queries should stay surfaced without formal transitions | passed / landed | Moved the read-only helper/query family into `surface_only_inputs`; runtime/schema audits stayed green and Meerkat TLC generated states dropped from 3,668,832 to 3,113,272 while the raw/phase quotients stayed at 385 / 390. |
 | Meerkat committed visibility publication progress should not stay as top-level shadow state | passed / landed | Removed `committed_visibility_revision` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 59,371 to 45,610 while the raw/phase quotients stayed at 385 / 390. |
@@ -350,11 +358,13 @@ The checked-in row ledger for that audit now lives in
 
 - Audited lifecycle pairs: `Running <-> Stopped`, `Completed <-> Running`,
   `Completed <-> Stopped`
-- Transition-bearing rows in scope: `65`
-- Runtime probes implemented: `65`
-- Schema/runtime alignments: `65`
+- Transition-bearing rows in scope: `62`
+- Runtime probes implemented: `62`
+- Schema/runtime alignments: `62`
 - Schema/runtime mismatches: `0`
 - Remaining unprobed rows: `0`
+- Modeled-state rows in scope: `78`
+- Modeled-state rows aligned: `78`
 
 The Mob lifecycle triangle is now fully probed and green on the current
 representative pre-state frontier.
@@ -374,6 +384,10 @@ The Mob parity pass closed three concrete issues:
   treating every phase-local transition as always enabled
 - the full lifecycle triangle is now exact on the current transition-bearing
   frontier
+- the stricter modeled-state triangle is also exact (`78 / 78 / 78 / 0`)
+- `CancelWork` turned out not to belong in the formal top-level transition
+  graph; it is now surfaced-only, and the generated seam rejects impossible
+  queued external entry packets instead of deadlocking once Mob is terminal
 
 ### Post-parity Mob rerun
 
@@ -393,15 +407,15 @@ cargo run -p xtask --features machine-authority -- \
 
 Current result:
 
-- reachable states: `1,390`
-- raw quotient states: `202`
-- phase-observed quotient states: `204`
-- full-observed quotient states: `1,390`
-- TLC: `45,831 generated / 1,390 distinct / depth 7`
-- dominant mixed block: `705` states spanning `Running`, `Stopped`, and
+- reachable states: `1,214`
+- raw quotient states: `187`
+- phase-observed quotient states: `189`
+- full-observed quotient states: `1,214`
+- TLC: `38,134 generated / 1,214 distinct / depth 7`
+- dominant mixed block: `585` states spanning `Running`, `Stopped`, and
   `Completed`
-- dominant block tuples: `379`
-- tuples reused across multiple phases: `169`
+- dominant block tuples: `316`
+- tuples reused across multiple phases: `149`
 - maximum phases sharing one tuple: `3`
 
 The dominant Mob block is now being split primarily by the remaining
@@ -411,15 +425,17 @@ runtime-backed or seam-facing dimensions, not by the removed shadow counters:
 - `wiring_edge_count`
 - `active_run_count`
 - `active_member_count`
-- `retiring_member_count`
 - `active_fence_token`
 - `active_runtime_id`
 - `coordinator_bound`
+- `active_identity`
 
-The important read is that the raw quotient stayed at `202` even as the
-reachable state space collapsed from `4,797` to `1,390`. That means the removed
-fields were carrying presentation-only distinctions, not additional labeled
-behavior. This is the exact kind of simplification we want before DSL work.
+The important read is that the raw quotient has continued to fall only when we
+removed formal distinctions that were still present in the truthful state
+graph. The reachable space is now down from `4,797` to `1,214`, while the raw
+quotient is down to `187`. That means the remaining reductions are still coming
+from real formal-state normalization rather than from papering over runtime
+behavior.
 
 We then removed the residual top-level `current_generation` seam-shadow field
 and re-ran the same trustworthy Mob lanes. The readout stayed flat:
@@ -434,6 +450,20 @@ That is a useful result in its own right: `current_generation` was not merely
 low-signal, it was fully correlated with the remaining field tuple on the
 current truthful state graph. Removing it simplified the formal contract
 without reducing the modeled behavior.
+
+The later `CancelWork` extraction plus composition-side external-entry
+rejection pass tightened the truthful graph again:
+
+- reachable states: `1,214`
+- raw quotient states: `187`
+- phase-observed quotient states: `189`
+- full-observed quotient states: `1,214`
+- TLC: `38,134 generated / 1,214 distinct / depth 7`
+
+That cut is also a good architecture read. The top-level Mob machine should
+own lifecycle and orchestration truth; concrete `WorkRef` cancellation remains a
+carrier-level concern, and impossible external calls are now rejected at the
+composition perimeter instead of being forced into the kernel state graph.
 
 ### Reading the current pass
 

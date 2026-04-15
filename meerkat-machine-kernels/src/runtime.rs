@@ -1245,7 +1245,7 @@ mod tests {
         );
         assert_eq!(
             submitted.next_state.fields.get("active_run_count"),
-            Some(&KernelValue::U64(1))
+            Some(&KernelValue::U64(0))
         );
     }
 

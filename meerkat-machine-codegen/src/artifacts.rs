@@ -41,7 +41,7 @@ use meerkat_machine_schema::{
     CompositionStateLimits, CompositionWitness, EntryInput, EnumSchema, Expr, FeedbackFieldSource,
     FeedbackInputRef, Guard, HelperSchema, MachineCoverageManifest, MachineSchema, Quantifier,
     Route, RouteBindingSource, RouteDelivery, RouteTarget, RouteTargetKind, SchedulerRule,
-    TransitionSchema, TypeRef, Update, VariantSchema, canonical_machine_schemas,
+    TransitionSchema, TriggerKind, TypeRef, Update, VariantSchema, canonical_machine_schemas,
 };
 
 fn route_target_variant<'a>(
@@ -2550,8 +2550,10 @@ impl<'a> CompositionTlaCompiler<'a> {
             }
         }
 
+        self.render_entry_packet_admissibility_helpers(&mut out);
         self.render_entry_input_actions(&mut out);
         self.render_deliver_queued_route_action(&mut out);
+        self.render_reject_pending_entry_input_action(&mut out);
         self.render_quiescent_stutter(&mut out);
         self.render_witness_inject_actions(&mut out);
 
@@ -3425,6 +3427,7 @@ impl<'a> CompositionTlaCompiler<'a> {
                 packet_expr
             )
             .expect("write to string");
+            writeln!(out, "    /\\ EntryPacketAdmissible({packet_expr})").expect("write to string");
             writeln!(
                 out,
                 "    /\\ pending_inputs' = Append(pending_inputs, {})",
@@ -3522,6 +3525,164 @@ impl<'a> CompositionTlaCompiler<'a> {
         pushln!(out);
     }
 
+    fn entry_packet_admissibility_name(&self, instance_id: &str) -> String {
+        format!("EntryPacketAdmissible_{}", tla_ident(instance_id))
+    }
+
+    fn render_entry_packet_admissibility_helpers(&self, out: &mut String) {
+        if self.schema.entry_inputs.is_empty() {
+            return;
+        }
+
+        for instance in &self.schema.machines {
+            let machine = self.machine(instance.instance_id.as_str());
+            let helper_prefix = format!("{}__entry_packet__", tla_ident(&instance.instance_id));
+            let mut compiler = MachineTlaCompiler::new_with_helper_prefix(machine, helper_prefix)
+                .with_phase_symbol(self.phase_var(instance.instance_id.as_str()))
+                .with_field_env_override(self.machine_field_env(instance.instance_id.as_str()));
+
+            for derived in helper_dependency_order(machine) {
+                compiler.render_helper(out, derived);
+                pushln!(out);
+            }
+
+            let branches = machine
+                .transitions
+                .iter()
+                .filter(|transition| transition.on.kind == TriggerKind::Input)
+                .map(|transition| {
+                    self.render_machine_packet_admissibility_branch(
+                        &mut compiler,
+                        instance.instance_id.as_str(),
+                        transition,
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            for helper in &compiler.helper_defs {
+                pushln!(out, "{helper}");
+                pushln!(out);
+            }
+
+            writeln!(
+                out,
+                "{}(packet) ==",
+                self.entry_packet_admissibility_name(instance.instance_id.as_str())
+            )
+            .expect("write to string");
+            if branches.is_empty() {
+                pushln!(out, "    FALSE");
+            } else {
+                for branch in &branches {
+                    pushln!(out, "    \\/ {branch}");
+                }
+            }
+            pushln!(out);
+        }
+
+        writeln!(out, "EntryPacketAdmissible(packet) ==").expect("write to string");
+        pushln!(out, "    CASE");
+        for (idx, instance) in self.schema.machines.iter().enumerate() {
+            let prefix = if idx == 0 { "      " } else { "      [] " };
+            writeln!(
+                out,
+                "{}packet.machine = {} -> {}(packet)",
+                prefix,
+                tla_string(&instance.instance_id),
+                self.entry_packet_admissibility_name(instance.instance_id.as_str())
+            )
+            .expect("write to string");
+        }
+        pushln!(out, "      [] OTHER -> FALSE");
+        pushln!(out);
+    }
+
+    fn render_machine_packet_admissibility_branch(
+        &self,
+        compiler: &mut MachineTlaCompiler<'_>,
+        instance_id: &str,
+        transition: &TransitionSchema,
+    ) -> String {
+        let phase_var = self.phase_var(instance_id);
+        let from_guard = if transition.from.len() == 1 {
+            format!("{phase_var} = {}", tla_string(&transition.from[0]))
+        } else {
+            transition
+                .from
+                .iter()
+                .map(|phase| format!("{phase_var} = {}", tla_string(phase)))
+                .collect::<Vec<_>>()
+                .join(" \\/ ")
+        };
+
+        let binding_types = compiler.binding_type_map(transition);
+        let binding_env = transition
+            .on
+            .bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.clone(),
+                    format!("packet.payload.{}", tla_ident(binding)),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let field_env = self.machine_field_env(instance_id);
+
+        let mut clauses = vec![
+            format!("packet.variant = {}", tla_string(&transition.on.variant)),
+            from_guard,
+        ];
+        clauses.extend(
+            transition.guards.iter().map(|guard| {
+                compiler.render_guard(guard, &field_env, &binding_env, &binding_types)
+            }),
+        );
+
+        format!(
+            "/\\ {}",
+            clauses
+                .into_iter()
+                .map(|clause| format!("({clause})"))
+                .collect::<Vec<_>>()
+                .join(" /\\ ")
+        )
+    }
+
+    fn render_reject_pending_entry_input_action(&self, out: &mut String) {
+        if self.schema.entry_inputs.is_empty() {
+            return;
+        }
+
+        writeln!(out, "RejectPendingEntryInput ==").expect("write to string");
+        pushln!(out, "    /\\ \\E packet \\in SeqElements(pending_inputs) :");
+        pushln!(out, "       /\\ packet.source_kind = \"entry\"");
+        pushln!(out, "       /\\ ~EntryPacketAdmissible(packet)");
+        pushln!(
+            out,
+            "       /\\ pending_inputs' = SeqRemove(pending_inputs, packet)"
+        );
+        pushln!(out, "       /\\ observed_inputs' = observed_inputs");
+        pushln!(out, "       /\\ pending_routes' = pending_routes");
+        pushln!(out, "       /\\ delivered_routes' = delivered_routes");
+        pushln!(out, "       /\\ emitted_effects' = emitted_effects");
+        pushln!(
+            out,
+            "       /\\ observed_transitions' = observed_transitions"
+        );
+        writeln!(out, "       /\\ model_step_count' = model_step_count + 1")
+            .expect("write to string");
+        let mut unchanged = self.machine_vars();
+        unchanged.extend(self.obligation_vars());
+        unchanged.extend([
+            "witness_current_script_input".into(),
+            "witness_remaining_script_inputs".into(),
+        ]);
+        writeln!(out, "       /\\ UNCHANGED << {} >>", unchanged.join(", "))
+            .expect("write to string");
+        pushln!(out);
+    }
+
     fn render_quiescent_stutter(&self, out: &mut String) {
         writeln!(out, "QuiescentStutter ==");
         pushln!(out, "    /\\ Len(pending_routes) = 0");
@@ -3539,6 +3700,9 @@ impl<'a> CompositionTlaCompiler<'a> {
         if !self.schema.routes.is_empty() {
             branches.push("DeliverQueuedRoute".into());
         }
+        if !self.schema.entry_inputs.is_empty() {
+            branches.push("RejectPendingEntryInput".into());
+        }
         for instance in &self.schema.machines {
             let machine = self.machine(instance.instance_id.as_str());
             for transition in &machine.transitions {
@@ -3554,6 +3718,9 @@ impl<'a> CompositionTlaCompiler<'a> {
         let mut clauses = Vec::new();
         if !self.schema.routes.is_empty() {
             clauses.push("DeliverQueuedRoute".into());
+        }
+        if !self.schema.entry_inputs.is_empty() {
+            clauses.push("RejectPendingEntryInput".into());
         }
         clauses.extend(self.schema.machines.iter().flat_map(|instance| {
             let machine = self.machine(instance.instance_id.as_str());
@@ -3748,6 +3915,10 @@ impl<'a> CompositionTlaCompiler<'a> {
                 "    /\\ ~(witness_current_script_input \\in SeqElements(pending_inputs))"
             )
             .expect("write to string");
+            pushln!(
+                out,
+                "    /\\ EntryPacketAdmissible(Head(witness_remaining_script_inputs))"
+            );
             pushln!(out, "    /\\ Len(pending_inputs) = 0");
             pushln!(out, "    /\\ Len(pending_routes) = 0");
             pushln!(out, "    /\\ Len(witness_remaining_script_inputs) > 0");

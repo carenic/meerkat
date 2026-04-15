@@ -50,7 +50,7 @@ use meerkat_session::{SessionAgent, SessionAgentBuilder, SessionSnapshot};
 use meerkat_store::{MemoryStore, SessionStore};
 use serde::Serialize;
 use serde_json::value::RawValue;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -17254,6 +17254,26 @@ struct MobRuntimeParitySnapshotSummary {
     phase: String,
     active_member_count: usize,
     all_member_count: usize,
+    retiring_member_count: usize,
+    wiring_edge_count: usize,
+    task_count: Option<usize>,
+    coordinator_bound: Option<bool>,
+    pending_spawn_count: Option<u32>,
+    active_flow_count: Option<u32>,
+    topology_revision: Option<u32>,
+    supervisor_active: Option<bool>,
+    representative_agent_identity: Option<String>,
+    representative_runtime_id: Option<String>,
+    representative_fence_token: Option<u64>,
+    formal_available_fields: BTreeMap<String, String>,
+    formal_unavailable_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MobRuntimeParityObservableSnapshot {
+    phase: String,
+    active_member_count: usize,
+    all_member_count: usize,
     task_count: Option<usize>,
     coordinator_bound: Option<bool>,
     pending_spawn_count: Option<u32>,
@@ -17266,7 +17286,7 @@ struct MobRuntimeParitySnapshotSummary {
 struct MobRuntimeParityObservableSurface {
     outcome_kind: MobRuntimeParityOutcomeKind,
     result_summary: String,
-    after: Option<MobRuntimeParitySnapshotSummary>,
+    after: Option<MobRuntimeParityObservableSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -17284,7 +17304,20 @@ impl MobRuntimeParityInvocationReport {
         MobRuntimeParityObservableSurface {
             outcome_kind: self.outcome_kind,
             result_summary: self.result_summary.clone(),
-            after: self.after.clone(),
+            after: self
+                .after
+                .as_ref()
+                .map(|after| MobRuntimeParityObservableSnapshot {
+                    phase: after.phase.clone(),
+                    active_member_count: after.active_member_count,
+                    all_member_count: after.all_member_count,
+                    task_count: after.task_count,
+                    coordinator_bound: after.coordinator_bound,
+                    pending_spawn_count: after.pending_spawn_count,
+                    active_flow_count: after.active_flow_count,
+                    topology_revision: after.topology_revision,
+                    supervisor_active: after.supervisor_active,
+                }),
         }
     }
 }
@@ -17360,6 +17393,62 @@ struct MobRuntimeParityAuditReport {
     pairs: Vec<MobRuntimeParityPairReport>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MobModeledStateOutcomeKind {
+    Ok,
+    Err,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct MobModeledStateSummary {
+    phase: String,
+    formal_fields: BTreeMap<String, String>,
+    unavailable_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MobModeledStateRuntimeReport {
+    phase: String,
+    outcome_kind: MobModeledStateOutcomeKind,
+    before: Option<MobModeledStateSummary>,
+    after: Option<MobModeledStateSummary>,
+    result_summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MobModeledStateSchemaReport {
+    outcome_kind: MobModeledStateOutcomeKind,
+    after: Option<MobModeledStateSummary>,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MobModeledStateRowReport {
+    phase: String,
+    input_variant: String,
+    aligned: bool,
+    differing_keys: Vec<String>,
+    runtime: MobModeledStateRuntimeReport,
+    schema: MobModeledStateSchemaReport,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct MobModeledStateAuditSummary {
+    row_count: usize,
+    aligned_rows: usize,
+    mismatched_rows: usize,
+    unprobed_rows: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct MobModeledStateAuditReport {
+    machine: String,
+    generated_at: String,
+    summary: MobModeledStateAuditSummary,
+    rows: Vec<MobModeledStateRowReport>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MobRuntimeParityProbeInput {
     Spawn,
@@ -17399,6 +17488,7 @@ struct MobRuntimeParityFixture {
     cancel_identity: AgentIdentity,
     task_id: Option<TaskId>,
     flow_run_id: Option<RunId>,
+    submitted_work_ref: Option<WorkRef>,
     wired_external: bool,
 }
 
@@ -17515,10 +17605,33 @@ impl MobRuntimeParityFixture {
         self.flow_run_id = Some(run_id.clone());
         Ok(run_id)
     }
+
+    async fn ensure_submitted_work(&mut self) -> Result<WorkRef, String> {
+        if let Some(work_ref) = &self.submitted_work_ref {
+            return Ok(work_ref.clone());
+        }
+        let entry = self.worker_entry().await?;
+        let work_ref = WorkRef::new();
+        self.handle
+            .submit_work(
+                entry.agent_runtime_id.clone(),
+                entry.fence_token,
+                work_ref.clone(),
+                WorkSpec::new("mob-runtime-parity".to_string(), WorkOrigin::Internal),
+            )
+            .await
+            .map_err(|error| format!("submit work: {error:?}"))?;
+        self.submitted_work_ref = Some(work_ref.clone());
+        Ok(work_ref)
+    }
 }
 
 fn mob_runtime_parity_report_path() -> PathBuf {
     std::env::temp_dir().join("mob-runtime-phase-parity.json")
+}
+
+fn mob_modeled_state_report_path() -> PathBuf {
+    std::env::temp_dir().join("mob-runtime-modeled-state-parity.json")
 }
 
 fn mob_runtime_parity_target_pairs() -> &'static [(MobRuntimeParityPhase, MobRuntimeParityPhase)] {
@@ -17581,13 +17694,82 @@ async fn mob_runtime_parity_snapshot_summary(
     let phase = handle.status();
     let active_members = handle.list_members().await;
     let all_members = handle.list_all_members().await;
+    let including_retiring = handle.list_members_including_retiring().await;
     let tasks = handle.task_list().await.ok();
     let orchestrator = handle.debug_orchestrator_snapshot().await.ok();
+    let retiring_member_count = including_retiring
+        .iter()
+        .filter(|entry| entry.state == crate::roster::MemberState::Retiring)
+        .count();
+    let wiring_edge_count = mob_runtime_parity_wiring_edge_count(&all_members);
+    let representative = active_members
+        .iter()
+        .min_by(|left, right| left.agent_identity.cmp(&right.agent_identity));
+    let representative_agent_identity = representative.map(|entry| {
+        serde_json::to_string(&entry.agent_identity).unwrap_or_else(|_| "\"<agent>\"".into())
+    });
+    let representative_runtime_id = representative.map(|entry| {
+        serde_json::to_string(&entry.agent_runtime_id).unwrap_or_else(|_| "\"<runtime-id>\"".into())
+    });
+    let representative_fence_token = representative.map(|entry| entry.fence_token.get());
+    let mut formal_available_fields = BTreeMap::new();
+    formal_available_fields.insert(
+        "active_member_count".into(),
+        serde_json::to_string(&active_members.len()).expect("serialize active_member_count"),
+    );
+    formal_available_fields.insert(
+        "active_run_count".into(),
+        serde_json::to_string(
+            &orchestrator
+                .as_ref()
+                .map(|snapshot| snapshot.active_flow_count)
+                .unwrap_or_default(),
+        )
+        .expect("serialize active_run_count"),
+    );
+    formal_available_fields.insert(
+        "pending_spawn_count".into(),
+        serde_json::to_string(
+            &orchestrator
+                .as_ref()
+                .map(|snapshot| snapshot.pending_spawn_count)
+                .unwrap_or_default(),
+        )
+        .expect("serialize pending_spawn_count"),
+    );
+    formal_available_fields.insert(
+        "retiring_member_count".into(),
+        serde_json::to_string(&retiring_member_count).expect("serialize retiring_member_count"),
+    );
+    formal_available_fields.insert(
+        "wiring_edge_count".into(),
+        serde_json::to_string(&wiring_edge_count).expect("serialize wiring_edge_count"),
+    );
+    formal_available_fields.insert(
+        "coordinator_bound".into(),
+        serde_json::to_string(
+            &orchestrator
+                .as_ref()
+                .map(|snapshot| snapshot.coordinator_bound)
+                .unwrap_or(false),
+        )
+        .expect("serialize coordinator_bound"),
+    );
+    let mut formal_unavailable_fields = schema_mob_machine()
+        .state
+        .fields
+        .iter()
+        .filter(|field| !formal_available_fields.contains_key(&field.name))
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    formal_unavailable_fields.sort();
 
     Some(MobRuntimeParitySnapshotSummary {
         phase: phase.as_str().to_string(),
         active_member_count: active_members.len(),
         all_member_count: all_members.len(),
+        retiring_member_count,
+        wiring_edge_count,
         task_count: tasks.as_ref().map(std::vec::Vec::len),
         coordinator_bound: orchestrator
             .as_ref()
@@ -17604,7 +17786,38 @@ async fn mob_runtime_parity_snapshot_summary(
         supervisor_active: orchestrator
             .as_ref()
             .map(|snapshot| snapshot.supervisor_active),
+        representative_agent_identity,
+        representative_runtime_id,
+        representative_fence_token,
+        formal_available_fields,
+        formal_unavailable_fields,
     })
+}
+
+fn mob_runtime_parity_wiring_edge_count(entries: &[RosterEntry]) -> usize {
+    let identities = entries
+        .iter()
+        .map(|entry| entry.agent_identity.clone())
+        .collect::<BTreeSet<_>>();
+    let mut edges = BTreeSet::new();
+
+    for entry in entries {
+        for peer in &entry.wired_to {
+            if !identities.contains(peer) {
+                continue;
+            }
+            let (left, right) = if entry.agent_identity <= *peer {
+                (entry.agent_identity.clone(), peer.clone())
+            } else {
+                (peer.clone(), entry.agent_identity.clone())
+            };
+            if left != right {
+                edges.insert((left, right));
+            }
+        }
+    }
+
+    edges.len()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17794,6 +18007,7 @@ async fn build_mob_runtime_parity_fixture() -> MobRuntimeParityFixture {
         cancel_identity: AgentIdentity::from("cancel-target"),
         task_id: None,
         flow_run_id: None,
+        submitted_work_ref: None,
         wired_external: false,
     }
 }
@@ -17812,6 +18026,12 @@ async fn mob_runtime_parity_prepare_probe(
         | MobRuntimeParityProbeInput::CancelAllWork => {
             fixture.ensure_worker().await?;
             setup_tags.push("worker_spawned".to_string());
+        }
+        MobRuntimeParityProbeInput::CancelWork => {
+            fixture.ensure_worker().await?;
+            setup_tags.push("worker_spawned".to_string());
+            let _ = fixture.ensure_submitted_work().await?;
+            setup_tags.push("work_submitted".to_string());
         }
         MobRuntimeParityProbeInput::RunFlow => {
             fixture.ensure_worker().await?;
@@ -17857,7 +18077,6 @@ async fn mob_runtime_parity_prepare_probe(
             setup_tags.push("turn_driven_member_spawned".to_string());
         }
         MobRuntimeParityProbeInput::Spawn
-        | MobRuntimeParityProbeInput::CancelWork
         | MobRuntimeParityProbeInput::Stop
         | MobRuntimeParityProbeInput::Resume
         | MobRuntimeParityProbeInput::Complete
@@ -17995,7 +18214,7 @@ async fn mob_runtime_parity_execute_probe(
             .map(|_| summarize_mob_runtime_success(probe, "member_delivery")),
         MobRuntimeParityProbeInput::CancelWork => fixture
             .handle
-            .cancel_work(WorkRef::new())
+            .cancel_work(fixture.submitted_work_ref.clone().unwrap_or_default())
             .await
             .map(|()| summarize_mob_runtime_success(probe, "unit")),
         MobRuntimeParityProbeInput::CancelAllWork => {
@@ -18406,6 +18625,637 @@ async fn build_mob_runtime_parity_pair_report(
     }
 }
 
+fn mob_runtime_parity_probe_variant_name(probe: MobRuntimeParityProbeInput) -> &'static str {
+    match probe {
+        MobRuntimeParityProbeInput::Spawn => "Spawn",
+        MobRuntimeParityProbeInput::SubmitWork => "SubmitWork",
+        MobRuntimeParityProbeInput::RunFlow => "RunFlow",
+        MobRuntimeParityProbeInput::CancelFlow => "CancelFlow",
+        MobRuntimeParityProbeInput::Retire => "Retire",
+        MobRuntimeParityProbeInput::Respawn => "Respawn",
+        MobRuntimeParityProbeInput::RetireAll => "RetireAll",
+        MobRuntimeParityProbeInput::Wire => "Wire",
+        MobRuntimeParityProbeInput::Unwire => "Unwire",
+        MobRuntimeParityProbeInput::ExternalTurn => "ExternalTurn",
+        MobRuntimeParityProbeInput::InternalTurn => "InternalTurn",
+        MobRuntimeParityProbeInput::CancelWork => "CancelWork",
+        MobRuntimeParityProbeInput::CancelAllWork => "CancelAllWork",
+        MobRuntimeParityProbeInput::Stop => "Stop",
+        MobRuntimeParityProbeInput::Resume => "Resume",
+        MobRuntimeParityProbeInput::Complete => "Complete",
+        MobRuntimeParityProbeInput::Reset => "Reset",
+        MobRuntimeParityProbeInput::Destroy => "Destroy",
+        MobRuntimeParityProbeInput::TaskCreate => "TaskCreate",
+        MobRuntimeParityProbeInput::TaskUpdate => "TaskUpdate",
+        MobRuntimeParityProbeInput::SubscribeAgentEvents => "SubscribeAgentEvents",
+        MobRuntimeParityProbeInput::SubscribeAllAgentEvents => "SubscribeAllAgentEvents",
+        MobRuntimeParityProbeInput::SubscribeMobEvents => "SubscribeMobEvents",
+        MobRuntimeParityProbeInput::RecordOperatorActionProvenance => {
+            "RecordOperatorActionProvenance"
+        }
+        MobRuntimeParityProbeInput::SetSpawnPolicy => "SetSpawnPolicy",
+        MobRuntimeParityProbeInput::Shutdown => "Shutdown",
+        MobRuntimeParityProbeInput::ForceCancel => "ForceCancel",
+    }
+}
+
+fn mob_modeled_normalize_json_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(mob_modeled_normalize_json_value)
+                .collect(),
+        ),
+        serde_json::Value::Object(entries) => {
+            let mut normalized = serde_json::Map::new();
+            let mut keys: Vec<_> = entries.into_iter().collect();
+            keys.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, value) in keys {
+                normalized.insert(key, mob_modeled_normalize_json_value(value));
+            }
+            serde_json::Value::Object(normalized)
+        }
+        other => other,
+    }
+}
+
+fn mob_modeled_normalize_formal_string(raw: &str) -> String {
+    serde_json::from_str(raw)
+        .map(mob_modeled_normalize_json_value)
+        .and_then(|value| serde_json::to_string(&value))
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+fn mob_modeled_default_kernel_value(
+    ty: &meerkat_machine_schema::TypeRef,
+) -> meerkat_machine_kernels::KernelValue {
+    match ty {
+        meerkat_machine_schema::TypeRef::Bool => meerkat_machine_kernels::KernelValue::Bool(false),
+        meerkat_machine_schema::TypeRef::U32 | meerkat_machine_schema::TypeRef::U64 => {
+            meerkat_machine_kernels::KernelValue::U64(0)
+        }
+        meerkat_machine_schema::TypeRef::String => {
+            meerkat_machine_kernels::KernelValue::String(String::new())
+        }
+        meerkat_machine_schema::TypeRef::Named(name)
+            if matches!(name.as_str(), "FenceToken" | "Generation") =>
+        {
+            meerkat_machine_kernels::KernelValue::U64(0)
+        }
+        meerkat_machine_schema::TypeRef::Named(_) => {
+            meerkat_machine_kernels::KernelValue::String(String::new())
+        }
+        meerkat_machine_schema::TypeRef::Enum(name) => {
+            meerkat_machine_kernels::KernelValue::NamedVariant {
+                enum_name: name.clone(),
+                variant: String::new(),
+            }
+        }
+        meerkat_machine_schema::TypeRef::Option(_) => meerkat_machine_kernels::KernelValue::None,
+        meerkat_machine_schema::TypeRef::Set(_) => {
+            meerkat_machine_kernels::KernelValue::Set(BTreeSet::new())
+        }
+        meerkat_machine_schema::TypeRef::Seq(_) => {
+            meerkat_machine_kernels::KernelValue::Seq(Vec::new())
+        }
+        meerkat_machine_schema::TypeRef::Map(_, _) => {
+            meerkat_machine_kernels::KernelValue::Map(BTreeMap::new())
+        }
+    }
+}
+
+fn mob_modeled_option_some(
+    value: meerkat_machine_kernels::KernelValue,
+) -> meerkat_machine_kernels::KernelValue {
+    meerkat_machine_kernels::KernelValue::Map(BTreeMap::from([(
+        meerkat_machine_kernels::KernelValue::String("value".to_string()),
+        value,
+    )]))
+}
+
+fn mob_modeled_json_value_from_raw(raw: &str) -> serde_json::Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+}
+
+fn mob_modeled_kernel_value_from_json(
+    ty: &meerkat_machine_schema::TypeRef,
+    value: &serde_json::Value,
+) -> meerkat_machine_kernels::KernelValue {
+    match ty {
+        meerkat_machine_schema::TypeRef::Bool => {
+            meerkat_machine_kernels::KernelValue::Bool(value.as_bool().unwrap_or(false))
+        }
+        meerkat_machine_schema::TypeRef::U32 | meerkat_machine_schema::TypeRef::U64 => {
+            meerkat_machine_kernels::KernelValue::U64(value.as_u64().unwrap_or(0))
+        }
+        meerkat_machine_schema::TypeRef::String => meerkat_machine_kernels::KernelValue::String(
+            value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default()),
+        ),
+        meerkat_machine_schema::TypeRef::Named(name)
+            if matches!(name.as_str(), "FenceToken" | "Generation") =>
+        {
+            meerkat_machine_kernels::KernelValue::U64(value.as_u64().unwrap_or(0))
+        }
+        meerkat_machine_schema::TypeRef::Named(_) => meerkat_machine_kernels::KernelValue::String(
+            serde_json::to_string(value).unwrap_or_else(|_| "null".into()),
+        ),
+        meerkat_machine_schema::TypeRef::Enum(name) => {
+            meerkat_machine_kernels::KernelValue::NamedVariant {
+                enum_name: name.clone(),
+                variant: value.as_str().unwrap_or_default().to_string(),
+            }
+        }
+        meerkat_machine_schema::TypeRef::Option(inner) => {
+            if value.is_null() {
+                meerkat_machine_kernels::KernelValue::None
+            } else {
+                mob_modeled_option_some(mob_modeled_kernel_value_from_json(inner, value))
+            }
+        }
+        meerkat_machine_schema::TypeRef::Set(inner) => {
+            let values = value
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| mob_modeled_kernel_value_from_json(inner, item))
+                        .collect()
+                })
+                .unwrap_or_default();
+            meerkat_machine_kernels::KernelValue::Set(values)
+        }
+        meerkat_machine_schema::TypeRef::Seq(inner) => meerkat_machine_kernels::KernelValue::Seq(
+            value
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| mob_modeled_kernel_value_from_json(inner, item))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        meerkat_machine_schema::TypeRef::Map(key_ty, value_ty) => {
+            let mut entries = BTreeMap::new();
+            if let Some(object) = value.as_object() {
+                for (key, item) in object {
+                    let key_value = mob_modeled_kernel_value_from_json(
+                        key_ty,
+                        &serde_json::Value::String(key.clone()),
+                    );
+                    let value_value = mob_modeled_kernel_value_from_json(value_ty, item);
+                    entries.insert(key_value, value_value);
+                }
+            }
+            meerkat_machine_kernels::KernelValue::Map(entries)
+        }
+    }
+}
+
+fn mob_modeled_kernel_value_from_raw(
+    ty: &meerkat_machine_schema::TypeRef,
+    raw: &str,
+) -> meerkat_machine_kernels::KernelValue {
+    mob_modeled_kernel_value_from_json(ty, &mob_modeled_json_value_from_raw(raw))
+}
+
+fn mob_modeled_json_from_kernel_value(
+    value: &meerkat_machine_kernels::KernelValue,
+) -> serde_json::Value {
+    match value {
+        meerkat_machine_kernels::KernelValue::Bool(value) => serde_json::Value::Bool(*value),
+        meerkat_machine_kernels::KernelValue::U64(value) => {
+            serde_json::Value::Number(serde_json::Number::from(*value))
+        }
+        meerkat_machine_kernels::KernelValue::String(value) => {
+            serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.clone()))
+        }
+        meerkat_machine_kernels::KernelValue::NamedVariant { variant, .. } => {
+            serde_json::Value::String(variant.clone())
+        }
+        meerkat_machine_kernels::KernelValue::Seq(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(mob_modeled_json_from_kernel_value)
+                .collect(),
+        ),
+        meerkat_machine_kernels::KernelValue::Set(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(mob_modeled_json_from_kernel_value)
+                .collect(),
+        ),
+        meerkat_machine_kernels::KernelValue::Map(entries)
+            if entries.len() == 1
+                && entries.contains_key(&meerkat_machine_kernels::KernelValue::String(
+                    "value".to_string(),
+                )) =>
+        {
+            mob_modeled_json_from_kernel_value(
+                entries
+                    .get(&meerkat_machine_kernels::KernelValue::String(
+                        "value".to_string(),
+                    ))
+                    .expect("value key present"),
+            )
+        }
+        meerkat_machine_kernels::KernelValue::Map(entries) => {
+            let mut object = serde_json::Map::new();
+            for (key, value) in entries {
+                let key_json = mob_modeled_json_from_kernel_value(key);
+                let key_string = key_json
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| serde_json::to_string(&key_json).unwrap_or_default());
+                object.insert(key_string, mob_modeled_json_from_kernel_value(value));
+            }
+            serde_json::Value::Object(object)
+        }
+        meerkat_machine_kernels::KernelValue::None => serde_json::Value::Null,
+    }
+}
+
+fn mob_modeled_formal_string_from_kernel_value(
+    value: &meerkat_machine_kernels::KernelValue,
+) -> String {
+    mob_modeled_normalize_formal_string(
+        &serde_json::to_string(&mob_modeled_json_from_kernel_value(value))
+            .unwrap_or_else(|_| "null".into()),
+    )
+}
+
+fn mob_modeled_summary_from_runtime_snapshot(
+    snapshot: Option<&MobRuntimeParitySnapshotSummary>,
+) -> Option<MobModeledStateSummary> {
+    snapshot.map(|snapshot| MobModeledStateSummary {
+        phase: snapshot.phase.clone(),
+        formal_fields: snapshot.formal_available_fields.clone(),
+        unavailable_fields: snapshot.formal_unavailable_fields.clone(),
+    })
+}
+
+fn mob_modeled_summary_from_kernel_state(
+    schema: &MachineSchema,
+    state: &meerkat_machine_kernels::KernelState,
+    runtime_reference: &MobRuntimeParitySnapshotSummary,
+) -> MobModeledStateSummary {
+    let formal_fields = schema
+        .state
+        .fields
+        .iter()
+        .filter(|field| {
+            runtime_reference
+                .formal_available_fields
+                .contains_key(&field.name)
+        })
+        .map(|field| {
+            let value = state
+                .fields
+                .get(&field.name)
+                .map(mob_modeled_formal_string_from_kernel_value)
+                .unwrap_or_else(|| "null".to_string());
+            (field.name.clone(), value)
+        })
+        .collect();
+
+    MobModeledStateSummary {
+        phase: state.phase.clone(),
+        formal_fields,
+        unavailable_fields: runtime_reference.formal_unavailable_fields.clone(),
+    }
+}
+
+fn mob_modeled_differing_keys(
+    runtime_after: &Option<MobModeledStateSummary>,
+    schema_after: &Option<MobModeledStateSummary>,
+) -> Vec<String> {
+    let mut keys = BTreeSet::new();
+    if runtime_after.as_ref().map(|summary| summary.phase.as_str())
+        != schema_after.as_ref().map(|summary| summary.phase.as_str())
+    {
+        keys.insert("phase".to_string());
+    }
+
+    let runtime_fields = runtime_after
+        .as_ref()
+        .map(|summary| &summary.formal_fields)
+        .cloned()
+        .unwrap_or_default();
+    let schema_fields = schema_after
+        .as_ref()
+        .map(|summary| &summary.formal_fields)
+        .cloned()
+        .unwrap_or_default();
+
+    for key in runtime_fields
+        .keys()
+        .chain(schema_fields.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        if runtime_fields.get(key) != schema_fields.get(key) {
+            keys.insert(key.clone());
+        }
+    }
+
+    keys.into_iter().collect()
+}
+
+fn mob_modeled_kernel_state(
+    schema: &MachineSchema,
+    before: &MobRuntimeParitySnapshotSummary,
+) -> meerkat_machine_kernels::KernelState {
+    let mut fields = BTreeMap::new();
+    for field in &schema.state.fields {
+        let value = before
+            .formal_available_fields
+            .get(&field.name)
+            .map(|raw| mob_modeled_kernel_value_from_raw(&field.ty, raw))
+            .unwrap_or_else(|| match field.name.as_str() {
+                "active_identity" => before
+                    .representative_agent_identity
+                    .as_ref()
+                    .map(|raw| {
+                        mob_modeled_option_some(meerkat_machine_kernels::KernelValue::String(
+                            raw.clone(),
+                        ))
+                    })
+                    .unwrap_or(meerkat_machine_kernels::KernelValue::None),
+                "active_runtime_id" => before
+                    .representative_runtime_id
+                    .as_ref()
+                    .map(|raw| {
+                        mob_modeled_option_some(meerkat_machine_kernels::KernelValue::String(
+                            raw.clone(),
+                        ))
+                    })
+                    .unwrap_or(meerkat_machine_kernels::KernelValue::None),
+                "active_fence_token" => before
+                    .representative_fence_token
+                    .map(|value| {
+                        mob_modeled_option_some(meerkat_machine_kernels::KernelValue::U64(value))
+                    })
+                    .unwrap_or(meerkat_machine_kernels::KernelValue::None),
+                _ => mob_modeled_default_kernel_value(&field.ty),
+            });
+        fields.insert(field.name.clone(), value);
+    }
+
+    meerkat_machine_kernels::KernelState {
+        phase: before.phase.clone(),
+        fields,
+    }
+}
+
+fn mob_modeled_named_string(value: String) -> meerkat_machine_kernels::KernelValue {
+    meerkat_machine_kernels::KernelValue::String(value)
+}
+
+fn mob_modeled_representative_identity_value(before: &MobRuntimeParitySnapshotSummary) -> String {
+    before
+        .representative_agent_identity
+        .clone()
+        .unwrap_or_else(|| "\"<agent-identity>\"".to_string())
+}
+
+fn mob_modeled_representative_runtime_value(before: &MobRuntimeParitySnapshotSummary) -> String {
+    before
+        .representative_runtime_id
+        .clone()
+        .unwrap_or_else(|| "\"<runtime-id>\"".to_string())
+}
+
+fn mob_modeled_kernel_input(
+    schema: &MachineSchema,
+    before: &MobRuntimeParitySnapshotSummary,
+    probe: MobRuntimeParityProbeInput,
+) -> Result<meerkat_machine_kernels::KernelInput, String> {
+    let variant = mob_runtime_parity_probe_variant_name(probe).to_string();
+    let input_variant = schema
+        .inputs
+        .variant_named(&variant)
+        .map_err(|err| err.to_string())?;
+    let mut fields = BTreeMap::new();
+
+    for field in &input_variant.fields {
+        let value = match field.name.as_str() {
+            "agent_identity" => {
+                mob_modeled_named_string(mob_modeled_representative_identity_value(before))
+            }
+            "agent_runtime_id" => {
+                mob_modeled_named_string(mob_modeled_representative_runtime_value(before))
+            }
+            "fence_token" => meerkat_machine_kernels::KernelValue::U64(
+                before.representative_fence_token.unwrap_or_default(),
+            ),
+            "generation" => meerkat_machine_kernels::KernelValue::U64(0),
+            "work_id" => mob_modeled_named_string("\"<work-id>\"".to_string()),
+            _ => mob_modeled_default_kernel_value(&field.ty),
+        };
+        fields.insert(field.name.clone(), value);
+    }
+
+    Ok(meerkat_machine_kernels::KernelInput { variant, fields })
+}
+
+fn mob_modeled_transition_refusal_detail(
+    error: &meerkat_machine_kernels::TransitionRefusal,
+) -> String {
+    match error {
+        meerkat_machine_kernels::TransitionRefusal::UnknownInputVariant { variant, .. } => {
+            format!("unknown_input:{variant}")
+        }
+        meerkat_machine_kernels::TransitionRefusal::UnknownSignalVariant { variant, .. } => {
+            format!("unknown_signal:{variant}")
+        }
+        meerkat_machine_kernels::TransitionRefusal::InvalidInputPayload { reason, .. } => {
+            format!("invalid_input:{reason}")
+        }
+        meerkat_machine_kernels::TransitionRefusal::InvalidSignalPayload { reason, .. } => {
+            format!("invalid_signal:{reason}")
+        }
+        meerkat_machine_kernels::TransitionRefusal::NoMatchingTransition {
+            phase, variant, ..
+        } => {
+            format!("no_match:{phase}:{variant}")
+        }
+        meerkat_machine_kernels::TransitionRefusal::AmbiguousTransition {
+            phase,
+            variant,
+            transitions,
+            ..
+        } => format!("ambiguous:{phase}:{variant}:{transitions:?}"),
+        meerkat_machine_kernels::TransitionRefusal::EvaluationError {
+            transition, reason, ..
+        } => format!("evaluation:{transition}:{reason}"),
+    }
+}
+
+fn mob_modeled_schema_report(
+    schema: &MachineSchema,
+    runtime: &MobRuntimeParityInvocationReport,
+    probe: MobRuntimeParityProbeInput,
+) -> MobModeledStateSchemaReport {
+    let Some(before) = runtime.before.as_ref() else {
+        return MobModeledStateSchemaReport {
+            outcome_kind: MobModeledStateOutcomeKind::Err,
+            after: None,
+            detail: "missing runtime pre-state".to_string(),
+        };
+    };
+
+    let state = mob_modeled_kernel_state(schema, before);
+    let input = match mob_modeled_kernel_input(schema, before, probe) {
+        Ok(input) => input,
+        Err(detail) => {
+            return MobModeledStateSchemaReport {
+                outcome_kind: MobModeledStateOutcomeKind::Err,
+                after: None,
+                detail,
+            };
+        }
+    };
+
+    match meerkat_machine_kernels::generated::mob::transition(&state, &input) {
+        Ok(outcome) => MobModeledStateSchemaReport {
+            outcome_kind: MobModeledStateOutcomeKind::Ok,
+            after: Some(mob_modeled_summary_from_kernel_state(
+                schema,
+                &outcome.next_state,
+                before,
+            )),
+            detail: outcome.transition,
+        },
+        Err(error) => MobModeledStateSchemaReport {
+            outcome_kind: MobModeledStateOutcomeKind::Err,
+            after: Some(MobModeledStateSummary {
+                phase: before.phase.clone(),
+                formal_fields: before.formal_available_fields.clone(),
+                unavailable_fields: before.formal_unavailable_fields.clone(),
+            }),
+            detail: mob_modeled_transition_refusal_detail(&error),
+        },
+    }
+}
+
+fn mob_modeled_runtime_report(
+    runtime: &MobRuntimeParityInvocationReport,
+) -> MobModeledStateRuntimeReport {
+    let before = mob_modeled_summary_from_runtime_snapshot(runtime.before.as_ref());
+    let after = mob_modeled_summary_from_runtime_snapshot(runtime.after.as_ref()).or_else(|| {
+        (runtime.outcome_kind == MobRuntimeParityOutcomeKind::Err)
+            .then(|| before.clone())
+            .flatten()
+    });
+
+    MobModeledStateRuntimeReport {
+        phase: runtime.phase.clone(),
+        outcome_kind: match runtime.outcome_kind {
+            MobRuntimeParityOutcomeKind::Ok => MobModeledStateOutcomeKind::Ok,
+            MobRuntimeParityOutcomeKind::Err => MobModeledStateOutcomeKind::Err,
+        },
+        before,
+        after,
+        result_summary: runtime.result_summary.clone(),
+    }
+}
+
+async fn write_mob_runtime_modeled_state_audit_report(path: PathBuf) -> MobModeledStateAuditReport {
+    let schema = meerkat_machine_kernels::generated::mob::schema();
+    let surface_only_inputs = schema
+        .surface_only_inputs
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut rows = Vec::new();
+
+    for phase in [
+        MobRuntimeParityPhase::Running,
+        MobRuntimeParityPhase::Stopped,
+        MobRuntimeParityPhase::Completed,
+    ] {
+        for input_variant in &schema.inputs.variants {
+            if surface_only_inputs.contains(input_variant.name.as_str()) {
+                continue;
+            }
+            let Some(probe) = mob_runtime_parity_probe_for_input_variant(&input_variant.name)
+            else {
+                rows.push(MobModeledStateRowReport {
+                    phase: phase.schema_name().to_string(),
+                    input_variant: input_variant.name.clone(),
+                    aligned: false,
+                    differing_keys: vec!["unprobed".to_string()],
+                    runtime: MobModeledStateRuntimeReport {
+                        phase: phase.schema_name().to_string(),
+                        outcome_kind: MobModeledStateOutcomeKind::Err,
+                        before: None,
+                        after: None,
+                        result_summary: "no runtime probe implemented".to_string(),
+                    },
+                    schema: MobModeledStateSchemaReport {
+                        outcome_kind: MobModeledStateOutcomeKind::Err,
+                        after: None,
+                        detail: "no runtime probe implemented".to_string(),
+                    },
+                });
+                continue;
+            };
+
+            let runtime = execute_mob_runtime_parity_probe(phase, probe)
+                .await
+                .expect("mob runtime modeled-state probe should succeed");
+            let schema_report = mob_modeled_schema_report(&schema, &runtime, probe);
+            let runtime_report = mob_modeled_runtime_report(&runtime);
+            let differing_keys =
+                mob_modeled_differing_keys(&runtime_report.after, &schema_report.after);
+            let aligned = runtime_report.outcome_kind == schema_report.outcome_kind
+                && differing_keys.is_empty();
+
+            rows.push(MobModeledStateRowReport {
+                phase: phase.schema_name().to_string(),
+                input_variant: input_variant.name.clone(),
+                aligned,
+                differing_keys,
+                runtime: runtime_report,
+                schema: schema_report,
+            });
+        }
+    }
+
+    let summary = rows.iter().fold(
+        MobModeledStateAuditSummary::default(),
+        |mut summary, row| {
+            summary.row_count += 1;
+            if row.runtime.result_summary == "no runtime probe implemented" {
+                summary.unprobed_rows += 1;
+            } else if row.aligned {
+                summary.aligned_rows += 1;
+            } else {
+                summary.mismatched_rows += 1;
+            }
+            summary
+        },
+    );
+
+    let report = MobModeledStateAuditReport {
+        machine: "MobMachine".to_string(),
+        generated_at: Utc::now().to_rfc3339(),
+        summary,
+        rows,
+    };
+
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&report).expect("serialize modeled-state audit report"),
+    )
+    .expect("write modeled-state audit report");
+
+    report
+}
+
 #[tokio::test]
 #[ignore = "diagnostic audit"]
 async fn audit_mob_runtime_phase_parity_map() {
@@ -18489,5 +19339,31 @@ async fn audit_mob_runtime_phase_parity_map() {
                     .unwrap_or("no runtime probe implemented")
             );
         }
+    }
+}
+
+#[tokio::test]
+#[ignore = "diagnostic audit"]
+async fn audit_mob_runtime_modeled_state_parity_map() {
+    let path = mob_modeled_state_report_path();
+    let report = write_mob_runtime_modeled_state_audit_report(path.clone()).await;
+
+    println!("wrote {}", path.display());
+    println!(
+        "rows={} aligned={} mismatched={} unprobed={}",
+        report.summary.row_count,
+        report.summary.aligned_rows,
+        report.summary.mismatched_rows,
+        report.summary.unprobed_rows
+    );
+    for row in report.rows.iter().filter(|row| !row.aligned) {
+        println!(
+            "  {} / {}: runtime={:?} schema={:?} differing_keys={:?}",
+            row.phase,
+            row.input_variant,
+            row.runtime.outcome_kind,
+            row.schema.outcome_kind,
+            row.differing_keys
+        );
     }
 }

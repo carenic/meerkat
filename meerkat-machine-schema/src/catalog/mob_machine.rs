@@ -78,6 +78,7 @@ pub fn mob_machine() -> MachineSchema {
             "ListMembersIncludingRetiring".into(),
             "ListAllMembers".into(),
             "MemberStatus".into(),
+            "CancelWork".into(),
             "PollEvents".into(),
             "ReplayAllEvents".into(),
             "GetMember".into(),
@@ -222,10 +223,7 @@ pub fn mob_machine() -> MachineSchema {
                         Box::new(Expr::None),
                     ),
                 }],
-                updates: vec![Update::Increment {
-                    field: "active_run_count".into(),
-                    amount: 1,
-                }],
+                updates: vec![],
                 to: "Running".into(),
                 // SubmitMemberWork effect removed (unimplemented route to MeerkatMachine).
                 emit: vec![],
@@ -815,7 +813,7 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
             bindings: vec![],
         },
         guards: vec![],
-        updates: clear_runtime_projection_updates(),
+        updates: vec![set_bool("coordinator_bound", false), clear_active_runs()],
         to: "Stopped".into(),
         emit: vec![simple_emit("EmitRunLifecycleNotice")],
     });
@@ -830,7 +828,7 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
             bindings: vec![],
         },
         guards: vec![],
-        updates: vec![],
+        updates: vec![set_bool("coordinator_bound", true)],
         to: "Running".into(),
         emit: vec![simple_emit("EmitRunLifecycleNotice")],
     });
@@ -860,7 +858,7 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
             bindings: vec![],
         },
         guards: vec![],
-        updates: reset_mob_projection_updates(),
+        updates: reset_mob_projection_updates_with_coordinator(true),
         to: "Running".into(),
         emit: vec![simple_emit("EmitRunLifecycleNotice")],
     });
@@ -931,7 +929,7 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
             bindings: vec![],
         },
         guards: vec![],
-        updates: clear_runtime_projection_updates(),
+        updates: vec![set_bool("coordinator_bound", false), clear_active_runs()],
         to: "Stopped".into(),
         emit: vec![simple_emit("EmitRunLifecycleNotice")],
     });
@@ -941,7 +939,7 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
             phase,
             "Shutdown",
             vec![],
-            clear_runtime_projection_updates(),
+            vec![set_bool("coordinator_bound", false), clear_active_runs()],
             vec![simple_emit("EmitRunLifecycleNotice")],
         ));
     }
@@ -1239,10 +1237,16 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
                 bindings: vec!["agent_runtime_id".into()],
             },
             guards: retire_guards.clone(),
-            updates: vec![Update::Increment {
-                field: "retiring_member_count".into(),
-                amount: 1,
-            }],
+            updates: vec![
+                Update::Decrement {
+                    field: "active_member_count".into(),
+                    amount: 1,
+                },
+                Update::Assign {
+                    field: "retiring_member_count".into(),
+                    expr: Expr::U64(0),
+                },
+            ],
             to: phase.into(),
             emit: vec![runtime_observation_emit("RequestRuntimeRetire")],
         });
@@ -1259,10 +1263,16 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
                 bindings: vec![],
             },
             guards: vec![],
-            updates: vec![Update::Assign {
-                field: "retiring_member_count".into(),
-                expr: Expr::Field("active_member_count".into()),
-            }],
+            updates: vec![
+                Update::Assign {
+                    field: "active_member_count".into(),
+                    expr: Expr::U64(0),
+                },
+                Update::Assign {
+                    field: "retiring_member_count".into(),
+                    expr: Expr::U64(0),
+                },
+            ],
             to: phase.into(),
             emit: vec![lifecycle_notice_emit("retiring")],
         });
@@ -1310,7 +1320,7 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
         guards: vec![],
         updates: destroy_mob_projection_updates(),
         to: "Destroyed".into(),
-        emit: vec![lifecycle_notice_emit("destroyed")],
+        emit: vec![],
     });
 
     // Respawn: Running self-loop
@@ -1320,25 +1330,9 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
         phase,
         "Respawn",
         vec!["agent_runtime_id"],
-        vec![Update::Increment {
-            field: "pending_spawn_count".into(),
-            amount: 1,
-        }],
+        vec![],
         vec![simple_emit("ExposePendingSpawn")],
     ));
-
-    // CancelWork: handled directly in handle.rs with no actor dispatch or
-    // phase guard. Returns WorkNotFound from any phase. Self-loop per phase.
-    for phase in ["Running", "Stopped", "Completed", "Destroyed"] {
-        transitions.push(mob_self_loop_transition(
-            "CancelWork",
-            phase,
-            "CancelWork",
-            vec!["work_id"],
-            clear_work_updates(),
-            vec![simple_emit("FlowTerminalized")],
-        ));
-    }
 
     // CancelAllWork: delegates to ForceCancel which the formal model keeps in Running.
     let phase = "Running";
@@ -1430,10 +1424,21 @@ fn runtime_is_bound_guard() -> Guard {
 }
 
 fn clear_runtime_projection_updates() -> Vec<Update> {
-    vec![Update::Assign {
+    vec![clear_active_runs()]
+}
+
+fn clear_active_runs() -> Update {
+    Update::Assign {
         field: "active_run_count".into(),
         expr: Expr::U64(0),
-    }]
+    }
+}
+
+fn set_bool(field: &str, value: bool) -> Update {
+    Update::Assign {
+        field: field.into(),
+        expr: Expr::Bool(value),
+    }
 }
 
 fn reset_member_runtime_updates() -> Vec<Update> {
@@ -1452,6 +1457,10 @@ fn reset_member_runtime_updates() -> Vec<Update> {
 }
 
 fn reset_mob_projection_updates() -> Vec<Update> {
+    reset_mob_projection_updates_with_coordinator(false)
+}
+
+fn reset_mob_projection_updates_with_coordinator(coordinator_bound: bool) -> Vec<Update> {
     let mut updates = clear_runtime_projection_updates();
     updates.extend(vec![
         Update::Assign {
@@ -1466,10 +1475,7 @@ fn reset_mob_projection_updates() -> Vec<Update> {
             field: "wiring_edge_count".into(),
             expr: Expr::U64(0),
         },
-        Update::Assign {
-            field: "coordinator_bound".into(),
-            expr: Expr::Bool(false),
-        },
+        set_bool("coordinator_bound", coordinator_bound),
     ]);
     updates
 }

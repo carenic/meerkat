@@ -10,6 +10,13 @@ cargo test -p meerkat-mob audit_mob_runtime_phase_parity_map \
   -- --ignored --nocapture
 ```
 
+and the stricter modeled-state follow-up:
+
+```bash
+cargo test -p meerkat-mob audit_mob_runtime_modeled_state_parity_map \
+  -- --ignored --nocapture
+```
+
 The goal is to keep the Mob simplification loop honest:
 
 - close runtime/schema gaps before using Hopcroft results as simplification
@@ -25,12 +32,15 @@ The live JSON report is written to the system temp directory as
 
 - Audited lifecycle pairs: `Running ↔ Stopped`, `Completed ↔ Running`,
   `Completed ↔ Stopped`
-- Transition-bearing rows in scope: `65`
-- Live-probed rows: `65`
-- `fixed`: `65`
+- Transition-bearing rows in scope: `62`
+- Live-probed rows: `62`
+- `fixed`: `62`
 - `align_schema`: `0`
 - `align_runtime`: `0`
 - `needs_decision`: `0`
+- Modeled-state rows in scope: `78`
+- Modeled-state rows probed: `78`
+- Modeled-state rows aligned: `78`
 
 Current state:
 
@@ -39,13 +49,20 @@ Current state:
 - the audit now evaluates guard-sensitive schema rows against the representative
   runtime pre-snapshots where it has enough field information to do so
 - the transition-bearing parity surface is exact for the current triangle:
-  `65 / 65 / 65 / 0 / 0`
+  `62 / 62 / 62 / 0 / 0`
+- the runtime-backed modeled-state surface is also exact for the current
+  triangle: `78 / 78 / 78 / 0`
 - the formal machine no longer carries the pure shadow fields
   `inflight_work_id`, `task_count`, or `event_subscription_count`
 - the formal machine also no longer carries the seam-shadow
   `current_generation` field; `RequestRuntimeBinding` now emits generation
   directly from the transition bindings instead of replaying a top-level
   stored copy
+- `CancelWork` is now a surfaced-only input rather than a formal top-level
+  transition, because the runtime behavior hangs on concrete `WorkRef` carrier
+  lineage rather than on the lifecycle phase alone
+- the generated `meerkat_mob_seam` composition now rejects inadmissible queued
+  external entry packets instead of deadlocking after terminal Mob shutdown
 
 ## Resolution Rubric
 
@@ -80,37 +97,46 @@ Current state:
   switched `RequestRuntimeBinding` generation emission to come directly from the
   transition bindings.
 - That cut also stayed green on the exact lifecycle triangle, and the truthful
-  raw/phase/full Hopcroft readout remained unchanged (`1,390 -> 202`,
-  `1,390 -> 204`, `1,390 -> 1,390`), which means `current_generation` was
-  fully correlated with the remaining state rather than carrying independent
-  labeled behavior.
+  raw/phase/full Hopcroft readout remained unchanged at the time
+  (`1,390 -> 202`, `1,390 -> 204`, `1,390 -> 1,390`), which means
+  `current_generation` was fully correlated with the remaining state rather
+  than carrying independent labeled behavior.
+- The next tranche moved `CancelWork` out of the formal transition graph and
+  into `surface_only_inputs`, then added a composition-side rejection step for
+  queued external entry packets that are no longer admissible in the current
+  machine state.
+- That pair of fixes kept the exact lifecycle triangle green while also
+  removing the last `meerkat_mob_seam` deadlock caused by impossible external
+  calls against a destroyed Mob.
 
 ## Pair Ledger
 
-- `Running ↔ Stopped`: `27` rows, `27` probed, `27` fixed, `0` mismatches,
+- `Running ↔ Stopped`: `26` rows, `26` probed, `26` fixed, `0` mismatches,
   `0` unprobed
-- `Completed ↔ Running`: `26` rows, `26` probed, `26` fixed, `0` mismatches,
+- `Completed ↔ Running`: `25` rows, `25` probed, `25` fixed, `0` mismatches,
   `0` unprobed
-- `Completed ↔ Stopped`: `12` rows, `12` probed, `12` fixed, `0` mismatches,
+- `Completed ↔ Stopped`: `11` rows, `11` probed, `11` fixed, `0` mismatches,
   `0` unprobed
 
 ## Readout
 
 - The lifecycle triangle is now exact on the audited transition surface.
+- The lifecycle triangle is also exact on the runtime-backed modeled-state
+  surface (`78 / 78 / 78 / 0`).
 - The broad quotient result still stands after the parity cleanup, and the
-  shadow-field cut made that read much cleaner: the raw Mob quotient stayed at
-  `202` even while the truthful state space collapsed from `4,797` to `1,390`.
+  shadow-field cuts plus `CancelWork` extraction made that read much cleaner:
+  the truthful state space has now collapsed from `4,797` to `1,214`.
 - The trustworthy raw/phase/full reread is now:
-  raw `1,390 -> 202`, phase `1,390 -> 204`, full `1,390 -> 1,390`.
-- The dominant mixed block (`705` states) is now split primarily by
+  raw `1,214 -> 187`, phase `1,214 -> 189`, full `1,214 -> 1,214`.
+- The dominant mixed block (`585` states) is now split primarily by
   `pending_spawn_count`, `wiring_edge_count`, `active_run_count`,
-  `active_member_count`, `retiring_member_count`, `active_fence_token`,
-  `active_runtime_id`, and `coordinator_bound`.
+  `active_member_count`, `active_fence_token`, `active_runtime_id`,
+  `coordinator_bound`, and `active_identity`.
 
 ## Notes
 
 - The audit loop also smoke-probes the surfaced query/inspection inputs while it
-  walks the pair matrix, but the `65` counted rows above are the transition-
+  walks the pair matrix, but the `62` counted rows above are the transition-
   bearing rows used for exact schema/runtime classification.
 - This ledger is intentionally narrower than the Meerkat one: it is focused on
   the lifecycle triangle that dominates the current Mob mixed-phase quotient
