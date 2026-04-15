@@ -19,7 +19,6 @@ meerkat = { workspace = true, features = ["anthropic", "session-store", "jsonl-s
 meerkat-core.workspace = true
 meerkat-runtime.workspace = true
 meerkat-store = { workspace = true, features = ["memory"] }
-serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
