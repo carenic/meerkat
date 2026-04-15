@@ -41,10 +41,6 @@ pub fn mob_machine() -> MachineSchema {
                     "active_fence_token",
                     TypeRef::Option(Box::new(TypeRef::Named("FenceToken".into()))),
                 ),
-                field(
-                    "current_generation",
-                    TypeRef::Option(Box::new(TypeRef::Named("Generation".into()))),
-                ),
                 field("active_member_count", TypeRef::U32),
                 field("active_run_count", TypeRef::U32),
                 field("pending_spawn_count", TypeRef::U32),
@@ -58,7 +54,6 @@ pub fn mob_machine() -> MachineSchema {
                     init("active_identity", Expr::None),
                     init("active_runtime_id", Expr::None),
                     init("active_fence_token", Expr::None),
-                    init("current_generation", Expr::None),
                     init("active_member_count", Expr::U64(0)),
                     init("active_run_count", Expr::U64(0)),
                     init("pending_spawn_count", Expr::U64(0)),
@@ -179,7 +174,6 @@ pub fn mob_machine() -> MachineSchema {
                         assign_some("active_identity", "agent_identity"),
                         assign_some("active_runtime_id", "agent_runtime_id"),
                         assign_some("active_fence_token", "fence_token"),
-                        assign_some("current_generation", "generation"),
                         Update::Assign {
                             field: "active_member_count".into(),
                             expr: Expr::U64(1),
@@ -349,7 +343,6 @@ pub fn mob_machine() -> MachineSchema {
                         assign_some("active_identity", "agent_identity"),
                         assign_some("active_runtime_id", "agent_runtime_id"),
                         assign_some("active_fence_token", "fence_token"),
-                        assign_some("current_generation", "generation"),
                         Update::Assign {
                             field: "active_member_count".into(),
                             expr: Expr::U64(1),
@@ -383,7 +376,6 @@ pub fn mob_machine() -> MachineSchema {
                         assign_some("active_identity", "agent_identity"),
                         assign_some("active_runtime_id", "agent_runtime_id"),
                         assign_some("active_fence_token", "fence_token"),
-                        assign_some("current_generation", "generation"),
                         Update::Assign {
                             field: "active_member_count".into(),
                             expr: Expr::U64(1),
@@ -509,10 +501,16 @@ fn runtime_binding_emit(variant: &str) -> EffectEmit {
     EffectEmit {
         variant: variant.into(),
         fields: IndexMap::from([
-            ("agent_identity".into(), option_value("active_identity")),
-            ("agent_runtime_id".into(), option_value("active_runtime_id")),
-            ("fence_token".into(), option_value("active_fence_token")),
-            ("generation".into(), option_value("current_generation")),
+            (
+                "agent_identity".into(),
+                Expr::Binding("agent_identity".into()),
+            ),
+            (
+                "agent_runtime_id".into(),
+                Expr::Binding("agent_runtime_id".into()),
+            ),
+            ("fence_token".into(), Expr::Binding("fence_token".into())),
+            ("generation".into(), Expr::Binding("generation".into())),
         ]),
     }
 }
@@ -1489,10 +1487,6 @@ fn destroy_mob_projection_updates() -> Vec<Update> {
         },
         Update::Assign {
             field: "active_fence_token".into(),
-            expr: Expr::None,
-        },
-        Update::Assign {
-            field: "current_generation".into(),
             expr: Expr::None,
         },
         Update::Assign {
