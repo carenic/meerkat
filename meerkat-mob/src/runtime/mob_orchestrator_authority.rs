@@ -19,9 +19,6 @@
 //! - 6 effects: ActivateSupervisor, DeactivateSupervisor, FlowActivated,
 //!   FlowDeactivated, EmitOrchestratorNotice, MemberForceCancelled
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
-
 use crate::error::MobError;
 use crate::runtime::MobState;
 
@@ -194,16 +191,12 @@ pub(crate) trait MobOrchestratorMutator: sealed::Sealed {
 /// The canonical authority for MobOrchestrator state.
 ///
 /// Holds the canonical phase + fields and delegates all transitions through
-/// the encoded transition table. Also maintains an `Arc<AtomicU8>` observable
-/// cache so that `MobHandle` can read the current phase lock-free.
+/// the encoded transition table.
 pub(crate) struct MobOrchestratorAuthority {
     /// Canonical phase.
     phase: MobState,
     /// Canonical machine-owned fields.
     fields: MobOrchestratorFields,
-    /// Observable cache for lock-free reads.
-    /// Set by the authority after each transition — never written elsewhere.
-    observable: Arc<AtomicU8>,
 }
 
 impl sealed::Sealed for MobOrchestratorAuthority {}
@@ -211,26 +204,22 @@ impl sealed::Sealed for MobOrchestratorAuthority {}
 impl MobOrchestratorAuthority {
     #[cfg(test)]
     /// Create a new authority in Creating phase with default fields.
-    pub(crate) fn new(observable: Arc<AtomicU8>) -> Self {
-        observable.store(MobState::Creating as u8, Ordering::Release);
+    pub(crate) fn new() -> Self {
         Self {
             phase: MobState::Creating,
             fields: MobOrchestratorFields::default(),
-            observable,
         }
     }
 
     /// Create a fresh authority directly in Running phase with the canonical
     /// running-default fields used by live mob bootstrap.
-    pub(crate) fn new_running(observable: Arc<AtomicU8>) -> Self {
-        observable.store(MobState::Running as u8, Ordering::Release);
+    pub(crate) fn new_running() -> Self {
         Self {
             phase: MobState::Running,
             fields: MobOrchestratorFields {
                 supervisor_active: true,
                 ..MobOrchestratorFields::default()
             },
-            observable,
         }
     }
 
@@ -238,12 +227,10 @@ impl MobOrchestratorAuthority {
     ///
     /// Used during resume to restore the authority to the persisted phase
     /// rather than always starting in Creating.
-    pub(crate) fn with_phase(observable: Arc<AtomicU8>, phase: MobState) -> Self {
-        observable.store(phase as u8, Ordering::Release);
+    pub(crate) fn with_phase(phase: MobState) -> Self {
         Self {
             phase,
             fields: MobOrchestratorFields::default(),
-            observable,
         }
     }
 
@@ -509,10 +496,9 @@ impl MobOrchestratorMutator for MobOrchestratorAuthority {
     ) -> Result<MobOrchestratorTransition, MobError> {
         let (next_phase, next_fields, effects) = self.evaluate(input)?;
 
-        // Commit: update canonical state and observable cache.
+        // Commit: update canonical state.
         self.phase = next_phase;
         self.fields = next_fields;
-        self.observable.store(next_phase as u8, Ordering::Release);
 
         Ok(MobOrchestratorTransition {
             next_phase,
@@ -531,11 +517,11 @@ mod tests {
     use super::*;
 
     fn make_authority() -> MobOrchestratorAuthority {
-        MobOrchestratorAuthority::new(Arc::new(AtomicU8::new(0)))
+        MobOrchestratorAuthority::new()
     }
 
     fn make_running_authority() -> MobOrchestratorAuthority {
-        MobOrchestratorAuthority::new_running(Arc::new(AtomicU8::new(0)))
+        MobOrchestratorAuthority::new_running()
     }
 
     #[test]
@@ -820,21 +806,17 @@ mod tests {
     }
 
     #[test]
-    fn observable_cache_updated_on_transition() {
-        let observable = Arc::new(AtomicU8::new(0));
-        let mut auth = MobOrchestratorAuthority::new_running(observable.clone());
-        assert_eq!(observable.load(Ordering::Acquire), MobState::Running as u8);
+    fn internal_phase_updated_on_transition() {
+        let mut auth = MobOrchestratorAuthority::new_running();
         auth.apply(MobOrchestratorInput::StopOrchestrator)
             .expect("stop");
-        assert_eq!(observable.load(Ordering::Acquire), MobState::Stopped as u8);
+        assert_eq!(auth.phase(), MobState::Stopped);
     }
 
     #[test]
-    fn running_constructor_initializes_observable_cache() {
-        let observable = Arc::new(AtomicU8::new(0));
-        let auth = MobOrchestratorAuthority::new_running(observable.clone());
+    fn running_constructor_initializes_running_phase() {
+        let auth = MobOrchestratorAuthority::new_running();
         assert_eq!(auth.phase(), MobState::Running);
-        assert_eq!(observable.load(Ordering::Acquire), MobState::Running as u8);
         assert!(auth.snapshot().supervisor_active);
     }
 
@@ -881,19 +863,13 @@ mod tests {
 
     #[test]
     fn with_phase_initializes_to_given_phase() {
-        let observable = Arc::new(AtomicU8::new(0));
-        let auth = MobOrchestratorAuthority::with_phase(observable.clone(), MobState::Completed);
+        let auth = MobOrchestratorAuthority::with_phase(MobState::Completed);
         assert_eq!(auth.phase(), MobState::Completed);
-        assert_eq!(
-            observable.load(Ordering::Acquire),
-            MobState::Completed as u8
-        );
     }
 
     #[test]
     fn with_phase_stopped_accepts_resume() {
-        let observable = Arc::new(AtomicU8::new(0));
-        let mut auth = MobOrchestratorAuthority::with_phase(observable.clone(), MobState::Stopped);
+        let mut auth = MobOrchestratorAuthority::with_phase(MobState::Stopped);
         assert_eq!(auth.phase(), MobState::Stopped);
         let t = auth
             .apply(MobOrchestratorInput::ResumeOrchestrator)

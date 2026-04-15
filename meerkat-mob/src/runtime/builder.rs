@@ -957,14 +957,11 @@ impl MobBuilder {
                 MobState::Running => {
                     // Fresh creation and stale Creating restores both normalize to
                     // the checked-in Running bootstrap state.
-                    super::mob_orchestrator_authority::MobOrchestratorAuthority::new_running(
-                        state.clone(),
-                    )
+                    super::mob_orchestrator_authority::MobOrchestratorAuthority::new_running()
                 }
                 _ => {
                     // Resume: restore to the persisted phase.
                     super::mob_orchestrator_authority::MobOrchestratorAuthority::with_phase(
-                        state.clone(),
                         initial_phase,
                     )
                 }

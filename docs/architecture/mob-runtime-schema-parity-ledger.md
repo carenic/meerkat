@@ -270,6 +270,11 @@ Current state:
   orchestrator is unbound. The actor shell now uses the same coordinator-bound
   gate directly instead of letting the lower orchestrator authority answer that
   validity question first.
+- The next ownership cut is runtime-only but still important: the lower
+  `MobOrchestratorAuthority` no longer writes the actor's shared phase
+  observable at all. The top-level mob lifecycle projection remains actor /
+  lifecycle-owned, and the orchestrator helper is reduced to field + effect
+  realization instead of acting like a second hidden phase publisher.
 
 ## Notes
 
