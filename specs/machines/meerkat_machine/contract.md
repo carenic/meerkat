@@ -27,11 +27,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `staged_filter`: `ToolFilter`
 - `active_requested_deferred_names`: `Set<String>`
 - `staged_requested_deferred_names`: `Set<String>`
-- `requested_witnesses`: `Map<String, ToolVisibilityWitness>`
-- `filter_witnesses`: `Map<String, ToolVisibilityWitness>`
 - `active_visibility_revision`: `u64`
 - `staged_visibility_revision`: `u64`
-- `committed_visibility_revision`: `u64`
 
 ## Inputs
 - `RegisterSession`(session_id: SessionId)
@@ -196,15 +193,12 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ## Helpers
 - `HasPendingVisibilityPromotion`() -> `Bool`
-- `RequestedWitnessKeys`() -> `Set<String>`
-- `FilterWitnessKeys`() -> `Set<String>`
 
 ## Invariants
 - `fence_requires_bound_runtime`
 - `destroyed_has_no_active_work`
 - `drain_requires_ingress_context`
 - `active_requested_names_subset_of_staged`
-- `committed_visibility_not_ahead_of_active`
 
 ## Transitions
 ### `Initialize`

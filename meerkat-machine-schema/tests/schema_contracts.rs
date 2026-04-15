@@ -279,11 +279,8 @@ fn meerkat_machine_merges_turn_admission_tool_visibility_and_peer_directory_stat
         "staged_filter",
         "active_requested_deferred_names",
         "staged_requested_deferred_names",
-        "requested_witnesses",
-        "filter_witnesses",
         "active_visibility_revision",
         "staged_visibility_revision",
-        "committed_visibility_revision",
     ] {
         assert!(
             field_names.iter().any(|name| name == &required),

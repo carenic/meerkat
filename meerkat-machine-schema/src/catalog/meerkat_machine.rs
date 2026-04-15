@@ -86,23 +86,8 @@ pub fn meerkat_machine() -> MachineSchema {
                     "staged_requested_deferred_names",
                     TypeRef::Set(Box::new(TypeRef::String)),
                 ),
-                field(
-                    "requested_witnesses",
-                    TypeRef::Map(
-                        Box::new(TypeRef::String),
-                        Box::new(named("ToolVisibilityWitness")),
-                    ),
-                ),
-                field(
-                    "filter_witnesses",
-                    TypeRef::Map(
-                        Box::new(TypeRef::String),
-                        Box::new(named("ToolVisibilityWitness")),
-                    ),
-                ),
                 field("active_visibility_revision", TypeRef::U64),
                 field("staged_visibility_revision", TypeRef::U64),
-                field("committed_visibility_revision", TypeRef::U64),
             ],
             init: InitSchema {
                 phase: "Initializing".into(),
@@ -133,11 +118,8 @@ pub fn meerkat_machine() -> MachineSchema {
                     init("staged_filter", tool_filter_all()),
                     init("active_requested_deferred_names", Expr::EmptySet),
                     init("staged_requested_deferred_names", Expr::EmptySet),
-                    init("requested_witnesses", Expr::EmptyMap),
-                    init("filter_witnesses", Expr::EmptyMap),
                     init("active_visibility_revision", Expr::U64(0)),
                     init("staged_visibility_revision", Expr::U64(0)),
-                    init("committed_visibility_revision", Expr::U64(0)),
                 ],
             },
             terminal_phases: vec!["Destroyed".into()],
@@ -206,29 +188,15 @@ pub fn meerkat_machine() -> MachineSchema {
                 variants
             },
         },
-        helpers: vec![
-            HelperSchema {
-                name: "HasPendingVisibilityPromotion".into(),
-                params: vec![],
-                returns: TypeRef::Bool,
-                body: Expr::Gt(
-                    Box::new(Expr::Field("staged_visibility_revision".into())),
-                    Box::new(Expr::Field("active_visibility_revision".into())),
-                ),
-            },
-            HelperSchema {
-                name: "RequestedWitnessKeys".into(),
-                params: vec![],
-                returns: TypeRef::Set(Box::new(TypeRef::String)),
-                body: Expr::MapKeys(Box::new(Expr::Field("requested_witnesses".into()))),
-            },
-            HelperSchema {
-                name: "FilterWitnessKeys".into(),
-                params: vec![],
-                returns: TypeRef::Set(Box::new(TypeRef::String)),
-                body: Expr::MapKeys(Box::new(Expr::Field("filter_witnesses".into()))),
-            },
-        ],
+        helpers: vec![HelperSchema {
+            name: "HasPendingVisibilityPromotion".into(),
+            params: vec![],
+            returns: TypeRef::Bool,
+            body: Expr::Gt(
+                Box::new(Expr::Field("staged_visibility_revision".into())),
+                Box::new(Expr::Field("active_visibility_revision".into())),
+            ),
+        }],
         derived: vec![],
         invariants: vec![
             // running_has_active_work removed: active_work_id was a mob-level
@@ -284,13 +252,6 @@ pub fn meerkat_machine() -> MachineSchema {
                         value: Box::new(Expr::Binding("name".into())),
                     }),
                 },
-            },
-            InvariantSchema {
-                name: "committed_visibility_not_ahead_of_active".into(),
-                expr: Expr::Lte(
-                    Box::new(Expr::Field("committed_visibility_revision".into())),
-                    Box::new(Expr::Field("active_visibility_revision".into())),
-                ),
             },
         ],
         transitions: vec![
@@ -651,10 +612,6 @@ pub fn meerkat_machine() -> MachineSchema {
                         field: "active_visibility_revision".into(),
                         expr: Expr::Field("staged_visibility_revision".into()),
                     },
-                    Update::Assign {
-                        field: "committed_visibility_revision".into(),
-                        expr: Expr::Binding("revision".into()),
-                    },
                 ],
                 to: "Running".into(),
                 emit: vec![EffectEmit {
@@ -686,10 +643,7 @@ pub fn meerkat_machine() -> MachineSchema {
                         ),
                     },
                 ],
-                updates: vec![Update::Assign {
-                    field: "committed_visibility_revision".into(),
-                    expr: Expr::Binding("revision".into()),
-                }],
+                updates: vec![],
                 to: "Running".into(),
                 emit: vec![EffectEmit {
                     variant: "CommittedVisibleSetPublished".into(),
@@ -1087,23 +1041,11 @@ fn reset_session_state() -> Vec<Update> {
             expr: Expr::EmptySet,
         },
         Update::Assign {
-            field: "requested_witnesses".into(),
-            expr: Expr::EmptyMap,
-        },
-        Update::Assign {
-            field: "filter_witnesses".into(),
-            expr: Expr::EmptyMap,
-        },
-        Update::Assign {
             field: "active_visibility_revision".into(),
             expr: Expr::U64(0),
         },
         Update::Assign {
             field: "staged_visibility_revision".into(),
-            expr: Expr::U64(0),
-        },
-        Update::Assign {
-            field: "committed_visibility_revision".into(),
             expr: Expr::U64(0),
         },
     ]
@@ -1273,18 +1215,6 @@ fn stage_persistent_filter_transition(name: &str, phase: &str) -> TransitionSche
                 field: "staged_filter".into(),
                 expr: Expr::Binding("filter".into()),
             },
-            Update::ForEach {
-                binding: "name".into(),
-                over: Expr::MapKeys(Box::new(Expr::Binding("witnesses".into()))),
-                updates: vec![Update::MapInsert {
-                    field: "filter_witnesses".into(),
-                    key: Expr::Binding("name".into()),
-                    value: Expr::MapGet {
-                        map: Box::new(Expr::Binding("witnesses".into())),
-                        key: Box::new(Expr::Binding("name".into())),
-                    },
-                }],
-            },
             Update::Assign {
                 field: "staged_visibility_revision".into(),
                 expr: next_staged_visibility_revision_expr(),
@@ -1312,18 +1242,6 @@ fn request_deferred_tools_transition(name: &str, phase: &str) -> TransitionSchem
                 updates: vec![Update::SetInsert {
                     field: "staged_requested_deferred_names".into(),
                     value: Expr::Binding("name".into()),
-                }],
-            },
-            Update::ForEach {
-                binding: "name".into(),
-                over: Expr::MapKeys(Box::new(Expr::Binding("witnesses".into()))),
-                updates: vec![Update::MapInsert {
-                    field: "requested_witnesses".into(),
-                    key: Expr::Binding("name".into()),
-                    value: Expr::MapGet {
-                        map: Box::new(Expr::Binding("witnesses".into())),
-                        key: Box::new(Expr::Binding("name".into())),
-                    },
                 }],
             },
             Update::Assign {
@@ -1419,10 +1337,6 @@ fn publish_committed_visible_set_transition(name: &str, phase: &str) -> Transiti
             Update::Assign {
                 field: "staged_visibility_revision".into(),
                 expr: Expr::Binding("staged_visibility_revision".into()),
-            },
-            Update::Assign {
-                field: "committed_visibility_revision".into(),
-                expr: Expr::Binding("active_visibility_revision".into()),
             },
         ],
         to: phase.into(),

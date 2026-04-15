@@ -11987,11 +11987,6 @@ fn runtime_modeled_kernel_state(
             .unwrap_or_else(|| match field.name.as_str() {
                 "active_fence_token" => runtime_modeled_option_some(KernelValue::U64(0)),
                 "active_generation" => runtime_modeled_option_some(KernelValue::U64(0)),
-                "committed_visibility_revision" => before
-                    .formal_available_fields
-                    .get("active_visibility_revision")
-                    .map(|raw| runtime_modeled_kernel_value_from_raw(&field.ty, raw))
-                    .unwrap_or_else(|| runtime_modeled_default_kernel_value(&field.ty)),
                 _ => runtime_modeled_default_kernel_value(&field.ty),
             });
         fields.insert(field.name.clone(), value);

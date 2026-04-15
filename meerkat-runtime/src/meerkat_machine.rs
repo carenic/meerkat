@@ -3437,14 +3437,6 @@ impl MeerkatMachine {
                 formal_projection_value(&visibility_state.staged_requested_deferred_names),
             );
             available_fields.insert(
-                "requested_witnesses".into(),
-                formal_projection_value(&visibility_state.requested_witnesses),
-            );
-            available_fields.insert(
-                "filter_witnesses".into(),
-                formal_projection_value(&visibility_state.filter_witnesses),
-            );
-            available_fields.insert(
                 "active_visibility_revision".into(),
                 formal_projection_value(&visibility_state.active_revision),
             );
@@ -3455,11 +3447,7 @@ impl MeerkatMachine {
 
             MeerkatFormalStateProjection {
                 available_fields,
-                unavailable_fields: vec![
-                    "active_fence_token".into(),
-                    "active_generation".into(),
-                    "committed_visibility_revision".into(),
-                ],
+                unavailable_fields: vec!["active_fence_token".into(), "active_generation".into()],
             }
         };
 

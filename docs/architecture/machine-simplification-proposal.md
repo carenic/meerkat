@@ -95,6 +95,8 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | `Creating` vs `Running` can merge internally | passed / landed | Fresh and resumed mobs already surface `Running`; removed the dead formal `Creating` phase and `Start` signal without changing the public `MobState` enum. |
 | Meerkat `Recovering` is a transient / no-op top-level phase | passed / landed | Removed the unreachable top-level `Recovering` phase from the formal model; the internal `RuntimeControlAuthority` still owns recovery/recycle transitions, and TLC state space stayed unchanged. |
 | Meerkat pure queries should stay surfaced without formal transitions | passed / landed | Moved the read-only helper/query family into `surface_only_inputs`; runtime/schema audits stayed green and Meerkat TLC generated states dropped from 3,668,832 to 3,113,272 while the raw/phase quotients stayed at 385 / 390. |
+| Meerkat committed visibility publication progress should not stay as top-level shadow state | passed / landed | Removed `committed_visibility_revision` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 59,371 to 45,610 while the raw/phase quotients stayed at 385 / 390. |
+| Meerkat visibility witness provenance should not stay as top-level shadow state | passed / landed | Removed `requested_witnesses` and `filter_witnesses` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 45,610 to 15,809 while the raw/phase quotients still held at 385 / 390. |
 | Meerkat `Stopped` vs `Retired` can merge internally | rejected | The top-level transition sets diverge in load-bearing ways: `Retired` still accepts `Reset`, `StopRuntimeExecutor`, and `Recycle`, while `Stopped` does not, and the retire path carries archival/drain semantics that phase 1 should keep explicit. |
 | Meerkat `Idle` vs `Attached` can merge internally | rejected | In the current formal model, phase identity still carries load-bearing "executor attached" semantics that are not derivable from the existing Meerkat extended state. Several absorbed transitions are phase-gated without a field-level attachment witness, so phase-1 collapse would require introducing a replacement attachment bit plus a new public projection layer rather than actually simplifying the model. |
 
@@ -145,9 +147,9 @@ We ran three observation modes for each machine:
 | MobMachine | `none` | 4,797 | 202 | 95.8% | Raw behavior is still dramatically smaller than the current formal state space, but exact parity tightened the quotient slightly. |
 | MobMachine | `phase` | 4,797 | 204 | 95.7% | Preserving phase still barely changes the quotient; `Running` / `Stopped` / `Completed` remain mostly projection. |
 | MobMachine | `full` | 4,797 | 4,797 | 0.0% | Once the full extended state is preserved, every reachable snapshot is distinct. |
-| MeerkatMachine | `none` | 59,371 | 385 | 99.4% | Raw behavior still collapses to a much smaller machine even after the exact parity pass. |
-| MeerkatMachine | `phase` | 59,371 | 390 | 99.3% | Preserving phase adds only five quotient blocks; phase is almost entirely projection here too. |
-| MeerkatMachine | `full` | 59,371 | 58,038 | 2.2% | Preserving the full snapshot nearly eliminates quotienting; the remaining collapse is small and mostly strips non-authoritative snapshot churn such as `model_step_count`. |
+| MeerkatMachine | `none` | 15,809 | 385 | 97.6% | Raw behavior still collapses to a much smaller machine after the exact parity pass and the visibility-boundary simplifications. |
+| MeerkatMachine | `phase` | 15,809 | 390 | 97.5% | Preserving phase still adds only five quotient blocks; phase remains almost entirely projection here too. |
+| MeerkatMachine | `full` | 15,809 | 15,280 | 3.3% | Preserving the full snapshot still keeps almost every remaining state distinct, but the shadow visibility layers are gone. |
 
 All six rows above have now been rerun after the exact runtime/schema parity
 passes on the current branch tip.
@@ -171,7 +173,7 @@ The raw quotient exposes the highest-signal parity/simplification targets:
 
 - **MobMachine** has one dominant mixed block of `2,819` states spanning
   `Running`, `Stopped`, and `Completed`.
-- **MeerkatMachine** has one dominant mixed block of `32,248` states spanning
+- **MeerkatMachine** has one dominant mixed block of `6,904` states spanning
   `Initializing`, `Idle`, `Attached`, `Running`, `Retired`, and `Stopped`.
 
 These are not automatic merge approvals. They are a **schema-side lower bound**
@@ -435,23 +437,26 @@ cargo run -p xtask --features machine-authority -- \
 
 Current result:
 
-- reachable states: `59,371`
+- reachable states: `15,809`
 - raw quotient states: `385`
 - phase-observed quotient states: `390`
-- full-observed quotient states: `58,038`
-- TLC: `3,113,272 generated / 59,371 distinct / depth 9`
-- reachable edges: `1,305,806` (down from `1,539,266` before query extraction)
-- dominant mixed block: `32,248` states spanning `Initializing`, `Idle`,
+- full-observed quotient states: `15,280`
+- TLC: `809,617 generated / 15,809 distinct / depth 9`
+- reachable edges: `431,575`
+- dominant mixed block: `6,904` states spanning `Initializing`, `Idle`,
   `Attached`, `Running`, `Retired`, and `Stopped`
-- dominant block tuples: `16,859`
-- tuples reused across multiple phases: `9,647`
+- dominant block tuples: `3,085`
+- tuples reused across multiple phases: `2,224`
 - maximum phases sharing one tuple: `5`
 
 The important read is now sharper than the earlier partial dump story:
 
 - the raw quotient is much smaller than the reachable state space
 - phase preservation adds only `5` blocks (`385 -> 390`)
-- preserving the full snapshot nearly eliminates quotienting (`58,038`)
+- preserving the full snapshot still keeps almost every remaining state distinct
+  (`15,280`)
+- the visibility-boundary cuts removed a large amount of formal shadow state
+  without changing the audited public-phase behavior
 
 That means the remaining Meerkat complexity is carried overwhelmingly by the
 field tuple, not by the phase label.
@@ -462,27 +467,27 @@ We then extended the always-on Hopcroft summary to project the largest
 mixed-phase block onto its extended-state fields. On the current Meerkat run,
 that yields:
 
-- dominant mixed block: `32,248` states
-- distinct extended-state tuples inside that block: `16,859`
-- tuples reused across multiple phases: `9,647`
+- dominant mixed block: `6,904` states
+- distinct extended-state tuples inside that block: `3,085`
+- tuples reused across multiple phases: `2,224`
 - maximum phases sharing one tuple: `5`
 
 That is the strongest concrete evidence so far that the current phase surface
 is layered on top of a smaller field-driven machine instead of acting as the
 primary semantic axis. The most discriminating fields inside the block are:
 
-- `staged_visibility_revision` (`8` value buckets; largest bucket `8,142`)
-- `committed_visibility_revision` (`3` buckets; largest bucket `13,080`)
-- `active_visibility_revision` (`3` buckets; largest bucket `15,924`)
-- `pre_run_phase` (`3` buckets; largest bucket `17,064`)
-- `peer_ingress_configured` (`2` buckets; split `16,428 / 15,820`)
-- `requested_witnesses` (`2` buckets; split `19,044 / 13,204`)
-- `filter_witnesses` (`2` buckets; split `19,330 / 12,918`)
-- `staged_requested_deferred_names` (`2` buckets; split `19,869 / 12,379`)
+- `staged_visibility_revision` (`8` value buckets; largest bucket `1,911`)
+- `active_visibility_revision` (`3` buckets; largest bucket `2,736`)
+- `pre_run_phase` (`3` buckets; largest bucket `3,669`)
+- `peer_ingress_configured` (`2` buckets; split `3,952 / 2,952`)
+- `attachment_live` (`2` buckets; split `4,109 / 2,795`)
+- `staged_requested_deferred_names` (`2` buckets; split `4,202 / 2,702`)
+- `active_fence_token` (`2` buckets; split `4,304 / 2,600`)
+- `active_generation` (`2` buckets; split `4,304 / 2,600`)
 
 The read is strikingly consistent with the earlier field-ablation pass: the
-largest Meerkat block is dominated by visibility-staging, deferred-tool,
-ingress, and runtime-carrier dimensions rather than by phase labels.
+largest Meerkat block is now dominated by visibility-staging, runtime binding,
+ingress, and pre-run restoration dimensions rather than by phase labels.
 
 ### Audit-map results
 
