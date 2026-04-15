@@ -1450,6 +1450,18 @@ fn collect_named_literals_from_update(
                 );
             }
         }
+        Update::MapRemove { field, key } => {
+            if let Some(TypeRef::Map(key_ty, _)) = field_types.get(field) {
+                collect_named_literals_from_expr(
+                    samples,
+                    key,
+                    Some(key_ty),
+                    field_types,
+                    helper_returns,
+                    binding_types,
+                );
+            }
+        }
         Update::SetInsert { field, value } | Update::SetRemove { field, value } => {
             if let Some(TypeRef::Set(inner_ty)) = field_types.get(field) {
                 collect_named_literals_from_expr(
@@ -2057,6 +2069,14 @@ fn render_named_domain_assignment(
     sample_cardinality: usize,
     named_samples: &BTreeMap<String, BTreeSet<String>>,
 ) -> String {
+    if named_type_uses_nat_domain(name) {
+        return if sample_cardinality > 1 {
+            "{1, 2}".into()
+        } else {
+            "{1}".into()
+        };
+    }
+
     if name == "ToolFilter" {
         let target_cardinality = sample_cardinality.max(2);
         let mut values = named_samples
@@ -2109,6 +2129,13 @@ fn sample_values(
                 .map(|sample| tla_string(&sample))
                 .collect()
         }
+        TypeRef::Named(name) | TypeRef::Enum(name) if named_type_uses_nat_domain(name) => {
+            if sample_cardinality > 1 {
+                vec!["1".into(), "2".into()]
+            } else {
+                vec!["1".into()]
+            }
+        }
         TypeRef::Named(name) | TypeRef::Enum(name) => {
             if let Some(samples) = named_samples.get(name) {
                 let limit = sample_cardinality.max(1);
@@ -2157,6 +2184,13 @@ fn sample_values(
         ),
         TypeRef::Map(_, _) => vec![],
     }
+}
+
+fn named_type_uses_nat_domain(name: &str) -> bool {
+    matches!(
+        name,
+        "BoundarySequence" | "TurnNumber" | "FenceToken" | "Generation"
+    )
 }
 
 fn render_sequence_domain_definition(inner: &TypeRef) -> String {
@@ -2357,6 +2391,11 @@ impl<'a> CompositionTlaCompiler<'a> {
         writeln!(
             &mut out,
             "MapSet(map, key, value) == [x \\in DOMAIN map \\cup {{key}} |-> IF x = key THEN value ELSE map[x]]"
+        )
+        .expect("write to string");
+        writeln!(
+            &mut out,
+            "MapRemove(map, key) == [x \\in DOMAIN map \\ {{key}} |-> map[x]]"
         )
         .expect("write to string");
         writeln!(
@@ -4719,6 +4758,11 @@ impl<'a> MachineTlaCompiler<'a> {
         .expect("write to string");
         writeln!(
             &mut out,
+            "MapRemove(map, key) == [x \\in DOMAIN map \\ {{key}} |-> map[x]]"
+        )
+        .expect("write to string");
+        writeln!(
+            &mut out,
             "StartsWith(seq, prefix) == /\\ Len(prefix) <= Len(seq) /\\ SubSeq(seq, 1, Len(prefix)) = prefix"
         )
         .expect("write to string");
@@ -5167,6 +5211,11 @@ impl<'a> MachineTlaCompiler<'a> {
                     field.clone(),
                     format!("MapSet({current}, {key_expr}, {value_expr})"),
                 );
+            }
+            Update::MapRemove { field, key } => {
+                let current = env.get(field).cloned().unwrap_or_else(|| field.clone());
+                let key_expr = self.render_expr_with_types(key, env, binding_env, binding_types);
+                env.insert(field.clone(), format!("MapRemove({current}, {key_expr})"));
             }
             Update::SetInsert { field, value } => {
                 let current = env.get(field).cloned().unwrap_or_else(|| field.clone());
@@ -5922,6 +5971,7 @@ fn collect_update_fields(updates: &[Update]) -> BTreeSet<String> {
             | Update::Increment { field, .. }
             | Update::Decrement { field, .. }
             | Update::MapInsert { field, .. }
+            | Update::MapRemove { field, .. }
             | Update::SetInsert { field, .. }
             | Update::SetRemove { field, .. }
             | Update::SeqAppend { field, .. }
@@ -5955,6 +6005,9 @@ fn collect_update_bindings(updates: &[Update]) -> BTreeSet<String> {
             Update::MapInsert { key, value, .. } => {
                 collect_expr_bindings(key, &mut bindings);
                 collect_expr_bindings(value, &mut bindings);
+            }
+            Update::MapRemove { key, .. } => {
+                collect_expr_bindings(key, &mut bindings);
             }
             Update::SetInsert { value, .. }
             | Update::SetRemove { value, .. }
@@ -5996,6 +6049,9 @@ fn collect_update_fields_exprs(updates: &[Update]) -> BTreeSet<String> {
             Update::MapInsert { key, value, .. } => {
                 collect_expr_fields(key, &mut fields);
                 collect_expr_fields(value, &mut fields);
+            }
+            Update::MapRemove { key, .. } => {
+                collect_expr_fields(key, &mut fields);
             }
             Update::SetInsert { value, .. }
             | Update::SetRemove { value, .. }

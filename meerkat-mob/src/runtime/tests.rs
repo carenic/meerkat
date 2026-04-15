@@ -17345,6 +17345,8 @@ enum MobRuntimeParityOutcomeKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct MobRuntimeParitySnapshotSummary {
     phase: String,
+    live_runtime_ids: BTreeSet<String>,
+    runtime_fence_tokens: BTreeMap<String, u64>,
     active_member_count: usize,
     all_member_count: usize,
     wiring_edge_count: usize,
@@ -17804,10 +17806,49 @@ async fn mob_runtime_parity_snapshot_summary(
         serde_json::to_string(&entry.agent_identity).unwrap_or_else(|_| "\"<agent>\"".into())
     });
     let representative_runtime_id = representative.map(|entry| {
-        serde_json::to_string(&entry.agent_runtime_id).unwrap_or_else(|_| "\"<runtime-id>\"".into())
+        mob_modeled_normalize_formal_string(
+            &serde_json::to_string(&entry.agent_runtime_id)
+                .unwrap_or_else(|_| "\"<runtime-id>\"".into()),
+        )
     });
     let representative_fence_token = representative.map(|entry| entry.fence_token.get());
+    let live_runtime_ids = active_members
+        .iter()
+        .map(|entry| {
+            mob_modeled_normalize_formal_string(
+                &serde_json::to_string(&entry.agent_runtime_id)
+                    .expect("serialize live runtime id for parity snapshot"),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let live_runtime_id_values = live_runtime_ids
+        .iter()
+        .map(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw.clone()))
+        })
+        .collect::<Vec<_>>();
+    let runtime_fence_tokens = active_members
+        .iter()
+        .map(|entry| {
+            (
+                mob_modeled_normalize_formal_string(
+                    &serde_json::to_string(&entry.agent_runtime_id)
+                        .expect("serialize runtime id for fence parity snapshot"),
+                ),
+                entry.fence_token.get(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut formal_available_fields = BTreeMap::new();
+    formal_available_fields.insert(
+        "live_runtime_ids".into(),
+        serde_json::to_string(&live_runtime_id_values).expect("serialize live_runtime_ids"),
+    );
+    formal_available_fields.insert(
+        "runtime_fence_tokens".into(),
+        serde_json::to_string(&runtime_fence_tokens).expect("serialize runtime_fence_tokens"),
+    );
     formal_available_fields.insert(
         "active_member_count".into(),
         serde_json::to_string(&active_members.len()).expect("serialize active_member_count"),
@@ -17857,6 +17898,8 @@ async fn mob_runtime_parity_snapshot_summary(
 
     Some(MobRuntimeParitySnapshotSummary {
         phase: phase.as_str().to_string(),
+        live_runtime_ids,
+        runtime_fence_tokens,
         active_member_count: active_members.len(),
         all_member_count: all_members.len(),
         wiring_edge_count,
@@ -17915,6 +17958,8 @@ enum MobRuntimeParityExprValue {
     Bool(bool),
     U64(u64),
     String(String),
+    Set(BTreeSet<String>),
+    Map(BTreeMap<String, u64>),
     None,
 }
 
@@ -17923,6 +17968,12 @@ fn mob_runtime_parity_field_value(
     field: &str,
 ) -> Option<MobRuntimeParityExprValue> {
     match field {
+        "live_runtime_ids" => Some(MobRuntimeParityExprValue::Set(
+            snapshot.live_runtime_ids.clone(),
+        )),
+        "runtime_fence_tokens" => Some(MobRuntimeParityExprValue::Map(
+            snapshot.runtime_fence_tokens.clone(),
+        )),
         "active_member_count" => Some(MobRuntimeParityExprValue::U64(
             snapshot.active_member_count as u64,
         )),
@@ -19038,9 +19089,15 @@ fn mob_modeled_kernel_value_from_json(
         {
             meerkat_machine_kernels::KernelValue::U64(value.as_u64().unwrap_or(0))
         }
-        meerkat_machine_schema::TypeRef::Named(_) => meerkat_machine_kernels::KernelValue::String(
-            serde_json::to_string(value).unwrap_or_else(|_| "null".into()),
-        ),
+        meerkat_machine_schema::TypeRef::Named(_) => {
+            let normalized = value
+                .as_str()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .unwrap_or_else(|| value.clone());
+            meerkat_machine_kernels::KernelValue::String(
+                serde_json::to_string(&normalized).unwrap_or_else(|_| "null".into()),
+            )
+        }
         meerkat_machine_schema::TypeRef::Enum(name) => {
             meerkat_machine_kernels::KernelValue::NamedVariant {
                 enum_name: name.clone(),
@@ -19280,6 +19337,14 @@ fn mob_modeled_representative_runtime_value(before: &MobRuntimeParitySnapshotSum
         .unwrap_or_else(|| "\"<runtime-id>\"".to_string())
 }
 
+fn mob_modeled_spawn_runtime_value(identity: &str, generation: u64) -> String {
+    serde_json::json!({
+        "identity": identity,
+        "generation": generation,
+    })
+    .to_string()
+}
+
 fn mob_modeled_kernel_input(
     schema: &MachineSchema,
     before: &MobRuntimeParitySnapshotSummary,
@@ -19294,16 +19359,36 @@ fn mob_modeled_kernel_input(
 
     for field in &input_variant.fields {
         let value = match field.name.as_str() {
-            "agent_identity" => {
-                mob_modeled_named_string(mob_modeled_representative_identity_value(before))
+            "agent_identity" => match probe {
+                MobRuntimeParityProbeInput::Spawn => {
+                    mob_modeled_named_string("\"parity-spawn\"".to_string())
+                }
+                _ => mob_modeled_named_string(mob_modeled_representative_identity_value(before)),
+            },
+            "agent_runtime_id" => match probe {
+                MobRuntimeParityProbeInput::Spawn => {
+                    mob_modeled_named_string(mob_modeled_spawn_runtime_value("parity-spawn", 0))
+                }
+                _ => mob_modeled_named_string(mob_modeled_representative_runtime_value(before)),
+            },
+            "fence_token" => {
+                let value = match probe {
+                    MobRuntimeParityProbeInput::Spawn => 1,
+                    MobRuntimeParityProbeInput::Respawn => {
+                        before.representative_fence_token.unwrap_or_default() + 1
+                    }
+                    _ => before.representative_fence_token.unwrap_or_default(),
+                };
+                meerkat_machine_kernels::KernelValue::U64(value)
             }
-            "agent_runtime_id" => {
-                mob_modeled_named_string(mob_modeled_representative_runtime_value(before))
+            "generation" => {
+                let value = match probe {
+                    MobRuntimeParityProbeInput::Spawn => 0,
+                    MobRuntimeParityProbeInput::Respawn => 0,
+                    _ => 0,
+                };
+                meerkat_machine_kernels::KernelValue::U64(value)
             }
-            "fence_token" => meerkat_machine_kernels::KernelValue::U64(
-                before.representative_fence_token.unwrap_or_default(),
-            ),
-            "generation" => meerkat_machine_kernels::KernelValue::U64(0),
             "work_id" => mob_modeled_named_string("\"<work-id>\"".to_string()),
             _ => mob_modeled_default_kernel_value(&field.ty),
         };

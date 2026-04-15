@@ -648,6 +648,9 @@ fn render_update(update: &Update) -> String {
                 render_expr(value)
             )
         }
+        Update::MapRemove { field, key } => {
+            format!("{field}' = MapRemove({field}, {})", render_expr(key))
+        }
         Update::SetInsert { field, value } => {
             format!("{field}' = {field} \\cup {{ {} }}", render_expr(value))
         }

@@ -524,6 +524,18 @@ impl GeneratedMachineKernel {
                 map.insert(key, value);
                 state.fields.insert(field.clone(), KernelValue::Map(map));
             }
+            Update::MapRemove { field, key } => {
+                let key = self.eval_expr(state, bindings, key, transition_name)?;
+                let mut map = state
+                    .fields
+                    .get(field)
+                    .cloned()
+                    .unwrap_or(KernelValue::Map(BTreeMap::new()))
+                    .into_map()
+                    .map_err(|reason| self.eval_error(transition_name, reason))?;
+                map.remove(&key);
+                state.fields.insert(field.clone(), KernelValue::Map(map));
+            }
             Update::SetInsert { field, value } => {
                 let value = self.eval_expr(state, bindings, value, transition_name)?;
                 let mut set = state

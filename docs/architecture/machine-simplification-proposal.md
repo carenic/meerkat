@@ -68,6 +68,11 @@ Hopcroft-style behavioral quotient over the reachable graph.
   `SubmitWork` / flow-start guards to the authoritative active-member counters
   instead of replaying representative runtime identity through top-level formal
   state.
+- Restored the real Mob stale-binding truth in a normalized shape by adding
+  `live_runtime_ids` plus `runtime_fence_tokens` to `MobMachine`, extending
+  the formal update language with `MapRemove`, and modeling stale-fence
+  invalidation directly in the checked-in machine instead of in a helper-only
+  handle path or a fake single representative runtime binding.
 - Removed the dead Mob `retiring_member_count` field and simplified the retire
   guard/update surface to rely on `active_member_count`, which preserved the
   truthful Hopcroft/TLC readout exactly because the counter never carried
@@ -196,7 +201,7 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | MobMachine | Signals | 79 | 31 | -48 |
 | MobMachine | Transitions | 210 | 82 | -128 |
 | MobMachine | TLC generated states | 452,835 | 26,484 | -426,351 |
-| MobMachine | TLC distinct states | 6,401 | 813 | -5,588 |
+| MobMachine | TLC distinct states | 6,401 | 1,323 | -5,078 |
 | MobMachine | TLC depth | 7 | 7 | 0 |
 
 ### Hypothesis / verdict tracker
@@ -216,6 +221,7 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | Mob `current_generation` should not stay as top-level seam-shadow state | passed / landed | Removed `current_generation` and emitted `RequestRuntimeBinding.generation` directly from the transition bindings; exact Mob parity stayed green and the truthful Hopcroft/TLC readout stayed unchanged, proving the field was fully correlated rather than behavior-bearing. |
 | Mob `CancelWork` should stay surfaced without formal transition coverage | passed / landed | Moved `CancelWork` to `surface_only_inputs`; exact Mob parity stayed green, the truthful TLC state space fell from 1,390 to 1,214, and the raw/phase quotients tightened from 202 / 204 to 187 / 189. |
 | Mob representative runtime identity should not stay as top-level formal state | passed / landed | Removed `active_identity`, `active_runtime_id`, and `active_fence_token`; exact Mob parity stayed green, truthful TLC distinct states fell from 1,214 to 770, and the raw/phase quotients tightened from 187 / 189 to 138 / 140. |
+| Mob stale-binding truth should stay formally owned in `MobMachine` | passed / landed | Restored `live_runtime_ids` plus `runtime_fence_tokens`, added formal `MapRemove`, and modeled stale-fence invalidation exactly where the public handle enforces it. Exact Mob parity stayed green on all three layers, and the truthful quotient moved to `1323 -> 207 / 209 / 1323`, showing that the restored binding table is real machine behavior rather than a representative shadow. |
 | Mob `retiring_member_count` should not stay as top-level formal state | passed / landed | Removed the dead retire counter; exact Mob parity stayed green and the truthful Hopcroft/TLC readout stayed flat at `770 -> 138 / 140 / 770`, proving the counter was not carrying independent formal behavior. |
 | Mob public `Stop` should reject active flows | passed / landed | Added `no_active_runs` to `StopRunning` after a focused runtime/schema probe showed `handle.stop()` rejects while flows are still active; the lifecycle-triangle parity audit stayed exact and truthful TLC generated states fell from `25,943` to `25,767` with the quotient unchanged. |
 | Mob bootstrap should start with coordinator bound | passed / landed | Changed the formal init state from `Running + coordinator_bound=false` to `Running + coordinator_bound=true` to match the live runtime bootstrap snapshot; the lifecycle-triangle parity audit stayed exact and the truthful quotient held at `138 / 140` while reachable states rose from `770` to `813`, proving the old bootstrap state had been under-modeled rather than behavior-bearing. |
@@ -286,9 +292,9 @@ We ran three observation modes for each machine:
 
 | Machine | Observation | Reachable states | Quotient states | Reduction | Reading |
 |---|---|---:|---:|---:|---|
-| MobMachine | `none` | 813 | 138 | 83.0% | After the bootstrap parity correction, the truthful graph grew slightly while the raw quotient stayed flat, confirming the old `coordinator_bound=false` init was under-modeled bootstrap truth rather than behavior-bearing structure. |
-| MobMachine | `phase` | 813 | 140 | 82.8% | Preserving phase still adds only two quotient blocks; `Running` / `Stopped` / `Completed` remain mostly projection. |
-| MobMachine | `full` | 813 | 813 | 0.0% | Once the remaining authoritative counters are preserved, every reachable Mob snapshot is still distinct. |
+| MobMachine | `none` | 1323 | 207 | 84.4% | After restoring the real stale-binding table to `MobMachine`, the truthful graph grew, but the result is still strongly quotientable. The added state is machine-owned binding truth, not a representative identity shadow. |
+| MobMachine | `phase` | 1323 | 209 | 84.2% | Preserving phase still adds only two quotient blocks; `Running` / `Stopped` / `Completed` remain mostly projection even after binding-table restoration. |
+| MobMachine | `full` | 1323 | 1323 | 0.0% | Once the remaining authoritative counters and binding table are preserved, every reachable Mob snapshot is still distinct. |
 | MeerkatMachine | `none` | 17,384 | 385 | 97.8% | After deleting `RuntimeControlAuthority` as a semantic reducer and rerunning the truthful model, the reachable graph grows materially while the raw quotient stays flat. The main new split drivers are now checked-in control facts (`current_run_id`, `pre_run_phase`) rather than helper-owned folklore. |
 | MeerkatMachine | `phase` | 17,384 | 390 | 97.8% | Preserving phase still adds only five quotient blocks, so phase remains almost entirely projection even after the control-absorption tranche. |
 | MeerkatMachine | `full` | 17,384 | 16,995 | 2.2% | Preserving the full snapshot still keeps nearly every remaining Meerkat state distinct, but the extra structure now lives in visibility revisions, deferred-name sets, run binding/return state, ingress configuration, and drain state rather than in the deleted helper authority. |
@@ -539,34 +545,38 @@ cargo run -p xtask --features machine-authority -- \
 
 Current result:
 
-- reachable states: `813`
-- raw quotient states: `138`
-- phase-observed quotient states: `140`
-- full-observed quotient states: `813`
-- TLC: `26,484 generated / 813 distinct / depth 7`
-- dominant mixed block: `362` states spanning `Running`, `Stopped`, and
+- reachable states: `1,323`
+- raw quotient states: `207`
+- phase-observed quotient states: `209`
+- full-observed quotient states: `1,323`
+- TLC: `41,202 generated / 1,323 distinct / depth 7`
+- dominant mixed block: `668` states spanning `Running`, `Stopped`, and
   `Completed`
-- dominant block tuples: `205`
-- tuples reused across multiple phases: `86`
+- dominant block tuples: `401`
+- tuples reused across multiple phases: `169`
 - maximum phases sharing one tuple: `3`
 
 The dominant Mob block is now being split primarily by the remaining
-runtime-backed lifecycle/orchestration counters:
+runtime-backed lifecycle/orchestration counters plus the restored binding
+table:
 
 - `pending_spawn_count`
 - `wiring_edge_count`
 - `active_run_count`
 - `active_member_count`
 - `coordinator_bound`
+- `runtime_fence_tokens`
+- `live_runtime_ids`
 
-The important read is that the raw quotient has continued to fall only when we
-removed formal distinctions that were still present in the truthful state
-graph. The reachable space is now down from `4,797` to `813`, while the raw
-quotient is down to `138`. The most recent init-state correction increased the
-reachable space because the old bootstrap truth was wrong, but it did not
-increase the intrinsic quotient. That means the remaining Mob state is now much
-closer to the real lifecycle/counter core than to the earlier seam-shadow
-projection layer.
+The important read is that the raw quotient has continued to move only when we
+changed real machine-owned distinctions in the truthful state graph. The
+reachable space is now down from `4,797` to `1,323`, while the raw quotient is
+down to `207`. The most recent binding-table restoration increased the
+reachable space because the old formal machine had been missing stale-fence
+truth, not because the representative identity shadow was architecturally
+correct. That means the remaining Mob state is now much closer to the real
+lifecycle/counter-plus-binding core than to the earlier seam-shadow projection
+layer.
 
 We then removed the residual top-level `current_generation` seam-shadow field
 and re-ran the same trustworthy Mob lanes. The readout stayed flat:
@@ -614,18 +624,22 @@ active-member counter surface. That read tightened again:
 
 That was the strongest Mob simplification result so far. A later bootstrap
 parity correction changed the truthful init state from
-`Running + coordinator_bound=false` to `Running + coordinator_bound=true`, so
-the current readout is:
+`Running + coordinator_bound=false` to `Running + coordinator_bound=true`. The
+newer binding-table restoration then corrected the remaining stale-fence
+omission without bringing back the old representative runtime-identity shadow,
+so the current readout is:
 
-- reachable states: `813`
-- raw quotient states: `138`
-- phase-observed quotient states: `140`
-- full-observed quotient states: `813`
-- TLC: `26,484 generated / 813 distinct / depth 7`
+- reachable states: `1,323`
+- raw quotient states: `207`
+- phase-observed quotient states: `209`
+- full-observed quotient states: `1,323`
+- TLC: `41,202 generated / 1,323 distinct / depth 7`
 
-The key reading did not change. The machine is no longer spending state-space
-budget replaying a representative member/runtime identity at the top level,
-and the remaining mixed block is now dominated by lifecycle and
+The key reading still did not change. The machine is no longer spending
+state-space budget replaying a fake single current member/runtime identity at
+the top level, but it is now honestly spending state-space budget on the real
+binding table that the public stale-fence behavior depends on. The remaining
+mixed block is now dominated by lifecycle, orchestration, and binding
 orchestration counters rather than seam-shadow identity facts.
 
 ### Reading the current pass

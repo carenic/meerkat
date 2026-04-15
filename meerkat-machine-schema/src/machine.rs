@@ -422,6 +422,10 @@ pub enum Update {
         key: Expr,
         value: Expr,
     },
+    MapRemove {
+        field: String,
+        key: Expr,
+    },
     SetInsert {
         field: String,
         value: Expr,
@@ -511,6 +515,22 @@ impl Update {
                     bindings,
                 )?;
                 value.validate(
+                    phase_names,
+                    field_names,
+                    input_variants,
+                    signal_variants,
+                    effect_variants,
+                    helper_names,
+                    bindings,
+                )?;
+            }
+            Self::MapRemove { field, key } => {
+                if !field_names.contains(field.as_str()) {
+                    return Err(MachineSchemaError::UnknownField {
+                        field: field.clone(),
+                    });
+                }
+                key.validate(
                     phase_names,
                     field_names,
                     input_variants,

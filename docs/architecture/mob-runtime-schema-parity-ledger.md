@@ -63,10 +63,13 @@ Current state:
 - `CancelWork` is now a surfaced-only input rather than a formal top-level
   transition, because the runtime behavior hangs on concrete `WorkRef` carrier
   lineage rather than on the lifecycle phase alone
-- the formal machine no longer carries the representative runtime-identity
-  shadow trio `active_identity`, `active_runtime_id`, or `active_fence_token`;
-  the remaining `SubmitWork` / flow-start guards now use the authoritative
-  active-member counters instead
+- the formal machine still does not carry the old representative runtime-
+  identity shadow trio `active_identity`, `active_runtime_id`, or
+  `active_fence_token`, but it now does carry the real stale-binding truth as
+  `live_runtime_ids` plus `runtime_fence_tokens`
+- stale-fence-sensitive commands now validate against that formal binding
+  table, so the checked-in machine owns the same current-binding truth the
+  public handle uses to reject stale work
 - the formal machine no longer carries the dead `retiring_member_count`
   counter; the retire path now relies directly on `active_member_count`, and
   the truthful Hopcroft/TLC readout stayed flat because the removed counter was
@@ -164,6 +167,16 @@ Current state:
   machine had been starting from the wrong bootstrap state. The raw / phase /
   full quotient stayed at `138 / 140 / 813`, which means this was a parity
   correction, not a new simplification.
+- The current tranche restored the real stale-binding truth to the formal
+  machine in a normalized shape:
+  - `live_runtime_ids: Set<AgentRuntimeId>`
+  - `runtime_fence_tokens: Map<AgentRuntimeId, FenceToken>`
+- It also extended the formal update language with `MapRemove` so per-member
+  teardown can invalidate one runtime binding without zeroing the whole map.
+- The exact lifecycle triangle stayed green on all three parity layers after
+  that change, and the truthful Hopcroft/TLC readout moved to
+  `1323 -> 207 -> 209 -> 1323`, which means the restored binding table is real
+  machine-owned behavior rather than a presentation-only shadow.
 
 ## Pair Ledger
 
@@ -181,13 +194,17 @@ Current state:
   surface (`78 / 78 / 78 / 0`).
 - The broad quotient result still stands after the parity cleanup, and the
   shadow-field cuts plus `CancelWork` extraction made that read much cleaner:
-  the truthful state space has now collapsed from `4,797` to `813`.
+  the truthful state space has now collapsed from `4,797` to `1,323`.
 - The trustworthy raw/phase/full reread is now:
-  raw `813 -> 138`, phase `813 -> 140`, full `813 -> 813`.
+  raw `1323 -> 207`, phase `1323 -> 209`, full `1323 -> 1323`.
 - The latest public-guard parity hardening did not change the remaining Mob
   core fields; it only removed one over-admitted `Stop` row from the formal
   graph, which is why the quotient stayed flat while TLC generated states
   dipped slightly.
+- The latest binding-table restoration is intentionally different from the old
+  representative identity trio: it gives `MobMachine` enough formal state to
+  model stale-fence rejection exactly, without pretending the mob has a single
+  current runtime/fence owner.
 - The latest init-state parity hardening corrected the bootstrap truth without
   changing the remaining intrinsic quotient, which is why the reachable space
   rose while the raw quotient stayed flat.

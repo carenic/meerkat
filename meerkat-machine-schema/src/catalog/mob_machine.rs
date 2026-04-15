@@ -29,6 +29,17 @@ pub fn mob_machine() -> MachineSchema {
                 ],
             },
             fields: vec![
+                field(
+                    "live_runtime_ids",
+                    TypeRef::Set(Box::new(TypeRef::Named("AgentRuntimeId".into()))),
+                ),
+                field(
+                    "runtime_fence_tokens",
+                    TypeRef::Map(
+                        Box::new(TypeRef::Named("AgentRuntimeId".into())),
+                        Box::new(TypeRef::Named("FenceToken".into())),
+                    ),
+                ),
                 field("active_member_count", TypeRef::U32),
                 field("active_run_count", TypeRef::U32),
                 field("pending_spawn_count", TypeRef::U32),
@@ -38,6 +49,8 @@ pub fn mob_machine() -> MachineSchema {
             init: InitSchema {
                 phase: "Running".into(),
                 fields: vec![
+                    init("live_runtime_ids", Expr::EmptySet),
+                    init("runtime_fence_tokens", Expr::EmptyMap),
                     init("active_member_count", Expr::U64(0)),
                     init("active_run_count", Expr::U64(0)),
                     init("pending_spawn_count", Expr::U64(0)),
@@ -117,6 +130,17 @@ pub fn mob_machine() -> MachineSchema {
                 guards: vec![],
                 updates: {
                     let mut updates = reset_member_runtime_updates();
+                    updates.extend(vec![
+                        Update::SetInsert {
+                            field: "live_runtime_ids".into(),
+                            value: Expr::Binding("agent_runtime_id".into()),
+                        },
+                        Update::MapInsert {
+                            field: "runtime_fence_tokens".into(),
+                            key: Expr::Binding("agent_runtime_id".into()),
+                            value: Expr::Binding("fence_token".into()),
+                        },
+                    ]);
                     updates.push(Update::Assign {
                         field: "active_member_count".into(),
                         expr: Expr::U64(1),
@@ -157,7 +181,10 @@ pub fn mob_machine() -> MachineSchema {
                         "work_id".into(),
                     ],
                 },
-                guards: vec![active_members_present_guard()],
+                guards: vec![
+                    active_members_present_guard(),
+                    current_binding_matches_guard(),
+                ],
                 updates: vec![],
                 to: "Running".into(),
                 // SubmitMemberWork effect removed (unimplemented route to MeerkatMachine).
@@ -175,7 +202,7 @@ pub fn mob_machine() -> MachineSchema {
                         "work_id".into(),
                     ],
                 },
-                guards: vec![],
+                guards: vec![current_binding_matches_guard()],
                 updates: clear_work_updates(),
                 to: "Running".into(),
                 emit: vec![],
@@ -192,7 +219,7 @@ pub fn mob_machine() -> MachineSchema {
                         "work_id".into(),
                     ],
                 },
-                guards: vec![],
+                guards: vec![current_binding_matches_guard()],
                 updates: clear_work_updates(),
                 to: "Running".into(),
                 emit: vec![],
@@ -209,7 +236,7 @@ pub fn mob_machine() -> MachineSchema {
                         "work_id".into(),
                     ],
                 },
-                guards: vec![],
+                guards: vec![current_binding_matches_guard()],
                 updates: clear_work_updates(),
                 to: "Running".into(),
                 emit: vec![],
@@ -222,7 +249,7 @@ pub fn mob_machine() -> MachineSchema {
                     variant: "RetireMember".into(),
                     bindings: vec!["agent_runtime_id".into(), "fence_token".into()],
                 },
-                guards: vec![],
+                guards: vec![current_binding_matches_guard()],
                 updates: vec![],
                 to: "Running".into(),
                 emit: vec![runtime_observation_emit("RequestRuntimeRetire")],
@@ -235,8 +262,8 @@ pub fn mob_machine() -> MachineSchema {
                     variant: "ObserveRuntimeRetired".into(),
                     bindings: vec!["agent_runtime_id".into(), "fence_token".into()],
                 },
-                guards: vec![],
-                updates: clear_runtime_projection_updates(),
+                guards: vec![current_binding_matches_guard()],
+                updates: clear_current_runtime_projection_updates(),
                 to: "Stopped".into(),
                 emit: vec![lifecycle_notice_emit("retired")],
             },
@@ -256,6 +283,17 @@ pub fn mob_machine() -> MachineSchema {
                 guards: vec![],
                 updates: {
                     let mut updates = reset_member_runtime_updates();
+                    updates.extend(vec![
+                        Update::SetInsert {
+                            field: "live_runtime_ids".into(),
+                            value: Expr::Binding("agent_runtime_id".into()),
+                        },
+                        Update::MapInsert {
+                            field: "runtime_fence_tokens".into(),
+                            key: Expr::Binding("agent_runtime_id".into()),
+                            value: Expr::Binding("fence_token".into()),
+                        },
+                    ]);
                     updates.push(Update::Assign {
                         field: "active_member_count".into(),
                         expr: Expr::U64(1),
@@ -284,6 +322,17 @@ pub fn mob_machine() -> MachineSchema {
                 guards: vec![],
                 updates: {
                     let mut updates = reset_member_runtime_updates();
+                    updates.extend(vec![
+                        Update::SetInsert {
+                            field: "live_runtime_ids".into(),
+                            value: Expr::Binding("agent_runtime_id".into()),
+                        },
+                        Update::MapInsert {
+                            field: "runtime_fence_tokens".into(),
+                            key: Expr::Binding("agent_runtime_id".into()),
+                            value: Expr::Binding("fence_token".into()),
+                        },
+                    ]);
                     updates.push(Update::Assign {
                         field: "active_member_count".into(),
                         expr: Expr::U64(1),
@@ -335,7 +384,7 @@ pub fn mob_machine() -> MachineSchema {
                     variant: "ObserveRuntimeDestroyed".into(),
                     bindings: vec!["agent_runtime_id".into(), "fence_token".into()],
                 },
-                guards: vec![],
+                guards: vec![current_binding_matches_guard()],
                 updates: destroy_mob_projection_updates(),
                 to: "Destroyed".into(),
                 emit: vec![lifecycle_notice_emit("destroyed")],
@@ -1094,7 +1143,7 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
     });
 
     // Retire: per-phase self-loops for Running and Stopped
-    let retire_guards = vec![active_members_present_guard()];
+    let retire_guards = vec![active_members_present_guard(), runtime_id_present_guard()];
     for phase in ["Running", "Stopped"] {
         transitions.push(TransitionSchema {
             name: format!("Retire{phase}"),
@@ -1105,10 +1154,20 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
                 bindings: vec!["agent_runtime_id".into()],
             },
             guards: retire_guards.clone(),
-            updates: vec![Update::Decrement {
-                field: "active_member_count".into(),
-                amount: 1,
-            }],
+            updates: vec![
+                Update::Decrement {
+                    field: "active_member_count".into(),
+                    amount: 1,
+                },
+                Update::SetRemove {
+                    field: "live_runtime_ids".into(),
+                    value: Expr::Binding("agent_runtime_id".into()),
+                },
+                Update::MapRemove {
+                    field: "runtime_fence_tokens".into(),
+                    key: Expr::Binding("agent_runtime_id".into()),
+                },
+            ],
             to: phase.into(),
             emit: vec![runtime_observation_emit("RequestRuntimeRetire")],
         });
@@ -1125,10 +1184,20 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
                 bindings: vec![],
             },
             guards: vec![],
-            updates: vec![Update::Assign {
-                field: "active_member_count".into(),
-                expr: Expr::U64(0),
-            }],
+            updates: vec![
+                Update::Assign {
+                    field: "active_member_count".into(),
+                    expr: Expr::U64(0),
+                },
+                Update::Assign {
+                    field: "live_runtime_ids".into(),
+                    expr: Expr::EmptySet,
+                },
+                Update::Assign {
+                    field: "runtime_fence_tokens".into(),
+                    expr: Expr::EmptyMap,
+                },
+            ],
             to: phase.into(),
             emit: vec![lifecycle_notice_emit("retiring")],
         });
@@ -1181,22 +1250,41 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
 
     // Respawn: Running self-loop
     let phase = "Running";
-    transitions.push(mob_self_loop_transition(
-        "Respawn",
-        phase,
-        "Respawn",
-        vec!["agent_runtime_id"],
-        vec![],
-        vec![simple_emit("ExposePendingSpawn")],
-    ));
+    transitions.push(TransitionSchema {
+        name: "RespawnRunning".into(),
+        from: vec![phase.into()],
+        on: InputMatch {
+            kind: mob_trigger_kind("Respawn"),
+            variant: "Respawn".into(),
+            bindings: vec!["agent_runtime_id".into()],
+        },
+        guards: vec![runtime_id_present_guard()],
+        updates: vec![Update::MapInsert {
+            field: "runtime_fence_tokens".into(),
+            key: Expr::Binding("agent_runtime_id".into()),
+            value: Expr::Add(
+                Box::new(Expr::MapGet {
+                    map: Box::new(Expr::Field("runtime_fence_tokens".into())),
+                    key: Box::new(Expr::Binding("agent_runtime_id".into())),
+                }),
+                Box::new(Expr::U64(1)),
+            ),
+        }],
+        to: phase.into(),
+        emit: vec![simple_emit("ExposePendingSpawn")],
+    });
 
     // CancelAllWork: delegates to ForceCancel which the formal model keeps in Running.
     let phase = "Running";
-    transitions.push(mob_self_loop_transition(
+    transitions.push(mob_guarded_self_loop_transition(
         "CancelAllWork",
         phase,
         "CancelAllWork",
-        vec![],
+        vec!["agent_runtime_id", "fence_token"],
+        vec![
+            active_members_present_guard(),
+            current_binding_matches_guard(),
+        ],
         clear_work_updates(),
         vec![simple_emit("FlowTerminalized")],
     ));
@@ -1269,6 +1357,35 @@ fn active_members_present_guard() -> Guard {
     }
 }
 
+fn current_binding_matches_guard() -> Guard {
+    Guard {
+        name: "current_binding_matches".into(),
+        expr: Expr::And(vec![
+            Expr::Contains {
+                collection: Box::new(Expr::Field("live_runtime_ids".into())),
+                value: Box::new(Expr::Binding("agent_runtime_id".into())),
+            },
+            Expr::Eq(
+                Box::new(Expr::MapGet {
+                    map: Box::new(Expr::Field("runtime_fence_tokens".into())),
+                    key: Box::new(Expr::Binding("agent_runtime_id".into())),
+                }),
+                Box::new(Expr::Binding("fence_token".into())),
+            ),
+        ]),
+    }
+}
+
+fn runtime_id_present_guard() -> Guard {
+    Guard {
+        name: "runtime_id_present".into(),
+        expr: Expr::Contains {
+            collection: Box::new(Expr::Field("live_runtime_ids".into())),
+            value: Box::new(Expr::Binding("agent_runtime_id".into())),
+        },
+    }
+}
+
 fn no_active_runs_guard() -> Guard {
     Guard {
         name: "no_active_runs".into(),
@@ -1281,6 +1398,24 @@ fn no_active_runs_guard() -> Guard {
 
 fn clear_runtime_projection_updates() -> Vec<Update> {
     vec![clear_active_runs()]
+}
+
+fn clear_current_runtime_projection_updates() -> Vec<Update> {
+    let mut updates = clear_runtime_projection_updates();
+    updates.splice(
+        0..0,
+        [
+            Update::SetRemove {
+                field: "live_runtime_ids".into(),
+                value: Expr::Binding("agent_runtime_id".into()),
+            },
+            Update::MapRemove {
+                field: "runtime_fence_tokens".into(),
+                key: Expr::Binding("agent_runtime_id".into()),
+            },
+        ],
+    );
+    updates
 }
 
 fn clear_active_runs() -> Update {
@@ -1306,10 +1441,6 @@ fn reset_member_runtime_updates() -> Vec<Update> {
     updates
 }
 
-fn reset_mob_projection_updates() -> Vec<Update> {
-    reset_mob_projection_updates_with_coordinator(false)
-}
-
 fn reset_mob_projection_updates_with_coordinator(coordinator_bound: bool) -> Vec<Update> {
     let mut updates = clear_runtime_projection_updates();
     updates.extend(vec![
@@ -1327,7 +1458,31 @@ fn reset_mob_projection_updates_with_coordinator(coordinator_bound: bool) -> Vec
 }
 
 fn destroy_mob_projection_updates() -> Vec<Update> {
-    let mut updates = reset_mob_projection_updates();
+    let mut updates = vec![
+        Update::Assign {
+            field: "live_runtime_ids".into(),
+            expr: Expr::EmptySet,
+        },
+        Update::Assign {
+            field: "runtime_fence_tokens".into(),
+            expr: Expr::EmptyMap,
+        },
+    ];
+    updates.extend(vec![
+        Update::Assign {
+            field: "active_run_count".into(),
+            expr: Expr::U64(0),
+        },
+        Update::Assign {
+            field: "pending_spawn_count".into(),
+            expr: Expr::U64(0),
+        },
+        Update::Assign {
+            field: "wiring_edge_count".into(),
+            expr: Expr::U64(0),
+        },
+        set_bool("coordinator_bound", false),
+    ]);
     updates.extend(vec![Update::Assign {
         field: "active_member_count".into(),
         expr: Expr::U64(0),

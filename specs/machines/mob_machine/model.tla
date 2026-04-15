@@ -3,13 +3,16 @@ EXTENDS TLC, Naturals, Sequences, FiniteSets
 
 \* Generated semantic machine model for MobMachine.
 
-CONSTANTS AgentIdentityValues, AgentRuntimeIdValues, BooleanValues, FenceTokenValues, GenerationValues, NatValues, WorkIdValues
+CONSTANTS AgentIdentityValues, AgentRuntimeIdValues, BooleanValues, FenceTokenValues, GenerationValues, NatValues, SetOfAgentRuntimeIdValues, WorkIdValues
 
 None == [tag |-> "none", value |-> "none"]
 Some(v) == [tag |-> "some", value |-> v]
 
+MapAgentRuntimeIdFenceTokenValues == {[x \in {} |-> None]} \cup { [x \in {k} |-> v] : k \in AgentRuntimeIdValues, v \in FenceTokenValues }
+
 MapLookup(map, key) == IF key \in DOMAIN map THEN map[key] ELSE None
 MapSet(map, key, value) == [x \in DOMAIN map \cup {key} |-> IF x = key THEN value ELSE map[x]]
+MapRemove(map, key) == [x \in DOMAIN map \ {key} |-> map[x]]
 StartsWith(seq, prefix) == /\ Len(prefix) <= Len(seq) /\ SubSeq(seq, 1, Len(prefix)) = prefix
 SeqElements(seq) == {seq[i] : i \in 1..Len(seq)}
 RECURSIVE SeqRemove(_, _)
@@ -17,13 +20,15 @@ SeqRemove(seq, value) == IF Len(seq) = 0 THEN <<>> ELSE IF Head(seq) = value THE
 RECURSIVE SeqRemoveAll(_, _)
 SeqRemoveAll(seq, values) == IF Len(values) = 0 THEN seq ELSE SeqRemoveAll(SeqRemove(seq, Head(values)), Tail(values))
 
-VARIABLES phase, model_step_count, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound
+VARIABLES phase, model_step_count, live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound
 
-vars == << phase, model_step_count, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+vars == << phase, model_step_count, live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 Init ==
     /\ phase = "Running"
     /\ model_step_count = 0
+    /\ live_runtime_ids = {}
+    /\ runtime_fence_tokens = [x \in {} |-> None]
     /\ active_member_count = 0
     /\ active_run_count = 0
     /\ pending_spawn_count = 0
@@ -38,6 +43,8 @@ SpawnRunning(agent_identity, agent_runtime_id, fence_token, generation) ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
+    /\ live_runtime_ids' = (live_runtime_ids \cup {agent_runtime_id})
+    /\ runtime_fence_tokens' = MapSet(runtime_fence_tokens, agent_runtime_id, fence_token)
     /\ active_member_count' = 1
     /\ active_run_count' = 0
     /\ pending_spawn_count' = 0
@@ -48,52 +55,60 @@ ObserveRuntimeReady(agent_runtime_id, fence_token) ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 SubmitWorkRunning(agent_runtime_id, fence_token, work_id) ==
     /\ phase = "Running"
     /\ (active_member_count > 0)
+    /\ ((agent_runtime_id \in live_runtime_ids) /\ ((IF agent_runtime_id \in DOMAIN runtime_fence_tokens THEN runtime_fence_tokens[agent_runtime_id] ELSE "None") = fence_token))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 ObserveWorkCompleted(agent_runtime_id, fence_token, work_id) ==
     /\ phase = "Running"
+    /\ ((agent_runtime_id \in live_runtime_ids) /\ ((IF agent_runtime_id \in DOMAIN runtime_fence_tokens THEN runtime_fence_tokens[agent_runtime_id] ELSE "None") = fence_token))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ active_run_count' = 0
-    /\ UNCHANGED << active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 ObserveWorkFailed(agent_runtime_id, fence_token, work_id) ==
     /\ phase = "Running"
+    /\ ((agent_runtime_id \in live_runtime_ids) /\ ((IF agent_runtime_id \in DOMAIN runtime_fence_tokens THEN runtime_fence_tokens[agent_runtime_id] ELSE "None") = fence_token))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ active_run_count' = 0
-    /\ UNCHANGED << active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 ObserveWorkCancelled(agent_runtime_id, fence_token, work_id) ==
     /\ phase = "Running"
+    /\ ((agent_runtime_id \in live_runtime_ids) /\ ((IF agent_runtime_id \in DOMAIN runtime_fence_tokens THEN runtime_fence_tokens[agent_runtime_id] ELSE "None") = fence_token))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ active_run_count' = 0
-    /\ UNCHANGED << active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 RetireMember(agent_runtime_id, fence_token) ==
     /\ phase = "Running"
+    /\ ((agent_runtime_id \in live_runtime_ids) /\ ((IF agent_runtime_id \in DOMAIN runtime_fence_tokens THEN runtime_fence_tokens[agent_runtime_id] ELSE "None") = fence_token))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 ObserveRuntimeRetired(agent_runtime_id, fence_token) ==
     /\ phase = "Running"
+    /\ ((agent_runtime_id \in live_runtime_ids) /\ ((IF agent_runtime_id \in DOMAIN runtime_fence_tokens THEN runtime_fence_tokens[agent_runtime_id] ELSE "None") = fence_token))
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
+    /\ live_runtime_ids' = (live_runtime_ids \ {agent_runtime_id})
+    /\ runtime_fence_tokens' = MapRemove(runtime_fence_tokens, agent_runtime_id)
     /\ active_run_count' = 0
     /\ UNCHANGED << active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
@@ -102,6 +117,8 @@ ResetMember(agent_identity, agent_runtime_id, fence_token, generation) ==
     /\ phase = "Running" \/ phase = "Stopped"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
+    /\ live_runtime_ids' = (live_runtime_ids \cup {agent_runtime_id})
+    /\ runtime_fence_tokens' = MapSet(runtime_fence_tokens, agent_runtime_id, fence_token)
     /\ active_member_count' = 1
     /\ active_run_count' = 0
     /\ pending_spawn_count' = 0
@@ -112,6 +129,8 @@ RespawnMember(agent_identity, agent_runtime_id, fence_token, generation) ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
+    /\ live_runtime_ids' = (live_runtime_ids \cup {agent_runtime_id})
+    /\ runtime_fence_tokens' = MapSet(runtime_fence_tokens, agent_runtime_id, fence_token)
     /\ active_member_count' = 1
     /\ active_run_count' = 0
     /\ pending_spawn_count' = 0
@@ -123,13 +142,15 @@ MarkCompleted ==
     /\ (active_run_count = 0)
     /\ phase' = "Completed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 DestroyMob ==
     /\ phase = "Running" \/ phase = "Stopped" \/ phase = "Completed"
     /\ phase' = "Destroyed"
     /\ model_step_count' = model_step_count + 1
+    /\ live_runtime_ids' = {}
+    /\ runtime_fence_tokens' = [x \in {} |-> None]
     /\ active_member_count' = 0
     /\ active_run_count' = 0
     /\ pending_spawn_count' = 0
@@ -139,8 +160,11 @@ DestroyMob ==
 
 ObserveRuntimeDestroyed(agent_runtime_id, fence_token) ==
     /\ phase = "Running" \/ phase = "Stopped" \/ phase = "Completed" \/ phase = "Destroyed"
+    /\ ((agent_runtime_id \in live_runtime_ids) /\ ((IF agent_runtime_id \in DOMAIN runtime_fence_tokens THEN runtime_fence_tokens[agent_runtime_id] ELSE "None") = fence_token))
     /\ phase' = "Destroyed"
     /\ model_step_count' = model_step_count + 1
+    /\ live_runtime_ids' = {}
+    /\ runtime_fence_tokens' = [x \in {} |-> None]
     /\ active_member_count' = 0
     /\ active_run_count' = 0
     /\ pending_spawn_count' = 0
@@ -152,56 +176,56 @@ RecordOperatorActionProvenanceRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 RecordOperatorActionProvenanceStopped ==
     /\ phase = "Stopped"
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 RecordOperatorActionProvenanceCompleted ==
     /\ phase = "Completed"
     /\ phase' = "Completed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 RecordOperatorActionProvenanceDestroyed ==
     /\ phase = "Destroyed"
     /\ phase' = "Destroyed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 SetSpawnPolicyRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 SetSpawnPolicyStopped ==
     /\ phase = "Stopped"
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 SetSpawnPolicyCompleted ==
     /\ phase = "Completed"
     /\ phase' = "Completed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 SetSpawnPolicyDestroyed ==
     /\ phase = "Destroyed"
     /\ phase' = "Destroyed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 StopRunning ==
@@ -211,7 +235,7 @@ StopRunning ==
     /\ model_step_count' = model_step_count + 1
     /\ active_run_count' = 0
     /\ coordinator_bound' = FALSE
-    /\ UNCHANGED << active_member_count, pending_spawn_count, wiring_edge_count >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, pending_spawn_count, wiring_edge_count >>
 
 
 ResumeStopped ==
@@ -219,7 +243,7 @@ ResumeStopped ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ coordinator_bound' = TRUE
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count >>
 
 
 CompleteRunning ==
@@ -227,7 +251,7 @@ CompleteRunning ==
     /\ phase' = "Completed"
     /\ model_step_count' = model_step_count + 1
     /\ active_run_count' = 0
-    /\ UNCHANGED << active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 ResetToRunning ==
@@ -238,7 +262,7 @@ ResetToRunning ==
     /\ pending_spawn_count' = 0
     /\ wiring_edge_count' = 0
     /\ coordinator_bound' = TRUE
-    /\ UNCHANGED << active_member_count >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count >>
 
 
 WireRunning ==
@@ -246,35 +270,35 @@ WireRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ wiring_edge_count' = (wiring_edge_count) + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, coordinator_bound >>
 
 
 ExternalTurnRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 InternalTurnRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 TaskCreateRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 TaskUpdateRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 ForceCancelRunning ==
@@ -282,7 +306,7 @@ ForceCancelRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ active_run_count' = 0
-    /\ UNCHANGED << active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 SubscribeAgentEventsRunning ==
@@ -290,7 +314,7 @@ SubscribeAgentEventsRunning ==
     /\ (active_member_count > 0)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 SubscribeAgentEventsStopped ==
@@ -298,7 +322,7 @@ SubscribeAgentEventsStopped ==
     /\ (active_member_count > 0)
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 SubscribeAgentEventsCompleted ==
@@ -306,7 +330,7 @@ SubscribeAgentEventsCompleted ==
     /\ (active_member_count > 0)
     /\ phase' = "Completed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 SubscribeAgentEventsDestroyed ==
@@ -314,63 +338,63 @@ SubscribeAgentEventsDestroyed ==
     /\ (active_member_count > 0)
     /\ phase' = "Destroyed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 SubscribeAllAgentEventsRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 SubscribeAllAgentEventsStopped ==
     /\ phase = "Stopped"
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 SubscribeAllAgentEventsCompleted ==
     /\ phase = "Completed"
     /\ phase' = "Completed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 SubscribeAllAgentEventsDestroyed ==
     /\ phase = "Destroyed"
     /\ phase' = "Destroyed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 SubscribeMobEventsRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 SubscribeMobEventsStopped ==
     /\ phase = "Stopped"
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 SubscribeMobEventsCompleted ==
     /\ phase = "Completed"
     /\ phase' = "Completed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 SubscribeMobEventsDestroyed ==
     /\ phase = "Destroyed"
     /\ phase' = "Destroyed"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 ShutdownRunning ==
@@ -379,7 +403,7 @@ ShutdownRunning ==
     /\ model_step_count' = model_step_count + 1
     /\ active_run_count' = 0
     /\ coordinator_bound' = FALSE
-    /\ UNCHANGED << active_member_count, pending_spawn_count, wiring_edge_count >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, pending_spawn_count, wiring_edge_count >>
 
 
 ShutdownStopped ==
@@ -388,7 +412,7 @@ ShutdownStopped ==
     /\ model_step_count' = model_step_count + 1
     /\ active_run_count' = 0
     /\ coordinator_bound' = FALSE
-    /\ UNCHANGED << active_member_count, pending_spawn_count, wiring_edge_count >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, pending_spawn_count, wiring_edge_count >>
 
 
 ShutdownCompleted ==
@@ -397,7 +421,7 @@ ShutdownCompleted ==
     /\ model_step_count' = model_step_count + 1
     /\ active_run_count' = 0
     /\ coordinator_bound' = FALSE
-    /\ UNCHANGED << active_member_count, pending_spawn_count, wiring_edge_count >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, pending_spawn_count, wiring_edge_count >>
 
 
 CancelFlowRunning ==
@@ -405,7 +429,7 @@ CancelFlowRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ active_run_count' = 0
-    /\ UNCHANGED << active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 InitializeOrchestratorRunning ==
@@ -413,7 +437,7 @@ InitializeOrchestratorRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ coordinator_bound' = TRUE
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count >>
 
 
 BindCoordinatorRunning ==
@@ -421,7 +445,7 @@ BindCoordinatorRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ coordinator_bound' = TRUE
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count >>
 
 
 UnbindCoordinatorRunning ==
@@ -429,7 +453,7 @@ UnbindCoordinatorRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ coordinator_bound' = FALSE
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count >>
 
 
 StageSpawnRunning ==
@@ -437,7 +461,7 @@ StageSpawnRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ pending_spawn_count' = (pending_spawn_count) + 1
-    /\ UNCHANGED << active_member_count, active_run_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, wiring_edge_count, coordinator_bound >>
 
 
 StopOrchestratorRunning ==
@@ -445,7 +469,7 @@ StopOrchestratorRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ coordinator_bound' = FALSE
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count >>
 
 
 ResumeOrchestratorRunning ==
@@ -453,7 +477,7 @@ ResumeOrchestratorRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ coordinator_bound' = TRUE
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count >>
 
 
 DestroyOrchestratorRunning ==
@@ -461,70 +485,70 @@ DestroyOrchestratorRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ coordinator_bound' = FALSE
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count >>
 
 
 ForceCancelMemberRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 MemberPeerExposedRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 MemberTerminalizedRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 OperationPeerTrustedRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 PeerInputAdmittedRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 BeginCleanupStopped ==
     /\ phase = "Stopped"
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 BeginCleanupCompleted ==
     /\ phase = "Completed"
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 FinishCleanupStopped ==
     /\ phase = "Stopped"
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 FinishCleanupCompleted ==
     /\ phase = "Completed"
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 RunFlowRunning ==
@@ -533,7 +557,7 @@ RunFlowRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ active_run_count' = (active_run_count) + 1
-    /\ UNCHANGED << active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 StartFlowRunning ==
@@ -542,7 +566,7 @@ StartFlowRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ active_run_count' = (active_run_count) + 1
-    /\ UNCHANGED << active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 CreateRunRunning ==
@@ -551,7 +575,7 @@ CreateRunRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ active_run_count' = (active_run_count) + 1
-    /\ UNCHANGED << active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 StartRunRunning ==
@@ -560,7 +584,7 @@ StartRunRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ active_run_count' = (active_run_count) + 1
-    /\ UNCHANGED << active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 UnwireRunning ==
@@ -569,7 +593,7 @@ UnwireRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ wiring_edge_count' = (wiring_edge_count) - 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, coordinator_bound >>
 
 
 CompleteFlowRunning ==
@@ -578,7 +602,7 @@ CompleteFlowRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ active_run_count' = 0
-    /\ UNCHANGED << active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 FinishRunRunning ==
@@ -587,14 +611,17 @@ FinishRunRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ active_run_count' = 0
-    /\ UNCHANGED << active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 RetireRunning(agent_runtime_id) ==
     /\ phase = "Running"
     /\ (active_member_count > 0)
+    /\ (agent_runtime_id \in live_runtime_ids)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
+    /\ live_runtime_ids' = (live_runtime_ids \ {agent_runtime_id})
+    /\ runtime_fence_tokens' = MapRemove(runtime_fence_tokens, agent_runtime_id)
     /\ active_member_count' = (active_member_count) - 1
     /\ UNCHANGED << active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
@@ -602,8 +629,11 @@ RetireRunning(agent_runtime_id) ==
 RetireStopped(agent_runtime_id) ==
     /\ phase = "Stopped"
     /\ (active_member_count > 0)
+    /\ (agent_runtime_id \in live_runtime_ids)
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
+    /\ live_runtime_ids' = (live_runtime_ids \ {agent_runtime_id})
+    /\ runtime_fence_tokens' = MapRemove(runtime_fence_tokens, agent_runtime_id)
     /\ active_member_count' = (active_member_count) - 1
     /\ UNCHANGED << active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
@@ -612,6 +642,8 @@ RetireAllRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
+    /\ live_runtime_ids' = {}
+    /\ runtime_fence_tokens' = [x \in {} |-> None]
     /\ active_member_count' = 0
     /\ UNCHANGED << active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
@@ -620,6 +652,8 @@ RetireAllStopped ==
     /\ phase = "Stopped"
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
+    /\ live_runtime_ids' = {}
+    /\ runtime_fence_tokens' = [x \in {} |-> None]
     /\ active_member_count' = 0
     /\ UNCHANGED << active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
@@ -631,13 +665,15 @@ CompleteSpawnRunning ==
     /\ model_step_count' = model_step_count + 1
     /\ active_member_count' = (active_member_count) + 1
     /\ pending_spawn_count' = (pending_spawn_count) - 1
-    /\ UNCHANGED << active_run_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_run_count, wiring_edge_count, coordinator_bound >>
 
 
 DestroyFromAny ==
     /\ phase = "Running" \/ phase = "Stopped" \/ phase = "Completed"
     /\ phase' = "Destroyed"
     /\ model_step_count' = model_step_count + 1
+    /\ live_runtime_ids' = {}
+    /\ runtime_fence_tokens' = [x \in {} |-> None]
     /\ active_member_count' = 0
     /\ active_run_count' = 0
     /\ pending_spawn_count' = 0
@@ -647,17 +683,21 @@ DestroyFromAny ==
 
 RespawnRunning(agent_runtime_id) ==
     /\ phase = "Running"
+    /\ (agent_runtime_id \in live_runtime_ids)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ runtime_fence_tokens' = MapSet(runtime_fence_tokens, agent_runtime_id, ((IF agent_runtime_id \in DOMAIN runtime_fence_tokens THEN runtime_fence_tokens[agent_runtime_id] ELSE "None") + 1))
+    /\ UNCHANGED << live_runtime_ids, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
-CancelAllWorkRunning ==
+CancelAllWorkRunning(agent_runtime_id, fence_token) ==
     /\ phase = "Running"
+    /\ (active_member_count > 0)
+    /\ ((agent_runtime_id \in live_runtime_ids) /\ ((IF agent_runtime_id \in DOMAIN runtime_fence_tokens THEN runtime_fence_tokens[agent_runtime_id] ELSE "None") = fence_token))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ active_run_count' = 0
-    /\ UNCHANGED << active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
+    /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
 Next ==
@@ -738,12 +778,12 @@ Next ==
     \/ CompleteSpawnRunning
     \/ DestroyFromAny
     \/ \E agent_runtime_id \in AgentRuntimeIdValues : RespawnRunning(agent_runtime_id)
-    \/ CancelAllWorkRunning
+    \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : CancelAllWorkRunning(agent_runtime_id, fence_token)
     \/ TerminalStutter
 
 
-CiStateConstraint == /\ model_step_count <= 6
-DeepStateConstraint == /\ model_step_count <= 8
+CiStateConstraint == /\ model_step_count <= 6 /\ Cardinality(live_runtime_ids) <= 1 /\ Cardinality(DOMAIN runtime_fence_tokens) <= 1
+DeepStateConstraint == /\ model_step_count <= 8 /\ Cardinality(live_runtime_ids) <= 2 /\ Cardinality(DOMAIN runtime_fence_tokens) <= 2
 
 Spec == Init /\ [][Next]_vars
 

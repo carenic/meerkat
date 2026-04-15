@@ -7,6 +7,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ## State
 - Phase enum: `Running | Stopped | Completed | Destroyed`
+- `live_runtime_ids`: `Set<AgentRuntimeId>`
+- `runtime_fence_tokens`: `Map<AgentRuntimeId, FenceToken>`
 - `active_member_count`: `u32`
 - `active_run_count`: `u32`
 - `pending_spawn_count`: `u32`
@@ -138,32 +140,43 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `SubmitWork`(agent_runtime_id, fence_token, work_id)
 - Guards:
   - `active_members_present`
+  - `current_binding_matches`
 - To: `Running`
 
 ### `ObserveWorkCompleted`
 - From: `Running`
 - On: `ObserveWorkCompleted`(agent_runtime_id, fence_token, work_id)
+- Guards:
+  - `current_binding_matches`
 - To: `Running`
 
 ### `ObserveWorkFailed`
 - From: `Running`
 - On: `ObserveWorkFailed`(agent_runtime_id, fence_token, work_id)
+- Guards:
+  - `current_binding_matches`
 - To: `Running`
 
 ### `ObserveWorkCancelled`
 - From: `Running`
 - On: `ObserveWorkCancelled`(agent_runtime_id, fence_token, work_id)
+- Guards:
+  - `current_binding_matches`
 - To: `Running`
 
 ### `RetireMember`
 - From: `Running`
 - On: `RetireMember`(agent_runtime_id, fence_token)
+- Guards:
+  - `current_binding_matches`
 - Emits: `RequestRuntimeRetire`
 - To: `Running`
 
 ### `ObserveRuntimeRetired`
 - From: `Running`
 - On: `ObserveRuntimeRetired`(agent_runtime_id, fence_token)
+- Guards:
+  - `current_binding_matches`
 - Emits: `EmitMemberLifecycleNotice`
 - To: `Stopped`
 
@@ -196,6 +209,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ### `ObserveRuntimeDestroyed`
 - From: `Running`, `Stopped`, `Completed`, `Destroyed`
 - On: `ObserveRuntimeDestroyed`(agent_runtime_id, fence_token)
+- Guards:
+  - `current_binding_matches`
 - Emits: `EmitMemberLifecycleNotice`
 - To: `Destroyed`
 
@@ -550,6 +565,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `Retire`(agent_runtime_id)
 - Guards:
   - `active_members_present`
+  - `runtime_id_present`
 - Emits: `RequestRuntimeRetire`
 - To: `Running`
 
@@ -558,6 +574,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `Retire`(agent_runtime_id)
 - Guards:
   - `active_members_present`
+  - `runtime_id_present`
 - Emits: `RequestRuntimeRetire`
 - To: `Stopped`
 
@@ -589,12 +606,17 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ### `RespawnRunning`
 - From: `Running`
 - On: `Respawn`(agent_runtime_id)
+- Guards:
+  - `runtime_id_present`
 - Emits: `ExposePendingSpawn`
 - To: `Running`
 
 ### `CancelAllWorkRunning`
 - From: `Running`
-- On: `CancelAllWork`()
+- On: `CancelAllWork`(agent_runtime_id, fence_token)
+- Guards:
+  - `active_members_present`
+  - `current_binding_matches`
 - Emits: `FlowTerminalized`
 - To: `Running`
 
