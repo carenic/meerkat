@@ -1924,11 +1924,13 @@ impl MeerkatMachine {
                     driver.start_run(run_id.clone()).map_err(|err| {
                         RuntimeDriverError::Internal(format!("failed to start runtime run: {err}"))
                     })?;
-                    driver.stage_input(&dequeued_id, &run_id).map_err(|err| {
-                        RuntimeDriverError::Internal(format!(
+                    if let Err(err) = driver.stage_input(&dequeued_id, &run_id) {
+                        let _ = driver.rollback_staged(std::slice::from_ref(&dequeued_id));
+                        let _ = driver.complete_run();
+                        return Err(RuntimeDriverError::Internal(format!(
                             "failed to stage accepted input: {err}"
-                        ))
-                    })?;
+                        )));
+                    }
 
                     MeerkatMachineLegacyRunPrepared {
                         input_id,

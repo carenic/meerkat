@@ -727,7 +727,7 @@ async fn process_queue(
                                     reason: format!("runtime loop commit failed for run {run_id}: {err}"),
                                 })
                                 .await;
-                            return false;
+                            return true;
                         }
 
                         // Resolve completion waiters unconditionally
@@ -763,7 +763,7 @@ async fn process_queue(
                                     );
                                 }
                             }
-                            return false;
+                            return true;
                         }
                         // Resolve completion waiter so callers don't hang.
                         if let Some(completions) = completions.as_ref() {

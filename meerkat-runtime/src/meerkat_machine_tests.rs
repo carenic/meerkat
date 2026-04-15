@@ -12790,6 +12790,58 @@ async fn modeled_meerkat_accept_with_completion_running_steer_signal_matches_run
 }
 
 #[tokio::test]
+async fn prepare_runtime_loop_batch_start_unwinds_run_state_when_staging_rejects() {
+    let runtime_id = LogicalRuntimeId::new("prepare-unwind");
+    let driver: SharedDriver = Arc::new(tokio::sync::Mutex::new(DriverEntry::Ephemeral(
+        EphemeralRuntimeDriver::new(runtime_id),
+    )));
+
+    let accepted_input_id = {
+        let mut entry = driver.lock().await;
+        let outcome = entry
+            .as_driver_mut()
+            .accept_input(make_prompt("queued"))
+            .await
+            .expect("accept should queue input");
+        match outcome {
+            AcceptOutcome::Accepted { input_id, .. } => input_id,
+            other => panic!("expected accepted input, got {other:?}"),
+        }
+    };
+
+    let err = prepare_runtime_loop_batch_start(&driver, RunId::new(), &[InputId::new()])
+        .await
+        .expect_err("staging an unknown input should fail and unwind");
+    assert!(
+        err.to_string()
+            .contains("failed to stage accepted input batch"),
+        "unexpected helper error: {err}"
+    );
+
+    let entry = driver.lock().await;
+    let DriverEntry::Ephemeral(driver) = &*entry else {
+        panic!("test uses ephemeral driver");
+    };
+    assert_eq!(
+        driver.runtime_state(),
+        RuntimeState::Idle,
+        "helper should unwind the started run back to idle"
+    );
+    assert!(
+        driver.current_run_id().is_none(),
+        "helper should clear the transient run id on staging failure"
+    );
+    let state = driver
+        .input_state(&accepted_input_id)
+        .expect("accepted input should still be present after unwind");
+    assert_eq!(
+        state.current_state(),
+        crate::input_state::InputLifecycleState::Queued,
+        "staging failure should leave the queued input untouched"
+    );
+}
+
+#[tokio::test]
 async fn modeled_meerkat_accept_with_completion_running_interrupt_signal_matches_runtime() {
     let fixture = build_runtime_parity_fixture(RuntimeParityPhase::Running).await;
     let before = runtime_parity_snapshot_summary(&fixture.adapter, &fixture.session_id)
