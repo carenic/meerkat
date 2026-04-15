@@ -1,8 +1,11 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
-use std::{collections::BTreeSet, fs};
+#[cfg(feature = "machine-authority")]
+use std::collections::BTreeSet;
+use std::fs;
 
 use super::*;
+#[cfg(feature = "machine-authority")]
 use meerkat_machine_schema::{
     EnumSchema, InitSchema, InputMatch, MachineSchema, RustBinding, StateSchema, TransitionSchema,
     TriggerKind, VariantSchema,
@@ -90,6 +93,7 @@ fn machine_workflow_red_ok_detects_missing_and_stale_generated_artifacts() {
     );
 }
 
+#[cfg(feature = "machine-authority")]
 #[test]
 fn tlc_dot_parser_reads_snapshot_nodes_and_action_labels() {
     let dot = r#"
@@ -112,6 +116,7 @@ color="white";
     assert_eq!(graph.states[0].phase.as_deref(), Some("Idle"));
 }
 
+#[cfg(feature = "machine-authority")]
 #[test]
 fn hopcroft_refinement_merges_terminally_equivalent_states_without_observation() {
     let dot = r#"
@@ -145,6 +150,7 @@ color="white";
     assert!(phases.contains(&"RightTerminal"));
 }
 
+#[cfg(feature = "machine-authority")]
 #[test]
 fn phase_observation_prevents_cross_phase_merges() {
     let dot = r#"
@@ -163,6 +169,7 @@ color="white";
     assert_eq!(quotient.blocks.len(), 2);
 }
 
+#[cfg(feature = "machine-authority")]
 #[test]
 fn field_observation_modes_support_only_and_all_except() {
     let dot = r#"
@@ -198,6 +205,7 @@ color="white";
     );
 }
 
+#[cfg(feature = "machine-authority")]
 #[test]
 fn largest_mixed_block_projection_reports_distinct_field_partitions() {
     let dot = r#"
@@ -257,6 +265,7 @@ color="white";
     assert_eq!(y.top_values[0].count, 3);
 }
 
+#[cfg(feature = "machine-authority")]
 #[test]
 fn schema_input_rows_classify_same_left_only_and_different_surfaces() {
     let schema = MachineSchema {

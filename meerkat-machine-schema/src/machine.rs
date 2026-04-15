@@ -1123,12 +1123,18 @@ mod tests {
     fn rejects_surface_only_inputs_with_transitions() {
         let mut schema = meerkat_machine();
         schema.surface_only_inputs.push("RegisterSession".into());
+        let transition = schema
+            .transitions
+            .iter()
+            .find(|transition| transition.on.variant == "RegisterSession")
+            .map(|transition| transition.name.clone())
+            .expect("register session transition should exist");
 
         assert_eq!(
             schema.validate(),
             Err(MachineSchemaError::SurfaceOnlyInputHasTransition {
                 variant: "RegisterSession".into(),
-                transition: "RegisterSession".into(),
+                transition,
             })
         );
     }

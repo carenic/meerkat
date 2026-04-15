@@ -13,6 +13,17 @@ fn verified_witness() -> KernelValue {
     string("verified")
 }
 
+fn tool_filter_all() -> KernelValue {
+    KernelValue::String(
+        serde_json::to_string(&meerkat_core::ToolFilter::All)
+            .expect("tool filter should serialize"),
+    )
+}
+
+fn empty_string_set() -> KernelValue {
+    KernelValue::Set(Default::default())
+}
+
 fn input(variant: &str, fields: Vec<(&str, KernelValue)>) -> KernelInput {
     KernelInput {
         variant: variant.to_string(),
@@ -71,7 +82,14 @@ fn session_tool_visibility_kernel_publishes_committed_set_from_attached() {
         &attached,
         &input(
             "PublishCommittedVisibleSet",
-            vec![("revision", KernelValue::U64(0))],
+            vec![
+                ("active_filter", tool_filter_all()),
+                ("staged_filter", tool_filter_all()),
+                ("active_requested_deferred_names", empty_string_set()),
+                ("staged_requested_deferred_names", empty_string_set()),
+                ("active_visibility_revision", KernelValue::U64(0)),
+                ("staged_visibility_revision", KernelValue::U64(0)),
+            ],
         ),
     )
     .expect("publish committed visible set");
