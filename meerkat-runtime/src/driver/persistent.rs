@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
 use meerkat_core::BlobStore;
 use meerkat_core::lifecycle::{InputId, RunBoundaryReceipt, RunId};
 
@@ -14,9 +13,9 @@ use crate::accept::AcceptOutcome;
 use crate::driver::ephemeral::handling_mode_from_policy;
 use crate::identifiers::LogicalRuntimeId;
 use crate::input::{Input, externalize_input_images};
-use crate::input_state::{
-    InputAbandonReason, InputLifecycleState, InputState, InputStateHistoryEntry,
-    InputTerminalOutcome,
+use crate::input_state::{InputAbandonReason, InputLifecycleState, InputState};
+use crate::meerkat_machine::{
+    machine_normalize_recovered_input_state, machine_realize_recovered_runtime_state,
 };
 use crate::runtime_event::RuntimeEventEnvelope;
 use crate::runtime_ingress_authority::ContentShape;
@@ -559,94 +558,13 @@ impl RuntimeDriver for PersistentRuntimeDriver {
         // Inject stored states into the ephemeral driver's ledger.
         // Uses recover() which also rebuilds the idempotency index for
         // dedup correctness and filters out Ephemeral inputs.
-        for mut state in stored_states {
-            if matches!(
-                state.current_state(),
-                InputLifecycleState::Applied | InputLifecycleState::AppliedPendingConsumption
-            ) {
-                let has_receipt =
-                    match (state.last_run_id().cloned(), state.last_boundary_sequence()) {
-                        (Some(run_id), Some(sequence)) => self
-                            .store
-                            .load_boundary_receipt(&self.runtime_id, &run_id, sequence)
-                            .await
-                            .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?
-                            .is_some(),
-                        _ => false,
-                    };
-                let now = Utc::now();
-                let from = state.current_state();
-                if has_receipt {
-                    let auth = crate::input_lifecycle_authority::InputLifecycleAuthority::restore(
-                        InputLifecycleState::Consumed,
-                        Some(InputTerminalOutcome::Consumed),
-                        state.last_run_id().cloned(),
-                        state.last_boundary_sequence(),
-                        state.attempt_count(),
-                        {
-                            let mut h = state.history().to_vec();
-                            h.push(InputStateHistoryEntry {
-                                timestamp: now,
-                                from,
-                                to: InputLifecycleState::Consumed,
-                                reason: Some("recovery: boundary receipt already committed".into()),
-                            });
-                            h
-                        },
-                        now,
-                    );
-                    *state.authority_mut() = auth;
-                } else {
-                    let auth = crate::input_lifecycle_authority::InputLifecycleAuthority::restore(
-                        InputLifecycleState::Queued,
-                        None,
-                        state.last_run_id().cloned(),
-                        state.last_boundary_sequence(),
-                        state.attempt_count(),
-                        {
-                            let mut h = state.history().to_vec();
-                            h.push(InputStateHistoryEntry {
-                                timestamp: now,
-                                from,
-                                to: InputLifecycleState::Queued,
-                                reason: Some("recovery: missing boundary receipt".into()),
-                            });
-                            h
-                        },
-                        now,
-                    );
-                    *state.authority_mut() = auth;
-                }
-            }
-            if matches!(
-                state.current_state(),
-                InputLifecycleState::Accepted | InputLifecycleState::Staged
-            ) {
-                // Accepted/Staged are pre-run in-flight states. On recovery they
-                // must re-enter the queue explicitly so ingress/ledger/queue
-                // truth stays aligned before Recover effects are evaluated.
-                let now = Utc::now();
-                let from = state.current_state();
-                let auth = crate::input_lifecycle_authority::InputLifecycleAuthority::restore(
-                    InputLifecycleState::Queued,
-                    None,
-                    state.last_run_id().cloned(),
-                    state.last_boundary_sequence(),
-                    state.attempt_count(),
-                    {
-                        let mut h = state.history().to_vec();
-                        h.push(InputStateHistoryEntry {
-                            timestamp: now,
-                            from,
-                            to: InputLifecycleState::Queued,
-                            reason: Some("recovery: pre-run state normalized to queued".into()),
-                        });
-                        h
-                    },
-                    now,
-                );
-                *state.authority_mut() = auth;
-            }
+        for state in stored_states {
+            let state = machine_normalize_recovered_input_state(
+                self.store.as_ref(),
+                &self.runtime_id,
+                state,
+            )
+            .await?;
 
             // Admit to ingress authority so Recover can see this input.
             if self.inner.input_state(&state.input_id).is_none() {
@@ -730,29 +648,7 @@ impl RuntimeDriver for PersistentRuntimeDriver {
             .await
             .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?
         {
-            match runtime_state {
-                RuntimeState::Retired if self.inner.runtime_state() != RuntimeState::Retired => {
-                    self.inner
-                        .set_control_projection(RuntimeState::Retired, None, None);
-                }
-                RuntimeState::Stopped
-                    if self.inner.runtime_state() != RuntimeState::Stopped
-                        && self.inner.runtime_state() != RuntimeState::Destroyed =>
-                {
-                    // Never revive Destroyed as Stopped
-                    self.inner
-                        .set_control_projection(RuntimeState::Stopped, None, None);
-                    self.inner.stop_runtime_cleanup();
-                }
-                RuntimeState::Destroyed
-                    if self.inner.runtime_state() != RuntimeState::Destroyed =>
-                {
-                    self.inner
-                        .set_control_projection(RuntimeState::Destroyed, None, None);
-                    self.inner.destroy_cleanup();
-                }
-                _ => {}
-            }
+            machine_realize_recovered_runtime_state(&mut self.inner, runtime_state);
 
             // Terminal states must not have active inputs. If persisted state
             // is terminal but active inputs exist, fail closed as store

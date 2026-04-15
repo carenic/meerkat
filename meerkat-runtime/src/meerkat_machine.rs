@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use chrono::Utc;
 use meerkat_core::BlobStore;
 use meerkat_core::comms_drain_lifecycle_authority::{
     CommsDrainLifecycleAuthority, CommsDrainLifecycleEffect, CommsDrainMode, DrainExitReason,
@@ -43,7 +44,9 @@ use crate::driver::persistent::PersistentRuntimeDriver;
 use crate::identifiers::LogicalRuntimeId;
 use crate::input::Input;
 use crate::input_lifecycle_authority::InputLifecycleError;
-use crate::input_state::{InputLifecycleState, InputState};
+use crate::input_state::{
+    InputLifecycleState, InputState, InputStateHistoryEntry, InputTerminalOutcome,
+};
 use crate::meerkat_machine_types::{
     HydratedSessionLlmState, MeerkatAdmittedInputSnapshot, MeerkatBindingSnapshot,
     MeerkatCompletionWaiterSnapshot, MeerkatCompletionWaitersSnapshot, MeerkatControlSnapshot,
@@ -612,6 +615,115 @@ fn machine_validate_run_failed(
     }
 
     Ok(())
+}
+
+pub(crate) async fn machine_normalize_recovered_input_state(
+    store: &dyn RuntimeStore,
+    runtime_id: &LogicalRuntimeId,
+    mut state: InputState,
+) -> Result<InputState, RuntimeDriverError> {
+    if matches!(
+        state.current_state(),
+        InputLifecycleState::Applied | InputLifecycleState::AppliedPendingConsumption
+    ) {
+        let has_receipt = match (state.last_run_id().cloned(), state.last_boundary_sequence()) {
+            (Some(run_id), Some(sequence)) => store
+                .load_boundary_receipt(runtime_id, &run_id, sequence)
+                .await
+                .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?
+                .is_some(),
+            _ => false,
+        };
+        let now = Utc::now();
+        let from = state.current_state();
+        let auth = crate::input_lifecycle_authority::InputLifecycleAuthority::restore(
+            if has_receipt {
+                InputLifecycleState::Consumed
+            } else {
+                InputLifecycleState::Queued
+            },
+            if has_receipt {
+                Some(InputTerminalOutcome::Consumed)
+            } else {
+                None
+            },
+            state.last_run_id().cloned(),
+            state.last_boundary_sequence(),
+            state.attempt_count(),
+            {
+                let mut h = state.history().to_vec();
+                h.push(InputStateHistoryEntry {
+                    timestamp: now,
+                    from,
+                    to: if has_receipt {
+                        InputLifecycleState::Consumed
+                    } else {
+                        InputLifecycleState::Queued
+                    },
+                    reason: Some(if has_receipt {
+                        "recovery: boundary receipt already committed".into()
+                    } else {
+                        "recovery: missing boundary receipt".into()
+                    }),
+                });
+                h
+            },
+            now,
+        );
+        *state.authority_mut() = auth;
+    }
+
+    if matches!(
+        state.current_state(),
+        InputLifecycleState::Accepted | InputLifecycleState::Staged
+    ) {
+        let now = Utc::now();
+        let from = state.current_state();
+        let auth = crate::input_lifecycle_authority::InputLifecycleAuthority::restore(
+            InputLifecycleState::Queued,
+            None,
+            state.last_run_id().cloned(),
+            state.last_boundary_sequence(),
+            state.attempt_count(),
+            {
+                let mut h = state.history().to_vec();
+                h.push(InputStateHistoryEntry {
+                    timestamp: now,
+                    from,
+                    to: InputLifecycleState::Queued,
+                    reason: Some("recovery: pre-run state normalized to queued".into()),
+                });
+                h
+            },
+            now,
+        );
+        *state.authority_mut() = auth;
+    }
+
+    Ok(state)
+}
+
+pub(crate) fn machine_realize_recovered_runtime_state(
+    driver: &mut crate::driver::ephemeral::EphemeralRuntimeDriver,
+    runtime_state: RuntimeState,
+) {
+    match runtime_state {
+        RuntimeState::Retired if driver.runtime_state() != RuntimeState::Retired => {
+            driver.set_control_projection(RuntimeState::Retired, None, None);
+        }
+        RuntimeState::Stopped
+            if driver.runtime_state() != RuntimeState::Stopped
+                && driver.runtime_state() != RuntimeState::Destroyed =>
+        {
+            driver.set_control_projection(RuntimeState::Stopped, None, None);
+            driver.stop_runtime_cleanup();
+        }
+        RuntimeState::Destroyed if driver.runtime_state() != RuntimeState::Destroyed => {
+            driver.set_control_projection(RuntimeState::Destroyed, None, None);
+            driver.destroy_cleanup();
+        }
+        _ => {}
+    }
 }
 
 fn machine_build_replay_plan(
