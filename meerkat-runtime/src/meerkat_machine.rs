@@ -308,6 +308,13 @@ impl DriverEntry {
             DriverEntry::Persistent(d) => d.destroy().await,
         }
     }
+
+    pub(crate) async fn stop_runtime(&mut self) -> Result<(), RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.stop_runtime(),
+            DriverEntry::Persistent(d) => d.stop_runtime().await,
+        }
+    }
 }
 
 /// Shared completion registry (accessed by adapter for registration and loop for resolution).
@@ -2979,10 +2986,7 @@ impl MeerkatMachine {
 
         if matches!(command, RunControlCommand::StopRuntimeExecutor { .. }) {
             let mut driver = driver.lock().await;
-            driver
-                .as_driver_mut()
-                .on_runtime_control(crate::traits::RuntimeControlCommand::Stop)
-                .await?;
+            driver.stop_runtime().await?;
             drop(driver);
             let mut completions = completions.lock().await;
             completions.resolve_all_terminated("runtime stopped");

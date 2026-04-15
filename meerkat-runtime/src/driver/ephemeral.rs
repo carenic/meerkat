@@ -28,9 +28,7 @@ use crate::runtime_ingress_authority::{
     RuntimeIngressInput, RuntimeIngressMutator,
 };
 use crate::runtime_state::RuntimeState;
-use crate::traits::{
-    RecoveryReport, ResetReport, RetireReport, RuntimeControlCommand, RuntimeDriverError,
-};
+use crate::traits::{RecoveryReport, ResetReport, RetireReport, RuntimeDriverError};
 
 /// Typed post-admission signal that the runtime loop should act on.
 ///
@@ -929,6 +927,34 @@ impl EphemeralRuntimeDriver {
         Ok(abandoned)
     }
 
+    pub fn stop_runtime(&mut self) -> Result<(), RuntimeDriverError> {
+        match self.phase {
+            RuntimeState::Initializing
+            | RuntimeState::Idle
+            | RuntimeState::Attached
+            | RuntimeState::Running
+            | RuntimeState::Retired => {
+                self.current_run_id = None;
+                self.pre_run_phase = None;
+                self.transition_phase(RuntimeState::Stopped);
+            }
+            from => {
+                return Err(RuntimeDriverError::Internal(
+                    crate::runtime_state::RuntimeStateTransitionError {
+                        from,
+                        to: RuntimeState::Stopped,
+                    }
+                    .to_string(),
+                ));
+            }
+        }
+        self.abandon_all_non_terminal(InputAbandonReason::Stopped);
+        self.silent_comms_intents.clear();
+        self.queue.drain();
+        self.steer_queue.drain();
+        Ok(())
+    }
+
     pub fn recover_ephemeral(&mut self) -> RecoveryReport {
         let mut recovered = 0;
         let mut abandoned = 0;
@@ -1484,41 +1510,6 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
                 }
             }
             _ => {}
-        }
-        Ok(())
-    }
-
-    async fn on_runtime_control(
-        &mut self,
-        command: RuntimeControlCommand,
-    ) -> Result<(), RuntimeDriverError> {
-        match command {
-            RuntimeControlCommand::Stop => {
-                match self.phase {
-                    RuntimeState::Initializing
-                    | RuntimeState::Idle
-                    | RuntimeState::Attached
-                    | RuntimeState::Running
-                    | RuntimeState::Retired => {
-                        self.current_run_id = None;
-                        self.pre_run_phase = None;
-                        self.transition_phase(RuntimeState::Stopped);
-                    }
-                    from => {
-                        return Err(RuntimeDriverError::Internal(
-                            crate::runtime_state::RuntimeStateTransitionError {
-                                from,
-                                to: RuntimeState::Stopped,
-                            }
-                            .to_string(),
-                        ));
-                    }
-                }
-                self.abandon_all_non_terminal(InputAbandonReason::Stopped);
-                self.silent_comms_intents.clear();
-                self.queue.drain();
-                self.steer_queue.drain();
-            }
         }
         Ok(())
     }

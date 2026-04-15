@@ -6,7 +6,7 @@ use meerkat_runtime::{
     ContinuationInput, EphemeralRuntimeDriver, Input, InputDurability, InputHeader,
     InputLifecycleEvent, InputLifecycleState, InputOrigin, InputVisibility, LogicalRuntimeId,
     PeerConvention, PeerInput, PostAdmissionSignal, PromptInput, ResponseProgressPhase,
-    ResponseTerminalStatus, RuntimeControlCommand, RuntimeDriver, RuntimeEvent, RuntimeState,
+    ResponseTerminalStatus, RuntimeDriver, RuntimeEvent, RuntimeState,
     post_admission_signal_from_accept_outcome,
 };
 
@@ -628,10 +628,7 @@ async fn stop_abandons_all_active_inputs() {
     let input_id = input.id().clone();
     driver.accept_input(input).await.unwrap();
 
-    driver
-        .on_runtime_control(RuntimeControlCommand::Stop)
-        .await
-        .unwrap();
+    driver.stop_runtime().unwrap();
 
     assert_eq!(driver.runtime_state(), RuntimeState::Stopped);
     assert!(driver.queue().is_empty());

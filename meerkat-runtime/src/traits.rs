@@ -54,14 +54,6 @@ pub enum RuntimeControlPlaneError {
     Internal(String),
 }
 
-/// Runtime control commands (distinct from RunControlCommand which is core-level).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case")]
-pub enum RuntimeControlCommand {
-    /// Stop the runtime gracefully.
-    Stop,
-}
-
 /// Report from a recovery operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryReport {
@@ -125,12 +117,6 @@ pub trait RuntimeDriver: Send + Sync {
 
     /// Handle a run event (from core).
     async fn on_run_event(&mut self, event: RunEvent) -> Result<(), RuntimeDriverError>;
-
-    /// Handle a runtime control command.
-    async fn on_runtime_control(
-        &mut self,
-        command: RuntimeControlCommand,
-    ) -> Result<(), RuntimeDriverError>;
 
     /// Recover from a crash/restart.
     async fn recover(&mut self) -> Result<RecoveryReport, RuntimeDriverError>;
@@ -215,13 +201,6 @@ mod tests {
     // Verify traits are object-safe
     fn _assert_driver_object_safe(_: &dyn RuntimeDriver) {}
     fn _assert_control_plane_object_safe(_: &dyn RuntimeControlPlane) {}
-
-    #[test]
-    fn runtime_control_command_serde() {
-        let cmd = RuntimeControlCommand::Stop;
-        let json = serde_json::to_value(&cmd).unwrap();
-        assert_eq!(json["command"], "stop");
-    }
 
     #[test]
     fn runtime_driver_error_display() {

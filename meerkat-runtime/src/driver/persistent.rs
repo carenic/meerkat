@@ -22,9 +22,7 @@ use crate::runtime_event::RuntimeEventEnvelope;
 use crate::runtime_ingress_authority::ContentShape;
 use crate::runtime_state::RuntimeState;
 use crate::store::RuntimeStore;
-use crate::traits::{
-    DestroyReport, RecoveryReport, RuntimeControlCommand, RuntimeDriver, RuntimeDriverError,
-};
+use crate::traits::{DestroyReport, RecoveryReport, RuntimeDriver, RuntimeDriverError};
 use meerkat_core::types::HandlingMode;
 
 use super::ephemeral::EphemeralRuntimeDriver;
@@ -317,6 +315,27 @@ impl PersistentRuntimeDriver {
             inputs_abandoned: abandoned,
         })
     }
+
+    pub async fn stop_runtime(&mut self) -> Result<(), RuntimeDriverError> {
+        let checkpoint = self.inner.clone();
+        self.inner.stop_runtime()?;
+        let input_states = self.inner.input_states_snapshot();
+        if let Err(err) = self
+            .store
+            .atomic_lifecycle_commit(
+                &self.runtime_id,
+                self.runtime_state_for_persistence(),
+                &input_states,
+            )
+            .await
+        {
+            self.inner = checkpoint;
+            return Err(RuntimeDriverError::Internal(format!(
+                "stop persist failed: {err}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
@@ -433,30 +452,6 @@ impl RuntimeDriver for PersistentRuntimeDriver {
             }
         }
 
-        Ok(())
-    }
-
-    async fn on_runtime_control(
-        &mut self,
-        command: RuntimeControlCommand,
-    ) -> Result<(), RuntimeDriverError> {
-        let checkpoint = self.inner.clone();
-        self.inner.on_runtime_control(command).await?;
-        let input_states = self.inner.input_states_snapshot();
-        if let Err(err) = self
-            .store
-            .atomic_lifecycle_commit(
-                &self.runtime_id,
-                self.runtime_state_for_persistence(),
-                &input_states,
-            )
-            .await
-        {
-            self.inner = checkpoint;
-            return Err(RuntimeDriverError::Internal(format!(
-                "control op persist failed: {err}"
-            )));
-        }
         Ok(())
     }
 
@@ -653,9 +648,7 @@ impl RuntimeDriver for PersistentRuntimeDriver {
                         && self.inner.runtime_state() != RuntimeState::Destroyed =>
                 {
                     // Never revive Destroyed as Stopped
-                    self.inner
-                        .on_runtime_control(RuntimeControlCommand::Stop)
-                        .await?;
+                    self.inner.stop_runtime()?;
                 }
                 RuntimeState::Destroyed
                     if self.inner.runtime_state() != RuntimeState::Destroyed =>

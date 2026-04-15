@@ -118,6 +118,6 @@ pub use runtime_state::{RuntimeState, RuntimeStateTransitionError};
 pub use service_ext::{RuntimeMode, SessionServiceRuntimeExt};
 pub use store::{InMemoryRuntimeStore, RuntimeStore, RuntimeStoreError, SessionDelta};
 pub use traits::{
-    DestroyReport, RecoveryReport, RecycleReport, ResetReport, RetireReport, RuntimeControlCommand,
-    RuntimeControlPlane, RuntimeControlPlaneError, RuntimeDriver, RuntimeDriverError,
+    DestroyReport, RecoveryReport, RecycleReport, ResetReport, RetireReport, RuntimeControlPlane,
+    RuntimeControlPlaneError, RuntimeDriver, RuntimeDriverError,
 };

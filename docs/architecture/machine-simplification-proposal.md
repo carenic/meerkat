@@ -185,6 +185,11 @@ Hopcroft-style behavioral quotient over the reachable graph.
   `MeerkatMachine` / `RuntimeControlPlane`, while the concrete drivers retain
   just the realization/persistence helpers needed to apply the machine-owned
   transition.
+- Removed the last coarse lifecycle control verb from the generic
+  `RuntimeDriver` trait as well: `stop` is now a concrete driver realization
+  helper rather than a trait-level runtime lifecycle noun, while
+  `MeerkatMachine` / the control-plane seam remain the only layers that speak
+  the lifecycle command semantically.
 - Taught the generated closed-world composition models to reject queued
   external entry packets that are no longer admissible for the current machine
   state, which removes seam deadlocks without widening the machine transition

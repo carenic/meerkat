@@ -83,6 +83,10 @@ Current state:
   verbs `retire`, `reset`, or `destroy`; those nouns are now machine/control
   plane owned, with only concrete driver persistence helpers retaining the
   mechanics needed to realize the machine-owned transition and durable commit
+- the generic `RuntimeDriver` trait no longer exposes coarse stop control
+  either; `stop` now lives as a concrete driver realization helper while the
+  machine/control-plane path remains the only layer that speaks the lifecycle
+  noun
 - attached steered `AcceptWithCompletion` is no longer treated as a queue-only
   self-loop in the formal model: when `request_immediate_processing=true`, the
   checked-in Meerkat machine now models the runtime’s `Attached -> Running`
