@@ -76,8 +76,9 @@ fn prepared_meerkat_state() -> meerkat_machine_kernels::KernelState {
 fn session_tool_visibility_kernel_publishes_committed_set_from_attached() {
     let attached = prepared_meerkat_state();
 
-    // PublishCommittedVisibleSet from Attached requires revision == active_visibility_revision.
-    // At init, active_visibility_revision == 0.
+    // PublishCommittedVisibleSet from Attached carries the active/staged owner
+    // revisions in the input, but the top-level machine no longer stores a
+    // separate active visibility mirror.
     let published = meerkat::transition(
         &attached,
         &input(
@@ -133,9 +134,9 @@ fn session_tool_visibility_kernel_stages_deferred_requests_without_touching_acti
         requested.fields.get("staged_visibility_revision"),
         Some(&KernelValue::U64(1))
     );
-    assert_eq!(
-        requested.fields.get("active_visibility_revision"),
-        Some(&KernelValue::U64(0))
+    assert!(
+        !requested.fields.contains_key("active_visibility_revision"),
+        "top-level machine should no longer mirror active visibility revision",
     );
     assert!(
         !requested

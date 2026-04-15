@@ -2,8 +2,8 @@ use indexmap::IndexMap;
 
 use crate::{
     EffectDisposition, EffectDispositionRule, EffectEmit, EnumSchema, Expr, FieldSchema, Guard,
-    HelperSchema, InitSchema, InputMatch, InvariantSchema, MachineSchema, Quantifier, RustBinding,
-    StateSchema, TransitionSchema, TypeRef, Update, VariantSchema, machine::TriggerKind,
+    InitSchema, InputMatch, InvariantSchema, MachineSchema, Quantifier, RustBinding, StateSchema,
+    TransitionSchema, TypeRef, Update, VariantSchema, machine::TriggerKind,
 };
 
 pub fn meerkat_machine() -> MachineSchema {
@@ -62,7 +62,6 @@ pub fn meerkat_machine() -> MachineSchema {
                     "silent_intent_overrides",
                     TypeRef::Set(Box::new(TypeRef::String)),
                 ),
-                field("active_visibility_revision", TypeRef::U64),
                 field("staged_visibility_revision", TypeRef::U64),
             ],
             init: InitSchema {
@@ -76,7 +75,6 @@ pub fn meerkat_machine() -> MachineSchema {
                     init("current_run_id", Expr::None),
                     init("pre_run_phase", Expr::None),
                     init("silent_intent_overrides", Expr::EmptySet),
-                    init("active_visibility_revision", Expr::U64(0)),
                     init("staged_visibility_revision", Expr::U64(0)),
                 ],
             },
@@ -135,15 +133,7 @@ pub fn meerkat_machine() -> MachineSchema {
                 variants
             },
         },
-        helpers: vec![HelperSchema {
-            name: "HasPendingVisibilityPromotion".into(),
-            params: vec![],
-            returns: TypeRef::Bool,
-            body: Expr::Gt(
-                Box::new(Expr::Field("staged_visibility_revision".into())),
-                Box::new(Expr::Field("active_visibility_revision".into())),
-            ),
-        }],
+        helpers: vec![],
         derived: vec![],
         invariants: vec![
             // The top-level kernel no longer tracks a dedicated active work id.
@@ -244,7 +234,7 @@ pub fn meerkat_machine() -> MachineSchema {
                     reconfigure_visibility_revision_guard(),
                 ],
                 updates: vec![Update::Assign {
-                    field: "active_visibility_revision".into(),
+                    field: "staged_visibility_revision".into(),
                     expr: Expr::Binding("next_active_visibility_revision".into()),
                 }],
                 to: "Attached".into(),
@@ -275,7 +265,7 @@ pub fn meerkat_machine() -> MachineSchema {
                     reconfigure_visibility_revision_guard(),
                 ],
                 updates: vec![Update::Assign {
-                    field: "active_visibility_revision".into(),
+                    field: "staged_visibility_revision".into(),
                     expr: Expr::Binding("next_active_visibility_revision".into()),
                 }],
                 to: "Running".into(),
@@ -478,63 +468,20 @@ pub fn meerkat_machine() -> MachineSchema {
                 }],
             },
             TransitionSchema {
-                name: "BoundaryAppliedPromote".into(),
+                name: "BoundaryAppliedPublish".into(),
                 from: vec!["Running".into()],
                 on: InputMatch {
                     kind: meerkat_trigger_kind("BoundaryApplied"),
                     variant: "BoundaryApplied".into(),
                     bindings: vec!["revision".into()],
                 },
-                guards: vec![
-                    Guard {
-                        name: "has_pending_visibility_promotion".into(),
-                        expr: Expr::Call {
-                            helper: "HasPendingVisibilityPromotion".into(),
-                            args: vec![],
-                        },
-                    },
-                    Guard {
-                        name: "revision_matches_staged".into(),
-                        expr: Expr::Eq(
-                            Box::new(Expr::Field("staged_visibility_revision".into())),
-                            Box::new(Expr::Binding("revision".into())),
-                        ),
-                    },
-                ],
-                updates: vec![Update::Assign {
-                    field: "active_visibility_revision".into(),
-                    expr: Expr::Field("staged_visibility_revision".into()),
+                guards: vec![Guard {
+                    name: "revision_not_ahead_of_staged".into(),
+                    expr: Expr::Lte(
+                        Box::new(Expr::Binding("revision".into())),
+                        Box::new(Expr::Field("staged_visibility_revision".into())),
+                    ),
                 }],
-                to: "Running".into(),
-                emit: vec![EffectEmit {
-                    variant: "CommittedVisibleSetPublished".into(),
-                    fields: IndexMap::from([("revision".into(), Expr::Binding("revision".into()))]),
-                }],
-            },
-            TransitionSchema {
-                name: "BoundaryAppliedNoop".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: meerkat_trigger_kind("BoundaryApplied"),
-                    variant: "BoundaryApplied".into(),
-                    bindings: vec!["revision".into()],
-                },
-                guards: vec![
-                    Guard {
-                        name: "no_pending_visibility_promotion".into(),
-                        expr: Expr::Not(Box::new(Expr::Call {
-                            helper: "HasPendingVisibilityPromotion".into(),
-                            args: vec![],
-                        })),
-                    },
-                    Guard {
-                        name: "revision_not_ahead_of_active".into(),
-                        expr: Expr::Lte(
-                            Box::new(Expr::Binding("revision".into())),
-                            Box::new(Expr::Field("active_visibility_revision".into())),
-                        ),
-                    },
-                ],
                 updates: vec![],
                 to: "Running".into(),
                 emit: vec![EffectEmit {
@@ -759,10 +706,6 @@ fn reset_session_state() -> Vec<Update> {
             expr: Expr::None,
         },
         Update::Assign {
-            field: "active_visibility_revision".into(),
-            expr: Expr::U64(0),
-        },
-        Update::Assign {
             field: "staged_visibility_revision".into(),
             expr: Expr::U64(0),
         },
@@ -983,16 +926,10 @@ fn publish_committed_visible_set_transition(name: &str, phase: &str) -> Transiti
                 },
             },
         ],
-        updates: vec![
-            Update::Assign {
-                field: "active_visibility_revision".into(),
-                expr: Expr::Binding("active_visibility_revision".into()),
-            },
-            Update::Assign {
-                field: "staged_visibility_revision".into(),
-                expr: Expr::Binding("staged_visibility_revision".into()),
-            },
-        ],
+        updates: vec![Update::Assign {
+            field: "staged_visibility_revision".into(),
+            expr: Expr::Binding("staged_visibility_revision".into()),
+        }],
         to: phase.into(),
         emit: vec![EffectEmit {
             variant: "CommittedVisibleSetPublished".into(),
@@ -1006,14 +943,7 @@ fn publish_committed_visible_set_transition(name: &str, phase: &str) -> Transiti
 
 fn next_staged_visibility_revision_expr() -> Expr {
     Expr::Add(
-        Box::new(Expr::IfElse {
-            condition: Box::new(Expr::Gt(
-                Box::new(Expr::Field("active_visibility_revision".into())),
-                Box::new(Expr::Field("staged_visibility_revision".into())),
-            )),
-            then_expr: Box::new(Expr::Field("active_visibility_revision".into())),
-            else_expr: Box::new(Expr::Field("staged_visibility_revision".into())),
-        }),
+        Box::new(Expr::Field("staged_visibility_revision".into())),
         Box::new(Expr::U64(1)),
     )
 }
@@ -1024,7 +954,7 @@ fn reconfigure_visibility_revision_guard() -> Guard {
         expr: Expr::Or(vec![
             Expr::Eq(
                 Box::new(Expr::Binding("next_active_visibility_revision".into())),
-                Box::new(Expr::Field("active_visibility_revision".into())),
+                Box::new(Expr::Field("staged_visibility_revision".into())),
             ),
             Expr::Eq(
                 Box::new(Expr::Binding("next_active_visibility_revision".into())),

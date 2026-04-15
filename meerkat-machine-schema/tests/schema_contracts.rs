@@ -276,7 +276,6 @@ fn meerkat_machine_merges_turn_admission_tool_visibility_and_peer_directory_stat
     for required in [
         "current_run_id",
         "silent_intent_overrides",
-        "active_visibility_revision",
         "staged_visibility_revision",
     ] {
         assert!(
@@ -311,7 +310,7 @@ fn meerkat_machine_merges_turn_admission_tool_visibility_and_peer_directory_stat
         "StagePersistentFilterRunning",
         "RequestDeferredToolsAttached",
         "RequestDeferredToolsRunning",
-        "BoundaryAppliedPromote",
+        "BoundaryAppliedPublish",
         "StageAddAttached",
         "StageAddRunning",
         "StageRemoveAttached",

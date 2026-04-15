@@ -180,6 +180,12 @@ Current state:
   `PublishCommittedVisibleSet` input bindings instead of storing a top-level
   mirror. TLC stayed green, the raw quotient stayed flat at `340`, and the
   truthful Meerkat graph fell again from `7,255` to `3,835` reachable states.
+- Fast-loop landed: `active_visibility_revision` was removed from the
+  checked-in Meerkat state while the machine collapsed boundary publication to
+  a single staged revision token and publish-time legality. The canonical
+  active revision still lives in the lower-authority visibility owner. TLC
+  stayed green, the raw quotient dropped from `340` to `260`, and the truthful
+  Meerkat graph fell again from `3,835` to `1,773` reachable states.
 
 ## Full-row Snapshot (2026-04-15)
 

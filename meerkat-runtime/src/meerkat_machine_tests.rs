@@ -10438,11 +10438,11 @@ async fn modeled_stage_persistent_filter_matches_runtime_after_active_ahead_reco
     let before = runtime_parity_snapshot_summary(&fixture.adapter, &fixture.session_id)
         .await
         .expect("pre-stage snapshot should exist");
-    assert_eq!(
-        before
+    assert!(
+        !before
             .formal_available_fields
-            .get("active_visibility_revision"),
-        Some(&"1".to_string())
+            .contains_key("active_visibility_revision"),
+        "top-level machine should no longer mirror active visibility revision",
     );
     assert_eq!(
         before

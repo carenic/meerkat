@@ -15,7 +15,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `current_run_id`: `Option<RunId>`
 - `pre_run_phase`: `Option<String>`
 - `silent_intent_overrides`: `Set<String>`
-- `active_visibility_revision`: `u64`
 - `staged_visibility_revision`: `u64`
 
 ## Inputs
@@ -131,9 +130,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `EmitExternalToolDelta`
 - `CloseSurfaceConnection`
 - `RejectSurfaceCall`
-
-## Helpers
-- `HasPendingVisibilityPromotion`() -> `Bool`
 
 ## Invariants
 - `fence_requires_bound_runtime`
@@ -437,21 +433,11 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `RequestCancellationAtBoundary`
 - To: `Running`
 
-### `BoundaryAppliedPromote`
+### `BoundaryAppliedPublish`
 - From: `Running`
 - On: `BoundaryApplied`(revision)
 - Guards:
-  - `has_pending_visibility_promotion`
-  - `revision_matches_staged`
-- Emits: `CommittedVisibleSetPublished`
-- To: `Running`
-
-### `BoundaryAppliedNoop`
-- From: `Running`
-- On: `BoundaryApplied`(revision)
-- Guards:
-  - `no_pending_visibility_promotion`
-  - `revision_not_ahead_of_active`
+  - `revision_not_ahead_of_staged`
 - Emits: `CommittedVisibleSetPublished`
 - To: `Running`
 

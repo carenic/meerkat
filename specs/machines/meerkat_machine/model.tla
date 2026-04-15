@@ -27,11 +27,9 @@ SeqRemove(seq, value) == IF Len(seq) = 0 THEN <<>> ELSE IF Head(seq) = value THE
 RECURSIVE SeqRemoveAll(_, _)
 SeqRemoveAll(seq, values) == IF Len(values) = 0 THEN seq ELSE SeqRemoveAll(SeqRemove(seq, Head(values)), Tail(values))
 
-VARIABLES phase, model_step_count, session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision
+VARIABLES phase, model_step_count, session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision
 
-vars == << phase, model_step_count, session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
-
-HasPendingVisibilityPromotion == (staged_visibility_revision > active_visibility_revision)
+vars == << phase, model_step_count, session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 Init ==
     /\ phase = "Initializing"
@@ -44,7 +42,6 @@ Init ==
     /\ current_run_id = None
     /\ pre_run_phase = None
     /\ silent_intent_overrides = {}
-    /\ active_visibility_revision = 0
     /\ staged_visibility_revision = 0
 
 TerminalStutter ==
@@ -55,7 +52,7 @@ Initialize ==
     /\ phase = "Initializing"
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 RegisterSessionIdle(arg_session_id) ==
@@ -63,7 +60,7 @@ RegisterSessionIdle(arg_session_id) ==
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
     /\ session_id' = Some(arg_session_id)
-    /\ UNCHANGED << active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 RegisterSessionAttached(arg_session_id) ==
@@ -71,7 +68,7 @@ RegisterSessionAttached(arg_session_id) ==
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
     /\ session_id' = Some(arg_session_id)
-    /\ UNCHANGED << active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 RegisterSessionRunning(arg_session_id) ==
@@ -79,7 +76,7 @@ RegisterSessionRunning(arg_session_id) ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ session_id' = Some(arg_session_id)
-    /\ UNCHANGED << active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 RegisterSessionRetired(arg_session_id) ==
@@ -87,7 +84,7 @@ RegisterSessionRetired(arg_session_id) ==
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
     /\ session_id' = Some(arg_session_id)
-    /\ UNCHANGED << active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 RegisterSessionStopped(arg_session_id) ==
@@ -95,7 +92,7 @@ RegisterSessionStopped(arg_session_id) ==
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
     /\ session_id' = Some(arg_session_id)
-    /\ UNCHANGED << active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 UnregisterSessionIdle(arg_session_id) ==
@@ -110,7 +107,6 @@ UnregisterSessionIdle(arg_session_id) ==
     /\ attachment_live' = FALSE
     /\ current_run_id' = None
     /\ pre_run_phase' = None
-    /\ active_visibility_revision' = 0
     /\ staged_visibility_revision' = 0
     /\ UNCHANGED << silent_intent_overrides >>
 
@@ -127,7 +123,6 @@ UnregisterSessionAttached(arg_session_id) ==
     /\ attachment_live' = FALSE
     /\ current_run_id' = None
     /\ pre_run_phase' = None
-    /\ active_visibility_revision' = 0
     /\ staged_visibility_revision' = 0
     /\ UNCHANGED << silent_intent_overrides >>
 
@@ -144,7 +139,6 @@ UnregisterSessionRunning(arg_session_id) ==
     /\ attachment_live' = FALSE
     /\ current_run_id' = None
     /\ pre_run_phase' = None
-    /\ active_visibility_revision' = 0
     /\ staged_visibility_revision' = 0
     /\ UNCHANGED << silent_intent_overrides >>
 
@@ -161,7 +155,6 @@ UnregisterSessionRetired(arg_session_id) ==
     /\ attachment_live' = FALSE
     /\ current_run_id' = None
     /\ pre_run_phase' = None
-    /\ active_visibility_revision' = 0
     /\ staged_visibility_revision' = 0
     /\ UNCHANGED << silent_intent_overrides >>
 
@@ -178,7 +171,6 @@ UnregisterSessionStopped(arg_session_id) ==
     /\ attachment_live' = FALSE
     /\ current_run_id' = None
     /\ pre_run_phase' = None
-    /\ active_visibility_revision' = 0
     /\ staged_visibility_revision' = 0
     /\ UNCHANGED << silent_intent_overrides >>
 
@@ -187,22 +179,22 @@ ReconfigureSessionLlmIdentityAttached(previous_identity, previous_visibility_sta
     /\ phase = "Attached"
     /\ (session_id # None)
     /\ (active_runtime_id # None)
-    /\ ((next_active_visibility_revision = active_visibility_revision) \/ (next_active_visibility_revision = ((IF (active_visibility_revision > staged_visibility_revision) THEN active_visibility_revision ELSE staged_visibility_revision) + 1)))
+    /\ ((next_active_visibility_revision = staged_visibility_revision) \/ (next_active_visibility_revision = (staged_visibility_revision + 1)))
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ active_visibility_revision' = next_active_visibility_revision
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
+    /\ staged_visibility_revision' = next_active_visibility_revision
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides >>
 
 
 ReconfigureSessionLlmIdentityRunning(previous_identity, previous_visibility_state, previous_capability_surface, previous_capability_surface_status, target_identity, target_capability_surface, next_visibility_state, next_capability_base_filter, next_active_visibility_revision, tool_visibility_delta) ==
     /\ phase = "Running"
     /\ (session_id # None)
     /\ (active_runtime_id # None)
-    /\ ((next_active_visibility_revision = active_visibility_revision) \/ (next_active_visibility_revision = ((IF (active_visibility_revision > staged_visibility_revision) THEN active_visibility_revision ELSE staged_visibility_revision) + 1)))
+    /\ ((next_active_visibility_revision = staged_visibility_revision) \/ (next_active_visibility_revision = (staged_visibility_revision + 1)))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ active_visibility_revision' = next_active_visibility_revision
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
+    /\ staged_visibility_revision' = next_active_visibility_revision
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides >>
 
 
 StagePersistentFilterIdle(filter, witnesses) ==
@@ -210,8 +202,8 @@ StagePersistentFilterIdle(filter, witnesses) ==
     /\ (session_id # None)
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
-    /\ staged_visibility_revision' = ((IF (active_visibility_revision > staged_visibility_revision) THEN active_visibility_revision ELSE staged_visibility_revision) + 1)
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision >>
+    /\ staged_visibility_revision' = (staged_visibility_revision + 1)
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides >>
 
 
 StagePersistentFilterAttached(filter, witnesses) ==
@@ -219,8 +211,8 @@ StagePersistentFilterAttached(filter, witnesses) ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ staged_visibility_revision' = ((IF (active_visibility_revision > staged_visibility_revision) THEN active_visibility_revision ELSE staged_visibility_revision) + 1)
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision >>
+    /\ staged_visibility_revision' = (staged_visibility_revision + 1)
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides >>
 
 
 StagePersistentFilterRunning(filter, witnesses) ==
@@ -228,8 +220,8 @@ StagePersistentFilterRunning(filter, witnesses) ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ staged_visibility_revision' = ((IF (active_visibility_revision > staged_visibility_revision) THEN active_visibility_revision ELSE staged_visibility_revision) + 1)
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision >>
+    /\ staged_visibility_revision' = (staged_visibility_revision + 1)
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides >>
 
 
 StagePersistentFilterRetired(filter, witnesses) ==
@@ -237,8 +229,8 @@ StagePersistentFilterRetired(filter, witnesses) ==
     /\ (session_id # None)
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
-    /\ staged_visibility_revision' = ((IF (active_visibility_revision > staged_visibility_revision) THEN active_visibility_revision ELSE staged_visibility_revision) + 1)
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision >>
+    /\ staged_visibility_revision' = (staged_visibility_revision + 1)
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides >>
 
 
 StagePersistentFilterStopped(filter, witnesses) ==
@@ -246,8 +238,8 @@ StagePersistentFilterStopped(filter, witnesses) ==
     /\ (session_id # None)
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ staged_visibility_revision' = ((IF (active_visibility_revision > staged_visibility_revision) THEN active_visibility_revision ELSE staged_visibility_revision) + 1)
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision >>
+    /\ staged_visibility_revision' = (staged_visibility_revision + 1)
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides >>
 
 
 RequestDeferredToolsIdle(names, witnesses) ==
@@ -255,8 +247,8 @@ RequestDeferredToolsIdle(names, witnesses) ==
     /\ (session_id # None)
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
-    /\ staged_visibility_revision' = ((IF (active_visibility_revision > staged_visibility_revision) THEN active_visibility_revision ELSE staged_visibility_revision) + 1)
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision >>
+    /\ staged_visibility_revision' = (staged_visibility_revision + 1)
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides >>
 
 
 RequestDeferredToolsAttached(names, witnesses) ==
@@ -264,8 +256,8 @@ RequestDeferredToolsAttached(names, witnesses) ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ staged_visibility_revision' = ((IF (active_visibility_revision > staged_visibility_revision) THEN active_visibility_revision ELSE staged_visibility_revision) + 1)
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision >>
+    /\ staged_visibility_revision' = (staged_visibility_revision + 1)
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides >>
 
 
 RequestDeferredToolsRunning(names, witnesses) ==
@@ -273,8 +265,8 @@ RequestDeferredToolsRunning(names, witnesses) ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ staged_visibility_revision' = ((IF (active_visibility_revision > staged_visibility_revision) THEN active_visibility_revision ELSE staged_visibility_revision) + 1)
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision >>
+    /\ staged_visibility_revision' = (staged_visibility_revision + 1)
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides >>
 
 
 RequestDeferredToolsRetired(names, witnesses) ==
@@ -282,8 +274,8 @@ RequestDeferredToolsRetired(names, witnesses) ==
     /\ (session_id # None)
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
-    /\ staged_visibility_revision' = ((IF (active_visibility_revision > staged_visibility_revision) THEN active_visibility_revision ELSE staged_visibility_revision) + 1)
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision >>
+    /\ staged_visibility_revision' = (staged_visibility_revision + 1)
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides >>
 
 
 RequestDeferredToolsStopped(names, witnesses) ==
@@ -291,8 +283,8 @@ RequestDeferredToolsStopped(names, witnesses) ==
     /\ (session_id # None)
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ staged_visibility_revision' = ((IF (active_visibility_revision > staged_visibility_revision) THEN active_visibility_revision ELSE staged_visibility_revision) + 1)
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision >>
+    /\ staged_visibility_revision' = (staged_visibility_revision + 1)
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides >>
 
 
 PrepareBindingsInitializing(agent_runtime_id, fence_token, generation) ==
@@ -302,7 +294,7 @@ PrepareBindingsInitializing(agent_runtime_id, fence_token, generation) ==
     /\ active_runtime_id' = Some(agent_runtime_id)
     /\ active_fence_token' = Some(fence_token)
     /\ active_generation' = Some(generation)
-    /\ UNCHANGED << session_id, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 PrepareBindingsIdle(agent_runtime_id, fence_token, generation) ==
@@ -312,7 +304,7 @@ PrepareBindingsIdle(agent_runtime_id, fence_token, generation) ==
     /\ active_runtime_id' = Some(agent_runtime_id)
     /\ active_fence_token' = Some(fence_token)
     /\ active_generation' = Some(generation)
-    /\ UNCHANGED << session_id, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 PrepareBindingsAttached(agent_runtime_id, fence_token, generation) ==
@@ -322,7 +314,7 @@ PrepareBindingsAttached(agent_runtime_id, fence_token, generation) ==
     /\ active_runtime_id' = Some(agent_runtime_id)
     /\ active_fence_token' = Some(fence_token)
     /\ active_generation' = Some(generation)
-    /\ UNCHANGED << session_id, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 PrepareBindingsRunning(agent_runtime_id, fence_token, generation) ==
@@ -332,7 +324,7 @@ PrepareBindingsRunning(agent_runtime_id, fence_token, generation) ==
     /\ active_runtime_id' = Some(agent_runtime_id)
     /\ active_fence_token' = Some(fence_token)
     /\ active_generation' = Some(generation)
-    /\ UNCHANGED << session_id, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 PrepareBindingsRetired(agent_runtime_id, fence_token, generation) ==
@@ -342,7 +334,7 @@ PrepareBindingsRetired(agent_runtime_id, fence_token, generation) ==
     /\ active_runtime_id' = Some(agent_runtime_id)
     /\ active_fence_token' = Some(fence_token)
     /\ active_generation' = Some(generation)
-    /\ UNCHANGED << session_id, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 PrepareBindingsStopped(agent_runtime_id, fence_token, generation) ==
@@ -352,7 +344,7 @@ PrepareBindingsStopped(agent_runtime_id, fence_token, generation) ==
     /\ active_runtime_id' = Some(agent_runtime_id)
     /\ active_fence_token' = Some(fence_token)
     /\ active_generation' = Some(generation)
-    /\ UNCHANGED << session_id, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 SetPeerIngressContextIdle(keep_alive) ==
@@ -360,7 +352,7 @@ SetPeerIngressContextIdle(keep_alive) ==
     /\ (session_id # None)
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 SetPeerIngressContextAttached(keep_alive) ==
@@ -368,7 +360,7 @@ SetPeerIngressContextAttached(keep_alive) ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 SetPeerIngressContextRunning(keep_alive) ==
@@ -376,7 +368,7 @@ SetPeerIngressContextRunning(keep_alive) ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 SetPeerIngressContextRetired(keep_alive) ==
@@ -384,7 +376,7 @@ SetPeerIngressContextRetired(keep_alive) ==
     /\ (session_id # None)
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 SetPeerIngressContextStopped(keep_alive) ==
@@ -392,7 +384,7 @@ SetPeerIngressContextStopped(keep_alive) ==
     /\ (session_id # None)
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 NotifyDrainExitedIdle(reason) ==
@@ -400,7 +392,7 @@ NotifyDrainExitedIdle(reason) ==
     /\ (session_id # None)
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 NotifyDrainExitedAttached(reason) ==
@@ -408,7 +400,7 @@ NotifyDrainExitedAttached(reason) ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 NotifyDrainExitedRunning(reason) ==
@@ -416,7 +408,7 @@ NotifyDrainExitedRunning(reason) ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 NotifyDrainExitedRetired(reason) ==
@@ -424,7 +416,7 @@ NotifyDrainExitedRetired(reason) ==
     /\ (session_id # None)
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 NotifyDrainExitedStopped(reason) ==
@@ -432,7 +424,7 @@ NotifyDrainExitedStopped(reason) ==
     /\ (session_id # None)
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 InterruptCurrentRunAttached ==
@@ -440,7 +432,7 @@ InterruptCurrentRunAttached ==
     /\ attachment_live
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 InterruptCurrentRun ==
@@ -448,7 +440,7 @@ InterruptCurrentRun ==
     /\ attachment_live
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 CancelAfterBoundaryAttached ==
@@ -456,7 +448,7 @@ CancelAfterBoundaryAttached ==
     /\ attachment_live
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 CancelAfterBoundary ==
@@ -464,89 +456,73 @@ CancelAfterBoundary ==
     /\ attachment_live
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
-
-
-BoundaryAppliedPromote(revision) ==
-    /\ phase = "Running"
-    /\ HasPendingVisibilityPromotion
-    /\ (staged_visibility_revision = revision)
-    /\ phase' = "Running"
-    /\ model_step_count' = model_step_count + 1
-    /\ active_visibility_revision' = staged_visibility_revision
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
-BoundaryAppliedNoop(revision) ==
+BoundaryAppliedPublish(revision) ==
     /\ phase = "Running"
-    /\ ~(HasPendingVisibilityPromotion)
-    /\ (revision <= active_visibility_revision)
+    /\ (revision <= staged_visibility_revision)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
-PublishCommittedVisibleSetIdle(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, arg_active_visibility_revision, arg_staged_visibility_revision) ==
+PublishCommittedVisibleSetIdle(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, arg_staged_visibility_revision) ==
     /\ phase = "Idle"
     /\ (session_id # None)
-    /\ (arg_active_visibility_revision >= arg_staged_visibility_revision)
-    /\ ((arg_active_visibility_revision # arg_staged_visibility_revision) \/ ((active_filter = staged_filter) /\ (active_requested_deferred_names = staged_requested_deferred_names)))
+    /\ (active_visibility_revision >= arg_staged_visibility_revision)
+    /\ ((active_visibility_revision # arg_staged_visibility_revision) \/ ((active_filter = staged_filter) /\ (active_requested_deferred_names = staged_requested_deferred_names)))
     /\ (\A requested_name \in active_requested_deferred_names : (requested_name \in staged_requested_deferred_names))
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
-    /\ active_visibility_revision' = arg_active_visibility_revision
     /\ staged_visibility_revision' = arg_staged_visibility_revision
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides >>
 
 
-PublishCommittedVisibleSetAttached(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, arg_active_visibility_revision, arg_staged_visibility_revision) ==
+PublishCommittedVisibleSetAttached(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, arg_staged_visibility_revision) ==
     /\ phase = "Attached"
     /\ (session_id # None)
-    /\ (arg_active_visibility_revision >= arg_staged_visibility_revision)
-    /\ ((arg_active_visibility_revision # arg_staged_visibility_revision) \/ ((active_filter = staged_filter) /\ (active_requested_deferred_names = staged_requested_deferred_names)))
+    /\ (active_visibility_revision >= arg_staged_visibility_revision)
+    /\ ((active_visibility_revision # arg_staged_visibility_revision) \/ ((active_filter = staged_filter) /\ (active_requested_deferred_names = staged_requested_deferred_names)))
     /\ (\A requested_name \in active_requested_deferred_names : (requested_name \in staged_requested_deferred_names))
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ active_visibility_revision' = arg_active_visibility_revision
     /\ staged_visibility_revision' = arg_staged_visibility_revision
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides >>
 
 
-PublishCommittedVisibleSetRunning(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, arg_active_visibility_revision, arg_staged_visibility_revision) ==
+PublishCommittedVisibleSetRunning(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, arg_staged_visibility_revision) ==
     /\ phase = "Running"
     /\ (session_id # None)
-    /\ (arg_active_visibility_revision >= arg_staged_visibility_revision)
-    /\ ((arg_active_visibility_revision # arg_staged_visibility_revision) \/ ((active_filter = staged_filter) /\ (active_requested_deferred_names = staged_requested_deferred_names)))
+    /\ (active_visibility_revision >= arg_staged_visibility_revision)
+    /\ ((active_visibility_revision # arg_staged_visibility_revision) \/ ((active_filter = staged_filter) /\ (active_requested_deferred_names = staged_requested_deferred_names)))
     /\ (\A requested_name \in active_requested_deferred_names : (requested_name \in staged_requested_deferred_names))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ active_visibility_revision' = arg_active_visibility_revision
     /\ staged_visibility_revision' = arg_staged_visibility_revision
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides >>
 
 
-PublishCommittedVisibleSetRetired(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, arg_active_visibility_revision, arg_staged_visibility_revision) ==
+PublishCommittedVisibleSetRetired(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, arg_staged_visibility_revision) ==
     /\ phase = "Retired"
     /\ (session_id # None)
-    /\ (arg_active_visibility_revision >= arg_staged_visibility_revision)
-    /\ ((arg_active_visibility_revision # arg_staged_visibility_revision) \/ ((active_filter = staged_filter) /\ (active_requested_deferred_names = staged_requested_deferred_names)))
+    /\ (active_visibility_revision >= arg_staged_visibility_revision)
+    /\ ((active_visibility_revision # arg_staged_visibility_revision) \/ ((active_filter = staged_filter) /\ (active_requested_deferred_names = staged_requested_deferred_names)))
     /\ (\A requested_name \in active_requested_deferred_names : (requested_name \in staged_requested_deferred_names))
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
-    /\ active_visibility_revision' = arg_active_visibility_revision
     /\ staged_visibility_revision' = arg_staged_visibility_revision
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides >>
 
 
-PublishCommittedVisibleSetStopped(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, arg_active_visibility_revision, arg_staged_visibility_revision) ==
+PublishCommittedVisibleSetStopped(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, arg_staged_visibility_revision) ==
     /\ phase = "Stopped"
     /\ (session_id # None)
-    /\ (arg_active_visibility_revision >= arg_staged_visibility_revision)
-    /\ ((arg_active_visibility_revision # arg_staged_visibility_revision) \/ ((active_filter = staged_filter) /\ (active_requested_deferred_names = staged_requested_deferred_names)))
+    /\ (active_visibility_revision >= arg_staged_visibility_revision)
+    /\ ((active_visibility_revision # arg_staged_visibility_revision) \/ ((active_filter = staged_filter) /\ (active_requested_deferred_names = staged_requested_deferred_names)))
     /\ (\A requested_name \in active_requested_deferred_names : (requested_name \in staged_requested_deferred_names))
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ active_visibility_revision' = arg_active_visibility_revision
     /\ staged_visibility_revision' = arg_staged_visibility_revision
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides >>
 
@@ -555,7 +531,7 @@ RetireRequestedFromIdle ==
     /\ phase = "Idle" \/ phase = "Attached" \/ phase = "Running"
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 Reset ==
@@ -567,7 +543,7 @@ Reset ==
     /\ current_run_id' = None
     /\ pre_run_phase' = None
     /\ silent_intent_overrides' = {}
-    /\ UNCHANGED << session_id, active_runtime_id, attachment_live, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, attachment_live, staged_visibility_revision >>
 
 
 StopRuntimeExecutorDetached ==
@@ -578,7 +554,7 @@ StopRuntimeExecutorDetached ==
     /\ current_run_id' = None
     /\ pre_run_phase' = None
     /\ silent_intent_overrides' = {}
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, staged_visibility_revision >>
 
 
 StopRuntimeExecutorLiveAttached ==
@@ -587,7 +563,7 @@ StopRuntimeExecutorLiveAttached ==
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
     /\ silent_intent_overrides' = {}
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, staged_visibility_revision >>
 
 
 StopRuntimeExecutorLiveRunning ==
@@ -596,7 +572,7 @@ StopRuntimeExecutorLiveRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ silent_intent_overrides' = {}
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, staged_visibility_revision >>
 
 
 Destroy ==
@@ -607,7 +583,7 @@ Destroy ==
     /\ current_run_id' = None
     /\ pre_run_phase' = None
     /\ silent_intent_overrides' = {}
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, staged_visibility_revision >>
 
 
 EnsureSessionWithExecutorIdle(arg_session_id) ==
@@ -615,7 +591,7 @@ EnsureSessionWithExecutorIdle(arg_session_id) ==
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
     /\ attachment_live' = TRUE
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 EnsureSessionWithExecutorAttached(arg_session_id) ==
@@ -623,7 +599,7 @@ EnsureSessionWithExecutorAttached(arg_session_id) ==
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
     /\ attachment_live' = TRUE
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 EnsureSessionWithExecutorRunning(arg_session_id) ==
@@ -631,21 +607,21 @@ EnsureSessionWithExecutorRunning(arg_session_id) ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ attachment_live' = TRUE
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 EnsureSessionWithExecutorRetired(arg_session_id) ==
     /\ phase = "Retired"
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 EnsureSessionWithExecutorStopped(arg_session_id) ==
     /\ phase = "Stopped"
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 SetSilentIntentsIdle(arg_session_id, intents) ==
@@ -654,7 +630,7 @@ SetSilentIntentsIdle(arg_session_id, intents) ==
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
     /\ silent_intent_overrides' = intents
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, staged_visibility_revision >>
 
 
 SetSilentIntentsAttached(arg_session_id, intents) ==
@@ -663,7 +639,7 @@ SetSilentIntentsAttached(arg_session_id, intents) ==
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
     /\ silent_intent_overrides' = intents
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, staged_visibility_revision >>
 
 
 SetSilentIntentsRunning(arg_session_id, intents) ==
@@ -672,7 +648,7 @@ SetSilentIntentsRunning(arg_session_id, intents) ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ silent_intent_overrides' = intents
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, staged_visibility_revision >>
 
 
 SetSilentIntentsRetired(arg_session_id, intents) ==
@@ -681,7 +657,7 @@ SetSilentIntentsRetired(arg_session_id, intents) ==
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
     /\ silent_intent_overrides' = intents
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, staged_visibility_revision >>
 
 
 SetSilentIntentsStopped(arg_session_id, intents) ==
@@ -689,7 +665,7 @@ SetSilentIntentsStopped(arg_session_id, intents) ==
     /\ (session_id # None)
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AbortIdle(arg_session_id) ==
@@ -697,7 +673,7 @@ AbortIdle(arg_session_id) ==
     /\ (session_id # None)
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AbortAttached(arg_session_id) ==
@@ -705,7 +681,7 @@ AbortAttached(arg_session_id) ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AbortRunning(arg_session_id) ==
@@ -713,7 +689,7 @@ AbortRunning(arg_session_id) ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AbortRetired(arg_session_id) ==
@@ -721,7 +697,7 @@ AbortRetired(arg_session_id) ==
     /\ (session_id # None)
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AbortStopped(arg_session_id) ==
@@ -729,7 +705,7 @@ AbortStopped(arg_session_id) ==
     /\ (session_id # None)
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 WaitIdle(arg_session_id) ==
@@ -737,7 +713,7 @@ WaitIdle(arg_session_id) ==
     /\ (session_id # None)
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 WaitAttached(arg_session_id) ==
@@ -745,7 +721,7 @@ WaitAttached(arg_session_id) ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 WaitRunning(arg_session_id) ==
@@ -753,7 +729,7 @@ WaitRunning(arg_session_id) ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 WaitRetired(arg_session_id) ==
@@ -761,7 +737,7 @@ WaitRetired(arg_session_id) ==
     /\ (session_id # None)
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 WaitStopped(arg_session_id) ==
@@ -769,42 +745,42 @@ WaitStopped(arg_session_id) ==
     /\ (session_id # None)
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AbortAllIdle ==
     /\ phase = "Idle"
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AbortAllAttached ==
     /\ phase = "Attached"
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AbortAllRunning ==
     /\ phase = "Running"
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AbortAllRetired ==
     /\ phase = "Retired"
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AbortAllStopped ==
     /\ phase = "Stopped"
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 EnsureDrainRunningAttached ==
@@ -812,7 +788,7 @@ EnsureDrainRunningAttached ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 EnsureDrainRunningRunning ==
@@ -820,7 +796,7 @@ EnsureDrainRunningRunning ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 IngestIdle(runtime_id, work_id, origin) ==
@@ -828,7 +804,7 @@ IngestIdle(runtime_id, work_id, origin) ==
     /\ (session_id # None)
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 IngestAttached(runtime_id, work_id, origin) ==
@@ -836,7 +812,7 @@ IngestAttached(runtime_id, work_id, origin) ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 IngestRunning(runtime_id, work_id, origin) ==
@@ -844,7 +820,7 @@ IngestRunning(runtime_id, work_id, origin) ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 PublishEventIdle(kind) ==
@@ -852,7 +828,7 @@ PublishEventIdle(kind) ==
     /\ (session_id # None)
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 PublishEventAttached(kind) ==
@@ -860,7 +836,7 @@ PublishEventAttached(kind) ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 PublishEventRunning(kind) ==
@@ -868,7 +844,7 @@ PublishEventRunning(kind) ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 PublishEventRetired(kind) ==
@@ -876,7 +852,7 @@ PublishEventRetired(kind) ==
     /\ (session_id # None)
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 PublishEventStopped(kind) ==
@@ -884,7 +860,7 @@ PublishEventStopped(kind) ==
     /\ (session_id # None)
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AcceptWithCompletionIdleQueued(input_id, request_immediate_processing, interrupt_yielding, run_id) ==
@@ -894,7 +870,7 @@ AcceptWithCompletionIdleQueued(input_id, request_immediate_processing, interrupt
     /\ (interrupt_yielding = FALSE)
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AcceptWithCompletionIdleImmediate(input_id, request_immediate_processing, interrupt_yielding, run_id) ==
@@ -904,7 +880,7 @@ AcceptWithCompletionIdleImmediate(input_id, request_immediate_processing, interr
     /\ (interrupt_yielding = FALSE)
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AcceptWithCompletionAttachedImmediate(input_id, request_immediate_processing, interrupt_yielding, run_id) ==
@@ -916,7 +892,7 @@ AcceptWithCompletionAttachedImmediate(input_id, request_immediate_processing, in
     /\ model_step_count' = model_step_count + 1
     /\ current_run_id' = Some(run_id)
     /\ pre_run_phase' = Some("attached")
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, staged_visibility_revision >>
 
 
 AcceptWithCompletionAttachedQueued(input_id, request_immediate_processing, interrupt_yielding, run_id) ==
@@ -926,7 +902,7 @@ AcceptWithCompletionAttachedQueued(input_id, request_immediate_processing, inter
     /\ (interrupt_yielding = FALSE)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AcceptWithCompletionRunningQueuedPassive(input_id, request_immediate_processing, interrupt_yielding, run_id) ==
@@ -936,7 +912,7 @@ AcceptWithCompletionRunningQueuedPassive(input_id, request_immediate_processing,
     /\ (interrupt_yielding = FALSE)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AcceptWithCompletionRunningInterruptYielding(input_id, request_immediate_processing, interrupt_yielding, run_id) ==
@@ -946,7 +922,7 @@ AcceptWithCompletionRunningInterruptYielding(input_id, request_immediate_process
     /\ (interrupt_yielding = TRUE)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AcceptWithCompletionRunningImmediate(input_id, request_immediate_processing, interrupt_yielding, run_id) ==
@@ -956,7 +932,7 @@ AcceptWithCompletionRunningImmediate(input_id, request_immediate_processing, int
     /\ (interrupt_yielding = FALSE)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AcceptWithoutWakeIdle(input_id) ==
@@ -964,7 +940,7 @@ AcceptWithoutWakeIdle(input_id) ==
     /\ (session_id # None)
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AcceptWithoutWakeAttached(input_id) ==
@@ -972,7 +948,7 @@ AcceptWithoutWakeAttached(input_id) ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 AcceptWithoutWakeRunning(input_id) ==
@@ -980,7 +956,7 @@ AcceptWithoutWakeRunning(input_id) ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 ClassifyExternalEnvelopeAttached ==
@@ -988,7 +964,7 @@ ClassifyExternalEnvelopeAttached ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 ClassifyExternalEnvelopeRunning ==
@@ -996,7 +972,7 @@ ClassifyExternalEnvelopeRunning ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 ClassifyPlainEventAttached ==
@@ -1004,7 +980,7 @@ ClassifyPlainEventAttached ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 ClassifyPlainEventRunning ==
@@ -1012,7 +988,7 @@ ClassifyPlainEventRunning ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 PrepareIdle(arg_session_id, run_id) ==
@@ -1022,7 +998,7 @@ PrepareIdle(arg_session_id, run_id) ==
     /\ model_step_count' = model_step_count + 1
     /\ current_run_id' = Some(run_id)
     /\ pre_run_phase' = Some("idle")
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, staged_visibility_revision >>
 
 
 PrepareAttached(arg_session_id, run_id) ==
@@ -1032,7 +1008,7 @@ PrepareAttached(arg_session_id, run_id) ==
     /\ model_step_count' = model_step_count + 1
     /\ current_run_id' = Some(run_id)
     /\ pre_run_phase' = Some("attached")
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, staged_visibility_revision >>
 
 
 DrainQueuedRunRetired(run_id) ==
@@ -1041,7 +1017,7 @@ DrainQueuedRunRetired(run_id) ==
     /\ model_step_count' = model_step_count + 1
     /\ current_run_id' = Some(run_id)
     /\ pre_run_phase' = Some("retired")
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, staged_visibility_revision >>
 
 
 StartConversationRunAttached ==
@@ -1049,7 +1025,7 @@ StartConversationRunAttached ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 StartImmediateAppendAttached ==
@@ -1057,7 +1033,7 @@ StartImmediateAppendAttached ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 StartImmediateContextAttached ==
@@ -1065,7 +1041,7 @@ StartImmediateContextAttached ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 CommitRunningToIdle(input_id, run_id) ==
@@ -1076,7 +1052,7 @@ CommitRunningToIdle(input_id, run_id) ==
     /\ model_step_count' = model_step_count + 1
     /\ current_run_id' = None
     /\ pre_run_phase' = None
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, staged_visibility_revision >>
 
 
 FailRunningToIdle(run_id) ==
@@ -1087,7 +1063,7 @@ FailRunningToIdle(run_id) ==
     /\ model_step_count' = model_step_count + 1
     /\ current_run_id' = None
     /\ pre_run_phase' = None
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, staged_visibility_revision >>
 
 
 CommitRunningToAttached(input_id, run_id) ==
@@ -1098,7 +1074,7 @@ CommitRunningToAttached(input_id, run_id) ==
     /\ model_step_count' = model_step_count + 1
     /\ current_run_id' = None
     /\ pre_run_phase' = None
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, staged_visibility_revision >>
 
 
 FailRunningToAttached(run_id) ==
@@ -1109,7 +1085,7 @@ FailRunningToAttached(run_id) ==
     /\ model_step_count' = model_step_count + 1
     /\ current_run_id' = None
     /\ pre_run_phase' = None
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, staged_visibility_revision >>
 
 
 CommitRunningToRetired(input_id, run_id) ==
@@ -1120,7 +1096,7 @@ CommitRunningToRetired(input_id, run_id) ==
     /\ model_step_count' = model_step_count + 1
     /\ current_run_id' = None
     /\ pre_run_phase' = None
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, staged_visibility_revision >>
 
 
 FailRunningToRetired(run_id) ==
@@ -1131,7 +1107,7 @@ FailRunningToRetired(run_id) ==
     /\ model_step_count' = model_step_count + 1
     /\ current_run_id' = None
     /\ pre_run_phase' = None
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, silent_intent_overrides, staged_visibility_revision >>
 
 
 StageAddAttached ==
@@ -1139,7 +1115,7 @@ StageAddAttached ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 StageAddRunning ==
@@ -1147,7 +1123,7 @@ StageAddRunning ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 StageRemoveAttached ==
@@ -1155,7 +1131,7 @@ StageRemoveAttached ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 StageRemoveRunning ==
@@ -1163,7 +1139,7 @@ StageRemoveRunning ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 StageReloadAttached ==
@@ -1171,7 +1147,7 @@ StageReloadAttached ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 StageReloadRunning ==
@@ -1179,7 +1155,7 @@ StageReloadRunning ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 ApplySurfaceBoundaryAttached ==
@@ -1187,7 +1163,7 @@ ApplySurfaceBoundaryAttached ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 ApplySurfaceBoundaryRunning ==
@@ -1195,7 +1171,7 @@ ApplySurfaceBoundaryRunning ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 PendingSucceededAttached ==
@@ -1203,7 +1179,7 @@ PendingSucceededAttached ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 PendingSucceededRunning ==
@@ -1211,7 +1187,7 @@ PendingSucceededRunning ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 PendingFailedAttached ==
@@ -1219,7 +1195,7 @@ PendingFailedAttached ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 PendingFailedRunning ==
@@ -1227,7 +1203,7 @@ PendingFailedRunning ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 CallStartedAttached ==
@@ -1235,7 +1211,7 @@ CallStartedAttached ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 CallStartedRunning ==
@@ -1243,7 +1219,7 @@ CallStartedRunning ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 CallFinishedAttached ==
@@ -1251,7 +1227,7 @@ CallFinishedAttached ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 CallFinishedRunning ==
@@ -1259,7 +1235,7 @@ CallFinishedRunning ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 FinalizeRemovalCleanAttached ==
@@ -1267,7 +1243,7 @@ FinalizeRemovalCleanAttached ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 FinalizeRemovalCleanRunning ==
@@ -1275,7 +1251,7 @@ FinalizeRemovalCleanRunning ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 FinalizeRemovalForcedAttached ==
@@ -1283,7 +1259,7 @@ FinalizeRemovalForcedAttached ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 FinalizeRemovalForcedRunning ==
@@ -1291,7 +1267,7 @@ FinalizeRemovalForcedRunning ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 SnapshotAlignedAttached ==
@@ -1299,7 +1275,7 @@ SnapshotAlignedAttached ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 SnapshotAlignedRunning ==
@@ -1307,7 +1283,7 @@ SnapshotAlignedRunning ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 ShutdownSurfaceAttached ==
@@ -1315,7 +1291,7 @@ ShutdownSurfaceAttached ==
     /\ (session_id # None)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 ShutdownSurfaceRunning ==
@@ -1323,7 +1299,7 @@ ShutdownSurfaceRunning ==
     /\ (session_id # None)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 RecycleFromIdleOrRetired ==
@@ -1334,7 +1310,7 @@ RecycleFromIdleOrRetired ==
     /\ active_fence_token' = None
     /\ active_generation' = None
     /\ current_run_id' = None
-    /\ UNCHANGED << session_id, active_runtime_id, attachment_live, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, attachment_live, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 RecycleFromAttached ==
@@ -1345,7 +1321,7 @@ RecycleFromAttached ==
     /\ active_fence_token' = None
     /\ active_generation' = None
     /\ current_run_id' = None
-    /\ UNCHANGED << session_id, active_runtime_id, attachment_live, pre_run_phase, silent_intent_overrides, active_visibility_revision, staged_visibility_revision >>
+    /\ UNCHANGED << session_id, active_runtime_id, attachment_live, pre_run_phase, silent_intent_overrides, staged_visibility_revision >>
 
 
 Next ==
@@ -1392,13 +1368,12 @@ Next ==
     \/ InterruptCurrentRun
     \/ CancelAfterBoundaryAttached
     \/ CancelAfterBoundary
-    \/ \E revision \in 0..2 : BoundaryAppliedPromote(revision)
-    \/ \E revision \in 0..2 : BoundaryAppliedNoop(revision)
-    \/ \E active_filter \in ToolFilterValues : \E staged_filter \in ToolFilterValues : \E active_requested_deferred_names \in SetOfStringValues : \E staged_requested_deferred_names \in SetOfStringValues : \E arg_active_visibility_revision \in 0..2 : \E arg_staged_visibility_revision \in 0..2 : PublishCommittedVisibleSetIdle(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, arg_active_visibility_revision, arg_staged_visibility_revision)
-    \/ \E active_filter \in ToolFilterValues : \E staged_filter \in ToolFilterValues : \E active_requested_deferred_names \in SetOfStringValues : \E staged_requested_deferred_names \in SetOfStringValues : \E arg_active_visibility_revision \in 0..2 : \E arg_staged_visibility_revision \in 0..2 : PublishCommittedVisibleSetAttached(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, arg_active_visibility_revision, arg_staged_visibility_revision)
-    \/ \E active_filter \in ToolFilterValues : \E staged_filter \in ToolFilterValues : \E active_requested_deferred_names \in SetOfStringValues : \E staged_requested_deferred_names \in SetOfStringValues : \E arg_active_visibility_revision \in 0..2 : \E arg_staged_visibility_revision \in 0..2 : PublishCommittedVisibleSetRunning(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, arg_active_visibility_revision, arg_staged_visibility_revision)
-    \/ \E active_filter \in ToolFilterValues : \E staged_filter \in ToolFilterValues : \E active_requested_deferred_names \in SetOfStringValues : \E staged_requested_deferred_names \in SetOfStringValues : \E arg_active_visibility_revision \in 0..2 : \E arg_staged_visibility_revision \in 0..2 : PublishCommittedVisibleSetRetired(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, arg_active_visibility_revision, arg_staged_visibility_revision)
-    \/ \E active_filter \in ToolFilterValues : \E staged_filter \in ToolFilterValues : \E active_requested_deferred_names \in SetOfStringValues : \E staged_requested_deferred_names \in SetOfStringValues : \E arg_active_visibility_revision \in 0..2 : \E arg_staged_visibility_revision \in 0..2 : PublishCommittedVisibleSetStopped(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, arg_active_visibility_revision, arg_staged_visibility_revision)
+    \/ \E revision \in 0..2 : BoundaryAppliedPublish(revision)
+    \/ \E active_filter \in ToolFilterValues : \E staged_filter \in ToolFilterValues : \E active_requested_deferred_names \in SetOfStringValues : \E staged_requested_deferred_names \in SetOfStringValues : \E active_visibility_revision \in 0..2 : \E arg_staged_visibility_revision \in 0..2 : PublishCommittedVisibleSetIdle(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, arg_staged_visibility_revision)
+    \/ \E active_filter \in ToolFilterValues : \E staged_filter \in ToolFilterValues : \E active_requested_deferred_names \in SetOfStringValues : \E staged_requested_deferred_names \in SetOfStringValues : \E active_visibility_revision \in 0..2 : \E arg_staged_visibility_revision \in 0..2 : PublishCommittedVisibleSetAttached(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, arg_staged_visibility_revision)
+    \/ \E active_filter \in ToolFilterValues : \E staged_filter \in ToolFilterValues : \E active_requested_deferred_names \in SetOfStringValues : \E staged_requested_deferred_names \in SetOfStringValues : \E active_visibility_revision \in 0..2 : \E arg_staged_visibility_revision \in 0..2 : PublishCommittedVisibleSetRunning(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, arg_staged_visibility_revision)
+    \/ \E active_filter \in ToolFilterValues : \E staged_filter \in ToolFilterValues : \E active_requested_deferred_names \in SetOfStringValues : \E staged_requested_deferred_names \in SetOfStringValues : \E active_visibility_revision \in 0..2 : \E arg_staged_visibility_revision \in 0..2 : PublishCommittedVisibleSetRetired(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, arg_staged_visibility_revision)
+    \/ \E active_filter \in ToolFilterValues : \E staged_filter \in ToolFilterValues : \E active_requested_deferred_names \in SetOfStringValues : \E staged_requested_deferred_names \in SetOfStringValues : \E active_visibility_revision \in 0..2 : \E arg_staged_visibility_revision \in 0..2 : PublishCommittedVisibleSetStopped(active_filter, staged_filter, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, arg_staged_visibility_revision)
     \/ RetireRequestedFromIdle
     \/ Reset
     \/ StopRuntimeExecutorDetached
