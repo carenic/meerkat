@@ -101,6 +101,11 @@ Hopcroft-style behavioral quotient over the reachable graph.
   truthful reachable graph, did not participate in surviving formal guards,
   and kept exact parity plus the truthful TLC/Hopcroft readout unchanged after
   removal.
+- Removed the dead Meerkat active-work slice from the formal state:
+  `active_work_id` never became `Some(...)` in the truthful graph, and the
+  old `has_active_work`-guarded top-level completion/operation signal slice
+  had zero reachable edges. Removing both kept exact parity plus the truthful
+  TLC/Hopcroft readout unchanged.
 - Taught the generated closed-world composition models to reject queued
   external entry packets that are no longer admissible for the current machine
   state, which removes seam deadlocks without widening the machine transition
@@ -155,6 +160,7 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | Meerkat visibility witness provenance should not stay as top-level shadow state | passed / landed | Removed `requested_witnesses` and `filter_witnesses` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 45,610 to 15,809 while the raw/phase quotients still held at 385 / 390. |
 | Meerkat LLM/capability projection should not stay as top-level shadow state | passed / landed | Removed `current_llm_identity`, `current_capability_surface`, `capability_surface_status`, `capability_base_filter`, and `inherited_base_filter` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 15,809 to 11,814 while the raw/phase quotients still held at 385 / 390. |
 | Meerkat wake/process pending bits should not stay as top-level formal state | passed / landed | Removed `wake_pending` and `process_pending` after the truthful graph showed they were constant `FALSE` across all reachable states; exact audited parity stayed green and the truthful TLC/Hopcroft readout stayed flat at 11,814 reachable with raw/phase/full quotients 385 / 390 / 11,425. |
+| Meerkat active-work slice should not stay as top-level formal state | passed / landed | Removed `active_work_id` plus the unreachable top-level `RunCompleted` / `RunFailed` / `RunCancelled` and old `has_active_work`-guarded operation-completion signal slice; exact audited parity stayed green and the truthful TLC/Hopcroft readout stayed flat at 11,814 reachable with raw/phase/full quotients 385 / 390 / 11,425. |
 | Meerkat `Stopped` vs `Retired` can merge internally | rejected | The top-level transition sets diverge in load-bearing ways: `Retired` still accepts `Reset`, `StopRuntimeExecutor`, and `Recycle`, while `Stopped` does not, and the retire path carries archival/drain semantics that phase 1 should keep explicit. |
 | Meerkat `Idle` vs `Attached` can merge internally | rejected | In the current formal model, phase identity still carries load-bearing "executor attached" semantics that are not derivable from the existing Meerkat extended state. Several absorbed transitions are phase-gated without a field-level attachment witness, so phase-1 collapse would require introducing a replacement attachment bit plus a new public projection layer rather than actually simplifying the model. |
 
@@ -590,6 +596,10 @@ The important read is now sharper than the earlier partial dump story:
 - the visibility-boundary and LLM/capability-boundary cuts removed a large
   amount of formal shadow state without changing the audited public-phase
   behavior
+- the old active-work slice was also dead top-level state rather than hidden
+  complexity: `active_work_id` never became `Some(...)`, the
+  `has_active_work`-guarded run-terminal slice had zero reachable edges, and
+  removing both left the truthful readout unchanged
 
 That means the remaining Meerkat complexity is carried overwhelmingly by the
 field tuple, not by the phase label.

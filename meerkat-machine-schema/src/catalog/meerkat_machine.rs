@@ -52,10 +52,6 @@ pub fn meerkat_machine() -> MachineSchema {
                     "active_generation",
                     TypeRef::Option(Box::new(TypeRef::Named("Generation".into()))),
                 ),
-                field(
-                    "active_work_id",
-                    TypeRef::Option(Box::new(TypeRef::Named("WorkId".into()))),
-                ),
                 field("attachment_live", TypeRef::Bool),
                 field("pre_run_phase", TypeRef::Option(Box::new(TypeRef::String))),
                 field("peer_ingress_configured", TypeRef::Bool),
@@ -80,7 +76,6 @@ pub fn meerkat_machine() -> MachineSchema {
                     init("active_runtime_id", Expr::None),
                     init("active_fence_token", Expr::None),
                     init("active_generation", Expr::None),
-                    init("active_work_id", Expr::None),
                     init("attachment_live", Expr::Bool(false)),
                     init("pre_run_phase", Expr::None),
                     init("peer_ingress_configured", Expr::Bool(false)),
@@ -170,9 +165,9 @@ pub fn meerkat_machine() -> MachineSchema {
         }],
         derived: vec![],
         invariants: vec![
-            // running_has_active_work removed: active_work_id was a mob-level
-            // concept tied to SubmitMobWork (now removed). Conversation runs
-            // enter Running via Prepare without setting active_work_id.
+            // The top-level kernel no longer tracks a dedicated active work id.
+            // Conversation runs enter Running via Prepare/Commit/Fail and the
+            // lower control/ingress authorities own run identity.
             InvariantSchema {
                 name: "fence_requires_bound_runtime".into(),
                 expr: Expr::Or(vec![
@@ -182,19 +177,6 @@ pub fn meerkat_machine() -> MachineSchema {
                     ),
                     Expr::Neq(
                         Box::new(Expr::Field("active_runtime_id".into())),
-                        Box::new(Expr::None),
-                    ),
-                ]),
-            },
-            InvariantSchema {
-                name: "destroyed_has_no_active_work".into(),
-                expr: Expr::Or(vec![
-                    Expr::Neq(
-                        Box::new(Expr::CurrentPhase),
-                        Box::new(Expr::Phase("Destroyed".into())),
-                    ),
-                    Expr::Eq(
-                        Box::new(Expr::Field("active_work_id".into())),
                         Box::new(Expr::None),
                     ),
                 ]),
@@ -614,45 +596,6 @@ pub fn meerkat_machine() -> MachineSchema {
                 "PublishCommittedVisibleSetStopped",
                 "Stopped",
             ),
-            TransitionSchema {
-                name: "RunCompleted".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: meerkat_trigger_kind("RunCompleted"),
-                    variant: "RunCompleted".into(),
-                    bindings: vec!["work_id".into()],
-                },
-                guards: vec![work_matches_active_guard("work_id")],
-                updates: clear_running_state(),
-                to: "Attached".into(),
-                emit: vec![work_identity_emit("WorkCompleted", "work_id")],
-            },
-            TransitionSchema {
-                name: "RunFailed".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: meerkat_trigger_kind("RunFailed"),
-                    variant: "RunFailed".into(),
-                    bindings: vec!["work_id".into()],
-                },
-                guards: vec![work_matches_active_guard("work_id")],
-                updates: clear_running_state(),
-                to: "Attached".into(),
-                emit: vec![work_identity_emit("WorkFailed", "work_id")],
-            },
-            TransitionSchema {
-                name: "RunCancelled".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: meerkat_trigger_kind("RunCancelled"),
-                    variant: "RunCancelled".into(),
-                    bindings: vec!["work_id".into()],
-                },
-                guards: vec![work_matches_active_guard("work_id")],
-                updates: clear_running_state(),
-                to: "Attached".into(),
-                emit: vec![work_identity_emit("WorkCancelled", "work_id")],
-            },
             // Recover: dispatch calls drv.recover() which only touches ingress
             // authority — the control phase does NOT change. Runtime rejects
             // Destroyed and Running; all other phases are self-loop no-ops.
@@ -730,7 +673,7 @@ pub fn meerkat_machine() -> MachineSchema {
                     bindings: vec![],
                 },
                 guards: vec![],
-                updates: clear_running_state(),
+                updates: vec![],
                 to: "Retired".into(),
                 emit: vec![runtime_identity_emit("RuntimeRetired")],
             },
@@ -755,10 +698,6 @@ pub fn meerkat_machine() -> MachineSchema {
                     },
                     Update::Assign {
                         field: "active_generation".into(),
-                        expr: Expr::None,
-                    },
-                    Update::Assign {
-                        field: "active_work_id".into(),
                         expr: Expr::None,
                     },
                     Update::Assign {
@@ -790,10 +729,6 @@ pub fn meerkat_machine() -> MachineSchema {
                 guards: vec![attachment_not_live_guard()],
                 updates: vec![
                     Update::Assign {
-                        field: "active_work_id".into(),
-                        expr: Expr::None,
-                    },
-                    Update::Assign {
                         field: "pre_run_phase".into(),
                         expr: Expr::None,
                     },
@@ -814,16 +749,10 @@ pub fn meerkat_machine() -> MachineSchema {
                     bindings: vec![],
                 },
                 guards: vec![attachment_live_guard()],
-                updates: vec![
-                    Update::Assign {
-                        field: "active_work_id".into(),
-                        expr: Expr::None,
-                    },
-                    Update::Assign {
-                        field: "drain_running".into(),
-                        expr: Expr::Bool(false),
-                    },
-                ],
+                updates: vec![Update::Assign {
+                    field: "drain_running".into(),
+                    expr: Expr::Bool(false),
+                }],
                 to: "Attached".into(),
                 emit: vec![notice_emit("stop", "runtime executor stopped")],
             },
@@ -836,16 +765,10 @@ pub fn meerkat_machine() -> MachineSchema {
                     bindings: vec![],
                 },
                 guards: vec![attachment_live_guard()],
-                updates: vec![
-                    Update::Assign {
-                        field: "active_work_id".into(),
-                        expr: Expr::None,
-                    },
-                    Update::Assign {
-                        field: "drain_running".into(),
-                        expr: Expr::Bool(false),
-                    },
-                ],
+                updates: vec![Update::Assign {
+                    field: "drain_running".into(),
+                    expr: Expr::Bool(false),
+                }],
                 to: "Running".into(),
                 emit: vec![notice_emit("stop", "runtime executor stopped")],
             },
@@ -866,10 +789,6 @@ pub fn meerkat_machine() -> MachineSchema {
                 },
                 guards: vec![runtime_is_bound_guard()],
                 updates: vec![
-                    Update::Assign {
-                        field: "active_work_id".into(),
-                        expr: Expr::None,
-                    },
                     Update::Assign {
                         field: "pre_run_phase".into(),
                         expr: Expr::None,
@@ -924,10 +843,6 @@ fn reset_session_state() -> Vec<Update> {
             expr: Expr::None,
         },
         Update::Assign {
-            field: "active_work_id".into(),
-            expr: Expr::None,
-        },
-        Update::Assign {
             field: "attachment_live".into(),
             expr: Expr::Bool(false),
         },
@@ -970,13 +885,6 @@ fn reset_session_state() -> Vec<Update> {
     ]
 }
 
-fn clear_running_state() -> Vec<Update> {
-    vec![Update::Assign {
-        field: "active_work_id".into(),
-        expr: Expr::None,
-    }]
-}
-
 fn runtime_identity_fields() -> Vec<FieldSchema> {
     vec![
         field("agent_runtime_id", TypeRef::Named("AgentRuntimeId".into())),
@@ -998,18 +906,6 @@ fn runtime_identity_emit(variant: &str) -> EffectEmit {
             ("agent_runtime_id".into(), option_value("active_runtime_id")),
             ("fence_token".into(), option_value("active_fence_token")),
             ("generation".into(), option_value("active_generation")),
-        ]),
-    }
-}
-
-fn work_identity_emit(variant: &str, binding: &str) -> EffectEmit {
-    EffectEmit {
-        variant: variant.into(),
-        fields: IndexMap::from([
-            ("agent_runtime_id".into(), option_value("active_runtime_id")),
-            ("fence_token".into(), option_value("active_fence_token")),
-            ("generation".into(), option_value("active_generation")),
-            ("work_id".into(), Expr::Binding(binding.into())),
         ]),
     }
 }
@@ -1354,16 +1250,6 @@ fn runtime_is_bound_guard() -> Guard {
     }
 }
 
-fn has_active_work_guard() -> Guard {
-    Guard {
-        name: "has_active_work".into(),
-        expr: Expr::Neq(
-            Box::new(Expr::Field("active_work_id".into())),
-            Box::new(Expr::None),
-        ),
-    }
-}
-
 fn attachment_live_guard() -> Guard {
     Guard {
         name: "attachment_live".into(),
@@ -1384,16 +1270,6 @@ fn pre_run_phase_matches_guard(phase: &str) -> Guard {
         expr: Expr::Eq(
             Box::new(Expr::Field("pre_run_phase".into())),
             Box::new(Expr::Some(Box::new(Expr::String(phase.to_lowercase())))),
-        ),
-    }
-}
-
-fn work_matches_active_guard(binding: &str) -> Guard {
-    Guard {
-        name: "work_matches_active".into(),
-        expr: Expr::Eq(
-            Box::new(Expr::Field("active_work_id".into())),
-            Box::new(Expr::Some(Box::new(Expr::Binding(binding.into())))),
         ),
     }
 }
@@ -1540,18 +1416,6 @@ fn direct_meerkat_trigger_variants() -> Vec<VariantSchema> {
         VariantSchema {
             name: "BoundaryApplied".into(),
             fields: vec![field("revision", TypeRef::U64)],
-        },
-        VariantSchema {
-            name: "RunCompleted".into(),
-            fields: vec![field("work_id", TypeRef::Named("WorkId".into()))],
-        },
-        VariantSchema {
-            name: "RunFailed".into(),
-            fields: vec![field("work_id", TypeRef::Named("WorkId".into()))],
-        },
-        VariantSchema {
-            name: "RunCancelled".into(),
-            fields: vec![field("work_id", TypeRef::Named("WorkId".into()))],
         },
         variant("Recover"),
         variant("Retire"),
@@ -1711,53 +1575,9 @@ fn absorbed_meerkat_input_variants() -> Vec<VariantSchema> {
             name: "Fail".into(),
             fields: vec![field("run_id", named("RunId"))],
         },
-        variant("AdmitQueued"),
-        variant("AdmitConsumedOnAccept"),
-        variant("StageDrainSnapshot"),
-        variant("SupersedeQueuedInput"),
-        variant("CoalesceQueuedInputs"),
-        variant("SetSilentIntentOverrides"),
         variant("StartConversationRun"),
         variant("StartImmediateAppend"),
         variant("StartImmediateContext"),
-        variant("PrimitiveApplied"),
-        variant("LlmReturnedToolCalls"),
-        variant("LlmReturnedTerminal"),
-        variant("RegisterPendingOps"),
-        variant("ToolCallsResolved"),
-        variant("OpsBarrierSatisfied"),
-        variant("BoundaryContinue"),
-        variant("BoundaryComplete"),
-        variant("RecoverableFailure"),
-        variant("FatalFailure"),
-        variant("RetryRequested"),
-        variant("CancelNow"),
-        variant("CancellationObserved"),
-        variant("AcknowledgeTerminal"),
-        variant("TurnLimitReached"),
-        variant("BudgetExhausted"),
-        variant("TimeBudgetExceeded"),
-        variant("EnterExtraction"),
-        variant("ExtractionValidationPassed"),
-        variant("ExtractionValidationFailed"),
-        variant("ExtractionStart"),
-        variant("ForceCancelNoRun"),
-        variant("RegisterOperation"),
-        variant("ProvisioningSucceeded"),
-        variant("ProvisioningFailed"),
-        variant("AbortProvisioning"),
-        variant("PeerReady"),
-        variant("RegisterWatcher"),
-        variant("ProgressReported"),
-        variant("CompleteOperation"),
-        variant("FailOperation"),
-        variant("CancelOperation"),
-        variant("RetireRequested"),
-        variant("RetireCompleted"),
-        variant("CollectTerminal"),
-        variant("OwnerTerminated"),
-        variant("BeginWaitAll"),
-        variant("CancelWaitAll"),
         variant("ClassifyExternalEnvelope"),
         variant("ClassifyPlainEvent"),
         variant("EnsureDrainRunning"),
@@ -2035,9 +1855,10 @@ fn absorbed_meerkat_transitions() -> Vec<TransitionSchema> {
         ));
     }
 
-    // Commit and Fail exit Running: runtime applies RunCompleted/RunFailed
-    // which restores the pre-run control phase (Idle or Attached). Both
-    // targets are modeled explicitly.
+    // Commit and Fail exit Running directly at the top-level machine
+    // boundary, restoring the pre-run control phase (Idle or Attached).
+    // The lower runtime authorities still own the internal run-completion
+    // details.
     for (to_phase, guard_phase) in [("Idle", "Idle"), ("Attached", "Attached")] {
         transitions.push(TransitionSchema {
             name: format!("CommitRunningTo{to_phase}"),
@@ -2071,79 +1892,6 @@ fn absorbed_meerkat_transitions() -> Vec<TransitionSchema> {
             to: to_phase.into(),
             emit: vec![simple_emit("RecordTerminalOutcome")],
         });
-    }
-
-    for (variant, bindings, emit_variant) in [
-        ("AdmitQueued", vec![], Some("ResolveAdmission")),
-        ("AdmitConsumedOnAccept", vec![], Some("ResolveAdmission")),
-        ("StageDrainSnapshot", vec![], None),
-        ("SupersedeQueuedInput", vec![], None),
-        ("CoalesceQueuedInputs", vec![], None),
-        (
-            "SetSilentIntentOverrides",
-            vec![],
-            Some("SilentIntentApplied"),
-        ),
-        ("PrimitiveApplied", vec![], Some("SubmitRunPrimitive")),
-        ("LlmReturnedToolCalls", vec![], None),
-        ("LlmReturnedTerminal", vec![], Some("RecordTerminalOutcome")),
-        ("RegisterPendingOps", vec![], Some("SubmitOpEvent")),
-        ("ToolCallsResolved", vec![], Some("SubmitOpEvent")),
-        ("OpsBarrierSatisfied", vec![], Some("SubmitOpEvent")),
-        ("BoundaryContinue", vec![], None),
-        ("BoundaryComplete", vec![], Some("RecordBoundarySequence")),
-        ("RecoverableFailure", vec![], Some("RecordTerminalOutcome")),
-        ("FatalFailure", vec![], Some("RecordTerminalOutcome")),
-        ("RetryRequested", vec![], Some("SubmitRunPrimitive")),
-        ("CancelNow", vec![], Some("RequestCancellationAtBoundary")),
-        (
-            "CancellationObserved",
-            vec![],
-            Some("RecordTerminalOutcome"),
-        ),
-        ("AcknowledgeTerminal", vec![], None),
-        ("TurnLimitReached", vec![], Some("RecordTerminalOutcome")),
-        ("BudgetExhausted", vec![], Some("RecordTerminalOutcome")),
-        ("TimeBudgetExceeded", vec![], Some("RecordTerminalOutcome")),
-        ("EnterExtraction", vec![], None),
-        ("ExtractionValidationPassed", vec![], None),
-        (
-            "ExtractionValidationFailed",
-            vec![],
-            Some("RecordTerminalOutcome"),
-        ),
-        ("ExtractionStart", vec![], None),
-        (
-            "ForceCancelNoRun",
-            vec![],
-            Some("RequestCancellationAtBoundary"),
-        ),
-        ("RegisterOperation", vec![], Some("SubmitOpEvent")),
-        ("ProvisioningSucceeded", vec![], Some("NotifyOpWatcher")),
-        ("ProvisioningFailed", vec![], Some("NotifyOpWatcher")),
-        ("AbortProvisioning", vec![], Some("NotifyOpWatcher")),
-        ("PeerReady", vec![], Some("ExposeOperationPeer")),
-        ("RegisterWatcher", vec![], Some("NotifyOpWatcher")),
-        ("ProgressReported", vec![], Some("NotifyOpWatcher")),
-        ("CompleteOperation", vec![], Some("CompletionResolved")),
-        ("FailOperation", vec![], Some("CompletionResolved")),
-        ("CancelOperation", vec![], Some("CompletionResolved")),
-        ("RetireRequested", vec![], Some("CheckCompaction")),
-        ("RetireCompleted", vec![], Some("CheckCompaction")),
-        ("CollectTerminal", vec![], Some("CollectCompletedResult")),
-        ("OwnerTerminated", vec![], Some("CompletionResolved")),
-        ("BeginWaitAll", vec![], None),
-        ("CancelWaitAll", vec![], None),
-    ] {
-        transitions.push(self_loop_transition_with(
-            &format!("{variant}Running"),
-            "Running",
-            variant,
-            bindings,
-            vec![],
-            emit_variant.into_iter().map(simple_emit).collect(),
-            vec![has_active_work_guard()],
-        ));
     }
 
     for (variant, bindings, emit_variant) in [
@@ -2200,10 +1948,6 @@ fn absorbed_meerkat_transitions() -> Vec<TransitionSchema> {
         },
         Update::Assign {
             field: "active_generation".into(),
-            expr: Expr::None,
-        },
-        Update::Assign {
-            field: "active_work_id".into(),
             expr: Expr::None,
         },
         Update::Assign {

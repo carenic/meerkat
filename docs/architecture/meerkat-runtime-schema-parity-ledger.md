@@ -109,6 +109,10 @@ Current exact-parity state:
 - the old wake/process pending bits are also gone from the top-level formal
   machine; the current truthful graph never drove them away from
   `FALSE`, and exact parity stayed green after the cut
+- the dead top-level active-work slice is also gone: `active_work_id` never
+  became `Some(...)` in the truthful graph, the old `has_active_work`-gated
+  completion/operation slice had zero reachable edges, and exact parity stayed
+  green after removing both
 - the pure query surface remains runtime-audited helper behavior, but it is no
   longer counted as formal transition coverage
 
@@ -287,7 +291,7 @@ Outcome:
    until the DSL work deliberately lifts them into the top-level machine.
 3. Use the trustworthy post-parity Hopcroft rerun as the Meerkat
    simplification baseline after the visibility-boundary and
-   LLM/capability-boundary cuts:
+   LLM/capability-boundary, wake/process, and dead active-work cuts:
    raw `11,814 -> 385`, phase `11,814 -> 390`, TLC `598,901 generated /
    11,814 distinct / depth 9`.
 4. Read that baseline together with the largest-block field projection from

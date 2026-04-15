@@ -221,7 +221,6 @@ fn meerkat_machine_absorbs_runtime_ingress_turn_tool_and_peer_domains() {
         "EnsureDrainRunning",
         "ClassifyExternalEnvelope",
         "ClassifyPlainEvent",
-        "RegisterOperation",
         "StartConversationRun",
         "StageAdd",
         "StageRemove",

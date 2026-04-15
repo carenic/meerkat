@@ -3367,10 +3367,6 @@ impl MeerkatMachine {
                 formal_projection_value(&Some(driver.runtime_id().to_string())),
             );
             available_fields.insert(
-                "active_work_id".into(),
-                formal_projection_value(&Option::<String>::None),
-            );
-            available_fields.insert(
                 "attachment_live".into(),
                 formal_projection_value(&attachment_live),
             );
