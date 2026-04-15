@@ -240,10 +240,33 @@ impl PersistentRuntimeDriver {
     ///
     /// Unlike `reset()`, this must not abandon queued/staged work.
     pub async fn recycle_preserving_work(&mut self) -> Result<usize, RuntimeDriverError> {
+        let checkpoint = self.inner.clone();
         let silent_intents = self.inner.silent_comms_intents();
+        let restore_attached = matches!(self.inner.runtime_state(), RuntimeState::Attached);
+        let input_states = self.inner.input_states_snapshot();
+        if let Err(err) = self
+            .store
+            .atomic_lifecycle_commit(
+                &self.runtime_id,
+                self.runtime_state_for_persistence(),
+                &input_states,
+            )
+            .await
+        {
+            self.inner = checkpoint;
+            return Err(RuntimeDriverError::Internal(format!(
+                "recycle persist failed: {err}"
+            )));
+        }
+
         self.inner = EphemeralRuntimeDriver::new(self.runtime_id.clone());
         self.inner.set_silent_comms_intents(silent_intents);
         let _ = RuntimeDriver::recover(self).await?;
+        if restore_attached && matches!(self.inner.runtime_state(), RuntimeState::Idle) {
+            self.inner
+                .attach()
+                .map_err(|err| RuntimeDriverError::Internal(err.to_string()))?;
+        }
         Ok(self.inner.active_input_ids().len())
     }
 

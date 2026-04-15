@@ -488,6 +488,40 @@ async fn machine_reset(driver: &mut DriverEntry) -> Result<ResetReport, RuntimeD
     driver.finalize_reset().await
 }
 
+async fn machine_recycle_preserving_work(
+    driver: &mut DriverEntry,
+) -> Result<usize, RuntimeDriverError> {
+    let target_phase = match driver.runtime_state() {
+        RuntimeState::Idle | RuntimeState::Retired => RuntimeState::Idle,
+        RuntimeState::Attached => RuntimeState::Attached,
+        from => {
+            return Err(RuntimeDriverError::Internal(
+                RuntimeStateTransitionError {
+                    from,
+                    to: RuntimeState::Idle,
+                }
+                .to_string(),
+            ));
+        }
+    };
+
+    if driver.current_run_id().is_some() {
+        return Err(RuntimeDriverError::Internal(
+            RuntimeStateTransitionError {
+                from: driver.runtime_state(),
+                to: target_phase,
+            }
+            .to_string(),
+        ));
+    }
+
+    driver.set_control_projection(target_phase, None, None);
+    match driver {
+        DriverEntry::Ephemeral(driver) => driver.recycle_preserving_work(),
+        DriverEntry::Persistent(driver) => driver.recycle_preserving_work().await,
+    }
+}
+
 pub(crate) async fn prepare_runtime_loop_batch_start(
     driver: &SharedDriver,
     run_id: RunId,
@@ -1702,25 +1736,9 @@ impl MeerkatMachine {
 
                 let (transferred, active_after_recycle) = {
                     let mut drv = driver.lock().await;
-                    let should_restore_attached = matches!(state, RuntimeState::Attached);
-
-                    let transferred =
-                        match &mut *drv {
-                            DriverEntry::Ephemeral(driver) => driver
-                                .recycle_preserving_work()
-                                .map_err(|e| RuntimeControlPlaneError::Internal(e.to_string()))?,
-                            DriverEntry::Persistent(driver) => driver
-                                .recycle_preserving_work()
-                                .await
-                                .map_err(|e| RuntimeControlPlaneError::Internal(e.to_string()))?,
-                        };
-
-                    if should_restore_attached
-                        && matches!(drv.as_driver().runtime_state(), RuntimeState::Idle)
-                    {
-                        drv.attach()
-                            .map_err(|e| RuntimeControlPlaneError::Internal(e.to_string()))?;
-                    }
+                    let transferred = machine_recycle_preserving_work(&mut drv)
+                        .await
+                        .map_err(|e| RuntimeControlPlaneError::Internal(e.to_string()))?;
 
                     let active_after_recycle = drv.as_driver().active_input_ids();
                     (transferred, active_after_recycle)

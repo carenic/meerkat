@@ -938,49 +938,6 @@ impl EphemeralRuntimeDriver {
     }
 
     pub fn recycle_preserving_work(&mut self) -> Result<usize, RuntimeDriverError> {
-        let next_phase = match self.phase {
-            RuntimeState::Idle | RuntimeState::Retired => {
-                if self.current_run_id.is_some() {
-                    return Err(RuntimeDriverError::Internal(
-                        crate::runtime_state::RuntimeStateTransitionError {
-                            from: self.phase,
-                            to: RuntimeState::Idle,
-                        }
-                        .to_string(),
-                    ));
-                }
-                RuntimeState::Idle
-            }
-            RuntimeState::Attached => {
-                if self.current_run_id.is_some() {
-                    return Err(RuntimeDriverError::Internal(
-                        crate::runtime_state::RuntimeStateTransitionError {
-                            from: self.phase,
-                            to: RuntimeState::Attached,
-                        }
-                        .to_string(),
-                    ));
-                }
-                RuntimeState::Attached
-            }
-            from => {
-                return Err(RuntimeDriverError::Internal(
-                    crate::runtime_state::RuntimeStateTransitionError {
-                        from,
-                        to: RuntimeState::Idle,
-                    }
-                    .to_string(),
-                ));
-            }
-        };
-        if self.phase == next_phase {
-            self.phase = next_phase;
-        } else {
-            self.transition_phase(next_phase);
-        }
-        self.current_run_id = None;
-        self.pre_run_phase = None;
-
         let transferred = self.ledger.active_input_ids().len();
         let runtime_id = self.runtime_id.clone();
         let silent_comms_intents = self.silent_comms_intents.clone();
