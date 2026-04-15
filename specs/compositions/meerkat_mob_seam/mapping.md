@@ -66,15 +66,6 @@ This section is generated from the Rust composition catalog. Do not edit it by h
 - `runtime_destroyed_reaches_mob`
   - anchors: `mob_meerkat_seam`, `meerkat_runtime_entry`
   - scenarios: `binding_round_trip`, `work_round_trip`
-- `work_completed_reaches_mob`
-  - anchors: `mob_meerkat_seam`, `meerkat_runtime_entry`
-  - scenarios: `binding_round_trip`, `work_round_trip`
-- `work_failed_reaches_mob`
-  - anchors: `mob_meerkat_seam`, `meerkat_runtime_entry`
-  - scenarios: `binding_round_trip`, `work_round_trip`
-- `work_cancelled_reaches_mob`
-  - anchors: `mob_meerkat_seam`, `meerkat_runtime_entry`
-  - scenarios: `binding_round_trip`, `work_round_trip`
 
 ### Scheduler Rules
 - `(none)`

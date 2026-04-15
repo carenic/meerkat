@@ -87,9 +87,6 @@ fn renders_kernel_seam_composition_with_routes() {
     assert!(rendered.contains(
         "binding_request_reaches_meerkat == mob.RequestRuntimeBinding -> meerkat.PrepareBindings (Input) [Immediate]"
     ));
-    assert!(rendered.contains(
-        "work_completed_reaches_mob == meerkat.WorkCompleted -> mob.ObserveWorkCompleted (Signal) [Immediate]"
-    ));
     assert!(rendered.contains("ROUTES"));
     assert!(rendered.ends_with("====\n"));
 }
@@ -122,7 +119,7 @@ fn renders_composition_mapping_coverage_with_routes() {
     assert!(rendered.contains("### Scenarios"));
     assert!(rendered.contains("### Routes"));
     assert!(rendered.contains("- `binding_request_reaches_meerkat`"));
-    assert!(rendered.contains("- `work_completed_reaches_mob`"));
+    assert!(rendered.contains("- `work_request_reaches_meerkat`"));
 }
 
 #[test]

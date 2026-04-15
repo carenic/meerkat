@@ -254,6 +254,18 @@ Hopcroft-style behavioral quotient over the reachable graph.
   checked-in transitions as well as the routed packet shape: `SubmitWork` now
   binds `origin`, and Meerkat `Ingest` transitions bind `runtime_id`,
   `work_id`, and `origin` instead of widening only the route schema.
+- Corrected the remaining Mob external-addressability runtime drift by making
+  `handle_external_turn()` honor `RosterEntry.effective_profile_override`
+  rather than always re-resolving from the definition role. Override-backed
+  members now follow the same externally addressable policy in runtime that the
+  spawn path and formal machine already intended.
+- Removed the paper-only Mob work-terminal seam from the checked-in machines and
+  composition. `SubmitWork` still models `RequestRuntimeIngress`, but
+  `ObserveWorkCompleted` / `ObserveWorkFailed` / `ObserveWorkCancelled` and the
+  corresponding `Work*` return routes are gone until a real `WorkRef -> InputId`
+  tracking protocol exists in the runtime. This keeps the two-machine model
+  honest instead of publishing completion/cancellation semantics that the live
+  runtime does not yet own.
 - Cleared the full phase-exit workspace gates on the rebased branch tip: `./scripts/repo-cargo nextest run --workspace` finished with 4,305 passing tests / 149 skipped, and `./scripts/repo-cargo clippy --workspace -- -D warnings` finished clean after fixing branch-head regressions in tool-visibility boundary change detection, stale semantic-model expectations, and idle-session LLM hot-swap fallback handling.
 - Regenerated machine/composition artifacts and re-ran schema parity, drift, TLC, render, runtime, and owner tests on top of the landed tranches.
 

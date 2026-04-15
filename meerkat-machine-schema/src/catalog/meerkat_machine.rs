@@ -131,18 +131,6 @@ pub fn meerkat_machine() -> MachineSchema {
                         name: "RuntimeDestroyed".into(),
                         fields: runtime_identity_fields(),
                     },
-                    VariantSchema {
-                        name: "WorkCompleted".into(),
-                        fields: work_identity_fields(),
-                    },
-                    VariantSchema {
-                        name: "WorkFailed".into(),
-                        fields: work_identity_fields(),
-                    },
-                    VariantSchema {
-                        name: "WorkCancelled".into(),
-                        fields: work_identity_fields(),
-                    },
                     variant("RequestCancellationAtBoundary"),
                     variant("WakeInterrupt"),
                     VariantSchema {
@@ -813,9 +801,6 @@ pub fn meerkat_machine() -> MachineSchema {
             routed_disposition("RuntimeBound", &["MobMachine"]),
             routed_disposition("RuntimeRetired", &["MobMachine"]),
             routed_disposition("RuntimeDestroyed", &["MobMachine"]),
-            routed_disposition("WorkCompleted", &["MobMachine"]),
-            routed_disposition("WorkFailed", &["MobMachine"]),
-            routed_disposition("WorkCancelled", &["MobMachine"]),
             local_disposition("RequestCancellationAtBoundary"),
             local_disposition("WakeInterrupt"),
             external_disposition("CommittedVisibleSetPublished"),
@@ -890,12 +875,6 @@ fn runtime_identity_fields() -> Vec<FieldSchema> {
         field("fence_token", TypeRef::Named("FenceToken".into())),
         field("generation", TypeRef::Named("Generation".into())),
     ]
-}
-
-fn work_identity_fields() -> Vec<FieldSchema> {
-    let mut fields = runtime_identity_fields();
-    fields.push(field("work_id", TypeRef::Named("WorkId".into())));
-    fields
 }
 
 fn runtime_identity_emit(variant: &str) -> EffectEmit {

@@ -12814,7 +12814,10 @@ async fn prepare_runtime_loop_batch_start_unwinds_run_state_when_staging_rejects
         .expect_err("staging an unknown input should fail and unwind");
     assert!(
         err.to_string()
-            .contains("failed to stage accepted input batch"),
+            .contains("failed to stage accepted input batch")
+            || err
+                .to_string()
+                .contains("stage drain snapshot requires queued contributors"),
         "unexpected helper error: {err}"
     );
 

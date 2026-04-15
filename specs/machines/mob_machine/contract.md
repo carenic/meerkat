@@ -75,9 +75,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ## Signals
 - `ObserveRuntimeReady`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
-- `ObserveWorkCompleted`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, work_id: WorkId)
-- `ObserveWorkFailed`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, work_id: WorkId)
-- `ObserveWorkCancelled`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, work_id: WorkId)
 - `RetireMember`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
 - `ObserveRuntimeRetired`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
 - `ResetMember`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: Bool)
@@ -157,27 +154,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `current_binding_matches`
   - `internal_origin`
 - Emits: `RequestRuntimeIngress`
-- To: `Running`
-
-### `ObserveWorkCompleted`
-- From: `Running`
-- On: `ObserveWorkCompleted`(agent_runtime_id, fence_token, work_id)
-- Guards:
-  - `current_binding_matches`
-- To: `Running`
-
-### `ObserveWorkFailed`
-- From: `Running`
-- On: `ObserveWorkFailed`(agent_runtime_id, fence_token, work_id)
-- Guards:
-  - `current_binding_matches`
-- To: `Running`
-
-### `ObserveWorkCancelled`
-- From: `Running`
-- On: `ObserveWorkCancelled`(agent_runtime_id, fence_token, work_id)
-- Guards:
-  - `current_binding_matches`
 - To: `Running`
 
 ### `RetireMember`

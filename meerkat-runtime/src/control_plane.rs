@@ -21,6 +21,7 @@ async fn mark_runtime_stopped(driver: &SharedDriver) -> Result<(), RuntimeDriver
         return Ok(());
     }
 
+    driver.set_control_projection(RuntimeState::Stopped, None, None);
     driver.finalize_stop_runtime().await
 }
 

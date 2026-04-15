@@ -10305,6 +10305,38 @@ async fn test_external_backend_lifecycle_and_turn_policy() {
     );
 }
 
+#[tokio::test]
+async fn test_external_turn_prefers_effective_profile_override_addressability() {
+    let definition = sample_definition();
+    let mut override_profile = definition
+        .profiles
+        .get(&ProfileName::from("worker"))
+        .expect("worker profile")
+        .as_inline()
+        .expect("worker profile should be inline")
+        .clone();
+    override_profile.external_addressable = true;
+
+    let (handle, _service) = create_test_mob(definition).await;
+    let mut spec = SpawnMemberSpec::new("worker", AgentIdentity::from("w-override"));
+    spec.override_profile = Some(override_profile);
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("spawn override worker");
+
+    handle
+        .member(&AgentIdentity::from("w-override"))
+        .await
+        .expect("member handle")
+        .send(
+            "outside hello".to_string(),
+            meerkat_core::types::HandlingMode::Queue,
+        )
+        .await
+        .expect("override profile should permit external turns");
+}
+
 // -----------------------------------------------------------------------
 // P1-T11: MobCreated event stores definition
 // -----------------------------------------------------------------------

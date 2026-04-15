@@ -14,9 +14,6 @@ _Generated from the Rust composition catalog. Do not edit by hand._
 - `runtime_bound_reaches_mob`: `meerkat`.`RuntimeBound` -> `mob`.`ObserveRuntimeReady` [Immediate]
 - `runtime_retired_reaches_mob`: `meerkat`.`RuntimeRetired` -> `mob`.`ObserveRuntimeRetired` [Immediate]
 - `runtime_destroyed_reaches_mob`: `meerkat`.`RuntimeDestroyed` -> `mob`.`ObserveRuntimeDestroyed` [Immediate]
-- `work_completed_reaches_mob`: `meerkat`.`WorkCompleted` -> `mob`.`ObserveWorkCompleted` [Immediate]
-- `work_failed_reaches_mob`: `meerkat`.`WorkFailed` -> `mob`.`ObserveWorkFailed` [Immediate]
-- `work_cancelled_reaches_mob`: `meerkat`.`WorkCancelled` -> `mob`.`ObserveWorkCancelled` [Immediate]
 
 ## Target Selectors
 - `(none)`

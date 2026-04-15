@@ -99,9 +99,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RuntimeBound`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation)
 - `RuntimeRetired`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation)
 - `RuntimeDestroyed`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation)
-- `WorkCompleted`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, work_id: WorkId)
-- `WorkFailed`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, work_id: WorkId)
-- `WorkCancelled`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, work_id: WorkId)
 - `RequestCancellationAtBoundary`
 - `WakeInterrupt`
 - `CommittedVisibleSetPublished`(revision: u64)

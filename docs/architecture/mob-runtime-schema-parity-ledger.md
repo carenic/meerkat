@@ -90,6 +90,14 @@ Current state:
   triangle, and that exact observable pass stays green too
 - the generated `meerkat_mob_seam` composition now rejects inadmissible queued
   external entry packets instead of deadlocking after terminal Mob shutdown
+- external-turn legality now honors the roster's
+  `effective_profile_override` instead of always re-resolving by role name,
+  so externally addressable override profiles are no longer silently ignored
+- the checked-in Mob/Meerkat seam no longer claims a `WorkCompleted` /
+  `WorkFailed` / `WorkCancelled` return lane. The live runtime still treats
+  `SubmitWork` as a thin ingress request plus opaque `WorkRef` receipt, so the
+  formal model now stops at `RequestRuntimeIngress` instead of overclaiming an
+  unwired work-terminal protocol
 
 ## Resolution Rubric
 
@@ -185,6 +193,15 @@ Current state:
   `76,199 generated / 2,238 distinct / depth 7`, which is the right signature
   for lifting a real legality distinction into `MobMachine` instead of hiding
   it in the handle/actor branch.
+- The latest runtime fix applies that same external-origin legality to the live
+  actor path too: `handle_external_turn()` now prefers the roster entry's
+  `effective_profile_override` when deciding whether a member is externally
+  addressable.
+- The latest simplification cut removes the unwired work-terminal seam from the
+  formal graph entirely. `ObserveWorkCompleted`, `ObserveWorkFailed`, and
+  `ObserveWorkCancelled` are gone from `MobMachine`, the return-leg routes are
+  gone from `meerkat_mob_seam`, and the checked-in model now matches the live
+  runtime's current "submit only" work semantics.
 
 ## Pair Ledger
 

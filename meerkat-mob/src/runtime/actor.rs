@@ -4641,10 +4641,13 @@ impl MobActor {
         };
 
         // Check external_addressable
-        let profile = self
-            .definition
-            .resolve_profile(&entry.role, self.realm_profile_store.as_ref())
-            .await?;
+        let profile = if let Some(profile) = entry.effective_profile_override.clone() {
+            profile
+        } else {
+            self.definition
+                .resolve_profile(&entry.role, self.realm_profile_store.as_ref())
+                .await?
+        };
 
         if !profile.external_addressable {
             return Err(MobError::NotExternallyAddressable(meerkat_id));

@@ -270,6 +270,7 @@ impl EphemeralRuntimeDriver {
         work_id: InputId,
         content_shape: ContentShape,
         handling_mode: HandlingMode,
+        is_prompt: bool,
         lifecycle_state: InputLifecycleState,
         policy: PolicyDecision,
         request_id: Option<RequestId>,
@@ -279,6 +280,7 @@ impl EphemeralRuntimeDriver {
             work_id,
             content_shape,
             handling_mode,
+            is_prompt,
             lifecycle_state,
             policy,
             request_id,
@@ -907,7 +909,7 @@ impl EphemeralRuntimeDriver {
         self.finalize_stop_runtime();
     }
 
-    pub fn recover_ephemeral(&mut self) -> RecoveryReport {
+    pub fn recover_ephemeral(&mut self) -> Result<RecoveryReport, RuntimeDriverError> {
         let mut recovered = 0;
         let mut abandoned = 0;
         let mut requeued = 0;
@@ -963,62 +965,50 @@ impl EphemeralRuntimeDriver {
             .ledger
             .iter()
             .filter_map(|(input_id, state)| {
-                let handling_mode = state
-                    .policy
-                    .as_ref()
-                    .map(|p| handling_mode_from_policy(&p.decision))
-                    .unwrap_or(HandlingMode::Queue);
-                let content_shape = state
-                    .persisted_input
-                    .as_ref()
-                    .map(|input| ContentShape(input.kind_id().to_string()))
-                    .unwrap_or_else(|| ContentShape("unknown".into()));
-                let policy = match state.policy.as_ref() {
-                    Some(policy) => policy.decision.clone(),
-                    None => match state.persisted_input.as_ref() {
-                        Some(input) => DefaultPolicyTable::resolve(input, true),
-                        None => return None,
-                    },
-                };
-
-                Some((
-                    input_id.clone(),
-                    content_shape,
-                    handling_mode,
-                    state.current_state(),
-                    policy,
-                ))
+                crate::meerkat_machine::machine_build_recovered_ingress_entry(state).map(|entry| {
+                    (
+                        input_id.clone(),
+                        entry.content_shape,
+                        entry.handling_mode,
+                        entry.is_prompt,
+                        entry.lifecycle_state,
+                        entry.policy,
+                    )
+                })
             })
             .collect();
 
-        for (input_id, content_shape, handling_mode, lifecycle_state, policy) in recovered_entries {
-            if let Err(err) = rebuilt_ingress.apply(RuntimeIngressInput::AdmitRecovered {
-                work_id: input_id.clone(),
-                content_shape,
-                handling_mode,
-                lifecycle_state,
-                policy,
-                request_id: None,
-                reservation_key: None,
-            }) {
-                tracing::warn!(
-                    input_id = ?input_id,
-                    error = %err,
-                    "ingress authority rejected rebuilt recovered input"
-                );
-            }
+        for (input_id, content_shape, handling_mode, is_prompt, lifecycle_state, policy) in
+            recovered_entries
+        {
+            rebuilt_ingress
+                .apply(RuntimeIngressInput::AdmitRecovered {
+                    work_id: input_id.clone(),
+                    content_shape,
+                    handling_mode,
+                    is_prompt,
+                    lifecycle_state,
+                    policy,
+                    request_id: None,
+                    reservation_key: None,
+                })
+                .map_err(|err| {
+                    RuntimeDriverError::Internal(format!(
+                        "ingress authority rejected rebuilt recovered input '{input_id}': {err}"
+                    ))
+                })?;
         }
 
         self.ingress = rebuilt_ingress;
         self.rebuild_queue_projections();
         self.debug_assert_queue_projection_alignment();
 
-        RecoveryReport {
+        Ok(RecoveryReport {
             inputs_recovered: recovered,
             inputs_abandoned: abandoned,
             inputs_requeued: requeued,
             details: Vec::new(),
-        }
+        })
     }
 
     pub fn recycle_preserving_work(&mut self) -> Result<usize, RuntimeDriverError> {
@@ -1034,7 +1024,7 @@ impl EphemeralRuntimeDriver {
         self.ledger = ledger;
         self.ingress = ingress;
 
-        let _ = self.recover_ephemeral();
+        self.recover_ephemeral()?;
         self.rebuild_queue_projections();
         self.debug_assert_queue_projection_alignment();
 
@@ -1132,11 +1122,9 @@ impl EphemeralRuntimeDriver {
                 self.process_ingress_effects(&transition.effects);
             }
             Err(err) => {
-                tracing::warn!(
-                    run_id = ?run_id,
-                    error = %err,
-                    "ingress authority rejected RunCompleted"
-                );
+                return Err(RuntimeDriverError::Internal(format!(
+                    "ingress authority rejected RunCompleted for {run_id:?}: {err}"
+                )));
             }
         }
 
@@ -1165,11 +1153,9 @@ impl EphemeralRuntimeDriver {
                 self.process_ingress_effects(&transition.effects);
             }
             Err(err) => {
-                tracing::warn!(
-                    run_id = ?run_id,
-                    error = %err,
-                    "ingress authority rejected RunFailed"
-                );
+                return Err(RuntimeDriverError::Internal(format!(
+                    "ingress authority rejected RunFailed for run {run_id:?}: {err}"
+                )));
             }
         }
 
@@ -1195,12 +1181,10 @@ impl EphemeralRuntimeDriver {
                 self.process_ingress_effects(&transition.effects);
             }
             Err(err) => {
-                tracing::warn!(
-                    run_id = ?run_id,
-                    boundary_sequence = receipt.sequence,
-                    error = %err,
-                    "ingress authority rejected BoundaryApplied"
-                );
+                return Err(RuntimeDriverError::Internal(format!(
+                    "ingress authority rejected BoundaryApplied for run {run_id:?} boundary {}: {err}",
+                    receipt.sequence
+                )));
             }
         }
 
@@ -1233,6 +1217,19 @@ impl EphemeralRuntimeDriver {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
     async fn accept_input(&mut self, input: Input) -> Result<AcceptOutcome, RuntimeDriverError> {
+        match self.runtime_state() {
+            RuntimeState::Retired | RuntimeState::Stopped => {
+                return Err(RuntimeDriverError::NotReady {
+                    state: self.runtime_state(),
+                });
+            }
+            RuntimeState::Destroyed => return Err(RuntimeDriverError::Destroyed),
+            RuntimeState::Initializing
+            | RuntimeState::Idle
+            | RuntimeState::Attached
+            | RuntimeState::Running => {}
+        }
+
         if let Err(e) = validate_durability(&input) {
             match e {
                 DurabilityError::DerivedForbidden { .. }
@@ -1271,12 +1268,9 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
                         self.process_ingress_effects(&transition.effects);
                     }
                     Err(err) => {
-                        tracing::warn!(
-                            input_id = ?input_id,
-                            existing_id = ?existing_id,
-                            error = %err,
-                            "ingress authority rejected AdmitDeduplicated"
-                        );
+                        return Err(RuntimeDriverError::Internal(format!(
+                            "ingress authority rejected AdmitDeduplicated for '{input_id}' against '{existing_id}': {err}"
+                        )));
                     }
                 }
                 self.emit_event(RuntimeEvent::InputLifecycle(
@@ -1356,11 +1350,9 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
                 self.process_accept_effects(&transition.effects, &input);
             }
             Err(err) => {
-                tracing::warn!(
-                    input_id = ?input_id,
-                    error = %err,
-                    "ingress authority rejected accept_input"
-                );
+                return Err(RuntimeDriverError::Internal(format!(
+                    "ingress authority rejected accept_input for '{input_id}': {err}"
+                )));
             }
         }
         let final_state = self.ledger.get(&input_id).cloned().unwrap_or_else(|| state);
@@ -1379,7 +1371,7 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
     }
 
     async fn recover(&mut self) -> Result<RecoveryReport, RuntimeDriverError> {
-        Ok(self.recover_ephemeral())
+        self.recover_ephemeral()
     }
     fn runtime_state(&self) -> RuntimeState {
         self.control_snapshot().phase

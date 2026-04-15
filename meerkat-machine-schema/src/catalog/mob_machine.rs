@@ -240,57 +240,6 @@ pub fn mob_machine() -> MachineSchema {
                 emit: vec![work_submission_emit("RequestRuntimeIngress")],
             },
             TransitionSchema {
-                name: "ObserveWorkCompleted".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: mob_trigger_kind("ObserveWorkCompleted"),
-                    variant: "ObserveWorkCompleted".into(),
-                    bindings: vec![
-                        "agent_runtime_id".into(),
-                        "fence_token".into(),
-                        "work_id".into(),
-                    ],
-                },
-                guards: vec![current_binding_matches_guard()],
-                updates: clear_work_updates(),
-                to: "Running".into(),
-                emit: vec![],
-            },
-            TransitionSchema {
-                name: "ObserveWorkFailed".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: mob_trigger_kind("ObserveWorkFailed"),
-                    variant: "ObserveWorkFailed".into(),
-                    bindings: vec![
-                        "agent_runtime_id".into(),
-                        "fence_token".into(),
-                        "work_id".into(),
-                    ],
-                },
-                guards: vec![current_binding_matches_guard()],
-                updates: clear_work_updates(),
-                to: "Running".into(),
-                emit: vec![],
-            },
-            TransitionSchema {
-                name: "ObserveWorkCancelled".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: mob_trigger_kind("ObserveWorkCancelled"),
-                    variant: "ObserveWorkCancelled".into(),
-                    bindings: vec![
-                        "agent_runtime_id".into(),
-                        "fence_token".into(),
-                        "work_id".into(),
-                    ],
-                },
-                guards: vec![current_binding_matches_guard()],
-                updates: clear_work_updates(),
-                to: "Running".into(),
-                emit: vec![],
-            },
-            TransitionSchema {
                 name: "RetireMember".into(),
                 from: vec!["Running".into()],
                 on: InputMatch {
@@ -515,14 +464,6 @@ fn work_submission_fields() -> Vec<FieldSchema> {
     ]
 }
 
-fn work_observation_fields() -> Vec<FieldSchema> {
-    vec![
-        field("agent_runtime_id", TypeRef::Named("AgentRuntimeId".into())),
-        field("fence_token", TypeRef::Named("FenceToken".into())),
-        field("work_id", TypeRef::Named("WorkId".into())),
-    ]
-}
-
 fn runtime_binding_emit(variant: &str) -> EffectEmit {
     EffectEmit {
         variant: variant.into(),
@@ -633,18 +574,6 @@ fn direct_mob_trigger_variants() -> Vec<VariantSchema> {
         VariantSchema {
             name: "SubmitWork".into(),
             fields: work_submission_fields(),
-        },
-        VariantSchema {
-            name: "ObserveWorkCompleted".into(),
-            fields: work_observation_fields(),
-        },
-        VariantSchema {
-            name: "ObserveWorkFailed".into(),
-            fields: work_observation_fields(),
-        },
-        VariantSchema {
-            name: "ObserveWorkCancelled".into(),
-            fields: work_observation_fields(),
         },
         VariantSchema {
             name: "RetireMember".into(),

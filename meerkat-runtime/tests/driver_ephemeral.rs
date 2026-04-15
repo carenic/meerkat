@@ -1,13 +1,15 @@
 #![allow(clippy::unwrap_used)]
 
 use chrono::Utc;
-use meerkat_core::lifecycle::{InputId, RunId};
+use meerkat_core::lifecycle::{
+    InputId, RunBoundaryReceipt, RunId, run_primitive::RunApplyBoundary,
+};
 use meerkat_runtime::{
     ContinuationInput, EphemeralRuntimeDriver, Input, InputDurability, InputHeader,
     InputLifecycleEvent, InputLifecycleState, InputOrigin, InputVisibility, LogicalRuntimeId,
     PeerConvention, PeerInput, PostAdmissionSignal, PromptInput, ResponseProgressPhase,
-    ResponseTerminalStatus, RuntimeDriver, RuntimeEvent, RuntimeState,
-    post_admission_signal_from_accept_outcome,
+    ResponseTerminalStatus, RuntimeDriver, RuntimeDriverError, RuntimeEvent, RuntimeState,
+    driver::ephemeral::ReplayQueuedContributorsPlan, post_admission_signal_from_accept_outcome,
 };
 
 fn make_prompt_input(text: &str) -> Input {
@@ -319,6 +321,21 @@ async fn on_run_completed_consumes() {
     // Stage and apply
     driver.stage_input(&input_id, &run_id).unwrap();
     driver.apply_input(&input_id, &run_id).unwrap();
+    driver
+        .boundary_applied(
+            run_id.clone(),
+            RunBoundaryReceipt {
+                run_id: run_id.clone(),
+                boundary: RunApplyBoundary::RunStart,
+                contributing_input_ids: vec![input_id.clone()],
+                conversation_digest: None,
+                message_count: 0,
+                sequence: 1,
+            },
+            None,
+        )
+        .await
+        .unwrap();
 
     // Run completed
     driver
@@ -350,7 +367,7 @@ async fn on_run_failed_rollbacks() {
         .run_failed(
             run_id,
             vec![input_id.clone()],
-            crate::driver::ephemeral::ReplayQueuedContributorsPlan {
+            ReplayQueuedContributorsPlan {
                 queue_work_ids: vec![input_id.clone()],
                 steer_work_ids: Vec::new(),
                 wake_runtime: true,
@@ -391,7 +408,7 @@ async fn on_run_failed_requests_wake_for_backlog() {
         .run_failed(
             run_id,
             vec![input1_id.clone()],
-            crate::driver::ephemeral::ReplayQueuedContributorsPlan {
+            ReplayQueuedContributorsPlan {
                 queue_work_ids: vec![input1_id.clone()],
                 steer_work_ids: Vec::new(),
                 wake_runtime: true,
@@ -430,7 +447,7 @@ async fn reset_after_retire_returns_runtime_to_idle() {
 }
 
 #[tokio::test]
-async fn recovery_counts_queued_as_recovered() {
+async fn recovery_counts_queued_as_recovered() -> Result<(), RuntimeDriverError> {
     let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new("test"));
 
     // Accept an input — policy transitions it to Queued
@@ -446,16 +463,17 @@ async fn recovery_counts_queued_as_recovered() {
     driver.clear_queue_projections();
 
     // Recover
-    let report = driver.recover_ephemeral();
+    let report = driver.recover_ephemeral()?;
     // Queued inputs are counted as recovered (already in correct state)
     assert_eq!(report.inputs_recovered, 1);
     assert_eq!(report.inputs_requeued, 0); // Already Queued, no transition needed
     assert_eq!(driver.queue().input_ids(), vec![input_id]);
     assert_queue_projection_alignment(&driver);
+    Ok(())
 }
 
 #[tokio::test]
-async fn recovery_applied_stays_applied() {
+async fn recovery_applied_stays_applied() -> Result<(), RuntimeDriverError> {
     let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new("test"));
 
     let input = make_prompt_input("hello");
@@ -467,7 +485,7 @@ async fn recovery_applied_stays_applied() {
     driver.stage_input(&input_id, &run_id).unwrap();
     driver.apply_input(&input_id, &run_id).unwrap();
 
-    let report = driver.recover_ephemeral();
+    let report = driver.recover_ephemeral()?;
     assert_eq!(report.inputs_recovered, 1);
 
     // Applied stays Applied (side effects already happened)
@@ -477,6 +495,7 @@ async fn recovery_applied_stays_applied() {
         InputLifecycleState::AppliedPendingConsumption
     );
     assert_queue_projection_alignment(&driver);
+    Ok(())
 }
 
 #[tokio::test]
@@ -516,7 +535,7 @@ async fn rollback_restores_queue_projection_order() {
         .run_failed(
             run_id,
             vec![first_id.clone()],
-            crate::driver::ephemeral::ReplayQueuedContributorsPlan {
+            ReplayQueuedContributorsPlan {
                 queue_work_ids: vec![first_id.clone()],
                 steer_work_ids: Vec::new(),
                 wake_runtime: true,
@@ -625,6 +644,21 @@ async fn retired_can_drain_queue_via_run_cycle() {
 
     driver.stage_input(&input_id, &run_id).unwrap();
     driver.apply_input(&input_id, &run_id).unwrap();
+    driver
+        .boundary_applied(
+            run_id.clone(),
+            RunBoundaryReceipt {
+                run_id: run_id.clone(),
+                boundary: RunApplyBoundary::RunStart,
+                contributing_input_ids: vec![input_id.clone()],
+                conversation_digest: None,
+                message_count: 0,
+                sequence: 1,
+            },
+            None,
+        )
+        .await
+        .unwrap();
 
     // Complete run → returns to Retired (not Idle)
     driver.run_completed(run_id, vec![input_id]).await.unwrap();

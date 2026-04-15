@@ -11,19 +11,17 @@ use meerkat_core::BlobStore;
 use meerkat_core::lifecycle::{InputId, RunBoundaryReceipt, RunId};
 
 use crate::accept::AcceptOutcome;
-use crate::driver::ephemeral::handling_mode_from_policy;
 use crate::identifiers::LogicalRuntimeId;
 use crate::input::{Input, externalize_input_images};
 use crate::input_state::{InputAbandonReason, InputState};
 use crate::meerkat_machine::{
-    machine_normalize_recovered_input_state, machine_realize_recovered_runtime_state,
+    machine_build_recovered_ingress_entry, machine_normalize_recovered_input_state,
+    machine_realize_recovered_runtime_state,
 };
 use crate::runtime_event::RuntimeEventEnvelope;
-use crate::runtime_ingress_authority::ContentShape;
 use crate::runtime_state::RuntimeState;
 use crate::store::RuntimeStore;
 use crate::traits::{DestroyReport, RecoveryReport, RuntimeDriver, RuntimeDriverError};
-use meerkat_core::types::HandlingMode;
 
 use super::ephemeral::EphemeralRuntimeDriver;
 
@@ -585,29 +583,11 @@ impl RuntimeDriver for PersistentRuntimeDriver {
 
             // Admit to ingress authority so Recover can see this input.
             if self.inner.input_state(&state.input_id).is_none() {
-                let handling_mode = state
-                    .policy
-                    .as_ref()
-                    .map(|p| handling_mode_from_policy(&p.decision))
-                    .unwrap_or(HandlingMode::Queue);
-                let content_shape = state
-                    .persisted_input
-                    .as_ref()
-                    .map(|i| ContentShape(i.kind_id().to_string()))
-                    .unwrap_or_else(|| ContentShape("unknown".into()));
-                let policy = match state.policy.as_ref() {
-                    Some(p) => p.decision.clone(),
-                    None => match state.persisted_input.as_ref() {
-                        Some(input) => {
-                            crate::policy_table::DefaultPolicyTable::resolve(input, true)
-                        }
-                        None => {
-                            // No policy and no payload — load into ledger for dedup
-                            // but skip ingress admission (nothing to route).
-                            self.inner.ledger_mut().recover(state);
-                            continue;
-                        }
-                    },
+                let Some(entry) = machine_build_recovered_ingress_entry(&state) else {
+                    // No policy and no payload — load into ledger for dedup but
+                    // skip ingress admission (nothing to route).
+                    self.inner.ledger_mut().recover(state);
+                    continue;
                 };
                 let request_id = None;
                 let reservation_key = None;
@@ -628,10 +608,11 @@ impl RuntimeDriver for PersistentRuntimeDriver {
 
                 if let Err(err) = self.inner.admit_recovered_to_ingress(
                     state.input_id.clone(),
-                    content_shape,
-                    handling_mode,
+                    entry.content_shape,
+                    entry.handling_mode,
+                    entry.is_prompt,
                     lifecycle_state,
-                    policy,
+                    entry.policy,
                     request_id,
                     reservation_key,
                 ) {

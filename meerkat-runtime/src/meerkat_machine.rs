@@ -32,7 +32,7 @@ use meerkat_core::lifecycle::core_executor::CoreApplyOutput;
 use meerkat_core::lifecycle::run_control::RunControlCommand;
 use meerkat_core::lifecycle::run_primitive::RunApplyBoundary;
 use meerkat_core::lifecycle::{InputId, RunId};
-use meerkat_core::types::SessionId;
+use meerkat_core::types::{HandlingMode, SessionId};
 use meerkat_core::{
     CommsDrainPhase, SessionToolVisibilityState, ToolFilter, ToolScopeApplyError,
     ToolScopeRevision, ToolScopeStageError, ToolVisibilityOwner, ToolVisibilityWitness,
@@ -57,6 +57,8 @@ use crate::meerkat_machine_types::{
     SessionLlmCapabilitySurface, SessionLlmCapabilitySurfaceStatus, SessionLlmReconfigureHost,
     SessionLlmReconfigureReport, SessionLlmReconfigureRequest, SessionToolVisibilityDelta,
 };
+use crate::policy::PolicyDecision;
+use crate::runtime_ingress_authority::ContentShape;
 use crate::runtime_state::{RuntimeState, RuntimeStateTransitionError};
 use crate::service_ext::{RuntimeMode, SessionServiceRuntimeExt};
 use crate::store::RuntimeStore;
@@ -701,6 +703,44 @@ pub(crate) async fn machine_normalize_recovered_input_state(
     }
 
     Ok(state)
+}
+
+pub(crate) struct RecoveredIngressEntry {
+    pub content_shape: ContentShape,
+    pub handling_mode: HandlingMode,
+    pub is_prompt: bool,
+    pub lifecycle_state: InputLifecycleState,
+    pub policy: PolicyDecision,
+}
+
+pub(crate) fn machine_build_recovered_ingress_entry(
+    state: &InputState,
+) -> Option<RecoveredIngressEntry> {
+    let handling_mode = state
+        .policy
+        .as_ref()
+        .map(|policy| crate::driver::ephemeral::handling_mode_from_policy(&policy.decision))
+        .unwrap_or(HandlingMode::Queue);
+    let content_shape = state
+        .persisted_input
+        .as_ref()
+        .map(|input| ContentShape(input.kind_id().to_string()))
+        .unwrap_or_else(|| ContentShape("unknown".into()));
+    let policy = match state.policy.as_ref() {
+        Some(policy) => policy.decision.clone(),
+        None => match state.persisted_input.as_ref() {
+            Some(input) => crate::policy_table::DefaultPolicyTable::resolve(input, true),
+            None => return None,
+        },
+    };
+
+    Some(RecoveredIngressEntry {
+        content_shape,
+        handling_mode,
+        is_prompt: matches!(state.persisted_input.as_ref(), Some(Input::Prompt(_))),
+        lifecycle_state: state.current_state(),
+        policy,
+    })
 }
 
 pub(crate) fn machine_realize_recovered_runtime_state(
@@ -2328,6 +2368,23 @@ impl MeerkatMachine {
                     )
                 };
 
+                let state = self
+                    .existing_session_runtime_state(&session_id)
+                    .await
+                    .unwrap_or(RuntimeState::Destroyed);
+                if matches!(
+                    state,
+                    RuntimeState::Retired | RuntimeState::Stopped | RuntimeState::Destroyed
+                ) {
+                    return Err(match state {
+                        RuntimeState::Destroyed => RuntimeDriverError::Destroyed,
+                        RuntimeState::Retired | RuntimeState::Stopped => {
+                            RuntimeDriverError::NotReady { state }
+                        }
+                        _ => unreachable!("guard only matches retired/stopped/destroyed"),
+                    });
+                }
+
                 let request_immediate_processing =
                     crate::driver::ephemeral::requests_immediate_processing(&input);
                 let (outcome, signal, handle) = {
@@ -2410,6 +2467,23 @@ impl MeerkatMachine {
                         })?;
                     entry.driver.clone()
                 };
+
+                let state = self
+                    .existing_session_runtime_state(&session_id)
+                    .await
+                    .unwrap_or(RuntimeState::Destroyed);
+                if matches!(
+                    state,
+                    RuntimeState::Retired | RuntimeState::Stopped | RuntimeState::Destroyed
+                ) {
+                    return Err(match state {
+                        RuntimeState::Destroyed => RuntimeDriverError::Destroyed,
+                        RuntimeState::Retired | RuntimeState::Stopped => {
+                            RuntimeDriverError::NotReady { state }
+                        }
+                        _ => unreachable!("guard only matches retired/stopped/destroyed"),
+                    });
+                }
 
                 let request_immediate_processing =
                     crate::driver::ephemeral::requests_immediate_processing(&input);
@@ -3633,9 +3707,35 @@ impl MeerkatMachine {
             )
         };
 
+        let state_before_stop = self
+            .existing_session_runtime_state(session_id)
+            .await
+            .unwrap_or(RuntimeState::Destroyed);
+
         if let Some(control_tx) = control_tx
             && control_tx.send(command.clone()).await.is_ok()
         {
+            if matches!(
+                (state_before_stop, &command),
+                (
+                    RuntimeState::Attached,
+                    RunControlCommand::StopRuntimeExecutor { .. }
+                )
+            ) {
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+                    loop {
+                        match self.existing_session_runtime_state(session_id).await {
+                            Some(RuntimeState::Stopped | RuntimeState::Destroyed) => break,
+                            Some(RuntimeState::Attached) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            }
+                            Some(_) | None => break,
+                        }
+                    }
+                })
+                .await;
+            }
+
             return Ok(());
         }
 
@@ -4601,7 +4701,7 @@ impl MeerkatMachine {
             let sessions = self.sessions.read().await;
             sessions
                 .get(session_id)
-                .map(|entry| entry.control_snapshot())
+                .map(RuntimeSessionEntry::control_snapshot)
         }?;
         Some(control.phase)
     }
