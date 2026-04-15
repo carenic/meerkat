@@ -97,16 +97,6 @@ pub enum RuntimeIngressInput {
         aggregate_work_id: InputId,
         source_work_ids: Vec<InputId>,
     },
-    /// Retire the ingress (stop accepting new input, drain existing).
-    Retire,
-    /// Reset: abandon all non-terminal inputs, return to Active.
-    Reset,
-    /// Stop: abandon everything, transition to Destroyed ingress state while
-    /// preserving the distinction from terminal runtime destruction in the
-    /// recorded input outcomes.
-    Stop,
-    /// Destroy: abandon everything, transition to Destroyed.
-    Destroy,
     /// Admit a recovered input from persistent store (crash recovery).
     /// Restores the input into ingress tracking at its persisted lifecycle state
     /// without re-running the admission policy.
@@ -531,10 +521,6 @@ impl RuntimeIngressAuthority {
                 reservation_key.clone(),
             ),
 
-            RuntimeIngressInput::Retire => self.eval_retire(),
-            RuntimeIngressInput::Reset => self.eval_reset(),
-            RuntimeIngressInput::Stop => self.eval_stop(),
-            RuntimeIngressInput::Destroy => self.eval_destroy(),
             RuntimeIngressInput::ReconcileTerminalInputs { terminal_inputs } => {
                 self.eval_reconcile_terminal_inputs(terminal_inputs)
             }
@@ -1081,144 +1067,6 @@ impl RuntimeIngressAuthority {
         Ok((fields, effects))
     }
 
-    fn eval_retire(
-        &self,
-    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
-        let fields = self.fields.clone();
-        let effects = vec![RuntimeIngressEffect::IngressNotice {
-            kind: "Retire".into(),
-            detail: "IngressRetired".into(),
-        }];
-
-        Ok((fields, effects))
-    }
-
-    fn eval_reset(
-        &self,
-    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
-        let mut fields = self.fields.clone();
-        let mut effects = Vec::new();
-
-        // Abandon all non-terminal inputs
-        let non_terminal_ids: Vec<InputId> = fields
-            .lifecycle
-            .iter()
-            .filter(|(_, state)| !state.is_terminal())
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        for wid in &non_terminal_ids {
-            let outcome = InputTerminalOutcome::Abandoned {
-                reason: crate::input_state::InputAbandonReason::Reset,
-            };
-            fields
-                .lifecycle
-                .insert(wid.clone(), InputLifecycleState::Abandoned);
-
-            effects.push(RuntimeIngressEffect::InputLifecycleNotice {
-                work_id: wid.clone(),
-                new_state: InputLifecycleState::Abandoned,
-            });
-            effects.push(RuntimeIngressEffect::CompletionResolved {
-                work_id: wid.clone(),
-                outcome,
-            });
-        }
-
-        // Drain queues
-        fields.queue.clear();
-        fields.steer_queue.clear();
-        effects.push(RuntimeIngressEffect::IngressNotice {
-            kind: "Reset".into(),
-            detail: "IngressReset".into(),
-        });
-
-        Ok((fields, effects))
-    }
-
-    fn eval_destroy(
-        &self,
-    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
-        let mut fields = self.fields.clone();
-        let mut effects = Vec::new();
-
-        // Abandon all non-terminal inputs
-        let non_terminal_ids: Vec<InputId> = fields
-            .lifecycle
-            .iter()
-            .filter(|(_, state)| !state.is_terminal())
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        for wid in &non_terminal_ids {
-            let outcome = InputTerminalOutcome::Abandoned {
-                reason: crate::input_state::InputAbandonReason::Destroyed,
-            };
-            fields
-                .lifecycle
-                .insert(wid.clone(), InputLifecycleState::Abandoned);
-
-            effects.push(RuntimeIngressEffect::InputLifecycleNotice {
-                work_id: wid.clone(),
-                new_state: InputLifecycleState::Abandoned,
-            });
-            effects.push(RuntimeIngressEffect::CompletionResolved {
-                work_id: wid.clone(),
-                outcome,
-            });
-        }
-
-        fields.queue.clear();
-        fields.steer_queue.clear();
-        effects.push(RuntimeIngressEffect::IngressNotice {
-            kind: "Destroy".into(),
-            detail: "IngressDestroyed".into(),
-        });
-
-        Ok((fields, effects))
-    }
-
-    fn eval_stop(
-        &self,
-    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
-        let mut fields = self.fields.clone();
-        let mut effects = Vec::new();
-
-        let non_terminal_ids: Vec<InputId> = fields
-            .lifecycle
-            .iter()
-            .filter(|(_, state)| !state.is_terminal())
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        for wid in &non_terminal_ids {
-            let outcome = InputTerminalOutcome::Abandoned {
-                reason: crate::input_state::InputAbandonReason::Stopped,
-            };
-            fields
-                .lifecycle
-                .insert(wid.clone(), InputLifecycleState::Abandoned);
-
-            effects.push(RuntimeIngressEffect::InputLifecycleNotice {
-                work_id: wid.clone(),
-                new_state: InputLifecycleState::Abandoned,
-            });
-            effects.push(RuntimeIngressEffect::CompletionResolved {
-                work_id: wid.clone(),
-                outcome,
-            });
-        }
-
-        fields.queue.clear();
-        fields.steer_queue.clear();
-        effects.push(RuntimeIngressEffect::IngressNotice {
-            kind: "Stop".into(),
-            detail: "IngressStopped".into(),
-        });
-
-        Ok((fields, effects))
-    }
-
     /// Restore a store-recovered input into the ingress authority's tracking.
     /// This does NOT re-run the admission pipeline — the input was already admitted
     /// before the crash. We just need the authority to know about it so that
@@ -1427,7 +1275,7 @@ mod tests {
         !current_run_contributors_for_test(auth).is_empty()
     }
 
-    // ---- Lifecycle-free helper behavior ----
+    // ---- Queue/ledger helper behavior ----
 
     #[test]
     fn new_starts_with_empty_queues() {
@@ -1435,74 +1283,6 @@ mod tests {
         assert!(auth.queue().is_empty());
         assert!(auth.steer_queue().is_empty());
         assert!(!has_current_run_for_test(&auth));
-    }
-
-    #[test]
-    fn retire_emits_notice_without_mutating_queues() {
-        let mut auth = RuntimeIngressAuthority::new();
-        let w1 = InputId::new();
-        admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
-        let t = auth
-            .apply(RuntimeIngressInput::Retire)
-            .expect("retire should succeed");
-        assert_eq!(auth.queue(), &[w1]);
-        assert!(t
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, RuntimeIngressEffect::IngressNotice { kind, .. } if kind == "Retire")));
-    }
-
-    #[test]
-    fn destroy_abandons_all_non_terminal_inputs() {
-        let mut auth = RuntimeIngressAuthority::new();
-        let w1 = InputId::new();
-        admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
-        let t = auth
-            .apply(RuntimeIngressInput::Destroy)
-            .expect("destroy should succeed");
-        assert_eq!(
-            auth.lifecycle_state(&w1),
-            Some(InputLifecycleState::Abandoned)
-        );
-        assert!(t
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, RuntimeIngressEffect::CompletionResolved { work_id, .. } if work_id == &w1)));
-    }
-
-    #[test]
-    fn destroy_after_retire_is_still_allowed() {
-        let mut auth = RuntimeIngressAuthority::new();
-        auth.apply(RuntimeIngressInput::Retire).unwrap();
-        let t = auth
-            .apply(RuntimeIngressInput::Destroy)
-            .expect("destroy from retired should succeed");
-        assert!(t
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, RuntimeIngressEffect::IngressNotice { kind, .. } if kind == "Destroy")));
-    }
-
-    #[test]
-    fn destroy_does_not_block_follow_on_helper_commands() {
-        let mut auth = RuntimeIngressAuthority::new();
-        auth.apply(RuntimeIngressInput::Destroy).unwrap();
-
-        let result = auth.apply(RuntimeIngressInput::Retire);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn reset_clears_state_without_phase_machine() {
-        let mut auth = RuntimeIngressAuthority::new();
-        auth.apply(RuntimeIngressInput::Retire).unwrap();
-        let t = auth
-            .apply(RuntimeIngressInput::Reset)
-            .expect("reset from retired");
-        assert!(t
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, RuntimeIngressEffect::IngressNotice { kind, .. } if kind == "Reset")));
     }
 
     // ---- AdmitQueued ----
@@ -1608,24 +1388,6 @@ mod tests {
             result,
             Err(RuntimeIngressError::GuardFailed { .. })
         ));
-    }
-
-    #[test]
-    fn admit_queued_still_allowed_after_retire_notice() {
-        let mut auth = RuntimeIngressAuthority::new();
-        auth.apply(RuntimeIngressInput::Retire).unwrap();
-
-        let result = auth.apply(RuntimeIngressInput::AdmitQueued {
-            work_id: InputId::new(),
-            content_shape: ContentShape("text".into()),
-            handling_mode: HandlingMode::Queue,
-            is_prompt: false,
-            request_id: None,
-            reservation_key: None,
-            policy: test_policy(),
-            existing_superseded_id: None,
-        });
-        assert!(result.is_ok());
     }
 
     // ---- AdmitConsumedOnAccept ----
@@ -1984,20 +1746,6 @@ mod tests {
         assert!(!auth.queue().contains(&s2));
     }
 
-    #[test]
-    fn stop_marks_abandoned_inputs_stopped() {
-        let mut auth = RuntimeIngressAuthority::new();
-        let wid = InputId::new();
-        admit_queued(&mut auth, wid.clone(), HandlingMode::Queue);
-
-        auth.apply(RuntimeIngressInput::Stop)
-            .expect("stop should succeed");
-        assert_eq!(
-            auth.lifecycle_state(&wid),
-            Some(InputLifecycleState::Abandoned)
-        );
-    }
-
     // ---- Full lifecycle: admit -> stage -> boundary -> complete ----
 
     #[test]
@@ -2042,133 +1790,30 @@ mod tests {
         assert!(auth.queue().is_empty());
     }
 
-    // ---- Destroy abandons non-terminal inputs ----
-
-    #[test]
-    fn destroy_abandons_queued_inputs() {
-        let mut auth = RuntimeIngressAuthority::new();
-        let w1 = InputId::new();
-        let w2 = InputId::new();
-        admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
-        admit_queued(&mut auth, w2.clone(), HandlingMode::Queue);
-
-        let t = auth.apply(RuntimeIngressInput::Destroy).unwrap();
-
-        assert_eq!(
-            auth.lifecycle_state(&w1),
-            Some(InputLifecycleState::Abandoned)
-        );
-        assert_eq!(
-            auth.lifecycle_state(&w2),
-            Some(InputLifecycleState::Abandoned)
-        );
-        assert!(auth.queue().is_empty());
-        // Should have effects for each abandoned input
-        let completion_count = t
-            .effects
-            .iter()
-            .filter(|e| matches!(e, RuntimeIngressEffect::CompletionResolved { .. }))
-            .count();
-        assert_eq!(completion_count, 2);
-    }
-
-    // ---- Reset abandons non-terminal inputs and clears helper state ----
-
-    #[test]
-    fn reset_abandons_and_returns_to_active() {
-        let mut auth = RuntimeIngressAuthority::new();
-        let w1 = InputId::new();
-        admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
-
-        // Admit a consumed input too (should not be re-abandoned)
-        let w2 = InputId::new();
-        admit_consumed(&mut auth, w2.clone());
-
-        auth.apply(RuntimeIngressInput::Reset).unwrap();
-
-        assert_eq!(
-            auth.lifecycle_state(&w1),
-            Some(InputLifecycleState::Abandoned)
-        );
-        // w2 was already Consumed, stays Consumed
-        assert_eq!(
-            auth.lifecycle_state(&w2),
-            Some(InputLifecycleState::Consumed)
-        );
-        assert!(auth.queue().is_empty());
-    }
-
-    #[test]
-    fn reset_helper_allows_staged_cleanup_without_control_phase() {
-        let mut auth = RuntimeIngressAuthority::new();
-        let w1 = InputId::new();
-        admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
-
-        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
-            run_id: RunId::new(),
-            contributing_work_ids: vec![w1.clone()],
-        })
-        .unwrap();
-
-        auth.apply(RuntimeIngressInput::Reset)
-            .expect("helper reset should abandon staged work without control-phase context");
-        assert_eq!(
-            auth.lifecycle_state(&w1),
-            Some(InputLifecycleState::Abandoned)
-        );
-    }
-
-    // ---- Retire does not prevent drain bookkeeping ----
-
-    #[test]
-    fn retired_can_stage_and_complete_drain() {
-        let mut auth = RuntimeIngressAuthority::new();
-        let w1 = InputId::new();
-        admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
-
-        auth.apply(RuntimeIngressInput::Retire).unwrap();
-
-        // Can still drain
-        let run_id = RunId::new();
-        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
-            run_id: run_id.clone(),
-            contributing_work_ids: vec![w1.clone()],
-        })
-        .unwrap();
-
-        auth.apply(RuntimeIngressInput::BoundaryApplied {
-            contributing_work_ids: vec![w1.clone()],
-            boundary_sequence: 1,
-        })
-        .unwrap();
-
-        auth.apply(RuntimeIngressInput::RunCompleted {
-            contributing_work_ids: vec![w1.clone()],
-        })
-        .unwrap();
-
-        assert_eq!(
-            auth.lifecycle_state(&w1),
-            Some(InputLifecycleState::Consumed)
-        );
-    }
-
     // ---- can_accept probing ----
 
     #[test]
     fn can_accept_probes_without_mutation() {
         let auth = RuntimeIngressAuthority::new();
-        assert!(auth.can_accept(&RuntimeIngressInput::Retire));
-        // Reset from Active with no current run should succeed
-        assert!(auth.can_accept(&RuntimeIngressInput::Reset));
+        assert!(
+            auth.can_accept(&RuntimeIngressInput::AdmitConsumedOnAccept {
+                work_id: InputId::new(),
+                content_shape: ContentShape("text".into()),
+                request_id: None,
+                reservation_key: None,
+                policy: test_policy(),
+            })
+        );
         assert!(!has_current_run_for_test(&auth));
     }
 
     #[test]
-    fn can_accept_reset_from_active() {
+    fn can_accept_stage_rejects_without_matching_queue_prefix() {
         let auth = RuntimeIngressAuthority::new();
-        assert!(auth.can_accept(&RuntimeIngressInput::Reset));
-        assert!(!has_current_run_for_test(&auth));
+        assert!(!auth.can_accept(&RuntimeIngressInput::StageDrainSnapshot {
+            run_id: RunId::new(),
+            contributing_work_ids: vec![InputId::new()],
+        }));
     }
 
     // ---- State unchanged on failure ----

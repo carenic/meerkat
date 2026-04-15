@@ -266,6 +266,10 @@ Interpretation:
   gap either: recovery now normalizes canonical input lifecycle truth in the
   ledger first and then rebuilds ingress mechanically from that ledger, instead
   of asking ingress to classify recovery semantics on its own
+- removing ingress `Retire` / `Reset` / `Stop` / `Destroy` did not reopen any
+  Meerkat parity gap either: those coarse lifecycle transitions were already
+  owned by driver + ledger abandonment semantics, so the helper surface was
+  just shadow ceremony around queue reconciliation
 
 ## Resolution Rubric
 

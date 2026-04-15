@@ -707,6 +707,10 @@ The important read is now sharper than the earlier partial dump story:
   Meerkat frontier either: recovery is now derived from canonical ledger truth
   and ingress is rebuilt mechanically from that truth instead of classifying
   recovery lifecycle itself
+- removing ingress `Retire` / `Reset` / `Stop` / `Destroy` did not change the
+  audited Meerkat frontier either: those coarse lifecycle transitions were
+  already owned by driver + ledger abandonment semantics, so the helper surface
+  was ceremonial rather than authoritative
 - preserving the full snapshot still keeps almost every remaining state
   distinct (`19,078`), which tells us the field tuple is still doing most of
   the real work even after the retire-drain correction

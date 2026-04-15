@@ -866,19 +866,6 @@ impl EphemeralRuntimeDriver {
     }
 
     pub fn retire(&mut self) -> Result<RetireReport, RuntimeDriverError> {
-        // Ingress authority: Retire
-        match self.ingress.apply(RuntimeIngressInput::Retire) {
-            Ok(transition) => {
-                self.process_ingress_effects(&transition.effects);
-            }
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "ingress authority rejected Retire"
-                );
-            }
-        }
-
         let next_phase = match self.phase {
             RuntimeState::Idle | RuntimeState::Attached | RuntimeState::Running => {
                 RuntimeState::Retired
@@ -902,19 +889,6 @@ impl EphemeralRuntimeDriver {
     }
 
     pub fn reset(&mut self) -> Result<ResetReport, RuntimeDriverError> {
-        // Ingress authority: Reset (authority rejects if a run is in progress)
-        match self.ingress.apply(RuntimeIngressInput::Reset) {
-            Ok(transition) => {
-                self.process_ingress_effects(&transition.effects);
-            }
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "ingress authority rejected Reset"
-                );
-            }
-        }
-
         let abandoned = self.abandon_all_non_terminal(InputAbandonReason::Reset);
         self.queue.drain();
         self.steer_queue.drain();
@@ -947,19 +921,6 @@ impl EphemeralRuntimeDriver {
     }
 
     pub fn destroy(&mut self) -> Result<usize, RuntimeDriverError> {
-        // Ingress authority: Destroy
-        match self.ingress.apply(RuntimeIngressInput::Destroy) {
-            Ok(transition) => {
-                self.process_ingress_effects(&transition.effects);
-            }
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "ingress authority rejected Destroy"
-                );
-            }
-        }
-
         match self.phase {
             RuntimeState::Initializing
             | RuntimeState::Idle
@@ -1553,20 +1514,6 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
     ) -> Result<(), RuntimeDriverError> {
         match command {
             RuntimeControlCommand::Stop => {
-                // Ingress authority: Stop (abandon everything while preserving
-                // the distinction between a stopped runtime and a destroyed one).
-                match self.ingress.apply(RuntimeIngressInput::Stop) {
-                    Ok(transition) => {
-                        self.process_ingress_effects(&transition.effects);
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "ingress authority rejected Stop on Stop"
-                        );
-                    }
-                }
-
                 match self.phase {
                     RuntimeState::Initializing
                     | RuntimeState::Idle
