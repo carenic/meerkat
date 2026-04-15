@@ -438,6 +438,7 @@ pub struct MeerkatInputsSnapshot {
     pub current_run_contributors: Vec<InputId>,
     pub wake_requested: bool,
     pub process_requested: bool,
+    pub post_admission_signal: String,
     pub silent_intent_overrides: Vec<String>,
 }
 

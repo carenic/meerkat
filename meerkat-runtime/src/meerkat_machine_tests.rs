@@ -11309,10 +11309,15 @@ struct RuntimeParitySnapshotSummary {
     current_run_present: bool,
     pre_run_phase: Option<String>,
     attachment_live: bool,
+    control_wake_pending: bool,
+    control_process_pending: bool,
     queue_len: usize,
     steer_queue_len: usize,
     current_run_contributor_count: usize,
     admitted_input_count: usize,
+    ingress_wake_requested: bool,
+    ingress_process_requested: bool,
+    post_admission_signal: String,
     ledger_input_count: usize,
     ledger_non_terminal_count: usize,
     ledger_accepted_count: usize,
@@ -11715,6 +11720,11 @@ fn normalize_runtime_parity_formal_fields(
     }
     if let Some(value) = fields.get_mut("active_runtime_id") {
         *value = "\"<runtime-id>\"".to_string();
+    }
+    if let Some(value) = fields.get_mut("current_run_id")
+        && value != "null"
+    {
+        *value = "\"<run-id>\"".to_string();
     }
     for value in fields.values_mut() {
         *value = runtime_modeled_normalize_formal_string(value);
@@ -12362,6 +12372,67 @@ fn runtime_parity_event(
     }
 }
 
+#[tokio::test]
+async fn modeled_meerkat_accept_with_completion_attached_steer_matches_runtime() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    let apply_started = Arc::new(Notify::new());
+    let allow_finish = Arc::new(Notify::new());
+
+    adapter
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should prepare for attached steer modeling");
+    adapter
+        .ensure_session_with_executor(
+            session_id.clone(),
+            Box::new(RuntimeParityBlockingExecutor {
+                apply_started: Arc::clone(&apply_started),
+                allow_finish: Arc::clone(&allow_finish),
+            }),
+        )
+        .await;
+    wait_for_runtime_parity_phase(&adapter, &session_id, RuntimeState::Attached).await;
+
+    let before = runtime_parity_snapshot_summary(&adapter, &session_id)
+        .await
+        .expect("attached steer test should capture a pre-state snapshot");
+    let (outcome, completion_handle) = adapter
+        .accept_input_with_completion(
+            &session_id,
+            runtime_parity_steered_prompt("modeled attached steer"),
+        )
+        .await
+        .expect("attached steered input should be accepted");
+    assert!(outcome.is_accepted());
+    let completion_handle =
+        completion_handle.expect("attached steered input should expose a completion waiter");
+
+    tokio::time::timeout(Duration::from_secs(1), apply_started.notified())
+        .await
+        .expect("attached steered input should request immediate processing");
+
+    let after = runtime_parity_snapshot_summary(&adapter, &session_id)
+        .await
+        .expect("attached steer test should capture an active run snapshot");
+    let schema = modeled_meerkat_kernel::schema();
+    let input = KernelInput {
+        variant: "AcceptWithCompletion".to_string(),
+        fields: BTreeMap::from([
+            ("input_id".to_string(), runtime_modeled_input_id_value()),
+            (
+                "request_immediate_processing".to_string(),
+                KernelValue::Bool(true),
+            ),
+            ("run_id".to_string(), runtime_modeled_run_id_value()),
+        ]),
+    };
+    assert_modeled_meerkat_transition_matches_runtime_after(&schema, &before, &input, &after);
+
+    allow_finish.notify_waiters();
+    let _ = tokio::time::timeout(Duration::from_secs(1), completion_handle.wait()).await;
+}
+
 fn install_runtime_parity_reconfigure_host(adapter: &Arc<MeerkatMachine>) {
     adapter.set_session_llm_reconfigure_host(Arc::new(TestLlmReconfigureHost {
         current_identity: Arc::new(std::sync::Mutex::new(meerkat_core::SessionLlmIdentity {
@@ -12401,10 +12472,15 @@ async fn runtime_parity_snapshot_summary(
                 .pre_run_phase
                 .map(runtime_parity_state_label),
             attachment_live: snapshot.binding.attachment_live,
+            control_wake_pending: snapshot.control.wake_pending,
+            control_process_pending: snapshot.control.process_pending,
             queue_len: snapshot.inputs.queue.len(),
             steer_queue_len: snapshot.inputs.steer_queue.len(),
             current_run_contributor_count: snapshot.inputs.current_run_contributors.len(),
             admitted_input_count: snapshot.inputs.admission_order.len(),
+            ingress_wake_requested: snapshot.inputs.wake_requested,
+            ingress_process_requested: snapshot.inputs.process_requested,
+            post_admission_signal: snapshot.inputs.post_admission_signal,
             ledger_input_count: snapshot.ledger.input_count,
             ledger_non_terminal_count: snapshot.ledger.non_terminal_count,
             ledger_accepted_count: snapshot.ledger.accepted_count,

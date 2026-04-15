@@ -118,6 +118,21 @@ Hopcroft-style behavioral quotient over the reachable graph.
   `MachineToolVisibilityOwner`; exact audited parity stayed green and the
   truthful Meerkat state space fell back from `38,945` to `11,814` distinct
   states while the raw/phase quotient held at `385 / 390`.
+- Absorbed `current_run_id` back into the top-level Meerkat formal state,
+  wiring it through `Prepare`, `Commit`, `Fail`, and the terminal/control
+  clearing paths so the checked-in machine now owns active-run identity again
+  instead of delegating it entirely to handwritten `RuntimeControlAuthority`
+  state.
+- Extended the exact Meerkat parity snapshot to include the stale handwritten
+  control wake/process booleans, the live ingress wake/process booleans, and
+  the driver-owned typed `post_admission_signal`; the stricter full-row pair
+  audit stayed green at `260 / 260`, which shows those carriers are not
+  hiding new public-phase mismatches on the current 10-pair frontier.
+- Modeled attached steered `AcceptWithCompletion` as a payload-sensitive
+  immediate path: when `request_immediate_processing=true`, the checked-in
+  Meerkat machine now transitions `Attached -> Running` and binds the fresh
+  run identity instead of collapsing that runtime behavior into the queue-only
+  attached self-loop.
 - Taught the generated closed-world composition models to reject queued
   external entry packets that are no longer admissible for the current machine
   state, which removes seam deadlocks without widening the machine transition
@@ -171,11 +186,13 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | Meerkat committed visibility publication progress should not stay as top-level shadow state | passed / landed | Removed `committed_visibility_revision` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 59,371 to 45,610 while the raw/phase quotients stayed at 385 / 390. |
 | Meerkat visibility witness provenance should not stay as top-level shadow state | passed / landed | Removed `requested_witnesses` and `filter_witnesses` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 45,610 to 15,809 while the raw/phase quotients still held at 385 / 390. |
 | Meerkat LLM/capability projection should not stay as top-level shadow state | passed / landed | Removed `current_llm_identity`, `current_capability_surface`, `capability_surface_status`, `capability_base_filter`, and `inherited_base_filter` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 15,809 to 11,814 while the raw/phase quotients still held at 385 / 390. |
-| Meerkat top-level wake/process mirrors should not stay as formal state | passed / landed | Removed the top-level `wake_pending` and `process_pending` mirrors after the truthful graph showed they were constant `FALSE` across all reachable Meerkat states; exact audited parity stayed green and the truthful TLC/Hopcroft readout stayed flat at 11,814 reachable with raw/phase/full quotients 385 / 390 / 11,425. This does **not** close the separate gap that the real runtime-control wake/process behavior still lives outside the checked-in Meerkat catalog. |
+| Meerkat top-level wake/process mirrors should not stay as formal state | passed / landed | Removed the top-level `wake_pending` and `process_pending` mirrors after the truthful graph showed they were constant `FALSE` across all reachable Meerkat states; exact audited parity stayed green and the truthful TLC/Hopcroft readout stayed flat at 11,814 reachable with raw/phase/full quotients 385 / 390 / 11,425. The stricter audit now also sees the live ingress wake/process booleans plus the driver-owned `post_admission_signal`, so the remaining wake/process question is about lower-authority carrier boundaries rather than a hidden top-level phase mismatch. |
 | Meerkat active-work slice should not stay as top-level formal state | passed / landed | Removed `active_work_id` plus the unreachable top-level `RunCompleted` / `RunFailed` / `RunCancelled` and old `has_active_work`-guarded operation-completion signal slice; exact audited parity stayed green and the truthful TLC/Hopcroft readout stayed flat at 11,814 reachable with raw/phase/full quotients 385 / 390 / 11,425. |
 | Meerkat `ToolFilter` verification domain should not stay singleton | passed / landed | Broadened CI/deep cfg generation from `ToolFilterValues = {"All"}` to `{"All", "toolfilter_2"}`; the truthful Meerkat state space rose from 11,814 to 38,945 distinct states while the raw/phase quotient stayed at 385 / 390, proving the old filter simplification signal had been under-constrained rather than behavior-free. |
 | Meerkat top-level filter mirrors should not stay as formal state | passed / landed | Removed top-level `active_filter` / `staged_filter` after the stronger two-sample `ToolFilter` rerun showed the authoritative filter state already lives in `MachineToolVisibilityOwner`; exact audited parity stayed green and the truthful Meerkat state space fell back from 38,945 to 11,814 distinct states while the raw/phase quotient stayed at 385 / 390. |
-| Behavior-bearing runtime-control state should stay outside MeerkatMachine | rejected | The current handwritten runtime-control authority still owns behavior-bearing fields such as `current_run_id`, `pre_run_state`, `wake_pending`, and `process_pending`. The right corrective move is to absorb that behavior back into the checked-in Meerkat machine model rather than continue treating it as external shell state. |
+| Behavior-bearing runtime-control state should stay outside MeerkatMachine | rejected | `current_run_id` is now absorbed back into the checked-in Meerkat machine, and the stricter audit shows the live wake/process carrier currently runs through ingress + `post_admission_signal` rather than through the stale handwritten control booleans alone. The remaining work is to decide which of those lower-authority admission carriers should be lifted into the two-machine model, not to keep punting them to handwritten shell state. |
+| Active run identity can stay outside the checked-in Meerkat machine | rejected / landed | Absorbed `current_run_id` into the top-level Meerkat state and wired the same prepare/commit/fail/control clears as the runtime. Exact audited parity stayed green, TLC moved to `1,068,719 generated / 11,858 distinct / depth 9`, and Hopcroft stayed at raw/phase/full `385 / 390 / 11,469`, which is the expected signature for lifting a real control truth into the model without changing the core quotient. |
+| Attached steered accept can stay collapsed into the queue-only accept surface | rejected / landed | The live runtime can synchronously jump `Attached -> Running` during `AcceptWithCompletion` when admission requests immediate processing. The Meerkat catalog now models that payload-sensitive path explicitly with a run binding, and the targeted runtime/model regression is green. |
 | Meerkat `Stopped` vs `Retired` can merge internally | rejected | The top-level transition sets diverge in load-bearing ways: `Retired` still accepts `Reset`, `StopRuntimeExecutor`, and `Recycle`, while `Stopped` does not, and the retire path carries archival/drain semantics that phase 1 should keep explicit. |
 | Meerkat `Idle` vs `Attached` can merge internally | rejected | In the current formal model, phase identity still carries load-bearing "executor attached" semantics that are not derivable from the existing Meerkat extended state. Several absorbed transitions are phase-gated without a field-level attachment witness, so phase-1 collapse would require introducing a replacement attachment bit plus a new public projection layer rather than actually simplifying the model. |
 
@@ -226,9 +243,9 @@ We ran three observation modes for each machine:
 | MobMachine | `none` | 813 | 138 | 83.0% | After the bootstrap parity correction, the truthful graph grew slightly while the raw quotient stayed flat, confirming the old `coordinator_bound=false` init was under-modeled bootstrap truth rather than behavior-bearing structure. |
 | MobMachine | `phase` | 813 | 140 | 82.8% | Preserving phase still adds only two quotient blocks; `Running` / `Stopped` / `Completed` remain mostly projection. |
 | MobMachine | `full` | 813 | 813 | 0.0% | Once the remaining authoritative counters are preserved, every reachable Mob snapshot is still distinct. |
-| MeerkatMachine | `none` | 11,814 | 385 | 96.7% | After broadening the `ToolFilter` domain and then removing the top-level filter mirrors, the truthful graph returns to 11,814 states while the raw quotient stays flat, confirming the mirrors were representational shadow rather than behavior-bearing state. |
-| MeerkatMachine | `phase` | 11,814 | 390 | 96.7% | Preserving phase still adds only five quotient blocks, so phase remains almost entirely projection here too. |
-| MeerkatMachine | `full` | 11,814 | 11,425 | 3.3% | Preserving the full snapshot still keeps nearly every remaining Meerkat state distinct, but the extra structure now lives in revisions, deferred-name sets, runtime binding, and pre-run restoration rather than in the removed filter mirrors. |
+| MeerkatMachine | `none` | 11,858 | 385 | 96.8% | After absorbing `current_run_id` and modeling attached steered acceptance, the truthful graph rises slightly while the raw quotient stays flat, which is the expected signature for lifting real control truth into the checked-in machine without changing its core behavioral complexity. |
+| MeerkatMachine | `phase` | 11,858 | 390 | 96.7% | Preserving phase still adds only five quotient blocks, so phase remains almost entirely projection here too. |
+| MeerkatMachine | `full` | 11,858 | 11,469 | 3.3% | Preserving the full snapshot still keeps nearly every remaining Meerkat state distinct, but the extra structure now lives in revisions, deferred-name sets, runtime binding, and pre-run restoration rather than in the removed filter mirrors. |
 
 All six rows above have now been rerun after the exact runtime/schema parity
 passes on the current branch tip.
@@ -252,7 +269,7 @@ The raw quotient exposes the highest-signal parity/simplification targets:
 
 - **MobMachine** has one dominant mixed block of `705` states spanning
   `Running`, `Stopped`, and `Completed`.
-- **MeerkatMachine** has one dominant mixed block of `4,669` states spanning
+- **MeerkatMachine** has one dominant mixed block of `4,711` states spanning
   `Initializing`, `Idle`, `Attached`, `Running`, `Retired`, and `Stopped`.
 
 These are not automatic merge approvals. They are a **schema-side lower bound**
@@ -590,16 +607,16 @@ cargo run -p xtask --features machine-authority -- \
 
 Current result:
 
-- reachable states: `38,945`
+- reachable states: `11,858`
 - raw quotient states: `385`
 - phase-observed quotient states: `390`
-- full-observed quotient states: `37,750`
-- TLC: `3,517,281 generated / 38,945 distinct / depth 9`
-- reachable edges: `1,975,445`
-- dominant mixed block: `16,103` states spanning `Initializing`, `Idle`,
+- full-observed quotient states: `11,469`
+- TLC: `1,068,719 generated / 11,858 distinct / depth 9`
+- reachable edges: `616,383`
+- dominant mixed block: `4,711` states spanning `Initializing`, `Idle`,
   `Attached`, `Running`, `Retired`, and `Stopped`
-- dominant block tuples: `6,948`
-- tuples reused across multiple phases: `5,338`
+- dominant block tuples: `2,169`
+- tuples reused across multiple phases: `1,644`
 - maximum phases sharing one tuple: `5`
 
 The important read is now sharper than the earlier partial dump story:
@@ -618,10 +635,15 @@ The important read is now sharper than the earlier partial dump story:
 - broadening `ToolFilter` was still necessary, because it exposed that the
   top-level `active_filter` / `staged_filter` pair was only a mirror of lower
   authority state; once those mirrors were removed, the truthful graph dropped
-  back to `11,814` states without changing the quotient or exact parity surface
+  back to the lower five-figure range without changing the quotient or exact
+  parity surface
+- absorbing `current_run_id` and modeling attached steered acceptance raised
+  the truthful graph only slightly while keeping the quotient flat, which is
+  the expected signature for lifting real control truth into the checked-in
+  machine instead of papering over it with shell state
 - the next Meerkat gap is no longer "maybe filter mirrors are real"; it is the
-  stronger authority-boundary question of pulling behavior-bearing runtime
-  control state back under the checked-in Meerkat machine model
+  stronger authority-boundary and payload-sensitivity question of which live
+  ingress/post-admission mechanics belong in the two-machine model
 
 That means the remaining Meerkat complexity is carried overwhelmingly by the
 field tuple, not by the phase label.

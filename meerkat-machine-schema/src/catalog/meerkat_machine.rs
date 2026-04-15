@@ -53,6 +53,10 @@ pub fn meerkat_machine() -> MachineSchema {
                     TypeRef::Option(Box::new(TypeRef::Named("Generation".into()))),
                 ),
                 field("attachment_live", TypeRef::Bool),
+                field(
+                    "current_run_id",
+                    TypeRef::Option(Box::new(TypeRef::Named("RunId".into()))),
+                ),
                 field("pre_run_phase", TypeRef::Option(Box::new(TypeRef::String))),
                 field("peer_ingress_configured", TypeRef::Bool),
                 field("drain_running", TypeRef::Bool),
@@ -75,6 +79,7 @@ pub fn meerkat_machine() -> MachineSchema {
                     init("active_fence_token", Expr::None),
                     init("active_generation", Expr::None),
                     init("attachment_live", Expr::Bool(false)),
+                    init("current_run_id", Expr::None),
                     init("pre_run_phase", Expr::None),
                     init("peer_ingress_configured", Expr::Bool(false)),
                     init("drain_running", Expr::Bool(false)),
@@ -175,6 +180,38 @@ pub fn meerkat_machine() -> MachineSchema {
                         Box::new(Expr::Field("active_runtime_id".into())),
                         Box::new(Expr::None),
                     ),
+                ]),
+            },
+            InvariantSchema {
+                name: "running_has_current_run".into(),
+                expr: Expr::Or(vec![
+                    Expr::Neq(
+                        Box::new(Expr::CurrentPhase),
+                        Box::new(Expr::Phase("Running".into())),
+                    ),
+                    Expr::Neq(
+                        Box::new(Expr::Field("current_run_id".into())),
+                        Box::new(Expr::None),
+                    ),
+                ]),
+            },
+            InvariantSchema {
+                name: "current_run_only_while_running_or_retired".into(),
+                expr: Expr::Or(vec![
+                    Expr::Eq(
+                        Box::new(Expr::Field("current_run_id".into())),
+                        Box::new(Expr::None),
+                    ),
+                    Expr::Or(vec![
+                        Expr::Eq(
+                            Box::new(Expr::CurrentPhase),
+                            Box::new(Expr::Phase("Running".into())),
+                        ),
+                        Expr::Eq(
+                            Box::new(Expr::CurrentPhase),
+                            Box::new(Expr::Phase("Retired".into())),
+                        ),
+                    ]),
                 ]),
             },
             InvariantSchema {
@@ -685,6 +722,10 @@ pub fn meerkat_machine() -> MachineSchema {
                 guards: vec![],
                 updates: vec![
                     Update::Assign {
+                        field: "current_run_id".into(),
+                        expr: Expr::None,
+                    },
+                    Update::Assign {
                         field: "active_fence_token".into(),
                         expr: Expr::None,
                     },
@@ -720,6 +761,10 @@ pub fn meerkat_machine() -> MachineSchema {
                 },
                 guards: vec![attachment_not_live_guard()],
                 updates: vec![
+                    Update::Assign {
+                        field: "current_run_id".into(),
+                        expr: Expr::None,
+                    },
                     Update::Assign {
                         field: "pre_run_phase".into(),
                         expr: Expr::None,
@@ -782,6 +827,10 @@ pub fn meerkat_machine() -> MachineSchema {
                 guards: vec![runtime_is_bound_guard()],
                 updates: vec![
                     Update::Assign {
+                        field: "current_run_id".into(),
+                        expr: Expr::None,
+                    },
+                    Update::Assign {
                         field: "pre_run_phase".into(),
                         expr: Expr::None,
                     },
@@ -837,6 +886,10 @@ fn reset_session_state() -> Vec<Update> {
         Update::Assign {
             field: "attachment_live".into(),
             expr: Expr::Bool(false),
+        },
+        Update::Assign {
+            field: "current_run_id".into(),
+            expr: Expr::None,
         },
         Update::Assign {
             field: "pre_run_phase".into(),
@@ -1237,6 +1290,26 @@ fn pre_run_phase_matches_guard(phase: &str) -> Guard {
     }
 }
 
+fn current_run_id_matches_guard(binding: &str) -> Guard {
+    Guard {
+        name: "current_run_id_matches_binding".into(),
+        expr: Expr::Eq(
+            Box::new(Expr::Field("current_run_id".into())),
+            Box::new(Expr::Some(Box::new(Expr::Binding(binding.into())))),
+        ),
+    }
+}
+
+fn bool_binding_guard(name: &str, binding: &str, value: bool) -> Guard {
+    Guard {
+        name: name.into(),
+        expr: Expr::Eq(
+            Box::new(Expr::Binding(binding.into())),
+            Box::new(Expr::Bool(value)),
+        ),
+    }
+}
+
 fn assign_some(field: &str, binding: &str) -> Update {
     Update::Assign {
         field: field.into(),
@@ -1517,7 +1590,11 @@ fn absorbed_meerkat_input_variants() -> Vec<VariantSchema> {
         },
         VariantSchema {
             name: "AcceptWithCompletion".into(),
-            fields: vec![field("input_id", named("InputId"))],
+            fields: vec![
+                field("input_id", named("InputId")),
+                field("request_immediate_processing", TypeRef::Bool),
+                field("run_id", named("RunId")),
+            ],
         },
         VariantSchema {
             name: "AcceptWithoutWake".into(),
@@ -1525,7 +1602,10 @@ fn absorbed_meerkat_input_variants() -> Vec<VariantSchema> {
         },
         VariantSchema {
             name: "Prepare".into(),
-            fields: vec![field("session_id", named("SessionId"))],
+            fields: vec![
+                field("session_id", named("SessionId")),
+                field("run_id", named("RunId")),
+            ],
         },
         VariantSchema {
             name: "Commit".into(),
@@ -1738,18 +1818,84 @@ fn absorbed_meerkat_transitions() -> Vec<TransitionSchema> {
 
     // Input admission through the helper surface currently accepts from Idle,
     // Attached, and Running, while Retired/Stopped/Destroyed reject.
-    for variant in ["AcceptWithCompletion", "AcceptWithoutWake"] {
-        for phase in ["Idle", "Attached", "Running"] {
-            transitions.push(self_loop_transition_with(
-                &format!("{variant}{phase}"),
-                phase,
-                variant,
-                vec!["input_id"],
-                vec![],
-                vec![simple_emit("IngressAccepted")],
-                vec![session_registered_guard()],
-            ));
-        }
+    transitions.push(self_loop_transition_with(
+        "AcceptWithCompletionIdle",
+        "Idle",
+        "AcceptWithCompletion",
+        vec!["input_id", "request_immediate_processing", "run_id"],
+        vec![],
+        vec![simple_emit("IngressAccepted")],
+        vec![session_registered_guard()],
+    ));
+    transitions.push(TransitionSchema {
+        name: "AcceptWithCompletionAttachedImmediate".into(),
+        from: vec!["Attached".into()],
+        on: InputMatch {
+            kind: meerkat_trigger_kind("AcceptWithCompletion"),
+            variant: "AcceptWithCompletion".into(),
+            bindings: vec![
+                "input_id".into(),
+                "request_immediate_processing".into(),
+                "run_id".into(),
+            ],
+        },
+        guards: vec![
+            session_registered_guard(),
+            bool_binding_guard(
+                "request_immediate_processing",
+                "request_immediate_processing",
+                true,
+            ),
+        ],
+        updates: vec![
+            assign_some("current_run_id", "run_id"),
+            Update::Assign {
+                field: "pre_run_phase".into(),
+                expr: Expr::Some(Box::new(Expr::String("attached".into()))),
+            },
+        ],
+        to: "Running".into(),
+        emit: vec![
+            simple_emit("IngressAccepted"),
+            simple_emit("SubmitRunPrimitive"),
+        ],
+    });
+    transitions.push(self_loop_transition_with(
+        "AcceptWithCompletionAttachedQueued",
+        "Attached",
+        "AcceptWithCompletion",
+        vec!["input_id", "request_immediate_processing", "run_id"],
+        vec![],
+        vec![simple_emit("IngressAccepted")],
+        vec![
+            session_registered_guard(),
+            bool_binding_guard(
+                "request_immediate_processing",
+                "request_immediate_processing",
+                false,
+            ),
+        ],
+    ));
+    transitions.push(self_loop_transition_with(
+        "AcceptWithCompletionRunning",
+        "Running",
+        "AcceptWithCompletion",
+        vec!["input_id", "request_immediate_processing", "run_id"],
+        vec![],
+        vec![simple_emit("IngressAccepted")],
+        vec![session_registered_guard()],
+    ));
+
+    for phase in ["Idle", "Attached", "Running"] {
+        transitions.push(self_loop_transition_with(
+            &format!("AcceptWithoutWake{phase}"),
+            phase,
+            "AcceptWithoutWake",
+            vec!["input_id"],
+            vec![],
+            vec![simple_emit("IngressAccepted")],
+            vec![session_registered_guard()],
+        ));
     }
 
     for (variant, bindings, emit_variant) in [
@@ -1790,13 +1936,16 @@ fn absorbed_meerkat_transitions() -> Vec<TransitionSchema> {
             on: InputMatch {
                 kind: meerkat_trigger_kind("Prepare"),
                 variant: "Prepare".into(),
-                bindings: vec!["session_id".into()],
+                bindings: vec!["session_id".into(), "run_id".into()],
             },
             guards: vec![session_registered_guard()],
-            updates: vec![Update::Assign {
-                field: "pre_run_phase".into(),
-                expr: Expr::Some(Box::new(Expr::String(pre_run_phase.into()))),
-            }],
+            updates: vec![
+                assign_some("current_run_id", "run_id"),
+                Update::Assign {
+                    field: "pre_run_phase".into(),
+                    expr: Expr::Some(Box::new(Expr::String(pre_run_phase.into()))),
+                },
+            ],
             to: "Running".into(),
             emit: vec![simple_emit("SubmitRunPrimitive")],
         });
@@ -1831,11 +1980,20 @@ fn absorbed_meerkat_transitions() -> Vec<TransitionSchema> {
                 variant: "Commit".into(),
                 bindings: vec!["input_id".into(), "run_id".into()],
             },
-            guards: vec![pre_run_phase_matches_guard(guard_phase)],
-            updates: vec![Update::Assign {
-                field: "pre_run_phase".into(),
-                expr: Expr::None,
-            }],
+            guards: vec![
+                pre_run_phase_matches_guard(guard_phase),
+                current_run_id_matches_guard("run_id"),
+            ],
+            updates: vec![
+                Update::Assign {
+                    field: "current_run_id".into(),
+                    expr: Expr::None,
+                },
+                Update::Assign {
+                    field: "pre_run_phase".into(),
+                    expr: Expr::None,
+                },
+            ],
             to: to_phase.into(),
             emit: vec![],
         });
@@ -1847,11 +2005,20 @@ fn absorbed_meerkat_transitions() -> Vec<TransitionSchema> {
                 variant: "Fail".into(),
                 bindings: vec!["run_id".into()],
             },
-            guards: vec![pre_run_phase_matches_guard(guard_phase)],
-            updates: vec![Update::Assign {
-                field: "pre_run_phase".into(),
-                expr: Expr::None,
-            }],
+            guards: vec![
+                pre_run_phase_matches_guard(guard_phase),
+                current_run_id_matches_guard("run_id"),
+            ],
+            updates: vec![
+                Update::Assign {
+                    field: "current_run_id".into(),
+                    expr: Expr::None,
+                },
+                Update::Assign {
+                    field: "pre_run_phase".into(),
+                    expr: Expr::None,
+                },
+            ],
             to: to_phase.into(),
             emit: vec![simple_emit("RecordTerminalOutcome")],
         });
@@ -1911,6 +2078,10 @@ fn absorbed_meerkat_transitions() -> Vec<TransitionSchema> {
         },
         Update::Assign {
             field: "active_generation".into(),
+            expr: Expr::None,
+        },
+        Update::Assign {
+            field: "current_run_id".into(),
             expr: Expr::None,
         },
         Update::Assign {

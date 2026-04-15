@@ -66,17 +66,27 @@ Current state:
   mirrors: `wake_pending` and `process_pending` were constant `FALSE` across
   the truthful reachable graph and their removal kept the exact parity surface
   unchanged
-- this does **not** mean runtime-control wake/process behavior is now fully
-  modeled elsewhere in the canonical catalog: the authoritative
-  `RuntimeControlAuthority` still owns the real wake/process semantics in
-  handwritten code, so absorbing that behavior back into the checked-in
-  Meerkat machine is a distinct follow-up from removing the dead top-level
-  mirrors
+- this does **not** mean wake/process behavior is solved everywhere in the
+  checked-in catalog: the stale handwritten `RuntimeControlAuthority`
+  booleans are still outside the formal model, but the live runtime path now
+  actually carries wake/process intent through `RuntimeIngressAuthority` plus
+  the driver-owned typed `post_admission_signal`
+- the parity snapshot now includes `control.wake_pending`,
+  `control.process_pending`, `inputs.wake_requested`,
+  `inputs.process_requested`, and the typed `post_admission_signal`; adding
+  those carriers to the exact full-row pair audit did **not** create any new
+  public-phase mismatches on the current 10-pair frontier
+- `current_run_id` is now absorbed back into the top-level Meerkat formal
+  state and clears on the same terminal/control paths as the live runtime
+- attached steered `AcceptWithCompletion` is no longer treated as a queue-only
+  self-loop in the formal model: when `request_immediate_processing=true`, the
+  checked-in Meerkat machine now models the runtime’s `Attached -> Running`
+  jump and binds the fresh `current_run_id` / `pre_run_phase`
 - the top-level Meerkat machine no longer carries the filter mirror pair
   `active_filter` / `staged_filter`; the authoritative
   `MachineToolVisibilityOwner` still owns the real filter state, exact parity
   stayed green, and the truthful Meerkat reachable graph fell from `38,945`
-  back to `11,814` states while the raw/phase quotient stayed at `385 / 390`
+  back to `11,858` states while the raw/phase quotient stayed at `385 / 390`
 - the pure query/helper surface is now explicitly carried as
   `surface_only_inputs` instead of formal self-loops:
   `ContainsSession`, `SessionHasExecutor`, `SessionHasComms`,
@@ -120,11 +130,12 @@ Current exact-parity state:
 - the old wake/process pending bits are also gone from the top-level formal
   machine; the truthful graph never drove those mirrors away from `FALSE`,
   and exact parity stayed green after the cut
-- that top-level cut does not close the deeper control-authority modeling
-  question: the real `wake_pending` / `process_pending` behavior still lives in
-  handwritten `RuntimeControlAuthority` logic and should be absorbed back into
-  the checked-in Meerkat machine rather than treated as verified by the
-  top-level audit
+- that top-level cut does not close the deeper admission/wake modeling
+  question: the stale handwritten control booleans remain outside the catalog,
+  while the live wake/process carrier now runs through ingress +
+  `post_admission_signal`; the pair audit says those carriers do not create
+  hidden phase distinctions, but payload-sensitive admission semantics still
+  need to be lifted deliberately where they change top-level Meerkat behavior
 - the dead top-level active-work slice is also gone: `active_work_id` never
   became `Some(...)` in the truthful graph, the old `has_active_work`-gated
   completion/operation slice had zero reachable edges, and exact parity stayed
@@ -135,8 +146,8 @@ Current exact-parity state:
   frontier
 - after broadening that `ToolFilter` domain, we removed the top-level
   `active_filter` / `staged_filter` mirrors as well; exact parity stayed green
-  and the truthful Meerkat readout returned to `11,814` reachable states with
-  raw/phase/full quotients `385 / 390 / 11,425`
+  and the truthful Meerkat readout now sits at `11,858` reachable states with
+  raw/phase/full quotients `385 / 390 / 11,469`
 - the pure query surface remains runtime-audited helper behavior, but it is no
   longer counted as formal transition coverage
 
@@ -280,6 +291,10 @@ Outcome:
 - the runtime probe surface now covers the full currently targeted Meerkat
   reducer/control acceptance frontier
 - the schema widening needed for this batch is landed and verified
+- the first payload-sensitive accept gap is also closed inside this batch:
+  attached steered `AcceptWithCompletion` is now modeled as an immediate
+  `Attached -> Running` path rather than being collapsed into the queue-only
+  accept surface
 - there are no current Meerkat acceptance mismatches left in the initial
   three-pair tranche
 
@@ -314,18 +329,20 @@ Outcome:
    as lower-authority carrier facts in the exact observable audit unless and
    until the DSL work deliberately lifts them into the top-level machine.
 3. Use the trustworthy post-parity Hopcroft rerun as the Meerkat
-   simplification baseline after the visibility-boundary and
-   LLM/capability-boundary, wake/process, dead active-work, and
-   non-singleton `ToolFilter` cuts:
-   raw `38,945 -> 385`, phase `38,945 -> 390`, TLC `3,517,281 generated /
-   38,945 distinct / depth 9`.
+   simplification baseline after the visibility-boundary,
+   LLM/capability-boundary, dead active-work, `current_run_id`, and attached
+   steered-accept cuts:
+   raw `11,858 -> 385`, phase `11,858 -> 390`, full `11,858 -> 11,469`,
+   TLC `1,068,719 generated / 11,858 distinct / depth 9`.
 4. Read that baseline together with the largest-block field projection from
    [`docs/architecture/machine-simplification-proposal.md`](machine-simplification-proposal.md):
-   the dominant Meerkat mixed block is now measured as `16,103` states over
-   `6,948` extended-state tuples, with `5,338` tuples reused across multiple
+   the dominant Meerkat mixed block is now measured as `4,711` states over
+   `2,169` extended-state tuples, with `1,644` tuples reused across multiple
    phases.
 5. Read that baseline together with the now-green Mob lifecycle-triangle
    ledger in
    [`docs/architecture/mob-runtime-schema-parity-ledger.md`](mob-runtime-schema-parity-ledger.md).
-6. Feed the refreshed mixed-phase blocks into the DSL-design work instead of
-   the older pre-expansion bearings.
+6. Use the next loop to target payload-sensitive Meerkat admission semantics
+   beyond the attached-steer case, especially the question of which live
+   ingress/post-admission carriers belong in the two-machine model versus
+   which should stay below it as lower-authority mechanics.

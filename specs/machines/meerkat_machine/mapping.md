@@ -311,7 +311,10 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `AcceptWithCompletionIdle`
   - anchors: `meerkat_machine`, `meerkat_public_surface`, `peer_directory_reachability_authority`
   - scenarios: `bind-run-boundary-terminal`, `retire-reset-destroy`, `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `peer_reachability_probe`
-- `AcceptWithCompletionAttached`
+- `AcceptWithCompletionAttachedImmediate`
+  - anchors: `meerkat_machine`, `meerkat_public_surface`, `peer_directory_reachability_authority`
+  - scenarios: `bind-run-boundary-terminal`, `retire-reset-destroy`, `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `peer_reachability_probe`
+- `AcceptWithCompletionAttachedQueued`
   - anchors: `meerkat_machine`, `meerkat_public_surface`, `peer_directory_reachability_authority`
   - scenarios: `bind-run-boundary-terminal`, `retire-reset-destroy`, `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `peer_reachability_probe`
 - `AcceptWithCompletionRunning`
@@ -571,6 +574,12 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 
 ### Invariants
 - `fence_requires_bound_runtime`
+  - anchors: `meerkat_machine`, `meerkat_public_surface`, `peer_directory_reachability_authority`
+  - scenarios: `bind-run-boundary-terminal`, `retire-reset-destroy`, `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `peer_reachability_probe`
+- `running_has_current_run`
+  - anchors: `meerkat_machine`, `meerkat_public_surface`, `peer_directory_reachability_authority`
+  - scenarios: `bind-run-boundary-terminal`, `retire-reset-destroy`, `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `peer_reachability_probe`
+- `current_run_only_while_running_or_retired`
   - anchors: `meerkat_machine`, `meerkat_public_surface`, `peer_directory_reachability_authority`
   - scenarios: `bind-run-boundary-terminal`, `retire-reset-destroy`, `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `peer_reachability_probe`
 - `drain_requires_ingress_context`

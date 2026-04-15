@@ -489,6 +489,11 @@ impl EphemeralRuntimeDriver {
         std::mem::replace(&mut self.post_admission_signal, PostAdmissionSignal::None)
     }
 
+    /// Inspect the current typed post-admission signal without draining it.
+    pub fn post_admission_signal(&self) -> PostAdmissionSignal {
+        self.post_admission_signal
+    }
+
     /// Drain the typed signal and return whether wake is needed (backward-compat).
     ///
     /// **Deprecated**: prefer `take_post_admission_signal()` for typed semantics.

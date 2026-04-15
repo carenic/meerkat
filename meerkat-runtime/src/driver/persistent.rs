@@ -130,6 +130,11 @@ impl PersistentRuntimeDriver {
         self.inner.take_post_admission_signal()
     }
 
+    /// Inspect the current typed post-admission signal without draining it.
+    pub fn post_admission_signal(&self) -> crate::driver::ephemeral::PostAdmissionSignal {
+        self.inner.post_admission_signal()
+    }
+
     /// Check and clear wake flag (backward-compat, delegates to inner).
     pub fn take_wake_requested(&mut self) -> bool {
         self.inner.take_wake_requested()

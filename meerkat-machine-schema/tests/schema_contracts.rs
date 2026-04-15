@@ -273,6 +273,7 @@ fn meerkat_machine_merges_turn_admission_tool_visibility_and_peer_directory_stat
         .collect::<Vec<_>>();
 
     for required in [
+        "current_run_id",
         "active_requested_deferred_names",
         "staged_requested_deferred_names",
         "active_visibility_revision",
@@ -293,7 +294,8 @@ fn meerkat_machine_merges_turn_admission_tool_visibility_and_peer_directory_stat
         "NotifyDrainExitedRunning",
         "EnsureDrainRunningAttached",
         "EnsureDrainRunningRunning",
-        "AcceptWithCompletionAttached",
+        "AcceptWithCompletionAttachedQueued",
+        "AcceptWithCompletionAttachedImmediate",
         "AcceptWithCompletionRunning",
         "AcceptWithoutWakeAttached",
         "AcceptWithoutWakeRunning",

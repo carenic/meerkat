@@ -12,6 +12,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `active_fence_token`: `Option<FenceToken>`
 - `active_generation`: `Option<Generation>`
 - `attachment_live`: `Bool`
+- `current_run_id`: `Option<RunId>`
 - `pre_run_phase`: `Option<String>`
 - `peer_ingress_configured`: `Bool`
 - `drain_running`: `Bool`
@@ -52,9 +53,9 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `PublishEvent`(kind: String)
 - `RuntimeState`(runtime_id: String)
 - `LoadBoundaryReceipt`(runtime_id: String, sequence: u64)
-- `AcceptWithCompletion`(input_id: InputId)
+- `AcceptWithCompletion`(input_id: InputId, request_immediate_processing: Bool, run_id: RunId)
 - `AcceptWithoutWake`(input_id: InputId)
-- `Prepare`(session_id: SessionId)
+- `Prepare`(session_id: SessionId, run_id: RunId)
 - `Commit`(input_id: InputId, run_id: RunId)
 - `Fail`(run_id: RunId)
 - `Recycle`
@@ -139,6 +140,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ## Invariants
 - `fence_requires_bound_runtime`
+- `running_has_current_run`
+- `current_run_only_while_running_or_retired`
 - `drain_requires_ingress_context`
 - `active_requested_names_subset_of_staged`
 
@@ -825,23 +828,33 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AcceptWithCompletionIdle`
 - From: `Idle`
-- On: `AcceptWithCompletion`(input_id)
+- On: `AcceptWithCompletion`(input_id, request_immediate_processing, run_id)
 - Guards:
   - `session_registered`
 - Emits: `IngressAccepted`
 - To: `Idle`
 
-### `AcceptWithCompletionAttached`
+### `AcceptWithCompletionAttachedImmediate`
 - From: `Attached`
-- On: `AcceptWithCompletion`(input_id)
+- On: `AcceptWithCompletion`(input_id, request_immediate_processing, run_id)
 - Guards:
   - `session_registered`
+  - `request_immediate_processing`
+- Emits: `IngressAccepted`, `SubmitRunPrimitive`
+- To: `Running`
+
+### `AcceptWithCompletionAttachedQueued`
+- From: `Attached`
+- On: `AcceptWithCompletion`(input_id, request_immediate_processing, run_id)
+- Guards:
+  - `session_registered`
+  - `request_immediate_processing`
 - Emits: `IngressAccepted`
 - To: `Attached`
 
 ### `AcceptWithCompletionRunning`
 - From: `Running`
-- On: `AcceptWithCompletion`(input_id)
+- On: `AcceptWithCompletion`(input_id, request_immediate_processing, run_id)
 - Guards:
   - `session_registered`
 - Emits: `IngressAccepted`
@@ -905,7 +918,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `PrepareIdle`
 - From: `Idle`
-- On: `Prepare`(session_id)
+- On: `Prepare`(session_id, run_id)
 - Guards:
   - `session_registered`
 - Emits: `SubmitRunPrimitive`
@@ -913,7 +926,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `PrepareAttached`
 - From: `Attached`
-- On: `Prepare`(session_id)
+- On: `Prepare`(session_id, run_id)
 - Guards:
   - `session_registered`
 - Emits: `SubmitRunPrimitive`
@@ -948,6 +961,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `Commit`(input_id, run_id)
 - Guards:
   - `pre_run_phase_matches_idle`
+  - `current_run_id_matches_binding`
 - To: `Idle`
 
 ### `FailRunningToIdle`
@@ -955,6 +969,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `Fail`(run_id)
 - Guards:
   - `pre_run_phase_matches_idle`
+  - `current_run_id_matches_binding`
 - Emits: `RecordTerminalOutcome`
 - To: `Idle`
 
@@ -963,6 +978,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `Commit`(input_id, run_id)
 - Guards:
   - `pre_run_phase_matches_attached`
+  - `current_run_id_matches_binding`
 - To: `Attached`
 
 ### `FailRunningToAttached`
@@ -970,6 +986,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `Fail`(run_id)
 - Guards:
   - `pre_run_phase_matches_attached`
+  - `current_run_id_matches_binding`
 - Emits: `RecordTerminalOutcome`
 - To: `Attached`
 

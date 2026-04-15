@@ -164,6 +164,14 @@ impl DriverEntry {
         }
     }
 
+    /// Inspect the current typed post-admission signal without draining it.
+    pub(crate) fn post_admission_signal(&self) -> crate::driver::ephemeral::PostAdmissionSignal {
+        match self {
+            DriverEntry::Ephemeral(d) => d.post_admission_signal(),
+            DriverEntry::Persistent(d) => d.post_admission_signal(),
+        }
+    }
+
     /// Check and clear the wake flag (backward-compat wrapper).
     pub(crate) fn take_wake_requested(&mut self) -> bool {
         match self {
@@ -3304,6 +3312,7 @@ impl MeerkatMachine {
             current_run_contributors: ingress.current_run_contributors().to_vec(),
             wake_requested: ingress.wake_requested(),
             process_requested: ingress.process_requested(),
+            post_admission_signal: format!("{:?}", driver.post_admission_signal()),
             silent_intent_overrides: ingress.silent_intent_overrides().iter().cloned().collect(),
         };
         let ledger = {
@@ -3369,6 +3378,10 @@ impl MeerkatMachine {
             available_fields.insert(
                 "attachment_live".into(),
                 formal_projection_value(&attachment_live),
+            );
+            available_fields.insert(
+                "current_run_id".into(),
+                formal_projection_value(&control.current_run_id.as_ref().map(ToString::to_string)),
             );
             available_fields.insert(
                 "pre_run_phase".into(),
