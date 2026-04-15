@@ -164,7 +164,7 @@ BaseInit ==
     /\ mob_active_run_count = 0
     /\ mob_pending_spawn_count = 0
     /\ mob_wiring_edge_count = 0
-    /\ mob_coordinator_bound = FALSE
+    /\ mob_coordinator_bound = TRUE
     /\ model_step_count = 0
     /\ pending_routes = <<>>
     /\ delivered_routes = {}

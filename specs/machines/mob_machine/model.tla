@@ -28,7 +28,7 @@ Init ==
     /\ active_run_count = 0
     /\ pending_spawn_count = 0
     /\ wiring_edge_count = 0
-    /\ coordinator_bound = FALSE
+    /\ coordinator_bound = TRUE
 
 TerminalStutter ==
     /\ phase = "Destroyed"

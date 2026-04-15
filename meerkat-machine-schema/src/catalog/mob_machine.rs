@@ -42,7 +42,7 @@ pub fn mob_machine() -> MachineSchema {
                     init("active_run_count", Expr::U64(0)),
                     init("pending_spawn_count", Expr::U64(0)),
                     init("wiring_edge_count", Expr::U64(0)),
-                    init("coordinator_bound", Expr::Bool(false)),
+                    init("coordinator_bound", Expr::Bool(true)),
                 ],
             },
             terminal_phases: vec!["Destroyed".into()],

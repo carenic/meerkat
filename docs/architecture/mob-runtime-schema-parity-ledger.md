@@ -73,6 +73,9 @@ Current state:
   path: a running Mob with active flows rejects `stop()` until those flows are
   canceled or settle, and the focused runtime/schema proof for that row is
   now checked in
+- the formal machine now starts `Running + coordinator_bound=true`, matching
+  the live runtime bootstrap path and the initial `debug_orchestrator_snapshot`
+  seen from a freshly created Mob
 - the generated `meerkat_mob_seam` composition now rejects inadmissible queued
   external entry packets instead of deadlocking after terminal Mob shutdown
 
@@ -144,6 +147,14 @@ Current state:
 - That fix kept the exact lifecycle triangle green and left the truthful raw /
   phase / full Hopcroft readout unchanged at `770 -> 138 -> 140 -> 770`,
   while TLC generated states fell slightly from `25,943` to `25,767`.
+- The next parity-hardening tranche aligned the formal Mob init state with the
+  live runtime bootstrap by switching `coordinator_bound` from `false` to
+  `true` and adding a direct runtime/schema proof for the initial snapshot.
+- That fix also kept the exact lifecycle triangle green, but it changed the
+  truthful reachable state space from `770` to `813` because the old formal
+  machine had been starting from the wrong bootstrap state. The raw / phase /
+  full quotient stayed at `138 / 140 / 813`, which means this was a parity
+  correction, not a new simplification.
 
 ## Pair Ledger
 
@@ -161,14 +172,17 @@ Current state:
   surface (`78 / 78 / 78 / 0`).
 - The broad quotient result still stands after the parity cleanup, and the
   shadow-field cuts plus `CancelWork` extraction made that read much cleaner:
-  the truthful state space has now collapsed from `4,797` to `770`.
+  the truthful state space has now collapsed from `4,797` to `813`.
 - The trustworthy raw/phase/full reread is now:
-  raw `770 -> 138`, phase `770 -> 140`, full `770 -> 770`.
+  raw `813 -> 138`, phase `813 -> 140`, full `813 -> 813`.
 - The latest public-guard parity hardening did not change the remaining Mob
   core fields; it only removed one over-admitted `Stop` row from the formal
   graph, which is why the quotient stayed flat while TLC generated states
   dipped slightly.
-- The dominant mixed block (`347` states) is now split primarily by
+- The latest init-state parity hardening corrected the bootstrap truth without
+  changing the remaining intrinsic quotient, which is why the reachable space
+  rose while the raw quotient stayed flat.
+- The dominant mixed block (`362` states) is now split primarily by
   `pending_spawn_count`, `wiring_edge_count`, `active_run_count`,
   `active_member_count`, and `coordinator_bound`.
 

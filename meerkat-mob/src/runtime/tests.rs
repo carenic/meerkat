@@ -11510,6 +11510,29 @@ async fn test_flow_finished_cleans_tracking_maps() {
 }
 
 #[tokio::test]
+async fn test_mob_schema_initial_orchestrator_projection_matches_runtime() {
+    let schema = schema_mob_machine();
+    assert_eq!(schema.state.init.phase, "Running");
+    let coordinator_bound = schema
+        .state
+        .init
+        .fields
+        .iter()
+        .find(|field| field.field == "coordinator_bound")
+        .expect("coordinator_bound init");
+    assert_eq!(coordinator_bound.expr, Expr::Bool(true));
+
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let initial = handle
+        .debug_orchestrator_snapshot()
+        .await
+        .expect("initial orchestrator snapshot");
+    assert_eq!(initial.phase, MobState::Running);
+    assert!(initial.coordinator_bound);
+    assert_eq!(initial.pending_spawn_count, 0);
+}
+
+#[tokio::test]
 async fn test_orchestrator_snapshot_tracks_pending_spawn_ownership_and_revision() {
     let (handle, service) = create_test_mob(sample_definition()).await;
     let initial = handle
