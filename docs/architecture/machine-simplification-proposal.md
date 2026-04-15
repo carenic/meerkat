@@ -680,6 +680,7 @@ Current result:
 - reachable states: `19,467`
 - raw quotient states: `466`
 - phase-observed quotient states: `471`
+- full-observed quotient states: `19,078`
 - TLC: `1,827,886 generated / 19,467 distinct / depth 9`
 - reachable edges: `957,838`
 - dominant mixed block: `8,898` states spanning `Initializing`, `Idle`,
@@ -695,9 +696,8 @@ The important read is now sharper than the earlier partial dump story:
 - phase still adds very little independent information on top of the field
   tuple (`466 -> 471`)
 - preserving the full snapshot still keeps almost every remaining state
-  distinct (`16,995` on the most recent fully observed rerun before the new
-  retire-drain slice, which already told us the field tuple is doing most of
-  the real work)
+  distinct (`19,078`), which tells us the field tuple is still doing most of
+  the real work even after the retire-drain correction
 - the visibility-boundary and LLM/capability-boundary cuts removed a large
   amount of formal shadow state without changing the audited public-phase
   behavior

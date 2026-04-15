@@ -34,17 +34,17 @@ fn workspace_root() -> PathBuf {
 }
 
 fn binary_path(name: &str) -> PathBuf {
-    if let Some(path) = std::env::var_os(format!("CARGO_BIN_EXE_{name}")) {
+    if let Some(path) = std::env::var_os(format!(
+        "RKAT_TEST_BIN_{}",
+        name.replace('-', "_").to_ascii_uppercase()
+    )) {
         let path = PathBuf::from(path);
         if path.exists() {
             return path;
         }
     }
 
-    if let Some(path) = std::env::var_os(format!(
-        "RKAT_TEST_BIN_{}",
-        name.replace('-', "_").to_ascii_uppercase()
-    )) {
+    if let Some(path) = std::env::var_os(format!("CARGO_BIN_EXE_{name}")) {
         let path = PathBuf::from(path);
         if path.exists() {
             return path;
