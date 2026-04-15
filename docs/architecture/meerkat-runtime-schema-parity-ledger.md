@@ -202,6 +202,10 @@ Current exact-parity state:
   validates contributor `last_run` metadata directly against the control-owned
   run ID, and the diagnostic spine echoes `current_run_id` from control rather
   than from ingress
+- the formal machine now also models the `Running -> Retired` terminal return
+  that live runtime already used during drain/retire flow, and the runtime-side
+  return-phase classifier is now a machine-owned helper instead of a
+  driver-local `finish_run_from_current_phase()` decision
 - the pure query surface remains runtime-audited helper behavior, but it is no
   longer counted as formal transition coverage
 - the next remaining dogma violation is no longer coarse control truth in a

@@ -71,6 +71,27 @@ impl RuntimeState {
     }
 }
 
+/// Classify the machine-owned coarse phase a run should return to after a
+/// terminal outcome.
+///
+/// The checked-in `MeerkatMachine` owns the return-phase semantics through its
+/// `current_run_id` / `pre_run_phase` state. Runtime helpers may realize that
+/// projection, but they should not invent the mapping themselves.
+pub fn run_return_phase_from_pre_run_phase(pre_run_phase: Option<RuntimeState>) -> RuntimeState {
+    match pre_run_phase {
+        Some(RuntimeState::Attached) => RuntimeState::Attached,
+        Some(RuntimeState::Retired) => RuntimeState::Retired,
+        Some(
+            RuntimeState::Idle
+            | RuntimeState::Initializing
+            | RuntimeState::Running
+            | RuntimeState::Stopped
+            | RuntimeState::Destroyed,
+        )
+        | None => RuntimeState::Idle,
+    }
+}
+
 impl std::fmt::Display for RuntimeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -156,6 +177,26 @@ mod tests {
             &RuntimeState::Running
         ));
         assert!(!can_transition(&RuntimeState::Retired, &RuntimeState::Idle));
+    }
+
+    #[test]
+    fn run_return_phase_classifier_matches_machine_projection() {
+        assert_eq!(
+            run_return_phase_from_pre_run_phase(Some(RuntimeState::Idle)),
+            RuntimeState::Idle
+        );
+        assert_eq!(
+            run_return_phase_from_pre_run_phase(Some(RuntimeState::Attached)),
+            RuntimeState::Attached
+        );
+        assert_eq!(
+            run_return_phase_from_pre_run_phase(Some(RuntimeState::Retired)),
+            RuntimeState::Retired
+        );
+        assert_eq!(
+            run_return_phase_from_pre_run_phase(None),
+            RuntimeState::Idle
+        );
     }
 
     #[test]

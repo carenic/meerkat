@@ -1028,6 +1028,23 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `RecordTerminalOutcome`
 - To: `Attached`
 
+### `CommitRunningToRetired`
+- From: `Running`
+- On: `Commit`(input_id, run_id)
+- Guards:
+  - `pre_run_phase_matches_retired`
+  - `current_run_id_matches_binding`
+- To: `Retired`
+
+### `FailRunningToRetired`
+- From: `Running`
+- On: `Fail`(run_id)
+- Guards:
+  - `pre_run_phase_matches_retired`
+  - `current_run_id_matches_binding`
+- Emits: `RecordTerminalOutcome`
+- To: `Retired`
+
 ### `StageAddAttached`
 - From: `Attached`
 - On: `StageAdd`()

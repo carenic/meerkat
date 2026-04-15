@@ -1222,6 +1222,28 @@ FailRunningToAttached(run_id) ==
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, peer_ingress_configured, drain_running, silent_intent_overrides, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, staged_visibility_revision >>
 
 
+CommitRunningToRetired(input_id, run_id) ==
+    /\ phase = "Running"
+    /\ (pre_run_phase = Some("retired"))
+    /\ (current_run_id = Some(run_id))
+    /\ phase' = "Retired"
+    /\ model_step_count' = model_step_count + 1
+    /\ current_run_id' = None
+    /\ pre_run_phase' = None
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, peer_ingress_configured, drain_running, silent_intent_overrides, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, staged_visibility_revision >>
+
+
+FailRunningToRetired(run_id) ==
+    /\ phase = "Running"
+    /\ (pre_run_phase = Some("retired"))
+    /\ (current_run_id = Some(run_id))
+    /\ phase' = "Retired"
+    /\ model_step_count' = model_step_count + 1
+    /\ current_run_id' = None
+    /\ pre_run_phase' = None
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, peer_ingress_configured, drain_running, silent_intent_overrides, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, staged_visibility_revision >>
+
+
 StageAddAttached ==
     /\ phase = "Attached"
     /\ (session_id # None)
@@ -1560,6 +1582,8 @@ Next ==
     \/ \E run_id \in RunIdValues : FailRunningToIdle(run_id)
     \/ \E input_id \in InputIdValues : \E run_id \in RunIdValues : CommitRunningToAttached(input_id, run_id)
     \/ \E run_id \in RunIdValues : FailRunningToAttached(run_id)
+    \/ \E input_id \in InputIdValues : \E run_id \in RunIdValues : CommitRunningToRetired(input_id, run_id)
+    \/ \E run_id \in RunIdValues : FailRunningToRetired(run_id)
     \/ StageAddAttached
     \/ StageAddRunning
     \/ StageRemoveAttached

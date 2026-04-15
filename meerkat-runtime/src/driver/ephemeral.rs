@@ -446,12 +446,6 @@ impl EphemeralRuntimeDriver {
         self.phase.can_process_queue()
     }
 
-    fn resolve_run_return_phase(&self) -> RuntimeState {
-        self.pre_run_phase
-            .map(RunReturnPhase::as_runtime_state)
-            .unwrap_or(RuntimeState::Idle)
-    }
-
     fn set_phase(&mut self, next_phase: RuntimeState) -> RuntimeState {
         let from_phase = self.phase;
         self.phase = next_phase;
@@ -493,29 +487,39 @@ impl EphemeralRuntimeDriver {
         Ok(())
     }
 
-    fn finish_run_from_current_phase(
+    fn validate_active_run_id(
         &mut self,
         run_id: &RunId,
-    ) -> Result<RuntimeState, crate::runtime_state::RuntimeStateTransitionError> {
-        let next_phase = match self.phase {
-            RuntimeState::Running => self.resolve_run_return_phase(),
-            RuntimeState::Retired => RuntimeState::Retired,
+    ) -> Result<(), crate::runtime_state::RuntimeStateTransitionError> {
+        let expected_next_phase =
+            crate::runtime_state::run_return_phase_from_pre_run_phase(self.pre_run_phase());
+        match self.phase {
+            RuntimeState::Running | RuntimeState::Retired => {}
             from => {
                 return Err(crate::runtime_state::RuntimeStateTransitionError {
                     from,
-                    to: self.resolve_run_return_phase(),
+                    to: expected_next_phase,
                 });
             }
-        };
+        }
         match self.current_run_id.as_ref() {
             Some(active_id) if active_id == run_id => {}
             _ => {
                 return Err(crate::runtime_state::RuntimeStateTransitionError {
                     from: self.phase,
-                    to: next_phase,
+                    to: expected_next_phase,
                 });
             }
         }
+        Ok(())
+    }
+
+    fn apply_run_return_projection(
+        &mut self,
+        run_id: &RunId,
+        next_phase: RuntimeState,
+    ) -> Result<RuntimeState, crate::runtime_state::RuntimeStateTransitionError> {
+        self.validate_active_run_id(run_id)?;
         self.current_run_id = None;
         self.pre_run_phase = None;
         self.phase = next_phase;
@@ -557,7 +561,9 @@ impl EphemeralRuntimeDriver {
                 to: RuntimeState::Idle,
             },
         )?;
-        let _ = self.finish_run_from_current_phase(&run_id)?;
+        let next_phase =
+            crate::runtime_state::run_return_phase_from_pre_run_phase(self.pre_run_phase());
+        let _ = self.apply_run_return_projection(&run_id, next_phase)?;
         Ok(run_id)
     }
     /// Drain and return the accumulated post-admission signal.
@@ -1334,6 +1340,8 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
                 run_id,
                 consumed_input_ids,
             } => {
+                let next_phase =
+                    crate::runtime_state::run_return_phase_from_pre_run_phase(self.pre_run_phase());
                 // Ingress authority: RunCompleted — always call; authority rejects if run doesn't match.
                 match self.ingress.apply(RuntimeIngressInput::RunCompleted {
                     run_id: run_id.clone(),
@@ -1352,10 +1360,12 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
 
                 self.consume_inputs(&consumed_input_ids, &run_id)
                     .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
-                self.finish_run_from_current_phase(&run_id)
+                self.apply_run_return_projection(&run_id, next_phase)
                     .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
             }
             RunEvent::RunFailed { ref run_id, .. } => {
+                let next_phase =
+                    crate::runtime_state::run_return_phase_from_pre_run_phase(self.pre_run_phase());
                 // Ingress authority: RunFailed — always call; authority rejects if run doesn't match.
                 match self.ingress.apply(RuntimeIngressInput::RunFailed {
                     run_id: run_id.clone(),
@@ -1382,10 +1392,12 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
                     .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
                 // Wake decision is authority-driven: the ingress authority emits
                 // WakeRuntime when rolled-back inputs are re-enqueued (above).
-                self.finish_run_from_current_phase(run_id)
+                self.apply_run_return_projection(run_id, next_phase)
                     .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
             }
             RunEvent::RunCancelled { ref run_id, .. } => {
+                let next_phase =
+                    crate::runtime_state::run_return_phase_from_pre_run_phase(self.pre_run_phase());
                 // Ingress authority: RunCancelled — always call; authority rejects if run doesn't match.
                 match self.ingress.apply(RuntimeIngressInput::RunCancelled {
                     run_id: run_id.clone(),
@@ -1412,7 +1424,7 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
                     .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
                 // Wake decision is authority-driven: the ingress authority emits
                 // WakeRuntime when rolled-back inputs are re-enqueued (above).
-                self.finish_run_from_current_phase(run_id)
+                self.apply_run_return_projection(run_id, next_phase)
                     .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
             }
             RunEvent::RunStarted { .. } => {}

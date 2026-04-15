@@ -2126,10 +2126,14 @@ fn absorbed_meerkat_transitions() -> Vec<TransitionSchema> {
     }
 
     // Commit and Fail exit Running directly at the top-level machine
-    // boundary, restoring the pre-run control phase (Idle or Attached).
+    // boundary, restoring the pre-run control phase (Idle, Attached, or Retired).
     // The lower runtime authorities still own the internal run-completion
     // details.
-    for (to_phase, guard_phase) in [("Idle", "Idle"), ("Attached", "Attached")] {
+    for (to_phase, guard_phase) in [
+        ("Idle", "Idle"),
+        ("Attached", "Attached"),
+        ("Retired", "Retired"),
+    ] {
         transitions.push(TransitionSchema {
             name: format!("CommitRunningTo{to_phase}"),
             from: vec!["Running".into()],
