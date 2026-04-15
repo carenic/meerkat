@@ -376,7 +376,7 @@ impl RuntimeIngressAuthority {
     }
 
     /// Apply already-machine-classified contributor staging mechanics.
-    pub fn stage_drain_snapshot(
+    pub(crate) fn stage_drain_snapshot(
         &mut self,
         run_id: &RunId,
         contributing_work_ids: &[InputId],
@@ -388,7 +388,7 @@ impl RuntimeIngressAuthority {
     }
 
     /// Apply already-machine-classified boundary-consumption mechanics.
-    pub fn boundary_applied(
+    pub(crate) fn boundary_applied(
         &mut self,
         contributing_work_ids: &[InputId],
         boundary_sequence: u64,
@@ -400,7 +400,10 @@ impl RuntimeIngressAuthority {
     }
 
     /// Apply already-machine-classified run-completion mechanics.
-    pub fn run_completed(&mut self, contributing_work_ids: &[InputId]) -> RuntimeIngressTransition {
+    pub(crate) fn run_completed(
+        &mut self,
+        contributing_work_ids: &[InputId],
+    ) -> RuntimeIngressTransition {
         let (next_fields, effects) = self
             .eval_run_completed(contributing_work_ids)
             .expect("run completion is mechanical once machine legality is known");
@@ -409,7 +412,7 @@ impl RuntimeIngressAuthority {
 
     /// Replay contributors to the queue lanes chosen by the machine-owned
     /// replay classifier.
-    pub fn replay_queued_contributors(
+    pub(crate) fn replay_queued_contributors(
         &mut self,
         queue_work_ids: &[InputId],
         steer_work_ids: &[InputId],
