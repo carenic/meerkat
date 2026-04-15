@@ -273,7 +273,6 @@ struct RuntimeIngressFields {
     terminal_outcome: HashMap<InputId, Option<InputTerminalOutcome>>,
     queue: Vec<InputId>,
     steer_queue: Vec<InputId>,
-    current_run: Option<RunId>,
     current_run_contributors: Vec<InputId>,
     last_run: HashMap<InputId, Option<RunId>>,
     last_boundary_sequence: HashMap<InputId, Option<u64>>,
@@ -295,7 +294,6 @@ impl RuntimeIngressFields {
             terminal_outcome: HashMap::new(),
             queue: Vec::new(),
             steer_queue: Vec::new(),
-            current_run: None,
             current_run_contributors: Vec::new(),
             last_run: HashMap::new(),
             last_boundary_sequence: HashMap::new(),
@@ -379,7 +377,11 @@ impl RuntimeIngressAuthority {
 
     /// The current run ID (if a run is in progress).
     pub fn current_run(&self) -> Option<&RunId> {
-        self.fields.current_run.as_ref()
+        self.fields
+            .current_run_contributors
+            .first()
+            .and_then(|work_id| self.fields.last_run.get(work_id))
+            .and_then(|run_id| run_id.as_ref())
     }
 
     /// The current run's contributing work IDs.
@@ -882,7 +884,7 @@ impl RuntimeIngressAuthority {
         contributing_work_ids: &[InputId],
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: no_current_run
-        if self.fields.current_run.is_some() {
+        if !self.fields.current_run_contributors.is_empty() {
             return Err(RuntimeIngressError::GuardFailed {
                 guard: "no_current_run: a run is already in progress".into(),
             });
@@ -932,7 +934,6 @@ impl RuntimeIngressAuthority {
         }
 
         // Set current run
-        fields.current_run = Some(run_id.clone());
         fields.current_run_contributors = contributing_work_ids.to_vec();
 
         // Transition contributors to Staged and emit per-input StageInput effects
@@ -963,11 +964,11 @@ impl RuntimeIngressAuthority {
         boundary_sequence: u64,
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: run_matches_current
-        if self.fields.current_run.as_ref() != Some(run_id) {
+        if self.current_run() != Some(run_id) {
             return Err(RuntimeIngressError::GuardFailed {
                 guard: format!(
                     "run_matches_current: expected {:?}, got {run_id:?}",
-                    self.fields.current_run
+                    self.current_run()
                 ),
             });
         }
@@ -1008,11 +1009,11 @@ impl RuntimeIngressAuthority {
         run_id: &RunId,
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: run_matches_current
-        if self.fields.current_run.as_ref() != Some(run_id) {
+        if self.current_run() != Some(run_id) {
             return Err(RuntimeIngressError::GuardFailed {
                 guard: format!(
                     "run_matches_current: expected {:?}, got {run_id:?}",
-                    self.fields.current_run
+                    self.current_run()
                 ),
             });
         }
@@ -1049,7 +1050,6 @@ impl RuntimeIngressAuthority {
         }
 
         // Clear current run
-        fields.current_run = None;
         fields.current_run_contributors = Vec::new();
 
         Ok((fields, effects))
@@ -1060,11 +1060,11 @@ impl RuntimeIngressAuthority {
         run_id: &RunId,
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: run_matches_current
-        if self.fields.current_run.as_ref() != Some(run_id) {
+        if self.current_run() != Some(run_id) {
             return Err(RuntimeIngressError::GuardFailed {
                 guard: format!(
                     "run_matches_current: expected {:?}, got {run_id:?}",
-                    self.fields.current_run
+                    self.current_run()
                 ),
             });
         }
@@ -1101,7 +1101,6 @@ impl RuntimeIngressAuthority {
         }
 
         // Clear current run
-        fields.current_run = None;
         fields.current_run_contributors = Vec::new();
 
         // Wake if there's still work in the queue
@@ -1123,11 +1122,11 @@ impl RuntimeIngressAuthority {
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Same logic as RunFailed per the schema.
         // Guard: run_matches_current
-        if self.fields.current_run.as_ref() != Some(run_id) {
+        if self.current_run() != Some(run_id) {
             return Err(RuntimeIngressError::GuardFailed {
                 guard: format!(
                     "run_matches_current: expected {:?}, got {run_id:?}",
-                    self.fields.current_run
+                    self.current_run()
                 ),
             });
         }
@@ -1162,7 +1161,6 @@ impl RuntimeIngressAuthority {
             }
         }
 
-        fields.current_run = None;
         fields.current_run_contributors = Vec::new();
 
         if !fields.queue.is_empty() || !fields.steer_queue.is_empty() {
@@ -1290,7 +1288,7 @@ impl RuntimeIngressAuthority {
         &self,
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: no_current_run (can't reset while a run is in progress)
-        if self.fields.current_run.is_some() {
+        if !self.fields.current_run_contributors.is_empty() {
             return Err(RuntimeIngressError::GuardFailed {
                 guard: "no_current_run: cannot reset while a run is in progress".into(),
             });
@@ -1331,7 +1329,6 @@ impl RuntimeIngressAuthority {
         // Drain queues
         fields.queue.clear();
         fields.steer_queue.clear();
-        fields.current_run = None;
         fields.current_run_contributors = Vec::new();
         fields.silent_intent_overrides.clear();
 
@@ -1380,7 +1377,6 @@ impl RuntimeIngressAuthority {
 
         fields.queue.clear();
         fields.steer_queue.clear();
-        fields.current_run = None;
         fields.current_run_contributors = Vec::new();
         fields.silent_intent_overrides.clear();
 
@@ -1428,7 +1424,6 @@ impl RuntimeIngressAuthority {
 
         fields.queue.clear();
         fields.steer_queue.clear();
-        fields.current_run = None;
         fields.current_run_contributors = Vec::new();
         fields.silent_intent_overrides.clear();
 
@@ -1494,7 +1489,7 @@ impl RuntimeIngressAuthority {
         let mut effects = Vec::new();
 
         // Rollback any in-flight staged contributors
-        if fields.current_run.is_some() {
+        if !fields.current_run_contributors.is_empty() {
             for wid in &fields.current_run_contributors.clone() {
                 let lifecycle = fields.lifecycle.get(wid);
                 if lifecycle == Some(&InputLifecycleState::Staged) {
@@ -1516,7 +1511,6 @@ impl RuntimeIngressAuthority {
                     }
                 }
             }
-            fields.current_run = None;
             fields.current_run_contributors = Vec::new();
         }
 

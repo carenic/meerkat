@@ -178,10 +178,10 @@ Current exact-parity state:
 - the pure query surface remains runtime-audited helper behavior, but it is no
   longer counted as formal transition coverage
 - the next remaining dogma violation is no longer coarse control truth in a
-  separate reducer; it is the remaining handwritten ingress run/queue owner in
-  `RuntimeIngressAuthority`, which still owns `current_run`,
-  contributor queues, and reset / stop / destroy / recover bookkeeping below
-  the two checked-in machines
+  separate reducer; it is the remaining handwritten ingress queue/contributor
+  owner in `RuntimeIngressAuthority`, which no longer stores a second
+  `current_run` field but still owns contributor queues and reset / stop /
+  destroy / recover bookkeeping below the two checked-in machines
 
 Interpretation:
 

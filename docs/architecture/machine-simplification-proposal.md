@@ -291,11 +291,11 @@ We ran three observation modes for each machine:
 | MeerkatMachine | `full` | 17,384 | 16,995 | 2.2% | Preserving the full snapshot still keeps nearly every remaining Meerkat state distinct, but the extra structure now lives in visibility revisions, deferred-name sets, run binding/return state, ingress configuration, and drain state rather than in the deleted helper authority. |
 
 That rerun also clarified the next architectural blocker. The stale
-`RuntimeControlAuthority` problem is gone, but `RuntimeIngressAuthority` still
-owns a handwritten lifecycle (`Active` / `Retired` / `Destroyed`,
-`current_run`, contributor queues, and stop/reset/destroy/recover transitions)
-outside the two checked-in machines. The next honest tranche is therefore
-another absorption step, not a blind simplification cut.
+`RuntimeControlAuthority` problem is gone, and `RuntimeIngressAuthority` no
+longer owns a handwritten coarse lifecycle or a second stored `current_run`
+field, but it still owns contributor queues plus stop/reset/destroy/recover
+bookkeeping outside the two checked-in machines. The next honest tranche is
+therefore another absorption step, not a blind simplification cut.
 
 All six rows above have now been rerun after the exact runtime/schema parity
 passes on the current branch tip.
