@@ -264,7 +264,6 @@ struct RuntimeIngressFields {
     handling_mode: HashMap<InputId, HandlingMode>,
     is_prompt: HashMap<InputId, bool>,
     lifecycle: HashMap<InputId, InputLifecycleState>,
-    terminal_outcome: HashMap<InputId, Option<InputTerminalOutcome>>,
     queue: Vec<InputId>,
     steer_queue: Vec<InputId>,
 }
@@ -280,7 +279,6 @@ impl RuntimeIngressFields {
             handling_mode: HashMap::new(),
             is_prompt: HashMap::new(),
             lifecycle: HashMap::new(),
-            terminal_outcome: HashMap::new(),
             queue: Vec::new(),
             steer_queue: Vec::new(),
         }
@@ -358,14 +356,6 @@ impl RuntimeIngressAuthority {
     /// Lifecycle state for a specific work ID.
     pub fn lifecycle_state(&self, work_id: &InputId) -> Option<InputLifecycleState> {
         self.fields.lifecycle.get(work_id).copied()
-    }
-
-    /// Terminal outcome for a specific work ID.
-    pub fn terminal_outcome(&self, work_id: &InputId) -> Option<&InputTerminalOutcome> {
-        self.fields
-            .terminal_outcome
-            .get(work_id)
-            .and_then(|o| o.as_ref())
     }
 
     /// Policy snapshot for a specific work ID.
@@ -608,7 +598,6 @@ impl RuntimeIngressAuthority {
         fields
             .lifecycle
             .insert(work_id.clone(), InputLifecycleState::Queued);
-        fields.terminal_outcome.insert(work_id.clone(), None);
 
         // Route to queue or steer_queue based on handling mode
         match handling_mode {
@@ -739,9 +728,6 @@ impl RuntimeIngressAuthority {
         fields
             .lifecycle
             .insert(work_id.clone(), InputLifecycleState::Consumed);
-        fields
-            .terminal_outcome
-            .insert(work_id.clone(), Some(InputTerminalOutcome::Consumed));
 
         effects.push(RuntimeIngressEffect::IngressAccepted {
             work_id: work_id.clone(),
@@ -899,9 +885,6 @@ impl RuntimeIngressAuthority {
             fields
                 .lifecycle
                 .insert(wid.clone(), InputLifecycleState::Consumed);
-            fields
-                .terminal_outcome
-                .insert(wid.clone(), Some(InputTerminalOutcome::Consumed));
             effects.push(RuntimeIngressEffect::InputLifecycleNotice {
                 work_id: wid.clone(),
                 new_state: InputLifecycleState::Consumed,
@@ -1056,9 +1039,6 @@ impl RuntimeIngressAuthority {
         let outcome = InputTerminalOutcome::Superseded {
             superseded_by: new_work_id.clone(),
         };
-        fields
-            .terminal_outcome
-            .insert(old_work_id.clone(), Some(outcome.clone()));
 
         effects.push(RuntimeIngressEffect::InputLifecycleNotice {
             work_id: old_work_id.clone(),
@@ -1102,9 +1082,6 @@ impl RuntimeIngressAuthority {
             let outcome = InputTerminalOutcome::Coalesced {
                 aggregate_id: aggregate_work_id.clone(),
             };
-            fields
-                .terminal_outcome
-                .insert(wid.clone(), Some(outcome.clone()));
 
             effects.push(RuntimeIngressEffect::InputLifecycleNotice {
                 work_id: wid.clone(),
@@ -1152,9 +1129,6 @@ impl RuntimeIngressAuthority {
             fields
                 .lifecycle
                 .insert(wid.clone(), InputLifecycleState::Abandoned);
-            fields
-                .terminal_outcome
-                .insert(wid.clone(), Some(outcome.clone()));
 
             effects.push(RuntimeIngressEffect::InputLifecycleNotice {
                 work_id: wid.clone(),
@@ -1198,9 +1172,6 @@ impl RuntimeIngressAuthority {
             fields
                 .lifecycle
                 .insert(wid.clone(), InputLifecycleState::Abandoned);
-            fields
-                .terminal_outcome
-                .insert(wid.clone(), Some(outcome.clone()));
 
             effects.push(RuntimeIngressEffect::InputLifecycleNotice {
                 work_id: wid.clone(),
@@ -1242,9 +1213,6 @@ impl RuntimeIngressAuthority {
             fields
                 .lifecycle
                 .insert(wid.clone(), InputLifecycleState::Abandoned);
-            fields
-                .terminal_outcome
-                .insert(wid.clone(), Some(outcome.clone()));
 
             effects.push(RuntimeIngressEffect::InputLifecycleNotice {
                 work_id: wid.clone(),
@@ -1439,9 +1407,6 @@ impl RuntimeIngressAuthority {
             };
 
             fields.lifecycle.insert(work_id.clone(), terminal_state);
-            fields
-                .terminal_outcome
-                .insert(work_id.clone(), Some(outcome.clone()));
 
             effects.push(RuntimeIngressEffect::InputLifecycleNotice {
                 work_id: work_id.clone(),
@@ -1501,7 +1466,6 @@ fn seq_remove_all(seq: &mut Vec<InputId>, values: &[InputId]) {
 mod tests {
     use super::*;
     use crate::identifiers::PolicyVersion;
-    use crate::input_state::InputAbandonReason;
     use crate::policy::{
         ApplyMode, ConsumePoint, DrainPolicy, QueueMode, RoutingDisposition, WakeMode,
     };
@@ -1800,10 +1764,6 @@ mod tests {
             auth.lifecycle_state(&wid),
             Some(InputLifecycleState::Consumed)
         );
-        assert!(matches!(
-            auth.terminal_outcome(&wid),
-            Some(InputTerminalOutcome::Consumed)
-        ));
         // Not queued
         assert!(auth.queue().is_empty());
         assert!(
@@ -2115,10 +2075,6 @@ mod tests {
         );
         assert!(!auth.queue().contains(&old));
         assert!(auth.queue().contains(&new));
-        assert!(matches!(
-            auth.terminal_outcome(&old),
-            Some(InputTerminalOutcome::Superseded { .. })
-        ));
     }
 
     // ---- CoalesceQueuedInputs ----
@@ -2247,13 +2203,10 @@ mod tests {
 
         auth.apply(RuntimeIngressInput::Stop)
             .expect("stop should succeed");
-
-        assert!(matches!(
-            auth.terminal_outcome(&wid),
-            Some(InputTerminalOutcome::Abandoned {
-                reason: InputAbandonReason::Stopped,
-            })
-        ));
+        assert_eq!(
+            auth.lifecycle_state(&wid),
+            Some(InputLifecycleState::Abandoned)
+        );
     }
 
     // ---- Full lifecycle: admit -> stage -> boundary -> complete ----

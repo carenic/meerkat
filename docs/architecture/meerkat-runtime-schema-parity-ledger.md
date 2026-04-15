@@ -254,6 +254,10 @@ Interpretation:
 - removing the duplicate ingress `admitted_inputs` index did not reopen any
   Meerkat parity gap either: the helper now derives tracked-input membership
   from lifecycle ownership instead of keeping a second set in sync
+- removing the helper-owned ingress `terminal_outcome` cache did not reopen
+  any Meerkat parity gap either: per-input terminal outcome truth already
+  lived in the canonical input ledger, so ingress now emits terminal effects
+  without storing a second copy
 
 ## Resolution Rubric
 

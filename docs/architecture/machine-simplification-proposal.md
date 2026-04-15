@@ -696,6 +696,9 @@ The important read is now sharper than the earlier partial dump story:
 - phase preservation adds only `5` blocks (`466 -> 471`)
 - phase still adds very little independent information on top of the field
   tuple (`466 -> 471`)
+- removing ingress's duplicate `terminal_outcome` cache did not change the
+  truthful Meerkat graph at all, which confirms that terminal-outcome truth was
+  already canonical in the per-input ledger rather than the helper
 - preserving the full snapshot still keeps almost every remaining state
   distinct (`19,078`), which tells us the field tuple is still doing most of
   the real work even after the retire-drain correction
