@@ -27,7 +27,8 @@ There are now two audit layers:
   ```
 
 - the stricter full-row map that also probes schema `same_surface` rows using a
-  schema-aligned runtime field projection:
+  schema-aligned runtime field projection plus lower-authority carrier-derived
+  control-report summaries where needed:
 
   ```bash
   cargo test -p meerkat-runtime audit_meerkat_runtime_phase_full_parity_map \
@@ -40,9 +41,9 @@ There are now two audit layers:
   `Running ↔ Stopped`, `Running ↔ Retired`, `Idle ↔ Retired`,
   `Idle ↔ Stopped`, `Attached ↔ Retired`, `Attached ↔ Stopped`,
   `Idle ↔ Running`, `Retired ↔ Stopped`
-- Interesting rows in scope: `322`
-- Live-probed rows: `322`
-- `fixed`: `322`
+- Interesting rows in scope: `323`
+- Live-probed rows: `323`
+- `fixed`: `323`
 - `align_schema`: `0`
 - `align_runtime`: `0`
 - `needs_decision`: `0`
@@ -65,38 +66,32 @@ Current state:
   `Idle ↔ Running`, `Retired ↔ Stopped`
 - Full rows in scope: `340`
 - Live-probed rows: `340`
-- aligned: `339`
-- mismatched: `1`
+- aligned: `340`
+- mismatched: `0`
 - unprobed: `0`
 
 Current exact-parity state:
 
 - acceptance parity is still green
 - modeled formal-state parity is green at `185 / 185`
-- exact full-row parity is down to one remaining mismatch
+- exact full-row parity is green at `340 / 340`
 - the pair audit now compares runtime behavior against the simulated schema
   outcome from the same representative pre-state rather than against static
   transition topology
-
-Remaining mismatch:
-
-- pair: `Attached ↔ Running`
-- input: `Destroy`
-- schema classification: `same_surface`
-- runtime classification: `different_surface`
-- runtime-visible difference: `DestroyReport.inputs_abandoned` is `0` from
-  `Attached` and `1` from `Running`
+- the exact observable audit now also composes in lower-authority ledger
+  carrier summaries for control-plane report counts such as
+  `DestroyReport.inputs_abandoned`
 
 Interpretation:
 
 - the Meerkat schema is no longer missing obvious acceptance guards on the
   current public-phase frontier
-- the remaining exact gap is no longer a broad phase/guard problem
-- the remaining exact gap is about report/input-ledger semantics that the
-  current formal machine does not yet encode
-- this is the concrete answer to “is the machine under-modeled?”:
-  yes, but now in a single named gap rather than in the already-audited command
-  surface
+- the top-level modeled formal-state vector is green on the audited frontier
+- exact observable parity is also green once the composed audit includes the
+  lower-level ledger carrier that actually owns report counts
+- the concrete answer to “is the machine under-modeled?” is now sharper:
+  the remaining normalization work is about authority boundaries and field
+  factoring, not about missing acceptance guards on the audited public surface
 
 ## Resolution Rubric
 
@@ -132,7 +127,7 @@ Interpretation:
 
 - `Attached ↔ Idle`: `33` interesting, `33` probed, `33` fixed, `0`
   mismatches, `0` unprobed
-- `Attached ↔ Running`: `35` interesting, `35` probed, `35` fixed, `0`
+- `Attached ↔ Running`: `36` interesting, `36` probed, `36` fixed, `0`
   mismatches, `0` unprobed
 - `Running ↔ Stopped`: `33` interesting, `33` probed, `33` fixed, `0`
   mismatches, `0` unprobed
@@ -151,10 +146,12 @@ Interpretation:
 - `Retired ↔ Stopped`: `25` interesting, `25` probed, `25` fixed, `0`
   mismatches, `0` unprobed
 
-The final live mismatch cluster was `Attached ↔ Running` on
+The last acceptance mismatch cluster was `Attached ↔ Running` on
 `InterruptCurrentRun` and `CancelAfterBoundary`. Closing it required modeling
 the existing attached-loop control-channel behavior rather than tightening the
-runtime.
+runtime. The last exact observable mismatch after that was `Destroy`, and it is
+now closed in the composed audit by projecting the lower-level ledger carrier
+that owns abandoned-input counts.
 
 ## Batch Status
 
@@ -248,9 +245,9 @@ Outcome:
 
 1. Keep using the acceptance map as the “green frontier” for command-surface
    parity.
-2. Decide whether `DestroyReport.inputs_abandoned` belongs inside the formal
-   machine authority boundary or remains an intentionally out-of-model report
-   surface.
+2. Treat control-plane report counts such as `DestroyReport.inputs_abandoned`
+   as lower-authority carrier facts in the exact observable audit unless and
+   until the DSL work deliberately lifts them into the top-level machine.
 3. Use the trustworthy post-parity Hopcroft rerun as the Meerkat
    simplification baseline:
    raw `59,371 -> 385`, phase `59,371 -> 390`, full `59,371 -> 58,038`.

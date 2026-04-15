@@ -42,16 +42,16 @@ use crate::driver::persistent::PersistentRuntimeDriver;
 use crate::identifiers::LogicalRuntimeId;
 use crate::input::Input;
 use crate::input_lifecycle_authority::InputLifecycleError;
-use crate::input_state::InputState;
+use crate::input_state::{InputLifecycleState, InputState};
 use crate::meerkat_machine_types::{
     HydratedSessionLlmState, MeerkatAdmittedInputSnapshot, MeerkatBindingSnapshot,
     MeerkatCompletionWaiterSnapshot, MeerkatCompletionWaitersSnapshot, MeerkatControlSnapshot,
     MeerkatCursorSnapshot, MeerkatDrainSnapshot, MeerkatDriverKind, MeerkatFormalStateProjection,
-    MeerkatInputsSnapshot, MeerkatMachineCommand, MeerkatMachineCommandError,
-    MeerkatMachineCommandResult, MeerkatMachineLegacyRunPrepared, MeerkatMachineSpineSnapshot,
-    MeerkatOpsSnapshot, SessionLlmCapabilityDelta, SessionLlmCapabilitySurface,
-    SessionLlmCapabilitySurfaceStatus, SessionLlmReconfigureHost, SessionLlmReconfigureReport,
-    SessionLlmReconfigureRequest, SessionToolVisibilityDelta,
+    MeerkatInputsSnapshot, MeerkatLedgerSnapshot, MeerkatMachineCommand,
+    MeerkatMachineCommandError, MeerkatMachineCommandResult, MeerkatMachineLegacyRunPrepared,
+    MeerkatMachineSpineSnapshot, MeerkatOpsSnapshot, SessionLlmCapabilityDelta,
+    SessionLlmCapabilitySurface, SessionLlmCapabilitySurfaceStatus, SessionLlmReconfigureHost,
+    SessionLlmReconfigureReport, SessionLlmReconfigureRequest, SessionToolVisibilityDelta,
 };
 use crate::runtime_state::{RuntimeState, RuntimeStateTransitionError};
 use crate::service_ext::{RuntimeMode, SessionServiceRuntimeExt};
@@ -200,6 +200,13 @@ impl DriverEntry {
         match self {
             DriverEntry::Ephemeral(d) => d.control(),
             DriverEntry::Persistent(d) => d.inner_ref().control(),
+        }
+    }
+
+    pub(crate) fn ledger(&self) -> &crate::input_ledger::InputLedger {
+        match self {
+            DriverEntry::Ephemeral(d) => d.ledger(),
+            DriverEntry::Persistent(d) => d.inner_ref().ledger(),
         }
     }
 
@@ -3305,6 +3312,44 @@ impl MeerkatMachine {
             process_requested: ingress.process_requested(),
             silent_intent_overrides: ingress.silent_intent_overrides().iter().cloned().collect(),
         };
+        let ledger = {
+            let mut snapshot = MeerkatLedgerSnapshot {
+                input_count: 0,
+                non_terminal_count: 0,
+                accepted_count: 0,
+                queued_count: 0,
+                staged_count: 0,
+                applied_count: 0,
+                applied_pending_consumption_count: 0,
+                consumed_count: 0,
+                superseded_count: 0,
+                coalesced_count: 0,
+                abandoned_count: 0,
+            };
+
+            for (_input_id, state) in driver.ledger().iter() {
+                snapshot.input_count += 1;
+                let lifecycle = state.current_state();
+                if !lifecycle.is_terminal() {
+                    snapshot.non_terminal_count += 1;
+                }
+                match lifecycle {
+                    InputLifecycleState::Accepted => snapshot.accepted_count += 1,
+                    InputLifecycleState::Queued => snapshot.queued_count += 1,
+                    InputLifecycleState::Staged => snapshot.staged_count += 1,
+                    InputLifecycleState::Applied => snapshot.applied_count += 1,
+                    InputLifecycleState::AppliedPendingConsumption => {
+                        snapshot.applied_pending_consumption_count += 1;
+                    }
+                    InputLifecycleState::Consumed => snapshot.consumed_count += 1,
+                    InputLifecycleState::Superseded => snapshot.superseded_count += 1,
+                    InputLifecycleState::Coalesced => snapshot.coalesced_count += 1,
+                    InputLifecycleState::Abandoned => snapshot.abandoned_count += 1,
+                }
+            }
+
+            snapshot
+        };
         let ops_snapshot = ops_lifecycle.diagnostic_snapshot();
         let ops = MeerkatOpsSnapshot {
             operation_count: ops_snapshot.operation_count,
@@ -3422,6 +3467,7 @@ impl MeerkatMachine {
             binding,
             control,
             inputs,
+            ledger,
             completion_waiters,
             ops,
             drain,

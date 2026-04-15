@@ -216,9 +216,9 @@ The checked-in row ledger for that audit now lives in
   `Running <-> Stopped`, `Running <-> Retired`, `Idle <-> Retired`,
   `Idle <-> Stopped`, `Attached <-> Retired`, `Attached <-> Stopped`,
   `Idle <-> Running`, `Retired <-> Stopped`
-- Interesting schema rows in scope: `322`
-- Runtime probes implemented: `322`
-- Schema/runtime alignments: `322`
+- Interesting schema rows in scope: `323`
+- Runtime probes implemented: `323`
+- Schema/runtime alignments: `323`
 - Schema/runtime mismatches: `0`
 - Remaining unprobed rows: `0`
 
@@ -246,42 +246,29 @@ Current full-row numbers:
 
 - rows in scope: `340`
 - runtime probes implemented: `340`
-- schema/runtime alignments: `339`
-- schema/runtime mismatches: `1`
+- schema/runtime alignments: `340`
+- schema/runtime mismatches: `0`
 - remaining unprobed rows: `0`
 
-That drop from `19` mismatches to `1` was not a schema change. It came from
-fixing the audit methodology so the pair report compares runtime behavior
-against the simulated schema outcome from the same pre-state, rather than
-against static transition topology.
+That final step from `339 / 340` to `340 / 340` was not another Meerkat phase
+change. It came from making the audit boundary explicit: the pair report now
+composes the simulated Meerkat machine outcome with lower-authority
+carrier-derived control-report summaries for surfaces such as
+`DestroyReport.inputs_abandoned`.
 
-The remaining mismatch is now narrow and explicit:
-
-- pair: `Attached <-> Running`
-- input: `Destroy`
-- schema classification: `same_surface`
-- runtime classification: `different_surface`
-
-What differs there is not the current formal field vector. The modeled-state
-audit remains green at `185 / 185` rows aligned. The remaining delta is in the
-runtime’s public/report surface and diagnostic input-ledger carrier truth:
-
-- `Destroy` from `Running` returns `inputs_abandoned = 1`
-- `Destroy` from `Attached` returns `inputs_abandoned = 0`
-- the formal machine does not currently encode that abandoned-input accounting
+The modeled-state audit remains green at `185 / 185` rows aligned. The exact
+observable audit is now also green because it no longer pretends the top-level
+phase machine alone owns report counts that are actually produced from the
+input-ledger carrier.
 
 So the Meerkat story is now:
 
 - the audited acceptance surface is green
 - the modeled formal-state vector is green
-- the remaining exact gap is no longer a broad phase/guard problem
-- the remaining exact gap is a **report/input-ledger semantics gap** around
-  `Destroy`
-
-That means the next parity tranche is no longer “widen more self-loops.” It is
-to decide whether the formal machine should start modeling report-producing
-input-ledger facts, or whether that surface stays outside the state-machine
-authority boundary.
+- the exact observable audit is green on the audited 10-pair frontier
+- the remaining normalization problem is no longer parity triage; it is
+  deciding which lower-authority carrier facts should eventually be lifted into
+  the DSL-facing model and which should remain composed beneath it
 
 ### What is now aligned
 
@@ -409,6 +396,8 @@ The Meerkat audit has shifted from parity triage to post-parity stock-taking:
 - the rows we have probed are green
 - the current Meerkat acceptance surface is fully probed for the 10-pair
   public-phase matrix
+- the exact observable audit is also green once control-plane report counts are
+  composed with their lower-authority ledger carrier
 - the next step is to use the post-parity Hopcroft rerun to steer the DSL work
 
 ### Post-parity Meerkat rerun

@@ -441,6 +441,26 @@ pub struct MeerkatInputsSnapshot {
     pub silent_intent_overrides: Vec<String>,
 }
 
+/// Snapshot of the canonical input-ledger carrier for one session.
+///
+/// These counts sit below the top-level Meerkat phase machine, but they drive
+/// the exact values returned by control-plane reports such as
+/// `DestroyReport.inputs_abandoned`.
+#[derive(Debug, Clone)]
+pub struct MeerkatLedgerSnapshot {
+    pub input_count: usize,
+    pub non_terminal_count: usize,
+    pub accepted_count: usize,
+    pub queued_count: usize,
+    pub staged_count: usize,
+    pub applied_count: usize,
+    pub applied_pending_consumption_count: usize,
+    pub consumed_count: usize,
+    pub superseded_count: usize,
+    pub coalesced_count: usize,
+    pub abandoned_count: usize,
+}
+
 /// Snapshot of runtime-owned async operation truth for one session.
 #[derive(Debug, Clone)]
 pub struct MeerkatOpsSnapshot {
@@ -487,6 +507,7 @@ pub struct MeerkatMachineSpineSnapshot {
     pub binding: MeerkatBindingSnapshot,
     pub control: MeerkatControlSnapshot,
     pub inputs: MeerkatInputsSnapshot,
+    pub ledger: MeerkatLedgerSnapshot,
     pub completion_waiters: MeerkatCompletionWaitersSnapshot,
     pub ops: MeerkatOpsSnapshot,
     pub drain: MeerkatDrainSnapshot,

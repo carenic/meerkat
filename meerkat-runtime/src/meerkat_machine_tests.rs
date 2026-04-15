@@ -11313,6 +11313,17 @@ struct RuntimeParitySnapshotSummary {
     steer_queue_len: usize,
     current_run_contributor_count: usize,
     admitted_input_count: usize,
+    ledger_input_count: usize,
+    ledger_non_terminal_count: usize,
+    ledger_accepted_count: usize,
+    ledger_queued_count: usize,
+    ledger_staged_count: usize,
+    ledger_applied_count: usize,
+    ledger_applied_pending_consumption_count: usize,
+    ledger_consumed_count: usize,
+    ledger_superseded_count: usize,
+    ledger_coalesced_count: usize,
+    ledger_abandoned_count: usize,
     wait_request_present: bool,
     drain_slot_present: bool,
     drain_phase: Option<String>,
@@ -11449,6 +11460,7 @@ struct RuntimeModeledStateSchemaReport {
     outcome_kind: RuntimeModeledStateOutcomeKind,
     after: Option<RuntimeModeledStateSummary>,
     detail: String,
+    result_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -12398,6 +12410,19 @@ async fn runtime_parity_snapshot_summary(
             steer_queue_len: snapshot.inputs.steer_queue.len(),
             current_run_contributor_count: snapshot.inputs.current_run_contributors.len(),
             admitted_input_count: snapshot.inputs.admission_order.len(),
+            ledger_input_count: snapshot.ledger.input_count,
+            ledger_non_terminal_count: snapshot.ledger.non_terminal_count,
+            ledger_accepted_count: snapshot.ledger.accepted_count,
+            ledger_queued_count: snapshot.ledger.queued_count,
+            ledger_staged_count: snapshot.ledger.staged_count,
+            ledger_applied_count: snapshot.ledger.applied_count,
+            ledger_applied_pending_consumption_count: snapshot
+                .ledger
+                .applied_pending_consumption_count,
+            ledger_consumed_count: snapshot.ledger.consumed_count,
+            ledger_superseded_count: snapshot.ledger.superseded_count,
+            ledger_coalesced_count: snapshot.ledger.coalesced_count,
+            ledger_abandoned_count: snapshot.ledger.abandoned_count,
             wait_request_present: snapshot.ops.wait_request_id.is_some(),
             drain_slot_present: snapshot.drain.slot_present,
             drain_phase: snapshot.drain.phase.map(runtime_parity_drain_phase_label),
@@ -12975,6 +13000,7 @@ fn runtime_modeled_schema_report(
             outcome_kind: RuntimeModeledStateOutcomeKind::Err,
             after: None,
             detail: "missing runtime pre-state".to_string(),
+            result_summary: None,
         };
     };
 
@@ -12986,6 +13012,7 @@ fn runtime_modeled_schema_report(
                 outcome_kind: RuntimeModeledStateOutcomeKind::Err,
                 after: None,
                 detail,
+                result_summary: None,
             };
         }
     };
@@ -12995,6 +13022,7 @@ fn runtime_modeled_schema_report(
             outcome_kind: RuntimeModeledStateOutcomeKind::Ok,
             after: runtime_modeled_summary_from_kernel_state(schema, &outcome.next_state, before),
             detail: outcome.transition,
+            result_summary: runtime_modeled_schema_result_summary(before, probe),
         },
         Err(error) => RuntimeModeledStateSchemaReport {
             outcome_kind: RuntimeModeledStateOutcomeKind::Err,
@@ -13003,7 +13031,31 @@ fn runtime_modeled_schema_report(
                 formal_fields: before.formal_available_fields.clone(),
             }),
             detail: runtime_modeled_transition_refusal_detail(&error),
+            result_summary: None,
         },
+    }
+}
+
+fn runtime_modeled_schema_result_summary(
+    before: &RuntimeParitySnapshotSummary,
+    probe: RuntimeParityProbeInput,
+) -> Option<String> {
+    match probe {
+        // These control-plane reports are exact functions of the lower-level
+        // input ledger carrier, not the top-level phase machine alone.
+        RuntimeParityProbeInput::Destroy => Some(format!(
+            "destroy:abandoned={}",
+            before.ledger_non_terminal_count
+        )),
+        RuntimeParityProbeInput::Reset => Some(format!(
+            "reset:abandoned={}",
+            before.ledger_non_terminal_count
+        )),
+        RuntimeParityProbeInput::Recycle => Some(format!(
+            "recycle:transferred={}",
+            before.ledger_non_terminal_count
+        )),
+        _ => None,
     }
 }
 
@@ -13089,7 +13141,7 @@ fn classify_runtime_modeled_schema_pair(
             RuntimeParityClassification::RightOnly
         }
         (RuntimeModeledStateOutcomeKind::Ok, RuntimeModeledStateOutcomeKind::Ok)
-            if left.after == right.after =>
+            if left.after == right.after && left.result_summary == right.result_summary =>
         {
             RuntimeParityClassification::SameSurface
         }
@@ -13406,6 +13458,7 @@ async fn write_runtime_modeled_state_audit_report(path: PathBuf) -> RuntimeModel
                         outcome_kind: RuntimeModeledStateOutcomeKind::Err,
                         after: None,
                         detail: "no runtime probe implemented".to_string(),
+                        result_summary: None,
                     },
                 });
                 continue;
