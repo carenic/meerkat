@@ -439,6 +439,34 @@ impl MobActor {
         }
     }
 
+    fn require_mob_machine_reset(&self) -> Result<(), MobError> {
+        if matches!(
+            self.state(),
+            MobState::Running | MobState::Stopped | MobState::Completed
+        ) {
+            Ok(())
+        } else {
+            Err(MobError::InvalidTransition {
+                from: self.state(),
+                to: MobState::Running,
+            })
+        }
+    }
+
+    fn require_mob_machine_shutdown(&self) -> Result<(), MobError> {
+        if matches!(
+            self.state(),
+            MobState::Running | MobState::Stopped | MobState::Completed
+        ) {
+            Ok(())
+        } else {
+            Err(MobError::InvalidTransition {
+                from: self.state(),
+                to: MobState::Stopped,
+            })
+        }
+    }
+
     /// Guard that the mob is in one of the `allowed` phases.
     ///
     /// Used by command handlers that operate *within* the current state
@@ -1679,13 +1707,7 @@ impl MobActor {
                     }
                 }
                 MobCommand::Reset { reply_tx } => {
-                    // Shell guard: reject early if lifecycle phase doesn't support Reset.
-                    // This prevents fail_all_pending_spawns from running as a side-effect
-                    // when the transition is invalid (e.g. Destroyed).
-                    if let Err(error) = self.lifecycle_authority.require_phase(
-                        &[MobState::Running, MobState::Stopped, MobState::Completed],
-                        MobState::Running,
-                    ) {
+                    if let Err(error) = self.require_mob_machine_reset() {
                         let _ = reply_tx.send(Err(error));
                         continue;
                     }
@@ -1847,6 +1869,10 @@ impl MobActor {
                     let _ = reply_tx.send(());
                 }
                 MobCommand::Shutdown { reply_tx } => {
+                    if let Err(error) = self.require_mob_machine_shutdown() {
+                        let _ = reply_tx.send(Err(error));
+                        continue;
+                    }
                     self.fail_all_pending_spawns("mob runtime is shutting down")
                         .await;
                     let mut result: Result<(), MobError> = Ok(());
@@ -4368,13 +4394,6 @@ impl MobActor {
         self.ensure_pending_spawn_alignment("handle_reset preflight")?;
         self.ensure_flow_tracker_alignment("handle_reset preflight")
             .await?;
-        // Gate via lifecycle authority — Reset is a multi-step process
-        // (Running→Stop→Resume, Stopped→Resume, Completed→BeginCleanup→FinishCleanup→Resume).
-        // Use require_phase to validate the current phase supports reset.
-        self.lifecycle_authority.require_phase(
-            &[MobState::Running, MobState::Stopped, MobState::Completed],
-            MobState::Running,
-        )?;
         let prior_state = self.state();
         let was_stopped = prior_state == MobState::Stopped;
         self.cancel_all_flow_tasks().await?;

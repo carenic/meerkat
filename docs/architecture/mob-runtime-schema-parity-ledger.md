@@ -259,10 +259,10 @@ Current state:
   `live_runtime_ids`.
 - The latest fast-loop tranche did not remove another remaining core field.
   Instead, it moved top-level Mob lifecycle legality for `Stop`, `Resume`,
-  `Complete`, and `Destroy` into the checked-in machine boundary. `MobActor`
-  now rejects those verbs using MobMachine-aligned phase/run predicates first,
-  while the lifecycle and orchestrator authorities are left as realization
-  checks after the machine-owned gate passes.
+  `Complete`, `Destroy`, `Reset`, and `Shutdown` into the checked-in machine
+  boundary. `MobActor` now rejects those verbs using MobMachine-aligned
+  phase/run predicates first, while the lifecycle and orchestrator authorities
+  are left as realization checks after the machine-owned gate passes.
 
 ## Notes
 
