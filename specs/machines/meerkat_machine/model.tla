@@ -671,7 +671,8 @@ Reset ==
     /\ current_run_id' = None
     /\ pre_run_phase' = None
     /\ drain_running' = FALSE
-    /\ UNCHANGED << session_id, active_runtime_id, attachment_live, peer_ingress_configured, silent_intent_overrides, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, staged_visibility_revision >>
+    /\ silent_intent_overrides' = {}
+    /\ UNCHANGED << session_id, active_runtime_id, attachment_live, peer_ingress_configured, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, staged_visibility_revision >>
 
 
 StopRuntimeExecutorDetached ==
@@ -682,7 +683,8 @@ StopRuntimeExecutorDetached ==
     /\ current_run_id' = None
     /\ pre_run_phase' = None
     /\ drain_running' = FALSE
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, peer_ingress_configured, silent_intent_overrides, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, staged_visibility_revision >>
+    /\ silent_intent_overrides' = {}
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, peer_ingress_configured, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, staged_visibility_revision >>
 
 
 StopRuntimeExecutorLiveAttached ==
@@ -691,7 +693,8 @@ StopRuntimeExecutorLiveAttached ==
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
     /\ drain_running' = FALSE
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, peer_ingress_configured, silent_intent_overrides, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, staged_visibility_revision >>
+    /\ silent_intent_overrides' = {}
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, peer_ingress_configured, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, staged_visibility_revision >>
 
 
 StopRuntimeExecutorLiveRunning ==
@@ -700,7 +703,8 @@ StopRuntimeExecutorLiveRunning ==
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ drain_running' = FALSE
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, peer_ingress_configured, silent_intent_overrides, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, staged_visibility_revision >>
+    /\ silent_intent_overrides' = {}
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, peer_ingress_configured, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, staged_visibility_revision >>
 
 
 Destroy ==
@@ -711,7 +715,8 @@ Destroy ==
     /\ current_run_id' = None
     /\ pre_run_phase' = None
     /\ drain_running' = FALSE
-    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, peer_ingress_configured, silent_intent_overrides, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, staged_visibility_revision >>
+    /\ silent_intent_overrides' = {}
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, peer_ingress_configured, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, staged_visibility_revision >>
 
 
 EnsureSessionWithExecutorIdle(arg_session_id) ==

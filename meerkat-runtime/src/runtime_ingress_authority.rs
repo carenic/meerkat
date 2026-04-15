@@ -139,6 +139,10 @@ pub enum RuntimeIngressInput {
     Retire,
     /// Reset: abandon all non-terminal inputs, return to Active.
     Reset,
+    /// Stop: abandon everything, transition to Destroyed ingress state while
+    /// preserving the distinction from terminal runtime destruction in the
+    /// recorded input outcomes.
+    Stop,
     /// Destroy: abandon everything, transition to Destroyed.
     Destroy,
     /// Admit a recovered input from persistent store (crash recovery).
@@ -713,6 +717,7 @@ impl RuntimeIngressAuthority {
 
             RuntimeIngressInput::Retire => self.eval_retire(phase),
             RuntimeIngressInput::Reset => self.eval_reset(phase),
+            RuntimeIngressInput::Stop => self.eval_stop(phase),
             RuntimeIngressInput::Destroy => self.eval_destroy(phase),
             RuntimeIngressInput::Recover => self.eval_recover(phase),
             RuntimeIngressInput::ReconcileTerminalInputs { terminal_inputs } => {
@@ -1612,6 +1617,7 @@ impl RuntimeIngressAuthority {
         fields.steer_queue.clear();
         fields.current_run = None;
         fields.current_run_contributors = Vec::new();
+        fields.silent_intent_overrides.clear();
 
         effects.push(RuntimeIngressEffect::IngressNotice {
             kind: "Reset".into(),
@@ -1676,10 +1682,75 @@ impl RuntimeIngressAuthority {
         fields.steer_queue.clear();
         fields.current_run = None;
         fields.current_run_contributors = Vec::new();
+        fields.silent_intent_overrides.clear();
 
         effects.push(RuntimeIngressEffect::IngressNotice {
             kind: "Destroy".into(),
             detail: "IngressDestroyed".into(),
+        });
+
+        Ok((IngressPhase::Destroyed, fields, effects))
+    }
+
+    fn eval_stop(
+        &self,
+        phase: IngressPhase,
+    ) -> Result<
+        (
+            IngressPhase,
+            RuntimeIngressFields,
+            Vec<RuntimeIngressEffect>,
+        ),
+        RuntimeIngressError,
+    > {
+        // From: Active or Retired
+        if !matches!(phase, IngressPhase::Active | IngressPhase::Retired) {
+            return Err(RuntimeIngressError::InvalidTransition {
+                from: phase,
+                input: "Stop".into(),
+            });
+        }
+
+        let mut fields = self.fields.clone();
+        let mut effects = Vec::new();
+
+        let non_terminal_ids: Vec<InputId> = fields
+            .lifecycle
+            .iter()
+            .filter(|(_, state)| !state.is_terminal())
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for wid in &non_terminal_ids {
+            let outcome = InputTerminalOutcome::Abandoned {
+                reason: crate::input_state::InputAbandonReason::Stopped,
+            };
+            fields
+                .lifecycle
+                .insert(wid.clone(), InputLifecycleState::Abandoned);
+            fields
+                .terminal_outcome
+                .insert(wid.clone(), Some(outcome.clone()));
+
+            effects.push(RuntimeIngressEffect::InputLifecycleNotice {
+                work_id: wid.clone(),
+                new_state: InputLifecycleState::Abandoned,
+            });
+            effects.push(RuntimeIngressEffect::CompletionResolved {
+                work_id: wid.clone(),
+                outcome,
+            });
+        }
+
+        fields.queue.clear();
+        fields.steer_queue.clear();
+        fields.current_run = None;
+        fields.current_run_contributors = Vec::new();
+        fields.silent_intent_overrides.clear();
+
+        effects.push(RuntimeIngressEffect::IngressNotice {
+            kind: "Stop".into(),
+            detail: "IngressStopped".into(),
         });
 
         Ok((IngressPhase::Destroyed, fields, effects))
@@ -2030,6 +2101,7 @@ fn seq_remove_all(seq: &mut Vec<InputId>, values: &[InputId]) {
 mod tests {
     use super::*;
     use crate::identifiers::PolicyVersion;
+    use crate::input_state::InputAbandonReason;
     use crate::policy::{
         ApplyMode, ConsumePoint, DrainPolicy, QueueMode, RoutingDisposition, WakeMode,
     };
@@ -2749,6 +2821,61 @@ mod tests {
         .expect("set overrides should succeed");
 
         assert_eq!(auth.silent_intent_overrides(), &intents);
+    }
+
+    #[test]
+    fn reset_clears_silent_intent_overrides() {
+        let mut auth = RuntimeIngressAuthority::new();
+        let intents: BTreeSet<String> =
+            ["intent_a".into(), "intent_b".into()].into_iter().collect();
+        auth.apply(RuntimeIngressInput::SetSilentIntentOverrides {
+            intents: intents.clone(),
+        })
+        .expect("set overrides should succeed");
+        auth.apply(RuntimeIngressInput::Reset)
+            .expect("reset should succeed");
+
+        assert!(auth.silent_intent_overrides().is_empty());
+    }
+
+    #[test]
+    fn destroy_clears_silent_intent_overrides() {
+        let mut auth = RuntimeIngressAuthority::new();
+        let intents: BTreeSet<String> =
+            ["intent_a".into(), "intent_b".into()].into_iter().collect();
+        auth.apply(RuntimeIngressInput::SetSilentIntentOverrides {
+            intents: intents.clone(),
+        })
+        .expect("set overrides should succeed");
+        auth.apply(RuntimeIngressInput::Destroy)
+            .expect("destroy should succeed");
+
+        assert!(auth.silent_intent_overrides().is_empty());
+    }
+
+    #[test]
+    fn stop_clears_silent_intent_overrides_and_marks_abandoned_inputs_stopped() {
+        let mut auth = RuntimeIngressAuthority::new();
+        let intents: BTreeSet<String> =
+            ["intent_a".into(), "intent_b".into()].into_iter().collect();
+        auth.apply(RuntimeIngressInput::SetSilentIntentOverrides {
+            intents: intents.clone(),
+        })
+        .expect("set overrides should succeed");
+
+        let wid = InputId::new();
+        admit_queued(&mut auth, wid.clone(), HandlingMode::Queue);
+
+        auth.apply(RuntimeIngressInput::Stop)
+            .expect("stop should succeed");
+
+        assert!(auth.silent_intent_overrides().is_empty());
+        assert!(matches!(
+            auth.terminal_outcome(&wid),
+            Some(InputTerminalOutcome::Abandoned {
+                reason: InputAbandonReason::Stopped,
+            })
+        ));
     }
 
     // ---- Full lifecycle: admit -> stage -> boundary -> complete ----

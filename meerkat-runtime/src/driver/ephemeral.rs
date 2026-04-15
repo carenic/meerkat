@@ -22,9 +22,6 @@ use crate::input_state::{InputAbandonReason, InputLifecycleState, InputState, Po
 use crate::policy::{PolicyDecision, RoutingDisposition};
 use crate::policy_table::DefaultPolicyTable;
 use crate::queue::InputQueue;
-use crate::runtime_control_authority::{
-    RuntimeControlAuthority, RuntimeControlInput, RuntimeControlMutator,
-};
 use crate::runtime_event::{
     InputLifecycleEvent, RuntimeEvent, RuntimeEventEnvelope, RuntimeStateChangeEvent,
 };
@@ -59,6 +56,23 @@ pub enum PostAdmissionSignal {
     /// Request immediate steer/checkpoint processing within the current turn.
     /// Implies WakeLoop — strictly strongest.
     RequestImmediateProcessing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunReturnPhase {
+    Idle,
+    Attached,
+    Retired,
+}
+
+impl RunReturnPhase {
+    fn as_runtime_state(self) -> RuntimeState {
+        match self {
+            Self::Idle => RuntimeState::Idle,
+            Self::Attached => RuntimeState::Attached,
+            Self::Retired => RuntimeState::Retired,
+        }
+    }
 }
 
 impl PostAdmissionSignal {
@@ -99,9 +113,12 @@ pub(crate) fn requests_immediate_processing(input: &Input) -> bool {
 #[derive(Clone)]
 pub struct EphemeralRuntimeDriver {
     runtime_id: LogicalRuntimeId,
-    /// Canonical RMAT/MTAS authority for runtime control state.
-    /// Single source of truth for phase transitions (Idle/Attached/Running/Retired/etc.).
-    control: RuntimeControlAuthority,
+    /// Canonical coarse runtime phase owned by the checked-in MeerkatMachine.
+    phase: RuntimeState,
+    /// Active run identity, if a run is currently bound.
+    current_run_id: Option<RunId>,
+    /// The coarse phase a run returns to when it terminates.
+    pre_run_phase: Option<RunReturnPhase>,
     ledger: InputLedger,
     queue: InputQueue,
     steer_queue: InputQueue,
@@ -122,7 +139,9 @@ impl EphemeralRuntimeDriver {
     pub fn new(runtime_id: LogicalRuntimeId) -> Self {
         Self {
             runtime_id,
-            control: RuntimeControlAuthority::new_idle(),
+            phase: RuntimeState::Idle,
+            current_run_id: None,
+            pre_run_phase: None,
             ledger: InputLedger::new(),
             queue: InputQueue::new(),
             steer_queue: InputQueue::new(),
@@ -431,29 +450,119 @@ impl EphemeralRuntimeDriver {
     }
 
     pub fn is_idle(&self) -> bool {
-        self.control.is_idle()
+        self.phase == RuntimeState::Idle
     }
     pub fn is_idle_or_attached(&self) -> bool {
-        self.control.phase().is_idle_or_attached()
+        self.phase.is_idle_or_attached()
+    }
+
+    pub fn phase(&self) -> RuntimeState {
+        self.phase
+    }
+
+    pub fn current_run_id(&self) -> Option<&RunId> {
+        self.current_run_id.as_ref()
+    }
+
+    pub fn pre_run_phase(&self) -> Option<RuntimeState> {
+        self.pre_run_phase.map(RunReturnPhase::as_runtime_state)
+    }
+
+    pub fn can_process_queue(&self) -> bool {
+        self.phase.can_process_queue()
+    }
+
+    fn resolve_run_return_phase(&self) -> RuntimeState {
+        self.pre_run_phase
+            .map(RunReturnPhase::as_runtime_state)
+            .unwrap_or(RuntimeState::Idle)
+    }
+
+    fn set_phase(&mut self, next_phase: RuntimeState) -> RuntimeState {
+        let from_phase = self.phase;
+        self.phase = next_phase;
+        from_phase
+    }
+
+    fn transition_phase(&mut self, next_phase: RuntimeState) {
+        let from_phase = self.set_phase(next_phase);
+        self.emit_event(RuntimeEvent::RuntimeStateChange(RuntimeStateChangeEvent {
+            from: from_phase,
+            to: next_phase,
+        }));
+    }
+
+    fn begin_run_from_current_phase(
+        &mut self,
+        run_id: RunId,
+    ) -> Result<(), crate::runtime_state::RuntimeStateTransitionError> {
+        let pre_run_phase = match self.phase {
+            RuntimeState::Idle => RunReturnPhase::Idle,
+            RuntimeState::Attached => RunReturnPhase::Attached,
+            RuntimeState::Retired => RunReturnPhase::Retired,
+            from => {
+                return Err(crate::runtime_state::RuntimeStateTransitionError {
+                    from,
+                    to: RuntimeState::Running,
+                });
+            }
+        };
+        if self.current_run_id.is_some() {
+            return Err(crate::runtime_state::RuntimeStateTransitionError {
+                from: self.phase,
+                to: RuntimeState::Running,
+            });
+        }
+        self.current_run_id = Some(run_id);
+        self.pre_run_phase = Some(pre_run_phase);
+        self.phase = RuntimeState::Running;
+        Ok(())
+    }
+
+    fn finish_run_from_current_phase(
+        &mut self,
+        run_id: &RunId,
+    ) -> Result<RuntimeState, crate::runtime_state::RuntimeStateTransitionError> {
+        let next_phase = match self.phase {
+            RuntimeState::Running => self.resolve_run_return_phase(),
+            RuntimeState::Retired => RuntimeState::Retired,
+            from => {
+                return Err(crate::runtime_state::RuntimeStateTransitionError {
+                    from,
+                    to: self.resolve_run_return_phase(),
+                });
+            }
+        };
+        match self.current_run_id.as_ref() {
+            Some(active_id) if active_id == run_id => {}
+            _ => {
+                return Err(crate::runtime_state::RuntimeStateTransitionError {
+                    from: self.phase,
+                    to: next_phase,
+                });
+            }
+        }
+        self.current_run_id = None;
+        self.pre_run_phase = None;
+        self.phase = next_phase;
+        Ok(next_phase)
     }
 
     pub fn attach(&mut self) -> Result<(), crate::runtime_state::RuntimeStateTransitionError> {
-        let transition = self.control.apply(RuntimeControlInput::AttachExecutor)?;
-        self.emit_event(RuntimeEvent::RuntimeStateChange(RuntimeStateChangeEvent {
-            from: transition.from_phase,
-            to: transition.next_phase,
-        }));
+        if self.phase != RuntimeState::Idle {
+            return Err(crate::runtime_state::RuntimeStateTransitionError {
+                from: self.phase,
+                to: RuntimeState::Attached,
+            });
+        }
+        self.transition_phase(RuntimeState::Attached);
         Ok(())
     }
     pub fn detach(
         &mut self,
     ) -> Result<Option<RuntimeState>, crate::runtime_state::RuntimeStateTransitionError> {
-        if self.control.is_attached() {
-            let transition = self.control.apply(RuntimeControlInput::DetachExecutor)?;
-            self.emit_event(RuntimeEvent::RuntimeStateChange(RuntimeStateChangeEvent {
-                from: transition.from_phase,
-                to: transition.next_phase,
-            }));
+        if self.phase == RuntimeState::Attached {
+            self.transition_phase(RuntimeState::Idle);
             Ok(Some(RuntimeState::Attached))
         } else {
             Ok(None)
@@ -463,23 +572,18 @@ impl EphemeralRuntimeDriver {
         &mut self,
         run_id: RunId,
     ) -> Result<(), crate::runtime_state::RuntimeStateTransitionError> {
-        let _transition = self
-            .control
-            .apply(RuntimeControlInput::BeginRun { run_id })?;
-        Ok(())
+        self.begin_run_from_current_phase(run_id)
     }
     pub fn complete_run(
         &mut self,
     ) -> Result<RunId, crate::runtime_state::RuntimeStateTransitionError> {
-        let run_id = self.control.current_run_id().cloned().ok_or(
+        let run_id = self.current_run_id.clone().ok_or(
             crate::runtime_state::RuntimeStateTransitionError {
-                from: self.control.phase(),
+                from: self.phase,
                 to: RuntimeState::Idle,
             },
         )?;
-        let _transition = self.control.apply(RuntimeControlInput::RunCompleted {
-            run_id: run_id.clone(),
-        })?;
+        let _ = self.finish_run_from_current_phase(&run_id)?;
         Ok(run_id)
     }
     /// Drain and return the accumulated post-admission signal.
@@ -595,17 +699,6 @@ impl EphemeralRuntimeDriver {
     }
     pub fn input_states_snapshot(&self) -> Vec<InputState> {
         self.ledger.iter().map(|(_, state)| state.clone()).collect()
-    }
-    /// Get a reference to the runtime control authority.
-    pub fn control(&self) -> &RuntimeControlAuthority {
-        &self.control
-    }
-    /// Get a mutable reference to the runtime control authority.
-    ///
-    /// This is primarily a contract-test hook for driving explicit runtime
-    /// control transitions in recovery scenarios.
-    pub fn control_mut(&mut self) -> &mut RuntimeControlAuthority {
-        &mut self.control
     }
     /// Clear the physical queue projections without touching canonical ingress
     /// truth. Used by recovery contract tests to simulate projection loss.
@@ -815,14 +908,21 @@ impl EphemeralRuntimeDriver {
             }
         }
 
-        let transition = self
-            .control
-            .apply(RuntimeControlInput::RetireRequested)
-            .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
-        self.emit_event(RuntimeEvent::RuntimeStateChange(RuntimeStateChangeEvent {
-            from: transition.from_phase,
-            to: transition.next_phase,
-        }));
+        let next_phase = match self.phase {
+            RuntimeState::Idle | RuntimeState::Attached | RuntimeState::Running => {
+                RuntimeState::Retired
+            }
+            from => {
+                return Err(RuntimeDriverError::Internal(
+                    crate::runtime_state::RuntimeStateTransitionError {
+                        from,
+                        to: RuntimeState::Retired,
+                    }
+                    .to_string(),
+                ));
+            }
+        };
+        self.transition_phase(next_phase);
         let inputs_pending_drain = self.ledger.iter().filter(|(_, s)| !s.is_terminal()).count();
         Ok(RetireReport {
             inputs_abandoned: 0,
@@ -848,16 +948,23 @@ impl EphemeralRuntimeDriver {
         self.queue.drain();
         self.steer_queue.drain();
         self.post_admission_signal = PostAdmissionSignal::None;
-        match self.control.apply(RuntimeControlInput::ResetRequested) {
-            Ok(transition) => {
-                self.emit_event(RuntimeEvent::RuntimeStateChange(RuntimeStateChangeEvent {
-                    from: transition.from_phase,
-                    to: transition.next_phase,
-                }));
+        match self.phase {
+            RuntimeState::Initializing
+            | RuntimeState::Idle
+            | RuntimeState::Attached
+            | RuntimeState::Retired => {
+                self.current_run_id = None;
+                self.pre_run_phase = None;
+                self.transition_phase(RuntimeState::Idle);
             }
-            Err(err) if err.from == RuntimeState::Idle => {}
-            Err(err) => {
-                return Err(RuntimeDriverError::Internal(err.to_string()));
+            from => {
+                return Err(RuntimeDriverError::Internal(
+                    crate::runtime_state::RuntimeStateTransitionError {
+                        from,
+                        to: RuntimeState::Idle,
+                    }
+                    .to_string(),
+                ));
             }
         }
         self.rebuild_queue_projections();
@@ -881,14 +988,27 @@ impl EphemeralRuntimeDriver {
             }
         }
 
-        let transition = self
-            .control
-            .apply(RuntimeControlInput::DestroyRequested)
-            .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
-        self.emit_event(RuntimeEvent::RuntimeStateChange(RuntimeStateChangeEvent {
-            from: transition.from_phase,
-            to: transition.next_phase,
-        }));
+        match self.phase {
+            RuntimeState::Initializing
+            | RuntimeState::Idle
+            | RuntimeState::Attached
+            | RuntimeState::Running
+            | RuntimeState::Retired
+            | RuntimeState::Stopped => {
+                self.current_run_id = None;
+                self.pre_run_phase = None;
+                self.transition_phase(RuntimeState::Destroyed);
+            }
+            from => {
+                return Err(RuntimeDriverError::Internal(
+                    crate::runtime_state::RuntimeStateTransitionError {
+                        from,
+                        to: RuntimeState::Destroyed,
+                    }
+                    .to_string(),
+                ));
+            }
+        }
         let abandoned = self.abandon_all_non_terminal(InputAbandonReason::Destroyed);
         self.rebuild_queue_projections();
         self.debug_assert_queue_projection_alignment();
@@ -961,29 +1081,65 @@ impl EphemeralRuntimeDriver {
     }
 
     pub fn recycle_preserving_work(&mut self) -> Result<usize, RuntimeDriverError> {
-        let transition = self
-            .control
-            .apply(RuntimeControlInput::RecycleRequested)
-            .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
-        if transition.from_phase != transition.next_phase {
-            self.emit_event(RuntimeEvent::RuntimeStateChange(RuntimeStateChangeEvent {
-                from: transition.from_phase,
-                to: transition.next_phase,
-            }));
+        let next_phase = match self.phase {
+            RuntimeState::Idle | RuntimeState::Retired => {
+                if self.current_run_id.is_some() {
+                    return Err(RuntimeDriverError::Internal(
+                        crate::runtime_state::RuntimeStateTransitionError {
+                            from: self.phase,
+                            to: RuntimeState::Idle,
+                        }
+                        .to_string(),
+                    ));
+                }
+                RuntimeState::Idle
+            }
+            RuntimeState::Attached => {
+                if self.current_run_id.is_some() {
+                    return Err(RuntimeDriverError::Internal(
+                        crate::runtime_state::RuntimeStateTransitionError {
+                            from: self.phase,
+                            to: RuntimeState::Attached,
+                        }
+                        .to_string(),
+                    ));
+                }
+                RuntimeState::Attached
+            }
+            from => {
+                return Err(RuntimeDriverError::Internal(
+                    crate::runtime_state::RuntimeStateTransitionError {
+                        from,
+                        to: RuntimeState::Idle,
+                    }
+                    .to_string(),
+                ));
+            }
+        };
+        if self.phase != next_phase {
+            self.transition_phase(next_phase);
+        } else {
+            self.phase = next_phase;
         }
+        self.current_run_id = None;
+        self.pre_run_phase = None;
 
         let transferred = self.ledger.active_input_ids().len();
         let runtime_id = self.runtime_id.clone();
         let silent_comms_intents = self.silent_comms_intents.clone();
         let ledger = self.ledger.clone();
         let ingress = self.ingress.clone();
-        let control = self.control.clone();
+        let phase = self.phase;
+        let current_run_id = self.current_run_id.clone();
+        let pre_run_phase = self.pre_run_phase;
 
         *self = Self::new(runtime_id);
         self.silent_comms_intents = silent_comms_intents;
         self.ledger = ledger;
         self.ingress = ingress;
-        self.control = control;
+        self.phase = phase;
+        self.current_run_id = current_run_id;
+        self.pre_run_phase = pre_run_phase;
 
         let _ = self.recover_ephemeral();
         self.rebuild_queue_projections();
@@ -1050,7 +1206,7 @@ impl EphemeralRuntimeDriver {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
     async fn accept_input(&mut self, input: Input) -> Result<AcceptOutcome, RuntimeDriverError> {
-        let control_phase = self.control.phase();
+        let control_phase = self.phase;
         match control_phase.can_accept_input() {
             true => {}
             false => {
@@ -1119,7 +1275,7 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
         } else {
             self.ledger.accept(state.clone());
         }
-        let runtime_idle = self.control.phase().is_idle_or_attached();
+        let runtime_idle = self.phase.is_idle_or_attached();
         let mut policy = DefaultPolicyTable::resolve(&input, runtime_idle);
         crate::silent_intent::apply_silent_intent_override(
             &input,
@@ -1211,10 +1367,7 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
 
                 self.consume_inputs(&consumed_input_ids, &run_id)
                     .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
-                self.control
-                    .apply(RuntimeControlInput::RunCompleted {
-                        run_id: run_id.clone(),
-                    })
+                self.finish_run_from_current_phase(&run_id)
                     .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
             }
             RunEvent::RunFailed { ref run_id, .. } => {
@@ -1244,10 +1397,7 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
                     .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
                 // Wake decision is authority-driven: the ingress authority emits
                 // WakeRuntime when rolled-back inputs are re-enqueued (above).
-                self.control
-                    .apply(RuntimeControlInput::RunFailed {
-                        run_id: run_id.clone(),
-                    })
+                self.finish_run_from_current_phase(run_id)
                     .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
             }
             RunEvent::RunCancelled { ref run_id, .. } => {
@@ -1277,10 +1427,7 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
                     .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
                 // Wake decision is authority-driven: the ingress authority emits
                 // WakeRuntime when rolled-back inputs are re-enqueued (above).
-                self.control
-                    .apply(RuntimeControlInput::RunCancelled {
-                        run_id: run_id.clone(),
-                    })
+                self.finish_run_from_current_phase(run_id)
                     .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
             }
             RunEvent::RunStarted { .. } => {}
@@ -1340,42 +1487,43 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
     ) -> Result<(), RuntimeDriverError> {
         match command {
             RuntimeControlCommand::Stop => {
-                // Ingress authority: Destroy (Stop abandons everything)
-                match self.ingress.apply(RuntimeIngressInput::Destroy) {
+                // Ingress authority: Stop (abandon everything while preserving
+                // the distinction between a stopped runtime and a destroyed one).
+                match self.ingress.apply(RuntimeIngressInput::Stop) {
                     Ok(transition) => {
                         self.process_ingress_effects(&transition.effects);
                     }
                     Err(err) => {
                         tracing::warn!(
                             error = %err,
-                            "ingress authority rejected Destroy on Stop"
+                            "ingress authority rejected Stop on Stop"
                         );
                     }
                 }
 
-                let transition = self
-                    .control
-                    .apply(RuntimeControlInput::StopRequested)
-                    .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
-                self.emit_event(RuntimeEvent::RuntimeStateChange(RuntimeStateChangeEvent {
-                    from: transition.from_phase,
-                    to: transition.next_phase,
-                }));
-                self.abandon_all_non_terminal(InputAbandonReason::Destroyed);
-                self.queue.drain();
-                self.steer_queue.drain();
-            }
-            RuntimeControlCommand::Resume => {
-                // `Recovering` is now a compatibility-facing public state, not a
-                // live helper workflow. Resume remains a benign compatibility
-                // escape hatch for explicitly restored `Recovering`.
-                match self.control.apply(RuntimeControlInput::ResumeRequested) {
-                    Ok(_) => {}
-                    Err(err) if err.from != RuntimeState::Recovering => {}
-                    Err(err) => {
-                        return Err(RuntimeDriverError::Internal(err.to_string()));
+                match self.phase {
+                    RuntimeState::Initializing
+                    | RuntimeState::Idle
+                    | RuntimeState::Attached
+                    | RuntimeState::Running
+                    | RuntimeState::Retired => {
+                        self.current_run_id = None;
+                        self.pre_run_phase = None;
+                        self.transition_phase(RuntimeState::Stopped);
+                    }
+                    from => {
+                        return Err(RuntimeDriverError::Internal(
+                            crate::runtime_state::RuntimeStateTransitionError {
+                                from,
+                                to: RuntimeState::Stopped,
+                            }
+                            .to_string(),
+                        ));
                     }
                 }
+                self.abandon_all_non_terminal(InputAbandonReason::Stopped);
+                self.queue.drain();
+                self.steer_queue.drain();
             }
         }
         Ok(())
@@ -1385,7 +1533,7 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
         Ok(self.recover_ephemeral())
     }
     fn runtime_state(&self) -> RuntimeState {
-        self.control.phase()
+        self.phase
     }
     async fn retire(&mut self) -> Result<RetireReport, RuntimeDriverError> {
         EphemeralRuntimeDriver::retire(self)

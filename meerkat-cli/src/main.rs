@@ -66,6 +66,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 use tokio::process::Command as TokioCommand;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Exit codes as per DESIGN.md §12
 const EXIT_SUCCESS: u8 = 0;
@@ -1423,8 +1424,12 @@ impl From<CliMcpScope> for Option<McpScope> {
 #[allow(clippy::large_futures)]
 async fn main() -> anyhow::Result<ExitCode> {
     // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
     let cli = Cli::parse_from(inject_default_run_subcommand(std::env::args_os()));

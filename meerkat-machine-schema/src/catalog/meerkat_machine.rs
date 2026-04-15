@@ -746,6 +746,10 @@ pub fn meerkat_machine() -> MachineSchema {
                         field: "drain_running".into(),
                         expr: Expr::Bool(false),
                     },
+                    Update::Assign {
+                        field: "silent_intent_overrides".into(),
+                        expr: Expr::EmptySet,
+                    },
                 ],
                 to: "Idle".into(),
                 emit: vec![notice_emit("reset", "runtime reset")],
@@ -778,6 +782,10 @@ pub fn meerkat_machine() -> MachineSchema {
                         field: "drain_running".into(),
                         expr: Expr::Bool(false),
                     },
+                    Update::Assign {
+                        field: "silent_intent_overrides".into(),
+                        expr: Expr::EmptySet,
+                    },
                 ],
                 to: "Stopped".into(),
                 emit: vec![notice_emit("stop", "runtime executor stopped")],
@@ -791,10 +799,16 @@ pub fn meerkat_machine() -> MachineSchema {
                     bindings: vec![],
                 },
                 guards: vec![attachment_live_guard()],
-                updates: vec![Update::Assign {
-                    field: "drain_running".into(),
-                    expr: Expr::Bool(false),
-                }],
+                updates: vec![
+                    Update::Assign {
+                        field: "drain_running".into(),
+                        expr: Expr::Bool(false),
+                    },
+                    Update::Assign {
+                        field: "silent_intent_overrides".into(),
+                        expr: Expr::EmptySet,
+                    },
+                ],
                 to: "Attached".into(),
                 emit: vec![notice_emit("stop", "runtime executor stopped")],
             },
@@ -807,10 +821,16 @@ pub fn meerkat_machine() -> MachineSchema {
                     bindings: vec![],
                 },
                 guards: vec![attachment_live_guard()],
-                updates: vec![Update::Assign {
-                    field: "drain_running".into(),
-                    expr: Expr::Bool(false),
-                }],
+                updates: vec![
+                    Update::Assign {
+                        field: "drain_running".into(),
+                        expr: Expr::Bool(false),
+                    },
+                    Update::Assign {
+                        field: "silent_intent_overrides".into(),
+                        expr: Expr::EmptySet,
+                    },
+                ],
                 to: "Running".into(),
                 emit: vec![notice_emit("stop", "runtime executor stopped")],
             },
@@ -842,6 +862,10 @@ pub fn meerkat_machine() -> MachineSchema {
                     Update::Assign {
                         field: "drain_running".into(),
                         expr: Expr::Bool(false),
+                    },
+                    Update::Assign {
+                        field: "silent_intent_overrides".into(),
+                        expr: Expr::EmptySet,
                     },
                 ],
                 to: "Destroyed".into(),

@@ -7,6 +7,7 @@ use meerkat_core::{
 use meerkat_store::{RealmBackend, RealmOrigin};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
 #[command(name = "rkat-rpc", version = env!("CARGO_PKG_VERSION"))]
@@ -57,7 +58,13 @@ impl From<RealmBackendArg> for RealmBackend {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .init();
 
     let cli = Cli::parse();
     let selection = RealmConfig::selection_from_inputs(

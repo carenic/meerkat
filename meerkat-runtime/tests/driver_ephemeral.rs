@@ -273,7 +273,7 @@ async fn on_run_completed_consumes() {
     // Input should be consumed
     let state = driver.input_state(&input_id).unwrap();
     assert_eq!(state.current_state(), InputLifecycleState::Consumed);
-    assert!(driver.control().is_idle());
+    assert_eq!(driver.runtime_state(), RuntimeState::Idle);
 }
 
 #[tokio::test]
@@ -301,7 +301,7 @@ async fn on_run_failed_rollbacks() {
     // Input should be rolled back to Queued
     let state = driver.input_state(&input_id).unwrap();
     assert_eq!(state.current_state(), InputLifecycleState::Queued);
-    assert!(driver.control().is_idle());
+    assert_eq!(driver.runtime_state(), RuntimeState::Idle);
     assert_queue_projection_alignment(&driver);
 }
 
@@ -542,7 +542,7 @@ async fn retired_can_drain_queue_via_run_cycle() {
 
     let run_id = RunId::new();
     driver.start_run(run_id.clone()).unwrap();
-    assert!(driver.control().is_running());
+    assert_eq!(driver.runtime_state(), RuntimeState::Running);
 
     driver.stage_input(&input_id, &run_id).unwrap();
     driver.apply_input(&input_id, &run_id).unwrap();
@@ -590,7 +590,7 @@ async fn reset_rejected_while_running() {
 
     let result = driver.reset();
     assert!(result.is_err());
-    assert!(driver.control().is_running());
+    assert_eq!(driver.runtime_state(), RuntimeState::Running);
 }
 
 #[tokio::test]

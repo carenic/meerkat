@@ -41,6 +41,16 @@ fn binary_path(name: &str) -> PathBuf {
         }
     }
 
+    if let Some(path) = std::env::var_os(format!(
+        "RKAT_TEST_BIN_{}",
+        name.replace('-', "_").to_ascii_uppercase()
+    )) {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return path;
+        }
+    }
+
     if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") {
         let target_dir = PathBuf::from(target_dir);
         let candidates = [
@@ -53,31 +63,15 @@ fn binary_path(name: &str) -> PathBuf {
     }
 
     let root = workspace_root();
-    if let Some(candidate) = [
+    [
         root.join(format!("target/debug/{name}")),
         root.join(format!("target/release/{name}")),
     ]
     .into_iter()
     .find(|candidate| candidate.exists())
-    {
-        return candidate;
-    }
-
-    // Fall back to the explicit test-bin override only after trying the actual
-    // built workspace binaries. Under the shared-realm e2e wrappers, the copied
-    // e2e-bin carrier can wedge in dyld before `main`, while the real target
-    // binary remains healthy.
-    if let Some(path) = std::env::var_os(format!(
-        "RKAT_TEST_BIN_{}",
-        name.replace('-', "_").to_ascii_uppercase()
-    )) {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return path;
-        }
-    }
-
-    panic!("binary '{name}' not found; build it in CARGO_TARGET_DIR or repo target")
+    .unwrap_or_else(|| {
+        panic!("binary '{name}' not found; build it in CARGO_TARGET_DIR or repo target")
+    })
 }
 
 async fn write_project_config(project_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {

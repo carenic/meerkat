@@ -60,8 +60,6 @@ pub enum RuntimeControlPlaneError {
 pub enum RuntimeControlCommand {
     /// Stop the runtime gracefully.
     Stop,
-    /// Compatibility request to leave an explicitly restored recovering state.
-    Resume,
 }
 
 /// Report from a recovery operation.
@@ -232,10 +230,6 @@ mod tests {
         let cmd = RuntimeControlCommand::Stop;
         let json = serde_json::to_value(&cmd).unwrap();
         assert_eq!(json["command"], "stop");
-
-        let cmd = RuntimeControlCommand::Resume;
-        let json = serde_json::to_value(&cmd).unwrap();
-        assert_eq!(json["command"], "resume");
     }
 
     #[test]

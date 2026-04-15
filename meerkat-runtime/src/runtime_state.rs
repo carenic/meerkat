@@ -1,20 +1,17 @@
 //! §22 RuntimeState — the runtime's public state projection.
 //!
-//! Canonical live transition legality lives in `RuntimeControlAuthority`.
-//! `Recovering` remains a compatibility-facing public projection for restored
-//! historical state, but normal runtime control paths no longer enter it.
+//! Canonical live transition legality lives in the checked-in `MeerkatMachine`
+//! plus the runtime driver that realizes its coarse control transitions.
 
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 fn can_transition(from: &RuntimeState, next: &RuntimeState) -> bool {
-    use RuntimeState::{
-        Attached, Destroyed, Idle, Initializing, Recovering, Retired, Running, Stopped,
-    };
+    use RuntimeState::{Attached, Destroyed, Idle, Initializing, Retired, Running, Stopped};
 
     matches!(
         (from, next),
-        (Initializing | Recovering, Idle | Stopped | Destroyed)
+        (Initializing, Idle | Stopped | Destroyed)
             | (Idle, Attached | Running | Retired | Stopped | Destroyed)
             | (Attached, Running | Idle | Retired | Stopped | Destroyed)
             | (Running, Idle | Attached | Retired | Stopped | Destroyed)
@@ -36,8 +33,6 @@ pub enum RuntimeState {
     Attached,
     /// A run is in progress.
     Running,
-    /// Compatibility-facing recovering projection for restored historical state.
-    Recovering,
     /// Retired — no longer accepting new input, draining existing.
     Retired,
     /// Permanently stopped (terminal).
@@ -83,7 +78,6 @@ impl std::fmt::Display for RuntimeState {
             Self::Idle => write!(f, "idle"),
             Self::Attached => write!(f, "attached"),
             Self::Running => write!(f, "running"),
-            Self::Recovering => write!(f, "recovering"),
             Self::Retired => write!(f, "retired"),
             Self::Stopped => write!(f, "stopped"),
             Self::Destroyed => write!(f, "destroyed"),
@@ -112,7 +106,6 @@ mod tests {
         assert!(!RuntimeState::Idle.is_terminal());
         assert!(!RuntimeState::Attached.is_terminal());
         assert!(!RuntimeState::Running.is_terminal());
-        assert!(!RuntimeState::Recovering.is_terminal());
         assert!(!RuntimeState::Retired.is_terminal());
     }
 
@@ -193,7 +186,6 @@ mod tests {
             RuntimeState::Idle,
             RuntimeState::Attached,
             RuntimeState::Running,
-            RuntimeState::Recovering,
             RuntimeState::Retired,
             RuntimeState::Stopped,
             RuntimeState::Destroyed,

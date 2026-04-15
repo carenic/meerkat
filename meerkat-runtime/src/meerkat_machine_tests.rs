@@ -11287,6 +11287,9 @@ enum RuntimeParityOutcomeKind {
 struct RuntimeParitySnapshotSummary {
     phase: String,
     current_run_present: bool,
+    formal_session_id: Option<String>,
+    formal_active_runtime_id: Option<String>,
+    formal_current_run_id: Option<String>,
     pre_run_phase: Option<String>,
     attachment_live: bool,
     queue_len: usize,
@@ -11334,8 +11337,49 @@ impl RuntimeParityInvocationReport {
         RuntimeParityObservableSurface {
             outcome_kind: self.outcome_kind,
             result_summary: self.result_summary.clone(),
-            after: self.after.clone(),
+            after: self
+                .after
+                .as_ref()
+                .map(runtime_parity_normalize_observable_snapshot),
         }
+    }
+}
+
+fn runtime_parity_normalize_observable_snapshot(
+    snapshot: &RuntimeParitySnapshotSummary,
+) -> RuntimeParitySnapshotSummary {
+    let mut normalized = snapshot.clone();
+    normalized.formal_session_id = Some("\"<session-id>\"".to_string());
+    normalized.formal_active_runtime_id = Some("\"<runtime-id>\"".to_string());
+    normalized.formal_current_run_id = normalized
+        .formal_current_run_id
+        .as_ref()
+        .map(|_| "\"<run-id>\"".to_string());
+    normalized
+}
+
+fn assert_runtime_parity_identity_stability(
+    probe: RuntimeParityProbeInput,
+    before: Option<&RuntimeParitySnapshotSummary>,
+    after: Option<&RuntimeParitySnapshotSummary>,
+) {
+    let (Some(before), Some(after)) = (before, after) else {
+        return;
+    };
+
+    assert_eq!(
+        before.formal_session_id, after.formal_session_id,
+        "runtime parity probe {probe:?} should keep formal session_id stable"
+    );
+    assert_eq!(
+        before.formal_active_runtime_id, after.formal_active_runtime_id,
+        "runtime parity probe {probe:?} should keep formal active_runtime_id stable"
+    );
+    if before.formal_current_run_id.is_some() && after.formal_current_run_id.is_some() {
+        assert_eq!(
+            before.formal_current_run_id, after.formal_current_run_id,
+            "runtime parity probe {probe:?} should not churn current_run_id while a run remains bound"
+        );
     }
 }
 
@@ -11707,6 +11751,16 @@ fn normalize_runtime_parity_formal_fields(
         *value = runtime_modeled_normalize_formal_string(value);
     }
     fields
+}
+
+fn runtime_parity_formal_identity_field(
+    fields: &std::collections::BTreeMap<String, String>,
+    key: &str,
+) -> Option<String> {
+    match fields.get(key).map(String::as_str) {
+        Some("null") | None => None,
+        Some(value) => Some(value.to_string()),
+    }
 }
 
 fn runtime_modeled_normalize_json_value(value: serde_json::Value) -> serde_json::Value {
@@ -12572,6 +12626,114 @@ async fn modeled_meerkat_set_silent_intents_matches_runtime() {
 }
 
 #[tokio::test]
+async fn meerkat_reset_clears_silent_intent_overrides() {
+    let fixture = build_runtime_parity_fixture(RuntimeParityPhase::Idle).await;
+    fixture
+        .adapter
+        .set_session_silent_intents(&fixture.session_id, runtime_parity_silent_intents())
+        .await;
+
+    let runtime_id = LogicalRuntimeId::new(fixture.session_id.to_string());
+    let result = fixture
+        .adapter
+        .execute_meerkat_machine_command(
+            None,
+            MeerkatMachineCommand::Reset {
+                runtime_id: runtime_id.clone(),
+            },
+        )
+        .await
+        .expect("reset should succeed");
+    assert!(matches!(
+        result,
+        MeerkatMachineCommandResult::ResetReport(_)
+    ));
+
+    let snapshot = fixture
+        .adapter
+        .meerkat_machine_spine_snapshot(&fixture.session_id)
+        .await
+        .expect("snapshot should exist after reset");
+    assert!(
+        snapshot.inputs.silent_intent_overrides.is_empty(),
+        "reset should clear ingress-side silent intent overrides"
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn meerkat_destroy_clears_silent_intent_overrides() {
+    let fixture = build_runtime_parity_fixture(RuntimeParityPhase::Idle).await;
+    fixture
+        .adapter
+        .set_session_silent_intents(&fixture.session_id, runtime_parity_silent_intents())
+        .await;
+
+    let runtime_id = LogicalRuntimeId::new(fixture.session_id.to_string());
+    let result = fixture
+        .adapter
+        .execute_meerkat_machine_command(
+            None,
+            MeerkatMachineCommand::Destroy {
+                runtime_id: runtime_id.clone(),
+            },
+        )
+        .await
+        .expect("destroy should succeed");
+    assert!(matches!(
+        result,
+        MeerkatMachineCommandResult::DestroyReport(_)
+    ));
+
+    let snapshot = fixture
+        .adapter
+        .meerkat_machine_spine_snapshot(&fixture.session_id)
+        .await
+        .expect("snapshot should exist after destroy");
+    assert!(
+        snapshot.inputs.silent_intent_overrides.is_empty(),
+        "destroy should clear ingress-side silent intent overrides"
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn meerkat_stop_runtime_executor_clears_silent_intent_overrides() {
+    let fixture = build_runtime_parity_fixture(RuntimeParityPhase::Idle).await;
+    fixture
+        .adapter
+        .set_session_silent_intents(&fixture.session_id, runtime_parity_silent_intents())
+        .await;
+
+    fixture
+        .adapter
+        .stop_runtime_executor(
+            &fixture.session_id,
+            RunControlCommand::StopRuntimeExecutor {
+                reason: "clear silent intents".into(),
+            },
+        )
+        .await
+        .expect("stop runtime executor should succeed");
+
+    wait_for_runtime_parity_phase(&fixture.adapter, &fixture.session_id, RuntimeState::Stopped)
+        .await;
+    let snapshot = fixture
+        .adapter
+        .meerkat_machine_spine_snapshot(&fixture.session_id)
+        .await
+        .expect("snapshot should exist after stop");
+    assert!(
+        snapshot.inputs.silent_intent_overrides.is_empty(),
+        "stop should clear ingress-side silent intent overrides"
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
 async fn modeled_meerkat_accept_with_completion_running_steer_signal_matches_runtime() {
     let fixture = build_runtime_parity_fixture(RuntimeParityPhase::Running).await;
     let before = runtime_parity_snapshot_summary(&fixture.adapter, &fixture.session_id)
@@ -12718,39 +12880,54 @@ async fn runtime_parity_snapshot_summary(
     adapter
         .meerkat_machine_spine_snapshot(session_id)
         .await
-        .map(|snapshot| RuntimeParitySnapshotSummary {
-            phase: runtime_parity_state_label(snapshot.control.phase),
-            current_run_present: snapshot.control.current_run_id.is_some(),
-            pre_run_phase: snapshot
-                .control
-                .pre_run_phase
-                .map(runtime_parity_state_label),
-            attachment_live: snapshot.binding.attachment_live,
-            queue_len: snapshot.inputs.queue.len(),
-            steer_queue_len: snapshot.inputs.steer_queue.len(),
-            current_run_contributor_count: snapshot.inputs.current_run_contributors.len(),
-            admitted_input_count: snapshot.inputs.admission_order.len(),
-            post_admission_signal: snapshot.inputs.post_admission_signal,
-            ledger_input_count: snapshot.ledger.input_count,
-            ledger_non_terminal_count: snapshot.ledger.non_terminal_count,
-            ledger_accepted_count: snapshot.ledger.accepted_count,
-            ledger_queued_count: snapshot.ledger.queued_count,
-            ledger_staged_count: snapshot.ledger.staged_count,
-            ledger_applied_count: snapshot.ledger.applied_count,
-            ledger_applied_pending_consumption_count: snapshot
-                .ledger
-                .applied_pending_consumption_count,
-            ledger_consumed_count: snapshot.ledger.consumed_count,
-            ledger_superseded_count: snapshot.ledger.superseded_count,
-            ledger_coalesced_count: snapshot.ledger.coalesced_count,
-            ledger_abandoned_count: snapshot.ledger.abandoned_count,
-            wait_request_present: snapshot.ops.wait_request_id.is_some(),
-            drain_slot_present: snapshot.drain.slot_present,
-            drain_phase: snapshot.drain.phase.map(runtime_parity_drain_phase_label),
-            formal_available_fields: normalize_runtime_parity_formal_fields(
-                snapshot.formal_state.available_fields,
-            ),
-            formal_unavailable_fields: snapshot.formal_state.unavailable_fields,
+        .map(|snapshot| {
+            let raw_formal_fields = snapshot.formal_state.available_fields.clone();
+            RuntimeParitySnapshotSummary {
+                phase: runtime_parity_state_label(snapshot.control.phase),
+                current_run_present: snapshot.control.current_run_id.is_some(),
+                formal_session_id: runtime_parity_formal_identity_field(
+                    &raw_formal_fields,
+                    "session_id",
+                ),
+                formal_active_runtime_id: runtime_parity_formal_identity_field(
+                    &raw_formal_fields,
+                    "active_runtime_id",
+                ),
+                formal_current_run_id: runtime_parity_formal_identity_field(
+                    &raw_formal_fields,
+                    "current_run_id",
+                ),
+                pre_run_phase: snapshot
+                    .control
+                    .pre_run_phase
+                    .map(runtime_parity_state_label),
+                attachment_live: snapshot.binding.attachment_live,
+                queue_len: snapshot.inputs.queue.len(),
+                steer_queue_len: snapshot.inputs.steer_queue.len(),
+                current_run_contributor_count: snapshot.inputs.current_run_contributors.len(),
+                admitted_input_count: snapshot.inputs.admission_order.len(),
+                post_admission_signal: snapshot.inputs.post_admission_signal,
+                ledger_input_count: snapshot.ledger.input_count,
+                ledger_non_terminal_count: snapshot.ledger.non_terminal_count,
+                ledger_accepted_count: snapshot.ledger.accepted_count,
+                ledger_queued_count: snapshot.ledger.queued_count,
+                ledger_staged_count: snapshot.ledger.staged_count,
+                ledger_applied_count: snapshot.ledger.applied_count,
+                ledger_applied_pending_consumption_count: snapshot
+                    .ledger
+                    .applied_pending_consumption_count,
+                ledger_consumed_count: snapshot.ledger.consumed_count,
+                ledger_superseded_count: snapshot.ledger.superseded_count,
+                ledger_coalesced_count: snapshot.ledger.coalesced_count,
+                ledger_abandoned_count: snapshot.ledger.abandoned_count,
+                wait_request_present: snapshot.ops.wait_request_id.is_some(),
+                drain_slot_present: snapshot.drain.slot_present,
+                drain_phase: snapshot.drain.phase.map(runtime_parity_drain_phase_label),
+                formal_available_fields: normalize_runtime_parity_formal_fields(
+                    snapshot.formal_state.available_fields,
+                ),
+                formal_unavailable_fields: snapshot.formal_state.unavailable_fields,
+            }
         })
 }
 
@@ -13290,6 +13467,7 @@ async fn execute_runtime_parity_probe(
             .await
     };
     let after = runtime_parity_snapshot_summary(&fixture.adapter, &fixture.session_id).await;
+    assert_runtime_parity_identity_stability(probe, before.as_ref(), after.as_ref());
     let (outcome_kind, result_summary) = match &result {
         Ok(result) => (
             RuntimeParityOutcomeKind::Ok,

@@ -1128,7 +1128,11 @@ mod tests {
             .iter()
             .find(|transition| transition.on.variant == "RegisterSession")
             .map(|transition| transition.name.clone())
-            .expect("register session transition should exist");
+            .unwrap_or_default();
+        assert!(
+            !transition.is_empty(),
+            "register session transition should exist"
+        );
 
         assert_eq!(
             schema.validate(),

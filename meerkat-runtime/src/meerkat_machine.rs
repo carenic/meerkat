@@ -149,8 +149,8 @@ impl DriverEntry {
     /// Check if the runtime can process queued inputs (Idle, Attached, or Retired).
     pub(crate) fn can_process_queue(&self) -> bool {
         match self {
-            DriverEntry::Ephemeral(d) => d.control().can_process_queue(),
-            DriverEntry::Persistent(d) => d.inner_ref().control().can_process_queue(),
+            DriverEntry::Ephemeral(d) => d.can_process_queue(),
+            DriverEntry::Persistent(d) => d.inner_ref().can_process_queue(),
         }
     }
 
@@ -204,10 +204,10 @@ impl DriverEntry {
         }
     }
 
-    pub(crate) fn control(&self) -> &crate::runtime_control_authority::RuntimeControlAuthority {
+    pub(crate) fn runtime_state(&self) -> crate::runtime_state::RuntimeState {
         match self {
-            DriverEntry::Ephemeral(d) => d.control(),
-            DriverEntry::Persistent(d) => d.inner_ref().control(),
+            DriverEntry::Ephemeral(d) => d.runtime_state(),
+            DriverEntry::Persistent(d) => d.inner_ref().runtime_state(),
         }
     }
 
@@ -3260,7 +3260,6 @@ impl MeerkatMachine {
             DriverEntry::Ephemeral(_) => MeerkatDriverKind::Ephemeral,
             DriverEntry::Persistent(_) => MeerkatDriverKind::Persistent,
         };
-        let control = driver.control();
         let ingress = driver.ingress();
 
         let binding = MeerkatBindingSnapshot {
@@ -3284,9 +3283,15 @@ impl MeerkatMachine {
         };
 
         let control = MeerkatControlSnapshot {
-            phase: control.phase(),
-            current_run_id: control.current_run_id().cloned(),
-            pre_run_phase: control.pre_run_state(),
+            phase: driver.runtime_state(),
+            current_run_id: match &*driver {
+                DriverEntry::Ephemeral(d) => d.current_run_id().cloned(),
+                DriverEntry::Persistent(d) => d.inner_ref().current_run_id().cloned(),
+            },
+            pre_run_phase: match &*driver {
+                DriverEntry::Ephemeral(d) => d.pre_run_phase(),
+                DriverEntry::Persistent(d) => d.inner_ref().pre_run_phase(),
+            },
         };
 
         let admission_order = ingress

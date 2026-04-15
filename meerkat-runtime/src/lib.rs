@@ -7,9 +7,7 @@
 //! - Input acceptance, validation, and queueing
 //! - InputState lifecycle tracking
 //! - Policy resolution (what to do with each input)
-//! - Runtime state machine (Idle ↔ Attached ↔ Running ↔ Retired/Stopped/Destroyed,
-//!   with compatibility-facing `Recovering` still present in `RuntimeState`
-//!   for restored historical state, but not entered on normal live paths)
+//! - Runtime state machine (Initializing ↔ Idle ↔ Attached ↔ Running ↔ Retired/Stopped/Destroyed)
 //! - Retire/recycle/reset lifecycle operations
 //! - RuntimeEvent observability
 //!
@@ -49,7 +47,6 @@ pub mod peer_handling_mode;
 pub mod policy;
 pub mod policy_table;
 pub mod queue;
-pub mod runtime_control_authority;
 pub mod runtime_event;
 pub mod runtime_ingress_authority;
 pub(crate) mod runtime_loop;
@@ -109,10 +106,6 @@ pub use policy::{
 };
 pub use policy_table::{DEFAULT_POLICY_VERSION, DefaultPolicyTable};
 pub use queue::InputQueue;
-pub use runtime_control_authority::{
-    RuntimeControlAuthority, RuntimeControlEffect, RuntimeControlInput, RuntimeControlMutator,
-    RuntimeControlTransition,
-};
 pub use runtime_event::{
     InputLifecycleEvent, RunLifecycleEvent, RuntimeEvent, RuntimeEventEnvelope,
     RuntimeProjectionEvent, RuntimeStateChangeEvent, RuntimeTopologyEvent,
