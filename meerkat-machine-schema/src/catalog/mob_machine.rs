@@ -45,17 +45,11 @@ pub fn mob_machine() -> MachineSchema {
                     "current_generation",
                     TypeRef::Option(Box::new(TypeRef::Named("Generation".into()))),
                 ),
-                field(
-                    "inflight_work_id",
-                    TypeRef::Option(Box::new(TypeRef::Named("WorkId".into()))),
-                ),
                 field("active_member_count", TypeRef::U32),
                 field("active_run_count", TypeRef::U32),
                 field("pending_spawn_count", TypeRef::U32),
                 field("retiring_member_count", TypeRef::U32),
                 field("wiring_edge_count", TypeRef::U32),
-                field("task_count", TypeRef::U32),
-                field("event_subscription_count", TypeRef::U32),
                 field("coordinator_bound", TypeRef::Bool),
             ],
             init: InitSchema {
@@ -65,14 +59,11 @@ pub fn mob_machine() -> MachineSchema {
                     init("active_runtime_id", Expr::None),
                     init("active_fence_token", Expr::None),
                     init("current_generation", Expr::None),
-                    init("inflight_work_id", Expr::None),
                     init("active_member_count", Expr::U64(0)),
                     init("active_run_count", Expr::U64(0)),
                     init("pending_spawn_count", Expr::U64(0)),
                     init("retiring_member_count", Expr::U64(0)),
                     init("wiring_edge_count", Expr::U64(0)),
-                    init("task_count", Expr::U64(0)),
-                    init("event_subscription_count", Expr::U64(0)),
                     init("coordinator_bound", Expr::Bool(false)),
                 ],
             },
@@ -131,19 +122,6 @@ pub fn mob_machine() -> MachineSchema {
         helpers: vec![],
         derived: vec![],
         invariants: vec![
-            InvariantSchema {
-                name: "active_work_requires_runtime".into(),
-                expr: Expr::Or(vec![
-                    Expr::Eq(
-                        Box::new(Expr::Field("inflight_work_id".into())),
-                        Box::new(Expr::None),
-                    ),
-                    Expr::Neq(
-                        Box::new(Expr::Field("active_runtime_id".into())),
-                        Box::new(Expr::None),
-                    ),
-                ]),
-            },
             InvariantSchema {
                 name: "destroyed_has_no_active_runtime".into(),
                 expr: Expr::Or(vec![
@@ -250,13 +228,10 @@ pub fn mob_machine() -> MachineSchema {
                         Box::new(Expr::None),
                     ),
                 }],
-                updates: vec![
-                    assign_some("inflight_work_id", "work_id"),
-                    Update::Increment {
-                        field: "active_run_count".into(),
-                        amount: 1,
-                    },
-                ],
+                updates: vec![Update::Increment {
+                    field: "active_run_count".into(),
+                    amount: 1,
+                }],
                 to: "Running".into(),
                 // SubmitMemberWork effect removed (unimplemented route to MeerkatMachine).
                 emit: vec![],
@@ -904,14 +879,7 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
         ),
         ("ExternalTurn", Some("EmitProgressNote"), vec![]),
         ("InternalTurn", Some("EmitProgressNote"), vec![]),
-        (
-            "TaskCreate",
-            Some("EmitTaskNotice"),
-            vec![Update::Increment {
-                field: "task_count".into(),
-                amount: 1,
-            }],
-        ),
+        ("TaskCreate", Some("EmitTaskNotice"), vec![]),
         ("TaskUpdate", Some("EmitTaskNotice"), vec![]),
         (
             "ForceCancel",
@@ -938,36 +906,18 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
             "SubscribeAgentEvents",
             vec![],
             vec![active_members_present_guard()],
-            vec![Update::Increment {
-                field: "event_subscription_count".into(),
-                amount: 1,
-            }],
+            vec![],
             vec![],
         ));
     }
-    for (variant, updates) in [
-        (
-            "SubscribeAllAgentEvents",
-            vec![Update::Increment {
-                field: "event_subscription_count".into(),
-                amount: 1,
-            }],
-        ),
-        (
-            "SubscribeMobEvents",
-            vec![Update::Increment {
-                field: "event_subscription_count".into(),
-                amount: 1,
-            }],
-        ),
-    ] {
+    for variant in ["SubscribeAllAgentEvents", "SubscribeMobEvents"] {
         for phase in &all_phases {
             transitions.push(mob_self_loop_transition(
                 variant,
                 phase,
                 variant,
                 vec![],
-                updates.clone(),
+                vec![],
                 vec![],
             ));
         }
@@ -1482,16 +1432,10 @@ fn runtime_is_bound_guard() -> Guard {
 }
 
 fn clear_runtime_projection_updates() -> Vec<Update> {
-    vec![
-        Update::Assign {
-            field: "inflight_work_id".into(),
-            expr: Expr::None,
-        },
-        Update::Assign {
-            field: "active_run_count".into(),
-            expr: Expr::U64(0),
-        },
-    ]
+    vec![Update::Assign {
+        field: "active_run_count".into(),
+        expr: Expr::U64(0),
+    }]
 }
 
 fn reset_member_runtime_updates() -> Vec<Update> {
@@ -1522,14 +1466,6 @@ fn reset_mob_projection_updates() -> Vec<Update> {
         },
         Update::Assign {
             field: "wiring_edge_count".into(),
-            expr: Expr::U64(0),
-        },
-        Update::Assign {
-            field: "task_count".into(),
-            expr: Expr::U64(0),
-        },
-        Update::Assign {
-            field: "event_subscription_count".into(),
             expr: Expr::U64(0),
         },
         Update::Assign {

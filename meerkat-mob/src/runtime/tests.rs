@@ -17651,19 +17651,15 @@ fn mob_runtime_parity_eval_expr(
         Expr::CurrentPhase => Some(MobRuntimeParityExprValue::String(snapshot.phase.clone())),
         Expr::Phase(phase) => Some(MobRuntimeParityExprValue::String(phase.clone())),
         Expr::Field(field) => mob_runtime_parity_field_value(snapshot, field),
-        Expr::Not(inner) => match mob_runtime_parity_eval_bool(inner, snapshot) {
-            Some(value) => Some(MobRuntimeParityExprValue::Bool(!value)),
-            None => None,
-        },
+        Expr::Not(inner) => mob_runtime_parity_eval_bool(inner, snapshot)
+            .map(|value| MobRuntimeParityExprValue::Bool(!value)),
         Expr::And(items) => match items
             .iter()
             .map(|item| mob_runtime_parity_eval_bool(item, snapshot))
             .collect::<Vec<_>>()
             .as_slice()
         {
-            values if values.iter().any(|value| *value == Some(false)) => {
-                Some(MobRuntimeParityExprValue::Bool(false))
-            }
+            values if values.contains(&Some(false)) => Some(MobRuntimeParityExprValue::Bool(false)),
             values if values.iter().all(|value| *value == Some(true)) => {
                 Some(MobRuntimeParityExprValue::Bool(true))
             }
@@ -17675,9 +17671,7 @@ fn mob_runtime_parity_eval_expr(
             .collect::<Vec<_>>()
             .as_slice()
         {
-            values if values.iter().any(|value| *value == Some(true)) => {
-                Some(MobRuntimeParityExprValue::Bool(true))
-            }
+            values if values.contains(&Some(true)) => Some(MobRuntimeParityExprValue::Bool(true)),
             values if values.iter().all(|value| *value == Some(false)) => {
                 Some(MobRuntimeParityExprValue::Bool(false))
             }
@@ -17947,13 +17941,13 @@ async fn mob_runtime_parity_execute_probe(
                 .handle
                 .cancel_flow(run_id)
                 .await
-                .map(|_| summarize_mob_runtime_success(probe, "unit"))
+                .map(|()| summarize_mob_runtime_success(probe, "unit"))
         }
         MobRuntimeParityProbeInput::Retire => fixture
             .handle
             .retire(fixture.worker_identity.clone())
             .await
-            .map(|_| summarize_mob_runtime_success(probe, "unit")),
+            .map(|()| summarize_mob_runtime_success(probe, "unit")),
         MobRuntimeParityProbeInput::Respawn => fixture
             .handle
             .respawn(fixture.worker_identity.clone(), None)
@@ -17964,7 +17958,7 @@ async fn mob_runtime_parity_execute_probe(
             .handle
             .retire_all()
             .await
-            .map(|_| summarize_mob_runtime_success(probe, "unit")),
+            .map(|()| summarize_mob_runtime_success(probe, "unit")),
         MobRuntimeParityProbeInput::Wire => fixture
             .handle
             .wire(
@@ -17972,7 +17966,7 @@ async fn mob_runtime_parity_execute_probe(
                 MeerkatId::from(fixture.lead_identity.as_str()),
             )
             .await
-            .map(|_| summarize_mob_runtime_success(probe, "unit")),
+            .map(|()| summarize_mob_runtime_success(probe, "unit")),
         MobRuntimeParityProbeInput::Unwire => fixture
             .handle
             .unwire(
@@ -17980,7 +17974,7 @@ async fn mob_runtime_parity_execute_probe(
                 MeerkatId::from(fixture.lead_identity.as_str()),
             )
             .await
-            .map(|_| summarize_mob_runtime_success(probe, "unit")),
+            .map(|()| summarize_mob_runtime_success(probe, "unit")),
         MobRuntimeParityProbeInput::ExternalTurn => fixture
             .handle
             .external_turn_for_member(
@@ -18003,40 +17997,40 @@ async fn mob_runtime_parity_execute_probe(
             .handle
             .cancel_work(WorkRef::new())
             .await
-            .map(|_| summarize_mob_runtime_success(probe, "unit")),
+            .map(|()| summarize_mob_runtime_success(probe, "unit")),
         MobRuntimeParityProbeInput::CancelAllWork => {
             let entry = fixture.worker_entry().await.map_err(MobError::Internal)?;
             fixture
                 .handle
                 .cancel_all_work(entry.agent_runtime_id.clone(), entry.fence_token)
                 .await
-                .map(|_| summarize_mob_runtime_success(probe, "unit"))
+                .map(|()| summarize_mob_runtime_success(probe, "unit"))
         }
         MobRuntimeParityProbeInput::Stop => fixture
             .handle
             .stop()
             .await
-            .map(|_| summarize_mob_runtime_success(probe, "unit")),
+            .map(|()| summarize_mob_runtime_success(probe, "unit")),
         MobRuntimeParityProbeInput::Resume => fixture
             .handle
             .resume()
             .await
-            .map(|_| summarize_mob_runtime_success(probe, "unit")),
+            .map(|()| summarize_mob_runtime_success(probe, "unit")),
         MobRuntimeParityProbeInput::Complete => fixture
             .handle
             .complete()
             .await
-            .map(|_| summarize_mob_runtime_success(probe, "unit")),
+            .map(|()| summarize_mob_runtime_success(probe, "unit")),
         MobRuntimeParityProbeInput::Reset => fixture
             .handle
             .reset()
             .await
-            .map(|_| summarize_mob_runtime_success(probe, "unit")),
+            .map(|()| summarize_mob_runtime_success(probe, "unit")),
         MobRuntimeParityProbeInput::Destroy => fixture
             .handle
             .destroy()
             .await
-            .map(|_| summarize_mob_runtime_success(probe, "unit")),
+            .map(|()| summarize_mob_runtime_success(probe, "unit")),
         MobRuntimeParityProbeInput::TaskCreate => fixture
             .handle
             .task_create("mob runtime parity".to_string(), "task".to_string(), vec![])
@@ -18052,7 +18046,7 @@ async fn mob_runtime_parity_execute_probe(
                     Some(fixture.worker_identity.clone()),
                 )
                 .await
-                .map(|_| summarize_mob_runtime_success(probe, "unit"))
+                .map(|()| summarize_mob_runtime_success(probe, "unit"))
         }
         MobRuntimeParityProbeInput::SubscribeAgentEvents => fixture
             .handle
@@ -18084,23 +18078,23 @@ async fn mob_runtime_parity_execute_probe(
                 .handle
                 .record_operator_action_provenance("spawn_member", &authority)
                 .await
-                .map(|_| summarize_mob_runtime_success(probe, "unit"))
+                .map(|()| summarize_mob_runtime_success(probe, "unit"))
         }
         MobRuntimeParityProbeInput::SetSpawnPolicy => fixture
             .handle
             .set_spawn_policy(None)
             .await
-            .map(|_| summarize_mob_runtime_success(probe, "unit")),
+            .map(|()| summarize_mob_runtime_success(probe, "unit")),
         MobRuntimeParityProbeInput::Shutdown => fixture
             .handle
             .shutdown()
             .await
-            .map(|_| summarize_mob_runtime_success(probe, "unit")),
+            .map(|()| summarize_mob_runtime_success(probe, "unit")),
         MobRuntimeParityProbeInput::ForceCancel => fixture
             .handle
             .force_cancel_member(fixture.cancel_identity.clone())
             .await
-            .map(|_| summarize_mob_runtime_success(probe, "unit")),
+            .map(|()| summarize_mob_runtime_success(probe, "unit")),
     }
 }
 
@@ -18148,7 +18142,7 @@ async fn execute_mob_runtime_parity_probe(
         ),
         Err(_) => (
             MobRuntimeParityOutcomeKind::Err,
-            format!("probe_timeout:{:?}", probe),
+            format!("probe_timeout:{probe:?}"),
         ),
     };
 

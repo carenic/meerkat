@@ -40,6 +40,8 @@ Current state:
   runtime pre-snapshots where it has enough field information to do so
 - the transition-bearing parity surface is exact for the current triangle:
   `65 / 65 / 65 / 0 / 0`
+- the formal machine no longer carries the pure shadow fields
+  `inflight_work_id`, `task_count`, or `event_subscription_count`
 
 ## Resolution Rubric
 
@@ -63,6 +65,13 @@ Current state:
   runtime requires a live member, so the schema now models that with
   `active_members_present`, and the audit evaluates that guard against the
   representative pre-state.
+- The next simplification tranche removed three pure shadow fields from the
+  formal machine:
+  - `inflight_work_id`
+  - `task_count`
+  - `event_subscription_count`
+- None of those fields participated in guards or emitted semantics, and the
+  exact lifecycle-triangle parity audit stayed green after the cut.
 
 ## Pair Ledger
 
@@ -76,16 +85,15 @@ Current state:
 ## Readout
 
 - The lifecycle triangle is now exact on the audited transition surface.
-- The broad quotient result still stands after the parity cleanup, but it is
-  now slightly stricter: the raw Mob quotient moved from `195` to `202` once
-  the schema stopped over-permitting `SubscribeAgentEvents` from
-  member-less completed states.
+- The broad quotient result still stands after the parity cleanup, and the
+  shadow-field cut made that read much cleaner: the raw Mob quotient stayed at
+  `202` even while the truthful state space collapsed from `4,797` to `1,390`.
 - The trustworthy raw/phase/full reread is now:
-  raw `4,797 -> 202`, phase `4,797 -> 204`, full `4,797 -> 4,797`.
-- The dominant mixed block (`2,819` states) is split primarily by
-  `event_subscription_count`, `pending_spawn_count`, `task_count`,
-  `wiring_edge_count`, `active_run_count`, `active_member_count`,
-  `retiring_member_count`, and `active_fence_token`.
+  raw `1,390 -> 202`, phase `1,390 -> 204`, full `1,390 -> 1,390`.
+- The dominant mixed block (`705` states) is now split primarily by
+  `pending_spawn_count`, `wiring_edge_count`, `active_run_count`,
+  `active_member_count`, `retiring_member_count`, `active_fence_token`,
+  `active_runtime_id`, and `coordinator_bound`.
 
 ## Notes
 
@@ -98,8 +106,7 @@ Current state:
 
 ## Next Loop
 
-1. Use the exact Mob parity baseline together with the trustworthy Hopcroft
-   reread when comparing Mob to Meerkat and planning DSL work.
-2. Decide whether the next Mob pass should widen into the query/surface-only
-   family or whether the better next gap is the Meerkat big-block field-split
-   analysis for DSL design.
+1. Decide whether `active_runtime_id` / `active_fence_token` are genuinely
+   load-bearing Mob semantics or the next seam-shadow family to normalize.
+2. Re-run the same parity-plus-Hopcroft loop after that decision before making
+   any broader DSL-facing claims.

@@ -81,8 +81,8 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | MobMachine | Surface-only inputs | 0 | 12 | +12 |
 | MobMachine | Signals | 79 | 31 | -48 |
 | MobMachine | Transitions | 210 | 82 | -128 |
-| MobMachine | TLC generated states | 452,835 | 169,282 | -283,553 |
-| MobMachine | TLC distinct states | 6,401 | 4,797 | -1,604 |
+| MobMachine | TLC generated states | 452,835 | 45,831 | -407,004 |
+| MobMachine | TLC distinct states | 6,401 | 1,390 | -5,011 |
 | MobMachine | TLC depth | 7 | 7 | 0 |
 
 ### Hypothesis / verdict tracker
@@ -98,6 +98,7 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | Prune Mob target / node / frame-terminal notice signals | passed / landed | Removed the absorbed target/node/terminal notice layer; TLC generated states fell from 244,230 to 202,140 while distinct states held at 5,411. |
 | Prune Mob frame / loop lifecycle signals | passed / landed | Removed the remaining top-level frame/loop mirror, including `active_frame_count` and `active_loop_count`; TLC generated states fell from 202,140 to 162,926 and distinct states fell from 5,411 to 4,859. |
 | `Creating` vs `Running` can merge internally | passed / landed | Fresh and resumed mobs already surface `Running`; removed the dead formal `Creating` phase and `Start` signal without changing the public `MobState` enum. |
+| Mob work/task/subscription shadow counters should not stay as top-level formal state | passed / landed | Removed `inflight_work_id`, `task_count`, and `event_subscription_count`; exact Mob parity stayed green and TLC distinct states fell from 4,797 to 1,390 while the raw/phase quotients stayed at 202 / 204. |
 | Meerkat `Recovering` is a transient / no-op top-level phase | passed / landed | Removed the unreachable top-level `Recovering` phase from the formal model; the internal `RuntimeControlAuthority` still owns recovery/recycle transitions, and TLC state space stayed unchanged. |
 | Meerkat pure queries should stay surfaced without formal transitions | passed / landed | Moved the read-only helper/query family into `surface_only_inputs`; runtime/schema audits stayed green and Meerkat TLC generated states dropped from 3,668,832 to 3,113,272 while the raw/phase quotients stayed at 385 / 390. |
 | Meerkat committed visibility publication progress should not stay as top-level shadow state | passed / landed | Removed `committed_visibility_revision` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 59,371 to 45,610 while the raw/phase quotients stayed at 385 / 390. |
@@ -150,9 +151,9 @@ We ran three observation modes for each machine:
 
 | Machine | Observation | Reachable states | Quotient states | Reduction | Reading |
 |---|---|---:|---:|---:|---|
-| MobMachine | `none` | 4,797 | 202 | 95.8% | Raw behavior is still dramatically smaller than the current formal state space, but exact parity tightened the quotient slightly. |
-| MobMachine | `phase` | 4,797 | 204 | 95.7% | Preserving phase still barely changes the quotient; `Running` / `Stopped` / `Completed` remain mostly projection. |
-| MobMachine | `full` | 4,797 | 4,797 | 0.0% | Once the full extended state is preserved, every reachable snapshot is distinct. |
+| MobMachine | `none` | 1,390 | 202 | 85.5% | Removing the pure work/task/subscription shadow fields collapsed the truthful state space hard while leaving the raw quotient unchanged, which is the signature of a successful shadow-state cut. |
+| MobMachine | `phase` | 1,390 | 204 | 85.3% | Preserving phase still barely changes the quotient; `Running` / `Stopped` / `Completed` remain mostly projection. |
+| MobMachine | `full` | 1,390 | 1,390 | 0.0% | Once the remaining extended state is preserved, every reachable snapshot is still distinct. |
 | MeerkatMachine | `none` | 11,814 | 385 | 96.7% | Raw behavior still collapses to a much smaller machine after the exact parity pass and the visibility plus LLM/capability boundary simplifications. |
 | MeerkatMachine | `phase` | 11,814 | 390 | 96.7% | Preserving phase still adds only five quotient blocks; phase remains almost entirely projection here too. |
 | MeerkatMachine | `full` | 11,814 | 11,425 | 3.3% | Preserving the full snapshot still keeps almost every remaining state distinct, but the remaining shadow projection layers are materially smaller. |
@@ -177,7 +178,7 @@ passes on the current branch tip.
 
 The raw quotient exposes the highest-signal parity/simplification targets:
 
-- **MobMachine** has one dominant mixed block of `2,819` states spanning
+- **MobMachine** has one dominant mixed block of `705` states spanning
   `Running`, `Stopped`, and `Completed`.
 - **MeerkatMachine** has one dominant mixed block of `4,669` states spanning
   `Initializing`, `Idle`, `Attached`, `Running`, `Retired`, and `Stopped`.
@@ -387,34 +388,33 @@ cargo run -p xtask --features machine-authority -- \
 
 Current result:
 
-- reachable states: `4,797`
+- reachable states: `1,390`
 - raw quotient states: `202`
 - phase-observed quotient states: `204`
-- full-observed quotient states: `4,797`
-- TLC: `167,791 generated / 4,797 distinct / depth 7`
-- dominant mixed block: `2,819` states spanning `Running`, `Stopped`, and
+- full-observed quotient states: `1,390`
+- TLC: `45,831 generated / 1,390 distinct / depth 7`
+- dominant mixed block: `705` states spanning `Running`, `Stopped`, and
   `Completed`
-- dominant block tuples: `1,714`
-- tuples reused across multiple phases: `565`
+- dominant block tuples: `379`
+- tuples reused across multiple phases: `169`
 - maximum phases sharing one tuple: `3`
 
-The dominant Mob block is being split primarily by counter-like field
-dimensions, not by phase:
+The dominant Mob block is now being split primarily by the remaining
+runtime-backed or seam-facing dimensions, not by the removed shadow counters:
 
-- `event_subscription_count`
 - `pending_spawn_count`
-- `task_count`
 - `wiring_edge_count`
 - `active_run_count`
 - `active_member_count`
 - `retiring_member_count`
 - `active_fence_token`
+- `active_runtime_id`
+- `coordinator_bound`
 
-The important read is that the quotient stayed in the same order of magnitude
-but moved from `195` to `202` once the schema stopped over-permitting
-member-specific subscriptions from member-less completed states. That is the
-exact kind of “don’t minimize against an under-modeled machine” correction the
-parity pass is supposed to surface.
+The important read is that the raw quotient stayed at `202` even as the
+reachable state space collapsed from `4,797` to `1,390`. That means the removed
+fields were carrying presentation-only distinctions, not additional labeled
+behavior. This is the exact kind of simplification we want before DSL work.
 
 ### Reading the current pass
 

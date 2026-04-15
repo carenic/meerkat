@@ -11,14 +11,11 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `active_runtime_id`: `Option<AgentRuntimeId>`
 - `active_fence_token`: `Option<FenceToken>`
 - `current_generation`: `Option<Generation>`
-- `inflight_work_id`: `Option<WorkId>`
 - `active_member_count`: `u32`
 - `active_run_count`: `u32`
 - `pending_spawn_count`: `u32`
 - `retiring_member_count`: `u32`
 - `wiring_edge_count`: `u32`
-- `task_count`: `u32`
-- `event_subscription_count`: `u32`
 - `coordinator_bound`: `Bool`
 
 ## Inputs
@@ -127,7 +124,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `EmitTaskNotice`
 
 ## Invariants
-- `active_work_requires_runtime`
 - `destroyed_has_no_active_runtime`
 - `active_runtime_has_identity`
 - `retiring_members_do_not_exceed_active_members`
