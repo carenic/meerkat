@@ -2081,7 +2081,7 @@ impl MeerkatMachine {
                     self.recover_or_create_ops_state(&session_id).await;
 
                 // Double-check under the lock — another task may have inserted
-                // the entry while we were recovering.
+                // the entry while we were rebuilding runtime state.
                 let mut sessions = self.sessions.write().await;
                 if let Some(entry) = sessions.get_mut(&session_id) {
                     entry.clear_dead_attachment();

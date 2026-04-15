@@ -93,7 +93,7 @@ Current state:
   stayed green after lifting it, and the targeted runtime/model regression for
   `SetSilentIntents` is green
 - live recycle no longer detours through a handwritten control-side
-  `Recovering` hop: the runtime helper now realizes recycle as the same direct
+  recovery hop: the runtime helper now realizes recycle as the same direct
   control projection the checked-in Meerkat machine already models
   (`Idle/Retired -> Idle`, `Attached -> Attached`), and exact parity stayed
   green after removing the extra helper-only recycle completion transition
@@ -147,19 +147,13 @@ Current exact-parity state:
   graph never drove those mirrors away from `FALSE`, and exact parity stayed
   green after both cuts
 - that closes the stale handwritten wake/process branch, and the handwritten
-  recover workflow is gone too: `RecoverRequested` / `RecoverySucceeded` were
-  removed from `RuntimeControlAuthority`, the runtime tests now drive the real
-  `recover()` path instead of a helper-only mini-machine, and `Recovering`
-  remains only as a compatibility-facing public `RuntimeState`
-- the remaining lower-authority control question is now narrower still:
-  the helper still owns a compatibility `ResumeRequested` escape hatch for an
-  explicitly restored `Recovering` state plus duplicated run-return
-  bookkeeping, but the live recover/recycle flow no longer depends on a
-  helper-side `Recovering` workflow
-- that duplicated run-return bookkeeping is narrower than before too: the
-  helper no longer stores a full `RuntimeState` as `pre_run_state`, only the
-  three return targets the checked-in machine already models
-  (`idle` / `attached` / `retired`)
+  recover workflow is gone too: `RecoverRequested` / `RecoverySucceeded`,
+  `ResumeRequested`, and the entire `RuntimeControlAuthority` reducer were
+  removed, so the runtime now exposes only real machine phases and the live
+  `recover()` path runs directly through the checked-in runtime/ingress seam
+- coarse control truth now lives directly with the runtime driver in the same
+  shape the checked-in machine models: `phase`, `current_run_id`, and the
+  three legal run-return targets (`idle` / `attached` / `retired`)
 - the dead top-level active-work slice is also gone: `active_work_id` never
   became `Some(...)` in the truthful graph, the old `has_active_work`-gated
   completion/operation slice had zero reachable edges, and exact parity stayed
@@ -170,10 +164,19 @@ Current exact-parity state:
   frontier
 - after broadening that `ToolFilter` domain, we removed the top-level
   `active_filter` / `staged_filter` mirrors as well; exact parity stayed green
-  and the truthful Meerkat readout now sits at `11,858` reachable states with
-  raw/phase/full quotients `385 / 390 / 11,469`
+  and the truthful pre-absorption Meerkat readout sat at `11,858` reachable
+  states with raw/phase/full quotients `385 / 390 / 11,469`
+- after deleting `RuntimeControlAuthority` as a semantic reducer and absorbing
+  coarse control truth into the runtime path that realizes `MeerkatMachine`,
+  the truthful Meerkat readout now sits at `17,384` reachable states with
+  raw/phase/full quotients `385 / 390 / 16,995`
 - the pure query surface remains runtime-audited helper behavior, but it is no
   longer counted as formal transition coverage
+- the next remaining dogma violation is no longer coarse control truth in a
+  separate reducer; it is the handwritten ingress lifecycle in
+  `RuntimeIngressAuthority`, which still owns coarse lifecycle facts
+  (`Active`/`Retired`/`Destroyed`, `current_run`, contributor queues, stop /
+  reset / destroy / recover transitions) outside the two checked-in machines
 
 Interpretation:
 
@@ -185,6 +188,11 @@ Interpretation:
 - the concrete answer to “is the machine under-modeled?” is now sharper:
   the remaining normalization work is about authority boundaries and field
   factoring, not about missing acceptance guards on the audited public surface
+- rerunning Hopcroft after the control absorption was necessary: the reachable
+  Meerkat graph changed materially (`11,858 -> 17,384`) even though the raw /
+  phase quotient stayed flat at `385 / 390`, which means the old
+  simplification map was stale but the core behavioral quotient remained
+  stable
 
 ## Resolution Rubric
 

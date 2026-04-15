@@ -50,7 +50,7 @@ Hopcroft-style behavioral quotient over the reachable graph.
 - Pruned the absorbed Mob target / node / frame-terminal notice layer by removing `RegisterTargets`, `RecordTarget*`, `NodeExecutionReleased`, `Terminalize*`, `CompleteNode`, `RecordNodeOutput`, `FailNode`, `SkipNode`, `CancelNode`, and `UntilConditionMet`, plus their top-level effect-only projections.
 - Pruned the remaining top-level Mob frame / loop mirror by removing `RegisterReadyFrame`, `RegisterPendingBodyFrame`, `FrameTerminated`, `StartRootFrame`, `StartBodyFrame`, `StartLoop`, `BodyFrameStarted`, `BodyFrame*`, `UntilConditionFailed`, and `CancelLoop`, along with `active_frame_count`, `active_loop_count`, and their orphan top-level effects/invariants.
 - Collapsed the formal Mob `Creating` phase into `Running`, removing the dead top-level `Start` signal and all `Creating`-only formal transitions while leaving the public `MobState` surface unchanged.
-- Removed the unreachable top-level Meerkat `Recovering` phase and its self-loops from the formal model while leaving the public `RuntimeState` compatibility surface unchanged.
+- Removed the unreachable top-level Meerkat `Recovering` phase and its self-loops from the formal model.
 - Extracted the Meerkat pure query/helper surface (`ContainsSession`,
   `SessionHasExecutor`, `SessionHasComms`, `OpsLifecycleRegistry`,
   `InputState`, `ListActiveInputs`, `RuntimeState`, `LoadBoundaryReceipt`) into
@@ -165,13 +165,12 @@ Hopcroft-style behavioral quotient over the reachable graph.
   transition.
 - Removed the dead handwritten recovery workflow from `RuntimeControlAuthority`
   by deleting `RecoverRequested` / `RecoverySucceeded` and retargeting the
-  remaining runtime tests to the real `recover()` path. `Recovering` now
-  remains only as a compatibility-facing public `RuntimeState` plus a narrow
-  `Resume` escape hatch for explicitly restored historical state.
-- Narrowed the remaining handwritten run-return bookkeeping as well:
-  `RuntimeControlAuthority` no longer stores an arbitrary `RuntimeState` in
-  `pre_run_state`, only the three return targets the checked-in Meerkat
-  machine already models (`idle`, `attached`, `retired`).
+  remaining runtime tests to the real `recover()` path.
+- Removed the remaining handwritten control authority as a semantic reducer:
+  `Recovering` and `Resume` are gone from the runtime surface, coarse control
+  truth now lives directly with the runtime driver in the same shape the
+  checked-in Meerkat machine models, and `RuntimeControlAuthority` no longer
+  exists as a second lifecycle owner.
 - Taught the generated closed-world composition models to reject queued
   external entry packets that are no longer admissible for the current machine
   state, which removes seam deadlocks without widening the machine transition
@@ -220,7 +219,7 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | Mob `retiring_member_count` should not stay as top-level formal state | passed / landed | Removed the dead retire counter; exact Mob parity stayed green and the truthful Hopcroft/TLC readout stayed flat at `770 -> 138 / 140 / 770`, proving the counter was not carrying independent formal behavior. |
 | Mob public `Stop` should reject active flows | passed / landed | Added `no_active_runs` to `StopRunning` after a focused runtime/schema probe showed `handle.stop()` rejects while flows are still active; the lifecycle-triangle parity audit stayed exact and truthful TLC generated states fell from `25,943` to `25,767` with the quotient unchanged. |
 | Mob bootstrap should start with coordinator bound | passed / landed | Changed the formal init state from `Running + coordinator_bound=false` to `Running + coordinator_bound=true` to match the live runtime bootstrap snapshot; the lifecycle-triangle parity audit stayed exact and the truthful quotient held at `138 / 140` while reachable states rose from `770` to `813`, proving the old bootstrap state had been under-modeled rather than behavior-bearing. |
-| Meerkat `Recovering` is a transient / no-op top-level phase | passed / landed | Removed the unreachable top-level `Recovering` phase from the formal model; the live recover/recycle flow no longer depends on a handwritten helper `Recovering` workflow, and the remaining `Recovering` surface is compatibility-only. |
+| Meerkat `Recovering` is a transient / no-op top-level phase | passed / landed | Removed the unreachable top-level `Recovering` phase from the formal model, then removed `Recovering` from the runtime and wire surfaces as well. The live recover/recycle flow no longer depends on any handwritten helper recovery workflow. |
 | Meerkat pure queries should stay surfaced without formal transitions | passed / landed | Moved the read-only helper/query family into `surface_only_inputs`; runtime/schema audits stayed green and Meerkat TLC generated states dropped from 3,668,832 to 3,113,272 while the raw/phase quotients stayed at 385 / 390. |
 | Meerkat committed visibility publication progress should not stay as top-level shadow state | passed / landed | Removed `committed_visibility_revision` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 59,371 to 45,610 while the raw/phase quotients stayed at 385 / 390. |
 | Meerkat visibility witness provenance should not stay as top-level shadow state | passed / landed | Removed `requested_witnesses` and `filter_witnesses` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 45,610 to 15,809 while the raw/phase quotients still held at 385 / 390. |
@@ -232,7 +231,7 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | Meerkat active-work slice should not stay as top-level formal state | passed / landed | Removed `active_work_id` plus the unreachable top-level `RunCompleted` / `RunFailed` / `RunCancelled` and old `has_active_work`-guarded operation-completion signal slice; exact audited parity stayed green and the truthful TLC/Hopcroft readout stayed flat at 11,814 reachable with raw/phase/full quotients 385 / 390 / 11,425. |
 | Meerkat `ToolFilter` verification domain should not stay singleton | passed / landed | Broadened CI/deep cfg generation from `ToolFilterValues = {"All"}` to `{"All", "toolfilter_2"}`; the truthful Meerkat state space rose from 11,814 to 38,945 distinct states while the raw/phase quotient stayed at 385 / 390, proving the old filter simplification signal had been under-constrained rather than behavior-free. |
 | Meerkat top-level filter mirrors should not stay as formal state | passed / landed | Removed top-level `active_filter` / `staged_filter` after the stronger two-sample `ToolFilter` rerun showed the authoritative filter state already lives in `MachineToolVisibilityOwner`; exact audited parity stayed green and the truthful Meerkat state space fell back from 38,945 to 11,814 distinct states while the raw/phase quotient stayed at 385 / 390. |
-| Behavior-bearing runtime-control state should stay outside MeerkatMachine | rejected | `current_run_id` is now absorbed back into the checked-in Meerkat machine, the stale handwritten control booleans are gone, the dead handwritten recover workflow is gone, and even the remaining helper-side run-return bookkeeping is narrowed to the same three return targets the checked-in machine models. The remaining work is the compatibility-facing `Recovering`/`Resume` surface plus any surviving duplicated run-return realization, not keeping live shell state below the two-machine model. |
+| Behavior-bearing runtime-control state should stay outside MeerkatMachine | rejected / landed | `current_run_id` is absorbed back into the checked-in Meerkat machine, the stale handwritten control booleans are gone, the dead handwritten recover workflow is gone, `Recovering` / `Resume` are gone from the runtime surface, and `RuntimeControlAuthority` has been deleted as a semantic reducer. Rerunning Hopcroft/TLC after that absorption changed the truthful Meerkat graph from `11,858` to `17,384` reachable states while leaving the raw/phase quotient flat at `385 / 390`, which is the right signature for lifting real control truth into the machine without changing its core behavioral quotient. |
 | Active run identity can stay outside the checked-in Meerkat machine | rejected / landed | Absorbed `current_run_id` into the top-level Meerkat state and wired the same prepare/commit/fail/control clears as the runtime. Exact audited parity stayed green, TLC moved to `1,068,719 generated / 11,858 distinct / depth 9`, and Hopcroft stayed at raw/phase/full `385 / 390 / 11,469`, which is the expected signature for lifting a real control truth into the model without changing the core quotient. |
 | Attached steered accept can stay collapsed into the queue-only accept surface | rejected / landed | The live runtime can synchronously jump `Attached -> Running` during `AcceptWithCompletion` when admission requests immediate processing. The Meerkat catalog now models that payload-sensitive path explicitly with a run binding, and the targeted runtime/model regression is green. |
 | Running interrupt-bearing accept can stay collapsed into the passive queued accept surface | rejected / landed | The live runtime can request `InterruptYielding` during running queued `AcceptWithCompletion` even when it does not request immediate processing. The checked-in Meerkat machine now models that typed `PostAdmissionSignal("InterruptYielding")` branch explicitly, and both the targeted regression and the exact parity audits stayed green. |
@@ -286,9 +285,16 @@ We ran three observation modes for each machine:
 | MobMachine | `none` | 813 | 138 | 83.0% | After the bootstrap parity correction, the truthful graph grew slightly while the raw quotient stayed flat, confirming the old `coordinator_bound=false` init was under-modeled bootstrap truth rather than behavior-bearing structure. |
 | MobMachine | `phase` | 813 | 140 | 82.8% | Preserving phase still adds only two quotient blocks; `Running` / `Stopped` / `Completed` remain mostly projection. |
 | MobMachine | `full` | 813 | 813 | 0.0% | Once the remaining authoritative counters are preserved, every reachable Mob snapshot is still distinct. |
-| MeerkatMachine | `none` | 11,858 | 385 | 96.8% | After absorbing `current_run_id` and modeling the live attached-steer plus running-interrupt acceptance branches, the truthful graph rises slightly while the raw quotient stays flat, which is the expected signature for lifting real control truth into the checked-in machine without changing its core behavioral complexity. |
-| MeerkatMachine | `phase` | 11,858 | 390 | 96.7% | Preserving phase still adds only five quotient blocks, so phase remains almost entirely projection here too. |
-| MeerkatMachine | `full` | 11,858 | 11,469 | 3.3% | Preserving the full snapshot still keeps nearly every remaining Meerkat state distinct, but the extra structure now lives in revisions, deferred-name sets, runtime binding, and pre-run restoration rather than in the removed filter mirrors. |
+| MeerkatMachine | `none` | 17,384 | 385 | 97.8% | After deleting `RuntimeControlAuthority` as a semantic reducer and rerunning the truthful model, the reachable graph grows materially while the raw quotient stays flat. The main new split drivers are now checked-in control facts (`current_run_id`, `pre_run_phase`) rather than helper-owned folklore. |
+| MeerkatMachine | `phase` | 17,384 | 390 | 97.8% | Preserving phase still adds only five quotient blocks, so phase remains almost entirely projection even after the control-absorption tranche. |
+| MeerkatMachine | `full` | 17,384 | 16,995 | 2.2% | Preserving the full snapshot still keeps nearly every remaining Meerkat state distinct, but the extra structure now lives in visibility revisions, deferred-name sets, run binding/return state, ingress configuration, and drain state rather than in the deleted helper authority. |
+
+That rerun also clarified the next architectural blocker. The stale
+`RuntimeControlAuthority` problem is gone, but `RuntimeIngressAuthority` still
+owns a handwritten lifecycle (`Active` / `Retired` / `Destroyed`,
+`current_run`, contributor queues, and stop/reset/destroy/recover transitions)
+outside the two checked-in machines. The next honest tranche is therefore
+another absorption step, not a blind simplification cut.
 
 All six rows above have now been rerun after the exact runtime/schema parity
 passes on the current branch tip.
