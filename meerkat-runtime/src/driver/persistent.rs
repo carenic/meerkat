@@ -190,6 +190,14 @@ impl PersistentRuntimeDriver {
         self.inner.stage_batch(input_ids, run_id)
     }
 
+    pub(crate) fn machine_realize_stage_batch(
+        &mut self,
+        input_ids: &[InputId],
+        run_id: &meerkat_core::lifecycle::RunId,
+    ) -> Result<(), crate::input_lifecycle_authority::InputLifecycleError> {
+        self.inner.machine_realize_stage_batch(input_ids, run_id)
+    }
+
     /// Apply input (delegates to inner).
     pub fn apply_input(
         &mut self,
@@ -411,10 +419,19 @@ impl PersistentRuntimeDriver {
         receipt: RunBoundaryReceipt,
         session_snapshot: Option<Vec<u8>>,
     ) -> Result<(), RuntimeDriverError> {
+        self.machine_realize_boundary_applied(&run_id, &receipt, session_snapshot.as_ref())
+            .await
+    }
+
+    pub(crate) async fn machine_realize_boundary_applied(
+        &mut self,
+        run_id: &RunId,
+        receipt: &RunBoundaryReceipt,
+        session_snapshot: Option<&Vec<u8>>,
+    ) -> Result<(), RuntimeDriverError> {
         let checkpoint = self.inner.clone();
         self.inner
-            .boundary_applied(run_id, receipt.clone(), session_snapshot.clone())
-            .await?;
+            .machine_realize_boundary_applied(run_id, receipt)?;
         if self
             .store
             .load_boundary_receipt(&self.runtime_id, &receipt.run_id, receipt.sequence)
@@ -433,9 +450,10 @@ impl PersistentRuntimeDriver {
         self.store
             .atomic_apply(
                 &self.runtime_id,
-                session_snapshot
-                    .map(|session_snapshot| crate::store::SessionDelta { session_snapshot }),
-                receipt,
+                session_snapshot.map(|session_snapshot| crate::store::SessionDelta {
+                    session_snapshot: session_snapshot.clone(),
+                }),
+                receipt.clone(),
                 input_updates,
                 None,
             )
@@ -452,8 +470,18 @@ impl PersistentRuntimeDriver {
         run_id: RunId,
         consumed_input_ids: Vec<InputId>,
     ) -> Result<(), RuntimeDriverError> {
+        self.machine_realize_run_completed(&run_id, &consumed_input_ids)
+            .await
+    }
+
+    pub(crate) async fn machine_realize_run_completed(
+        &mut self,
+        run_id: &RunId,
+        consumed_input_ids: &[InputId],
+    ) -> Result<(), RuntimeDriverError> {
         let checkpoint = self.inner.clone();
-        self.inner.run_completed(run_id, consumed_input_ids).await?;
+        self.inner
+            .machine_realize_run_completed(run_id, consumed_input_ids)?;
         let input_states = self.inner.input_states_snapshot();
         if let Err(err) = self
             .store
@@ -480,16 +508,33 @@ impl PersistentRuntimeDriver {
         error: String,
         recoverable: bool,
     ) -> Result<(), RuntimeDriverError> {
+        self.machine_realize_run_failed(
+            &run_id,
+            &contributing_input_ids,
+            &replay_plan,
+            &error,
+            recoverable,
+        )
+        .await
+    }
+
+    pub(crate) async fn machine_realize_run_failed(
+        &mut self,
+        run_id: &RunId,
+        contributing_input_ids: &[InputId],
+        replay_plan: &super::ephemeral::ReplayQueuedContributorsPlan,
+        error: &str,
+        recoverable: bool,
+    ) -> Result<(), RuntimeDriverError> {
         let checkpoint = self.inner.clone();
         self.inner
-            .run_failed(
-                run_id,
-                contributing_input_ids,
-                replay_plan,
-                error,
-                recoverable,
-            )
-            .await?;
+            .machine_realize_run_failed(run_id, contributing_input_ids, replay_plan)?;
+        tracing::debug!(
+            run_id = ?run_id,
+            recoverable,
+            error,
+            "persistent driver realized machine-owned failed-run replay"
+        );
         let input_states = self.inner.input_states_snapshot();
         if let Err(err) = self
             .store

@@ -682,12 +682,33 @@ impl EphemeralRuntimeDriver {
         input_ids: &[InputId],
         run_id: &RunId,
     ) -> Result<(), InputLifecycleError> {
+        self.machine_realize_stage_batch(input_ids, run_id)
+    }
+
+    /// Machine-owned realization for a validated staged contributor batch.
+    pub(crate) fn machine_realize_stage_batch(
+        &mut self,
+        input_ids: &[InputId],
+        run_id: &RunId,
+    ) -> Result<(), InputLifecycleError> {
         // The checked-in Meerkat machine already owns contributor-set legality
-        // for starting a run batch. Ingress applies only the already-decided
-        // queue/lifecycle updates and emits the StageInput effects that drive
-        // the per-input lifecycle authority and staged events.
-        let transition = self.ingress.stage_drain_snapshot(run_id, input_ids);
-        self.process_ingress_effects(&transition.effects);
+        // for starting a run batch. Production no longer routes this through
+        // an ingress-helper transition surface; it applies the already-decided
+        // queue removal and staged lifecycle updates directly.
+        self.ingress.remove_from_queue_lanes(input_ids);
+        for input_id in input_ids {
+            self.ingress
+                .set_lifecycle_state(input_id, InputLifecycleState::Staged);
+            if let Some(state) = self.ledger.get_mut(input_id) {
+                state.apply(InputLifecycleInput::StageForRun {
+                    run_id: run_id.clone(),
+                })?;
+            }
+            self.emit_event(RuntimeEvent::InputLifecycle(InputLifecycleEvent::Staged {
+                input_id: input_id.clone(),
+                run_id: run_id.clone(),
+            }));
+        }
         self.rebuild_queue_projections();
         self.debug_assert_queue_projection_alignment();
 
@@ -987,13 +1008,25 @@ impl EphemeralRuntimeDriver {
         run_id: RunId,
         consumed_input_ids: Vec<InputId>,
     ) -> Result<(), RuntimeDriverError> {
-        // The checked-in Meerkat machine already owns contributor-set legality
-        // for completion. Ingress applies only the already-decided queue /
-        // lifecycle updates for those contributors.
-        let transition = self.ingress.run_completed(&consumed_input_ids);
-        self.process_ingress_effects(&transition.effects);
+        self.machine_realize_run_completed(&run_id, &consumed_input_ids)
+    }
 
-        self.consume_inputs(&consumed_input_ids, &run_id)
+    /// Machine-owned realization for a validated run-completion transition.
+    pub(crate) fn machine_realize_run_completed(
+        &mut self,
+        run_id: &RunId,
+        consumed_input_ids: &[InputId],
+    ) -> Result<(), RuntimeDriverError> {
+        // The checked-in Meerkat machine already owns contributor-set legality
+        // for completion. Production applies the already-decided consumed
+        // lifecycle mirror directly instead of routing through an ingress
+        // helper transition.
+        for input_id in consumed_input_ids {
+            self.ingress
+                .set_lifecycle_state(input_id, InputLifecycleState::Consumed);
+        }
+
+        self.consume_inputs(consumed_input_ids, run_id)
             .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
         Ok(())
     }
@@ -1006,15 +1039,30 @@ impl EphemeralRuntimeDriver {
         _error: String,
         _recoverable: bool,
     ) -> Result<(), RuntimeDriverError> {
-        let transition = self.ingress.replay_queued_contributors(
-            &replay_plan.queue_work_ids,
-            &replay_plan.steer_work_ids,
-            replay_plan.wake_runtime,
-            replay_plan.notice_kind,
-        );
-        self.process_ingress_effects(&transition.effects);
+        self.machine_realize_run_failed(&run_id, &contributing_input_ids, &replay_plan)
+    }
 
-        self.rollback_staged(&contributing_input_ids)
+    /// Machine-owned realization for a validated failed-run replay plan.
+    pub(crate) fn machine_realize_run_failed(
+        &mut self,
+        run_id: &RunId,
+        contributing_input_ids: &[InputId],
+        replay_plan: &ReplayQueuedContributorsPlan,
+    ) -> Result<(), RuntimeDriverError> {
+        self.ingress
+            .replay_queue_lanes(&replay_plan.queue_work_ids, &replay_plan.steer_work_ids);
+        if replay_plan.wake_runtime && self.post_admission_signal < PostAdmissionSignal::WakeLoop {
+            self.post_admission_signal = PostAdmissionSignal::WakeLoop;
+        }
+        tracing::debug!(
+            run_id = ?run_id,
+            kind = replay_plan.notice_kind,
+            queue = replay_plan.queue_work_ids.len(),
+            steer = replay_plan.steer_work_ids.len(),
+            "runtime replayed queued contributors"
+        );
+
+        self.rollback_staged(contributing_input_ids)
             .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
         Ok(())
     }
@@ -1025,13 +1073,28 @@ impl EphemeralRuntimeDriver {
         receipt: RunBoundaryReceipt,
         _session_snapshot: Option<Vec<u8>>,
     ) -> Result<(), RuntimeDriverError> {
+        self.machine_realize_boundary_applied(&run_id, &receipt)
+    }
+
+    /// Machine-owned realization for a validated boundary-application step.
+    pub(crate) fn machine_realize_boundary_applied(
+        &mut self,
+        run_id: &RunId,
+        receipt: &RunBoundaryReceipt,
+    ) -> Result<(), RuntimeDriverError> {
         // The checked-in Meerkat machine already owns contributor-set legality
-        // for boundary application. Ingress applies only the already-decided
-        // queue/lifecycle updates for those contributors.
-        let transition = self
-            .ingress
-            .boundary_applied(&receipt.contributing_input_ids, receipt.sequence);
-        self.process_ingress_effects(&transition.effects);
+        // for boundary application. Production applies the already-decided
+        // pending-consumption lifecycle mirror directly instead of routing
+        // through an ingress helper transition.
+        for input_id in &receipt.contributing_input_ids {
+            self.ingress
+                .set_lifecycle_state(input_id, InputLifecycleState::AppliedPendingConsumption);
+        }
+        tracing::debug!(
+            contributors = receipt.contributing_input_ids.len(),
+            sequence = receipt.sequence,
+            "runtime boundary applied"
+        );
 
         for input_id in &receipt.contributing_input_ids {
             if let Some(state) = self.ledger.get_mut(input_id) {

@@ -258,34 +258,38 @@ impl DriverEntry {
         }
     }
 
-    pub(crate) async fn boundary_applied(
+    pub(crate) async fn machine_realize_boundary_applied(
         &mut self,
         run_id: RunId,
         receipt: meerkat_core::lifecycle::RunBoundaryReceipt,
         session_snapshot: Option<Vec<u8>>,
     ) -> Result<(), RuntimeDriverError> {
         match self {
-            DriverEntry::Ephemeral(d) => {
-                d.boundary_applied(run_id, receipt, session_snapshot).await
-            }
+            DriverEntry::Ephemeral(d) => d.machine_realize_boundary_applied(&run_id, &receipt),
             DriverEntry::Persistent(d) => {
-                d.boundary_applied(run_id, receipt, session_snapshot).await
+                d.machine_realize_boundary_applied(&run_id, &receipt, session_snapshot.as_ref())
+                    .await
             }
         }
     }
 
-    pub(crate) async fn run_completed(
+    pub(crate) async fn machine_realize_run_completed(
         &mut self,
         run_id: RunId,
         consumed_input_ids: Vec<InputId>,
     ) -> Result<(), RuntimeDriverError> {
         match self {
-            DriverEntry::Ephemeral(d) => d.run_completed(run_id, consumed_input_ids).await,
-            DriverEntry::Persistent(d) => d.run_completed(run_id, consumed_input_ids).await,
+            DriverEntry::Ephemeral(d) => {
+                d.machine_realize_run_completed(&run_id, &consumed_input_ids)
+            }
+            DriverEntry::Persistent(d) => {
+                d.machine_realize_run_completed(&run_id, &consumed_input_ids)
+                    .await
+            }
         }
     }
 
-    pub(crate) async fn run_failed(
+    pub(crate) async fn machine_realize_run_failed(
         &mut self,
         run_id: RunId,
         contributing_input_ids: Vec<InputId>,
@@ -295,21 +299,15 @@ impl DriverEntry {
     ) -> Result<(), RuntimeDriverError> {
         match self {
             DriverEntry::Ephemeral(d) => {
-                d.run_failed(
-                    run_id,
-                    contributing_input_ids,
-                    replay_plan,
-                    error,
-                    recoverable,
-                )
-                .await
+                let _ = (error, recoverable);
+                d.machine_realize_run_failed(&run_id, &contributing_input_ids, &replay_plan)
             }
             DriverEntry::Persistent(d) => {
-                d.run_failed(
-                    run_id,
-                    contributing_input_ids,
-                    replay_plan,
-                    error,
+                d.machine_realize_run_failed(
+                    &run_id,
+                    &contributing_input_ids,
+                    &replay_plan,
+                    &error,
                     recoverable,
                 )
                 .await
@@ -330,14 +328,14 @@ impl DriverEntry {
     }
 
     /// Stage a batch of inputs atomically in a single `StageDrainSnapshot`.
-    pub(crate) fn stage_batch(
+    pub(crate) fn machine_realize_stage_batch(
         &mut self,
         input_ids: &[InputId],
         run_id: &RunId,
     ) -> Result<(), InputLifecycleError> {
         match self {
-            DriverEntry::Ephemeral(d) => d.stage_batch(input_ids, run_id),
-            DriverEntry::Persistent(d) => d.stage_batch(input_ids, run_id),
+            DriverEntry::Ephemeral(d) => d.machine_realize_stage_batch(input_ids, run_id),
+            DriverEntry::Persistent(d) => d.machine_realize_stage_batch(input_ids, run_id),
         }
     }
 
@@ -1148,7 +1146,7 @@ pub(crate) async fn prepare_runtime_loop_batch_start(
         RuntimeDriverError::Internal(format!("failed to start runtime run: {err}"))
     })?;
 
-    if let Err(err) = driver.stage_batch(staged_ids, &run_id) {
+    if let Err(err) = driver.machine_realize_stage_batch(staged_ids, &run_id) {
         let _ = driver.rollback_staged(staged_ids);
         let next_phase =
             crate::runtime_state::run_return_phase_from_pre_run_phase(driver.pre_run_phase());
@@ -1173,7 +1171,7 @@ pub(crate) async fn commit_runtime_loop_run(
         crate::runtime_state::run_return_phase_from_pre_run_phase(driver.pre_run_phase());
     machine_validate_boundary_applied(&driver, &receipt.contributing_input_ids)?;
     if let Err(err) = driver
-        .boundary_applied(run_id.clone(), receipt, session_snapshot)
+        .machine_realize_boundary_applied(run_id.clone(), receipt, session_snapshot)
         .await
     {
         let unwind_run_id = run_id.clone();
@@ -1181,7 +1179,7 @@ pub(crate) async fn commit_runtime_loop_run(
         machine_validate_run_failed(&driver, &staged_input_ids)?;
         let replay_plan = machine_build_replay_plan(&driver, &staged_input_ids, "RunFailed");
         if let Err(unwind_err) = driver
-            .run_failed(
+            .machine_realize_run_failed(
                 unwind_run_id.clone(),
                 staged_input_ids,
                 replay_plan,
@@ -1209,7 +1207,7 @@ pub(crate) async fn commit_runtime_loop_run(
     let completed_run_id = run_id.clone();
     machine_validate_run_completed(&driver, &consumed_input_ids)?;
     driver
-        .run_completed(completed_run_id.clone(), consumed_input_ids)
+        .machine_realize_run_completed(completed_run_id.clone(), consumed_input_ids)
         .await
         .map_err(|err| {
             RuntimeDriverError::Internal(format!(
@@ -1240,7 +1238,7 @@ pub(crate) async fn fail_runtime_loop_run(
     machine_validate_run_failed(&driver, &staged_input_ids)?;
     let replay_plan = machine_build_replay_plan(&driver, &staged_input_ids, "RunFailed");
     driver
-        .run_failed(
+        .machine_realize_run_failed(
             failed_run_id.clone(),
             staged_input_ids,
             replay_plan,

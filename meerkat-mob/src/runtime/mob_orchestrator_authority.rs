@@ -150,12 +150,12 @@ struct MobOrchestratorFields {
 }
 
 impl MobOrchestratorFields {
-    fn to_snapshot(&self, phase: MobState) -> MobOrchestratorSnapshot {
+    fn to_snapshot(&self, phase: MobState, active_flow_count: u32) -> MobOrchestratorSnapshot {
         MobOrchestratorSnapshot {
             phase,
             coordinator_bound: self.coordinator_bound,
             pending_spawn_count: self.pending_spawn_count,
-            active_flow_count: self.active_flow_count,
+            active_flow_count,
             topology_revision: self.topology_revision,
             supervisor_active: self.supervisor_active,
         }
@@ -247,12 +247,17 @@ impl MobOrchestratorAuthority {
     /// Current snapshot of all fields.
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> MobOrchestratorSnapshot {
-        self.fields.to_snapshot(self.phase)
+        self.fields
+            .to_snapshot(self.phase, self.fields.active_flow_count)
     }
 
     /// Current snapshot projected onto an external phase owner.
-    pub(crate) fn snapshot_in_phase(&self, phase: MobState) -> MobOrchestratorSnapshot {
-        self.fields.to_snapshot(phase)
+    pub(crate) fn snapshot_in_phase(
+        &self,
+        phase: MobState,
+        active_flow_count: u32,
+    ) -> MobOrchestratorSnapshot {
+        self.fields.to_snapshot(phase, active_flow_count)
     }
 
     /// Check if a transition is legal without applying it.
@@ -262,8 +267,14 @@ impl MobOrchestratorAuthority {
     }
 
     /// Check legality using an externally owned top-level phase.
-    pub(crate) fn can_accept_in_phase(&self, phase: MobState, input: MobOrchestratorInput) -> bool {
-        self.evaluate_in_phase(phase, input).is_ok()
+    pub(crate) fn can_accept_in_phase(
+        &self,
+        phase: MobState,
+        active_flow_count: u32,
+        input: MobOrchestratorInput,
+    ) -> bool {
+        self.evaluate_in_phase(phase, active_flow_count, input)
+            .is_ok()
     }
 
     /// Evaluate a transition without committing it.
@@ -271,15 +282,32 @@ impl MobOrchestratorAuthority {
     fn evaluate(
         &self,
         input: MobOrchestratorInput,
-    ) -> Result<(MobState, MobOrchestratorFields, Vec<MobOrchestratorEffect>), MobError> {
-        self.evaluate_in_phase(self.phase, input)
+    ) -> Result<
+        (
+            MobState,
+            MobOrchestratorFields,
+            u32,
+            Vec<MobOrchestratorEffect>,
+        ),
+        MobError,
+    > {
+        self.evaluate_in_phase(self.phase, self.fields.active_flow_count, input)
     }
 
     fn evaluate_in_phase(
         &self,
         phase: MobState,
+        active_flow_count: u32,
         input: MobOrchestratorInput,
-    ) -> Result<(MobState, MobOrchestratorFields, Vec<MobOrchestratorEffect>), MobError> {
+    ) -> Result<
+        (
+            MobState,
+            MobOrchestratorFields,
+            u32,
+            Vec<MobOrchestratorEffect>,
+        ),
+        MobError,
+    > {
         use MobOrchestratorInput::{
             BindCoordinator, CompleteFlow, CompleteSpawn, DestroyOrchestrator, ForceCancelMember,
             MarkCompleted, ResumeOrchestrator, StageSpawn, StartFlow, StopOrchestrator,
@@ -288,6 +316,7 @@ impl MobOrchestratorAuthority {
         use MobState::{Completed, Destroyed, Running, Stopped};
 
         let mut fields = self.fields.clone();
+        let mut next_active_flow_count = active_flow_count;
         let mut effects = Vec::new();
 
         let next_phase = match (phase, input) {
@@ -370,7 +399,7 @@ impl MobOrchestratorAuthority {
                         "guard failed: coordinator is not bound (start flow requires bound coordinator)".into(),
                     ));
                 }
-                fields.active_flow_count = fields.active_flow_count.saturating_add(1);
+                next_active_flow_count = active_flow_count.saturating_add(1);
                 effects.push(MobOrchestratorEffect::FlowActivated);
                 effects.push(MobOrchestratorEffect::EmitOrchestratorNotice);
                 Running
@@ -381,12 +410,12 @@ impl MobOrchestratorAuthority {
             // Updates: active_flow_count -= 1
             // Emits: FlowDeactivated, EmitOrchestratorNotice
             (Running | Completed, CompleteFlow) => {
-                if fields.active_flow_count == 0 {
+                if active_flow_count == 0 {
                     return Err(MobError::Internal(
                         "guard failed: no active flows to complete".into(),
                     ));
                 }
-                fields.active_flow_count -= 1;
+                next_active_flow_count = active_flow_count - 1;
                 effects.push(MobOrchestratorEffect::FlowDeactivated);
                 effects.push(MobOrchestratorEffect::EmitOrchestratorNotice);
                 Running
@@ -398,7 +427,7 @@ impl MobOrchestratorAuthority {
             // topology_revision += 1 when unbinding the coordinator
             // Emits: DeactivateSupervisor, EmitOrchestratorNotice
             (Running | Completed, StopOrchestrator) => {
-                if fields.active_flow_count != 0 {
+                if active_flow_count != 0 {
                     return Err(MobError::Internal(
                         "guard failed: active flows exist (stop requires no active flows)".into(),
                     ));
@@ -432,7 +461,7 @@ impl MobOrchestratorAuthority {
             // Guards: no_active_flows, no_pending_spawns
             // Emits: EmitOrchestratorNotice
             (Running | Stopped, MarkCompleted) => {
-                if fields.active_flow_count != 0 {
+                if active_flow_count != 0 {
                     return Err(MobError::Internal(
                         "guard failed: active flows exist (mark completed requires no active flows)".into(),
                     ));
@@ -457,7 +486,7 @@ impl MobOrchestratorAuthority {
                             .into(),
                     ));
                 }
-                if fields.active_flow_count != 0 {
+                if active_flow_count != 0 {
                     return Err(MobError::Internal(
                         "guard failed: active flows exist (destroy requires no active flows)"
                             .into(),
@@ -502,21 +531,24 @@ impl MobOrchestratorAuthority {
             }
         };
 
-        Ok((next_phase, fields, effects))
+        Ok((next_phase, fields, next_active_flow_count, effects))
     }
 
     pub(crate) fn apply_in_phase(
         &mut self,
         phase: MobState,
+        active_flow_count: u32,
         input: MobOrchestratorInput,
     ) -> Result<MobOrchestratorTransition, MobError> {
-        let (next_phase, next_fields, effects) = self.evaluate_in_phase(phase, input)?;
+        let (next_phase, next_fields, next_active_flow_count, effects) =
+            self.evaluate_in_phase(phase, active_flow_count, input)?;
 
+        self.fields.active_flow_count = next_active_flow_count;
         self.fields = next_fields;
 
         Ok(MobOrchestratorTransition {
             next_phase,
-            snapshot: self.fields.to_snapshot(next_phase),
+            snapshot: self.fields.to_snapshot(next_phase, next_active_flow_count),
             effects,
         })
     }
@@ -528,15 +560,16 @@ impl MobOrchestratorMutator for MobOrchestratorAuthority {
         &mut self,
         input: MobOrchestratorInput,
     ) -> Result<MobOrchestratorTransition, MobError> {
-        let (next_phase, next_fields, effects) = self.evaluate(input)?;
+        let (next_phase, next_fields, next_active_flow_count, effects) = self.evaluate(input)?;
 
         // Commit: update canonical state.
         self.phase = next_phase;
+        self.fields.active_flow_count = next_active_flow_count;
         self.fields = next_fields;
 
         Ok(MobOrchestratorTransition {
             next_phase,
-            snapshot: self.fields.to_snapshot(next_phase),
+            snapshot: self.fields.to_snapshot(next_phase, next_active_flow_count),
             effects,
         })
     }

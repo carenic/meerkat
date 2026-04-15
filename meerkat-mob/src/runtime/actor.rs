@@ -390,10 +390,37 @@ impl MobActor {
         self.run_cancel_tokens.len() as u32
     }
 
-    fn machine_coordinator_bound(&self) -> bool {
-        self.orchestrator.as_ref().map_or(true, |orch| {
-            orch.snapshot_in_phase(self.state()).coordinator_bound
+    fn machine_orchestrator_snapshot(&self, phase: MobState) -> Option<MobOrchestratorSnapshot> {
+        self.orchestrator
+            .as_ref()
+            .map(|orch| orch.snapshot_in_phase(phase, self.machine_active_run_count()))
+    }
+
+    fn machine_orchestrator_can_accept(
+        &self,
+        phase: MobState,
+        input: MobOrchestratorInput,
+    ) -> bool {
+        self.orchestrator.as_ref().is_some_and(|orch| {
+            orch.can_accept_in_phase(phase, self.machine_active_run_count(), input)
         })
+    }
+
+    fn machine_apply_orchestrator(
+        &mut self,
+        phase: MobState,
+        input: MobOrchestratorInput,
+    ) -> Result<Option<MobOrchestratorTransition>, MobError> {
+        let active_run_count = self.machine_active_run_count();
+        self.orchestrator
+            .as_mut()
+            .map(|orch| orch.apply_in_phase(phase, active_run_count, input))
+            .transpose()
+    }
+
+    fn machine_coordinator_bound(&self) -> bool {
+        self.machine_orchestrator_snapshot(self.state())
+            .map_or(true, |snapshot| snapshot.coordinator_bound)
     }
 
     fn require_mob_machine_stop(&self) -> Result<(), MobError> {
@@ -616,7 +643,7 @@ impl MobActor {
     fn pending_spawn_alignment_violation(&self) -> Option<String> {
         let expected = self.orchestrator.as_ref().map(|orchestrator| {
             orchestrator
-                .snapshot_in_phase(self.state())
+                .snapshot_in_phase(self.state(), self.machine_active_run_count())
                 .pending_spawn_count as usize
         });
         self.pending_spawns.alignment_violation(expected)
@@ -700,8 +727,8 @@ impl MobActor {
     fn stage_orchestrator_spawn(&mut self) -> Result<(), MobError> {
         let mut topology_advanced = false;
         let phase = self.state();
-        if let Some(ref mut orch) = self.orchestrator {
-            orch.apply_in_phase(phase, MobOrchestratorInput::StageSpawn)?;
+        if self.orchestrator.is_some() {
+            self.machine_apply_orchestrator(phase, MobOrchestratorInput::StageSpawn)?;
             topology_advanced = true;
         }
         if topology_advanced {
@@ -713,8 +740,8 @@ impl MobActor {
     fn complete_orchestrator_spawn(&mut self, spawn_ticket: Option<u64>, context: &'static str) {
         let mut topology_advanced = false;
         let phase = self.state();
-        if let Some(ref mut orch) = self.orchestrator {
-            match orch.apply_in_phase(phase, MobOrchestratorInput::CompleteSpawn) {
+        if self.orchestrator.is_some() {
+            match self.machine_apply_orchestrator(phase, MobOrchestratorInput::CompleteSpawn) {
                 Ok(_) => {
                     topology_advanced = true;
                 }
@@ -1558,11 +1585,8 @@ impl MobActor {
                 MobCommand::OrchestratorSnapshot { reply_tx } => {
                     let phase = self.state();
                     let _ = reply_tx.send(
-                        self.orchestrator
-                            .as_ref()
-                            .map_or_else(MobOrchestratorSnapshot::default, |orch| {
-                                orch.snapshot_in_phase(phase)
-                            }),
+                        self.machine_orchestrator_snapshot(phase)
+                            .unwrap_or_default(),
                     );
                 }
                 #[cfg(test)]
@@ -1613,8 +1637,8 @@ impl MobActor {
                             if stop_result.is_ok() {
                                 let mut topology_unbound = false;
                                 let phase = self.state();
-                                if let Some(ref mut orch) = self.orchestrator {
-                                    match orch.apply_in_phase(
+                                if self.orchestrator.is_some() {
+                                    match self.machine_apply_orchestrator(
                                         phase,
                                         MobOrchestratorInput::StopOrchestrator,
                                     ) {
@@ -1690,8 +1714,8 @@ impl MobActor {
                                 let mut resume_result: Result<(), MobError> = Ok(());
                                 let mut topology_bound = false;
                                 let phase = self.state();
-                                if let Some(ref mut orch) = self.orchestrator {
-                                    match orch.apply_in_phase(
+                                if self.orchestrator.is_some() {
+                                    match self.machine_apply_orchestrator(
                                         phase,
                                         MobOrchestratorInput::ResumeOrchestrator,
                                     ) {
@@ -4388,12 +4412,12 @@ impl MobActor {
             })
             .await?;
         let phase = self.state();
-        if let Some(ref mut orch) = self.orchestrator {
-            orch.apply_in_phase(phase, MobOrchestratorInput::MarkCompleted)
-                .map_err(|error| {
-                    MobError::Internal(format!(
-                        "orchestrator MarkCompleted transition failed during complete: {error}"
-                    ))
+        if self.orchestrator.is_some() {
+            self.machine_apply_orchestrator(phase, MobOrchestratorInput::MarkCompleted)?
+                .ok_or_else(|| {
+                    MobError::Internal(
+                        "orchestrator missing during complete despite expected binding".into(),
+                    )
                 })?;
         }
         self.lifecycle_authority
@@ -4423,25 +4447,25 @@ impl MobActor {
         self.edge_locks.clear().await;
         // Transition through StopOrchestrator then Destroy.
         let phase = self.state();
-        if let Some(ref mut orch) = self.orchestrator {
+        if self.orchestrator.is_some() {
             let mut topology_unbound = false;
-            if orch.can_accept_in_phase(phase, MobOrchestratorInput::StopOrchestrator) {
-                orch.apply_in_phase(phase, MobOrchestratorInput::StopOrchestrator)
-                    .map_err(|error| {
-                        MobError::Internal(format!(
-                            "orchestrator StopOrchestrator transition failed during destroy: {error}"
-                        ))
+            if self.machine_orchestrator_can_accept(phase, MobOrchestratorInput::StopOrchestrator) {
+                self.machine_apply_orchestrator(phase, MobOrchestratorInput::StopOrchestrator)?
+                    .ok_or_else(|| {
+                        MobError::Internal(
+                            "orchestrator missing during destroy despite expected binding".into(),
+                        )
                     })?;
                 topology_unbound = true;
             }
             if topology_unbound {
                 self.flow_engine.unbind_topology_coordinator();
             }
-            orch.apply_in_phase(phase, MobOrchestratorInput::DestroyOrchestrator)
-                .map_err(|error| {
-                    MobError::Internal(format!(
-                        "orchestrator DestroyOrchestrator transition failed during destroy: {error}"
-                    ))
+            self.machine_apply_orchestrator(phase, MobOrchestratorInput::DestroyOrchestrator)?
+                .ok_or_else(|| {
+                    MobError::Internal(
+                        "orchestrator missing during destroy despite expected binding".into(),
+                    )
                 })?;
         }
         self.lifecycle_authority
@@ -4566,25 +4590,25 @@ impl MobActor {
         }
 
         let phase = self.state();
-        if let Some(ref mut orch) = self.orchestrator {
+        if self.orchestrator.is_some() {
             let mut topology_unbound = false;
-            if orch.can_accept_in_phase(phase, MobOrchestratorInput::StopOrchestrator) {
-                orch.apply_in_phase(phase, MobOrchestratorInput::StopOrchestrator)
-                    .map_err(|error| {
-                        MobError::Internal(format!(
-                            "orchestrator StopOrchestrator transition failed during reset: {error}"
-                        ))
+            if self.machine_orchestrator_can_accept(phase, MobOrchestratorInput::StopOrchestrator) {
+                self.machine_apply_orchestrator(phase, MobOrchestratorInput::StopOrchestrator)?
+                    .ok_or_else(|| {
+                        MobError::Internal(
+                            "orchestrator missing during reset despite expected binding".into(),
+                        )
                     })?;
                 topology_unbound = true;
             }
             if topology_unbound {
                 self.flow_engine.unbind_topology_coordinator();
             }
-            orch.apply_in_phase(phase, MobOrchestratorInput::ResumeOrchestrator)
-                .map_err(|error| {
-                    MobError::Internal(format!(
-                        "orchestrator ResumeOrchestrator transition failed during reset: {error}"
-                    ))
+            self.machine_apply_orchestrator(phase, MobOrchestratorInput::ResumeOrchestrator)?
+                .ok_or_else(|| {
+                    MobError::Internal(
+                        "orchestrator missing during reset despite expected binding".into(),
+                    )
                 })?;
             self.flow_engine.bind_topology_coordinator();
         }
@@ -4890,8 +4914,9 @@ impl MobActor {
             .create_pending_run(&config, activation_params.clone())
             .await?;
         let phase = self.state();
-        if let Some(ref mut orch) = self.orchestrator
-            && let Err(error) = orch.apply_in_phase(phase, MobOrchestratorInput::StartFlow)
+        if self.orchestrator.is_some()
+            && let Err(error) =
+                self.machine_apply_orchestrator(phase, MobOrchestratorInput::StartFlow)
         {
             let reason =
                 format!("orchestrator StartFlow transition failed during flow admission: {error}");
@@ -4912,9 +4937,9 @@ impl MobActor {
             MobLifecycleInput::StartRun,
         ) {
             let mut details = Vec::new();
-            if let Some(ref mut orch) = self.orchestrator
+            if self.orchestrator.is_some()
                 && let Err(rollback_error) =
-                    orch.apply_in_phase(phase, MobOrchestratorInput::CompleteFlow)
+                    self.machine_apply_orchestrator(phase, MobOrchestratorInput::CompleteFlow)
             {
                 details.push(format!(
                     "orchestrator CompleteFlow rollback failed: {rollback_error}"
@@ -5024,13 +5049,13 @@ impl MobActor {
                 .as_ref()
                 .is_some_and(|run| run.status.is_terminal());
             let phase = self.state();
-            let authorities_expect_completion = self.orchestrator.as_ref().is_some_and(|orch| {
-                orch.can_accept_in_phase(phase, MobOrchestratorInput::CompleteFlow)
-            }) || self.lifecycle_authority.can_accept_in_phase(
-                phase,
-                self.machine_active_run_count(),
-                MobLifecycleInput::FinishRun,
-            );
+            let authorities_expect_completion = self
+                .machine_orchestrator_can_accept(phase, MobOrchestratorInput::CompleteFlow)
+                || self.lifecycle_authority.can_accept_in_phase(
+                    phase,
+                    self.machine_active_run_count(),
+                    MobLifecycleInput::FinishRun,
+                );
             if authorities_expect_completion && !run_terminal {
                 return Err(MobError::Internal(format!(
                     "{context}: received cleanup for run {run_id} with no local trackers while flow authorities still accept completion"
@@ -5045,11 +5070,11 @@ impl MobActor {
         }
 
         let phase = self.state();
-        if let Some(ref mut orch) = self.orchestrator {
-            orch.apply_in_phase(phase, MobOrchestratorInput::CompleteFlow)
-                .map_err(|error| {
+        if self.orchestrator.is_some() {
+            self.machine_apply_orchestrator(phase, MobOrchestratorInput::CompleteFlow)?
+                .ok_or_else(|| {
                     MobError::Internal(format!(
-                        "{context}: orchestrator CompleteFlow transition failed for run {run_id}: {error}"
+                        "{context}: orchestrator missing during flow cleanup for run {run_id}"
                     ))
                 })?;
         }
@@ -5100,11 +5125,11 @@ impl MobActor {
                 .terminalize_canceled(run_id.clone(), flow_id)
                 .await?;
             let phase = self.state();
-            if let Some(ref mut orch) = self.orchestrator {
-                orch.apply_in_phase(phase, MobOrchestratorInput::CompleteFlow)
-                    .map_err(|error| {
+            if self.orchestrator.is_some() {
+                self.machine_apply_orchestrator(phase, MobOrchestratorInput::CompleteFlow)?
+                    .ok_or_else(|| {
                         MobError::Internal(format!(
-                            "flow canceled cleanup (no task handle): orchestrator CompleteFlow transition failed for run {run_id}: {error}"
+                            "flow canceled cleanup (no task handle): orchestrator missing for run {run_id}"
                         ))
                     })?;
             }
@@ -5218,11 +5243,11 @@ impl MobActor {
                 .await?;
 
             let phase = self.state();
-            if let Some(ref mut orch) = self.orchestrator {
-                orch.apply_in_phase(phase, MobOrchestratorInput::CompleteFlow)
-                    .map_err(|error| {
+            if self.orchestrator.is_some() {
+                self.machine_apply_orchestrator(phase, MobOrchestratorInput::CompleteFlow)?
+                    .ok_or_else(|| {
                         MobError::Internal(format!(
-                            "orchestrator CompleteFlow failed during bulk flow cancellation for run {run_id}: {error}"
+                            "orchestrator missing during bulk flow cancellation for run {run_id}"
                         ))
                     })?;
             }

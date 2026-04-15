@@ -412,6 +412,21 @@ Interpretation:
   `PersistentRuntimeDriver` still perform the mechanics they uniquely own
   (store I/O and final durability commit for the persistent case), but they no
   longer each define their own recovery meaning below the machine boundary
+- contributor staging / boundary / completion / replay are no longer routed
+  through ingress-helper transition methods in production either:
+  `EphemeralRuntimeDriver` now applies the already-decided queue/lifecycle
+  mutations directly against lower-level ingress storage plus per-input
+  lifecycle, while the old ingress transition methods remain only as focused
+  table-test scaffolding. That removes the last obvious production transition
+  surface below `MeerkatMachine` for run-contributor progression
+- the runtime loop now enters that contributor mutation path only through
+  explicit machine-owned realization helpers too:
+  `machine_realize_stage_batch`, `machine_realize_boundary_applied`,
+  `machine_realize_run_completed`, and `machine_realize_run_failed` sit in the
+  checked-in machine layer and call the concrete drivers only for lower-level
+  queue/ledger/persistence mechanics. The plain driver verbs remain available
+  for direct contract tests, but production no longer uses them as semantic
+  entry points
 - the formal seam is no longer missing the forward Mob -> Meerkat ingress
   request: `SubmitWork` now emits `RequestRuntimeIngress`, the composition
   routes that effect into Meerkat `Ingest`, and that route now carries the
@@ -621,7 +636,7 @@ Outcome:
 6. The remaining Meerkat edge is now narrower and mostly terminal/batch
    mechanics. `RuntimeIngressAuthority` no longer treats contributor staging,
    boundary application, run completion, replay rollback, or admission
-   disposition as helper-owned transition classification; recovery
+   disposition as helper-owned production transition classification; recovery
    normalization/report semantics are also machine-owned now.
 7. Recovery semantics are also less split than before: persistent and
    ephemeral drivers now share the same machine-owned per-input recovery

@@ -366,6 +366,48 @@ impl RuntimeIngressAuthority {
         self.evaluate(input).is_ok()
     }
 
+    /// Remove the given work IDs from both queue lanes.
+    pub(crate) fn remove_from_queue_lanes(&mut self, work_ids: &[InputId]) {
+        self.fields
+            .queue
+            .retain(|wid| !work_ids.iter().any(|candidate| candidate == wid));
+        self.fields
+            .steer_queue
+            .retain(|wid| !work_ids.iter().any(|candidate| candidate == wid));
+    }
+
+    /// Set the ingress-owned lifecycle mirror for a single admitted work ID.
+    pub(crate) fn set_lifecycle_state(
+        &mut self,
+        work_id: &InputId,
+        lifecycle_state: InputLifecycleState,
+    ) {
+        self.fields
+            .lifecycle
+            .insert(work_id.clone(), lifecycle_state);
+    }
+
+    /// Replay contributors into the canonical queue/steer lanes.
+    pub(crate) fn replay_queue_lanes(
+        &mut self,
+        queue_work_ids: &[InputId],
+        steer_work_ids: &[InputId],
+    ) {
+        for wid in queue_work_ids {
+            self.set_lifecycle_state(wid, InputLifecycleState::Queued);
+            if !self.fields.queue.contains(wid) {
+                self.fields.queue.insert(0, wid.clone());
+            }
+        }
+
+        for wid in steer_work_ids {
+            self.set_lifecycle_state(wid, InputLifecycleState::Queued);
+            if !self.fields.steer_queue.contains(wid) {
+                self.fields.steer_queue.insert(0, wid.clone());
+            }
+        }
+    }
+
     fn commit_effects(
         &mut self,
         next_fields: RuntimeIngressFields,

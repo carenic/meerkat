@@ -968,6 +968,7 @@ impl MobBuilder {
             if orch
                 .apply_in_phase(
                     initial_phase,
+                    0,
                     super::mob_orchestrator_authority::MobOrchestratorInput::BindCoordinator,
                 )
                 .is_ok()

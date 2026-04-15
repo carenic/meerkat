@@ -118,6 +118,14 @@ Current state:
   `SubmitWork` as a thin ingress request plus opaque `WorkRef` receipt, so the
   formal model now stops at `RequestRuntimeIngress` instead of overclaiming an
   unwired work-terminal protocol
+- the production Mob actor now routes orchestrator legality and realization
+  through actor-level `machine_*` wrappers instead of treating lower
+  `MobOrchestratorAuthority` verbs as semantic entry points directly
+- the production orchestrator surface also no longer treats helper-owned
+  `active_flow_count` as canonical truth: snapshot/legality/application now
+  take the machine-owned `active_run_count` explicitly, so flow-count gating
+  is driven by the checked-in machine surface rather than by helper-local
+  state
 
 ## Resolution Rubric
 
