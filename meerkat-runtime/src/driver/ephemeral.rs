@@ -631,10 +631,10 @@ impl EphemeralRuntimeDriver {
         input_ids: &[InputId],
         run_id: &RunId,
     ) -> Result<(), InputLifecycleError> {
-        // Ingress authority: StageDrainSnapshot — the authority owns the Staged
-        // transition. It emits StageInput effects that drive the per-input lifecycle
-        // authority and Staged events (handled in process_ingress_effects).
-        // No independent shell StageForRun call — single source of truth.
+        // The checked-in Meerkat machine already owns contributor-set legality
+        // for starting a run batch. Ingress applies only the already-decided
+        // queue/lifecycle updates and emits the StageInput effects that drive
+        // the per-input lifecycle authority and staged events.
         match self.ingress.apply(RuntimeIngressInput::StageDrainSnapshot {
             run_id: run_id.clone(),
             contributing_work_ids: input_ids.to_vec(),
@@ -1043,6 +1043,9 @@ impl EphemeralRuntimeDriver {
         run_id: RunId,
         consumed_input_ids: Vec<InputId>,
     ) -> Result<(), RuntimeDriverError> {
+        // The checked-in Meerkat machine already owns contributor-set legality
+        // for completion. Ingress applies only the already-decided queue /
+        // lifecycle updates for those contributors.
         match self.ingress.apply(RuntimeIngressInput::RunCompleted {
             contributing_work_ids: consumed_input_ids.clone(),
         }) {
@@ -1101,6 +1104,9 @@ impl EphemeralRuntimeDriver {
         receipt: RunBoundaryReceipt,
         _session_snapshot: Option<Vec<u8>>,
     ) -> Result<(), RuntimeDriverError> {
+        // The checked-in Meerkat machine already owns contributor-set legality
+        // for boundary application. Ingress applies only the already-decided
+        // queue/lifecycle updates for those contributors.
         match self.ingress.apply(RuntimeIngressInput::BoundaryApplied {
             contributing_work_ids: receipt.contributing_input_ids.clone(),
             boundary_sequence: receipt.sequence,

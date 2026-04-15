@@ -135,24 +135,6 @@ impl DriverEntry {
         self.is_idle_or_attached() && self.as_driver().active_input_ids().is_empty()
     }
 
-    /// Attach an executor (Idle → Attached).
-    pub(crate) fn attach(&mut self) -> Result<(), RuntimeStateTransitionError> {
-        match self {
-            DriverEntry::Ephemeral(d) => d.attach(),
-            DriverEntry::Persistent(d) => d.attach(),
-        }
-    }
-
-    /// Detach an executor (Attached → Idle). No-op if not Attached.
-    pub(crate) fn detach(
-        &mut self,
-    ) -> Result<Option<crate::runtime_state::RuntimeState>, RuntimeStateTransitionError> {
-        match self {
-            DriverEntry::Ephemeral(d) => d.detach(),
-            DriverEntry::Persistent(d) => d.detach(),
-        }
-    }
-
     /// Check if the runtime can process queued inputs (Idle, Attached, or Retired).
     pub(crate) fn can_process_queue(&self) -> bool {
         match self {
@@ -426,6 +408,98 @@ fn machine_apply_run_return_projection(
     Ok(())
 }
 
+fn slice_starts_with(seq: &[InputId], prefix: &[InputId]) -> bool {
+    prefix.len() <= seq.len() && seq[..prefix.len()] == *prefix
+}
+
+fn machine_validate_stage_drain_snapshot(
+    driver: &DriverEntry,
+    contributing_work_ids: &[InputId],
+) -> Result<(), RuntimeDriverError> {
+    if contributing_work_ids.is_empty() {
+        return Err(RuntimeDriverError::Internal(
+            "stage drain snapshot requires at least one contributor".to_string(),
+        ));
+    }
+
+    for work_id in contributing_work_ids {
+        let lifecycle = driver
+            .as_driver()
+            .input_state(work_id)
+            .map(InputState::current_state);
+        if lifecycle != Some(InputLifecycleState::Queued) {
+            return Err(RuntimeDriverError::Internal(format!(
+                "stage drain snapshot requires queued contributors, but {work_id:?} is {lifecycle:?}"
+            )));
+        }
+    }
+
+    let ingress = driver.ingress();
+    let source_queue = if !ingress.steer_queue().is_empty() {
+        ingress.steer_queue()
+    } else {
+        ingress.queue()
+    };
+    if !slice_starts_with(source_queue, contributing_work_ids) {
+        return Err(RuntimeDriverError::Internal(
+            "stage drain snapshot contributors must match the current drain-source prefix"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn machine_validate_boundary_applied(
+    driver: &DriverEntry,
+    contributing_work_ids: &[InputId],
+) -> Result<(), RuntimeDriverError> {
+    if contributing_work_ids.is_empty() {
+        return Err(RuntimeDriverError::Internal(
+            "boundary applied requires at least one contributor".to_string(),
+        ));
+    }
+
+    for work_id in contributing_work_ids {
+        let lifecycle = driver
+            .as_driver()
+            .input_state(work_id)
+            .map(InputState::current_state);
+        if lifecycle != Some(InputLifecycleState::Staged) {
+            return Err(RuntimeDriverError::Internal(format!(
+                "boundary applied requires staged contributors, but {work_id:?} is {lifecycle:?}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn machine_validate_run_completed(
+    driver: &DriverEntry,
+    contributing_work_ids: &[InputId],
+) -> Result<(), RuntimeDriverError> {
+    if contributing_work_ids.is_empty() {
+        return Err(RuntimeDriverError::Internal(
+            "run completed requires at least one contributor".to_string(),
+        ));
+    }
+
+    for work_id in contributing_work_ids {
+        let lifecycle = driver
+            .as_driver()
+            .input_state(work_id)
+            .map(InputState::current_state);
+        if lifecycle != Some(InputLifecycleState::AppliedPendingConsumption) {
+            return Err(RuntimeDriverError::Internal(format!(
+                "run completed requires contributors pending consumption, but {work_id:?} is {lifecycle:?}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 async fn machine_stop_runtime(driver: &mut DriverEntry) -> Result<(), RuntimeDriverError> {
     match driver.runtime_state() {
         RuntimeState::Initializing
@@ -573,6 +647,7 @@ pub(crate) async fn prepare_runtime_loop_batch_start(
     staged_ids: &[InputId],
 ) -> Result<(), RuntimeDriverError> {
     let mut driver = driver.lock().await;
+    machine_validate_stage_drain_snapshot(&driver, staged_ids)?;
     machine_begin_run(&mut driver, run_id.clone()).map_err(|err| {
         RuntimeDriverError::Internal(format!("failed to start runtime run: {err}"))
     })?;
@@ -600,6 +675,7 @@ pub(crate) async fn commit_runtime_loop_run(
     let mut driver = driver.lock().await;
     let next_phase =
         crate::runtime_state::run_return_phase_from_pre_run_phase(driver.pre_run_phase());
+    machine_validate_boundary_applied(&driver, &receipt.contributing_input_ids)?;
     if let Err(err) = driver
         .boundary_applied(run_id.clone(), receipt, session_snapshot)
         .await
@@ -630,6 +706,7 @@ pub(crate) async fn commit_runtime_loop_run(
     }
 
     let completed_run_id = run_id.clone();
+    machine_validate_run_completed(&driver, &consumed_input_ids)?;
     driver
         .run_completed(completed_run_id.clone(), consumed_input_ids)
         .await
@@ -2565,7 +2642,7 @@ impl MeerkatMachine {
             }
             if detach_after_abort {
                 let mut driver_guard = driver.lock().await;
-                let _ = driver_guard.detach();
+                machine_unregister_session_projection(&mut driver_guard);
             }
             self.revert_attaching(&session_id).await;
             return;

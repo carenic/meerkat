@@ -225,7 +225,11 @@ pub fn meerkat_mob_seam_composition() -> CompositionSchema {
                 "meerkat",
                 RouteTargetKind::Input,
                 "Ingest",
-                &[bind("runtime_id", "agent_runtime_id")],
+                &[
+                    bind("runtime_id", "agent_runtime_id"),
+                    bind("work_id", "work_id"),
+                    bind("origin", "origin"),
+                ],
             ),
             route(
                 "retire_request_reaches_meerkat",

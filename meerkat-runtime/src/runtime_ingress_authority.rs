@@ -1,9 +1,11 @@
 //! Queue/ledger helper for runtime ingress bookkeeping.
 //!
 //! This helper still owns the admitted-input ledger, queue routing, and
-//! per-run contributor bookkeeping, but it no longer owns a separate coarse
-//! ingress lifecycle. Meerkat phase is the only coarse lifecycle truth; this
-//! helper exists only for lower-level ledger and queue mechanics.
+//! mechanical queue/lifecycle updates for run contributors, but it no longer
+//! owns a separate coarse ingress lifecycle or contributor-set legality.
+//! Meerkat phase plus the checked-in runtime machine now own coarse lifecycle
+//! truth and run-batch legality; this helper exists only for lower-level
+//! ledger and queue mechanics.
 
 use std::collections::HashMap;
 
@@ -37,10 +39,14 @@ pub struct RequestId(pub String);
 // Typed input enum — mirrors the machine schema's input variants
 // ---------------------------------------------------------------------------
 
-/// Typed inputs for the RuntimeIngress machine.
+/// Typed inputs for the RuntimeIngress helper.
 ///
 /// Shell code classifies raw inputs into these typed inputs, then calls
-/// [`RuntimeIngressAuthority::apply`]. The authority decides transition legality.
+/// [`RuntimeIngressAuthority::apply`]. For admission/coalescing/supersession
+/// this helper still owns the legality. For run-batch contributor paths
+/// (`StageDrainSnapshot`, `BoundaryApplied`, `RunCompleted`, `RunFailed`,
+/// `RunCancelled`) the checked-in `MeerkatMachine` now owns the legality and
+/// this helper applies only the already-decided queue/lifecycle updates.
 #[derive(Debug, Clone)]
 pub enum RuntimeIngressInput {
     /// Admit a queued input (Queue or Steer handling mode).
@@ -725,43 +731,12 @@ impl RuntimeIngressAuthority {
         run_id: &RunId,
         contributing_work_ids: &[InputId],
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
-        // Guard: contributors_non_empty
-        if contributing_work_ids.is_empty() {
-            return Err(RuntimeIngressError::GuardFailed {
-                guard: "contributors_non_empty: must have at least one contributor".into(),
-            });
-        }
-
-        // Guard: all_contributors_are_queued
-        for wid in contributing_work_ids {
-            let lifecycle = self.fields.lifecycle.get(wid);
-            if lifecycle != Some(&InputLifecycleState::Queued) {
-                return Err(RuntimeIngressError::GuardFailed {
-                    guard: format!("all_contributors_are_queued: {wid:?} is {lifecycle:?}"),
-                });
-            }
-        }
-
-        // Guard: contributors_match_current_drain_source
-        // If steer_queue has items, contributors must be a prefix of steer_queue.
-        // Otherwise, contributors must be a prefix of queue.
-        if !self.fields.steer_queue.is_empty() {
-            if !seq_starts_with(&self.fields.steer_queue, contributing_work_ids) {
-                return Err(RuntimeIngressError::GuardFailed {
-                    guard: "contributors_match_current_drain_source: not a prefix of steer_queue"
-                        .into(),
-                });
-            }
-        } else if !seq_starts_with(&self.fields.queue, contributing_work_ids) {
-            return Err(RuntimeIngressError::GuardFailed {
-                guard: "contributors_match_current_drain_source: not a prefix of queue".into(),
-            });
-        }
-
         let mut fields = self.fields.clone();
         let mut effects = Vec::new();
 
-        // Remove contributors from the appropriate queue
+        // The checked-in Meerkat machine already owns contributor-set legality
+        // for StageDrainSnapshot. This helper only applies the already-decided
+        // queue/lifecycle updates.
         if fields.steer_queue.is_empty() {
             seq_remove_all(&mut fields.queue, contributing_work_ids);
         } else {
@@ -794,26 +769,12 @@ impl RuntimeIngressAuthority {
         contributing_work_ids: &[InputId],
         _boundary_sequence: u64,
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
-        if contributing_work_ids.is_empty() {
-            return Err(RuntimeIngressError::GuardFailed {
-                guard: "current_run_present: no contributors are staged".into(),
-            });
-        }
-
-        // Guard: contributors_are_staged
-        for wid in contributing_work_ids {
-            let lifecycle = self.fields.lifecycle.get(wid);
-            if lifecycle != Some(&InputLifecycleState::Staged) {
-                return Err(RuntimeIngressError::GuardFailed {
-                    guard: format!("contributors_are_staged: {wid:?} is {lifecycle:?}"),
-                });
-            }
-        }
-
         let mut fields = self.fields.clone();
         let mut effects = Vec::new();
 
-        // Transition contributors to AppliedPendingConsumption
+        // The checked-in Meerkat machine owns boundary-applied contributor
+        // legality. This helper only applies the already-decided lifecycle
+        // updates.
         for wid in contributing_work_ids {
             fields
                 .lifecycle
@@ -832,26 +793,12 @@ impl RuntimeIngressAuthority {
         &self,
         contributing_work_ids: &[InputId],
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
-        if contributing_work_ids.is_empty() {
-            return Err(RuntimeIngressError::GuardFailed {
-                guard: "current_run_present: no contributors are staged".into(),
-            });
-        }
-
-        // Guard: contributors_pending_consumption
-        for wid in contributing_work_ids {
-            let lifecycle = self.fields.lifecycle.get(wid);
-            if lifecycle != Some(&InputLifecycleState::AppliedPendingConsumption) {
-                return Err(RuntimeIngressError::GuardFailed {
-                    guard: format!("contributors_pending_consumption: {wid:?} is {lifecycle:?}"),
-                });
-            }
-        }
-
         let mut fields = self.fields.clone();
         let mut effects = Vec::new();
 
-        // Consume all contributors
+        // The checked-in Meerkat machine owns run-completion contributor
+        // legality. This helper only applies the already-decided lifecycle
+        // updates.
         for wid in contributing_work_ids {
             fields
                 .lifecycle
@@ -1167,14 +1114,6 @@ impl RuntimeIngressMutator for RuntimeIngressAuthority {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Check if `seq` starts with the given `prefix`.
-fn seq_starts_with(seq: &[InputId], prefix: &[InputId]) -> bool {
-    if prefix.len() > seq.len() {
-        return false;
-    }
-    seq[..prefix.len()] == *prefix
-}
 
 /// Remove all items in `values` from `seq`.
 fn seq_remove_all(seq: &mut Vec<InputId>, values: &[InputId]) {

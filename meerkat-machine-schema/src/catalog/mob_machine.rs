@@ -442,6 +442,7 @@ fn work_submission_fields() -> Vec<FieldSchema> {
         field("agent_runtime_id", TypeRef::Named("AgentRuntimeId".into())),
         field("fence_token", TypeRef::Named("FenceToken".into())),
         field("work_id", TypeRef::Named("WorkId".into())),
+        field("origin", TypeRef::String),
     ]
 }
 
@@ -488,6 +489,7 @@ fn work_submission_emit(variant: &str) -> EffectEmit {
             ),
             ("fence_token".into(), Expr::Binding("fence_token".into())),
             ("work_id".into(), Expr::Binding("work_id".into())),
+            ("origin".into(), Expr::Binding("origin".into())),
         ]),
     }
 }

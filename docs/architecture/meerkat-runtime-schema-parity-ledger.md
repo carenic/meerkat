@@ -322,11 +322,18 @@ Interpretation:
   lifecycle verbs either: `PrepareBindings`, stale loop republish, and session
   unregister now project `Idle <-> Attached` through machine-owned helpers
   rather than calling `attach()` / `detach()` as semantic reducers
+- contributor-set legality for `StageDrainSnapshot`, `BoundaryApplied`, and
+  `RunCompleted` is no longer helper-owned either: the checked-in Meerkat
+  machine now validates queue-prefix, staged, and applied-pending-consumption
+  preconditions before ingress applies the already-decided queue/lifecycle
+  updates
 - the formal seam is no longer missing the forward Mob -> Meerkat ingress
   request: `SubmitWork` now emits `RequestRuntimeIngress`, the composition
-  routes that effect into Meerkat `Ingest`, and the truthful Mob quotient moved
-  to raw/phase/full `207 / 209 / 1323`, which is the right signature for
-  adding real routed behavior rather than more representative shadow state
+  routes that effect into Meerkat `Ingest`, and that route now carries the
+  opaque `work_id` plus `origin` as well as the member runtime binding. The
+  truthful Mob quotient moved to raw/phase/full `207 / 209 / 1323`, which is
+  the right signature for adding real routed behavior rather than more
+  representative shadow state
 - the outer Meerkat ingress/prepare shell also no longer pre-rejects the same
   non-accepting phases that the direct driver contract already rejects: the
   machine boundary now normalizes only the public `Destroyed` error shape while
@@ -522,8 +529,13 @@ Outcome:
 5. Read that baseline together with the now-green Mob lifecycle-triangle
    ledger in
    [`docs/architecture/mob-runtime-schema-parity-ledger.md`](mob-runtime-schema-parity-ledger.md).
-6. Use the next loop to target the remaining Meerkat contributor-set /
-   batch-legality seam: `RuntimeIngressAuthority` still owns the legality of
-   `StageDrainSnapshot`, `BoundaryApplied`, and terminal run-event contributor
-   sets below the checked-in machine boundary, even though coarse lifecycle and
-   run identity are now machine-owned.
+6. Use the next loop to target the remaining Meerkat contributor/batch seam:
+   `RuntimeIngressAuthority` no longer owns legality for
+   `StageDrainSnapshot`, `BoundaryApplied`, or `RunCompleted`, but batch
+   selection policy and the rollback/cancel contributor cases still live below
+   the checked-in machine boundary.
+7. The next remaining formal seam question after that is still narrower than
+   full `WorkRef -> InputId` translation: the forward Mob -> Meerkat route now
+   carries opaque `work_id` plus `origin`, so any remaining omission is about
+   content lowering or minted Meerkat input identity, not about the existence
+   or type of the forwarded ingress request itself.
