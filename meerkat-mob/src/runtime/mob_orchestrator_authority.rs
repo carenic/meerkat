@@ -35,7 +35,7 @@ use crate::runtime::MobState;
 /// [`MobOrchestratorAuthority::apply`]. The authority decides transition legality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MobOrchestratorInput {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     InitializeOrchestrator,
     BindCoordinator,
     #[cfg_attr(
@@ -209,7 +209,7 @@ pub(crate) struct MobOrchestratorAuthority {
 impl sealed::Sealed for MobOrchestratorAuthority {}
 
 impl MobOrchestratorAuthority {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     /// Create a new authority in Creating phase with default fields.
     pub(crate) fn new(observable: Arc<AtomicU8>) -> Self {
         observable.store(MobState::Creating as u8, Ordering::Release);
@@ -277,25 +277,16 @@ impl MobOrchestratorAuthority {
     ) -> Result<(MobState, MobOrchestratorFields, Vec<MobOrchestratorEffect>), MobError> {
         use MobOrchestratorInput::{
             BindCoordinator, CompleteFlow, CompleteSpawn, DestroyOrchestrator, ForceCancelMember,
-            InitializeOrchestrator, MarkCompleted, ResumeOrchestrator, StageSpawn, StartFlow,
-            StopOrchestrator, UnbindCoordinator,
+            MarkCompleted, ResumeOrchestrator, StageSpawn, StartFlow, StopOrchestrator,
+            UnbindCoordinator,
         };
-        use MobState::{Completed, Creating, Destroyed, Running, Stopped};
+        use MobState::{Completed, Destroyed, Running, Stopped};
 
         let phase = self.phase;
         let mut fields = self.fields.clone();
         let mut effects = Vec::new();
 
         let next_phase = match (phase, input) {
-            // InitializeOrchestrator: Creating -> Running
-            // Updates: supervisor_active = true
-            // Emits: ActivateSupervisor
-            (Creating, InitializeOrchestrator) => {
-                fields.supervisor_active = true;
-                effects.push(MobOrchestratorEffect::ActivateSupervisor);
-                Running
-            }
-
             // BindCoordinator: Running|Stopped|Completed -> Running
             // Guards: coordinator_is_not_bound
             // Updates: coordinator_bound = true, topology_revision += 1
@@ -492,14 +483,8 @@ impl MobOrchestratorAuthority {
             // All other combinations are illegal.
             _ => {
                 let target = match input {
-                    InitializeOrchestrator
-                    | BindCoordinator
-                    | ResumeOrchestrator
-                    | StageSpawn
-                    | CompleteSpawn
-                    | StartFlow
-                    | CompleteFlow
-                    | ForceCancelMember => Running,
+                    BindCoordinator | ResumeOrchestrator | StageSpawn | CompleteSpawn
+                    | StartFlow | CompleteFlow | ForceCancelMember => Running,
                     UnbindCoordinator | StopOrchestrator => Stopped,
                     MarkCompleted => Completed,
                     DestroyOrchestrator => Destroyed,

@@ -208,15 +208,15 @@ impl MobLifecycleAuthority {
             BeginCleanup, Destroy, FinishCleanup, FinishRun, MarkCompleted, Resume, Start,
             StartRun, Stop,
         };
-        use MobState::{Completed, Creating, Destroyed, Running, Stopped};
+        use MobState::{Completed, Destroyed, Running, Stopped};
 
         let phase = self.phase;
         let mut fields = self.fields.clone();
         let mut effects = Vec::new();
 
         let next_phase = match (phase, input) {
-            // Start: Creating|Stopped -> Running
-            (Creating | Stopped, Start) => Running,
+            // Start: Stopped -> Running
+            (Stopped, Start) => Running,
 
             // Stop: Running -> Stopped
             (Running, Stop) => Stopped,
@@ -235,10 +235,10 @@ impl MobLifecycleAuthority {
                 Completed
             }
 
-            // Destroy: Creating|Running|Stopped|Completed -> Destroyed
+            // Destroy: Running|Stopped|Completed -> Destroyed
             // Updates: active_run_count = 0, cleanup_pending = false
             // Emits: EmitLifecycleNotice
-            (Creating | Running | Stopped | Completed, Destroy) => {
+            (Running | Stopped | Completed, Destroy) => {
                 fields.active_run_count = 0;
                 fields.cleanup_pending = false;
                 effects.push(MobLifecycleEffect::EmitLifecycleNotice);
