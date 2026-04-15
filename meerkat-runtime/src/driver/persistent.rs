@@ -14,7 +14,7 @@ use crate::accept::AcceptOutcome;
 use crate::driver::ephemeral::handling_mode_from_policy;
 use crate::identifiers::LogicalRuntimeId;
 use crate::input::{Input, externalize_input_images};
-use crate::input_state::{InputAbandonReason, InputLifecycleState, InputState};
+use crate::input_state::{InputAbandonReason, InputState};
 use crate::meerkat_machine::{
     machine_normalize_recovered_input_state, machine_realize_recovered_runtime_state,
 };
@@ -56,7 +56,7 @@ impl PersistentRuntimeDriver {
         )
     }
 
-    pub fn new_with_control(
+    pub(crate) fn new_with_control(
         runtime_id: LogicalRuntimeId,
         store: Arc<dyn RuntimeStore>,
         blob_store: Arc<dyn BlobStore>,
