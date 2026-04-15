@@ -362,10 +362,13 @@ impl DriverEntry {
         }
     }
 
-    pub(crate) async fn stop_runtime(&mut self) -> Result<(), RuntimeDriverError> {
+    pub(crate) async fn finalize_stop_runtime(&mut self) -> Result<(), RuntimeDriverError> {
         match self {
-            DriverEntry::Ephemeral(d) => d.stop_runtime(),
-            DriverEntry::Persistent(d) => d.stop_runtime().await,
+            DriverEntry::Ephemeral(d) => {
+                d.finalize_stop_runtime();
+                Ok(())
+            }
+            DriverEntry::Persistent(d) => d.finalize_stop_runtime().await,
         }
     }
 }
@@ -421,6 +424,27 @@ fn machine_apply_run_return_projection(
     machine_validate_active_run(driver, run_id, next_phase)?;
     driver.set_control_projection(next_phase, None, None);
     Ok(())
+}
+
+async fn machine_stop_runtime(driver: &mut DriverEntry) -> Result<(), RuntimeDriverError> {
+    match driver.runtime_state() {
+        RuntimeState::Initializing
+        | RuntimeState::Idle
+        | RuntimeState::Attached
+        | RuntimeState::Running
+        | RuntimeState::Retired => {}
+        from => {
+            return Err(RuntimeDriverError::Internal(
+                RuntimeStateTransitionError {
+                    from,
+                    to: RuntimeState::Stopped,
+                }
+                .to_string(),
+            ));
+        }
+    }
+
+    driver.finalize_stop_runtime().await
 }
 
 pub(crate) async fn prepare_runtime_loop_batch_start(
@@ -3151,7 +3175,7 @@ impl MeerkatMachine {
 
         if matches!(command, RunControlCommand::StopRuntimeExecutor { .. }) {
             let mut driver = driver.lock().await;
-            driver.stop_runtime().await?;
+            machine_stop_runtime(&mut driver).await?;
             drop(driver);
             let mut completions = completions.lock().await;
             completions.resolve_all_terminated("runtime stopped");

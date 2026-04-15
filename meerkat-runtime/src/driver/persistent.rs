@@ -310,9 +310,11 @@ impl PersistentRuntimeDriver {
         })
     }
 
-    pub async fn stop_runtime(&mut self) -> Result<(), RuntimeDriverError> {
+    pub async fn finalize_stop_runtime(&mut self) -> Result<(), RuntimeDriverError> {
         let checkpoint = self.inner.clone();
-        self.inner.stop_runtime()?;
+        self.inner
+            .set_control_projection(RuntimeState::Stopped, None, None);
+        self.inner.stop_runtime_cleanup();
         let input_states = self.inner.input_states_snapshot();
         if let Err(err) = self
             .store
@@ -665,7 +667,9 @@ impl RuntimeDriver for PersistentRuntimeDriver {
                         && self.inner.runtime_state() != RuntimeState::Destroyed =>
                 {
                     // Never revive Destroyed as Stopped
-                    self.inner.stop_runtime()?;
+                    self.inner
+                        .set_control_projection(RuntimeState::Stopped, None, None);
+                    self.inner.stop_runtime_cleanup();
                 }
                 RuntimeState::Destroyed
                     if self.inner.runtime_state() != RuntimeState::Destroyed =>

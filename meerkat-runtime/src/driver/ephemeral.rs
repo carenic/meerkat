@@ -861,32 +861,16 @@ impl EphemeralRuntimeDriver {
         Ok(abandoned)
     }
 
-    pub fn stop_runtime(&mut self) -> Result<(), RuntimeDriverError> {
-        match self.phase {
-            RuntimeState::Initializing
-            | RuntimeState::Idle
-            | RuntimeState::Attached
-            | RuntimeState::Running
-            | RuntimeState::Retired => {
-                self.current_run_id = None;
-                self.pre_run_phase = None;
-                self.transition_phase(RuntimeState::Stopped);
-            }
-            from => {
-                return Err(RuntimeDriverError::Internal(
-                    crate::runtime_state::RuntimeStateTransitionError {
-                        from,
-                        to: RuntimeState::Stopped,
-                    }
-                    .to_string(),
-                ));
-            }
-        }
+    pub(crate) fn stop_runtime_cleanup(&mut self) {
         self.abandon_all_non_terminal(InputAbandonReason::Stopped);
         self.silent_comms_intents.clear();
         self.queue.drain();
         self.steer_queue.drain();
-        Ok(())
+    }
+
+    pub(crate) fn finalize_stop_runtime(&mut self) {
+        self.set_control_projection(RuntimeState::Stopped, None, None);
+        self.stop_runtime_cleanup();
     }
 
     pub fn recover_ephemeral(&mut self) -> RecoveryReport {

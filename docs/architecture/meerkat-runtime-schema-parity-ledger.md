@@ -97,6 +97,11 @@ Current state:
   `current_run_id` / `pre_run_phase` on terminal return, while the driver only
   realizes ingress/ledger mechanics for `BoundaryApplied`, `RunCompleted`, and
   `RunFailed`
+- coarse stop legality no longer lives in the driver either: `MeerkatMachine`
+  now owns the legal source phases for stop plus the `Stopped` projection,
+  while driver stop paths only execute the already-decided cleanup mechanics
+  (abandoning non-terminal inputs, clearing queue state, clearing silent
+  intents)
 - attached steered `AcceptWithCompletion` is no longer treated as a queue-only
   self-loop in the formal model: when `request_immediate_processing=true`, the
   checked-in Meerkat machine now models the runtime’s `Attached -> Running`
