@@ -699,6 +699,10 @@ The important read is now sharper than the earlier partial dump story:
 - removing ingress's duplicate `terminal_outcome` cache did not change the
   truthful Meerkat graph at all, which confirms that terminal-outcome truth was
   already canonical in the per-input ledger rather than the helper
+- removing the dead ingress `request_immediate_processing` parameter did not
+  change the truthful Meerkat graph or reopen parity, which confirms that
+  immediate-processing semantics are already owned by the checked-in Meerkat
+  accept / post-admission signal path rather than the queue helper
 - preserving the full snapshot still keeps almost every remaining state
   distinct (`19,078`), which tells us the field tuple is still doing most of
   the real work even after the retire-drain correction

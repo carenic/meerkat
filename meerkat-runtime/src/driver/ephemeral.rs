@@ -1303,7 +1303,6 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
         // the admission path (queued vs consumed-on-accept) based on the policy.
         // Zero policy branching in shell code.
         let handling_mode = handling_mode_from_policy(&policy);
-        let request_immediate_processing = requests_immediate_processing(&input);
         let content_shape = ContentShape(input.kind_id().to_string());
         let is_prompt = matches!(input, Input::Prompt(_));
         let existing_superseded_id = self.existing_superseded_input(&input).map(|(id, _)| id);
@@ -1322,7 +1321,6 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
                 work_id: input_id.clone(),
                 content_shape,
                 handling_mode,
-                request_immediate_processing,
                 is_prompt,
                 request_id: None,
                 reservation_key: None,

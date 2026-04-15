@@ -258,6 +258,10 @@ Interpretation:
   any Meerkat parity gap either: per-input terminal outcome truth already
   lived in the canonical input ledger, so ingress now emits terminal effects
   without storing a second copy
+- removing the dead `request_immediate_processing` parameter from ingress
+  admission did not reopen any Meerkat parity gap either: immediate-processing
+  semantics are now plainly owned by the checked-in Meerkat accept /
+  post-admission signal path, not by the queue helper boundary
 
 ## Resolution Rubric
 

@@ -48,9 +48,6 @@ pub enum RuntimeIngressInput {
         work_id: InputId,
         content_shape: ContentShape,
         handling_mode: HandlingMode,
-        /// Whether this admitted input should request immediate processing
-        /// in addition to routing through the steer lane.
-        request_immediate_processing: bool,
         is_prompt: bool,
         request_id: Option<RequestId>,
         reservation_key: Option<ReservationKey>,
@@ -457,7 +454,6 @@ impl RuntimeIngressAuthority {
                 work_id,
                 content_shape,
                 handling_mode,
-                request_immediate_processing,
                 is_prompt,
                 request_id,
                 reservation_key,
@@ -467,7 +463,6 @@ impl RuntimeIngressAuthority {
                 work_id,
                 content_shape,
                 *handling_mode,
-                *request_immediate_processing,
                 *is_prompt,
                 request_id,
                 reservation_key,
@@ -563,7 +558,6 @@ impl RuntimeIngressAuthority {
         work_id: &InputId,
         content_shape: &ContentShape,
         handling_mode: HandlingMode,
-        _request_immediate_processing: bool,
         is_prompt: bool,
         request_id: &Option<RequestId>,
         reservation_key: &Option<ReservationKey>,
@@ -1489,21 +1483,19 @@ mod tests {
         work_id: InputId,
         mode: HandlingMode,
     ) -> RuntimeIngressTransition {
-        admit_queued_with_options(auth, work_id, mode, mode == HandlingMode::Steer, false)
+        admit_queued_with_options(auth, work_id, mode, false)
     }
 
     fn admit_queued_with_options(
         auth: &mut RuntimeIngressAuthority,
         work_id: InputId,
         mode: HandlingMode,
-        request_immediate_processing: bool,
         is_prompt: bool,
     ) -> RuntimeIngressTransition {
         auth.apply(RuntimeIngressInput::AdmitQueued {
             work_id,
             content_shape: ContentShape("text".into()),
             handling_mode: mode,
-            request_immediate_processing,
             is_prompt,
             request_id: None,
             reservation_key: None,
@@ -1677,7 +1669,6 @@ mod tests {
                 work_id: wid.clone(),
                 content_shape: ContentShape("text".into()),
                 handling_mode: HandlingMode::Steer,
-                request_immediate_processing: false,
                 is_prompt: false,
                 request_id: None,
                 reservation_key: None,
@@ -1720,7 +1711,6 @@ mod tests {
             work_id: wid,
             content_shape: ContentShape("text".into()),
             handling_mode: HandlingMode::Queue,
-            request_immediate_processing: false,
             is_prompt: false,
             request_id: None,
             reservation_key: None,
@@ -1742,7 +1732,6 @@ mod tests {
             work_id: InputId::new(),
             content_shape: ContentShape("text".into()),
             handling_mode: HandlingMode::Queue,
-            request_immediate_processing: false,
             is_prompt: false,
             request_id: None,
             reservation_key: None,
