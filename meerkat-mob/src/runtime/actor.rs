@@ -1312,10 +1312,11 @@ impl MobActor {
                         "failed cleaning up mcp servers after startup error"
                     );
                 }
-                if let Err(e) = self
-                    .lifecycle_authority
-                    .apply_in_phase(self.state(), MobLifecycleInput::Stop)
-                {
+                if let Err(e) = self.lifecycle_authority.apply_in_phase(
+                    self.state(),
+                    self.machine_active_run_count(),
+                    MobLifecycleInput::Stop,
+                ) {
                     tracing::warn!(error = %e, "authority rejected Stop");
                 }
             } else if let Err(error) = self.ensure_autonomous_runtimes_from_roster().await {
@@ -1338,10 +1339,11 @@ impl MobActor {
                         "failed cleaning up mcp servers after startup error"
                     );
                 }
-                if let Err(e) = self
-                    .lifecycle_authority
-                    .apply_in_phase(self.state(), MobLifecycleInput::Stop)
-                {
+                if let Err(e) = self.lifecycle_authority.apply_in_phase(
+                    self.state(),
+                    self.machine_active_run_count(),
+                    MobLifecycleInput::Stop,
+                ) {
                     tracing::warn!(error = %e, "authority rejected Stop");
                 }
             }
@@ -1565,7 +1567,10 @@ impl MobActor {
                 }
                 #[cfg(test)]
                 MobCommand::LifecycleSnapshot { reply_tx } => {
-                    let _ = reply_tx.send(self.lifecycle_authority.snapshot_in_phase(self.state()));
+                    let _ = reply_tx.send(
+                        self.lifecycle_authority
+                            .snapshot_in_phase(self.state(), self.machine_active_run_count()),
+                    );
                 }
                 MobCommand::Stop { reply_tx } => {
                     let result = match self.require_mob_machine_stop() {
@@ -1628,9 +1633,11 @@ impl MobActor {
                                 }
                                 let phase = self.state();
                                 if stop_result.is_ok()
-                                    && let Err(error) = self
-                                        .lifecycle_authority
-                                        .apply_in_phase(phase, MobLifecycleInput::Stop)
+                                    && let Err(error) = self.lifecycle_authority.apply_in_phase(
+                                        phase,
+                                        self.machine_active_run_count(),
+                                        MobLifecycleInput::Stop,
+                                    )
                                 {
                                     stop_result = Err(MobError::Internal(format!(
                                         "lifecycle Stop transition failed during stop: {error}"
@@ -1703,9 +1710,11 @@ impl MobActor {
                                 }
                                 let phase = self.state();
                                 if resume_result.is_ok()
-                                    && let Err(error) = self
-                                        .lifecycle_authority
-                                        .apply_in_phase(phase, MobLifecycleInput::Resume)
+                                    && let Err(error) = self.lifecycle_authority.apply_in_phase(
+                                        phase,
+                                        self.machine_active_run_count(),
+                                        MobLifecycleInput::Resume,
+                                    )
                                 {
                                     resume_result = Err(MobError::Internal(format!(
                                         "lifecycle Resume transition failed during resume: {error}"
@@ -1960,9 +1969,11 @@ impl MobActor {
                     self.lifecycle_tasks.abort_all();
                     while self.lifecycle_tasks.join_next().await.is_some() {}
                     if self.state() == MobState::Running
-                        && let Err(error) = self
-                            .lifecycle_authority
-                            .apply_in_phase(self.state(), MobLifecycleInput::Stop)
+                        && let Err(error) = self.lifecycle_authority.apply_in_phase(
+                            self.state(),
+                            self.machine_active_run_count(),
+                            MobLifecycleInput::Stop,
+                        )
                     {
                         tracing::warn!(error = %error, "authority rejected Stop");
                         if result.is_ok() {
@@ -4450,10 +4461,11 @@ impl MobActor {
     /// error paths after destructive steps have already been taken.
     async fn fail_reset_to_stopped(&mut self) {
         self.provisioner.cancel_all_checkpointers().await;
-        if let Err(e) = self
-            .lifecycle_authority
-            .apply_in_phase(self.state(), MobLifecycleInput::Stop)
-        {
+        if let Err(e) = self.lifecycle_authority.apply_in_phase(
+            self.state(),
+            self.machine_active_run_count(),
+            MobLifecycleInput::Stop,
+        ) {
             tracing::warn!(error = %e, "authority rejected Stop in fail_reset_to_stopped");
         }
     }
@@ -4487,12 +4499,17 @@ impl MobActor {
         }
 
         let phase = self.state();
-        if self
-            .lifecycle_authority
-            .can_accept_in_phase(phase, MobLifecycleInput::Stop)
-        {
+        if self.lifecycle_authority.can_accept_in_phase(
+            phase,
+            self.machine_active_run_count(),
+            MobLifecycleInput::Stop,
+        ) {
             self.lifecycle_authority
-                .apply_in_phase(phase, MobLifecycleInput::Stop)
+                .apply_in_phase(
+                    phase,
+                    self.machine_active_run_count(),
+                    MobLifecycleInput::Stop,
+                )
                 .map_err(|error| {
                     MobError::Internal(format!(
                         "lifecycle Stop transition failed during reset: {error}"
@@ -4889,10 +4906,11 @@ impl MobActor {
             }
             return Err(MobError::Internal(reason));
         }
-        if let Err(error) = self
-            .lifecycle_authority
-            .apply_in_phase(phase, MobLifecycleInput::StartRun)
-        {
+        if let Err(error) = self.lifecycle_authority.apply_in_phase(
+            phase,
+            self.machine_active_run_count(),
+            MobLifecycleInput::StartRun,
+        ) {
             let mut details = Vec::new();
             if let Some(ref mut orch) = self.orchestrator
                 && let Err(rollback_error) =
@@ -5008,9 +5026,11 @@ impl MobActor {
             let phase = self.state();
             let authorities_expect_completion = self.orchestrator.as_ref().is_some_and(|orch| {
                 orch.can_accept_in_phase(phase, MobOrchestratorInput::CompleteFlow)
-            }) || self
-                .lifecycle_authority
-                .can_accept_in_phase(phase, MobLifecycleInput::FinishRun);
+            }) || self.lifecycle_authority.can_accept_in_phase(
+                phase,
+                self.machine_active_run_count(),
+                MobLifecycleInput::FinishRun,
+            );
             if authorities_expect_completion && !run_terminal {
                 return Err(MobError::Internal(format!(
                     "{context}: received cleanup for run {run_id} with no local trackers while flow authorities still accept completion"
@@ -5034,7 +5054,11 @@ impl MobActor {
                 })?;
         }
         self.lifecycle_authority
-            .apply_in_phase(phase, MobLifecycleInput::FinishRun)
+            .apply_in_phase(
+                phase,
+                self.machine_active_run_count(),
+                MobLifecycleInput::FinishRun,
+            )
             .map_err(|error| {
                 MobError::Internal(format!(
                     "{context}: lifecycle FinishRun transition failed for run {run_id}: {error}"
@@ -5085,7 +5109,11 @@ impl MobActor {
                     })?;
             }
             self.lifecycle_authority
-                .apply_in_phase(phase, MobLifecycleInput::FinishRun)
+                .apply_in_phase(
+                    phase,
+                    self.machine_active_run_count(),
+                    MobLifecycleInput::FinishRun,
+                )
                 .map_err(|error| {
                     MobError::Internal(format!(
                         "flow canceled cleanup (no task handle): lifecycle FinishRun transition failed for run {run_id}: {error}"
@@ -5199,7 +5227,11 @@ impl MobActor {
                     })?;
             }
             self.lifecycle_authority
-                .apply_in_phase(phase, MobLifecycleInput::FinishRun)
+                .apply_in_phase(
+                    phase,
+                    self.machine_active_run_count(),
+                    MobLifecycleInput::FinishRun,
+                )
                 .map_err(|error| {
                     MobError::Internal(format!(
                         "lifecycle FinishRun failed during bulk flow cancellation for run {run_id}: {error}"

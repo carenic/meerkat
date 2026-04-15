@@ -220,11 +220,15 @@ impl MobLifecycleAuthority {
     }
 
     #[cfg(test)]
-    pub(crate) fn snapshot_in_phase(&self, phase: MobState) -> MobLifecycleSnapshot {
+    pub(crate) fn snapshot_in_phase(
+        &self,
+        phase: MobState,
+        active_run_count: u32,
+    ) -> MobLifecycleSnapshot {
         MobLifecycleSnapshot {
             phase,
-            active_run_count: self.fields.active_run_count,
-            cleanup_pending: self.fields.cleanup_pending,
+            active_run_count,
+            cleanup_pending: false,
         }
     }
 
@@ -242,8 +246,14 @@ impl MobLifecycleAuthority {
         self.evaluate(input).is_ok()
     }
 
-    pub(crate) fn can_accept_in_phase(&self, phase: MobState, input: MobLifecycleInput) -> bool {
-        self.evaluate_in_phase(phase, input).is_ok()
+    pub(crate) fn can_accept_in_phase(
+        &self,
+        phase: MobState,
+        active_run_count: u32,
+        input: MobLifecycleInput,
+    ) -> bool {
+        self.evaluate_in_phase(phase, active_run_count, input)
+            .is_ok()
     }
 
     /// Require that the authority is in one of the given phases.
@@ -272,12 +282,13 @@ impl MobLifecycleAuthority {
         &self,
         input: MobLifecycleInput,
     ) -> Result<(MobState, MobLifecycleFields, Vec<MobLifecycleEffect>), MobError> {
-        self.evaluate_in_phase(self.phase, input)
+        self.evaluate_in_phase(self.phase, self.fields.active_run_count, input)
     }
 
     fn evaluate_in_phase(
         &self,
         phase: MobState,
+        active_run_count: u32,
         input: MobLifecycleInput,
     ) -> Result<(MobState, MobLifecycleFields, Vec<MobLifecycleEffect>), MobError> {
         use MobLifecycleInput::{
@@ -287,6 +298,7 @@ impl MobLifecycleAuthority {
         use MobState::{Completed, Destroyed, Running, Stopped};
 
         let mut fields = self.fields.clone();
+        fields.active_run_count = active_run_count;
         let mut effects = Vec::new();
 
         let next_phase = match (phase, input) {
@@ -380,11 +392,13 @@ impl MobLifecycleAuthority {
     pub(crate) fn apply_in_phase(
         &mut self,
         phase: MobState,
+        active_run_count: u32,
         input: MobLifecycleInput,
     ) -> Result<MobLifecycleTransition, MobError> {
-        let (next_phase, next_fields, effects) = self.evaluate_in_phase(phase, input)?;
+        let (next_phase, next_fields, effects) =
+            self.evaluate_in_phase(phase, active_run_count, input)?;
 
-        self.fields = next_fields.clone();
+        self.fields.cleanup_pending = next_fields.cleanup_pending;
         self.observable.store(next_phase as u8, Ordering::Release);
 
         Ok(MobLifecycleTransition {

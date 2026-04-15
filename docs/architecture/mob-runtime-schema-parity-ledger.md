@@ -306,6 +306,13 @@ Current state:
   behavior. The top-level checked-in `MobMachine` had already dropped
   `cleanup_pending`, and production runtime behavior no longer pays rent for it
   below that boundary either.
+- The next run-tracking cut does the same thing for `active_run_count`:
+  production lifecycle legality now receives active-run count explicitly from
+  the actor's canonical flow tracker set (`run_cancel_tokens` / `run_tasks`)
+  through `apply_in_phase(..., active_run_count, ...)` and
+  `can_accept_in_phase(..., active_run_count, ...)`. The helper no longer owns
+  live production run-count truth; it just applies the machine-aligned legality
+  table against actor-supplied state.
 
 ## Notes
 
@@ -341,7 +348,12 @@ Current state:
    authority at all, or whether the next largest win is to collapse more of its
    run-count / cleanup semantics directly under `MobMachine`.
 7. After removing production cleanup choreography, the strongest remaining
-   lifecycle-helper field is `active_run_count`, which now looks like the only
-   live lower-authority state still shaping run completion semantics.
+   lifecycle-helper field was `active_run_count`.
+8. After the actor-owned run-count projection cut, the remaining lifecycle
+   helper state is no longer a second owner of either coarse phase or live run
+   count. The next honest Mob frontier is whether the remaining
+   `MobLifecycleAuthority` helper should persist as a separate realization table
+   at all, or whether its residual legality can now be collapsed further under
+   `MobMachine`.
    authority and the lower topology service, plus any remaining top-level
    lifecycle legality that still bypasses the checked-in machine.
