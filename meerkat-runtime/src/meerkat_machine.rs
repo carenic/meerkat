@@ -3323,7 +3323,7 @@ impl MeerkatMachine {
             admission_order,
             queue: ingress.queue().to_vec(),
             steer_queue: ingress.steer_queue().to_vec(),
-            current_run_id: ingress.current_run().cloned(),
+            current_run_id: control.current_run_id.clone(),
             current_run_contributors: ingress.current_run_contributors().to_vec(),
             post_admission_signal: format!("{:?}", driver.post_admission_signal()),
             silent_intent_overrides: driver.silent_comms_intents().into_iter().collect(),

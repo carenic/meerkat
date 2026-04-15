@@ -655,13 +655,24 @@ impl MeerkatMachineSpineSnapshot {
                 .push("CurrentRunContributorsInvariant: active run but no contributors".into());
         }
 
-        // RunIdsAlignedInvariant: ~HasActiveRun \/ RunIdsAligned
-        if self.control.current_run_id.is_some()
-            && self.control.current_run_id != self.inputs.current_run_id
-        {
-            violations.push(
-                "RunIdsAlignedInvariant: control.current_run_id != inputs.current_run_id".into(),
-            );
+        // ContributorRunIdentityInvariant: when control owns an active run,
+        // every current contributor must point at that same run in the
+        // ingress bookkeeping.
+        if let Some(control_run_id) = &self.control.current_run_id {
+            for cid in &self.inputs.current_run_contributors {
+                if let Some(snap) = self
+                    .inputs
+                    .admission_order
+                    .iter()
+                    .find(|a| &a.input_id == cid)
+                    && snap.last_run_id.as_ref() != Some(control_run_id)
+                {
+                    violations.push(format!(
+                        "ContributorRunIdentityInvariant: contributor {cid} has last_run_id {:?}, expected {:?}",
+                        snap.last_run_id, control_run_id
+                    ));
+                }
+            }
         }
 
         // --- Ops invariants ---

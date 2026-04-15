@@ -361,18 +361,22 @@ impl RuntimeIngressAuthority {
         &self.fields.steer_queue
     }
 
-    /// The current run ID (if a run is in progress).
-    pub fn current_run(&self) -> Option<&RunId> {
-        self.fields
-            .current_run_contributors
-            .first()
-            .and_then(|work_id| self.fields.last_run.get(work_id))
-            .and_then(|run_id| run_id.as_ref())
-    }
-
     /// The current run's contributing work IDs.
     pub fn current_run_contributors(&self) -> &[InputId] {
         &self.fields.current_run_contributors
+    }
+
+    /// Whether the current contributor set coheres to the provided run ID.
+    ///
+    /// This validates run identity against contributor bookkeeping without
+    /// introducing a second runtime-owned "current run" authority.
+    pub fn contributors_match_run(&self, run_id: &RunId) -> bool {
+        !self.fields.current_run_contributors.is_empty()
+            && self
+                .fields
+                .current_run_contributors
+                .iter()
+                .all(|work_id| self.last_run(work_id) == Some(run_id))
     }
 
     /// Lifecycle state for a specific work ID.
@@ -880,12 +884,9 @@ impl RuntimeIngressAuthority {
         boundary_sequence: u64,
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: run_matches_current
-        if self.current_run() != Some(run_id) {
+        if !self.contributors_match_run(run_id) {
             return Err(RuntimeIngressError::GuardFailed {
-                guard: format!(
-                    "run_matches_current: expected {:?}, got {run_id:?}",
-                    self.current_run()
-                ),
+                guard: format!("run_matches_current: contributors do not match {run_id:?}"),
             });
         }
 
@@ -925,12 +926,9 @@ impl RuntimeIngressAuthority {
         run_id: &RunId,
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: run_matches_current
-        if self.current_run() != Some(run_id) {
+        if !self.contributors_match_run(run_id) {
             return Err(RuntimeIngressError::GuardFailed {
-                guard: format!(
-                    "run_matches_current: expected {:?}, got {run_id:?}",
-                    self.current_run()
-                ),
+                guard: format!("run_matches_current: contributors do not match {run_id:?}"),
             });
         }
 
@@ -976,12 +974,9 @@ impl RuntimeIngressAuthority {
         run_id: &RunId,
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: run_matches_current
-        if self.current_run() != Some(run_id) {
+        if !self.contributors_match_run(run_id) {
             return Err(RuntimeIngressError::GuardFailed {
-                guard: format!(
-                    "run_matches_current: expected {:?}, got {run_id:?}",
-                    self.current_run()
-                ),
+                guard: format!("run_matches_current: contributors do not match {run_id:?}"),
             });
         }
 
@@ -1038,12 +1033,9 @@ impl RuntimeIngressAuthority {
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Same logic as RunFailed per the schema.
         // Guard: run_matches_current
-        if self.current_run() != Some(run_id) {
+        if !self.contributors_match_run(run_id) {
             return Err(RuntimeIngressError::GuardFailed {
-                guard: format!(
-                    "run_matches_current: expected {:?}, got {run_id:?}",
-                    self.current_run()
-                ),
+                guard: format!("run_matches_current: contributors do not match {run_id:?}"),
             });
         }
 
@@ -1668,6 +1660,12 @@ mod tests {
         .expect("admit consumed should succeed")
     }
 
+    fn current_run_for_test(auth: &RuntimeIngressAuthority) -> Option<&RunId> {
+        auth.current_run_contributors()
+            .first()
+            .and_then(|work_id| auth.last_run(work_id))
+    }
+
     // ---- Lifecycle-free helper behavior ----
 
     #[test]
@@ -1675,7 +1673,7 @@ mod tests {
         let auth = RuntimeIngressAuthority::new();
         assert!(auth.queue().is_empty());
         assert!(auth.steer_queue().is_empty());
-        assert!(auth.current_run().is_none());
+        assert!(current_run_for_test(&auth).is_none());
     }
 
     #[test]
@@ -1916,7 +1914,7 @@ mod tests {
             .expect("stage should succeed");
 
         assert!(auth.queue().is_empty());
-        assert_eq!(auth.current_run(), Some(&run_id));
+        assert_eq!(current_run_for_test(&auth), Some(&run_id));
         assert_eq!(auth.current_run_contributors(), &[w1.clone(), w2.clone()]);
         assert_eq!(auth.lifecycle_state(&w1), Some(InputLifecycleState::Staged));
         assert_eq!(auth.lifecycle_state(&w2), Some(InputLifecycleState::Staged));
@@ -2065,7 +2063,7 @@ mod tests {
             auth.lifecycle_state(&w1),
             Some(InputLifecycleState::Consumed)
         );
-        assert!(auth.current_run().is_none());
+        assert!(current_run_for_test(&auth).is_none());
         assert!(auth.current_run_contributors().is_empty());
         assert!(t.effects.iter().any(|e| matches!(
             e,
@@ -2099,7 +2097,7 @@ mod tests {
 
         assert_eq!(auth.lifecycle_state(&w1), Some(InputLifecycleState::Queued));
         assert!(auth.queue().contains(&w1));
-        assert!(auth.current_run().is_none());
+        assert!(current_run_for_test(&auth).is_none());
         assert!(
             transition
                 .effects
@@ -2259,7 +2257,7 @@ mod tests {
             .expect("recover should succeed");
 
         assert_eq!(auth.lifecycle_state(&w1), Some(InputLifecycleState::Queued));
-        assert!(auth.current_run().is_none());
+        assert!(current_run_for_test(&auth).is_none());
         assert!(auth.queue().contains(&w1));
         assert!(
             transition
@@ -2383,7 +2381,7 @@ mod tests {
             auth.lifecycle_state(&w2),
             Some(InputLifecycleState::Consumed)
         );
-        assert!(auth.current_run().is_none());
+        assert!(current_run_for_test(&auth).is_none());
         assert!(auth.queue().is_empty());
     }
 
@@ -2505,14 +2503,14 @@ mod tests {
         assert!(auth.can_accept(&RuntimeIngressInput::Retire));
         // Reset from Active with no current run should succeed
         assert!(auth.can_accept(&RuntimeIngressInput::Reset));
-        assert!(auth.current_run().is_none());
+        assert!(current_run_for_test(&auth).is_none());
     }
 
     #[test]
     fn can_accept_reset_from_active() {
         let auth = RuntimeIngressAuthority::new();
         assert!(auth.can_accept(&RuntimeIngressInput::Reset));
-        assert!(auth.current_run().is_none());
+        assert!(current_run_for_test(&auth).is_none());
     }
 
     // ---- State unchanged on failure ----

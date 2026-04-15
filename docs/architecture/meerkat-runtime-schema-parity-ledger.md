@@ -193,13 +193,18 @@ Current exact-parity state:
   newly accepted inputs; that control intent is now decided in the
   driver/machine path and the helper only executes the explicit admit
   transition plus lower-level queue/ledger bookkeeping
+- the ingress helper also no longer derives a second authoritative
+  `current_run` projection from contributor state; the live guard path now
+  validates contributor `last_run` metadata directly against the control-owned
+  run ID, and the diagnostic spine echoes `current_run_id` from control rather
+  than from ingress
 - the pure query surface remains runtime-audited helper behavior, but it is no
   longer counted as formal transition coverage
 - the next remaining dogma violation is no longer coarse control truth in a
   separate reducer; it is the remaining handwritten ingress queue/contributor
-  owner in `RuntimeIngressAuthority`, which no longer stores a second
-  `current_run` field but still owns contributor queues and reset / stop /
-  destroy / recover bookkeeping below the two checked-in machines
+  owner in `RuntimeIngressAuthority`, which no longer derives a second active
+  run identity but still owns contributor queues and reset / stop / destroy /
+  recover bookkeeping below the two checked-in machines
 
 Interpretation:
 

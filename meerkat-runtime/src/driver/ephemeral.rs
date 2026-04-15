@@ -1425,7 +1425,7 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
                 run_id, receipt, ..
             } => {
                 // Ingress authority: BoundaryApplied
-                if self.ingress.current_run() == Some(&run_id) {
+                if self.ingress.contributors_match_run(&run_id) {
                     match self.ingress.apply(RuntimeIngressInput::BoundaryApplied {
                         run_id: run_id.clone(),
                         boundary_sequence: receipt.sequence,
