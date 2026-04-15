@@ -703,6 +703,10 @@ The important read is now sharper than the earlier partial dump story:
   change the truthful Meerkat graph or reopen parity, which confirms that
   immediate-processing semantics are already owned by the checked-in Meerkat
   accept / post-admission signal path rather than the queue helper
+- removing ingress-owned `Recover` semantics did not change the audited
+  Meerkat frontier either: recovery is now derived from canonical ledger truth
+  and ingress is rebuilt mechanically from that truth instead of classifying
+  recovery lifecycle itself
 - preserving the full snapshot still keeps almost every remaining state
   distinct (`19,078`), which tells us the field tuple is still doing most of
   the real work even after the retire-drain correction

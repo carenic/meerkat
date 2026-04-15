@@ -120,7 +120,6 @@ pub enum RuntimeIngressInput {
         reservation_key: Option<ReservationKey>,
     },
     /// Recover: re-derive transient state from canonical state.
-    Recover,
     /// Reconcile inputs that became terminal outside the ingress authority's
     /// local retry bookkeeping.
     ReconcileTerminalInputs {
@@ -207,13 +206,6 @@ pub enum RuntimeIngressEffect {
     /// Stage an input for a run — shell calls the per-input lifecycle
     /// authority and emits the Staged event in response.
     StageInput { work_id: InputId, run_id: RunId },
-
-    /// Per-input recovery effect: consume the input on accept.
-    RecoverConsumeOnAccept { work_id: InputId },
-    /// Per-input recovery effect: rollback the input to queued.
-    RecoverRollback { work_id: InputId },
-    /// Per-input recovery effect: keep the input in its current state.
-    RecoverKeep { work_id: InputId },
 }
 
 // ---------------------------------------------------------------------------
@@ -543,7 +535,6 @@ impl RuntimeIngressAuthority {
             RuntimeIngressInput::Reset => self.eval_reset(),
             RuntimeIngressInput::Stop => self.eval_stop(),
             RuntimeIngressInput::Destroy => self.eval_destroy(),
-            RuntimeIngressInput::Recover => self.eval_recover(),
             RuntimeIngressInput::ReconcileTerminalInputs { terminal_inputs } => {
                 self.eval_reconcile_terminal_inputs(terminal_inputs)
             }
@@ -1274,110 +1265,6 @@ impl RuntimeIngressAuthority {
         Ok((fields, vec![]))
     }
 
-    fn eval_recover(
-        &self,
-    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
-        let mut fields = self.fields.clone();
-        let mut effects = Vec::new();
-
-        // Emit per-input recovery effects for all non-terminal inputs.
-        // The authority inspects each input's lifecycle state and policy snapshot
-        // to decide the recovery action. The shell executes these effects.
-        let non_terminal_ids: Vec<InputId> = fields
-            .lifecycle
-            .iter()
-            .filter(|(_, state)| !state.is_terminal())
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        for wid in &non_terminal_ids {
-            let lifecycle = fields.lifecycle.get(wid).copied();
-            match lifecycle {
-                Some(InputLifecycleState::Accepted) => {
-                    fields
-                        .lifecycle
-                        .insert(wid.clone(), InputLifecycleState::Queued);
-                    let hm = fields.handling_mode.get(wid).copied();
-                    match hm {
-                        Some(HandlingMode::Steer) => {
-                            if !fields.steer_queue.contains(wid) {
-                                fields.steer_queue.insert(0, wid.clone());
-                            }
-                        }
-                        _ => {
-                            if !fields.queue.contains(wid) {
-                                fields.queue.insert(0, wid.clone());
-                            }
-                        }
-                    }
-                    // Check if this is an Ignore+OnAccept input that should be consumed
-                    let should_consume = fields
-                        .policy_snapshot
-                        .get(wid)
-                        .map(|p| {
-                            p.apply_mode == crate::policy::ApplyMode::Ignore
-                                && p.consume_point == crate::policy::ConsumePoint::OnAccept
-                        })
-                        .unwrap_or(false);
-                    if should_consume {
-                        effects.push(RuntimeIngressEffect::RecoverConsumeOnAccept {
-                            work_id: wid.clone(),
-                        });
-                    } else {
-                        effects.push(RuntimeIngressEffect::RecoverRollback {
-                            work_id: wid.clone(),
-                        });
-                    }
-                }
-                Some(InputLifecycleState::Staged) => {
-                    fields
-                        .lifecycle
-                        .insert(wid.clone(), InputLifecycleState::Queued);
-                    let hm = fields.handling_mode.get(wid).copied();
-                    match hm {
-                        Some(HandlingMode::Steer) => {
-                            if !fields.steer_queue.contains(wid) {
-                                fields.steer_queue.insert(0, wid.clone());
-                            }
-                        }
-                        _ => {
-                            if !fields.queue.contains(wid) {
-                                fields.queue.insert(0, wid.clone());
-                            }
-                        }
-                    }
-                    effects.push(RuntimeIngressEffect::RecoverRollback {
-                        work_id: wid.clone(),
-                    });
-                }
-                Some(
-                    InputLifecycleState::Applied | InputLifecycleState::AppliedPendingConsumption,
-                ) => {
-                    effects.push(RuntimeIngressEffect::RecoverKeep {
-                        work_id: wid.clone(),
-                    });
-                }
-                Some(InputLifecycleState::Queued) => {
-                    effects.push(RuntimeIngressEffect::RecoverKeep {
-                        work_id: wid.clone(),
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        if !fields.queue.is_empty() || !fields.steer_queue.is_empty() {
-            effects.push(RuntimeIngressEffect::WakeRuntime);
-        }
-
-        effects.push(RuntimeIngressEffect::IngressNotice {
-            kind: "Recover".into(),
-            detail: "IngressRecovered".into(),
-        });
-
-        Ok((fields, effects))
-    }
-
     fn eval_reconcile_terminal_inputs(
         &self,
         terminal_inputs: &[(InputId, InputTerminalOutcome)],
@@ -2095,93 +1982,6 @@ mod tests {
         );
         assert!(!auth.queue().contains(&s1));
         assert!(!auth.queue().contains(&s2));
-    }
-
-    // ---- Recover ----
-
-    #[test]
-    fn recover_rolls_back_in_flight_run() {
-        let mut auth = RuntimeIngressAuthority::new();
-        let w1 = InputId::new();
-        admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
-
-        let run_id = RunId::new();
-        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
-            run_id: run_id.clone(),
-            contributing_work_ids: vec![w1.clone()],
-        })
-        .unwrap();
-
-        let transition = auth
-            .apply(RuntimeIngressInput::Recover)
-            .expect("recover should succeed");
-
-        assert_eq!(auth.lifecycle_state(&w1), Some(InputLifecycleState::Queued));
-        assert!(!has_current_run_for_test(&auth));
-        assert!(auth.queue().contains(&w1));
-        assert!(
-            transition
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, RuntimeIngressEffect::WakeRuntime))
-        );
-    }
-
-    #[test]
-    fn recover_requeues_admitted_recovered_accepted_input() {
-        let mut auth = RuntimeIngressAuthority::new();
-        let w1 = InputId::new();
-
-        auth.apply(RuntimeIngressInput::AdmitRecovered {
-            work_id: w1.clone(),
-            content_shape: ContentShape("text".into()),
-            handling_mode: HandlingMode::Queue,
-            lifecycle_state: InputLifecycleState::Accepted,
-            policy: test_policy(),
-            request_id: None,
-            reservation_key: None,
-        })
-        .expect("admit recovered accepted input should succeed");
-
-        let transition = auth
-            .apply(RuntimeIngressInput::Recover)
-            .expect("recover should succeed");
-
-        assert_eq!(auth.lifecycle_state(&w1), Some(InputLifecycleState::Queued));
-        assert!(auth.queue().contains(&w1));
-        assert!(transition.effects.iter().any(|effect| matches!(
-            effect,
-            RuntimeIngressEffect::RecoverRollback { work_id } if work_id == &w1
-        )));
-    }
-
-    #[test]
-    fn recover_requeues_admitted_recovered_staged_input_without_current_run() {
-        let mut auth = RuntimeIngressAuthority::new();
-        let w1 = InputId::new();
-
-        auth.apply(RuntimeIngressInput::AdmitRecovered {
-            work_id: w1.clone(),
-            content_shape: ContentShape("text".into()),
-            handling_mode: HandlingMode::Steer,
-            lifecycle_state: InputLifecycleState::Staged,
-            policy: test_policy(),
-            request_id: None,
-            reservation_key: None,
-        })
-        .expect("admit recovered staged input should succeed");
-
-        let transition = auth
-            .apply(RuntimeIngressInput::Recover)
-            .expect("recover should succeed");
-
-        assert_eq!(auth.lifecycle_state(&w1), Some(InputLifecycleState::Queued));
-        assert!(auth.steer_queue().contains(&w1));
-        assert!(!auth.queue().contains(&w1));
-        assert!(transition.effects.iter().any(|effect| matches!(
-            effect,
-            RuntimeIngressEffect::RecoverRollback { work_id } if work_id == &w1
-        )));
     }
 
     #[test]

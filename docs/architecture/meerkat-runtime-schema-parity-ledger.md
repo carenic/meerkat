@@ -262,6 +262,10 @@ Interpretation:
   admission did not reopen any Meerkat parity gap either: immediate-processing
   semantics are now plainly owned by the checked-in Meerkat accept /
   post-admission signal path, not by the queue helper boundary
+- removing ingress-owned `Recover` semantics did not reopen any Meerkat parity
+  gap either: recovery now normalizes canonical input lifecycle truth in the
+  ledger first and then rebuilds ingress mechanically from that ledger, instead
+  of asking ingress to classify recovery semantics on its own
 
 ## Resolution Rubric
 

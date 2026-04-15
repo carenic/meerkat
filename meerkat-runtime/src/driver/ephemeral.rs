@@ -350,15 +350,6 @@ impl EphemeralRuntimeDriver {
                         "ingress authority: accept-phase effect (handled in accept path)"
                     );
                 }
-                RuntimeIngressEffect::RecoverConsumeOnAccept { work_id }
-                | RuntimeIngressEffect::RecoverRollback { work_id }
-                | RuntimeIngressEffect::RecoverKeep { work_id } => {
-                    tracing::trace!(
-                        work_id = ?work_id,
-                        effect = ?effect,
-                        "ingress authority: recovery effect"
-                    );
-                }
             }
         }
     }
@@ -998,59 +989,108 @@ impl EphemeralRuntimeDriver {
     }
 
     pub fn recover_ephemeral(&mut self) -> RecoveryReport {
-        // Ingress authority: Recover — returns typed per-input recovery effects.
-        let recovery_effects = match self.ingress.apply(RuntimeIngressInput::Recover) {
-            Ok(transition) => {
-                self.process_ingress_effects(&transition.effects);
-                transition.effects
-            }
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "ingress authority rejected Recover"
-                );
-                Vec::new()
-            }
-        };
-
-        // Execute the authority's per-input recovery effects.
         let mut recovered = 0;
         let mut abandoned = 0;
         let mut requeued = 0;
 
-        for effect in &recovery_effects {
-            match effect {
-                RuntimeIngressEffect::RecoverConsumeOnAccept { work_id } => {
-                    if let Some(state) = self.ledger.get_mut(work_id) {
+        let active_ids: Vec<InputId> = self
+            .ledger
+            .iter_non_terminal()
+            .map(|(input_id, _)| input_id.clone())
+            .collect();
+
+        for input_id in &active_ids {
+            let Some(state) = self.ledger.get_mut(input_id) else {
+                continue;
+            };
+            match state.current_state() {
+                InputLifecycleState::Accepted => {
+                    let consume_on_accept = state
+                        .policy
+                        .as_ref()
+                        .map(|p| {
+                            p.decision.apply_mode == crate::policy::ApplyMode::Ignore
+                                && p.decision.consume_point == crate::policy::ConsumePoint::OnAccept
+                        })
+                        .unwrap_or(false);
+                    if consume_on_accept {
                         let _ = state.apply(InputLifecycleInput::ConsumeOnAccept);
                         abandoned += 1;
-                        recovered += 1;
-                    }
-                }
-                RuntimeIngressEffect::RecoverRollback { work_id } => {
-                    if let Some(state) = self.ledger.get_mut(work_id) {
-                        match state.current_state() {
-                            InputLifecycleState::Accepted => {
-                                let _ = state.apply(InputLifecycleInput::QueueAccepted);
-                            }
-                            InputLifecycleState::Staged => {
-                                let _ = state.apply(InputLifecycleInput::RollbackStaged);
-                            }
-                            _ => {}
-                        }
+                    } else {
+                        let _ = state.apply(InputLifecycleInput::QueueAccepted);
                         requeued += 1;
-                        recovered += 1;
                     }
+                    recovered += 1;
                 }
-                RuntimeIngressEffect::RecoverKeep { work_id } => {
-                    if self.ledger.get(work_id).is_some() {
-                        recovered += 1;
-                    }
+                InputLifecycleState::Staged => {
+                    let _ = state.apply(InputLifecycleInput::RollbackStaged);
+                    requeued += 1;
+                    recovered += 1;
                 }
-                _ => {}
+                InputLifecycleState::Queued
+                | InputLifecycleState::Applied
+                | InputLifecycleState::AppliedPendingConsumption => {
+                    recovered += 1;
+                }
+                InputLifecycleState::Consumed
+                | InputLifecycleState::Superseded
+                | InputLifecycleState::Coalesced
+                | InputLifecycleState::Abandoned => {}
             }
         }
 
+        let mut rebuilt_ingress = RuntimeIngressAuthority::new();
+        let recovered_entries: Vec<_> = self
+            .ledger
+            .iter()
+            .filter_map(|(input_id, state)| {
+                let handling_mode = state
+                    .policy
+                    .as_ref()
+                    .map(|p| handling_mode_from_policy(&p.decision))
+                    .unwrap_or(HandlingMode::Queue);
+                let content_shape = state
+                    .persisted_input
+                    .as_ref()
+                    .map(|input| ContentShape(input.kind_id().to_string()))
+                    .unwrap_or_else(|| ContentShape("unknown".into()));
+                let policy = match state.policy.as_ref() {
+                    Some(policy) => policy.decision.clone(),
+                    None => match state.persisted_input.as_ref() {
+                        Some(input) => DefaultPolicyTable::resolve(input, true),
+                        None => return None,
+                    },
+                };
+
+                Some((
+                    input_id.clone(),
+                    content_shape,
+                    handling_mode,
+                    state.current_state(),
+                    policy,
+                ))
+            })
+            .collect();
+
+        for (input_id, content_shape, handling_mode, lifecycle_state, policy) in recovered_entries {
+            if let Err(err) = rebuilt_ingress.apply(RuntimeIngressInput::AdmitRecovered {
+                work_id: input_id.clone(),
+                content_shape,
+                handling_mode,
+                lifecycle_state,
+                policy,
+                request_id: None,
+                reservation_key: None,
+            }) {
+                tracing::warn!(
+                    input_id = ?input_id,
+                    error = %err,
+                    "ingress authority rejected rebuilt recovered input"
+                );
+            }
+        }
+
+        self.ingress = rebuilt_ingress;
         self.rebuild_queue_projections();
         self.debug_assert_queue_projection_alignment();
 
