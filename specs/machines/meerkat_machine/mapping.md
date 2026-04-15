@@ -579,12 +579,6 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `current_run_only_while_running_or_retired`
   - anchors: `meerkat_machine`, `meerkat_public_surface`, `peer_directory_reachability_authority`
   - scenarios: `bind-run-boundary-terminal`, `retire-reset-destroy`, `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `peer_reachability_probe`
-- `drain_requires_ingress_context`
-  - anchors: `meerkat_machine`, `meerkat_public_surface`, `peer_directory_reachability_authority`
-  - scenarios: `bind-run-boundary-terminal`, `retire-reset-destroy`, `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `peer_reachability_probe`
-- `active_requested_names_subset_of_staged`
-  - anchors: `meerkat_machine`, `meerkat_public_surface`, `peer_directory_reachability_authority`
-  - scenarios: `bind-run-boundary-terminal`, `retire-reset-destroy`, `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `peer_reachability_probe`
 
 
 <!-- GENERATED_COVERAGE_END -->

@@ -15,9 +15,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `current_run_id`: `Option<RunId>`
 - `pre_run_phase`: `Option<String>`
 - `peer_ingress_configured`: `Bool`
-- `drain_running`: `Bool`
 - `silent_intent_overrides`: `Set<String>`
-- `active_requested_deferred_names`: `Set<String>`
 - `staged_requested_deferred_names`: `Set<String>`
 - `active_visibility_revision`: `u64`
 - `staged_visibility_revision`: `u64`
@@ -143,8 +141,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `fence_requires_bound_runtime`
 - `running_has_current_run`
 - `current_run_only_while_running_or_retired`
-- `drain_requires_ingress_context`
-- `active_requested_names_subset_of_staged`
 
 ## Transitions
 ### `Initialize`
@@ -467,7 +463,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `session_registered`
   - `active_not_behind_staged`
-  - `active_requested_names_subset_of_staged_input`
   - `equal_revision_requires_equal_active_and_staged_input`
 - Emits: `CommittedVisibleSetPublished`
 - To: `Idle`
@@ -478,7 +473,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `session_registered`
   - `active_not_behind_staged`
-  - `active_requested_names_subset_of_staged_input`
   - `equal_revision_requires_equal_active_and_staged_input`
 - Emits: `CommittedVisibleSetPublished`
 - To: `Attached`
@@ -489,7 +483,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `session_registered`
   - `active_not_behind_staged`
-  - `active_requested_names_subset_of_staged_input`
   - `equal_revision_requires_equal_active_and_staged_input`
 - Emits: `CommittedVisibleSetPublished`
 - To: `Running`
@@ -500,7 +493,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `session_registered`
   - `active_not_behind_staged`
-  - `active_requested_names_subset_of_staged_input`
   - `equal_revision_requires_equal_active_and_staged_input`
 - Emits: `CommittedVisibleSetPublished`
 - To: `Retired`
@@ -511,7 +503,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `session_registered`
   - `active_not_behind_staged`
-  - `active_requested_names_subset_of_staged_input`
   - `equal_revision_requires_equal_active_and_staged_input`
 - Emits: `CommittedVisibleSetPublished`
 - To: `Stopped`

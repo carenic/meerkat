@@ -153,6 +153,21 @@ Current state:
 - the cross-pair public-phase expansion tranche is aligned
 - Meerkat acceptance parity is now green across the current public-phase
   frontier
+- Fast-loop finding: `silent_intent_overrides` is **not** a safe collapse even
+  though Hopcroft attributes `48.2%` collapse pressure to it. The live runtime
+  still applies that set before ingress transitions to force wake/apply policy
+  for matching peer intents, so we are treating it as an under-modeled
+  behavior carrier rather than simplifying the wrong truth.
+- Fast-loop landed: `drain_running` was removed from the checked-in Meerkat
+  state after the runtime review confirmed it is only a projection of
+  lower-authority drain state. TLC stayed green, the raw quotient stayed flat
+  at `459`, and the truthful Meerkat graph fell from `19,459` to `14,536`
+  reachable states.
+- Fast-loop landed: `active_requested_deferred_names` was removed from the
+  checked-in Meerkat state while the canonical `SessionToolVisibilityState`
+  and visibility owner stayed intact below the machine boundary. TLC stayed
+  green, the raw quotient stayed flat at `459`, and the truthful Meerkat graph
+  fell again from `14,536` to `11,293` reachable states.
 
 ## Full-row Snapshot (2026-04-15)
 

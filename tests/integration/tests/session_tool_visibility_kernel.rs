@@ -137,9 +137,11 @@ fn session_tool_visibility_kernel_stages_deferred_requests_without_touching_acti
         requested.fields.get("active_visibility_revision"),
         Some(&KernelValue::U64(0))
     );
-    assert_eq!(
-        requested.fields.get("active_requested_deferred_names"),
-        Some(&KernelValue::Set(Default::default()))
+    assert!(
+        !requested
+            .fields
+            .contains_key("active_requested_deferred_names"),
+        "top-level machine should no longer mirror active requested names",
     );
 
     match requested.fields.get("staged_requested_deferred_names") {

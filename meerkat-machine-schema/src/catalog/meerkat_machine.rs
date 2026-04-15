@@ -2,8 +2,8 @@ use indexmap::IndexMap;
 
 use crate::{
     EffectDisposition, EffectDispositionRule, EffectEmit, EnumSchema, Expr, FieldSchema, Guard,
-    HelperSchema, InitSchema, InputMatch, InvariantSchema, MachineSchema, Quantifier, RustBinding,
-    StateSchema, TransitionSchema, TypeRef, Update, VariantSchema, machine::TriggerKind,
+    HelperSchema, InitSchema, InputMatch, InvariantSchema, MachineSchema, RustBinding, StateSchema,
+    TransitionSchema, TypeRef, Update, VariantSchema, machine::TriggerKind,
 };
 
 pub fn meerkat_machine() -> MachineSchema {
@@ -59,13 +59,8 @@ pub fn meerkat_machine() -> MachineSchema {
                 ),
                 field("pre_run_phase", TypeRef::Option(Box::new(TypeRef::String))),
                 field("peer_ingress_configured", TypeRef::Bool),
-                field("drain_running", TypeRef::Bool),
                 field(
                     "silent_intent_overrides",
-                    TypeRef::Set(Box::new(TypeRef::String)),
-                ),
-                field(
-                    "active_requested_deferred_names",
                     TypeRef::Set(Box::new(TypeRef::String)),
                 ),
                 field(
@@ -86,9 +81,7 @@ pub fn meerkat_machine() -> MachineSchema {
                     init("current_run_id", Expr::None),
                     init("pre_run_phase", Expr::None),
                     init("peer_ingress_configured", Expr::Bool(false)),
-                    init("drain_running", Expr::Bool(false)),
                     init("silent_intent_overrides", Expr::EmptySet),
-                    init("active_requested_deferred_names", Expr::EmptySet),
                     init("staged_requested_deferred_names", Expr::EmptySet),
                     init("active_visibility_revision", Expr::U64(0)),
                     init("staged_visibility_revision", Expr::U64(0)),
@@ -207,31 +200,6 @@ pub fn meerkat_machine() -> MachineSchema {
                         ),
                     ]),
                 ]),
-            },
-            InvariantSchema {
-                name: "drain_requires_ingress_context".into(),
-                expr: Expr::Or(vec![
-                    Expr::Eq(
-                        Box::new(Expr::Field("drain_running".into())),
-                        Box::new(Expr::Bool(false)),
-                    ),
-                    Expr::Eq(
-                        Box::new(Expr::Field("peer_ingress_configured".into())),
-                        Box::new(Expr::Bool(true)),
-                    ),
-                ]),
-            },
-            InvariantSchema {
-                name: "active_requested_names_subset_of_staged".into(),
-                expr: Expr::Quantified {
-                    quantifier: Quantifier::All,
-                    binding: "name".into(),
-                    over: Box::new(Expr::Field("active_requested_deferred_names".into())),
-                    body: Box::new(Expr::Contains {
-                        collection: Box::new(Expr::Field("staged_requested_deferred_names".into())),
-                        value: Box::new(Expr::Binding("name".into())),
-                    }),
-                },
             },
         ],
         transitions: vec![
@@ -384,10 +352,7 @@ pub fn meerkat_machine() -> MachineSchema {
                     bindings: vec!["reason".into()],
                 },
                 guards: vec![session_registered_guard()],
-                updates: vec![Update::Assign {
-                    field: "drain_running".into(),
-                    expr: Expr::Bool(false),
-                }],
+                updates: vec![],
                 to: "Idle".into(),
                 emit: vec![notice_emit("drain", "drain exited")],
             },
@@ -400,10 +365,7 @@ pub fn meerkat_machine() -> MachineSchema {
                     bindings: vec!["reason".into()],
                 },
                 guards: vec![session_registered_guard()],
-                updates: vec![Update::Assign {
-                    field: "drain_running".into(),
-                    expr: Expr::Bool(false),
-                }],
+                updates: vec![],
                 to: "Attached".into(),
                 emit: vec![notice_emit("drain", "drain exited")],
             },
@@ -416,10 +378,7 @@ pub fn meerkat_machine() -> MachineSchema {
                     bindings: vec!["reason".into()],
                 },
                 guards: vec![session_registered_guard()],
-                updates: vec![Update::Assign {
-                    field: "drain_running".into(),
-                    expr: Expr::Bool(false),
-                }],
+                updates: vec![],
                 to: "Running".into(),
                 emit: vec![notice_emit("drain", "drain exited")],
             },
@@ -432,10 +391,7 @@ pub fn meerkat_machine() -> MachineSchema {
                     bindings: vec!["reason".into()],
                 },
                 guards: vec![session_registered_guard()],
-                updates: vec![Update::Assign {
-                    field: "drain_running".into(),
-                    expr: Expr::Bool(false),
-                }],
+                updates: vec![],
                 to: "Retired".into(),
                 emit: vec![notice_emit("drain", "drain exited")],
             },
@@ -448,10 +404,7 @@ pub fn meerkat_machine() -> MachineSchema {
                     bindings: vec!["reason".into()],
                 },
                 guards: vec![session_registered_guard()],
-                updates: vec![Update::Assign {
-                    field: "drain_running".into(),
-                    expr: Expr::Bool(false),
-                }],
+                updates: vec![],
                 to: "Stopped".into(),
                 emit: vec![notice_emit("drain", "drain exited")],
             },
@@ -555,16 +508,10 @@ pub fn meerkat_machine() -> MachineSchema {
                         ),
                     },
                 ],
-                updates: vec![
-                    Update::Assign {
-                        field: "active_requested_deferred_names".into(),
-                        expr: Expr::Field("staged_requested_deferred_names".into()),
-                    },
-                    Update::Assign {
-                        field: "active_visibility_revision".into(),
-                        expr: Expr::Field("staged_visibility_revision".into()),
-                    },
-                ],
+                updates: vec![Update::Assign {
+                    field: "active_visibility_revision".into(),
+                    expr: Expr::Field("staged_visibility_revision".into()),
+                }],
                 to: "Running".into(),
                 emit: vec![EffectEmit {
                     variant: "CommittedVisibleSetPublished".into(),
@@ -664,10 +611,6 @@ pub fn meerkat_machine() -> MachineSchema {
                         expr: Expr::None,
                     },
                     Update::Assign {
-                        field: "drain_running".into(),
-                        expr: Expr::Bool(false),
-                    },
-                    Update::Assign {
                         field: "silent_intent_overrides".into(),
                         expr: Expr::EmptySet,
                     },
@@ -700,10 +643,6 @@ pub fn meerkat_machine() -> MachineSchema {
                         expr: Expr::None,
                     },
                     Update::Assign {
-                        field: "drain_running".into(),
-                        expr: Expr::Bool(false),
-                    },
-                    Update::Assign {
                         field: "silent_intent_overrides".into(),
                         expr: Expr::EmptySet,
                     },
@@ -720,16 +659,10 @@ pub fn meerkat_machine() -> MachineSchema {
                     bindings: vec![],
                 },
                 guards: vec![attachment_live_guard()],
-                updates: vec![
-                    Update::Assign {
-                        field: "drain_running".into(),
-                        expr: Expr::Bool(false),
-                    },
-                    Update::Assign {
-                        field: "silent_intent_overrides".into(),
-                        expr: Expr::EmptySet,
-                    },
-                ],
+                updates: vec![Update::Assign {
+                    field: "silent_intent_overrides".into(),
+                    expr: Expr::EmptySet,
+                }],
                 to: "Attached".into(),
                 emit: vec![notice_emit("stop", "runtime executor stopped")],
             },
@@ -742,16 +675,10 @@ pub fn meerkat_machine() -> MachineSchema {
                     bindings: vec![],
                 },
                 guards: vec![attachment_live_guard()],
-                updates: vec![
-                    Update::Assign {
-                        field: "drain_running".into(),
-                        expr: Expr::Bool(false),
-                    },
-                    Update::Assign {
-                        field: "silent_intent_overrides".into(),
-                        expr: Expr::EmptySet,
-                    },
-                ],
+                updates: vec![Update::Assign {
+                    field: "silent_intent_overrides".into(),
+                    expr: Expr::EmptySet,
+                }],
                 to: "Running".into(),
                 emit: vec![notice_emit("stop", "runtime executor stopped")],
             },
@@ -779,10 +706,6 @@ pub fn meerkat_machine() -> MachineSchema {
                     Update::Assign {
                         field: "pre_run_phase".into(),
                         expr: Expr::None,
-                    },
-                    Update::Assign {
-                        field: "drain_running".into(),
-                        expr: Expr::Bool(false),
                     },
                     Update::Assign {
                         field: "silent_intent_overrides".into(),
@@ -845,14 +768,6 @@ fn reset_session_state() -> Vec<Update> {
         Update::Assign {
             field: "peer_ingress_configured".into(),
             expr: Expr::Bool(false),
-        },
-        Update::Assign {
-            field: "drain_running".into(),
-            expr: Expr::Bool(false),
-        },
-        Update::Assign {
-            field: "active_requested_deferred_names".into(),
-            expr: Expr::EmptySet,
         },
         Update::Assign {
             field: "staged_requested_deferred_names".into(),
@@ -1060,44 +975,20 @@ fn publish_committed_visible_set_transition(name: &str, phase: &str) -> Transiti
                 ),
             },
             Guard {
-                name: "active_requested_names_subset_of_staged_input".into(),
-                expr: Expr::Quantified {
-                    quantifier: Quantifier::All,
-                    binding: "name".into(),
-                    over: Box::new(Expr::Binding("active_requested_deferred_names".into())),
-                    body: Box::new(Expr::Contains {
-                        collection: Box::new(Expr::Binding(
-                            "staged_requested_deferred_names".into(),
-                        )),
-                        value: Box::new(Expr::Binding("name".into())),
-                    }),
-                },
-            },
-            Guard {
                 name: "equal_revision_requires_equal_active_and_staged_input".into(),
                 expr: Expr::Or(vec![
                     Expr::Neq(
                         Box::new(Expr::Binding("active_visibility_revision".into())),
                         Box::new(Expr::Binding("staged_visibility_revision".into())),
                     ),
-                    Expr::And(vec![
-                        Expr::Eq(
-                            Box::new(Expr::Binding("active_filter".into())),
-                            Box::new(Expr::Binding("staged_filter".into())),
-                        ),
-                        Expr::Eq(
-                            Box::new(Expr::Binding("active_requested_deferred_names".into())),
-                            Box::new(Expr::Binding("staged_requested_deferred_names".into())),
-                        ),
-                    ]),
+                    Expr::And(vec![Expr::Eq(
+                        Box::new(Expr::Binding("active_filter".into())),
+                        Box::new(Expr::Binding("staged_filter".into())),
+                    )]),
                 ]),
             },
         ],
         updates: vec![
-            Update::Assign {
-                field: "active_requested_deferred_names".into(),
-                expr: Expr::Binding("active_requested_deferred_names".into()),
-            },
             Update::Assign {
                 field: "staged_requested_deferred_names".into(),
                 expr: Expr::Binding("staged_requested_deferred_names".into()),
@@ -1162,16 +1053,10 @@ fn set_peer_ingress_transition(name: &str, phase: &str) -> TransitionSchema {
             bindings: vec!["keep_alive".into()],
         },
         guards: vec![session_registered_guard()],
-        updates: vec![
-            Update::Assign {
-                field: "peer_ingress_configured".into(),
-                expr: Expr::Bool(true),
-            },
-            Update::Assign {
-                field: "drain_running".into(),
-                expr: Expr::Binding("keep_alive".into()),
-            },
-        ],
+        updates: vec![Update::Assign {
+            field: "peer_ingress_configured".into(),
+            expr: Expr::Bool(true),
+        }],
         to: phase.into(),
         emit: vec![],
     }
@@ -1718,10 +1603,7 @@ fn absorbed_meerkat_transitions() -> Vec<TransitionSchema> {
             phase,
             "AbortAll",
             vec![],
-            vec![Update::Assign {
-                field: "drain_running".into(),
-                expr: Expr::Bool(false),
-            }],
+            vec![],
             vec![],
             vec![],
         ));
@@ -1733,10 +1615,7 @@ fn absorbed_meerkat_transitions() -> Vec<TransitionSchema> {
             phase,
             "EnsureDrainRunning",
             vec![],
-            vec![Update::Assign {
-                field: "drain_running".into(),
-                expr: Expr::Bool(true),
-            }],
+            vec![],
             vec![simple_emit("SpawnDrainTask")],
             vec![
                 session_registered_guard(),
@@ -2189,10 +2068,6 @@ fn absorbed_meerkat_transitions() -> Vec<TransitionSchema> {
         },
         Update::Assign {
             field: "peer_ingress_configured".into(),
-            expr: Expr::Bool(false),
-        },
-        Update::Assign {
-            field: "drain_running".into(),
             expr: Expr::Bool(false),
         },
     ];

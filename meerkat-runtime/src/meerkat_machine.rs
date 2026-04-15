@@ -34,8 +34,8 @@ use meerkat_core::lifecycle::run_primitive::RunApplyBoundary;
 use meerkat_core::lifecycle::{InputId, RunId};
 use meerkat_core::types::{HandlingMode, SessionId};
 use meerkat_core::{
-    CommsDrainPhase, SessionToolVisibilityState, ToolFilter, ToolScopeApplyError,
-    ToolScopeRevision, ToolScopeStageError, ToolVisibilityOwner, ToolVisibilityWitness,
+    SessionToolVisibilityState, ToolFilter, ToolScopeApplyError, ToolScopeRevision,
+    ToolScopeStageError, ToolVisibilityOwner, ToolVisibilityWitness,
 };
 
 use crate::accept::AcceptOutcome;
@@ -4035,8 +4035,6 @@ impl MeerkatMachine {
             }
         };
         let peer_ingress_configured = drain.slot_present;
-        let drain_running = matches!(drain.phase, Some(CommsDrainPhase::Running));
-
         let driver = driver_handle.lock().await;
         let driver_kind = match &*driver {
             DriverEntry::Ephemeral(_) => MeerkatDriverKind::Ephemeral,
@@ -4199,10 +4197,6 @@ impl MeerkatMachine {
                 formal_projection_value(&peer_ingress_configured),
             );
             available_fields.insert(
-                "drain_running".into(),
-                formal_projection_value(&drain_running),
-            );
-            available_fields.insert(
                 "silent_intent_overrides".into(),
                 formal_projection_value(
                     &driver
@@ -4210,10 +4204,6 @@ impl MeerkatMachine {
                         .into_iter()
                         .collect::<BTreeSet<_>>(),
                 ),
-            );
-            available_fields.insert(
-                "active_requested_deferred_names".into(),
-                formal_projection_value(&visibility_state.active_requested_deferred_names),
             );
             available_fields.insert(
                 "staged_requested_deferred_names".into(),
