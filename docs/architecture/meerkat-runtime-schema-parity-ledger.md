@@ -294,6 +294,10 @@ Interpretation:
   checked-in Meerkat module now owns the `BoundaryApplied -> RunCompleted` and
   `RunFailed` realization helpers, so the loop no longer carries a second copy
   of terminal run semantics below the machine boundary
+- the outer Meerkat ingress/prepare shell also no longer pre-rejects the same
+  non-accepting phases that the direct driver contract already rejects: the
+  machine boundary now normalizes only the public `Destroyed` error shape while
+  leaving direct legality ownership with `EphemeralRuntimeDriver::accept_input`
 
 ## Resolution Rubric
 

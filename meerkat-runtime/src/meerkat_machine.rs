@@ -703,6 +703,15 @@ pub struct MeerkatMachine {
 }
 
 impl MeerkatMachine {
+    fn normalize_destroyed_error(err: RuntimeDriverError) -> RuntimeDriverError {
+        match err {
+            RuntimeDriverError::NotReady {
+                state: RuntimeState::Destroyed,
+            } => RuntimeDriverError::Destroyed,
+            other => other,
+        }
+    }
+
     /// Create an ephemeral adapter (all sessions use EphemeralRuntimeDriver).
     pub fn ephemeral() -> Self {
         Self {
@@ -1691,25 +1700,15 @@ impl MeerkatMachine {
                     )
                 };
 
-                // Guard: WaitingInputsInvariant — no input admission on
-                // Retired, Stopped, or Destroyed sessions.
-                let state = Self::driver_runtime_state(&driver).await;
-                if matches!(
-                    state,
-                    RuntimeState::Retired | RuntimeState::Stopped | RuntimeState::Destroyed
-                ) {
-                    return Err(if state == RuntimeState::Destroyed {
-                        RuntimeDriverError::Destroyed
-                    } else {
-                        RuntimeDriverError::NotReady { state }
-                    });
-                }
-
                 let request_immediate_processing =
                     crate::driver::ephemeral::requests_immediate_processing(&input);
                 let (outcome, signal, handle) = {
                     let mut driver = driver.lock().await;
-                    let result = driver.as_driver_mut().accept_input(input).await?;
+                    let result = driver
+                        .as_driver_mut()
+                        .accept_input(input)
+                        .await
+                        .map_err(Self::normalize_destroyed_error)?;
                     let signal =
                         Self::machine_owned_admission_signal(&result, request_immediate_processing);
 
@@ -1784,25 +1783,15 @@ impl MeerkatMachine {
                     entry.driver.clone()
                 };
 
-                // Guard: WaitingInputsInvariant — no input admission on
-                // Retired, Stopped, or Destroyed sessions.
-                let state = Self::driver_runtime_state(&driver).await;
-                if matches!(
-                    state,
-                    RuntimeState::Retired | RuntimeState::Stopped | RuntimeState::Destroyed
-                ) {
-                    return Err(if state == RuntimeState::Destroyed {
-                        RuntimeDriverError::Destroyed
-                    } else {
-                        RuntimeDriverError::NotReady { state }
-                    });
-                }
-
                 let request_immediate_processing =
                     crate::driver::ephemeral::requests_immediate_processing(&input);
                 let outcome = {
                     let mut driver = driver.lock().await;
-                    let result = driver.as_driver_mut().accept_input(input).await?;
+                    let result = driver
+                        .as_driver_mut()
+                        .accept_input(input)
+                        .await
+                        .map_err(Self::normalize_destroyed_error)?;
                     let signal =
                         Self::machine_owned_admission_signal(&result, request_immediate_processing);
                     debug_assert!(
@@ -1835,26 +1824,14 @@ impl MeerkatMachine {
                         .clone()
                 };
 
-                // Guard: RunningHasActiveRunInvariant — reject Destroyed,
-                // Retired, and Stopped before attempting to start a new run.
-                let state = Self::driver_runtime_state(&driver).await;
-                if matches!(
-                    state,
-                    RuntimeState::Retired | RuntimeState::Stopped | RuntimeState::Destroyed
-                ) {
-                    return Err(if state == RuntimeState::Destroyed {
-                        RuntimeDriverError::Destroyed
-                    } else {
-                        RuntimeDriverError::NotReady { state }
-                    });
-                }
-
                 let prepared = {
                     let mut driver = driver.lock().await;
                     if !driver.is_idle_or_attached() {
-                        return Err(RuntimeDriverError::NotReady {
-                            state: driver.as_driver().runtime_state(),
-                        });
+                        return Err(Self::normalize_destroyed_error(
+                            RuntimeDriverError::NotReady {
+                                state: driver.as_driver().runtime_state(),
+                            },
+                        ));
                     }
 
                     let active_input_ids = driver.as_driver().active_input_ids();
@@ -1881,7 +1858,11 @@ impl MeerkatMachine {
                         });
                     }
 
-                    let outcome = driver.as_driver_mut().accept_input(input).await?;
+                    let outcome = driver
+                        .as_driver_mut()
+                        .accept_input(input)
+                        .await
+                        .map_err(Self::normalize_destroyed_error)?;
                     let input_id = match outcome {
                         AcceptOutcome::Accepted { input_id, .. } => input_id,
                         AcceptOutcome::Deduplicated { existing_id, .. } => {
@@ -1899,9 +1880,11 @@ impl MeerkatMachine {
                     };
 
                     if !driver.is_idle_or_attached() {
-                        return Err(RuntimeDriverError::NotReady {
-                            state: driver.as_driver().runtime_state(),
-                        });
+                        return Err(Self::normalize_destroyed_error(
+                            RuntimeDriverError::NotReady {
+                                state: driver.as_driver().runtime_state(),
+                            },
+                        ));
                     }
 
                     let (dequeued_id, dequeued_input) = driver.dequeue_next().ok_or_else(|| {
@@ -1910,9 +1893,11 @@ impl MeerkatMachine {
                         )
                     })?;
                     if dequeued_id != input_id {
-                        return Err(RuntimeDriverError::NotReady {
-                            state: driver.as_driver().runtime_state(),
-                        });
+                        return Err(Self::normalize_destroyed_error(
+                            RuntimeDriverError::NotReady {
+                                state: driver.as_driver().runtime_state(),
+                            },
+                        ));
                     }
 
                     let run_id = RunId::new();

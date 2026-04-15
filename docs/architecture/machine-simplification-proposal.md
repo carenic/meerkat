@@ -737,6 +737,10 @@ The important read is now sharper than the earlier partial dump story:
   Meerkat helpers did not reopen parity either: the loop no longer realizes
   `BoundaryApplied -> RunCompleted` or `RunFailed` inline, so terminal run
   semantics moved another step closer to the two-machine boundary
+- removing the outer ingress/prepare phase prechecks from `MeerkatMachine` did
+  not reopen parity either: direct admission legality is now owned in one
+  place by `EphemeralRuntimeDriver::accept_input`, while the machine boundary
+  preserves only the outward `Destroyed` error normalization
 - preserving the full snapshot still keeps almost every remaining state
   distinct (`19,078`), which tells us the field tuple is still doing most of
   the real work even after the retire-drain correction
