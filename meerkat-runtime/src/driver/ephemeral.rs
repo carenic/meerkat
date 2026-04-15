@@ -1278,19 +1278,37 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
         let content_shape = ContentShape(input.kind_id().to_string());
         let is_prompt = matches!(input, Input::Prompt(_));
         let existing_superseded_id = self.existing_superseded_input(&input).map(|(id, _)| id);
-        match self.ingress.admit(
-            input_id.clone(),
-            content_shape,
-            handling_mode,
-            request_immediate_processing,
-            is_prompt,
-            None, // request_id
-            None, // reservation_key
-            policy.clone(),
-            existing_superseded_id,
-        ) {
+        let post_admission_signal =
+            admission_signal_from_policy(&policy, request_immediate_processing);
+        let ingress_input = if policy.apply_mode == crate::policy::ApplyMode::Ignore
+            && policy.consume_point == crate::policy::ConsumePoint::OnAccept
+        {
+            RuntimeIngressInput::AdmitConsumedOnAccept {
+                work_id: input_id.clone(),
+                content_shape,
+                request_id: None,
+                reservation_key: None,
+                policy: policy.clone(),
+            }
+        } else {
+            RuntimeIngressInput::AdmitQueued {
+                work_id: input_id.clone(),
+                content_shape,
+                handling_mode,
+                request_immediate_processing,
+                is_prompt,
+                request_id: None,
+                reservation_key: None,
+                policy: policy.clone(),
+                existing_superseded_id,
+            }
+        };
+        match self.ingress.apply(ingress_input) {
             Ok(transition) => {
                 self.process_accept_effects(&transition.effects, &input);
+                if self.post_admission_signal < post_admission_signal {
+                    self.post_admission_signal = post_admission_signal;
+                }
             }
             Err(err) => {
                 tracing::warn!(
@@ -1300,10 +1318,6 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
                 );
             }
         }
-        // Wake/process decisions are driven by the ingress authority effects
-        // (WakeRuntime / RequestImmediateProcessing). The authority respects
-        // WakeMode::None and only emits these effects when the policy allows.
-        // No shell-side override here — that would bypass the authority.
         let final_state = self.ledger.get(&input_id).cloned().unwrap_or_else(|| state);
         Ok(AcceptOutcome::Accepted {
             input_id,
@@ -1529,5 +1543,20 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
     }
     fn active_input_ids(&self) -> Vec<InputId> {
         self.ledger.active_input_ids()
+    }
+}
+
+fn admission_signal_from_policy(
+    policy: &crate::policy::PolicyDecision,
+    request_immediate_processing: bool,
+) -> PostAdmissionSignal {
+    if request_immediate_processing {
+        return PostAdmissionSignal::RequestImmediateProcessing;
+    }
+
+    match policy.wake_mode {
+        crate::WakeMode::InterruptYielding => PostAdmissionSignal::InterruptYielding,
+        crate::WakeMode::WakeIfIdle => PostAdmissionSignal::WakeLoop,
+        crate::WakeMode::None => PostAdmissionSignal::None,
     }
 }

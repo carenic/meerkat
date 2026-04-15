@@ -88,6 +88,11 @@ Current state:
   `RuntimeIngressAuthority`, while the live runtime loop and exact audits were
   already driven by emitted wake/process effects plus the typed
   `post_admission_signal`
+- the helper no longer owns the immediate post-admission control consequence
+  either: consumed-on-accept vs queued routing now goes through explicit
+  ingress transition variants, and the runtime computes
+  `WakeLoop` / `InterruptYielding` / `RequestImmediateProcessing` directly from
+  the resolved policy before executing the ingress transition
 - Meerkat now formally owns `silent_intent_overrides` as checked-in ingress
   state instead of leaving it below the machine boundary; exact audited parity
   stayed green after lifting it, the targeted runtime/model regression for
@@ -184,6 +189,10 @@ Current exact-parity state:
 - the ingress helper also no longer owns `silent_intent_overrides`; that
   canonical set now lives only on the driver/machine side, and exact Meerkat
   parity stayed green after removing the helper mirror
+- the ingress helper no longer emits admission-side wake/process signals for
+  newly accepted inputs; that control intent is now decided in the
+  driver/machine path and the helper only executes the explicit admit
+  transition plus lower-level queue/ledger bookkeeping
 - the pure query surface remains runtime-audited helper behavior, but it is no
   longer counted as formal transition coverage
 - the next remaining dogma violation is no longer coarse control truth in a

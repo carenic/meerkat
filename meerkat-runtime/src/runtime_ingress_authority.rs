@@ -490,51 +490,6 @@ impl RuntimeIngressAuthority {
         self.evaluate(input).is_ok()
     }
 
-    /// Admit a new input — authority-owned classification.
-    ///
-    /// The shell provides all mechanical lookup results. The authority
-    /// internally decides whether to route through `AdmitQueued` or
-    /// `AdmitConsumedOnAccept` based on the policy. This eliminates
-    /// all policy branching from shell code.
-    #[allow(clippy::too_many_arguments)]
-    pub fn admit(
-        &mut self,
-        work_id: InputId,
-        content_shape: ContentShape,
-        handling_mode: HandlingMode,
-        request_immediate_processing: bool,
-        is_prompt: bool,
-        request_id: Option<RequestId>,
-        reservation_key: Option<ReservationKey>,
-        policy: PolicyDecision,
-        existing_superseded_id: Option<InputId>,
-    ) -> Result<RuntimeIngressTransition, RuntimeIngressError> {
-        let consumed_on_accept = policy.apply_mode == crate::policy::ApplyMode::Ignore
-            && policy.consume_point == crate::policy::ConsumePoint::OnAccept;
-
-        if consumed_on_accept {
-            self.apply(RuntimeIngressInput::AdmitConsumedOnAccept {
-                work_id,
-                content_shape,
-                request_id,
-                reservation_key,
-                policy,
-            })
-        } else {
-            self.apply(RuntimeIngressInput::AdmitQueued {
-                work_id,
-                content_shape,
-                handling_mode,
-                request_immediate_processing,
-                is_prompt,
-                request_id,
-                reservation_key,
-                policy,
-                existing_superseded_id,
-            })
-        }
-    }
-
     /// Evaluate a transition without committing it.
     fn evaluate(
         &self,
@@ -645,7 +600,7 @@ impl RuntimeIngressAuthority {
         work_id: &InputId,
         content_shape: &ContentShape,
         handling_mode: HandlingMode,
-        request_immediate_processing: bool,
+        _request_immediate_processing: bool,
         is_prompt: bool,
         request_id: &Option<RequestId>,
         reservation_key: &Option<ReservationKey>,
@@ -697,20 +652,6 @@ impl RuntimeIngressAuthority {
             work_id: work_id.clone(),
             new_state: InputLifecycleState::Queued,
         });
-        // Emit wake/process effects based on the policy's wake_mode.
-        match policy.wake_mode {
-            crate::WakeMode::WakeIfIdle => {
-                effects.push(RuntimeIngressEffect::WakeRuntime);
-            }
-            crate::WakeMode::InterruptYielding => {
-                effects.push(RuntimeIngressEffect::WakeRuntime);
-                effects.push(RuntimeIngressEffect::InterruptYielding);
-            }
-            crate::WakeMode::None => {}
-        }
-        if request_immediate_processing {
-            effects.push(RuntimeIngressEffect::RequestImmediateProcessing);
-        }
 
         // --- Shell-directive effects ---
         // The authority owns all routing/coalescing/supersession decisions.
@@ -1826,7 +1767,7 @@ mod tests {
                 .any(|e| matches!(e, RuntimeIngressEffect::IngressAccepted { .. }))
         );
         assert!(
-            t.effects
+            !t.effects
                 .iter()
                 .any(|e| matches!(e, RuntimeIngressEffect::WakeRuntime))
         );
@@ -1841,7 +1782,7 @@ mod tests {
         assert!(auth.queue().is_empty());
         assert_eq!(auth.steer_queue(), &[wid.clone()]);
         assert!(
-            t.effects
+            !t.effects
                 .iter()
                 .any(|e| matches!(e, RuntimeIngressEffect::RequestImmediateProcessing))
         );
