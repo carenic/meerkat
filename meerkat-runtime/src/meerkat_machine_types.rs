@@ -33,7 +33,7 @@ use crate::input_state::InputLifecycleState;
 use crate::input_state::InputState;
 use crate::input_state::InputTerminalOutcome;
 use crate::runtime_event::RuntimeEventEnvelope;
-use crate::runtime_ingress_authority::{ContentShape, IngressPhase, RequestId, ReservationKey};
+use crate::runtime_ingress_authority::{ContentShape, RequestId, ReservationKey};
 use crate::runtime_state::RuntimeState;
 use crate::traits::{
     DestroyReport, RecoveryReport, RecycleReport, ResetReport, RetireReport,
@@ -430,7 +430,6 @@ pub struct MeerkatAdmittedInputSnapshot {
 /// Snapshot of runtime ingress truth for one session.
 #[derive(Debug, Clone)]
 pub struct MeerkatInputsSnapshot {
-    pub ingress_phase: IngressPhase,
     pub admission_order: Vec<MeerkatAdmittedInputSnapshot>,
     pub queue: Vec<InputId>,
     pub steer_queue: Vec<InputId>,

@@ -3313,7 +3313,6 @@ impl MeerkatMachine {
             .collect();
 
         let inputs = MeerkatInputsSnapshot {
-            ingress_phase: ingress.phase(),
             admission_order,
             queue: ingress.queue().to_vec(),
             steer_queue: ingress.steer_queue().to_vec(),

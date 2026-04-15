@@ -1,25 +1,9 @@
-//! Generated-authority module for the RuntimeIngress machine.
+//! Queue/ledger helper for runtime ingress bookkeeping.
 //!
-//! This module provides typed enums and a sealed mutator trait that enforces
-//! all RuntimeIngress state mutations flow through the machine authority.
-//! Handwritten shell code calls [`RuntimeIngressAuthority::apply`] and executes
-//! returned effects; it cannot mutate canonical state directly.
-//!
-//! The transition table encoded here is the single source of truth, matching
-//! the machine schema in `meerkat-machine-schema/src/catalog/runtime_ingress.rs`:
-//!
-//! - 3 phases: Active, Retired, Destroyed
-//! - 16 inputs: AdmitQueued, AdmitConsumedOnAccept, AdmitDeduplicated, StageDrainSnapshot,
-//!   BoundaryApplied, RunCompleted, RunFailed, RunCancelled,
-//!   SupersedeQueuedInput, CoalesceQueuedInputs, Retire, Reset, Destroy,
-//!   Recover, ReconcileTerminalInputs, SetSilentIntentOverrides
-//! - 16 fields: admitted_inputs, admission_order, content_shape, request_id,
-//!   reservation_key, policy_snapshot, handling_mode, lifecycle,
-//!   terminal_outcome, queue, steer_queue, current_run, current_run_contributors,
-//!   last_run, last_boundary_sequence, silent_intent_overrides
-//! - 8 effects: IngressAccepted, ReadyForRun, InputLifecycleNotice,
-//!   WakeRuntime, RequestImmediateProcessing, CompletionResolved,
-//!   IngressNotice, SilentIntentApplied
+//! This helper still owns the admitted-input ledger, queue routing, and
+//! per-run contributor bookkeeping, but it no longer owns a separate coarse
+//! ingress lifecycle. Meerkat phase is the only coarse lifecycle truth; this
+//! helper exists only for lower-level ledger and queue mechanics.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -48,25 +32,6 @@ pub struct ReservationKey(pub String);
 /// Request ID for correlation tracking.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RequestId(pub String);
-
-// ---------------------------------------------------------------------------
-// Phase enum — mirrors the machine schema's phase variants
-// ---------------------------------------------------------------------------
-
-/// Canonical ingress phase.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum IngressPhase {
-    Active,
-    Retired,
-    Destroyed,
-}
-
-impl IngressPhase {
-    /// Whether this is a terminal phase.
-    pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Destroyed)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Typed input enum — mirrors the machine schema's input variants
@@ -266,8 +231,6 @@ pub enum RuntimeIngressEffect {
 /// Successful transition outcome from the RuntimeIngress authority.
 #[derive(Debug)]
 pub struct RuntimeIngressTransition {
-    /// The phase after the transition.
-    pub next_phase: IngressPhase,
     /// Effects to be executed by shell code.
     pub effects: Vec<RuntimeIngressEffect>,
 }
@@ -281,14 +244,11 @@ pub struct RuntimeIngressTransition {
 #[non_exhaustive]
 pub enum RuntimeIngressError {
     /// The transition is not valid from the current phase.
-    #[error("Invalid ingress transition: {from:?} via {input} (rejected)")]
-    InvalidTransition { from: IngressPhase, input: String },
+    #[error("Invalid ingress transition via {input} (rejected)")]
+    InvalidTransition { input: String },
     /// A guard condition was not met.
-    #[error("Guard failed: {guard} (from {from:?})")]
-    GuardFailed { from: IngressPhase, guard: String },
-    /// The ingress is in a terminal phase.
-    #[error("Ingress is in terminal phase {phase:?}")]
-    TerminalPhase { phase: IngressPhase },
+    #[error("Guard failed: {guard}")]
+    GuardFailed { guard: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -372,16 +332,12 @@ pub trait RuntimeIngressMutator: sealed::Sealed {
 // Authority implementation
 // ---------------------------------------------------------------------------
 
-/// The canonical authority for RuntimeIngress state.
+/// The canonical helper for ingress ledger/queue state.
 ///
-/// Holds the canonical phase + fields and delegates all transitions through
-/// the encoded transition table. The authority OWNS the canonical state --
-/// callers cannot get `&mut` access to the inner fields.
+/// Coarse lifecycle truth is owned by `MeerkatMachine`; this helper owns only
+/// the admitted-input ledger, queue routing, and per-run contributor fields.
 #[derive(Debug, Clone)]
 pub struct RuntimeIngressAuthority {
-    /// Canonical phase.
-    phase: IngressPhase,
-    /// Canonical machine-owned fields.
     fields: RuntimeIngressFields,
 }
 
@@ -394,22 +350,11 @@ impl Default for RuntimeIngressAuthority {
 }
 
 impl RuntimeIngressAuthority {
-    /// Create a new authority in the Active phase.
+    /// Create a new ingress helper.
     pub fn new() -> Self {
         Self {
-            phase: IngressPhase::Active,
             fields: RuntimeIngressFields::new(),
         }
-    }
-
-    /// Current phase.
-    pub fn phase(&self) -> IngressPhase {
-        self.phase
-    }
-
-    /// Whether the current phase is terminal.
-    pub fn is_terminal(&self) -> bool {
-        self.phase.is_terminal()
     }
 
     /// The set of admitted input IDs.
@@ -611,21 +556,7 @@ impl RuntimeIngressAuthority {
     fn evaluate(
         &self,
         input: &RuntimeIngressInput,
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        let phase = self.phase;
-
-        // Terminal phase rejects ALL inputs.
-        if phase.is_terminal() {
-            return Err(RuntimeIngressError::TerminalPhase { phase });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         match input {
             RuntimeIngressInput::AdmitQueued {
                 work_id,
@@ -638,7 +569,6 @@ impl RuntimeIngressAuthority {
                 policy,
                 existing_superseded_id,
             } => self.eval_admit_queued(
-                phase,
                 work_id,
                 content_shape,
                 *handling_mode,
@@ -657,7 +587,6 @@ impl RuntimeIngressAuthority {
                 reservation_key,
                 policy,
             } => self.eval_admit_consumed_on_accept(
-                phase,
                 work_id,
                 content_shape,
                 request_id,
@@ -668,33 +597,33 @@ impl RuntimeIngressAuthority {
             RuntimeIngressInput::AdmitDeduplicated {
                 work_id,
                 existing_id,
-            } => self.eval_admit_deduplicated(phase, work_id, existing_id),
+            } => self.eval_admit_deduplicated(work_id, existing_id),
 
             RuntimeIngressInput::StageDrainSnapshot {
                 run_id,
                 contributing_work_ids,
-            } => self.eval_stage_drain_snapshot(phase, run_id, contributing_work_ids),
+            } => self.eval_stage_drain_snapshot(run_id, contributing_work_ids),
 
             RuntimeIngressInput::BoundaryApplied {
                 run_id,
                 boundary_sequence,
-            } => self.eval_boundary_applied(phase, run_id, *boundary_sequence),
+            } => self.eval_boundary_applied(run_id, *boundary_sequence),
 
-            RuntimeIngressInput::RunCompleted { run_id } => self.eval_run_completed(phase, run_id),
+            RuntimeIngressInput::RunCompleted { run_id } => self.eval_run_completed(run_id),
 
-            RuntimeIngressInput::RunFailed { run_id } => self.eval_run_failed(phase, run_id),
+            RuntimeIngressInput::RunFailed { run_id } => self.eval_run_failed(run_id),
 
-            RuntimeIngressInput::RunCancelled { run_id } => self.eval_run_cancelled(phase, run_id),
+            RuntimeIngressInput::RunCancelled { run_id } => self.eval_run_cancelled(run_id),
 
             RuntimeIngressInput::SupersedeQueuedInput {
                 new_work_id,
                 old_work_id,
-            } => self.eval_supersede(phase, new_work_id, old_work_id),
+            } => self.eval_supersede(new_work_id, old_work_id),
 
             RuntimeIngressInput::CoalesceQueuedInputs {
                 aggregate_work_id,
                 source_work_ids,
-            } => self.eval_coalesce(phase, aggregate_work_id, source_work_ids),
+            } => self.eval_coalesce(aggregate_work_id, source_work_ids),
 
             RuntimeIngressInput::AdmitRecovered {
                 work_id,
@@ -705,7 +634,6 @@ impl RuntimeIngressAuthority {
                 request_id,
                 reservation_key,
             } => self.eval_admit_recovered(
-                phase,
                 work_id.clone(),
                 content_shape.clone(),
                 *handling_mode,
@@ -715,17 +643,17 @@ impl RuntimeIngressAuthority {
                 reservation_key.clone(),
             ),
 
-            RuntimeIngressInput::Retire => self.eval_retire(phase),
-            RuntimeIngressInput::Reset => self.eval_reset(phase),
-            RuntimeIngressInput::Stop => self.eval_stop(phase),
-            RuntimeIngressInput::Destroy => self.eval_destroy(phase),
-            RuntimeIngressInput::Recover => self.eval_recover(phase),
+            RuntimeIngressInput::Retire => self.eval_retire(),
+            RuntimeIngressInput::Reset => self.eval_reset(),
+            RuntimeIngressInput::Stop => self.eval_stop(),
+            RuntimeIngressInput::Destroy => self.eval_destroy(),
+            RuntimeIngressInput::Recover => self.eval_recover(),
             RuntimeIngressInput::ReconcileTerminalInputs { terminal_inputs } => {
-                self.eval_reconcile_terminal_inputs(phase, terminal_inputs)
+                self.eval_reconcile_terminal_inputs(terminal_inputs)
             }
 
             RuntimeIngressInput::SetSilentIntentOverrides { intents } => {
-                self.eval_set_silent_intent_overrides(phase, intents)
+                self.eval_set_silent_intent_overrides(intents)
             }
         }
     }
@@ -735,7 +663,6 @@ impl RuntimeIngressAuthority {
     #[allow(clippy::too_many_arguments)]
     fn eval_admit_queued(
         &self,
-        phase: IngressPhase,
         work_id: &InputId,
         content_shape: &ContentShape,
         handling_mode: HandlingMode,
@@ -745,26 +672,10 @@ impl RuntimeIngressAuthority {
         reservation_key: &Option<ReservationKey>,
         policy: &PolicyDecision,
         existing_superseded_id: &Option<InputId>,
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        // Only Active phase accepts new input
-        if phase != IngressPhase::Active {
-            return Err(RuntimeIngressError::InvalidTransition {
-                from: phase,
-                input: "AdmitQueued".into(),
-            });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: input_is_new
         if self.fields.admitted_inputs.contains(work_id) {
             return Err(RuntimeIngressError::GuardFailed {
-                from: phase,
                 guard: format!("input_is_new: {work_id:?} already admitted"),
             });
         }
@@ -885,30 +796,14 @@ impl RuntimeIngressAuthority {
             }
         }
 
-        Ok((IngressPhase::Active, fields, effects))
+        Ok((fields, effects))
     }
 
     fn eval_admit_deduplicated(
         &self,
-        phase: IngressPhase,
         work_id: &InputId,
         existing_id: &InputId,
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        // From: Active only (matching Admit)
-        if phase != IngressPhase::Active {
-            return Err(RuntimeIngressError::InvalidTransition {
-                from: phase,
-                input: "AdmitDeduplicated".into(),
-            });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // No state mutation — the duplicate input is not admitted.
         // Emit Deduplicated effect so the shell can emit the lifecycle event.
         let fields = self.fields.clone();
@@ -916,38 +811,20 @@ impl RuntimeIngressAuthority {
             work_id: work_id.clone(),
             existing_id: existing_id.clone(),
         }];
-
-        Ok((phase, fields, effects))
+        Ok((fields, effects))
     }
 
     fn eval_admit_consumed_on_accept(
         &self,
-        phase: IngressPhase,
         work_id: &InputId,
         content_shape: &ContentShape,
         request_id: &Option<RequestId>,
         reservation_key: &Option<ReservationKey>,
         policy: &PolicyDecision,
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        // Only Active phase accepts new input
-        if phase != IngressPhase::Active {
-            return Err(RuntimeIngressError::InvalidTransition {
-                from: phase,
-                input: "AdmitConsumedOnAccept".into(),
-            });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: input_is_new
         if self.fields.admitted_inputs.contains(work_id) {
             return Err(RuntimeIngressError::GuardFailed {
-                from: phase,
                 guard: format!("input_is_new: {work_id:?} already admitted"),
             });
         }
@@ -996,34 +873,17 @@ impl RuntimeIngressAuthority {
             work_id: work_id.clone(),
         });
 
-        Ok((IngressPhase::Active, fields, effects))
+        Ok((fields, effects))
     }
 
     fn eval_stage_drain_snapshot(
         &self,
-        phase: IngressPhase,
         run_id: &RunId,
         contributing_work_ids: &[InputId],
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        // From: Active or Retired
-        if !matches!(phase, IngressPhase::Active | IngressPhase::Retired) {
-            return Err(RuntimeIngressError::InvalidTransition {
-                from: phase,
-                input: "StageDrainSnapshot".into(),
-            });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: no_current_run
         if self.fields.current_run.is_some() {
             return Err(RuntimeIngressError::GuardFailed {
-                from: phase,
                 guard: "no_current_run: a run is already in progress".into(),
             });
         }
@@ -1031,7 +891,6 @@ impl RuntimeIngressAuthority {
         // Guard: contributors_non_empty
         if contributing_work_ids.is_empty() {
             return Err(RuntimeIngressError::GuardFailed {
-                from: phase,
                 guard: "contributors_non_empty: must have at least one contributor".into(),
             });
         }
@@ -1041,7 +900,6 @@ impl RuntimeIngressAuthority {
             let lifecycle = self.fields.lifecycle.get(wid);
             if lifecycle != Some(&InputLifecycleState::Queued) {
                 return Err(RuntimeIngressError::GuardFailed {
-                    from: phase,
                     guard: format!("all_contributors_are_queued: {wid:?} is {lifecycle:?}"),
                 });
             }
@@ -1053,14 +911,12 @@ impl RuntimeIngressAuthority {
         if !self.fields.steer_queue.is_empty() {
             if !seq_starts_with(&self.fields.steer_queue, contributing_work_ids) {
                 return Err(RuntimeIngressError::GuardFailed {
-                    from: phase,
                     guard: "contributors_match_current_drain_source: not a prefix of steer_queue"
                         .into(),
                 });
             }
         } else if !seq_starts_with(&self.fields.queue, contributing_work_ids) {
             return Err(RuntimeIngressError::GuardFailed {
-                from: phase,
                 guard: "contributors_match_current_drain_source: not a prefix of queue".into(),
             });
         }
@@ -1098,34 +954,17 @@ impl RuntimeIngressAuthority {
         });
 
         // Phase stays the same
-        Ok((phase, fields, effects))
+        Ok((fields, effects))
     }
 
     fn eval_boundary_applied(
         &self,
-        phase: IngressPhase,
         run_id: &RunId,
         boundary_sequence: u64,
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        // From: Active or Retired
-        if !matches!(phase, IngressPhase::Active | IngressPhase::Retired) {
-            return Err(RuntimeIngressError::InvalidTransition {
-                from: phase,
-                input: "BoundaryApplied".into(),
-            });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: run_matches_current
         if self.fields.current_run.as_ref() != Some(run_id) {
             return Err(RuntimeIngressError::GuardFailed {
-                from: phase,
                 guard: format!(
                     "run_matches_current: expected {:?}, got {run_id:?}",
                     self.fields.current_run
@@ -1138,7 +977,6 @@ impl RuntimeIngressAuthority {
             let lifecycle = self.fields.lifecycle.get(wid);
             if lifecycle != Some(&InputLifecycleState::Staged) {
                 return Err(RuntimeIngressError::GuardFailed {
-                    from: phase,
                     guard: format!("contributors_are_staged: {wid:?} is {lifecycle:?}"),
                 });
             }
@@ -1162,34 +1000,16 @@ impl RuntimeIngressAuthority {
             detail: "ContributorsPendingConsumption".into(),
         });
 
-        // Phase unchanged (schema says to: Active, but we preserve whatever phase we're in)
-        Ok((phase, fields, effects))
+        Ok((fields, effects))
     }
 
     fn eval_run_completed(
         &self,
-        phase: IngressPhase,
         run_id: &RunId,
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        // From: Active or Retired
-        if !matches!(phase, IngressPhase::Active | IngressPhase::Retired) {
-            return Err(RuntimeIngressError::InvalidTransition {
-                from: phase,
-                input: "RunCompleted".into(),
-            });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: run_matches_current
         if self.fields.current_run.as_ref() != Some(run_id) {
             return Err(RuntimeIngressError::GuardFailed {
-                from: phase,
                 guard: format!(
                     "run_matches_current: expected {:?}, got {run_id:?}",
                     self.fields.current_run
@@ -1202,7 +1022,6 @@ impl RuntimeIngressAuthority {
             let lifecycle = self.fields.lifecycle.get(wid);
             if lifecycle != Some(&InputLifecycleState::AppliedPendingConsumption) {
                 return Err(RuntimeIngressError::GuardFailed {
-                    from: phase,
                     guard: format!("contributors_pending_consumption: {wid:?} is {lifecycle:?}"),
                 });
             }
@@ -1233,34 +1052,16 @@ impl RuntimeIngressAuthority {
         fields.current_run = None;
         fields.current_run_contributors = Vec::new();
 
-        // Phase stays the same
-        Ok((phase, fields, effects))
+        Ok((fields, effects))
     }
 
     fn eval_run_failed(
         &self,
-        phase: IngressPhase,
         run_id: &RunId,
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        // From: Active or Retired
-        if !matches!(phase, IngressPhase::Active | IngressPhase::Retired) {
-            return Err(RuntimeIngressError::InvalidTransition {
-                from: phase,
-                input: "RunFailed".into(),
-            });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: run_matches_current
         if self.fields.current_run.as_ref() != Some(run_id) {
             return Err(RuntimeIngressError::GuardFailed {
-                from: phase,
                 guard: format!(
                     "run_matches_current: expected {:?}, got {run_id:?}",
                     self.fields.current_run
@@ -1313,34 +1114,17 @@ impl RuntimeIngressAuthority {
             detail: "StagedRolledBack".into(),
         });
 
-        Ok((phase, fields, effects))
+        Ok((fields, effects))
     }
 
     fn eval_run_cancelled(
         &self,
-        phase: IngressPhase,
         run_id: &RunId,
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        // Same logic as RunFailed per the schema
-        // From: Active or Retired
-        if !matches!(phase, IngressPhase::Active | IngressPhase::Retired) {
-            return Err(RuntimeIngressError::InvalidTransition {
-                from: phase,
-                input: "RunCancelled".into(),
-            });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
+        // Same logic as RunFailed per the schema.
         // Guard: run_matches_current
         if self.fields.current_run.as_ref() != Some(run_id) {
             return Err(RuntimeIngressError::GuardFailed {
-                from: phase,
                 guard: format!(
                     "run_matches_current: expected {:?}, got {run_id:?}",
                     self.fields.current_run
@@ -1390,35 +1174,18 @@ impl RuntimeIngressAuthority {
             detail: "StagedRolledBack".into(),
         });
 
-        Ok((phase, fields, effects))
+        Ok((fields, effects))
     }
 
     fn eval_supersede(
         &self,
-        phase: IngressPhase,
         new_work_id: &InputId,
         old_work_id: &InputId,
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        // From: Active or Retired
-        if !matches!(phase, IngressPhase::Active | IngressPhase::Retired) {
-            return Err(RuntimeIngressError::InvalidTransition {
-                from: phase,
-                input: "SupersedeQueuedInput".into(),
-            });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: old_work_id must be Queued
         let old_lifecycle = self.fields.lifecycle.get(old_work_id);
         if old_lifecycle != Some(&InputLifecycleState::Queued) {
             return Err(RuntimeIngressError::GuardFailed {
-                from: phase,
                 guard: format!("old_input_is_queued: {old_work_id:?} is {old_lifecycle:?}"),
             });
         }
@@ -1426,7 +1193,6 @@ impl RuntimeIngressAuthority {
         // Guard: new_work_id must be admitted
         if !self.fields.admitted_inputs.contains(new_work_id) {
             return Err(RuntimeIngressError::GuardFailed {
-                from: phase,
                 guard: format!("new_input_is_admitted: {new_work_id:?} not found"),
             });
         }
@@ -1458,36 +1224,19 @@ impl RuntimeIngressAuthority {
             outcome,
         });
 
-        Ok((phase, fields, effects))
+        Ok((fields, effects))
     }
 
     fn eval_coalesce(
         &self,
-        phase: IngressPhase,
         aggregate_work_id: &InputId,
         source_work_ids: &[InputId],
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        // From: Active or Retired
-        if !matches!(phase, IngressPhase::Active | IngressPhase::Retired) {
-            return Err(RuntimeIngressError::InvalidTransition {
-                from: phase,
-                input: "CoalesceQueuedInputs".into(),
-            });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: all source_work_ids must be Queued
         for wid in source_work_ids {
             let lifecycle = self.fields.lifecycle.get(wid);
             if lifecycle != Some(&InputLifecycleState::Queued) {
                 return Err(RuntimeIngressError::GuardFailed {
-                    from: phase,
                     guard: format!("all_sources_queued: {wid:?} is {lifecycle:?}"),
                 });
             }
@@ -1522,60 +1271,27 @@ impl RuntimeIngressAuthority {
             });
         }
 
-        Ok((phase, fields, effects))
+        Ok((fields, effects))
     }
 
     fn eval_retire(
         &self,
-        phase: IngressPhase,
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        // From: Active
-        if phase != IngressPhase::Active {
-            return Err(RuntimeIngressError::InvalidTransition {
-                from: phase,
-                input: "Retire".into(),
-            });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         let fields = self.fields.clone();
         let effects = vec![RuntimeIngressEffect::IngressNotice {
             kind: "Retire".into(),
             detail: "IngressRetired".into(),
         }];
 
-        Ok((IngressPhase::Retired, fields, effects))
+        Ok((fields, effects))
     }
 
     fn eval_reset(
         &self,
-        phase: IngressPhase,
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        // From: Active or Retired
-        if !matches!(phase, IngressPhase::Active | IngressPhase::Retired) {
-            return Err(RuntimeIngressError::InvalidTransition {
-                from: phase,
-                input: "Reset".into(),
-            });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: no_current_run (can't reset while a run is in progress)
         if self.fields.current_run.is_some() {
             return Err(RuntimeIngressError::GuardFailed {
-                from: phase,
                 guard: "no_current_run: cannot reset while a run is in progress".into(),
             });
         }
@@ -1624,28 +1340,12 @@ impl RuntimeIngressAuthority {
             detail: "IngressReset".into(),
         });
 
-        Ok((IngressPhase::Active, fields, effects))
+        Ok((fields, effects))
     }
 
     fn eval_destroy(
         &self,
-        phase: IngressPhase,
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        // From: Active or Retired
-        if !matches!(phase, IngressPhase::Active | IngressPhase::Retired) {
-            return Err(RuntimeIngressError::InvalidTransition {
-                from: phase,
-                input: "Destroy".into(),
-            });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         let mut fields = self.fields.clone();
         let mut effects = Vec::new();
 
@@ -1689,28 +1389,12 @@ impl RuntimeIngressAuthority {
             detail: "IngressDestroyed".into(),
         });
 
-        Ok((IngressPhase::Destroyed, fields, effects))
+        Ok((fields, effects))
     }
 
     fn eval_stop(
         &self,
-        phase: IngressPhase,
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        // From: Active or Retired
-        if !matches!(phase, IngressPhase::Active | IngressPhase::Retired) {
-            return Err(RuntimeIngressError::InvalidTransition {
-                from: phase,
-                input: "Stop".into(),
-            });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         let mut fields = self.fields.clone();
         let mut effects = Vec::new();
 
@@ -1753,7 +1437,7 @@ impl RuntimeIngressAuthority {
             detail: "IngressStopped".into(),
         });
 
-        Ok((IngressPhase::Destroyed, fields, effects))
+        Ok((fields, effects))
     }
 
     /// Restore a store-recovered input into the ingress authority's tracking.
@@ -1763,7 +1447,6 @@ impl RuntimeIngressAuthority {
     #[allow(clippy::too_many_arguments)]
     fn eval_admit_recovered(
         &self,
-        phase: IngressPhase,
         work_id: InputId,
         content_shape: ContentShape,
         handling_mode: HandlingMode,
@@ -1771,21 +1454,7 @@ impl RuntimeIngressAuthority {
         policy: PolicyDecision,
         request_id: Option<RequestId>,
         reservation_key: Option<ReservationKey>,
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        if !matches!(phase, IngressPhase::Active | IngressPhase::Retired) {
-            return Err(RuntimeIngressError::InvalidTransition {
-                from: phase,
-                input: "AdmitRecovered".into(),
-            });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         let mut fields = self.fields.clone();
 
         // Restore the input into the authority's canonical tracking at its persisted state.
@@ -1815,28 +1484,12 @@ impl RuntimeIngressAuthority {
             }
         }
 
-        Ok((phase, fields, vec![]))
+        Ok((fields, vec![]))
     }
 
     fn eval_recover(
         &self,
-        phase: IngressPhase,
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        // From: Active or Retired
-        if !matches!(phase, IngressPhase::Active | IngressPhase::Retired) {
-            return Err(RuntimeIngressError::InvalidTransition {
-                from: phase,
-                input: "Recover".into(),
-            });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         let mut fields = self.fields.clone();
         let mut effects = Vec::new();
 
@@ -1962,28 +1615,13 @@ impl RuntimeIngressAuthority {
             detail: "IngressRecovered".into(),
         });
 
-        Ok((phase, fields, effects))
+        Ok((fields, effects))
     }
 
     fn eval_reconcile_terminal_inputs(
         &self,
-        phase: IngressPhase,
         terminal_inputs: &[(InputId, InputTerminalOutcome)],
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        if !matches!(phase, IngressPhase::Active | IngressPhase::Retired) {
-            return Err(RuntimeIngressError::InvalidTransition {
-                from: phase,
-                input: "ReconcileTerminalInputs".into(),
-            });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         let mut fields = self.fields.clone();
         let mut effects = Vec::new();
 
@@ -2017,29 +1655,13 @@ impl RuntimeIngressAuthority {
             });
         }
 
-        Ok((phase, fields, effects))
+        Ok((fields, effects))
     }
 
     fn eval_set_silent_intent_overrides(
         &self,
-        phase: IngressPhase,
         intents: &BTreeSet<String>,
-    ) -> Result<
-        (
-            IngressPhase,
-            RuntimeIngressFields,
-            Vec<RuntimeIngressEffect>,
-        ),
-        RuntimeIngressError,
-    > {
-        // From: Active or Retired
-        if !matches!(phase, IngressPhase::Active | IngressPhase::Retired) {
-            return Err(RuntimeIngressError::InvalidTransition {
-                from: phase,
-                input: "SetSilentIntentOverrides".into(),
-            });
-        }
-
+    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         let mut fields = self.fields.clone();
         fields.silent_intent_overrides = intents.clone();
 
@@ -2048,7 +1670,7 @@ impl RuntimeIngressAuthority {
             detail: format!("{} intents configured", intents.len()),
         }];
 
-        Ok((phase, fields, effects))
+        Ok((fields, effects))
     }
 }
 
@@ -2057,16 +1679,11 @@ impl RuntimeIngressMutator for RuntimeIngressAuthority {
         &mut self,
         input: RuntimeIngressInput,
     ) -> Result<RuntimeIngressTransition, RuntimeIngressError> {
-        let (next_phase, next_fields, effects) = self.evaluate(&input)?;
+        let (next_fields, effects) = self.evaluate(&input)?;
 
-        // Commit: update canonical state.
-        self.phase = next_phase;
         self.fields = next_fields;
 
-        Ok(RuntimeIngressTransition {
-            next_phase,
-            effects,
-        })
+        Ok(RuntimeIngressTransition { effects })
     }
 }
 
@@ -2163,65 +1780,82 @@ mod tests {
         .expect("admit consumed should succeed")
     }
 
-    // ---- Phase transitions ----
+    // ---- Lifecycle-free helper behavior ----
 
     #[test]
-    fn new_starts_active() {
+    fn new_starts_with_empty_queues() {
         let auth = RuntimeIngressAuthority::new();
-        assert_eq!(auth.phase(), IngressPhase::Active);
-        assert!(!auth.is_terminal());
+        assert!(auth.queue().is_empty());
+        assert!(auth.steer_queue().is_empty());
+        assert!(auth.current_run().is_none());
     }
 
     #[test]
-    fn retire_transitions_to_retired() {
+    fn retire_emits_notice_without_mutating_queues() {
         let mut auth = RuntimeIngressAuthority::new();
+        let w1 = InputId::new();
+        admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
         let t = auth
             .apply(RuntimeIngressInput::Retire)
             .expect("retire should succeed");
-        assert_eq!(t.next_phase, IngressPhase::Retired);
-        assert_eq!(auth.phase(), IngressPhase::Retired);
+        assert_eq!(auth.queue(), &[w1]);
+        assert!(t
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, RuntimeIngressEffect::IngressNotice { kind, .. } if kind == "Retire")));
     }
 
     #[test]
-    fn destroy_transitions_to_destroyed() {
+    fn destroy_abandons_all_non_terminal_inputs() {
         let mut auth = RuntimeIngressAuthority::new();
+        let w1 = InputId::new();
+        admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
         let t = auth
             .apply(RuntimeIngressInput::Destroy)
             .expect("destroy should succeed");
-        assert_eq!(t.next_phase, IngressPhase::Destroyed);
-        assert!(auth.is_terminal());
+        assert_eq!(
+            auth.lifecycle_state(&w1),
+            Some(InputLifecycleState::Abandoned)
+        );
+        assert!(t
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, RuntimeIngressEffect::CompletionResolved { work_id, .. } if work_id == &w1)));
     }
 
     #[test]
-    fn destroy_from_retired() {
+    fn destroy_after_retire_is_still_allowed() {
         let mut auth = RuntimeIngressAuthority::new();
         auth.apply(RuntimeIngressInput::Retire).unwrap();
         let t = auth
             .apply(RuntimeIngressInput::Destroy)
             .expect("destroy from retired should succeed");
-        assert_eq!(t.next_phase, IngressPhase::Destroyed);
+        assert!(t
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, RuntimeIngressEffect::IngressNotice { kind, .. } if kind == "Destroy")));
     }
 
     #[test]
-    fn destroyed_rejects_all() {
+    fn destroy_does_not_block_follow_on_helper_commands() {
         let mut auth = RuntimeIngressAuthority::new();
         auth.apply(RuntimeIngressInput::Destroy).unwrap();
 
         let result = auth.apply(RuntimeIngressInput::Retire);
-        assert!(matches!(
-            result,
-            Err(RuntimeIngressError::TerminalPhase { .. })
-        ));
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn reset_returns_to_active() {
+    fn reset_clears_state_without_phase_machine() {
         let mut auth = RuntimeIngressAuthority::new();
         auth.apply(RuntimeIngressInput::Retire).unwrap();
         let t = auth
             .apply(RuntimeIngressInput::Reset)
             .expect("reset from retired");
-        assert_eq!(t.next_phase, IngressPhase::Active);
+        assert!(t
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, RuntimeIngressEffect::IngressNotice { kind, .. } if kind == "Reset")));
     }
 
     // ---- AdmitQueued ----
@@ -2232,7 +1866,6 @@ mod tests {
         let wid = InputId::new();
         let t = admit_queued(&mut auth, wid.clone(), HandlingMode::Queue);
 
-        assert_eq!(t.next_phase, IngressPhase::Active);
         assert!(auth.admitted_inputs().contains(&wid));
         assert_eq!(auth.queue(), &[wid.clone()]);
         assert!(auth.steer_queue().is_empty());
@@ -2333,7 +1966,7 @@ mod tests {
     }
 
     #[test]
-    fn admit_queued_rejected_from_retired() {
+    fn admit_queued_still_allowed_after_retire_notice() {
         let mut auth = RuntimeIngressAuthority::new();
         auth.apply(RuntimeIngressInput::Retire).unwrap();
 
@@ -2348,10 +1981,7 @@ mod tests {
             policy: test_policy(),
             existing_superseded_id: None,
         });
-        assert!(matches!(
-            result,
-            Err(RuntimeIngressError::InvalidTransition { .. })
-        ));
+        assert!(result.is_ok());
     }
 
     // ---- AdmitConsumedOnAccept ----
@@ -2943,7 +2573,6 @@ mod tests {
             Some(InputLifecycleState::Abandoned)
         );
         assert!(auth.queue().is_empty());
-        assert!(auth.is_terminal());
         // Should have effects for each abandoned input
         let completion_count = t
             .effects
@@ -2953,7 +2582,7 @@ mod tests {
         assert_eq!(completion_count, 2);
     }
 
-    // ---- Reset abandons non-terminal inputs and returns to Active ----
+    // ---- Reset abandons non-terminal inputs and clears helper state ----
 
     #[test]
     fn reset_abandons_and_returns_to_active() {
@@ -2967,7 +2596,6 @@ mod tests {
 
         auth.apply(RuntimeIngressInput::Reset).unwrap();
 
-        assert_eq!(auth.phase(), IngressPhase::Active);
         assert_eq!(
             auth.lifecycle_state(&w1),
             Some(InputLifecycleState::Abandoned)
@@ -2999,7 +2627,7 @@ mod tests {
         ));
     }
 
-    // ---- Retired can still drain ----
+    // ---- Retire does not prevent drain bookkeeping ----
 
     #[test]
     fn retired_can_stage_and_complete_drain() {
@@ -3008,7 +2636,6 @@ mod tests {
         admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
 
         auth.apply(RuntimeIngressInput::Retire).unwrap();
-        assert_eq!(auth.phase(), IngressPhase::Retired);
 
         // Can still drain
         let run_id = RunId::new();
@@ -3033,8 +2660,6 @@ mod tests {
             auth.lifecycle_state(&w1),
             Some(InputLifecycleState::Consumed)
         );
-        // Still Retired after drain
-        assert_eq!(auth.phase(), IngressPhase::Retired);
     }
 
     // ---- can_accept probing ----
@@ -3045,26 +2670,32 @@ mod tests {
         assert!(auth.can_accept(&RuntimeIngressInput::Retire));
         // Reset from Active with no current run should succeed
         assert!(auth.can_accept(&RuntimeIngressInput::Reset));
-        // Phase should be unchanged (probing, not mutating)
-        assert_eq!(auth.phase(), IngressPhase::Active);
+        assert!(auth.current_run().is_none());
     }
 
     #[test]
     fn can_accept_reset_from_active() {
         let auth = RuntimeIngressAuthority::new();
         assert!(auth.can_accept(&RuntimeIngressInput::Reset));
-        assert_eq!(auth.phase(), IngressPhase::Active); // not mutated
+        assert!(auth.current_run().is_none());
     }
 
-    // ---- Phase unchanged on failure ----
+    // ---- State unchanged on failure ----
 
     #[test]
-    fn phase_unchanged_on_rejected_transition() {
+    fn helper_state_unchanged_on_rejected_transition() {
         let mut auth = RuntimeIngressAuthority::new();
-        auth.apply(RuntimeIngressInput::Retire).unwrap();
-        let result = auth.apply(RuntimeIngressInput::Retire);
+        let w1 = InputId::new();
+        admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
+        let run_id = RunId::new();
+        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
+            run_id,
+            contributing_work_ids: vec![w1.clone()],
+        })
+        .unwrap();
+        let result = auth.apply(RuntimeIngressInput::Reset);
         assert!(result.is_err());
-        assert_eq!(auth.phase(), IngressPhase::Retired);
+        assert_eq!(auth.current_run_contributors(), &[w1]);
     }
 
     // ---- Steer rollback goes to steer_queue ----

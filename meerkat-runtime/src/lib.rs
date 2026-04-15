@@ -111,9 +111,8 @@ pub use runtime_event::{
     RuntimeProjectionEvent, RuntimeStateChangeEvent, RuntimeTopologyEvent,
 };
 pub use runtime_ingress_authority::{
-    ContentShape, IngressPhase, RequestId, ReservationKey, RuntimeIngressAuthority,
-    RuntimeIngressEffect, RuntimeIngressError, RuntimeIngressInput, RuntimeIngressMutator,
-    RuntimeIngressTransition,
+    ContentShape, RequestId, ReservationKey, RuntimeIngressAuthority, RuntimeIngressEffect,
+    RuntimeIngressError, RuntimeIngressInput, RuntimeIngressMutator, RuntimeIngressTransition,
 };
 pub use runtime_state::{RuntimeState, RuntimeStateTransitionError};
 pub use service_ext::{RuntimeMode, SessionServiceRuntimeExt};

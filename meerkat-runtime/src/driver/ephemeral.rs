@@ -153,6 +153,9 @@ impl EphemeralRuntimeDriver {
     }
 
     pub fn set_silent_comms_intents(&mut self, intents: Vec<String>) {
+        if self.phase == RuntimeState::Stopped {
+            return;
+        }
         let overrides = intents.into_iter().collect::<BTreeSet<_>>();
         match self
             .ingress

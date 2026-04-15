@@ -170,13 +170,18 @@ Current exact-parity state:
   coarse control truth into the runtime path that realizes `MeerkatMachine`,
   the truthful Meerkat readout now sits at `17,384` reachable states with
   raw/phase/full quotients `385 / 390 / 16,995`
+- the first ingress-authority absorption slice is now landed too:
+  `RuntimeIngressAuthority` no longer owns a coarse `Active` / `Retired` /
+  `Destroyed` phase. Admission/drain/reset/stop/destroy legality is now owned
+  by the checked-in Meerkat lifecycle, while the helper remains only a
+  queue/ledger authority for admitted inputs and contributor bookkeeping
 - the pure query surface remains runtime-audited helper behavior, but it is no
   longer counted as formal transition coverage
 - the next remaining dogma violation is no longer coarse control truth in a
-  separate reducer; it is the handwritten ingress lifecycle in
-  `RuntimeIngressAuthority`, which still owns coarse lifecycle facts
-  (`Active`/`Retired`/`Destroyed`, `current_run`, contributor queues, stop /
-  reset / destroy / recover transitions) outside the two checked-in machines
+  separate reducer; it is the remaining handwritten ingress run/queue owner in
+  `RuntimeIngressAuthority`, which still owns `current_run`,
+  contributor queues, and reset / stop / destroy / recover bookkeeping below
+  the two checked-in machines
 
 Interpretation:
 
@@ -193,6 +198,11 @@ Interpretation:
   phase quotient stayed flat at `385 / 390`, which means the old
   simplification map was stale but the core behavioral quotient remained
   stable
+- removing the helper-owned ingress phase did not reopen any Meerkat parity
+  gap: acceptance parity stayed `243 / 243`, exact full-row parity stayed
+  `260 / 260`, and modeled-state parity returned to `145 / 145` after
+  tightening `SetSilentIntents` from `Stopped` to remain a no-op at the helper
+  layer too
 
 ## Resolution Rubric
 
