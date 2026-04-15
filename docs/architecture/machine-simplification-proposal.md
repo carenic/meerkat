@@ -72,6 +72,10 @@ Hopcroft-style behavioral quotient over the reachable graph.
   guard/update surface to rely on `active_member_count`, which preserved the
   truthful Hopcroft/TLC readout exactly because the counter never carried
   independent formal behavior.
+- Tightened the public Mob `StopRunning` transition with `no_active_runs`
+  after a focused runtime probe proved the live actor rejects `stop()` while
+  flows are still active; the truthful Mob quotient stayed flat and TLC
+  generated states fell slightly.
 - Removed the Meerkat LLM/capability projection layer
   (`current_llm_identity`, `current_capability_surface`,
   `capability_surface_status`, `capability_base_filter`,
@@ -101,7 +105,7 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | MobMachine | Surface-only inputs | 0 | 12 | +12 |
 | MobMachine | Signals | 79 | 31 | -48 |
 | MobMachine | Transitions | 210 | 82 | -128 |
-| MobMachine | TLC generated states | 452,835 | 25,943 | -426,892 |
+| MobMachine | TLC generated states | 452,835 | 25,767 | -427,068 |
 | MobMachine | TLC distinct states | 6,401 | 770 | -5,631 |
 | MobMachine | TLC depth | 7 | 7 | 0 |
 
@@ -123,6 +127,7 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | Mob `CancelWork` should stay surfaced without formal transition coverage | passed / landed | Moved `CancelWork` to `surface_only_inputs`; exact Mob parity stayed green, the truthful TLC state space fell from 1,390 to 1,214, and the raw/phase quotients tightened from 202 / 204 to 187 / 189. |
 | Mob representative runtime identity should not stay as top-level formal state | passed / landed | Removed `active_identity`, `active_runtime_id`, and `active_fence_token`; exact Mob parity stayed green, truthful TLC distinct states fell from 1,214 to 770, and the raw/phase quotients tightened from 187 / 189 to 138 / 140. |
 | Mob `retiring_member_count` should not stay as top-level formal state | passed / landed | Removed the dead retire counter; exact Mob parity stayed green and the truthful Hopcroft/TLC readout stayed flat at `770 -> 138 / 140 / 770`, proving the counter was not carrying independent formal behavior. |
+| Mob public `Stop` should reject active flows | passed / landed | Added `no_active_runs` to `StopRunning` after a focused runtime/schema probe showed `handle.stop()` rejects while flows are still active; the lifecycle-triangle parity audit stayed exact and truthful TLC generated states fell from `25,943` to `25,767` with the quotient unchanged. |
 | Meerkat `Recovering` is a transient / no-op top-level phase | passed / landed | Removed the unreachable top-level `Recovering` phase from the formal model; the internal `RuntimeControlAuthority` still owns recovery/recycle transitions, and TLC state space stayed unchanged. |
 | Meerkat pure queries should stay surfaced without formal transitions | passed / landed | Moved the read-only helper/query family into `surface_only_inputs`; runtime/schema audits stayed green and Meerkat TLC generated states dropped from 3,668,832 to 3,113,272 while the raw/phase quotients stayed at 385 / 390. |
 | Meerkat committed visibility publication progress should not stay as top-level shadow state | passed / landed | Removed `committed_visibility_revision` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 59,371 to 45,610 while the raw/phase quotients stayed at 385 / 390. |
@@ -422,7 +427,7 @@ Current result:
 - raw quotient states: `138`
 - phase-observed quotient states: `140`
 - full-observed quotient states: `770`
-- TLC: `25,943 generated / 770 distinct / depth 7`
+- TLC: `25,767 generated / 770 distinct / depth 7`
 - dominant mixed block: `347` states spanning `Running`, `Stopped`, and
   `Completed`
 - dominant block tuples: `205`
@@ -487,7 +492,7 @@ active-member counter surface. That read tightened again:
 - raw quotient states: `138`
 - phase-observed quotient states: `140`
 - full-observed quotient states: `770`
-- TLC: `25,943 generated / 770 distinct / depth 7`
+- TLC: `25,767 generated / 770 distinct / depth 7`
 
 That is the strongest Mob result so far. The machine is no longer spending
 state-space budget replaying a representative member/runtime identity at the

@@ -4417,6 +4417,7 @@ mob_StopRunning ==
        /\ packet.variant = "Stop"
        /\ ~HigherPriorityReady("mob_kernel")
        /\ mob_phase = "Running"
+       /\ (mob_active_run_count = 0)
        /\ mob_phase' = "Stopped"
        /\ mob_active_run_count' = 0
        /\ mob_coordinator_bound' = FALSE
@@ -5560,7 +5561,7 @@ EntryPacketAdmissible_mob(packet) ==
     \/ /\ (packet.variant = "SetSpawnPolicy") /\ (mob_phase = "Stopped")
     \/ /\ (packet.variant = "SetSpawnPolicy") /\ (mob_phase = "Completed")
     \/ /\ (packet.variant = "SetSpawnPolicy") /\ (mob_phase = "Destroyed")
-    \/ /\ (packet.variant = "Stop") /\ (mob_phase = "Running")
+    \/ /\ (packet.variant = "Stop") /\ (mob_phase = "Running") /\ ((mob_active_run_count = 0))
     \/ /\ (packet.variant = "Resume") /\ (mob_phase = "Stopped")
     \/ /\ (packet.variant = "Complete") /\ (mob_phase = "Running")
     \/ /\ (packet.variant = "Reset") /\ (mob_phase = "Running" \/ mob_phase = "Stopped" \/ mob_phase = "Completed")

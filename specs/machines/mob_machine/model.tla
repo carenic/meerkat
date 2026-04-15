@@ -206,6 +206,7 @@ SetSpawnPolicyDestroyed ==
 
 StopRunning ==
     /\ phase = "Running"
+    /\ (active_run_count = 0)
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
     /\ active_run_count' = 0

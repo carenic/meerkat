@@ -304,13 +304,7 @@ pub fn mob_machine() -> MachineSchema {
                     variant: "MarkCompleted".into(),
                     bindings: vec![],
                 },
-                guards: vec![Guard {
-                    name: "no_active_runs".into(),
-                    expr: Expr::Eq(
-                        Box::new(Expr::Field("active_run_count".into())),
-                        Box::new(Expr::U64(0)),
-                    ),
-                }],
+                guards: vec![no_active_runs_guard()],
                 updates: vec![],
                 to: "Completed".into(),
                 emit: vec![lifecycle_notice_emit("completed")],
@@ -701,7 +695,7 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
             variant: "Stop".into(),
             bindings: vec![],
         },
-        guards: vec![],
+        guards: vec![no_active_runs_guard()],
         updates: vec![set_bool("coordinator_bound", false), clear_active_runs()],
         to: "Stopped".into(),
         emit: vec![simple_emit("EmitRunLifecycleNotice")],
@@ -1270,6 +1264,16 @@ fn active_members_present_guard() -> Guard {
         name: "active_members_present".into(),
         expr: Expr::Gt(
             Box::new(Expr::Field("active_member_count".into())),
+            Box::new(Expr::U64(0)),
+        ),
+    }
+}
+
+fn no_active_runs_guard() -> Guard {
+    Guard {
+        name: "no_active_runs".into(),
+        expr: Expr::Eq(
+            Box::new(Expr::Field("active_run_count".into())),
             Box::new(Expr::U64(0)),
         ),
     }

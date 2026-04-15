@@ -69,6 +69,10 @@ Current state:
   counter; the retire path now relies directly on `active_member_count`, and
   the truthful Hopcroft/TLC readout stayed flat because the removed counter was
   never carrying independent behavior
+- `StopRunning` now carries the same `no_active_runs` gate as the live actor
+  path: a running Mob with active flows rejects `stop()` until those flows are
+  canceled or settle, and the focused runtime/schema proof for that row is
+  now checked in
 - the generated `meerkat_mob_seam` composition now rejects inadmissible queued
   external entry packets instead of deadlocking after terminal Mob shutdown
 
@@ -134,6 +138,12 @@ Current state:
   `770 -> 138 -> 140 -> 770`, which means `retiring_member_count` was fully
   correlated with the remaining state and never carried independent labeled
   behavior.
+- The next parity-hardening tranche tightened the public `StopRunning`
+  transition with `no_active_runs` after a focused runtime probe showed that
+  the actor rejects `stop()` while flows are still active.
+- That fix kept the exact lifecycle triangle green and left the truthful raw /
+  phase / full Hopcroft readout unchanged at `770 -> 138 -> 140 -> 770`,
+  while TLC generated states fell slightly from `25,943` to `25,767`.
 
 ## Pair Ledger
 
@@ -154,6 +164,10 @@ Current state:
   the truthful state space has now collapsed from `4,797` to `770`.
 - The trustworthy raw/phase/full reread is now:
   raw `770 -> 138`, phase `770 -> 140`, full `770 -> 770`.
+- The latest public-guard parity hardening did not change the remaining Mob
+  core fields; it only removed one over-admitted `Stop` row from the formal
+  graph, which is why the quotient stayed flat while TLC generated states
+  dipped slightly.
 - The dominant mixed block (`347` states) is now split primarily by
   `pending_spawn_count`, `wiring_edge_count`, `active_run_count`,
   `active_member_count`, and `coordinator_bound`.

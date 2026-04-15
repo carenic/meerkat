@@ -242,6 +242,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ### `StopRunning`
 - From: `Running`
 - On: `Stop`()
+- Guards:
+  - `no_active_runs`
 - Emits: `EmitRunLifecycleNotice`
 - To: `Stopped`
 

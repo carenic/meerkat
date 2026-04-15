@@ -10750,6 +10750,54 @@ async fn test_stop_clears_pending_spawn_count_and_failed_member_projection() {
 }
 
 #[tokio::test]
+async fn test_stop_rejects_active_flow_and_schema_requires_no_active_runs() {
+    let (handle, service) =
+        create_test_mob(sample_definition_with_single_step_flow(60_000, 8)).await;
+    handle
+        .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
+        .await
+        .expect("spawn worker");
+    service.set_flow_turn_never_terminal(true);
+
+    let run_id = handle
+        .run_flow(FlowId::from("demo"), serde_json::json!({}))
+        .await
+        .expect("run flow");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let error = handle
+        .stop()
+        .await
+        .expect_err("stop should reject active flows");
+    assert!(matches!(
+        error,
+        MobError::Internal(message)
+            if message.contains("orchestrator StopOrchestrator transition failed during stop")
+    ));
+    assert_eq!(handle.status(), MobState::Running);
+
+    handle
+        .cancel_flow(run_id.clone())
+        .await
+        .expect("cancel flow after rejected stop");
+    let terminal = wait_for_run_terminal(&handle, &run_id, Duration::from_secs(8)).await;
+    assert_eq!(terminal.status, MobRunStatus::Canceled);
+
+    let schema = schema_mob_machine();
+    let stop = schema
+        .transitions
+        .iter()
+        .find(|transition| transition.name == "StopRunning")
+        .expect("StopRunning transition");
+    assert!(
+        stop.guards
+            .iter()
+            .any(|guard| guard.name == "no_active_runs"),
+        "StopRunning should require no active runs"
+    );
+}
+
+#[tokio::test]
 async fn test_failed_spawn_clears_pending_spawn_count_and_failed_roster_entry() {
     let (handle, service) = create_test_mob(sample_definition_with_auto_wire()).await;
     handle
