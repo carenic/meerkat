@@ -208,6 +208,36 @@ impl DriverEntry {
         }
     }
 
+    pub(crate) fn current_run_id(&self) -> Option<&RunId> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.current_run_id(),
+            DriverEntry::Persistent(d) => d.inner_ref().current_run_id(),
+        }
+    }
+
+    pub(crate) fn pre_run_phase(&self) -> Option<crate::runtime_state::RuntimeState> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.pre_run_phase(),
+            DriverEntry::Persistent(d) => d.inner_ref().pre_run_phase(),
+        }
+    }
+
+    pub(crate) fn set_control_projection(
+        &mut self,
+        next_phase: crate::runtime_state::RuntimeState,
+        current_run_id: Option<RunId>,
+        pre_run_phase: Option<crate::runtime_state::RuntimeState>,
+    ) {
+        match self {
+            DriverEntry::Ephemeral(d) => {
+                d.set_control_projection(next_phase, current_run_id, pre_run_phase)
+            }
+            DriverEntry::Persistent(d) => {
+                d.set_control_projection(next_phase, current_run_id, pre_run_phase)
+            }
+        }
+    }
+
     pub(crate) fn ledger(&self) -> &crate::input_ledger::InputLedger {
         match self {
             DriverEntry::Ephemeral(d) => d.ledger(),
@@ -219,22 +249,6 @@ impl DriverEntry {
         match self {
             DriverEntry::Ephemeral(d) => d.has_queued_input_outside(excluded),
             DriverEntry::Persistent(d) => d.has_queued_input_outside(excluded),
-        }
-    }
-
-    /// Start a new run (Idle → Running).
-    pub(crate) fn start_run(&mut self, run_id: RunId) -> Result<(), RuntimeStateTransitionError> {
-        match self {
-            DriverEntry::Ephemeral(d) => d.start_run(run_id),
-            DriverEntry::Persistent(d) => d.start_run(run_id),
-        }
-    }
-
-    /// Complete a run (Running → Idle).
-    pub(crate) fn complete_run(&mut self) -> Result<RunId, RuntimeStateTransitionError> {
-        match self {
-            DriverEntry::Ephemeral(d) => d.complete_run(),
-            DriverEntry::Persistent(d) => d.complete_run(),
         }
     }
 
@@ -359,19 +373,71 @@ impl DriverEntry {
 /// Shared completion registry (accessed by adapter for registration and loop for resolution).
 pub(crate) type SharedCompletionRegistry = Arc<Mutex<crate::completion::CompletionRegistry>>;
 
+fn machine_validate_active_run(
+    driver: &DriverEntry,
+    run_id: &RunId,
+    next_phase: RuntimeState,
+) -> Result<(), RuntimeStateTransitionError> {
+    match driver.runtime_state() {
+        RuntimeState::Running | RuntimeState::Retired => {}
+        from => {
+            return Err(RuntimeStateTransitionError {
+                from,
+                to: next_phase,
+            });
+        }
+    }
+
+    match driver.current_run_id() {
+        Some(active_id) if active_id == run_id => Ok(()),
+        _ => Err(RuntimeStateTransitionError {
+            from: driver.runtime_state(),
+            to: next_phase,
+        }),
+    }
+}
+
+fn machine_begin_run(
+    driver: &mut DriverEntry,
+    run_id: RunId,
+) -> Result<(), RuntimeStateTransitionError> {
+    let from = driver.runtime_state();
+    let pre_run_phase = crate::runtime_state::run_start_pre_phase_from_phase(from)?;
+    if driver.current_run_id().is_some() {
+        return Err(RuntimeStateTransitionError {
+            from,
+            to: RuntimeState::Running,
+        });
+    }
+    driver.set_control_projection(RuntimeState::Running, Some(run_id), Some(pre_run_phase));
+    Ok(())
+}
+
+fn machine_apply_run_return_projection(
+    driver: &mut DriverEntry,
+    run_id: &RunId,
+    next_phase: RuntimeState,
+) -> Result<(), RuntimeStateTransitionError> {
+    machine_validate_active_run(driver, run_id, next_phase)?;
+    driver.set_control_projection(next_phase, None, None);
+    Ok(())
+}
+
 pub(crate) async fn prepare_runtime_loop_batch_start(
     driver: &SharedDriver,
     run_id: RunId,
     staged_ids: &[InputId],
 ) -> Result<(), RuntimeDriverError> {
     let mut driver = driver.lock().await;
-    driver.start_run(run_id.clone()).map_err(|err| {
+    machine_begin_run(&mut driver, run_id.clone()).map_err(|err| {
         RuntimeDriverError::Internal(format!("failed to start runtime run: {err}"))
     })?;
 
     if let Err(err) = driver.stage_batch(staged_ids, &run_id) {
         let _ = driver.rollback_staged(staged_ids);
-        let _ = driver.complete_run();
+        let next_phase =
+            crate::runtime_state::run_return_phase_from_pre_run_phase(driver.pre_run_phase());
+        let _ = machine_apply_run_return_projection(&mut driver, &run_id, next_phase);
         return Err(RuntimeDriverError::Internal(format!(
             "failed to stage accepted input batch: {err}"
         )));
@@ -388,13 +454,27 @@ pub(crate) async fn commit_runtime_loop_run(
     session_snapshot: Option<Vec<u8>>,
 ) -> Result<(), RuntimeDriverError> {
     let mut driver = driver.lock().await;
+    let next_phase =
+        crate::runtime_state::run_return_phase_from_pre_run_phase(driver.pre_run_phase());
     if let Err(err) = driver
         .boundary_applied(run_id.clone(), receipt, session_snapshot)
         .await
     {
+        let unwind_run_id = run_id.clone();
         if let Err(unwind_err) = driver
-            .run_failed(run_id, format!("boundary commit failed: {err}"), true)
+            .run_failed(
+                unwind_run_id.clone(),
+                format!("boundary commit failed: {err}"),
+                true,
+            )
             .await
+        {
+            return Err(RuntimeDriverError::Internal(format!(
+                "runtime boundary commit failed: {err}; additionally failed to unwind runtime state: {unwind_err}"
+            )));
+        }
+        if let Err(unwind_err) =
+            machine_apply_run_return_projection(&mut driver, &unwind_run_id, next_phase)
         {
             return Err(RuntimeDriverError::Internal(format!(
                 "runtime boundary commit failed: {err}; additionally failed to unwind runtime state: {unwind_err}"
@@ -405,14 +485,22 @@ pub(crate) async fn commit_runtime_loop_run(
         )));
     }
 
+    let completed_run_id = run_id.clone();
     driver
-        .run_completed(run_id, consumed_input_ids)
+        .run_completed(completed_run_id.clone(), consumed_input_ids)
         .await
         .map_err(|err| {
             RuntimeDriverError::Internal(format!(
                 "failed to persist runtime completion snapshot: {err}"
             ))
         })?;
+    machine_apply_run_return_projection(&mut driver, &completed_run_id, next_phase).map_err(
+        |err| {
+            RuntimeDriverError::Internal(format!(
+                "failed to apply runtime return projection after completion: {err}"
+            ))
+        },
+    )?;
 
     Ok(())
 }
@@ -423,12 +511,20 @@ pub(crate) async fn fail_runtime_loop_run(
     error: String,
 ) -> Result<(), RuntimeDriverError> {
     let mut driver = driver.lock().await;
+    let next_phase =
+        crate::runtime_state::run_return_phase_from_pre_run_phase(driver.pre_run_phase());
+    let failed_run_id = run_id.clone();
     driver
-        .run_failed(run_id, error, true)
+        .run_failed(failed_run_id.clone(), error, true)
         .await
         .map_err(|run_err| {
             RuntimeDriverError::Internal(format!("failed to record run-failed event: {run_err}"))
-        })
+        })?;
+    machine_apply_run_return_projection(&mut driver, &failed_run_id, next_phase).map_err(|err| {
+        RuntimeDriverError::Internal(format!(
+            "failed to apply runtime return projection after failure: {err}"
+        ))
+    })
 }
 
 #[derive(Debug, Default)]
@@ -1921,12 +2017,16 @@ impl MeerkatMachine {
                     }
 
                     let run_id = RunId::new();
-                    driver.start_run(run_id.clone()).map_err(|err| {
+                    machine_begin_run(&mut driver, run_id.clone()).map_err(|err| {
                         RuntimeDriverError::Internal(format!("failed to start runtime run: {err}"))
                     })?;
                     if let Err(err) = driver.stage_input(&dequeued_id, &run_id) {
                         let _ = driver.rollback_staged(std::slice::from_ref(&dequeued_id));
-                        let _ = driver.complete_run();
+                        let next_phase = crate::runtime_state::run_return_phase_from_pre_run_phase(
+                            driver.pre_run_phase(),
+                        );
+                        let _ =
+                            machine_apply_run_return_projection(&mut driver, &run_id, next_phase);
                         return Err(RuntimeDriverError::Internal(format!(
                             "failed to stage accepted input: {err}"
                         )));

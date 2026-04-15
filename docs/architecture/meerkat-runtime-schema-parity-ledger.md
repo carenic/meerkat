@@ -91,6 +91,12 @@ Current state:
   inline; the checked-in machine module now owns the atomic
   `start_run + stage_batch + unwind-on-failure` sequence through a dedicated
   helper, while terminal return still remains the next separate tranche
+- coarse run-start / run-return legality is no longer committed by
+  `EphemeralRuntimeDriver` either: the checked-in machine module now validates
+  active run identity, commits the `Running` projection, and clears
+  `current_run_id` / `pre_run_phase` on terminal return, while the driver only
+  realizes ingress/ledger mechanics for `BoundaryApplied`, `RunCompleted`, and
+  `RunFailed`
 - attached steered `AcceptWithCompletion` is no longer treated as a queue-only
   self-loop in the formal model: when `request_immediate_processing=true`, the
   checked-in Meerkat machine now models the runtime’s `Attached -> Running`
@@ -242,6 +248,11 @@ Current exact-parity state:
   owner in `RuntimeIngressAuthority`, which no longer derives a second active
   run identity but still owns contributor queues and reset / stop / destroy /
   recover bookkeeping below the two checked-in machines
+- a second checked-in gap also remains on the formal side: the
+  `meerkat_mob_seam` composition still models the Mob <- Meerkat return leg
+  but not the forward Mob -> Meerkat work-ingress route, so the seam cannot yet
+  truthfully claim to verify Mob-originated work against Meerkat batching /
+  boundary legality end to end
 
 Interpretation:
 

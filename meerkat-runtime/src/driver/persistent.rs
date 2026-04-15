@@ -106,20 +106,14 @@ impl PersistentRuntimeDriver {
         }
     }
 
-    /// Start a new run (delegates to inner).
-    pub fn start_run(
+    pub(crate) fn set_control_projection(
         &mut self,
-        run_id: meerkat_core::lifecycle::RunId,
-    ) -> Result<(), crate::runtime_state::RuntimeStateTransitionError> {
-        self.inner.start_run(run_id)
-    }
-
-    /// Complete a run (delegates to inner).
-    pub fn complete_run(
-        &mut self,
-    ) -> Result<meerkat_core::lifecycle::RunId, crate::runtime_state::RuntimeStateTransitionError>
-    {
-        self.inner.complete_run()
+        next_phase: RuntimeState,
+        current_run_id: Option<RunId>,
+        pre_run_phase: Option<RuntimeState>,
+    ) {
+        self.inner
+            .set_control_projection(next_phase, current_run_id, pre_run_phase);
     }
 
     /// Get pending events (delegates to inner).

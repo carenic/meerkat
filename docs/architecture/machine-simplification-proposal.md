@@ -194,6 +194,12 @@ Hopcroft-style behavioral quotient over the reachable graph.
   machine-module helper so the coarse `start_run + stage_batch + unwind`
   sequence is no longer realized inline by the loop body. This intentionally
   leaves run terminal return for the next separate tranche.
+- Moved coarse run-start and run-return control writes out of the driver-owned
+  `EphemeralRuntimeDriver` reducer path as well: the checked-in machine module
+  now validates the active run binding, commits the `Running` projection, and
+  clears `current_run_id` / `pre_run_phase` on terminal return, while the
+  driver is reduced to ingress/ledger mechanics around `BoundaryApplied`,
+  `RunCompleted`, and `RunFailed`.
 - Taught the generated closed-world composition models to reject queued
   external entry packets that are no longer admissible for the current machine
   state, which removes seam deadlocks without widening the machine transition
@@ -244,6 +250,7 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | Mob public `Stop` should reject active flows | passed / landed | Added `no_active_runs` to `StopRunning` after a focused runtime/schema probe showed `handle.stop()` rejects while flows are still active; the lifecycle-triangle parity audit stayed exact and truthful TLC generated states fell from `25,943` to `25,767` with the quotient unchanged. |
 | Mob bootstrap should start with coordinator bound | passed / landed | Changed the formal init state from `Running + coordinator_bound=false` to `Running + coordinator_bound=true` to match the live runtime bootstrap snapshot; the lifecycle-triangle parity audit stayed exact and the truthful quotient held at `138 / 140` while reachable states rose from `770` to `813`, proving the old bootstrap state had been under-modeled rather than behavior-bearing. |
 | Meerkat `Recovering` is a transient / no-op top-level phase | passed / landed | Removed the unreachable top-level `Recovering` phase from the formal model, then removed `Recovering` from the runtime and wire surfaces as well. The live recover/recycle flow no longer depends on any handwritten helper recovery workflow. |
+| Driver-local run-start / run-return legality can stay below `MeerkatMachine` | rejected / landed | Moved active-run validation plus `current_run_id` / `pre_run_phase` writes/clears out of `EphemeralRuntimeDriver` and into the checked-in machine module. The driver now realizes ingress/ledger mechanics for `BoundaryApplied`, `RunCompleted`, and `RunFailed`, but it no longer decides whether a run may start or where it legally returns. |
 | Meerkat pure queries should stay surfaced without formal transitions | passed / landed | Moved the read-only helper/query family into `surface_only_inputs`; runtime/schema audits stayed green and Meerkat TLC generated states dropped from 3,668,832 to 3,113,272 while the raw/phase quotients stayed at 385 / 390. |
 | Meerkat committed visibility publication progress should not stay as top-level shadow state | passed / landed | Removed `committed_visibility_revision` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 59,371 to 45,610 while the raw/phase quotients stayed at 385 / 390. |
 | Meerkat visibility witness provenance should not stay as top-level shadow state | passed / landed | Removed `requested_witnesses` and `filter_witnesses` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 45,610 to 15,809 while the raw/phase quotients still held at 385 / 390. |
