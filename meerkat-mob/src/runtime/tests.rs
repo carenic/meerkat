@@ -17852,7 +17852,10 @@ async fn mob_runtime_parity_snapshot_summary(
             .resolve_profile(&entry.role, None)
             .await
             .ok();
-        if profile.as_ref().map(|profile| profile.external_addressable) == Some(true) {
+        if profile
+            .as_ref()
+            .is_some_and(|profile| profile.external_addressable)
+        {
             externally_addressable_runtime_ids.insert(mob_modeled_normalize_formal_string(
                 &serde_json::to_string(&entry.agent_runtime_id)
                     .expect("serialize runtime id for external addressability parity snapshot"),
