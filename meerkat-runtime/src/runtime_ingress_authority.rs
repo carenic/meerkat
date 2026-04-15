@@ -5,7 +5,7 @@
 //! ingress lifecycle. Meerkat phase is the only coarse lifecycle truth; this
 //! helper exists only for lower-level ledger and queue mechanics.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 use meerkat_core::lifecycle::run_primitive::RunApplyBoundary;
 use meerkat_core::lifecycle::{InputId, RunId};
@@ -261,7 +261,6 @@ pub enum RuntimeIngressError {
 /// by handwritten shell code.
 #[derive(Debug, Clone)]
 struct RuntimeIngressFields {
-    admitted_inputs: HashSet<InputId>,
     admission_order: Vec<InputId>,
     content_shape: HashMap<InputId, ContentShape>,
     request_id: HashMap<InputId, Option<RequestId>>,
@@ -282,7 +281,6 @@ struct RuntimeIngressFields {
 impl RuntimeIngressFields {
     fn new() -> Self {
         Self {
-            admitted_inputs: HashSet::new(),
             admission_order: Vec::new(),
             content_shape: HashMap::new(),
             request_id: HashMap::new(),
@@ -353,11 +351,6 @@ impl RuntimeIngressAuthority {
         Self {
             fields: RuntimeIngressFields::new(),
         }
-    }
-
-    /// The set of admitted input IDs.
-    pub fn admitted_inputs(&self) -> &HashSet<InputId> {
-        &self.fields.admitted_inputs
     }
 
     /// The admission order.
@@ -676,7 +669,7 @@ impl RuntimeIngressAuthority {
         existing_superseded_id: &Option<InputId>,
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: input_is_new
-        if self.fields.admitted_inputs.contains(work_id) {
+        if self.fields.lifecycle.contains_key(work_id) {
             return Err(RuntimeIngressError::GuardFailed {
                 guard: format!("input_is_new: {work_id:?} already admitted"),
             });
@@ -685,7 +678,6 @@ impl RuntimeIngressAuthority {
         let mut effects = Vec::new();
 
         // Register admission
-        fields.admitted_inputs.insert(work_id.clone());
         fields.admission_order.push(work_id.clone());
         fields
             .content_shape
@@ -825,7 +817,7 @@ impl RuntimeIngressAuthority {
         policy: &PolicyDecision,
     ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
         // Guard: input_is_new
-        if self.fields.admitted_inputs.contains(work_id) {
+        if self.fields.lifecycle.contains_key(work_id) {
             return Err(RuntimeIngressError::GuardFailed {
                 guard: format!("input_is_new: {work_id:?} already admitted"),
             });
@@ -835,7 +827,6 @@ impl RuntimeIngressAuthority {
         let mut effects = Vec::new();
 
         // Register admission (immediately consumed)
-        fields.admitted_inputs.insert(work_id.clone());
         fields.admission_order.push(work_id.clone());
         fields
             .content_shape
@@ -1189,7 +1180,7 @@ impl RuntimeIngressAuthority {
         }
 
         // Guard: new_work_id must be admitted
-        if !self.fields.admitted_inputs.contains(new_work_id) {
+        if !self.fields.lifecycle.contains_key(new_work_id) {
             return Err(RuntimeIngressError::GuardFailed {
                 guard: format!("new_input_is_admitted: {new_work_id:?} not found"),
             });
@@ -1453,7 +1444,6 @@ impl RuntimeIngressAuthority {
         let mut fields = self.fields.clone();
 
         // Restore the input into the authority's canonical tracking at its persisted state.
-        fields.admitted_inputs.insert(work_id.clone());
         fields.content_shape.insert(work_id.clone(), content_shape);
         fields.handling_mode.insert(work_id.clone(), handling_mode);
         fields.lifecycle.insert(work_id.clone(), lifecycle_state);
@@ -1620,7 +1610,7 @@ impl RuntimeIngressAuthority {
         let mut effects = Vec::new();
 
         for (work_id, outcome) in terminal_inputs {
-            if !fields.admitted_inputs.contains(work_id) {
+            if !fields.lifecycle.contains_key(work_id) {
                 continue;
             }
 
@@ -1860,7 +1850,7 @@ mod tests {
         let wid = InputId::new();
         let t = admit_queued(&mut auth, wid.clone(), HandlingMode::Queue);
 
-        assert!(auth.admitted_inputs().contains(&wid));
+        assert!(auth.lifecycle_state(&wid).is_some());
         assert_eq!(auth.queue(), &[wid.clone()]);
         assert!(auth.steer_queue().is_empty());
         assert_eq!(

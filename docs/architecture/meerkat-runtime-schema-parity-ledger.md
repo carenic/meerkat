@@ -175,6 +175,10 @@ Current exact-parity state:
   `Destroyed` phase. Admission/drain/reset/stop/destroy legality is now owned
   by the checked-in Meerkat lifecycle, while the helper remains only a
   queue/ledger authority for admitted inputs and contributor bookkeeping
+- the ingress helper also no longer keeps a second `admitted_inputs` set:
+  tracked-input membership is derived directly from the canonical per-input
+  lifecycle map, and exact Meerkat parity stayed green after removing that
+  duplicate ledger index
 - the pure query surface remains runtime-audited helper behavior, but it is no
   longer counted as formal transition coverage
 - the next remaining dogma violation is no longer coarse control truth in a
@@ -203,6 +207,9 @@ Interpretation:
   `260 / 260`, and modeled-state parity returned to `145 / 145` after
   tightening `SetSilentIntents` from `Stopped` to remain a no-op at the helper
   layer too
+- removing the duplicate ingress `admitted_inputs` index did not reopen any
+  Meerkat parity gap either: the helper now derives tracked-input membership
+  from lifecycle ownership instead of keeping a second set in sync
 
 ## Resolution Rubric
 
