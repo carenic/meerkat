@@ -320,6 +320,27 @@ impl DriverEntry {
 /// Shared completion registry (accessed by adapter for registration and loop for resolution).
 pub(crate) type SharedCompletionRegistry = Arc<Mutex<crate::completion::CompletionRegistry>>;
 
+pub(crate) async fn prepare_runtime_loop_batch_start(
+    driver: &SharedDriver,
+    run_id: RunId,
+    staged_ids: &[InputId],
+) -> Result<(), RuntimeDriverError> {
+    let mut driver = driver.lock().await;
+    driver.start_run(run_id.clone()).map_err(|err| {
+        RuntimeDriverError::Internal(format!("failed to start runtime run: {err}"))
+    })?;
+
+    if let Err(err) = driver.stage_batch(staged_ids, &run_id) {
+        let _ = driver.rollback_staged(staged_ids);
+        let _ = driver.complete_run();
+        return Err(RuntimeDriverError::Internal(format!(
+            "failed to stage accepted input batch: {err}"
+        )));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 struct MachineToolVisibilityOwner {
     state: StdRwLock<SessionToolVisibilityState>,

@@ -190,6 +190,10 @@ Hopcroft-style behavioral quotient over the reachable graph.
   helper rather than a trait-level runtime lifecycle noun, while
   `MeerkatMachine` / the control-plane seam remain the only layers that speak
   the lifecycle command semantically.
+- Moved runtime-loop batch start preparation out of `runtime_loop.rs` into a
+  machine-module helper so the coarse `start_run + stage_batch + unwind`
+  sequence is no longer realized inline by the loop body. This intentionally
+  leaves run terminal return for the next separate tranche.
 - Taught the generated closed-world composition models to reject queued
   external entry packets that are no longer admissible for the current machine
   state, which removes seam deadlocks without widening the machine transition

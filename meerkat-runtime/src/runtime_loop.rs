@@ -666,22 +666,10 @@ async fn process_queue(
 
             let run_id = RunId::new();
 
-            // Start run in the state machine
-            if d.start_run(run_id.clone()).is_err() {
-                return false;
-            }
-
-            // Stage the input batch atomically (Queued → Staged).
-            // Do NOT apply here — apply only after successful execution.
-            // If we pre-applied and the executor failed, the input would
-            // be stranded in AppliedPendingConsumption because RunFailed
-            // only rolls back Staged inputs.
+            // The checked-in Meerkat machine owns the coarse "this dequeued
+            // batch has now become a run" transition, including unwind on
+            // staging failure.
             let staged_ids: Vec<_> = staged_inputs.iter().map(|(id, _)| id.clone()).collect();
-            if d.stage_batch(&staged_ids, &run_id).is_err() {
-                let _ = d.rollback_staged(&staged_ids);
-                let _ = d.complete_run();
-                return false;
-            }
 
             // Use the authority's boundary classification (derived from stored metadata)
             // instead of the shell-level input_boundary function.
@@ -694,11 +682,22 @@ async fn process_queue(
                 .iter()
                 .map(|(staged_input_id, _)| staged_input_id.clone())
                 .collect::<Vec<_>>();
-            Some((contributing_input_ids, run_id, primitive))
+            Some((contributing_input_ids, staged_ids, run_id, primitive))
         };
 
         match dequeued {
-            Some((input_ids, run_id, primitive)) => {
+            Some((input_ids, staged_ids, run_id, primitive)) => {
+                if crate::meerkat_machine::prepare_runtime_loop_batch_start(
+                    driver,
+                    run_id.clone(),
+                    &staged_ids,
+                )
+                .await
+                .is_err()
+                {
+                    return false;
+                }
+
                 // Execute outside the driver lock (this calls start_turn, which is slow)
                 let result = executor.apply(run_id.clone(), primitive).await;
 

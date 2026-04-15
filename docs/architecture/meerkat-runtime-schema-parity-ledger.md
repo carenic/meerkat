@@ -87,6 +87,10 @@ Current state:
   either; `stop` now lives as a concrete driver realization helper while the
   machine/control-plane path remains the only layer that speaks the lifecycle
   noun
+- runtime-loop batch start preparation no longer realizes coarse run truth
+  inline; the checked-in machine module now owns the atomic
+  `start_run + stage_batch + unwind-on-failure` sequence through a dedicated
+  helper, while terminal return still remains the next separate tranche
 - attached steered `AcceptWithCompletion` is no longer treated as a queue-only
   self-loop in the formal model: when `request_immediate_processing=true`, the
   checked-in Meerkat machine now models the runtime’s `Attached -> Running`
