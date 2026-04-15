@@ -695,28 +695,10 @@ impl EphemeralRuntimeDriver {
         // for starting a run batch. Ingress applies only the already-decided
         // queue/lifecycle updates and emits the StageInput effects that drive
         // the per-input lifecycle authority and staged events.
-        match self.ingress.apply(RuntimeIngressInput::StageDrainSnapshot {
-            run_id: run_id.clone(),
-            contributing_work_ids: input_ids.to_vec(),
-        }) {
-            Ok(transition) => {
-                self.process_ingress_effects(&transition.effects);
-                self.rebuild_queue_projections();
-                self.debug_assert_queue_projection_alignment();
-            }
-            Err(err) => {
-                tracing::warn!(
-                    input_ids = ?input_ids,
-                    run_id = ?run_id,
-                    error = %err,
-                    "ingress authority rejected StageDrainSnapshot"
-                );
-                return Err(InputLifecycleError::InvalidTransition {
-                    from: InputLifecycleState::Queued,
-                    input: format!("StageDrainSnapshot rejected: {err}"),
-                });
-            }
-        }
+        let transition = self.ingress.stage_drain_snapshot(run_id, input_ids);
+        self.process_ingress_effects(&transition.effects);
+        self.rebuild_queue_projections();
+        self.debug_assert_queue_projection_alignment();
 
         Ok(())
     }
@@ -1115,18 +1097,8 @@ impl EphemeralRuntimeDriver {
         // The checked-in Meerkat machine already owns contributor-set legality
         // for completion. Ingress applies only the already-decided queue /
         // lifecycle updates for those contributors.
-        match self.ingress.apply(RuntimeIngressInput::RunCompleted {
-            contributing_work_ids: consumed_input_ids.clone(),
-        }) {
-            Ok(transition) => {
-                self.process_ingress_effects(&transition.effects);
-            }
-            Err(err) => {
-                return Err(RuntimeDriverError::Internal(format!(
-                    "ingress authority rejected RunCompleted for {run_id:?}: {err}"
-                )));
-            }
-        }
+        let transition = self.ingress.run_completed(&consumed_input_ids);
+        self.process_ingress_effects(&transition.effects);
 
         self.consume_inputs(&consumed_input_ids, &run_id)
             .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
@@ -1141,23 +1113,13 @@ impl EphemeralRuntimeDriver {
         _error: String,
         _recoverable: bool,
     ) -> Result<(), RuntimeDriverError> {
-        match self
-            .ingress
-            .apply(RuntimeIngressInput::ReplayQueuedContributors {
-                queue_work_ids: replay_plan.queue_work_ids,
-                steer_work_ids: replay_plan.steer_work_ids,
-                wake_runtime: replay_plan.wake_runtime,
-                notice_kind: replay_plan.notice_kind.to_string(),
-            }) {
-            Ok(transition) => {
-                self.process_ingress_effects(&transition.effects);
-            }
-            Err(err) => {
-                return Err(RuntimeDriverError::Internal(format!(
-                    "ingress authority rejected RunFailed for run {run_id:?}: {err}"
-                )));
-            }
-        }
+        let transition = self.ingress.replay_queued_contributors(
+            &replay_plan.queue_work_ids,
+            &replay_plan.steer_work_ids,
+            replay_plan.wake_runtime,
+            replay_plan.notice_kind,
+        );
+        self.process_ingress_effects(&transition.effects);
 
         self.rollback_staged(&contributing_input_ids)
             .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
@@ -1173,20 +1135,10 @@ impl EphemeralRuntimeDriver {
         // The checked-in Meerkat machine already owns contributor-set legality
         // for boundary application. Ingress applies only the already-decided
         // queue/lifecycle updates for those contributors.
-        match self.ingress.apply(RuntimeIngressInput::BoundaryApplied {
-            contributing_work_ids: receipt.contributing_input_ids.clone(),
-            boundary_sequence: receipt.sequence,
-        }) {
-            Ok(transition) => {
-                self.process_ingress_effects(&transition.effects);
-            }
-            Err(err) => {
-                return Err(RuntimeDriverError::Internal(format!(
-                    "ingress authority rejected BoundaryApplied for run {run_id:?} boundary {}: {err}",
-                    receipt.sequence
-                )));
-            }
-        }
+        let transition = self
+            .ingress
+            .boundary_applied(&receipt.contributing_input_ids, receipt.sequence);
+        self.process_ingress_effects(&transition.effects);
 
         for input_id in &receipt.contributing_input_ids {
             if let Some(state) = self.ledger.get_mut(input_id) {

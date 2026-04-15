@@ -320,6 +320,7 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | Driver-local run-start / run-return legality can stay below `MeerkatMachine` | rejected / landed | Moved active-run validation plus `current_run_id` / `pre_run_phase` writes/clears out of `EphemeralRuntimeDriver` and into the checked-in machine module. The driver now realizes ingress/ledger mechanics for `BoundaryApplied`, `RunCompleted`, and `RunFailed`, but it no longer decides whether a run may start or where it legally returns. |
 | Driver-local stop legality can stay below `MeerkatMachine` | rejected / landed | Moved stop legality into `MeerkatMachine`: the machine now owns the legal source phases and the `Stopped` projection, while driver stop paths are reduced to cleanup mechanics only. This removes another coarse lifecycle decision from `EphemeralRuntimeDriver` without introducing a new machine. |
 | Driver-local destroy legality can stay below `MeerkatMachine` | rejected / landed | Removed the coarse destroy legality check from `EphemeralRuntimeDriver`. The machine/control path already owns the legal source states, and the driver now only realizes the already-decided `Destroyed` cleanup mechanics. |
+| Ingress contributor staging / boundary / completion / replay should remain encoded as ingress-machine transitions | rejected / landed | Removed `StageDrainSnapshot`, `BoundaryApplied`, `RunCompleted`, and `ReplayQueuedContributors` from `RuntimeIngressInput` and replaced them with direct lower-level mutator methods on `RuntimeIngressAuthority`. The checked-in `MeerkatMachine` already owns contributor legality and replay classification, so ingress now applies only the already-decided queue/ledger mutations instead of pretending to own another transition surface. |
 | Driver-local retire/reset legality can stay below `MeerkatMachine` | rejected / landed | Removed the coarse `Retired` / `Idle` projection decisions from the driver. The machine/control path now owns the legal source phases plus the resulting coarse phase projection, while the driver only computes retire reports and reset cleanup mechanics. |
 | Meerkat pure queries should stay surfaced without formal transitions | passed / landed | Moved the read-only helper/query family into `surface_only_inputs`; runtime/schema audits stayed green and Meerkat TLC generated states dropped from 3,668,832 to 3,113,272 while the raw/phase quotients stayed at 385 / 390. |
 | Meerkat committed visibility publication progress should not stay as top-level shadow state | passed / landed | Removed `committed_visibility_revision` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 59,371 to 45,610 while the raw/phase quotients stayed at 385 / 390. |
@@ -417,11 +418,13 @@ That rerun also clarified the remaining architectural blockers. The stale
 `RuntimeControlAuthority` problem is gone, and `RuntimeIngressAuthority` no
 longer owns coarse lifecycle, batch selection, boundary classification, or a
 second derived active run identity. The remaining Meerkat edge is now narrower:
-ingress still applies contributor-state mutation plus dedup/terminal side
-effects below the checked-in machine boundary. On the Mob side, the forward
-route and `SubmitWork` origin legality are now checked in; what remains below
-the machine is delivery/lowering glue rather than an obvious missing
-machine/composition fact.
+ingress no longer models contributor staging, boundary application, run
+completion, or replay rollback as ingress-machine transitions. Those paths are
+now direct lower-level mutators driven by machine-owned legality, leaving only
+dedup, recovered-input seeding, and terminal reconciliation below the checked-in
+machine boundary. On the Mob side, the forward route and `SubmitWork` origin
+legality are now checked in; what remains below the machine is
+delivery/lowering glue rather than an obvious missing machine/composition fact.
 
 All six rows above have now been rerun after the exact runtime/schema parity
 passes on the current branch tip.

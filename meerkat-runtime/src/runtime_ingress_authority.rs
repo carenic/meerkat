@@ -80,29 +80,6 @@ pub enum RuntimeIngressInput {
         work_id: InputId,
         existing_id: InputId,
     },
-    /// Stage a drain snapshot: dequeue work and assign to a run.
-    StageDrainSnapshot {
-        run_id: RunId,
-        contributing_work_ids: Vec<InputId>,
-    },
-    /// Boundary applied: mark contributors as AppliedPendingConsumption.
-    BoundaryApplied {
-        contributing_work_ids: Vec<InputId>,
-        boundary_sequence: u64,
-    },
-    /// Run completed: consume all contributors.
-    RunCompleted { contributing_work_ids: Vec<InputId> },
-    /// Replay already-classified staged contributors back to their queue lanes.
-    ///
-    /// The checked-in Meerkat machine owns replay classification and wake
-    /// semantics; the ingress helper only applies the already-decided queue and
-    /// lifecycle mutations.
-    ReplayQueuedContributors {
-        queue_work_ids: Vec<InputId>,
-        steer_work_ids: Vec<InputId>,
-        wake_runtime: bool,
-        notice_kind: String,
-    },
     /// Supersede a queued input with a newer one.
     SupersedeQueuedInput {
         new_work_id: InputId,
@@ -389,6 +366,67 @@ impl RuntimeIngressAuthority {
         self.evaluate(input).is_ok()
     }
 
+    fn commit_effects(
+        &mut self,
+        next_fields: RuntimeIngressFields,
+        effects: Vec<RuntimeIngressEffect>,
+    ) -> RuntimeIngressTransition {
+        self.fields = next_fields;
+        RuntimeIngressTransition { effects }
+    }
+
+    /// Apply already-machine-classified contributor staging mechanics.
+    pub fn stage_drain_snapshot(
+        &mut self,
+        run_id: &RunId,
+        contributing_work_ids: &[InputId],
+    ) -> RuntimeIngressTransition {
+        let (next_fields, effects) = self
+            .eval_stage_drain_snapshot(run_id, contributing_work_ids)
+            .expect("stage drain snapshot is mechanical once machine legality is known");
+        self.commit_effects(next_fields, effects)
+    }
+
+    /// Apply already-machine-classified boundary-consumption mechanics.
+    pub fn boundary_applied(
+        &mut self,
+        contributing_work_ids: &[InputId],
+        boundary_sequence: u64,
+    ) -> RuntimeIngressTransition {
+        let (next_fields, effects) = self
+            .eval_boundary_applied(contributing_work_ids, boundary_sequence)
+            .expect("boundary application is mechanical once machine legality is known");
+        self.commit_effects(next_fields, effects)
+    }
+
+    /// Apply already-machine-classified run-completion mechanics.
+    pub fn run_completed(&mut self, contributing_work_ids: &[InputId]) -> RuntimeIngressTransition {
+        let (next_fields, effects) = self
+            .eval_run_completed(contributing_work_ids)
+            .expect("run completion is mechanical once machine legality is known");
+        self.commit_effects(next_fields, effects)
+    }
+
+    /// Replay contributors to the queue lanes chosen by the machine-owned
+    /// replay classifier.
+    pub fn replay_queued_contributors(
+        &mut self,
+        queue_work_ids: &[InputId],
+        steer_work_ids: &[InputId],
+        wake_runtime: bool,
+        notice_kind: &str,
+    ) -> RuntimeIngressTransition {
+        let (next_fields, effects) = self
+            .eval_replay_queued_contributors(
+                queue_work_ids,
+                steer_work_ids,
+                wake_runtime,
+                notice_kind,
+            )
+            .expect("replay queue routing is mechanical once machine legality is known");
+        self.commit_effects(next_fields, effects)
+    }
+
     /// Evaluate a transition without committing it.
     fn evaluate(
         &self,
@@ -437,31 +475,6 @@ impl RuntimeIngressAuthority {
                 work_id,
                 existing_id,
             } => self.eval_admit_deduplicated(work_id, existing_id),
-
-            RuntimeIngressInput::StageDrainSnapshot {
-                run_id,
-                contributing_work_ids,
-            } => self.eval_stage_drain_snapshot(run_id, contributing_work_ids),
-
-            RuntimeIngressInput::BoundaryApplied {
-                contributing_work_ids,
-                boundary_sequence,
-            } => self.eval_boundary_applied(contributing_work_ids, *boundary_sequence),
-
-            RuntimeIngressInput::RunCompleted {
-                contributing_work_ids,
-            } => self.eval_run_completed(contributing_work_ids),
-            RuntimeIngressInput::ReplayQueuedContributors {
-                queue_work_ids,
-                steer_work_ids,
-                wake_runtime,
-                notice_kind,
-            } => self.eval_replay_queued_contributors(
-                queue_work_ids,
-                steer_work_ids,
-                *wake_runtime,
-                notice_kind,
-            ),
 
             RuntimeIngressInput::SupersedeQueuedInput {
                 new_work_id,
@@ -1009,10 +1022,7 @@ impl RuntimeIngressMutator for RuntimeIngressAuthority {
         input: RuntimeIngressInput,
     ) -> Result<RuntimeIngressTransition, RuntimeIngressError> {
         let (next_fields, effects) = self.evaluate(&input)?;
-
-        self.fields = next_fields;
-
-        Ok(RuntimeIngressTransition { effects })
+        Ok(self.commit_effects(next_fields, effects))
     }
 }
 
@@ -1267,12 +1277,7 @@ mod tests {
         admit_queued(&mut auth, w2.clone(), HandlingMode::Queue);
 
         let run_id = RunId::new();
-        let t = auth
-            .apply(RuntimeIngressInput::StageDrainSnapshot {
-                run_id: run_id.clone(),
-                contributing_work_ids: vec![w1.clone(), w2.clone()],
-            })
-            .expect("stage should succeed");
+        let t = auth.stage_drain_snapshot(&run_id, &[w1.clone(), w2.clone()]);
 
         assert!(auth.queue().is_empty());
         assert!(has_current_run_for_test(&auth));
@@ -1298,20 +1303,12 @@ mod tests {
         admit_queued(&mut auth, w2.clone(), HandlingMode::Queue);
 
         // Stage w1
-        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
-            run_id: RunId::new(),
-            contributing_work_ids: vec![w1.clone()],
-        })
-        .unwrap();
+        auth.stage_drain_snapshot(&RunId::new(), &[w1.clone()]);
 
         // The helper no longer owns the "one active run at a time" rule; the
         // top-level Meerkat machine owns it. A second standalone stage call is
         // therefore legal here as pure queue bookkeeping.
-        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
-            run_id: RunId::new(),
-            contributing_work_ids: vec![w2],
-        })
-        .expect("standalone helper stage should succeed without control-phase context");
+        let _ = auth.stage_drain_snapshot(&RunId::new(), &[w2]);
     }
 
     #[test]
@@ -1322,11 +1319,7 @@ mod tests {
         admit_queued(&mut auth, w_queue.clone(), HandlingMode::Queue);
         admit_queued(&mut auth, w_steer.clone(), HandlingMode::Steer);
 
-        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
-            run_id: RunId::new(),
-            contributing_work_ids: vec![w_queue.clone()],
-        })
-        .expect("helper should apply already-machine-classified contributors");
+        let _ = auth.stage_drain_snapshot(&RunId::new(), &[w_queue.clone()]);
 
         assert_eq!(
             auth.lifecycle_state(&w_queue),
@@ -1349,18 +1342,9 @@ mod tests {
         admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
 
         let run_id = RunId::new();
-        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
-            run_id: run_id.clone(),
-            contributing_work_ids: vec![w1.clone()],
-        })
-        .unwrap();
+        auth.stage_drain_snapshot(&run_id, &[w1.clone()]);
 
-        let t = auth
-            .apply(RuntimeIngressInput::BoundaryApplied {
-                contributing_work_ids: vec![w1.clone()],
-                boundary_sequence: 42,
-            })
-            .expect("boundary applied should succeed");
+        let t = auth.boundary_applied(&[w1.clone()], 42);
 
         assert_eq!(
             auth.lifecycle_state(&w1),
@@ -1379,11 +1363,7 @@ mod tests {
         let w1 = InputId::new();
         admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
 
-        auth.apply(RuntimeIngressInput::BoundaryApplied {
-            contributing_work_ids: vec![w1.clone()],
-            boundary_sequence: 1,
-        })
-        .expect("helper should apply already-machine-classified contributors");
+        let _ = auth.boundary_applied(&[w1.clone()], 1);
         assert_eq!(
             auth.lifecycle_state(&w1),
             Some(InputLifecycleState::AppliedPendingConsumption)
@@ -1399,22 +1379,10 @@ mod tests {
         admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
 
         let run_id = RunId::new();
-        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
-            run_id: run_id.clone(),
-            contributing_work_ids: vec![w1.clone()],
-        })
-        .unwrap();
-        auth.apply(RuntimeIngressInput::BoundaryApplied {
-            contributing_work_ids: vec![w1.clone()],
-            boundary_sequence: 1,
-        })
-        .unwrap();
+        auth.stage_drain_snapshot(&run_id, &[w1.clone()]);
+        auth.boundary_applied(&[w1.clone()], 1);
 
-        let t = auth
-            .apply(RuntimeIngressInput::RunCompleted {
-                contributing_work_ids: vec![w1.clone()],
-            })
-            .expect("run completed should succeed");
+        let t = auth.run_completed(&[w1.clone()]);
 
         assert_eq!(
             auth.lifecycle_state(&w1),
@@ -1461,20 +1429,9 @@ mod tests {
         admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
 
         let run_id = RunId::new();
-        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
-            run_id: run_id.clone(),
-            contributing_work_ids: vec![w1.clone()],
-        })
-        .unwrap();
+        auth.stage_drain_snapshot(&run_id, &[w1.clone()]);
 
-        let transition = auth
-            .apply(RuntimeIngressInput::ReplayQueuedContributors {
-                queue_work_ids: vec![w1.clone()],
-                steer_work_ids: Vec::new(),
-                wake_runtime: true,
-                notice_kind: "RunFailed".into(),
-            })
-            .expect("run failed should succeed");
+        let transition = auth.replay_queued_contributors(&[w1.clone()], &[], true, "RunFailed");
 
         assert_eq!(auth.lifecycle_state(&w1), Some(InputLifecycleState::Queued));
         assert!(auth.queue().contains(&w1));
@@ -1494,18 +1451,8 @@ mod tests {
         admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
 
         let run_id = RunId::new();
-        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
-            run_id: run_id.clone(),
-            contributing_work_ids: vec![w1.clone()],
-        })
-        .unwrap();
-        auth.apply(RuntimeIngressInput::ReplayQueuedContributors {
-            queue_work_ids: vec![w1.clone()],
-            steer_work_ids: Vec::new(),
-            wake_runtime: true,
-            notice_kind: "RunFailed".into(),
-        })
-        .unwrap();
+        auth.stage_drain_snapshot(&run_id, &[w1.clone()]);
+        auth.replay_queued_contributors(&[w1.clone()], &[], true, "RunFailed");
 
         let transition = auth
             .apply(RuntimeIngressInput::ReconcileTerminalInputs {
@@ -1549,19 +1496,9 @@ mod tests {
         admit_queued(&mut auth, w1.clone(), HandlingMode::Queue);
 
         let run_id = RunId::new();
-        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
-            run_id: run_id.clone(),
-            contributing_work_ids: vec![w1.clone()],
-        })
-        .unwrap();
+        auth.stage_drain_snapshot(&run_id, &[w1.clone()]);
 
-        auth.apply(RuntimeIngressInput::ReplayQueuedContributors {
-            queue_work_ids: vec![w1.clone()],
-            steer_work_ids: Vec::new(),
-            wake_runtime: true,
-            notice_kind: "RunCancelled".into(),
-        })
-        .expect("run cancelled should succeed");
+        let _ = auth.replay_queued_contributors(&[w1.clone()], &[], true, "RunCancelled");
 
         assert_eq!(auth.lifecycle_state(&w1), Some(InputLifecycleState::Queued));
         assert!(auth.queue().contains(&w1));
@@ -1635,24 +1572,13 @@ mod tests {
 
         // Stage both
         let run_id = RunId::new();
-        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
-            run_id: run_id.clone(),
-            contributing_work_ids: vec![w1.clone(), w2.clone()],
-        })
-        .unwrap();
+        auth.stage_drain_snapshot(&run_id, &[w1.clone(), w2.clone()]);
 
         // Boundary applied
-        auth.apply(RuntimeIngressInput::BoundaryApplied {
-            contributing_work_ids: vec![w1.clone(), w2.clone()],
-            boundary_sequence: 1,
-        })
-        .unwrap();
+        auth.boundary_applied(&[w1.clone(), w2.clone()], 1);
 
         // Run completed
-        auth.apply(RuntimeIngressInput::RunCompleted {
-            contributing_work_ids: vec![w1.clone(), w2.clone()],
-        })
-        .unwrap();
+        auth.run_completed(&[w1.clone(), w2.clone()]);
 
         assert_eq!(
             auth.lifecycle_state(&w1),
@@ -1683,15 +1609,6 @@ mod tests {
         assert!(!has_current_run_for_test(&auth));
     }
 
-    #[test]
-    fn can_accept_stage_helper_no_longer_owns_prefix_legality() {
-        let auth = RuntimeIngressAuthority::new();
-        assert!(auth.can_accept(&RuntimeIngressInput::StageDrainSnapshot {
-            run_id: RunId::new(),
-            contributing_work_ids: vec![InputId::new()],
-        }));
-    }
-
     // ---- Mechanical contributor removal ----
 
     #[test]
@@ -1702,11 +1619,7 @@ mod tests {
         admit_queued(&mut auth, w_queue.clone(), HandlingMode::Queue);
         admit_queued(&mut auth, w_steer.clone(), HandlingMode::Steer);
 
-        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
-            run_id: RunId::new(),
-            contributing_work_ids: vec![w_queue.clone()],
-        })
-        .expect("helper should apply already-machine-classified contributors");
+        let _ = auth.stage_drain_snapshot(&RunId::new(), &[w_queue.clone()]);
         assert!(auth.queue().is_empty());
         assert_eq!(auth.steer_queue(), &[w_steer]);
         assert_eq!(
@@ -1724,19 +1637,9 @@ mod tests {
         admit_queued(&mut auth, w1.clone(), HandlingMode::Steer);
 
         let run_id = RunId::new();
-        auth.apply(RuntimeIngressInput::StageDrainSnapshot {
-            run_id: run_id.clone(),
-            contributing_work_ids: vec![w1.clone()],
-        })
-        .unwrap();
+        auth.stage_drain_snapshot(&run_id, &[w1.clone()]);
 
-        auth.apply(RuntimeIngressInput::ReplayQueuedContributors {
-            queue_work_ids: Vec::new(),
-            steer_work_ids: vec![w1.clone()],
-            wake_runtime: true,
-            notice_kind: "RunFailed".into(),
-        })
-        .unwrap();
+        let _ = auth.replay_queued_contributors(&[], &[w1.clone()], true, "RunFailed");
 
         // Should be back in steer_queue, not queue
         assert!(auth.steer_queue().contains(&w1));

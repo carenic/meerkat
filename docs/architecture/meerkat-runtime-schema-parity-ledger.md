@@ -602,11 +602,13 @@ Outcome:
 5. Read that baseline together with the now-green Mob lifecycle-triangle
    ledger in
    [`docs/architecture/mob-runtime-schema-parity-ledger.md`](mob-runtime-schema-parity-ledger.md).
-6. The remaining Meerkat edge is now narrow and mostly mechanical:
-   `RuntimeIngressAuthority` still applies contributor-state mutation and
-   terminal/dedup side effects below the checked-in machine boundary, even
-   though the coarse lifecycle, batch selection, boundary classification, run
-   identity, and contributor legality have all been lifted out.
+6. The remaining Meerkat edge is now narrower and mostly admission/terminal
+   mechanics. `RuntimeIngressAuthority` no longer treats contributor staging,
+   boundary application, run completion, or replay rollback as ingress-machine
+   inputs; those paths are now direct lower-level mutators driven by
+   machine-owned legality. The remaining helper-owned surface is dedup,
+   recovered-input seeding, and terminal reconciliation below the checked-in
+   machine boundary.
 7. The next remaining formal seam question after that is Mob-side rather than
    composition-side: the forward Mob -> Meerkat route now carries opaque
    `work_id` plus `origin`, but `MobMachine` still treats `SubmitWork` as one
