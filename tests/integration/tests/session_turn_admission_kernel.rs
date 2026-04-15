@@ -81,19 +81,17 @@ fn session_turn_admission_kernel_attached_state_reached() {
 }
 
 #[test]
-fn session_turn_admission_kernel_interrupt_rejected_without_active_work() {
+fn session_turn_admission_kernel_interrupt_allowed_while_attached() {
     let state = prepared_meerkat_state();
-    assert!(
-        meerkat::transition(&state, &input("InterruptCurrentRun")).is_err(),
-        "attached sessions without active work must reject interrupts"
-    );
+    let next = meerkat::transition(&state, &input("InterruptCurrentRun"))
+        .expect("attached sessions should accept interrupts as a self-loop");
+    assert_eq!(next.next_state.phase, "Attached");
 }
 
 #[test]
-fn session_turn_admission_kernel_cancel_boundary_rejected_without_active_work() {
+fn session_turn_admission_kernel_cancel_boundary_allowed_while_attached() {
     let state = prepared_meerkat_state();
-    assert!(
-        meerkat::transition(&state, &input("CancelAfterBoundary")).is_err(),
-        "attached sessions without active work must reject cancel-after-boundary"
-    );
+    let next = meerkat::transition(&state, &input("CancelAfterBoundary"))
+        .expect("attached sessions should accept cancel-after-boundary as a self-loop");
+    assert_eq!(next.next_state.phase, "Attached");
 }
