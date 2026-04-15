@@ -106,6 +106,10 @@ Current state:
   already owns the legal source states and binding guardrails for destroy, and
   the driver now only realizes the already-decided `Destroyed` cleanup
   mechanics
+- coarse retire/reset legality no longer lives in the driver either: the
+  checked-in machine now owns the legal source phases plus the resulting
+  `Retired` / `Idle` projections, while the driver only computes retire
+  reports and reset cleanup mechanics
 - attached steered `AcceptWithCompletion` is no longer treated as a queue-only
   self-loop in the formal model: when `request_immediate_processing=true`, the
   checked-in Meerkat machine now models the runtime’s `Attached -> Running`

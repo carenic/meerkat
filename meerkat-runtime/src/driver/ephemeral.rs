@@ -777,59 +777,25 @@ impl EphemeralRuntimeDriver {
         Ok(())
     }
 
-    pub fn retire(&mut self) -> Result<RetireReport, RuntimeDriverError> {
-        let next_phase = match self.phase {
-            RuntimeState::Idle | RuntimeState::Attached | RuntimeState::Running => {
-                RuntimeState::Retired
-            }
-            from => {
-                return Err(RuntimeDriverError::Internal(
-                    crate::runtime_state::RuntimeStateTransitionError {
-                        from,
-                        to: RuntimeState::Retired,
-                    }
-                    .to_string(),
-                ));
-            }
-        };
-        self.transition_phase(next_phase);
+    pub(crate) fn finalize_retire(&mut self) -> RetireReport {
         let inputs_pending_drain = self.ledger.iter().filter(|(_, s)| !s.is_terminal()).count();
-        Ok(RetireReport {
+        RetireReport {
             inputs_abandoned: 0,
             inputs_pending_drain,
-        })
+        }
     }
 
-    pub fn reset(&mut self) -> Result<ResetReport, RuntimeDriverError> {
+    pub(crate) fn reset_cleanup(&mut self) -> ResetReport {
         let abandoned = self.abandon_all_non_terminal(InputAbandonReason::Reset);
         self.queue.drain();
         self.steer_queue.drain();
         self.post_admission_signal = PostAdmissionSignal::None;
         self.silent_comms_intents.clear();
-        match self.phase {
-            RuntimeState::Initializing
-            | RuntimeState::Idle
-            | RuntimeState::Attached
-            | RuntimeState::Retired => {
-                self.current_run_id = None;
-                self.pre_run_phase = None;
-                self.transition_phase(RuntimeState::Idle);
-            }
-            from => {
-                return Err(RuntimeDriverError::Internal(
-                    crate::runtime_state::RuntimeStateTransitionError {
-                        from,
-                        to: RuntimeState::Idle,
-                    }
-                    .to_string(),
-                ));
-            }
-        }
         self.rebuild_queue_projections();
         self.debug_assert_queue_projection_alignment();
-        Ok(ResetReport {
+        ResetReport {
             inputs_abandoned: abandoned,
-        })
+        }
     }
 
     pub(crate) fn destroy_cleanup(&mut self) -> usize {

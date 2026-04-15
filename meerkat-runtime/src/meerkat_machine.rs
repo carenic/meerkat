@@ -336,17 +336,17 @@ impl DriverEntry {
         }
     }
 
-    pub(crate) async fn retire(&mut self) -> Result<RetireReport, RuntimeDriverError> {
+    pub(crate) async fn finalize_retire(&mut self) -> Result<RetireReport, RuntimeDriverError> {
         match self {
-            DriverEntry::Ephemeral(d) => d.retire(),
-            DriverEntry::Persistent(d) => d.retire().await,
+            DriverEntry::Ephemeral(d) => Ok(d.finalize_retire()),
+            DriverEntry::Persistent(d) => d.finalize_retire().await,
         }
     }
 
-    pub(crate) async fn reset(&mut self) -> Result<ResetReport, RuntimeDriverError> {
+    pub(crate) async fn finalize_reset(&mut self) -> Result<ResetReport, RuntimeDriverError> {
         match self {
-            DriverEntry::Ephemeral(d) => d.reset(),
-            DriverEntry::Persistent(d) => d.reset().await,
+            DriverEntry::Ephemeral(d) => Ok(d.reset_cleanup()),
+            DriverEntry::Persistent(d) => d.finalize_reset().await,
         }
     }
 
@@ -445,6 +445,47 @@ async fn machine_stop_runtime(driver: &mut DriverEntry) -> Result<(), RuntimeDri
     }
 
     driver.finalize_stop_runtime().await
+}
+
+async fn machine_retire(driver: &mut DriverEntry) -> Result<RetireReport, RuntimeDriverError> {
+    match driver.runtime_state() {
+        RuntimeState::Idle | RuntimeState::Attached | RuntimeState::Running => {}
+        from => {
+            return Err(RuntimeDriverError::Internal(
+                RuntimeStateTransitionError {
+                    from,
+                    to: RuntimeState::Retired,
+                }
+                .to_string(),
+            ));
+        }
+    }
+
+    let current_run_id = driver.current_run_id().cloned();
+    let pre_run_phase = driver.pre_run_phase();
+    driver.set_control_projection(RuntimeState::Retired, current_run_id, pre_run_phase);
+    driver.finalize_retire().await
+}
+
+async fn machine_reset(driver: &mut DriverEntry) -> Result<ResetReport, RuntimeDriverError> {
+    match driver.runtime_state() {
+        RuntimeState::Initializing
+        | RuntimeState::Idle
+        | RuntimeState::Attached
+        | RuntimeState::Retired => {}
+        from => {
+            return Err(RuntimeDriverError::Internal(
+                RuntimeStateTransitionError {
+                    from,
+                    to: RuntimeState::Idle,
+                }
+                .to_string(),
+            ));
+        }
+    }
+
+    driver.set_control_projection(RuntimeState::Idle, None, None);
+    driver.finalize_reset().await
 }
 
 pub(crate) async fn prepare_runtime_loop_batch_start(
@@ -1624,8 +1665,7 @@ impl MeerkatMachine {
                 }
 
                 let mut drv = driver.lock().await;
-                let mut report = drv
-                    .retire()
+                let mut report = machine_retire(&mut drv)
                     .await
                     .map_err(|e| RuntimeControlPlaneError::Internal(e.to_string()))?;
                 drop(drv);
@@ -1714,8 +1754,7 @@ impl MeerkatMachine {
                 }
 
                 let mut drv = driver.lock().await;
-                let report = drv
-                    .reset()
+                let report = machine_reset(&mut drv)
                     .await
                     .map_err(|e| RuntimeControlPlaneError::Internal(e.to_string()))?;
                 drop(drv);

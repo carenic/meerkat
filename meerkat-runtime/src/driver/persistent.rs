@@ -247,9 +247,11 @@ impl PersistentRuntimeDriver {
         Ok(self.inner.active_input_ids().len())
     }
 
-    pub async fn retire(&mut self) -> Result<crate::traits::RetireReport, RuntimeDriverError> {
+    pub async fn finalize_retire(
+        &mut self,
+    ) -> Result<crate::traits::RetireReport, RuntimeDriverError> {
         let checkpoint = self.inner.clone();
-        let report = EphemeralRuntimeDriver::retire(&mut self.inner)?;
+        let report = self.inner.finalize_retire();
         let input_states = self.inner.input_states_snapshot();
         if let Err(err) = self
             .store
@@ -268,9 +270,11 @@ impl PersistentRuntimeDriver {
         Ok(report)
     }
 
-    pub async fn reset(&mut self) -> Result<crate::traits::ResetReport, RuntimeDriverError> {
+    pub async fn finalize_reset(
+        &mut self,
+    ) -> Result<crate::traits::ResetReport, RuntimeDriverError> {
         let checkpoint = self.inner.clone();
-        let report = EphemeralRuntimeDriver::reset(&mut self.inner)?;
+        let report = self.inner.reset_cleanup();
         let input_states = self.inner.input_states_snapshot();
         if let Err(err) = self
             .store
