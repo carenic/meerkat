@@ -7,8 +7,6 @@
 //! - S24 ephemeral recovery
 //! - S25 retire/reset/destroy lifecycle operations
 
-use std::collections::BTreeSet;
-
 use meerkat_core::lifecycle::{InputId, RunEvent, RunId};
 use meerkat_core::types::HandlingMode;
 
@@ -156,27 +154,7 @@ impl EphemeralRuntimeDriver {
         if self.phase == RuntimeState::Stopped {
             return;
         }
-        let overrides = intents.into_iter().collect::<BTreeSet<_>>();
-        match self
-            .ingress
-            .apply(RuntimeIngressInput::SetSilentIntentOverrides { intents: overrides })
-        {
-            Ok(transition) => {
-                self.process_ingress_effects(&transition.effects);
-                self.silent_comms_intents = self
-                    .ingress
-                    .silent_intent_overrides()
-                    .iter()
-                    .cloned()
-                    .collect();
-            }
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "ingress authority rejected SetSilentIntentOverrides"
-                );
-            }
-        }
+        self.silent_comms_intents = intents;
     }
 
     pub fn silent_comms_intents(&self) -> Vec<String> {
@@ -335,13 +313,6 @@ impl EphemeralRuntimeDriver {
                         kind = %kind,
                         detail = %detail,
                         "ingress authority: notice"
-                    );
-                }
-                RuntimeIngressEffect::SilentIntentApplied { work_id, intent } => {
-                    tracing::debug!(
-                        work_id = ?work_id,
-                        intent = %intent,
-                        "ingress authority: silent intent applied"
                     );
                 }
                 RuntimeIngressEffect::StageInput { work_id, run_id } => {
@@ -951,6 +922,7 @@ impl EphemeralRuntimeDriver {
         self.queue.drain();
         self.steer_queue.drain();
         self.post_admission_signal = PostAdmissionSignal::None;
+        self.silent_comms_intents.clear();
         match self.phase {
             RuntimeState::Initializing
             | RuntimeState::Idle
@@ -1013,6 +985,7 @@ impl EphemeralRuntimeDriver {
             }
         }
         let abandoned = self.abandon_all_non_terminal(InputAbandonReason::Destroyed);
+        self.silent_comms_intents.clear();
         self.rebuild_queue_projections();
         self.debug_assert_queue_projection_alignment();
         Ok(abandoned)
@@ -1525,6 +1498,7 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
                     }
                 }
                 self.abandon_all_non_terminal(InputAbandonReason::Stopped);
+                self.silent_comms_intents.clear();
                 self.queue.drain();
                 self.steer_queue.drain();
             }

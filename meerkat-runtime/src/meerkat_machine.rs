@@ -110,6 +110,13 @@ impl DriverEntry {
         }
     }
 
+    pub(crate) fn silent_comms_intents(&self) -> Vec<String> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.silent_comms_intents(),
+            DriverEntry::Persistent(d) => d.silent_comms_intents(),
+        }
+    }
+
     /// Check if the runtime is idle or attached (quiescent with or without executor).
     pub(crate) fn is_idle_or_attached(&self) -> bool {
         match self {
@@ -3319,7 +3326,7 @@ impl MeerkatMachine {
             current_run_id: ingress.current_run().cloned(),
             current_run_contributors: ingress.current_run_contributors().to_vec(),
             post_admission_signal: format!("{:?}", driver.post_admission_signal()),
-            silent_intent_overrides: ingress.silent_intent_overrides().iter().cloned().collect(),
+            silent_intent_overrides: driver.silent_comms_intents().into_iter().collect(),
         };
         let ledger = {
             let mut snapshot = MeerkatLedgerSnapshot {
@@ -3404,10 +3411,9 @@ impl MeerkatMachine {
             available_fields.insert(
                 "silent_intent_overrides".into(),
                 formal_projection_value(
-                    &ingress
-                        .silent_intent_overrides()
-                        .iter()
-                        .cloned()
+                    &driver
+                        .silent_comms_intents()
+                        .into_iter()
                         .collect::<BTreeSet<_>>(),
                 ),
             );

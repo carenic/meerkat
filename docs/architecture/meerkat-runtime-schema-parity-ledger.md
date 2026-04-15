@@ -90,8 +90,10 @@ Current state:
   `post_admission_signal`
 - Meerkat now formally owns `silent_intent_overrides` as checked-in ingress
   state instead of leaving it below the machine boundary; exact audited parity
-  stayed green after lifting it, and the targeted runtime/model regression for
-  `SetSilentIntents` is green
+  stayed green after lifting it, the targeted runtime/model regression for
+  `SetSilentIntents` is green, and the remaining helper-side mirror is now
+  gone too: reset / stop / destroy clear the driver-owned set directly and the
+  diagnostic/formal projection no longer reads it from `RuntimeIngressAuthority`
 - live recycle no longer detours through a handwritten control-side
   recovery hop: the runtime helper now realizes recycle as the same direct
   control projection the checked-in Meerkat machine already models
@@ -179,6 +181,9 @@ Current exact-parity state:
   tracked-input membership is derived directly from the canonical per-input
   lifecycle map, and exact Meerkat parity stayed green after removing that
   duplicate ledger index
+- the ingress helper also no longer owns `silent_intent_overrides`; that
+  canonical set now lives only on the driver/machine side, and exact Meerkat
+  parity stayed green after removing the helper mirror
 - the pure query surface remains runtime-audited helper behavior, but it is no
   longer counted as formal transition coverage
 - the next remaining dogma violation is no longer coarse control truth in a

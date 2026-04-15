@@ -5,7 +5,7 @@
 //! ingress lifecycle. Meerkat phase is the only coarse lifecycle truth; this
 //! helper exists only for lower-level ledger and queue mechanics.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use meerkat_core::lifecycle::run_primitive::RunApplyBoundary;
 use meerkat_core::lifecycle::{InputId, RunId};
@@ -129,8 +129,6 @@ pub enum RuntimeIngressInput {
     ReconcileTerminalInputs {
         terminal_inputs: Vec<(InputId, InputTerminalOutcome)>,
     },
-    /// Configure silent intent overrides.
-    SetSilentIntentOverrides { intents: BTreeSet<String> },
 }
 
 // ---------------------------------------------------------------------------
@@ -173,9 +171,6 @@ pub enum RuntimeIngressEffect {
     },
     /// Informational ingress notice.
     IngressNotice { kind: String, detail: String },
-    /// A silent intent override was applied.
-    SilentIntentApplied { work_id: InputId, intent: String },
-
     // --- Accept-phase shell directives ---
     // These effects tell the shell exactly what to do with the Input payload
     // and ledger after admission, removing all policy branching from shell code.
@@ -275,7 +270,6 @@ struct RuntimeIngressFields {
     current_run_contributors: Vec<InputId>,
     last_run: HashMap<InputId, Option<RunId>>,
     last_boundary_sequence: HashMap<InputId, Option<u64>>,
-    silent_intent_overrides: BTreeSet<String>,
 }
 
 impl RuntimeIngressFields {
@@ -295,7 +289,6 @@ impl RuntimeIngressFields {
             current_run_contributors: Vec::new(),
             last_run: HashMap::new(),
             last_boundary_sequence: HashMap::new(),
-            silent_intent_overrides: BTreeSet::new(),
         }
     }
 }
@@ -413,11 +406,6 @@ impl RuntimeIngressAuthority {
     /// Reservation key for a specific work ID.
     pub fn reservation_key(&self, work_id: &InputId) -> Option<ReservationKey> {
         self.fields.reservation_key.get(work_id).cloned().flatten()
-    }
-
-    /// Silent intent overrides.
-    pub fn silent_intent_overrides(&self) -> &BTreeSet<String> {
-        &self.fields.silent_intent_overrides
     }
 
     /// Last run ID for a specific work ID.
@@ -645,10 +633,6 @@ impl RuntimeIngressAuthority {
             RuntimeIngressInput::Recover => self.eval_recover(),
             RuntimeIngressInput::ReconcileTerminalInputs { terminal_inputs } => {
                 self.eval_reconcile_terminal_inputs(terminal_inputs)
-            }
-
-            RuntimeIngressInput::SetSilentIntentOverrides { intents } => {
-                self.eval_set_silent_intent_overrides(intents)
             }
         }
     }
@@ -1321,8 +1305,6 @@ impl RuntimeIngressAuthority {
         fields.queue.clear();
         fields.steer_queue.clear();
         fields.current_run_contributors = Vec::new();
-        fields.silent_intent_overrides.clear();
-
         effects.push(RuntimeIngressEffect::IngressNotice {
             kind: "Reset".into(),
             detail: "IngressReset".into(),
@@ -1369,8 +1351,6 @@ impl RuntimeIngressAuthority {
         fields.queue.clear();
         fields.steer_queue.clear();
         fields.current_run_contributors = Vec::new();
-        fields.silent_intent_overrides.clear();
-
         effects.push(RuntimeIngressEffect::IngressNotice {
             kind: "Destroy".into(),
             detail: "IngressDestroyed".into(),
@@ -1416,8 +1396,6 @@ impl RuntimeIngressAuthority {
         fields.queue.clear();
         fields.steer_queue.clear();
         fields.current_run_contributors = Vec::new();
-        fields.silent_intent_overrides.clear();
-
         effects.push(RuntimeIngressEffect::IngressNotice {
             kind: "Stop".into(),
             detail: "IngressStopped".into(),
@@ -1638,21 +1616,6 @@ impl RuntimeIngressAuthority {
                 outcome: outcome.clone(),
             });
         }
-
-        Ok((fields, effects))
-    }
-
-    fn eval_set_silent_intent_overrides(
-        &self,
-        intents: &BTreeSet<String>,
-    ) -> Result<(RuntimeIngressFields, Vec<RuntimeIngressEffect>), RuntimeIngressError> {
-        let mut fields = self.fields.clone();
-        fields.silent_intent_overrides = intents.clone();
-
-        let effects = vec![RuntimeIngressEffect::IngressNotice {
-            kind: "SetSilentIntentOverrides".into(),
-            detail: format!("{} intents configured", intents.len()),
-        }];
 
         Ok((fields, effects))
     }
@@ -2422,68 +2385,15 @@ mod tests {
         )));
     }
 
-    // ---- SetSilentIntentOverrides ----
-
     #[test]
-    fn set_silent_intent_overrides() {
+    fn stop_marks_abandoned_inputs_stopped() {
         let mut auth = RuntimeIngressAuthority::new();
-        let intents: BTreeSet<String> =
-            ["intent_a".into(), "intent_b".into()].into_iter().collect();
-        auth.apply(RuntimeIngressInput::SetSilentIntentOverrides {
-            intents: intents.clone(),
-        })
-        .expect("set overrides should succeed");
-
-        assert_eq!(auth.silent_intent_overrides(), &intents);
-    }
-
-    #[test]
-    fn reset_clears_silent_intent_overrides() {
-        let mut auth = RuntimeIngressAuthority::new();
-        let intents: BTreeSet<String> =
-            ["intent_a".into(), "intent_b".into()].into_iter().collect();
-        auth.apply(RuntimeIngressInput::SetSilentIntentOverrides {
-            intents: intents.clone(),
-        })
-        .expect("set overrides should succeed");
-        auth.apply(RuntimeIngressInput::Reset)
-            .expect("reset should succeed");
-
-        assert!(auth.silent_intent_overrides().is_empty());
-    }
-
-    #[test]
-    fn destroy_clears_silent_intent_overrides() {
-        let mut auth = RuntimeIngressAuthority::new();
-        let intents: BTreeSet<String> =
-            ["intent_a".into(), "intent_b".into()].into_iter().collect();
-        auth.apply(RuntimeIngressInput::SetSilentIntentOverrides {
-            intents: intents.clone(),
-        })
-        .expect("set overrides should succeed");
-        auth.apply(RuntimeIngressInput::Destroy)
-            .expect("destroy should succeed");
-
-        assert!(auth.silent_intent_overrides().is_empty());
-    }
-
-    #[test]
-    fn stop_clears_silent_intent_overrides_and_marks_abandoned_inputs_stopped() {
-        let mut auth = RuntimeIngressAuthority::new();
-        let intents: BTreeSet<String> =
-            ["intent_a".into(), "intent_b".into()].into_iter().collect();
-        auth.apply(RuntimeIngressInput::SetSilentIntentOverrides {
-            intents: intents.clone(),
-        })
-        .expect("set overrides should succeed");
-
         let wid = InputId::new();
         admit_queued(&mut auth, wid.clone(), HandlingMode::Queue);
 
         auth.apply(RuntimeIngressInput::Stop)
             .expect("stop should succeed");
 
-        assert!(auth.silent_intent_overrides().is_empty());
         assert!(matches!(
             auth.terminal_outcome(&wid),
             Some(InputTerminalOutcome::Abandoned {
