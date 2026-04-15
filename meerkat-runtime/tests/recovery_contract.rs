@@ -132,6 +132,21 @@ fn sorted_id_strings(ids: impl IntoIterator<Item = InputId>) -> Vec<String> {
     ids
 }
 
+fn bind_running(driver: &mut EphemeralRuntimeDriver, run_id: RunId, pre_run_phase: RuntimeState) {
+    driver.contract_set_control_projection(
+        RuntimeState::Running,
+        Some(run_id),
+        Some(pre_run_phase),
+    );
+}
+
+async fn retire_runtime(
+    driver: &mut PersistentRuntimeDriver,
+) -> Result<meerkat_runtime::RetireReport, meerkat_runtime::RuntimeDriverError> {
+    driver.contract_set_control_projection(RuntimeState::Retired, None, None);
+    driver.contract_finalize_retire().await
+}
+
 #[tokio::test]
 #[ignore = "Phase 0 external boundary contract"]
 async fn recovery_store_contract_commits_authoritative_receipts_across_supported_backends() {
@@ -334,7 +349,7 @@ async fn recovery_persistent_driver_contract_replays_missing_receipts_and_persis
             harness.name
         );
 
-        let retire_report = driver.retire().await.unwrap();
+        let retire_report = retire_runtime(&mut driver).await.unwrap();
         assert_eq!(
             retire_report.inputs_pending_drain, 2,
             "{}: retire should preserve the replayable contributors for later drain",
@@ -510,7 +525,7 @@ async fn recovery_ephemeral_driver_contract_keeps_applied_boundary_inputs_out_of
     );
 
     let run_id = RunId::new();
-    driver.start_run(run_id.clone()).unwrap();
+    bind_running(&mut driver, run_id.clone(), RuntimeState::Idle);
     driver.stage_input(&first_id, &run_id).unwrap();
     driver.stage_input(&second_id, &run_id).unwrap();
     driver

@@ -18,6 +18,14 @@ fn runtime_id() -> LogicalRuntimeId {
     LogicalRuntimeId::new("peer-handling-mode-contract")
 }
 
+fn bind_running(driver: &mut EphemeralRuntimeDriver) {
+    driver.contract_set_control_projection(
+        meerkat_runtime::RuntimeState::Running,
+        Some(RunId::new()),
+        Some(meerkat_runtime::RuntimeState::Idle),
+    );
+}
+
 fn peer_message_input(handling_mode: Option<HandlingMode>) -> Input {
     Input::Peer(PeerInput {
         header: InputHeader {
@@ -43,7 +51,7 @@ fn peer_message_input(handling_mode: Option<HandlingMode>) -> Input {
 #[tokio::test]
 async fn running_queue_peer_message_interrupts_yielding() {
     let mut driver = EphemeralRuntimeDriver::new(runtime_id());
-    driver.start_run(RunId::new()).expect("start run");
+    bind_running(&mut driver);
 
     let input = peer_message_input(None);
     let policy = DefaultPolicyTable::resolve(&input, false);
@@ -66,7 +74,7 @@ async fn running_queue_peer_message_interrupts_yielding() {
 #[tokio::test]
 async fn running_steer_peer_message_requests_immediate_processing() {
     let mut driver = EphemeralRuntimeDriver::new(runtime_id());
-    driver.start_run(RunId::new()).expect("start run");
+    bind_running(&mut driver);
 
     let input = peer_message_input(Some(HandlingMode::Steer));
     let policy = DefaultPolicyTable::resolve(&input, false);

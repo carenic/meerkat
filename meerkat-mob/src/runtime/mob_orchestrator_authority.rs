@@ -483,6 +483,8 @@ impl MobOrchestratorAuthority {
             // All other combinations are illegal.
             _ => {
                 let target = match input {
+                    #[cfg(test)]
+                    MobOrchestratorInput::InitializeOrchestrator => Running,
                     BindCoordinator | ResumeOrchestrator | StageSpawn | CompleteSpawn
                     | StartFlow | CompleteFlow | ForceCancelMember => Running,
                     UnbindCoordinator | StopOrchestrator => Stopped,
@@ -533,23 +535,16 @@ mod tests {
     }
 
     fn make_running_authority() -> MobOrchestratorAuthority {
-        let mut auth = make_authority();
-        auth.apply(MobOrchestratorInput::InitializeOrchestrator)
-            .expect("init");
-        auth
+        MobOrchestratorAuthority::new_running(Arc::new(AtomicU8::new(0)))
     }
 
     #[test]
-    fn initialize_transitions_to_running_and_activates_supervisor() {
+    fn initialize_from_creating_is_rejected() {
         let mut auth = make_authority();
-        let t = auth
-            .apply(MobOrchestratorInput::InitializeOrchestrator)
-            .expect("init should succeed from Creating");
-        assert_eq!(t.next_phase, MobState::Running);
-        assert!(t.snapshot.supervisor_active);
+        let result = auth.apply(MobOrchestratorInput::InitializeOrchestrator);
         assert!(
-            t.effects
-                .contains(&MobOrchestratorEffect::ActivateSupervisor)
+            result.is_err(),
+            "initialize should be rejected from Creating"
         );
     }
 
@@ -827,11 +822,20 @@ mod tests {
     #[test]
     fn observable_cache_updated_on_transition() {
         let observable = Arc::new(AtomicU8::new(0));
-        let mut auth = MobOrchestratorAuthority::new(observable.clone());
-        assert_eq!(observable.load(Ordering::Acquire), MobState::Creating as u8);
-        auth.apply(MobOrchestratorInput::InitializeOrchestrator)
-            .expect("init");
+        let mut auth = MobOrchestratorAuthority::new_running(observable.clone());
         assert_eq!(observable.load(Ordering::Acquire), MobState::Running as u8);
+        auth.apply(MobOrchestratorInput::StopOrchestrator)
+            .expect("stop");
+        assert_eq!(observable.load(Ordering::Acquire), MobState::Stopped as u8);
+    }
+
+    #[test]
+    fn running_constructor_initializes_observable_cache() {
+        let observable = Arc::new(AtomicU8::new(0));
+        let auth = MobOrchestratorAuthority::new_running(observable.clone());
+        assert_eq!(auth.phase(), MobState::Running);
+        assert_eq!(observable.load(Ordering::Acquire), MobState::Running as u8);
+        assert!(auth.snapshot().supervisor_active);
     }
 
     #[test]
@@ -851,11 +855,8 @@ mod tests {
     }
 
     #[test]
-    fn full_lifecycle_creating_to_destroyed() {
-        let mut auth = make_authority();
-        // Creating -> Running
-        auth.apply(MobOrchestratorInput::InitializeOrchestrator)
-            .expect("init");
+    fn full_lifecycle_running_to_destroyed() {
+        let mut auth = make_running_authority();
         // Bind coordinator
         auth.apply(MobOrchestratorInput::BindCoordinator)
             .expect("bind");

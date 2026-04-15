@@ -46,6 +46,7 @@ pub fn mob_machine() -> MachineSchema {
                 ),
                 field("active_member_count", TypeRef::U32),
                 field("active_run_count", TypeRef::U32),
+                field("cleanup_pending", TypeRef::Bool),
                 field("pending_spawn_count", TypeRef::U32),
                 field("wiring_edge_count", TypeRef::U32),
                 field("coordinator_bound", TypeRef::Bool),
@@ -58,6 +59,7 @@ pub fn mob_machine() -> MachineSchema {
                     init("runtime_fence_tokens", Expr::EmptyMap),
                     init("active_member_count", Expr::U64(0)),
                     init("active_run_count", Expr::U64(0)),
+                    init("cleanup_pending", Expr::Bool(false)),
                     init("pending_spawn_count", Expr::U64(0)),
                     init("wiring_edge_count", Expr::U64(0)),
                     init("coordinator_bound", Expr::Bool(true)),
@@ -1055,7 +1057,7 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
         "Stopped",
         "BeginCleanup",
         vec![],
-        vec![],
+        vec![set_bool("cleanup_pending", true)],
         vec![simple_emit("EmitRunLifecycleNotice")],
     ));
     transitions.push(TransitionSchema {
@@ -1067,7 +1069,7 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
             bindings: vec![],
         },
         guards: vec![],
-        updates: vec![],
+        updates: vec![set_bool("cleanup_pending", true)],
         to: "Stopped".into(),
         emit: vec![simple_emit("EmitRunLifecycleNotice")],
     });
@@ -1079,7 +1081,7 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
         "Stopped",
         "FinishCleanup",
         vec![],
-        vec![],
+        vec![set_bool("cleanup_pending", false)],
         vec![simple_emit("EmitRunLifecycleNotice")],
     ));
     transitions.push(TransitionSchema {
@@ -1091,7 +1093,7 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
             bindings: vec![],
         },
         guards: vec![],
-        updates: vec![],
+        updates: vec![set_bool("cleanup_pending", false)],
         to: "Stopped".into(),
         emit: vec![simple_emit("EmitRunLifecycleNotice")],
     });
@@ -1596,6 +1598,7 @@ fn destroy_mob_projection_updates() -> Vec<Update> {
             field: "active_run_count".into(),
             expr: Expr::U64(0),
         },
+        set_bool("cleanup_pending", false),
         Update::Assign {
             field: "pending_spawn_count".into(),
             expr: Expr::U64(0),

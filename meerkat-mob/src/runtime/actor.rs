@@ -1430,6 +1430,10 @@ impl MobActor {
                         super::mob_orchestrator_authority::MobOrchestratorAuthority::snapshot,
                     ));
                 }
+                #[cfg(test)]
+                MobCommand::LifecycleSnapshot { reply_tx } => {
+                    let _ = reply_tx.send(self.lifecycle_authority.snapshot());
+                }
                 MobCommand::Stop { reply_tx } => {
                     let result = match self.expect_state(&[MobState::Running], MobState::Stopped) {
                         Ok(()) => {

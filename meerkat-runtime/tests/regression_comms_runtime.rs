@@ -36,6 +36,14 @@ fn assert_machine_owned_admission_signal(
     );
 }
 
+fn bind_running(driver: &mut EphemeralRuntimeDriver) {
+    driver.contract_set_control_projection(
+        RuntimeState::Running,
+        Some(meerkat_core::lifecycle::RunId::new()),
+        Some(RuntimeState::Idle),
+    );
+}
+
 fn iid() -> InteractionId {
     InteractionId(Uuid::now_v7())
 }
@@ -259,9 +267,8 @@ async fn response_after_completed_turn_wakes() {
     let mut driver = EphemeralRuntimeDriver::new(rid());
 
     // Simulate a completed run by starting and completing
-    let run_id = meerkat_core::lifecycle::RunId::new();
-    driver.start_run(run_id.clone()).unwrap();
-    driver.complete_run().unwrap();
+    bind_running(&mut driver);
+    driver.contract_set_control_projection(RuntimeState::Idle, None, None);
 
     // Now idle — accept a terminal response
     let resp = make_response("peer-1", ResponseStatus::Completed);
@@ -468,9 +475,7 @@ async fn message_while_running_requests_cooperative_interrupt() {
     let mut driver = EphemeralRuntimeDriver::new(rid());
 
     // Start a run
-    driver
-        .start_run(meerkat_core::lifecycle::RunId::new())
-        .unwrap();
+    bind_running(&mut driver);
 
     let interaction = make_message("peer-1", "hello");
     let input = interaction_to_peer_input(&interaction, &rid());
@@ -502,9 +507,7 @@ async fn message_while_running_requests_cooperative_interrupt() {
 async fn terminal_response_while_running_no_wake() {
     let mut driver = EphemeralRuntimeDriver::new(rid());
 
-    driver
-        .start_run(meerkat_core::lifecycle::RunId::new())
-        .unwrap();
+    bind_running(&mut driver);
 
     let interaction = make_response("peer-1", ResponseStatus::Completed);
     let input = interaction_to_peer_input(&interaction, &rid());
@@ -602,9 +605,7 @@ async fn terminal_response_with_steer_policy_while_running() {
 
     // Verify driver behavior while running.
     let mut driver = EphemeralRuntimeDriver::new(rid());
-    driver
-        .start_run(meerkat_core::lifecycle::RunId::new())
-        .unwrap();
+    bind_running(&mut driver);
     let outcome = driver.accept_input(input).await.unwrap();
     assert!(outcome.is_accepted());
     assert_machine_owned_admission_signal(

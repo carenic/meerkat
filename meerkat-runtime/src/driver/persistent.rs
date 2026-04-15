@@ -104,6 +104,20 @@ impl PersistentRuntimeDriver {
             .set_control_projection(next_phase, current_run_id, pre_run_phase);
     }
 
+    /// Low-level control projection shim for external contract tests.
+    ///
+    /// This does not decide lifecycle legality; it only applies an already
+    /// chosen MeerkatMachine control projection to the concrete driver shell.
+    #[doc(hidden)]
+    pub fn contract_set_control_projection(
+        &mut self,
+        next_phase: RuntimeState,
+        current_run_id: Option<RunId>,
+        pre_run_phase: Option<RuntimeState>,
+    ) {
+        self.set_control_projection(next_phase, current_run_id, pre_run_phase);
+    }
+
     /// Get pending events (delegates to inner).
     pub fn drain_events(&mut self) -> Vec<RuntimeEventEnvelope> {
         self.inner.drain_events()
@@ -280,6 +294,16 @@ impl PersistentRuntimeDriver {
         Ok(report)
     }
 
+    /// Low-level retire realization shim for external contract tests.
+    ///
+    /// Callers are responsible for setting the control projection first.
+    #[doc(hidden)]
+    pub async fn contract_finalize_retire(
+        &mut self,
+    ) -> Result<crate::traits::RetireReport, RuntimeDriverError> {
+        self.finalize_retire().await
+    }
+
     pub async fn finalize_reset(
         &mut self,
     ) -> Result<crate::traits::ResetReport, RuntimeDriverError> {
@@ -303,6 +327,16 @@ impl PersistentRuntimeDriver {
         Ok(report)
     }
 
+    /// Low-level reset realization shim for external contract tests.
+    ///
+    /// Callers are responsible for setting the post-reset control projection.
+    #[doc(hidden)]
+    pub async fn contract_finalize_reset(
+        &mut self,
+    ) -> Result<crate::traits::ResetReport, RuntimeDriverError> {
+        self.finalize_reset().await
+    }
+
     pub async fn destroy(&mut self) -> Result<DestroyReport, RuntimeDriverError> {
         let abandoned = self.inner.destroy_cleanup();
         let input_states = self.inner.input_states_snapshot();
@@ -324,6 +358,14 @@ impl PersistentRuntimeDriver {
         })
     }
 
+    /// Low-level destroy realization shim for external contract tests.
+    ///
+    /// Callers are responsible for setting the destroyed control projection.
+    #[doc(hidden)]
+    pub async fn contract_destroy(&mut self) -> Result<DestroyReport, RuntimeDriverError> {
+        self.destroy().await
+    }
+
     pub async fn finalize_stop_runtime(&mut self) -> Result<(), RuntimeDriverError> {
         let checkpoint = self.inner.clone();
         self.inner.stop_runtime_cleanup();
@@ -343,6 +385,14 @@ impl PersistentRuntimeDriver {
             )));
         }
         Ok(())
+    }
+
+    /// Low-level stop realization shim for external contract tests.
+    ///
+    /// Callers are responsible for setting the stopped control projection.
+    #[doc(hidden)]
+    pub async fn contract_finalize_stop_runtime(&mut self) -> Result<(), RuntimeDriverError> {
+        self.finalize_stop_runtime().await
     }
 
     pub async fn boundary_applied(

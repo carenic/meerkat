@@ -610,7 +610,6 @@ fn every_mutating_meerkat_runtime_command_has_transition_coverage() {
         "Retire",
         "Recycle",
         "Reset",
-        "Recover",
         "Destroy",
         "AcceptWithCompletion",
         "AcceptWithoutWake",
@@ -623,6 +622,14 @@ fn every_mutating_meerkat_runtime_command_has_transition_coverage() {
             "MeerkatMachine should model mutating runtime command {required} with at least one transition",
         );
     }
+
+    assert!(
+        schema
+            .surface_only_inputs
+            .iter()
+            .any(|name| name == "Recover"),
+        "Recover should remain surfaced even though recovery mutates only lower-authority ledger/runtime-driver state today",
+    );
 }
 
 #[test]

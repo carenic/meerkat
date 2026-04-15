@@ -191,7 +191,7 @@ impl DriverEntry {
         }
     }
 
-    pub(crate) fn current_run_id(&self) -> Option<&RunId> {
+    pub(crate) fn current_run_id(&self) -> Option<RunId> {
         match self {
             DriverEntry::Ephemeral(d) => d.current_run_id(),
             DriverEntry::Persistent(d) => d.inner_ref().current_run_id(),
@@ -218,6 +218,15 @@ impl DriverEntry {
             DriverEntry::Persistent(d) => {
                 d.set_control_projection(next_phase, current_run_id, pre_run_phase)
             }
+        }
+    }
+
+    pub(crate) fn control_projection_handle(
+        &self,
+    ) -> Arc<std::sync::RwLock<crate::driver::ephemeral::RuntimeControlProjection>> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.control_handle(),
+            DriverEntry::Persistent(d) => d.inner_ref().control_handle(),
         }
     }
 
@@ -382,7 +391,7 @@ fn machine_validate_active_run(
     }
 
     match driver.current_run_id() {
-        Some(active_id) if active_id == run_id => Ok(()),
+        Some(active_id) if &active_id == run_id => Ok(()),
         _ => Err(RuntimeStateTransitionError {
             from: driver.runtime_state(),
             to: next_phase,
@@ -641,7 +650,7 @@ async fn machine_retire(driver: &mut DriverEntry) -> Result<RetireReport, Runtim
         }
     }
 
-    let current_run_id = driver.current_run_id().cloned();
+    let current_run_id = driver.current_run_id();
     let pre_run_phase = driver.pre_run_phase();
     driver.set_control_projection(RuntimeState::Retired, current_run_id, pre_run_phase);
     driver.finalize_retire().await
@@ -3754,16 +3763,15 @@ impl MeerkatMachine {
             },
         };
 
+        let control_projection = driver
+            .control_projection_handle()
+            .read()
+            .expect("runtime control projection lock poisoned")
+            .clone();
         let control = MeerkatControlSnapshot {
-            phase: driver.runtime_state(),
-            current_run_id: match &*driver {
-                DriverEntry::Ephemeral(d) => d.current_run_id().cloned(),
-                DriverEntry::Persistent(d) => d.inner_ref().current_run_id().cloned(),
-            },
-            pre_run_phase: match &*driver {
-                DriverEntry::Ephemeral(d) => d.pre_run_phase(),
-                DriverEntry::Persistent(d) => d.inner_ref().pre_run_phase(),
-            },
+            phase: control_projection.phase,
+            current_run_id: control_projection.current_run_id,
+            pre_run_phase: control_projection.pre_run_phase,
         };
 
         let admission_order: Vec<MeerkatAdmittedInputSnapshot> = ingress

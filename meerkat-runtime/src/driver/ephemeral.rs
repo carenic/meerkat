@@ -7,6 +7,8 @@
 //! - S24 ephemeral recovery
 //! - S25 retire/reset/destroy lifecycle operations
 
+use std::sync::{Arc, RwLock as StdRwLock};
+
 use meerkat_core::lifecycle::{InputId, RunBoundaryReceipt, RunId};
 use meerkat_core::types::HandlingMode;
 
@@ -70,6 +72,25 @@ impl PostAdmissionSignal {
     }
 }
 
+/// Shared coarse runtime control projection owned by the checked-in
+/// `MeerkatMachine` and borrowed by concrete driver shells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeControlProjection {
+    pub(crate) phase: RuntimeState,
+    pub(crate) current_run_id: Option<RunId>,
+    pub(crate) pre_run_phase: Option<RuntimeState>,
+}
+
+impl Default for RuntimeControlProjection {
+    fn default() -> Self {
+        Self {
+            phase: RuntimeState::Idle,
+            current_run_id: None,
+            pre_run_phase: None,
+        }
+    }
+}
+
 /// Derive the handling mode from a policy decision's routing disposition.
 pub(crate) fn handling_mode_from_policy(policy: &crate::policy::PolicyDecision) -> HandlingMode {
     match policy.routing_disposition {
@@ -91,16 +112,11 @@ pub(crate) fn requests_immediate_processing(input: &Input) -> bool {
 #[derive(Clone)]
 pub struct EphemeralRuntimeDriver {
     runtime_id: LogicalRuntimeId,
-    /// Canonical coarse runtime phase owned by the checked-in MeerkatMachine.
-    phase: RuntimeState,
-    /// Active run identity, if a run is currently bound.
-    current_run_id: Option<RunId>,
-    /// The coarse machine phase a run returns to when it terminates.
+    /// Shared coarse runtime projection owned by the machine/session entry.
     ///
-    /// This is intentionally stored as the real `RuntimeState` projection
-    /// (`Idle`, `Attached`, or `Retired`) rather than a helper-local shadow
-    /// enum so the driver does not invent a parallel return-phase vocabulary.
-    pre_run_phase: Option<RuntimeState>,
+    /// The concrete driver may read and realize this state, but it is not the
+    /// semantic owner of the lifecycle tuple.
+    control: Arc<StdRwLock<RuntimeControlProjection>>,
     ledger: InputLedger,
     queue: InputQueue,
     steer_queue: InputQueue,
@@ -119,11 +135,19 @@ pub struct EphemeralRuntimeDriver {
 
 impl EphemeralRuntimeDriver {
     pub fn new(runtime_id: LogicalRuntimeId) -> Self {
+        Self::new_with_control(
+            runtime_id,
+            Arc::new(StdRwLock::new(RuntimeControlProjection::default())),
+        )
+    }
+
+    pub(crate) fn new_with_control(
+        runtime_id: LogicalRuntimeId,
+        control: Arc<StdRwLock<RuntimeControlProjection>>,
+    ) -> Self {
         Self {
             runtime_id,
-            phase: RuntimeState::Idle,
-            current_run_id: None,
-            pre_run_phase: None,
+            control,
             ledger: InputLedger::new(),
             queue: InputQueue::new(),
             steer_queue: InputQueue::new(),
@@ -134,8 +158,19 @@ impl EphemeralRuntimeDriver {
         }
     }
 
+    pub(crate) fn control_handle(&self) -> Arc<StdRwLock<RuntimeControlProjection>> {
+        self.control.clone()
+    }
+
+    fn control_snapshot(&self) -> RuntimeControlProjection {
+        self.control
+            .read()
+            .expect("runtime control projection lock poisoned")
+            .clone()
+    }
+
     pub fn set_silent_comms_intents(&mut self, intents: Vec<String>) {
-        if self.phase == RuntimeState::Stopped {
+        if self.control_snapshot().phase == RuntimeState::Stopped {
             return;
         }
         self.silent_comms_intents = intents;
@@ -399,31 +434,49 @@ impl EphemeralRuntimeDriver {
     }
 
     pub fn is_idle(&self) -> bool {
-        self.phase == RuntimeState::Idle
+        self.control_snapshot().phase == RuntimeState::Idle
     }
     pub fn is_idle_or_attached(&self) -> bool {
-        self.phase.is_idle_or_attached()
+        self.control_snapshot().phase.is_idle_or_attached()
     }
 
     pub fn phase(&self) -> RuntimeState {
-        self.phase
+        self.control_snapshot().phase
     }
 
-    pub fn current_run_id(&self) -> Option<&RunId> {
-        self.current_run_id.as_ref()
+    pub fn current_run_id(&self) -> Option<RunId> {
+        self.control_snapshot().current_run_id
     }
 
     pub fn pre_run_phase(&self) -> Option<RuntimeState> {
-        self.pre_run_phase
+        self.control_snapshot().pre_run_phase
     }
 
     pub fn can_process_queue(&self) -> bool {
-        self.phase.can_process_queue()
+        self.control_snapshot().phase.can_process_queue()
+    }
+
+    /// Low-level control projection shim for external contract tests.
+    ///
+    /// This does not decide lifecycle legality; it only applies an already
+    /// chosen MeerkatMachine control projection to the concrete driver shell.
+    #[doc(hidden)]
+    pub fn contract_set_control_projection(
+        &mut self,
+        next_phase: RuntimeState,
+        current_run_id: Option<RunId>,
+        pre_run_phase: Option<RuntimeState>,
+    ) {
+        self.set_control_projection(next_phase, current_run_id, pre_run_phase);
     }
 
     fn set_phase(&mut self, next_phase: RuntimeState) -> RuntimeState {
-        let from_phase = self.phase;
-        self.phase = next_phase;
+        let mut control = self
+            .control
+            .write()
+            .expect("runtime control projection lock poisoned");
+        let from_phase = control.phase;
+        control.phase = next_phase;
         from_phase
     }
 
@@ -441,13 +494,20 @@ impl EphemeralRuntimeDriver {
         current_run_id: Option<RunId>,
         pre_run_phase: Option<RuntimeState>,
     ) {
-        if self.phase != next_phase {
+        if self.control_snapshot().phase != next_phase {
             self.transition_phase(next_phase);
         } else {
-            self.phase = next_phase;
+            self.control
+                .write()
+                .expect("runtime control projection lock poisoned")
+                .phase = next_phase;
         }
-        self.current_run_id = current_run_id;
-        self.pre_run_phase = pre_run_phase;
+        let mut control = self
+            .control
+            .write()
+            .expect("runtime control projection lock poisoned");
+        control.current_run_id = current_run_id;
+        control.pre_run_phase = pre_run_phase;
     }
     /// Drain and return the accumulated post-admission signal.
     ///
@@ -765,6 +825,14 @@ impl EphemeralRuntimeDriver {
         }
     }
 
+    /// Low-level retire realization shim for external contract tests.
+    ///
+    /// Callers are responsible for setting the control projection first.
+    #[doc(hidden)]
+    pub fn contract_finalize_retire(&mut self) -> RetireReport {
+        self.finalize_retire()
+    }
+
     pub(crate) fn reset_cleanup(&mut self) -> ResetReport {
         let abandoned = self.abandon_all_non_terminal(InputAbandonReason::Reset);
         self.queue.drain();
@@ -778,12 +846,28 @@ impl EphemeralRuntimeDriver {
         }
     }
 
+    /// Low-level reset realization shim for external contract tests.
+    ///
+    /// Callers are responsible for setting the post-reset control projection.
+    #[doc(hidden)]
+    pub fn contract_reset_cleanup(&mut self) -> ResetReport {
+        self.reset_cleanup()
+    }
+
     pub(crate) fn destroy_cleanup(&mut self) -> usize {
         let abandoned = self.abandon_all_non_terminal(InputAbandonReason::Destroyed);
         self.silent_comms_intents.clear();
         self.rebuild_queue_projections();
         self.debug_assert_queue_projection_alignment();
         abandoned
+    }
+
+    /// Low-level destroy realization shim for external contract tests.
+    ///
+    /// Callers are responsible for setting the destroyed control projection.
+    #[doc(hidden)]
+    pub fn contract_destroy_cleanup(&mut self) -> usize {
+        self.destroy_cleanup()
     }
 
     pub(crate) fn stop_runtime_cleanup(&mut self) {
@@ -795,6 +879,14 @@ impl EphemeralRuntimeDriver {
 
     pub(crate) fn finalize_stop_runtime(&mut self) {
         self.stop_runtime_cleanup();
+    }
+
+    /// Low-level stop realization shim for external contract tests.
+    ///
+    /// Callers are responsible for setting the stopped control projection.
+    #[doc(hidden)]
+    pub fn contract_finalize_stop_runtime(&mut self) {
+        self.finalize_stop_runtime();
     }
 
     pub fn recover_ephemeral(&mut self) -> RecoveryReport {
@@ -917,17 +1009,12 @@ impl EphemeralRuntimeDriver {
         let silent_comms_intents = self.silent_comms_intents.clone();
         let ledger = self.ledger.clone();
         let ingress = self.ingress.clone();
-        let phase = self.phase;
-        let current_run_id = self.current_run_id.clone();
-        let pre_run_phase = self.pre_run_phase;
+        let control = self.control.clone();
 
-        *self = Self::new(runtime_id);
+        *self = Self::new_with_control(runtime_id, control);
         self.silent_comms_intents = silent_comms_intents;
         self.ledger = ledger;
         self.ingress = ingress;
-        self.phase = phase;
-        self.current_run_id = current_run_id;
-        self.pre_run_phase = pre_run_phase;
 
         let _ = self.recover_ephemeral();
         self.rebuild_queue_projections();
@@ -1182,7 +1269,7 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
         } else {
             self.ledger.accept(state.clone());
         }
-        let runtime_idle = self.phase.is_idle_or_attached();
+        let runtime_idle = self.runtime_state().is_idle_or_attached();
         let mut policy = DefaultPolicyTable::resolve(&input, runtime_idle);
         crate::silent_intent::apply_silent_intent_override(
             &input,
@@ -1261,7 +1348,7 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
         Ok(self.recover_ephemeral())
     }
     fn runtime_state(&self) -> RuntimeState {
-        self.phase
+        self.control_snapshot().phase
     }
     fn input_state(&self, input_id: &InputId) -> Option<&InputState> {
         self.ledger.get(input_id)

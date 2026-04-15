@@ -91,6 +91,25 @@ pub(crate) struct MobLifecycleTransition {
     pub effects: Vec<MobLifecycleEffect>,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MobLifecycleSnapshot {
+    pub phase: MobState,
+    pub active_run_count: u32,
+    pub cleanup_pending: bool,
+}
+
+#[cfg(test)]
+impl Default for MobLifecycleSnapshot {
+    fn default() -> Self {
+        Self {
+            phase: MobState::Running,
+            active_run_count: 0,
+            cleanup_pending: false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Canonical machine state (fields)
 // ---------------------------------------------------------------------------
@@ -165,6 +184,15 @@ impl MobLifecycleAuthority {
     /// Current phase (read from canonical state).
     pub(crate) fn phase(&self) -> MobState {
         self.phase
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> MobLifecycleSnapshot {
+        MobLifecycleSnapshot {
+            phase: self.phase,
+            active_run_count: self.fields.active_run_count,
+            cleanup_pending: self.fields.cleanup_pending,
+        }
     }
 
     /// Current active_run_count from canonical state.
@@ -334,12 +362,11 @@ mod tests {
     }
 
     #[test]
-    fn start_from_creating_transitions_to_running() {
+    fn start_from_creating_is_rejected() {
         let mut auth = make_authority(MobState::Creating);
         let result = auth.apply(MobLifecycleInput::Start);
-        let transition = result.expect("start from creating should succeed");
-        assert_eq!(transition.next_phase, MobState::Running);
-        assert_eq!(auth.phase(), MobState::Running);
+        assert!(result.is_err());
+        assert_eq!(auth.phase(), MobState::Creating);
     }
 
     #[test]
@@ -466,8 +493,8 @@ mod tests {
     #[test]
     fn observable_cache_is_updated_on_transition() {
         let observable = Arc::new(AtomicU8::new(0));
-        let mut auth = MobLifecycleAuthority::with_phase(observable.clone(), MobState::Creating);
-        assert_eq!(observable.load(Ordering::Acquire), MobState::Creating as u8);
+        let mut auth = MobLifecycleAuthority::with_phase(observable.clone(), MobState::Stopped);
+        assert_eq!(observable.load(Ordering::Acquire), MobState::Stopped as u8);
         auth.apply(MobLifecycleInput::Start).expect("start");
         assert_eq!(observable.load(Ordering::Acquire), MobState::Running as u8);
     }
@@ -485,7 +512,7 @@ mod tests {
     fn require_phase_accepts_allowed() {
         let auth = make_authority(MobState::Running);
         assert!(
-            auth.require_phase(&[MobState::Running, MobState::Creating], MobState::Running)
+            auth.require_phase(&[MobState::Running, MobState::Stopped], MobState::Running)
                 .is_ok()
         );
     }
@@ -508,12 +535,7 @@ mod tests {
 
     #[test]
     fn destroy_from_all_valid_phases() {
-        for phase in [
-            MobState::Creating,
-            MobState::Running,
-            MobState::Stopped,
-            MobState::Completed,
-        ] {
+        for phase in [MobState::Running, MobState::Stopped, MobState::Completed] {
             let mut auth = make_authority(phase);
             let t = auth
                 .apply(MobLifecycleInput::Destroy)
@@ -530,7 +552,7 @@ mod tests {
 
     #[test]
     fn stop_from_non_running_is_rejected() {
-        for phase in [MobState::Creating, MobState::Completed, MobState::Destroyed] {
+        for phase in [MobState::Completed, MobState::Destroyed] {
             let mut auth = make_authority(phase);
             assert!(
                 auth.apply(MobLifecycleInput::Stop).is_err(),
