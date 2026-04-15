@@ -8,7 +8,8 @@
 //! - InputState lifecycle tracking
 //! - Policy resolution (what to do with each input)
 //! - Runtime state machine (Idle ↔ Attached ↔ Running ↔ Retired/Stopped/Destroyed,
-//!   with compatibility-facing `Recovering` still present in `RuntimeState`)
+//!   with compatibility-facing `Recovering` still present in `RuntimeState`
+//!   for restored historical state, but not entered on normal live paths)
 //! - Retire/recycle/reset lifecycle operations
 //! - RuntimeEvent observability
 //!

@@ -1,6 +1,8 @@
 //! §22 RuntimeState — the runtime's public state projection.
 //!
-//! Canonical transition legality lives in `RuntimeControlAuthority`.
+//! Canonical live transition legality lives in `RuntimeControlAuthority`.
+//! `Recovering` remains a compatibility-facing public projection for restored
+//! historical state, but normal runtime control paths no longer enter it.
 
 use serde::{Deserialize, Serialize};
 
@@ -12,20 +14,10 @@ fn can_transition(from: &RuntimeState, next: &RuntimeState) -> bool {
 
     matches!(
         (from, next),
-        (Initializing, Idle | Stopped | Destroyed)
-            | (
-                Idle,
-                Attached | Running | Retired | Recovering | Stopped | Destroyed
-            )
-            | (
-                Attached,
-                Running | Idle | Retired | Recovering | Stopped | Destroyed
-            )
-            | (
-                Running,
-                Idle | Attached | Recovering | Retired | Stopped | Destroyed
-            )
-            | (Recovering, Idle | Attached | Running | Stopped | Destroyed)
+        (Initializing | Recovering, Idle | Stopped | Destroyed)
+            | (Idle, Attached | Running | Retired | Stopped | Destroyed)
+            | (Attached, Running | Idle | Retired | Stopped | Destroyed)
+            | (Running, Idle | Attached | Retired | Stopped | Destroyed)
             | (Retired, Running | Stopped | Destroyed)
             | (Stopped, Destroyed)
     )
@@ -44,7 +36,7 @@ pub enum RuntimeState {
     Attached,
     /// A run is in progress.
     Running,
-    /// Recovering from a crash or error.
+    /// Compatibility-facing recovering projection for restored historical state.
     Recovering,
     /// Retired — no longer accepting new input, draining existing.
     Retired,

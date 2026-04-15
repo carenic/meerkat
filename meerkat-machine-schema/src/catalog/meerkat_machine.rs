@@ -27,9 +27,9 @@ pub fn meerkat_machine() -> MachineSchema {
                     variant("Idle"),
                     variant("Attached"),
                     variant("Running"),
-                    // Recovering remains an internal RuntimeControlAuthority
-                    // phase, but the top-level MeerkatMachine never transitions
-                    // into it directly.
+                    // Recovering remains a compatibility-facing public
+                    // RuntimeState, but the top-level MeerkatMachine does not
+                    // transition into it directly.
                     variant("Retired"),
                     variant("Stopped"),
                     variant("Destroyed"),

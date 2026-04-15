@@ -11,6 +11,11 @@
 //! `post_admission_signal`. The old handwritten admission/wake branch here had
 //! become dead code, so this helper is intentionally narrower than the legacy
 //! transition table it replaced.
+//!
+//! Likewise, this helper no longer models a handwritten recovery workflow.
+//! `Recovering` remains a compatibility-facing public `RuntimeState`, but the
+//! live recover path is realized through the ingress/driver boundary rather
+//! than through `RecoverRequested` / `RecoverySucceeded` transitions here.
 
 use meerkat_core::lifecycle::RunId;
 
@@ -33,8 +38,6 @@ pub enum RuntimeControlInput {
     RunCompleted { run_id: RunId },
     RunFailed { run_id: RunId },
     RunCancelled { run_id: RunId },
-    RecoverRequested,
-    RecoverySucceeded,
     RetireRequested,
     ResetRequested,
     StopRequested,
@@ -205,8 +208,8 @@ impl RuntimeControlAuthority {
     > {
         use RuntimeControlInput::{
             AttachExecutor, BeginRun, DestroyRequested, DetachExecutor, ExternalToolDeltaReceived,
-            Initialize, RecoverRequested, RecoverySucceeded, RecycleRequested, ResetRequested,
-            ResumeRequested, RetireRequested, RunCancelled, RunCompleted, RunFailed, StopRequested,
+            Initialize, RecycleRequested, ResetRequested, ResumeRequested, RetireRequested,
+            RunCancelled, RunCompleted, RunFailed, StopRequested,
         };
         use RuntimeState::{
             Attached, Destroyed, Idle, Initializing, Recovering, Retired, Running, Stopped,
@@ -274,22 +277,6 @@ impl RuntimeControlAuthority {
                 Running
             }
 
-            // BeginRun from Recovering (recovery-then-run path)
-            (Recovering, BeginRun { run_id }) => {
-                if fields.current_run_id.is_some() {
-                    return Err(RuntimeStateTransitionError {
-                        from: phase,
-                        to: Running,
-                    });
-                }
-                fields.current_run_id = Some(run_id.clone());
-                fields.pre_run_state = Some(Recovering);
-                effects.push(RuntimeControlEffect::SubmitRunPrimitive {
-                    run_id: run_id.clone(),
-                });
-                Running
-            }
-
             // RunCompleted from Running — split by pre_run_state
             (Running, RunCompleted { run_id }) => {
                 self.validate_run_terminal(run_id, &fields)?;
@@ -336,30 +323,6 @@ impl RuntimeControlAuthority {
                 fields.current_run_id = None;
                 fields.pre_run_state = None;
                 Retired
-            }
-
-            // RecoverRequested from Idle
-            (Idle, RecoverRequested) => {
-                fields.pre_run_state = Some(Idle);
-                Recovering
-            }
-            // RecoverRequested from Running
-            (Running, RecoverRequested) => {
-                fields.current_run_id = None;
-                fields.pre_run_state = Some(Running);
-                Recovering
-            }
-            // RecoverRequested from Attached
-            (Attached, RecoverRequested) => {
-                fields.pre_run_state = Some(Attached);
-                Recovering
-            }
-
-            // RecoverySucceeded from Recovering
-            (Recovering, RecoverySucceeded) => {
-                fields.current_run_id = None;
-                fields.pre_run_state = None;
-                Idle
             }
 
             // RetireRequested from Idle/Running/Attached
@@ -424,7 +387,7 @@ impl RuntimeControlAuthority {
                 Destroyed
             }
 
-            // ResumeRequested from Recovering
+            // ResumeRequested from explicit compatibility Recovering state
             (Recovering, ResumeRequested) => Idle,
 
             // ExternalToolDeltaReceived — stays in same phase
@@ -534,8 +497,8 @@ impl RuntimeControlAuthority {
     fn infer_target(&self, input: &RuntimeControlInput) -> RuntimeState {
         use RuntimeControlInput::{
             AttachExecutor, BeginRun, DestroyRequested, DetachExecutor, ExternalToolDeltaReceived,
-            Initialize, RecoverRequested, RecoverySucceeded, RecycleRequested, ResetRequested,
-            ResumeRequested, RetireRequested, RunCancelled, RunCompleted, RunFailed, StopRequested,
+            Initialize, RecycleRequested, ResetRequested, ResumeRequested, RetireRequested,
+            RunCancelled, RunCompleted, RunFailed, StopRequested,
         };
         match input {
             Initialize => RuntimeState::Idle,
@@ -546,12 +509,11 @@ impl RuntimeControlAuthority {
                 self.resolve_run_return(&self.fields)
             }
             ExternalToolDeltaReceived => self.phase,
-            RecoverRequested => RuntimeState::Recovering,
             RecycleRequested => match self.phase {
                 RuntimeState::Attached => RuntimeState::Attached,
                 _ => RuntimeState::Idle,
             },
-            RecoverySucceeded | ResumeRequested | ResetRequested => RuntimeState::Idle,
+            ResumeRequested | ResetRequested => RuntimeState::Idle,
             RetireRequested => RuntimeState::Retired,
             StopRequested => RuntimeState::Stopped,
             DestroyRequested => RuntimeState::Destroyed,
@@ -874,45 +836,6 @@ mod tests {
         assert_eq!(t.next_phase, RuntimeState::Attached);
     }
 
-    // --- RecoverRequested ---
-
-    #[test]
-    fn recover_from_idle() {
-        let mut auth = make_idle();
-        let t = auth.apply(RuntimeControlInput::RecoverRequested).unwrap();
-        assert_eq!(t.next_phase, RuntimeState::Recovering);
-        assert_eq!(auth.pre_run_state(), Some(RuntimeState::Idle));
-    }
-
-    #[test]
-    fn recover_from_running_clears_run_id() {
-        let (mut auth, _) = make_running_from_idle();
-        let t = auth.apply(RuntimeControlInput::RecoverRequested).unwrap();
-        assert_eq!(t.next_phase, RuntimeState::Recovering);
-        assert!(auth.current_run_id().is_none());
-        assert_eq!(auth.pre_run_state(), Some(RuntimeState::Running));
-    }
-
-    #[test]
-    fn recover_from_attached() {
-        let mut auth = make_attached();
-        let t = auth.apply(RuntimeControlInput::RecoverRequested).unwrap();
-        assert_eq!(t.next_phase, RuntimeState::Recovering);
-        assert_eq!(auth.pre_run_state(), Some(RuntimeState::Attached));
-    }
-
-    // --- RecoverySucceeded ---
-
-    #[test]
-    fn recovery_succeeded_resets_to_idle() {
-        let mut auth = make_idle();
-        auth.apply(RuntimeControlInput::RecoverRequested).unwrap();
-        let t = auth.apply(RuntimeControlInput::RecoverySucceeded).unwrap();
-        assert_eq!(t.next_phase, RuntimeState::Idle);
-        assert!(auth.current_run_id().is_none());
-        assert!(auth.pre_run_state().is_none());
-    }
-
     // --- RetireRequested ---
 
     #[test]
@@ -1022,9 +945,8 @@ mod tests {
     // --- ResumeRequested ---
 
     #[test]
-    fn resume_from_recovering() {
-        let mut auth = make_idle();
-        auth.apply(RuntimeControlInput::RecoverRequested).unwrap();
+    fn resume_from_explicit_recovering() {
+        let mut auth = RuntimeControlAuthority::from_state(RuntimeState::Recovering);
         let t = auth.apply(RuntimeControlInput::ResumeRequested).unwrap();
         assert_eq!(t.next_phase, RuntimeState::Idle);
     }

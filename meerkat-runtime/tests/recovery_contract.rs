@@ -522,12 +522,6 @@ async fn recovery_ephemeral_driver_contract_keeps_applied_boundary_inputs_out_of
         .await
         .unwrap();
 
-    use meerkat_runtime::{RuntimeControlInput, RuntimeControlMutator};
-    driver
-        .control_mut()
-        .apply(RuntimeControlInput::RecoverRequested)
-        .unwrap();
-
     let report = driver.recover().await.unwrap();
     assert_eq!(
         report.inputs_recovered, 2,

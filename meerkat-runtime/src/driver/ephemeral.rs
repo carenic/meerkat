@@ -1366,6 +1366,9 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
                 self.steer_queue.drain();
             }
             RuntimeControlCommand::Resume => {
+                // `Recovering` is now a compatibility-facing public state, not a
+                // live helper workflow. Resume remains a benign compatibility
+                // escape hatch for explicitly restored `Recovering`.
                 match self.control.apply(RuntimeControlInput::ResumeRequested) {
                     Ok(_) => {}
                     Err(err) if err.from != RuntimeState::Recovering => {}

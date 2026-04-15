@@ -142,16 +142,16 @@ Current exact-parity state:
   formal machine and the handwritten runtime-control helper; the truthful
   graph never drove those mirrors away from `FALSE`, and exact parity stayed
   green after both cuts
-- that closes the stale handwritten wake/process branch, but not every
-  lower-authority control question: the remaining helper still owns the live
-  coarse control reducer for internal `Recovering` / recycle paths and the
-  duplicated run-return bookkeeping that the checked-in machine now models as
-  `current_run_id` / `pre_run_phase`
-- after the recycle alignment, that remaining gap is narrower than before:
-  the helper still carries the dead `RecoverRequested` /
-  `RecoverySucceeded` / `ResumeRequested` compatibility branch plus the
-  duplicated run-return bookkeeping, but live recycle no longer depends on an
-  internal helper `Recovering` detour
+- that closes the stale handwritten wake/process branch, and the handwritten
+  recover workflow is gone too: `RecoverRequested` / `RecoverySucceeded` were
+  removed from `RuntimeControlAuthority`, the runtime tests now drive the real
+  `recover()` path instead of a helper-only mini-machine, and `Recovering`
+  remains only as a compatibility-facing public `RuntimeState`
+- the remaining lower-authority control question is now narrower still:
+  the helper still owns a compatibility `ResumeRequested` escape hatch for an
+  explicitly restored `Recovering` state plus duplicated run-return
+  bookkeeping, but the live recover/recycle flow no longer depends on a
+  helper-side `Recovering` workflow
 - the dead top-level active-work slice is also gone: `active_work_id` never
   became `Some(...)` in the truthful graph, the old `has_active_work`-gated
   completion/operation slice had zero reachable edges, and exact parity stayed

@@ -395,13 +395,6 @@ async fn recovery_applied_stays_applied() {
     driver.stage_input(&input_id, &run_id).unwrap();
     driver.apply_input(&input_id, &run_id).unwrap();
 
-    // Recover — apply RecoverRequested through the authority
-    use meerkat_runtime::RuntimeControlInput;
-    use meerkat_runtime::RuntimeControlMutator;
-    driver
-        .control_mut()
-        .apply(RuntimeControlInput::RecoverRequested)
-        .unwrap();
     let report = driver.recover_ephemeral();
     assert_eq!(report.inputs_recovered, 1);
 

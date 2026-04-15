@@ -60,7 +60,7 @@ pub enum RuntimeControlPlaneError {
 pub enum RuntimeControlCommand {
     /// Stop the runtime gracefully.
     Stop,
-    /// Resume the runtime after recovery.
+    /// Compatibility request to leave an explicitly restored recovering state.
     Resume,
 }
 
