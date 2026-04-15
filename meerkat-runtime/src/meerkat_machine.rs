@@ -3375,14 +3375,6 @@ impl MeerkatMachine {
                 formal_projection_value(&attachment_live),
             );
             available_fields.insert(
-                "wake_pending".into(),
-                formal_projection_value(&control.wake_pending),
-            );
-            available_fields.insert(
-                "process_pending".into(),
-                formal_projection_value(&control.process_pending),
-            );
-            available_fields.insert(
                 "pre_run_phase".into(),
                 formal_projection_value(&control.pre_run_phase.map(|phase| phase.to_string())),
             );

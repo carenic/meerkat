@@ -13,8 +13,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `active_generation`: `Option<Generation>`
 - `active_work_id`: `Option<WorkId>`
 - `attachment_live`: `Bool`
-- `wake_pending`: `Bool`
-- `process_pending`: `Bool`
 - `pre_run_phase`: `Option<String>`
 - `peer_ingress_configured`: `Bool`
 - `drain_running`: `Bool`

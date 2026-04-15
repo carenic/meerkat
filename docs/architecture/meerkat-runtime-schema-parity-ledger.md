@@ -62,6 +62,10 @@ Current state:
   routed seam effects: `current_llm_identity`, `current_capability_surface`,
   `capability_surface_status`, `capability_base_filter`,
   `inherited_base_filter`
+- the formal Meerkat state no longer carries the dead wake/process pending
+  bits: `wake_pending` and `process_pending` were constant `FALSE` across the
+  truthful reachable graph and their removal kept the exact parity surface
+  unchanged
 - the pure query/helper surface is now explicitly carried as
   `surface_only_inputs` instead of formal self-loops:
   `ContainsSession`, `SessionHasExecutor`, `SessionHasComms`,
@@ -102,6 +106,9 @@ Current exact-parity state:
   runtime-owned and exact in the live runtime, but they are no longer modeled
   as top-level Meerkat machine state because they do not affect command
   legality, phase changes, or routed effect identity
+- the old wake/process pending bits are also gone from the top-level formal
+  machine; the current truthful graph never drove them away from
+  `FALSE`, and exact parity stayed green after the cut
 - the pure query surface remains runtime-audited helper behavior, but it is no
   longer counted as formal transition coverage
 

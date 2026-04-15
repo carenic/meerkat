@@ -96,6 +96,11 @@ Hopcroft-style behavioral quotient over the reachable graph.
   `capability_surface_status`, `capability_base_filter`,
   `inherited_base_filter`) from the formal state while keeping the live runtime
   ownership, exact runtime behavior, and routed seam effects unchanged.
+- Removed the dead Meerkat wake/process pending bits from the formal state:
+  `wake_pending` and `process_pending` were constant `FALSE` across the
+  truthful reachable graph, did not participate in surviving formal guards,
+  and kept exact parity plus the truthful TLC/Hopcroft readout unchanged after
+  removal.
 - Taught the generated closed-world composition models to reject queued
   external entry packets that are no longer admissible for the current machine
   state, which removes seam deadlocks without widening the machine transition
@@ -149,6 +154,7 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | Meerkat committed visibility publication progress should not stay as top-level shadow state | passed / landed | Removed `committed_visibility_revision` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 59,371 to 45,610 while the raw/phase quotients stayed at 385 / 390. |
 | Meerkat visibility witness provenance should not stay as top-level shadow state | passed / landed | Removed `requested_witnesses` and `filter_witnesses` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 45,610 to 15,809 while the raw/phase quotients still held at 385 / 390. |
 | Meerkat LLM/capability projection should not stay as top-level shadow state | passed / landed | Removed `current_llm_identity`, `current_capability_surface`, `capability_surface_status`, `capability_base_filter`, and `inherited_base_filter` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 15,809 to 11,814 while the raw/phase quotients still held at 385 / 390. |
+| Meerkat wake/process pending bits should not stay as top-level formal state | passed / landed | Removed `wake_pending` and `process_pending` after the truthful graph showed they were constant `FALSE` across all reachable states; exact audited parity stayed green and the truthful TLC/Hopcroft readout stayed flat at 11,814 reachable with raw/phase/full quotients 385 / 390 / 11,425. |
 | Meerkat `Stopped` vs `Retired` can merge internally | rejected | The top-level transition sets diverge in load-bearing ways: `Retired` still accepts `Reset`, `StopRuntimeExecutor`, and `Recycle`, while `Stopped` does not, and the retire path carries archival/drain semantics that phase 1 should keep explicit. |
 | Meerkat `Idle` vs `Attached` can merge internally | rejected | In the current formal model, phase identity still carries load-bearing "executor attached" semantics that are not derivable from the existing Meerkat extended state. Several absorbed transitions are phase-gated without a field-level attachment witness, so phase-1 collapse would require introducing a replacement attachment bit plus a new public projection layer rather than actually simplifying the model. |
 

@@ -57,8 +57,6 @@ pub fn meerkat_machine() -> MachineSchema {
                     TypeRef::Option(Box::new(TypeRef::Named("WorkId".into()))),
                 ),
                 field("attachment_live", TypeRef::Bool),
-                field("wake_pending", TypeRef::Bool),
-                field("process_pending", TypeRef::Bool),
                 field("pre_run_phase", TypeRef::Option(Box::new(TypeRef::String))),
                 field("peer_ingress_configured", TypeRef::Bool),
                 field("drain_running", TypeRef::Bool),
@@ -84,8 +82,6 @@ pub fn meerkat_machine() -> MachineSchema {
                     init("active_generation", Expr::None),
                     init("active_work_id", Expr::None),
                     init("attachment_live", Expr::Bool(false)),
-                    init("wake_pending", Expr::Bool(false)),
-                    init("process_pending", Expr::Bool(false)),
                     init("pre_run_phase", Expr::None),
                     init("peer_ingress_configured", Expr::Bool(false)),
                     init("drain_running", Expr::Bool(false)),
@@ -766,14 +762,6 @@ pub fn meerkat_machine() -> MachineSchema {
                         expr: Expr::None,
                     },
                     Update::Assign {
-                        field: "wake_pending".into(),
-                        expr: Expr::Bool(false),
-                    },
-                    Update::Assign {
-                        field: "process_pending".into(),
-                        expr: Expr::Bool(false),
-                    },
-                    Update::Assign {
                         field: "pre_run_phase".into(),
                         expr: Expr::None,
                     },
@@ -887,14 +875,6 @@ pub fn meerkat_machine() -> MachineSchema {
                         expr: Expr::None,
                     },
                     Update::Assign {
-                        field: "wake_pending".into(),
-                        expr: Expr::Bool(false),
-                    },
-                    Update::Assign {
-                        field: "process_pending".into(),
-                        expr: Expr::Bool(false),
-                    },
-                    Update::Assign {
                         field: "drain_running".into(),
                         expr: Expr::Bool(false),
                     },
@@ -949,14 +929,6 @@ fn reset_session_state() -> Vec<Update> {
         },
         Update::Assign {
             field: "attachment_live".into(),
-            expr: Expr::Bool(false),
-        },
-        Update::Assign {
-            field: "wake_pending".into(),
-            expr: Expr::Bool(false),
-        },
-        Update::Assign {
-            field: "process_pending".into(),
             expr: Expr::Bool(false),
         },
         Update::Assign {
@@ -2233,14 +2205,6 @@ fn absorbed_meerkat_transitions() -> Vec<TransitionSchema> {
         Update::Assign {
             field: "active_work_id".into(),
             expr: Expr::None,
-        },
-        Update::Assign {
-            field: "wake_pending".into(),
-            expr: Expr::Bool(false),
-        },
-        Update::Assign {
-            field: "process_pending".into(),
-            expr: Expr::Bool(false),
         },
         Update::Assign {
             field: "peer_ingress_configured".into(),
