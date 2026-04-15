@@ -285,8 +285,13 @@ Current state:
   `snapshot_in_phase(...)`, `can_accept_in_phase(...)`, and `apply_in_phase(...)`
   with `self.state()`, so the helper no longer gets to answer top-level legality
   from its own private phase copy during stop/resume/reset/destroy/flow paths.
-  The helper still stores phase internally for now, but that state is no longer
-  consulted by the actor for top-level legality or diagnostics.
+  The helper still stored phase internally at that point, but that state was no
+  longer consulted by the actor for top-level legality or diagnostics.
+- The next ownership cut finishes that job on the production path: stored
+  orchestrator phase is now test-only scaffolding inside
+  `MobOrchestratorAuthority`, while production builder/actor code uses only the
+  explicit `*_in_phase(...)` surface. This means live runtime orchestration no
+  longer has any hidden second phase owner below the checked-in `MobMachine`.
 
 ## Notes
 
@@ -313,11 +318,13 @@ Current state:
    `externally_addressable_runtime_ids`). On the current design those drivers
    still read as real orchestration and stale-binding legality rather than
    leftover top-level projection state.
-5. The next high-value Mob frontier is no longer raw field removal. It is the
-   remaining phase ownership inside the lower authorities: after the actor-side
-   `*_in_phase(...)` cut, we can now reassess whether
-   `MobOrchestratorAuthority` still needs to store phase at all, or whether the
-   next honest move is to collapse more top-level legality out of
-   `MobLifecycleAuthority`.
+5. The next high-value Mob frontier is now concentrated in
+   `MobLifecycleAuthority`, not `MobOrchestratorAuthority`: after the
+   production-side phase removal, the orchestrator helper is reduced to field +
+   effect realization parameterized by the actor's canonical mob phase.
+6. The next honest fast-loop candidate is therefore whether the remaining
+   coarse lifecycle legality and snapshot reads in `MobLifecycleAuthority`
+   should be collapsed the same way, or whether they still carry distinct
+   machine-local behavior that cannot yet move under `MobMachine`.
    authority and the lower topology service, plus any remaining top-level
    lifecycle legality that still bypasses the checked-in machine.

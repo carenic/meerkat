@@ -2,8 +2,8 @@
 //!
 //! This module provides typed enums and a sealed mutator trait that enforces
 //! all MobOrchestrator state mutations flow through the machine authority.
-//! Handwritten shell code calls [`MobOrchestratorAuthority::apply`] and executes
-//! returned effects; it cannot mutate canonical state directly.
+//! Handwritten shell code calls [`MobOrchestratorAuthority::apply_in_phase`] and
+//! executes returned effects; it cannot mutate canonical state directly.
 //!
 //! The transition table encoded here is the single source of truth, matching
 //! the machine schema in `meerkat-machine-schema/src/catalog/mob_orchestrator.rs`:
@@ -172,9 +172,9 @@ mod sealed {
 
 /// Sealed trait for MobOrchestrator state mutation.
 ///
-/// Only [`MobOrchestratorAuthority`] implements this. Handwritten code cannot
-/// create alternative implementations, ensuring single-source-of-truth
-/// semantics for orchestrator state.
+/// Only [`MobOrchestratorAuthority`] implements this. Tests keep a
+/// phase-owning helper surface for direct table checks, but production code
+/// routes legality through [`MobOrchestratorAuthority::apply_in_phase`].
 pub(crate) trait MobOrchestratorMutator: sealed::Sealed {
     /// Apply a typed input to the current machine state.
     ///
@@ -193,7 +193,8 @@ pub(crate) trait MobOrchestratorMutator: sealed::Sealed {
 /// Holds the canonical phase + fields and delegates all transitions through
 /// the encoded transition table.
 pub(crate) struct MobOrchestratorAuthority {
-    /// Canonical phase.
+    /// Test-only phase owner retained for direct authority table tests.
+    #[cfg(test)]
     phase: MobState,
     /// Canonical machine-owned fields.
     fields: MobOrchestratorFields,
@@ -206,6 +207,7 @@ impl MobOrchestratorAuthority {
     /// Create a new authority in Creating phase with default fields.
     pub(crate) fn new() -> Self {
         Self {
+            #[cfg(test)]
             phase: MobState::Creating,
             fields: MobOrchestratorFields::default(),
         }
@@ -215,6 +217,7 @@ impl MobOrchestratorAuthority {
     /// running-default fields used by live mob bootstrap.
     pub(crate) fn new_running() -> Self {
         Self {
+            #[cfg(test)]
             phase: MobState::Running,
             fields: MobOrchestratorFields {
                 supervisor_active: true,
@@ -229,25 +232,20 @@ impl MobOrchestratorAuthority {
     /// rather than always starting in Creating.
     pub(crate) fn with_phase(phase: MobState) -> Self {
         Self {
+            #[cfg(test)]
             phase,
             fields: MobOrchestratorFields::default(),
         }
     }
 
     /// Current phase (read from canonical state).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "authority inspection helper retained for schema-aligned orchestrator introspection"
-        )
-    )]
-    #[cfg_attr(test, allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn phase(&self) -> MobState {
         self.phase
     }
 
     /// Current snapshot of all fields.
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> MobOrchestratorSnapshot {
         self.fields.to_snapshot(self.phase)
     }
@@ -258,6 +256,7 @@ impl MobOrchestratorAuthority {
     }
 
     /// Check if a transition is legal without applying it.
+    #[cfg(test)]
     pub(crate) fn can_accept(&self, input: MobOrchestratorInput) -> bool {
         self.evaluate(input).is_ok()
     }
@@ -268,6 +267,7 @@ impl MobOrchestratorAuthority {
     }
 
     /// Evaluate a transition without committing it.
+    #[cfg(test)]
     fn evaluate(
         &self,
         input: MobOrchestratorInput,
@@ -512,7 +512,6 @@ impl MobOrchestratorAuthority {
     ) -> Result<MobOrchestratorTransition, MobError> {
         let (next_phase, next_fields, effects) = self.evaluate_in_phase(phase, input)?;
 
-        self.phase = next_phase;
         self.fields = next_fields;
 
         Ok(MobOrchestratorTransition {
@@ -523,6 +522,7 @@ impl MobOrchestratorAuthority {
     }
 }
 
+#[cfg(test)]
 impl MobOrchestratorMutator for MobOrchestratorAuthority {
     fn apply(
         &mut self,

@@ -7,9 +7,7 @@ use super::mob_lifecycle_authority::{
 use super::mob_member_bootstrap_authority::{
     MobMemberBootstrapAuthority, MobMemberBootstrapEffect, MobMemberBootstrapInput,
 };
-use super::mob_orchestrator_authority::{
-    MobOrchestratorAuthority, MobOrchestratorInput, MobOrchestratorMutator,
-};
+use super::mob_orchestrator_authority::{MobOrchestratorAuthority, MobOrchestratorInput};
 use super::mob_runtime_bridge_authority::{MobRuntimeBridgeAuthority, MobRuntimeBridgeEffect};
 use super::mob_wiring_authority::{
     ExternalUnwirePlan, ExternalWireInput, ExternalWirePlan, LocalUnwirePlan, LocalWirePlan,
@@ -604,10 +602,11 @@ impl MobActor {
     }
 
     fn pending_spawn_alignment_violation(&self) -> Option<String> {
-        let expected = self
-            .orchestrator
-            .as_ref()
-            .map(|orchestrator| orchestrator.snapshot().pending_spawn_count as usize);
+        let expected = self.orchestrator.as_ref().map(|orchestrator| {
+            orchestrator
+                .snapshot_in_phase(self.state())
+                .pending_spawn_count as usize
+        });
         self.pending_spawns.alignment_violation(expected)
     }
 
@@ -1537,10 +1536,14 @@ impl MobActor {
                 }
                 #[cfg(test)]
                 MobCommand::OrchestratorSnapshot { reply_tx } => {
-                    let _ = reply_tx.send(self.orchestrator.as_ref().map_or_else(
-                        MobOrchestratorSnapshot::default,
-                        super::mob_orchestrator_authority::MobOrchestratorAuthority::snapshot,
-                    ));
+                    let phase = self.state();
+                    let _ = reply_tx.send(
+                        self.orchestrator
+                            .as_ref()
+                            .map_or_else(MobOrchestratorSnapshot::default, |orch| {
+                                orch.snapshot_in_phase(phase)
+                            }),
+                    );
                 }
                 #[cfg(test)]
                 MobCommand::LifecycleSnapshot { reply_tx } => {

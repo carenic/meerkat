@@ -1,4 +1,3 @@
-use super::mob_orchestrator_authority::MobOrchestratorMutator;
 use super::*;
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
@@ -967,7 +966,10 @@ impl MobBuilder {
                 }
             };
             if orch
-                .apply(super::mob_orchestrator_authority::MobOrchestratorInput::BindCoordinator)
+                .apply_in_phase(
+                    initial_phase,
+                    super::mob_orchestrator_authority::MobOrchestratorInput::BindCoordinator,
+                )
                 .is_ok()
             {
                 topology_service.bind_coordinator();
