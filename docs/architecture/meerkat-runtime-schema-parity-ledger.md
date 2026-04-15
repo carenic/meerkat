@@ -57,6 +57,11 @@ Current state:
   visibility fields that do not affect transition legality:
   `committed_visibility_revision`, `requested_witnesses`,
   `filter_witnesses`
+- the formal Meerkat state no longer carries the LLM/capability projection
+  layer that is runtime-owned but does not affect transition legality or
+  routed seam effects: `current_llm_identity`, `current_capability_surface`,
+  `capability_surface_status`, `capability_base_filter`,
+  `inherited_base_filter`
 - the pure query/helper surface is now explicitly carried as
   `surface_only_inputs` instead of formal self-loops:
   `ContainsSession`, `SessionHasExecutor`, `SessionHasComms`,
@@ -93,6 +98,10 @@ Current exact-parity state:
 - visibility publication/provenance facts that remain runtime-owned but do not
   change Meerkat transition legality have been pushed below the top-level
   formal machine boundary rather than kept as shadow state
+- LLM/capability projection facts are now treated the same way: they remain
+  runtime-owned and exact in the live runtime, but they are no longer modeled
+  as top-level Meerkat machine state because they do not affect command
+  legality, phase changes, or routed effect identity
 - the pure query surface remains runtime-audited helper behavior, but it is no
   longer counted as formal transition coverage
 
@@ -270,13 +279,14 @@ Outcome:
    as lower-authority carrier facts in the exact observable audit unless and
    until the DSL work deliberately lifts them into the top-level machine.
 3. Use the trustworthy post-parity Hopcroft rerun as the Meerkat
-   simplification baseline after the visibility-boundary cuts:
-   raw `15,809 -> 385`, phase `15,809 -> 390`, TLC `809,617 generated /
-   15,809 distinct / depth 9`.
+   simplification baseline after the visibility-boundary and
+   LLM/capability-boundary cuts:
+   raw `11,814 -> 385`, phase `11,814 -> 390`, TLC `598,901 generated /
+   11,814 distinct / depth 9`.
 4. Read that baseline together with the largest-block field projection from
    [`docs/architecture/machine-simplification-proposal.md`](machine-simplification-proposal.md):
-   the dominant Meerkat mixed block is now measured as `6,904` states over
-   `3,085` extended-state tuples, with `2,224` tuples reused across multiple
+   the dominant Meerkat mixed block is now measured as `4,669` states over
+   `1,971` extended-state tuples, with `1,566` tuples reused across multiple
    phases.
 5. Read that baseline together with the now-green Mob lifecycle-triangle
    ledger in

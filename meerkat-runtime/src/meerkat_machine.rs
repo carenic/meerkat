@@ -3174,9 +3174,6 @@ impl MeerkatMachine {
             detached_wake_pending,
             detached_wake_signaled,
             epoch_id,
-            current_llm_identity,
-            current_capability_surface,
-            capability_surface_status,
             visibility_state,
         ) = {
             let sessions = self.sessions.read().await;
@@ -3204,9 +3201,6 @@ impl MeerkatMachine {
                 detached_wake_pending,
                 detached_wake_signaled,
                 entry.epoch_id.clone(),
-                entry.current_llm_identity.clone(),
-                entry.current_capability_surface.clone(),
-                entry.capability_surface_status,
                 entry.tool_visibility_owner.visibility_state().ok()?,
             )
         };
@@ -3399,26 +3393,6 @@ impl MeerkatMachine {
             available_fields.insert(
                 "drain_running".into(),
                 formal_projection_value(&drain_running),
-            );
-            available_fields.insert(
-                "current_llm_identity".into(),
-                formal_projection_value(&current_llm_identity),
-            );
-            available_fields.insert(
-                "current_capability_surface".into(),
-                formal_projection_value(&current_capability_surface),
-            );
-            available_fields.insert(
-                "capability_surface_status".into(),
-                formal_projection_value(&capability_surface_status),
-            );
-            available_fields.insert(
-                "capability_base_filter".into(),
-                formal_projection_value(&visibility_state.capability_base_filter),
-            );
-            available_fields.insert(
-                "inherited_base_filter".into(),
-                formal_projection_value(&visibility_state.inherited_base_filter),
             );
             available_fields.insert(
                 "active_filter".into(),

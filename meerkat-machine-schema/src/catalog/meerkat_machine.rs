@@ -62,20 +62,6 @@ pub fn meerkat_machine() -> MachineSchema {
                 field("pre_run_phase", TypeRef::Option(Box::new(TypeRef::String))),
                 field("peer_ingress_configured", TypeRef::Bool),
                 field("drain_running", TypeRef::Bool),
-                field(
-                    "current_llm_identity",
-                    TypeRef::Option(Box::new(named("SessionLlmIdentity"))),
-                ),
-                field(
-                    "current_capability_surface",
-                    TypeRef::Option(Box::new(named("SessionLlmCapabilitySurface"))),
-                ),
-                field(
-                    "capability_surface_status",
-                    named("SessionLlmCapabilitySurfaceStatus"),
-                ),
-                field("capability_base_filter", named("ToolFilter")),
-                field("inherited_base_filter", named("ToolFilter")),
                 field("active_filter", named("ToolFilter")),
                 field("staged_filter", named("ToolFilter")),
                 field(
@@ -103,17 +89,6 @@ pub fn meerkat_machine() -> MachineSchema {
                     init("pre_run_phase", Expr::None),
                     init("peer_ingress_configured", Expr::Bool(false)),
                     init("drain_running", Expr::Bool(false)),
-                    init("current_llm_identity", Expr::None),
-                    init("current_capability_surface", Expr::None),
-                    init(
-                        "capability_surface_status",
-                        Expr::NamedVariant {
-                            enum_name: "SessionLlmCapabilitySurfaceStatus".into(),
-                            variant: "Unresolved".into(),
-                        },
-                    ),
-                    init("capability_base_filter", tool_filter_all()),
-                    init("inherited_base_filter", tool_filter_all()),
                     init("active_filter", tool_filter_all()),
                     init("staged_filter", tool_filter_all()),
                     init("active_requested_deferred_names", Expr::EmptySet),
@@ -302,22 +277,10 @@ pub fn meerkat_machine() -> MachineSchema {
                     runtime_is_bound_guard(),
                     reconfigure_visibility_revision_guard(),
                 ],
-                updates: vec![
-                    assign_some("current_llm_identity", "target_identity"),
-                    assign_some("current_capability_surface", "target_capability_surface"),
-                    Update::Assign {
-                        field: "capability_surface_status".into(),
-                        expr: Expr::String("resolved".into()),
-                    },
-                    Update::Assign {
-                        field: "capability_base_filter".into(),
-                        expr: Expr::Binding("next_capability_base_filter".into()),
-                    },
-                    Update::Assign {
-                        field: "active_visibility_revision".into(),
-                        expr: Expr::Binding("next_active_visibility_revision".into()),
-                    },
-                ],
+                updates: vec![Update::Assign {
+                    field: "active_visibility_revision".into(),
+                    expr: Expr::Binding("next_active_visibility_revision".into()),
+                }],
                 to: "Attached".into(),
                 emit: vec![],
             },
@@ -345,22 +308,10 @@ pub fn meerkat_machine() -> MachineSchema {
                     runtime_is_bound_guard(),
                     reconfigure_visibility_revision_guard(),
                 ],
-                updates: vec![
-                    assign_some("current_llm_identity", "target_identity"),
-                    assign_some("current_capability_surface", "target_capability_surface"),
-                    Update::Assign {
-                        field: "capability_surface_status".into(),
-                        expr: Expr::String("resolved".into()),
-                    },
-                    Update::Assign {
-                        field: "capability_base_filter".into(),
-                        expr: Expr::Binding("next_capability_base_filter".into()),
-                    },
-                    Update::Assign {
-                        field: "active_visibility_revision".into(),
-                        expr: Expr::Binding("next_active_visibility_revision".into()),
-                    },
-                ],
+                updates: vec![Update::Assign {
+                    field: "active_visibility_revision".into(),
+                    expr: Expr::Binding("next_active_visibility_revision".into()),
+                }],
                 to: "Running".into(),
                 emit: vec![],
             },
@@ -1019,10 +970,6 @@ fn reset_session_state() -> Vec<Update> {
         Update::Assign {
             field: "drain_running".into(),
             expr: Expr::Bool(false),
-        },
-        Update::Assign {
-            field: "inherited_base_filter".into(),
-            expr: tool_filter_all(),
         },
         Update::Assign {
             field: "active_filter".into(),

@@ -274,7 +274,6 @@ fn meerkat_machine_merges_turn_admission_tool_visibility_and_peer_directory_stat
         .collect::<Vec<_>>();
 
     for required in [
-        "inherited_base_filter",
         "active_filter",
         "staged_filter",
         "active_requested_deferred_names",
