@@ -17346,6 +17346,7 @@ enum MobRuntimeParityOutcomeKind {
 struct MobRuntimeParitySnapshotSummary {
     phase: String,
     live_runtime_ids: BTreeSet<String>,
+    externally_addressable_runtime_ids: BTreeSet<String>,
     runtime_fence_tokens: BTreeMap<String, u64>,
     active_member_count: usize,
     all_member_count: usize,
@@ -17840,10 +17841,36 @@ async fn mob_runtime_parity_snapshot_summary(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let mut externally_addressable_runtime_ids = BTreeSet::new();
+    for entry in &active_members {
+        let profile = handle
+            .definition
+            .resolve_profile(&entry.role, None)
+            .await
+            .ok();
+        if profile.as_ref().map(|profile| profile.external_addressable) == Some(true) {
+            externally_addressable_runtime_ids.insert(mob_modeled_normalize_formal_string(
+                &serde_json::to_string(&entry.agent_runtime_id)
+                    .expect("serialize runtime id for external addressability parity snapshot"),
+            ));
+        }
+    }
+    let externally_addressable_runtime_id_values = externally_addressable_runtime_ids
+        .iter()
+        .map(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw.clone()))
+        })
+        .collect::<Vec<_>>();
     let mut formal_available_fields = BTreeMap::new();
     formal_available_fields.insert(
         "live_runtime_ids".into(),
         serde_json::to_string(&live_runtime_id_values).expect("serialize live_runtime_ids"),
+    );
+    formal_available_fields.insert(
+        "externally_addressable_runtime_ids".into(),
+        serde_json::to_string(&externally_addressable_runtime_id_values)
+            .expect("serialize externally_addressable_runtime_ids"),
     );
     formal_available_fields.insert(
         "runtime_fence_tokens".into(),
@@ -17899,6 +17926,7 @@ async fn mob_runtime_parity_snapshot_summary(
     Some(MobRuntimeParitySnapshotSummary {
         phase: phase.as_str().to_string(),
         live_runtime_ids,
+        externally_addressable_runtime_ids,
         runtime_fence_tokens,
         active_member_count: active_members.len(),
         all_member_count: all_members.len(),
@@ -17970,6 +17998,9 @@ fn mob_runtime_parity_field_value(
     match field {
         "live_runtime_ids" => Some(MobRuntimeParityExprValue::Set(
             snapshot.live_runtime_ids.clone(),
+        )),
+        "externally_addressable_runtime_ids" => Some(MobRuntimeParityExprValue::Set(
+            snapshot.externally_addressable_runtime_ids.clone(),
         )),
         "runtime_fence_tokens" => Some(MobRuntimeParityExprValue::Map(
             snapshot.runtime_fence_tokens.clone(),

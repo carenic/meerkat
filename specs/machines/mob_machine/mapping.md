@@ -22,7 +22,10 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ObserveRuntimeReady`
   - anchors: `mob_handle_surface`, `mob_actor_authority`
   - scenarios: `spawn-work-terminal`, `retire-respawn-destroy`
-- `SubmitWorkRunning`
+- `SubmitWorkRunningExternal`
+  - anchors: `mob_handle_surface`, `mob_actor_authority`
+  - scenarios: `spawn-work-terminal`, `retire-respawn-destroy`
+- `SubmitWorkRunningInternal`
   - anchors: `mob_handle_surface`, `mob_actor_authority`
   - scenarios: `spawn-work-terminal`, `retire-respawn-destroy`
 - `ObserveWorkCompleted`

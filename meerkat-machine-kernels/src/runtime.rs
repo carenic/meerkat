@@ -1219,6 +1219,7 @@ mod tests {
                         ),
                         ("fence_token".into(), KernelValue::U64(41)),
                         ("generation".into(), KernelValue::U64(2)),
+                        ("external_addressable".into(), KernelValue::Bool(false)),
                     ]),
                 },
             )
@@ -1243,15 +1244,12 @@ mod tests {
                         ),
                         ("fence_token".into(), KernelValue::U64(41)),
                         ("work_id".into(), KernelValue::String("work-1".into())),
-                        (
-                            "origin".into(),
-                            KernelValue::String("mob.submit_work".into()),
-                        ),
+                        ("origin".into(), KernelValue::String("Internal".into())),
                     ]),
                 },
             )
             .expect("submit work");
-        assert_eq!(submitted.transition, "SubmitWorkRunning");
+        assert_eq!(submitted.transition, "SubmitWorkRunningInternal");
         // SubmitMemberWork effect was removed (unimplemented route to MeerkatMachine).
         assert!(
             !submitted

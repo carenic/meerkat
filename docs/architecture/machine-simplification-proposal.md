@@ -296,6 +296,7 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | Mob `CancelWork` should stay surfaced without formal transition coverage | passed / landed | Moved `CancelWork` to `surface_only_inputs`; exact Mob parity stayed green, the truthful TLC state space fell from 1,390 to 1,214, and the raw/phase quotients tightened from 202 / 204 to 187 / 189. |
 | Mob representative runtime identity should not stay as top-level formal state | passed / landed | Removed `active_identity`, `active_runtime_id`, and `active_fence_token`; exact Mob parity stayed green, truthful TLC distinct states fell from 1,214 to 770, and the raw/phase quotients tightened from 187 / 189 to 138 / 140. |
 | Mob stale-binding truth should stay formally owned in `MobMachine` | passed / landed | Restored `live_runtime_ids` plus `runtime_fence_tokens`, added formal `MapRemove`, and modeled stale-fence invalidation exactly where the public handle enforces it. Exact Mob parity stayed green on all three layers, and the truthful quotient moved to `1323 -> 207 / 209 / 1323`, showing that the restored binding table is real machine behavior rather than a representative shadow. |
+| Mob `SubmitWork` origin can stay as handle/actor-only semantics | rejected / landed | Added `externally_addressable_runtime_ids` to `MobMachine` and split `SubmitWork` into explicit external vs internal origin guards. The truthful Mob state space rose from `1,323` to `2,238` while the quotient stayed flat at `207 / 209`, which is the expected signature for lifting a real legality distinction into the machine instead of hiding it below the boundary. |
 | Mob `retiring_member_count` should not stay as top-level formal state | passed / landed | Removed the dead retire counter; exact Mob parity stayed green and the truthful Hopcroft/TLC readout stayed flat at `770 -> 138 / 140 / 770`, proving the counter was not carrying independent formal behavior. |
 | Mob public `Stop` should reject active flows | passed / landed | Added `no_active_runs` to `StopRunning` after a focused runtime/schema probe showed `handle.stop()` rejects while flows are still active; the lifecycle-triangle parity audit stayed exact and truthful TLC generated states fell from `25,943` to `25,767` with the quotient unchanged. |
 | Mob bootstrap should start with coordinator bound | passed / landed | Changed the formal init state from `Running + coordinator_bound=false` to `Running + coordinator_bound=true` to match the live runtime bootstrap snapshot; the lifecycle-triangle parity audit stayed exact and the truthful quotient held at `138 / 140` while reachable states rose from `770` to `813`, proving the old bootstrap state had been under-modeled rather than behavior-bearing. |
@@ -380,9 +381,9 @@ We ran three observation modes for each machine:
 
 | Machine | Observation | Reachable states | Quotient states | Reduction | Reading |
 |---|---|---:|---:|---:|---|
-| MobMachine | `none` | 1323 | 207 | 84.4% | After restoring the real stale-binding table to `MobMachine` and then adding the forward Mob -> Meerkat ingress-request route, the truthful graph is still strongly quotientable. The remaining state is machine-owned binding/work-routing truth, not representative identity shadow state. |
-| MobMachine | `phase` | 1323 | 209 | 84.2% | Preserving phase still adds only two quotient blocks; `Running` / `Stopped` / `Completed` remain mostly projection even after stale-binding restoration and the forward ingress route. |
-| MobMachine | `full` | 1323 | 1323 | 0.0% | Once the remaining authoritative counters and binding table are preserved, every reachable Mob snapshot is still distinct. |
+| MobMachine | `none` | 2238 | 207 | 90.8% | After restoring stale-binding truth and then lifting `SubmitWork` origin legality into `MobMachine`, the truthful graph is still strongly quotientable. The remaining state is machine-owned binding/origin/work-routing truth, not representative identity shadow state. |
+| MobMachine | `phase` | 2238 | 209 | 90.7% | Preserving phase still adds only two quotient blocks; `Running` / `Stopped` / `Completed` remain mostly projection even after stale-binding restoration, the forward ingress route, and origin-sensitive submit-work legality. |
+| MobMachine | `full` | 2238 | 2238 | 0.0% | Once the remaining authoritative counters, binding table, and externally-addressable set are preserved, every reachable Mob snapshot is still distinct. |
 | MeerkatMachine | `none` | 19,459 | 459 | 97.6% | After the control/ingress owner-reduction cuts, the truthful graph remains highly quotientable. The largest mixed block is now driven by checked-in machine facts like `staged_visibility_revision`, `pre_run_phase`, `active_visibility_revision`, `current_run_id`, `peer_ingress_configured`, and `attachment_live`, not by deleted helper folklore. |
 | MeerkatMachine | `phase` | 19,459 | 464 | 97.6% | Preserving phase still adds only five quotient blocks, so phase remains almost entirely projection even after the latest control/ingress cuts. |
 | MeerkatMachine | `full` | 19,459 | 19,070 | 2.0% | Preserving the full snapshot still keeps nearly every remaining Meerkat state distinct, but the surviving structure now sits in real checked-in machine fields rather than in duplicated helper-owned lifecycle state. |
@@ -393,9 +394,9 @@ longer owns coarse lifecycle, batch selection, boundary classification, or a
 second derived active run identity. The remaining Meerkat edge is now narrower:
 ingress still applies contributor-state mutation plus dedup/terminal side
 effects below the checked-in machine boundary. On the Mob side, the forward
-route itself is now complete, but `MobMachine` still treats `SubmitWork` as one
-origin-insensitive self-loop even though runtime gives `origin` real
-external-vs-internal turn semantics before ingress.
+route and `SubmitWork` origin legality are now checked in; what remains below
+the machine is delivery/lowering glue rather than an obvious missing
+machine/composition fact.
 
 All six rows above have now been rerun after the exact runtime/schema parity
 passes on the current branch tip.

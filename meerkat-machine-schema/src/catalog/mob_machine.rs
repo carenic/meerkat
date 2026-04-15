@@ -34,6 +34,10 @@ pub fn mob_machine() -> MachineSchema {
                     TypeRef::Set(Box::new(TypeRef::Named("AgentRuntimeId".into()))),
                 ),
                 field(
+                    "externally_addressable_runtime_ids",
+                    TypeRef::Set(Box::new(TypeRef::Named("AgentRuntimeId".into()))),
+                ),
+                field(
                     "runtime_fence_tokens",
                     TypeRef::Map(
                         Box::new(TypeRef::Named("AgentRuntimeId".into())),
@@ -50,6 +54,7 @@ pub fn mob_machine() -> MachineSchema {
                 phase: "Running".into(),
                 fields: vec![
                     init("live_runtime_ids", Expr::EmptySet),
+                    init("externally_addressable_runtime_ids", Expr::EmptySet),
                     init("runtime_fence_tokens", Expr::EmptyMap),
                     init("active_member_count", Expr::U64(0)),
                     init("active_run_count", Expr::U64(0)),
@@ -129,6 +134,7 @@ pub fn mob_machine() -> MachineSchema {
                         "agent_runtime_id".into(),
                         "fence_token".into(),
                         "generation".into(),
+                        "external_addressable".into(),
                     ],
                 },
                 guards: vec![],
@@ -138,6 +144,17 @@ pub fn mob_machine() -> MachineSchema {
                         Update::SetInsert {
                             field: "live_runtime_ids".into(),
                             value: Expr::Binding("agent_runtime_id".into()),
+                        },
+                        Update::Conditional {
+                            condition: Expr::Binding("external_addressable".into()),
+                            then_updates: vec![Update::SetInsert {
+                                field: "externally_addressable_runtime_ids".into(),
+                                value: Expr::Binding("agent_runtime_id".into()),
+                            }],
+                            else_updates: vec![Update::SetRemove {
+                                field: "externally_addressable_runtime_ids".into(),
+                                value: Expr::Binding("agent_runtime_id".into()),
+                            }],
                         },
                         Update::MapInsert {
                             field: "runtime_fence_tokens".into(),
@@ -173,7 +190,7 @@ pub fn mob_machine() -> MachineSchema {
             // SubmitWork is a Running self-loop in the formal model. Fresh and
             // resumed mobs normalize directly to Running at runtime as well.
             TransitionSchema {
-                name: "SubmitWorkRunning".into(),
+                name: "SubmitWorkRunningExternal".into(),
                 from: vec!["Running".into()],
                 on: InputMatch {
                     kind: mob_trigger_kind("SubmitWork"),
@@ -188,6 +205,30 @@ pub fn mob_machine() -> MachineSchema {
                 guards: vec![
                     active_members_present_guard(),
                     current_binding_matches_guard(),
+                    external_origin_guard(),
+                    runtime_externally_addressable_guard(),
+                ],
+                updates: vec![],
+                to: "Running".into(),
+                emit: vec![work_submission_emit("RequestRuntimeIngress")],
+            },
+            TransitionSchema {
+                name: "SubmitWorkRunningInternal".into(),
+                from: vec!["Running".into()],
+                on: InputMatch {
+                    kind: mob_trigger_kind("SubmitWork"),
+                    variant: "SubmitWork".into(),
+                    bindings: vec![
+                        "agent_runtime_id".into(),
+                        "fence_token".into(),
+                        "work_id".into(),
+                        "origin".into(),
+                    ],
+                },
+                guards: vec![
+                    active_members_present_guard(),
+                    current_binding_matches_guard(),
+                    internal_origin_guard(),
                 ],
                 updates: vec![],
                 to: "Running".into(),
@@ -284,6 +325,7 @@ pub fn mob_machine() -> MachineSchema {
                         "agent_runtime_id".into(),
                         "fence_token".into(),
                         "generation".into(),
+                        "external_addressable".into(),
                     ],
                 },
                 guards: vec![],
@@ -293,6 +335,17 @@ pub fn mob_machine() -> MachineSchema {
                         Update::SetInsert {
                             field: "live_runtime_ids".into(),
                             value: Expr::Binding("agent_runtime_id".into()),
+                        },
+                        Update::Conditional {
+                            condition: Expr::Binding("external_addressable".into()),
+                            then_updates: vec![Update::SetInsert {
+                                field: "externally_addressable_runtime_ids".into(),
+                                value: Expr::Binding("agent_runtime_id".into()),
+                            }],
+                            else_updates: vec![Update::SetRemove {
+                                field: "externally_addressable_runtime_ids".into(),
+                                value: Expr::Binding("agent_runtime_id".into()),
+                            }],
                         },
                         Update::MapInsert {
                             field: "runtime_fence_tokens".into(),
@@ -323,6 +376,7 @@ pub fn mob_machine() -> MachineSchema {
                         "agent_runtime_id".into(),
                         "fence_token".into(),
                         "generation".into(),
+                        "external_addressable".into(),
                     ],
                 },
                 guards: vec![],
@@ -332,6 +386,17 @@ pub fn mob_machine() -> MachineSchema {
                         Update::SetInsert {
                             field: "live_runtime_ids".into(),
                             value: Expr::Binding("agent_runtime_id".into()),
+                        },
+                        Update::Conditional {
+                            condition: Expr::Binding("external_addressable".into()),
+                            then_updates: vec![Update::SetInsert {
+                                field: "externally_addressable_runtime_ids".into(),
+                                value: Expr::Binding("agent_runtime_id".into()),
+                            }],
+                            else_updates: vec![Update::SetRemove {
+                                field: "externally_addressable_runtime_ids".into(),
+                                value: Expr::Binding("agent_runtime_id".into()),
+                            }],
                         },
                         Update::MapInsert {
                             field: "runtime_fence_tokens".into(),
@@ -419,6 +484,7 @@ fn identity_runtime_fields() -> Vec<FieldSchema> {
         field("agent_runtime_id", TypeRef::Named("AgentRuntimeId".into())),
         field("fence_token", TypeRef::Named("FenceToken".into())),
         field("generation", TypeRef::Named("Generation".into())),
+        field("external_addressable", TypeRef::Bool),
     ]
 }
 
@@ -1399,6 +1465,36 @@ fn current_binding_matches_guard() -> Guard {
     }
 }
 
+fn runtime_externally_addressable_guard() -> Guard {
+    Guard {
+        name: "runtime_externally_addressable".into(),
+        expr: Expr::Contains {
+            collection: Box::new(Expr::Field("externally_addressable_runtime_ids".into())),
+            value: Box::new(Expr::Binding("agent_runtime_id".into())),
+        },
+    }
+}
+
+fn external_origin_guard() -> Guard {
+    Guard {
+        name: "external_origin".into(),
+        expr: Expr::Eq(
+            Box::new(Expr::Binding("origin".into())),
+            Box::new(Expr::String("External".into())),
+        ),
+    }
+}
+
+fn internal_origin_guard() -> Guard {
+    Guard {
+        name: "internal_origin".into(),
+        expr: Expr::Eq(
+            Box::new(Expr::Binding("origin".into())),
+            Box::new(Expr::String("Internal".into())),
+        ),
+    }
+}
+
 fn runtime_id_present_guard() -> Guard {
     Guard {
         name: "runtime_id_present".into(),
@@ -1430,6 +1526,10 @@ fn clear_current_runtime_projection_updates() -> Vec<Update> {
         [
             Update::SetRemove {
                 field: "live_runtime_ids".into(),
+                value: Expr::Binding("agent_runtime_id".into()),
+            },
+            Update::SetRemove {
+                field: "externally_addressable_runtime_ids".into(),
                 value: Expr::Binding("agent_runtime_id".into()),
             },
             Update::MapRemove {

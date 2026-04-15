@@ -177,6 +177,14 @@ Current state:
   that change, and the truthful Hopcroft/TLC readout moved to
   `1323 -> 207 -> 209 -> 1323`, which means the restored binding table is real
   machine-owned behavior rather than a presentation-only shadow.
+- The next tranche made `SubmitWork` origin-sensitive in the checked-in
+  machine by adding `externally_addressable_runtime_ids` and splitting the
+  running `SubmitWork` path into explicit external vs internal origin guards.
+- That cut kept the core quotient flat at `207 / 209`, but the truthful Mob
+  reachable graph rose from `1,323` to `2,238` with TLC
+  `76,199 generated / 2,238 distinct / depth 7`, which is the right signature
+  for lifting a real legality distinction into `MobMachine` instead of hiding
+  it in the handle/actor branch.
 
 ## Pair Ledger
 
@@ -193,10 +201,10 @@ Current state:
 - The lifecycle triangle is also exact on the runtime-backed modeled-state
   surface (`78 / 78 / 78 / 0`).
 - The broad quotient result still stands after the parity cleanup, and the
-  shadow-field cuts plus `CancelWork` extraction made that read much cleaner:
-  the truthful state space has now collapsed from `4,797` to `1,323`.
+  shadow-field cuts plus stale-binding/origin restoration made that read much
+  cleaner: the truthful state space has now collapsed from `4,797` to `2,238`.
 - The trustworthy raw/phase/full reread is now:
-  raw `1323 -> 207`, phase `1323 -> 209`, full `1323 -> 1323`.
+  raw `2238 -> 207`, phase `2238 -> 209`, full `2238 -> 2238`.
 - The latest public-guard parity hardening did not change the remaining Mob
   core fields; it only removed one over-admitted `Stop` row from the formal
   graph, which is why the quotient stayed flat while TLC generated states
@@ -208,9 +216,11 @@ Current state:
 - The latest init-state parity hardening corrected the bootstrap truth without
   changing the remaining intrinsic quotient, which is why the reachable space
   rose while the raw quotient stayed flat.
-- The dominant mixed block (`362` states) is now split primarily by
-  `pending_spawn_count`, `wiring_edge_count`, `active_run_count`,
-  `active_member_count`, and `coordinator_bound`.
+- The dominant mixed block (`1,170` states) is now split primarily by
+  `runtime_fence_tokens`, `pending_spawn_count`, `wiring_edge_count`,
+  `active_run_count`, `active_member_count`,
+  `externally_addressable_runtime_ids`, `coordinator_bound`, and
+  `live_runtime_ids`.
 
 ## Notes
 

@@ -8,6 +8,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ## State
 - Phase enum: `Running | Stopped | Completed | Destroyed`
 - `live_runtime_ids`: `Set<AgentRuntimeId>`
+- `externally_addressable_runtime_ids`: `Set<AgentRuntimeId>`
 - `runtime_fence_tokens`: `Map<AgentRuntimeId, FenceToken>`
 - `active_member_count`: `u32`
 - `active_run_count`: `u32`
@@ -16,7 +17,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `coordinator_bound`: `Bool`
 
 ## Inputs
-- `Spawn`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation)
+- `Spawn`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: Bool)
 - `SubmitWork`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, work_id: WorkId, origin: String)
 - `RunFlow`
 - `CancelFlow`
@@ -78,8 +79,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ObserveWorkCancelled`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, work_id: WorkId)
 - `RetireMember`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
 - `ObserveRuntimeRetired`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
-- `ResetMember`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation)
-- `RespawnMember`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation)
+- `ResetMember`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: Bool)
+- `RespawnMember`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: Bool)
 - `DestroyMob`
 - `ObserveRuntimeDestroyed`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
 - `MarkCompleted`
@@ -127,7 +128,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ## Transitions
 ### `SpawnRunning`
 - From: `Running`
-- On: `Spawn`(agent_identity, agent_runtime_id, fence_token, generation)
+- On: `Spawn`(agent_identity, agent_runtime_id, fence_token, generation, external_addressable)
 - Emits: `RequestRuntimeBinding`, `EmitMemberLifecycleNotice`
 - To: `Running`
 
@@ -136,12 +137,24 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `ObserveRuntimeReady`(agent_runtime_id, fence_token)
 - To: `Running`
 
-### `SubmitWorkRunning`
+### `SubmitWorkRunningExternal`
 - From: `Running`
 - On: `SubmitWork`(agent_runtime_id, fence_token, work_id, origin)
 - Guards:
   - `active_members_present`
   - `current_binding_matches`
+  - `external_origin`
+  - `runtime_externally_addressable`
+- Emits: `RequestRuntimeIngress`
+- To: `Running`
+
+### `SubmitWorkRunningInternal`
+- From: `Running`
+- On: `SubmitWork`(agent_runtime_id, fence_token, work_id, origin)
+- Guards:
+  - `active_members_present`
+  - `current_binding_matches`
+  - `internal_origin`
 - Emits: `RequestRuntimeIngress`
 - To: `Running`
 
@@ -184,13 +197,13 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ResetMember`
 - From: `Running`, `Stopped`
-- On: `ResetMember`(agent_identity, agent_runtime_id, fence_token, generation)
+- On: `ResetMember`(agent_identity, agent_runtime_id, fence_token, generation, external_addressable)
 - Emits: `RequestRuntimeBinding`, `EmitMemberLifecycleNotice`
 - To: `Running`
 
 ### `RespawnMember`
 - From: `Running`
-- On: `RespawnMember`(agent_identity, agent_runtime_id, fence_token, generation)
+- On: `RespawnMember`(agent_identity, agent_runtime_id, fence_token, generation, external_addressable)
 - Emits: `RequestRuntimeBinding`, `EmitMemberLifecycleNotice`
 - To: `Running`
 
