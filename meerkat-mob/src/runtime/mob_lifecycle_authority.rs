@@ -77,13 +77,7 @@ pub(crate) enum MobLifecycleInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MobLifecycleEffect {
     EmitLifecycleNotice,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "cleanup request effect retained only for lower-authority table tests after production reset flow stopped using it"
-        )
-    )]
+    #[cfg_attr(not(test), allow(dead_code))]
     RequestCleanup,
 }
 
@@ -146,6 +140,7 @@ struct MobLifecycleFields {
 // Sealed mutator trait — only the authority implements this
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 mod sealed {
     pub trait Sealed {}
 }
@@ -155,6 +150,7 @@ mod sealed {
 /// Only [`MobLifecycleAuthority`] implements this. Tests keep a phase-owning
 /// helper surface for direct table checks, while production code routes coarse
 /// lifecycle legality through [`MobLifecycleAuthority::apply_in_phase`].
+#[cfg(test)]
 pub(crate) trait MobLifecycleMutator: sealed::Sealed {
     /// Apply a typed input to the current machine state.
     ///
@@ -184,6 +180,7 @@ pub(crate) struct MobLifecycleAuthority {
     observable: Arc<AtomicU8>,
 }
 
+#[cfg(test)]
 impl sealed::Sealed for MobLifecycleAuthority {}
 
 impl MobLifecycleAuthority {
@@ -210,6 +207,7 @@ impl MobLifecycleAuthority {
         self.phase
     }
 
+    #[cfg(test)]
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> MobLifecycleSnapshot {
         MobLifecycleSnapshot {

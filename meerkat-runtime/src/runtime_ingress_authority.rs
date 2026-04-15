@@ -418,6 +418,7 @@ impl RuntimeIngressAuthority {
     }
 
     /// Apply already-machine-classified contributor staging mechanics.
+    #[cfg(test)]
     pub(crate) fn stage_drain_snapshot(
         &mut self,
         run_id: &RunId,
@@ -430,6 +431,7 @@ impl RuntimeIngressAuthority {
     }
 
     /// Apply already-machine-classified boundary-consumption mechanics.
+    #[cfg(test)]
     pub(crate) fn boundary_applied(
         &mut self,
         contributing_work_ids: &[InputId],
@@ -442,6 +444,7 @@ impl RuntimeIngressAuthority {
     }
 
     /// Apply already-machine-classified run-completion mechanics.
+    #[cfg(test)]
     pub(crate) fn run_completed(
         &mut self,
         contributing_work_ids: &[InputId],
@@ -454,6 +457,7 @@ impl RuntimeIngressAuthority {
 
     /// Replay contributors to the queue lanes chosen by the machine-owned
     /// replay classifier.
+    #[cfg(test)]
     pub(crate) fn replay_queued_contributors(
         &mut self,
         queue_work_ids: &[InputId],
@@ -750,6 +754,7 @@ impl RuntimeIngressAuthority {
         Ok((fields, effects))
     }
 
+    #[cfg(test)]
     fn eval_stage_drain_snapshot(
         &self,
         run_id: &RunId,
@@ -790,6 +795,7 @@ impl RuntimeIngressAuthority {
         Ok((fields, effects))
     }
 
+    #[cfg(test)]
     fn eval_boundary_applied(
         &self,
         contributing_work_ids: &[InputId],
@@ -812,6 +818,7 @@ impl RuntimeIngressAuthority {
         Ok((fields, effects))
     }
 
+    #[cfg(test)]
     fn eval_run_completed(
         &self,
         contributing_work_ids: &[InputId],
@@ -836,6 +843,7 @@ impl RuntimeIngressAuthority {
         Ok((fields, effects))
     }
 
+    #[cfg(test)]
     fn eval_replay_queued_contributors(
         &self,
         queue_work_ids: &[InputId],

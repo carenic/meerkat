@@ -1162,6 +1162,21 @@ The key gate is `make machine-verify` — TLC must stay green after every simpli
 If it breaks, the simplification is invalid and the counterexample trace tells you exactly
 why.
 
+## Current Stock-Take
+
+- The latest Mob runtime cut keeps semantic ownership aligned with the checked-in
+  two-machine model: production actor paths no longer use helper-owned lifecycle
+  mutator entry points, and both lower Mob authorities now receive canonical
+  top-level phase plus actor-owned run count on the live path.
+- The remaining direct mutator/table entry points in
+  `MobLifecycleAuthority`, `MobOrchestratorAuthority`, and the old
+  table-oriented ingress replay helpers are now test-only scaffolding for direct
+  table verification, not production semantic owners.
+- That puts the branch at the point where the next step is no longer another
+  obvious helper-authority cut; it is the real endgame sweep: full cargo/test,
+  e2e, clippy, TLC, and CI verification on the simplified machine/runtime
+  boundary.
+
 ## Relationship to the DSL
 
 Simplification is a prerequisite, not a dependency. The DSL works with any machine

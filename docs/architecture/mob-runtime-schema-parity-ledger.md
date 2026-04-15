@@ -363,5 +363,13 @@ Current state:
    `MobLifecycleAuthority` helper should persist as a separate realization table
    at all, or whether its residual legality can now be collapsed further under
    `MobMachine`.
-   authority and the lower topology service, plus any remaining top-level
-   lifecycle legality that still bypasses the checked-in machine.
+9. The current stock-taking cut closes the last production call sites that were
+   still using the helper-owned lifecycle mutator surface. Production actor
+   paths for `MarkCompleted`, `Destroy`, and `Resume` now go through
+   `apply_in_phase(..., machine_active_run_count, ...)`, which means both lower
+   Mob helpers are parameterized by canonical top-level phase and run-count
+   truth on the live path.
+10. The remaining helper-only mutation/table APIs in `MobLifecycleAuthority`,
+   `MobOrchestratorAuthority`, and `RuntimeIngressAuthority` are now explicitly
+   test-only. They still exist for direct table verification, but they are no
+   longer part of production semantic ownership.

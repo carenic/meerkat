@@ -166,6 +166,7 @@ impl MobOrchestratorFields {
 // Sealed mutator trait — only the authority implements this
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 mod sealed {
     pub trait Sealed {}
 }
@@ -175,6 +176,7 @@ mod sealed {
 /// Only [`MobOrchestratorAuthority`] implements this. Tests keep a
 /// phase-owning helper surface for direct table checks, but production code
 /// routes legality through [`MobOrchestratorAuthority::apply_in_phase`].
+#[cfg(test)]
 pub(crate) trait MobOrchestratorMutator: sealed::Sealed {
     /// Apply a typed input to the current machine state.
     ///
@@ -200,6 +202,7 @@ pub(crate) struct MobOrchestratorAuthority {
     fields: MobOrchestratorFields,
 }
 
+#[cfg(test)]
 impl sealed::Sealed for MobOrchestratorAuthority {}
 
 impl MobOrchestratorAuthority {
@@ -230,10 +233,10 @@ impl MobOrchestratorAuthority {
     ///
     /// Used during resume to restore the authority to the persisted phase
     /// rather than always starting in Creating.
-    pub(crate) fn with_phase(phase: MobState) -> Self {
+    pub(crate) fn with_phase(_phase: MobState) -> Self {
         Self {
             #[cfg(test)]
-            phase,
+            phase: _phase,
             fields: MobOrchestratorFields::default(),
         }
     }

@@ -5,7 +5,9 @@ use super::mob_lifecycle_authority::{MobLifecycleAuthority, MobLifecycleInput};
 use super::mob_member_bootstrap_authority::{
     MobMemberBootstrapAuthority, MobMemberBootstrapEffect, MobMemberBootstrapInput,
 };
-use super::mob_orchestrator_authority::{MobOrchestratorAuthority, MobOrchestratorInput};
+use super::mob_orchestrator_authority::{
+    MobOrchestratorAuthority, MobOrchestratorInput, MobOrchestratorTransition,
+};
 use super::mob_runtime_bridge_authority::{MobRuntimeBridgeAuthority, MobRuntimeBridgeEffect};
 use super::mob_wiring_authority::{
     ExternalUnwirePlan, ExternalWireInput, ExternalWirePlan, LocalUnwirePlan, LocalWirePlan,
@@ -373,17 +375,6 @@ impl MobActor {
         }
 
         Ok(true)
-    }
-
-    fn expect_state(&self, expected: &[MobState], to: MobState) -> Result<(), MobError> {
-        if expected.contains(&self.state()) {
-            Ok(())
-        } else {
-            Err(MobError::InvalidTransition {
-                from: self.state(),
-                to,
-            })
-        }
     }
 
     fn machine_active_run_count(&self) -> u32 {
@@ -4421,7 +4412,11 @@ impl MobActor {
                 })?;
         }
         self.lifecycle_authority
-            .apply(MobLifecycleInput::MarkCompleted)
+            .apply_in_phase(
+                phase,
+                self.machine_active_run_count(),
+                MobLifecycleInput::MarkCompleted,
+            )
             .map_err(|error| {
                 MobError::Internal(format!(
                     "lifecycle MarkCompleted transition failed during complete: {error}"
@@ -4469,7 +4464,11 @@ impl MobActor {
                 })?;
         }
         self.lifecycle_authority
-            .apply(MobLifecycleInput::Destroy)
+            .apply_in_phase(
+                phase,
+                self.machine_active_run_count(),
+                MobLifecycleInput::Destroy,
+            )
             .map_err(|error| {
                 MobError::Internal(format!(
                     "lifecycle Destroy transition failed during destroy: {error}"
@@ -4613,7 +4612,11 @@ impl MobActor {
             self.flow_engine.bind_topology_coordinator();
         }
         self.lifecycle_authority
-            .apply(MobLifecycleInput::Resume)
+            .apply_in_phase(
+                phase,
+                self.machine_active_run_count(),
+                MobLifecycleInput::Resume,
+            )
             .map_err(|error| {
                 MobError::Internal(format!(
                     "lifecycle Resume transition failed during reset: {error}"
