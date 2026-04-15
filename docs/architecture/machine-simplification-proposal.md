@@ -204,6 +204,10 @@ Hopcroft-style behavioral quotient over the reachable graph.
   the legal source phases for stop and the `Stopped` projection, while the
   driver only performs already-decided cleanup mechanics (abandoning
   non-terminal inputs, clearing queue state, and clearing silent intents).
+- Moved coarse destroy legality out of the driver as well: `MeerkatMachine`
+  already owned the public/state guardrails, and the driver now only realizes
+  the already-decided `Destroyed` cleanup instead of deciding whether destroy
+  is legal.
 - Taught the generated closed-world composition models to reject queued
   external entry packets that are no longer admissible for the current machine
   state, which removes seam deadlocks without widening the machine transition
@@ -256,6 +260,7 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | Meerkat `Recovering` is a transient / no-op top-level phase | passed / landed | Removed the unreachable top-level `Recovering` phase from the formal model, then removed `Recovering` from the runtime and wire surfaces as well. The live recover/recycle flow no longer depends on any handwritten helper recovery workflow. |
 | Driver-local run-start / run-return legality can stay below `MeerkatMachine` | rejected / landed | Moved active-run validation plus `current_run_id` / `pre_run_phase` writes/clears out of `EphemeralRuntimeDriver` and into the checked-in machine module. The driver now realizes ingress/ledger mechanics for `BoundaryApplied`, `RunCompleted`, and `RunFailed`, but it no longer decides whether a run may start or where it legally returns. |
 | Driver-local stop legality can stay below `MeerkatMachine` | rejected / landed | Moved stop legality into `MeerkatMachine`: the machine now owns the legal source phases and the `Stopped` projection, while driver stop paths are reduced to cleanup mechanics only. This removes another coarse lifecycle decision from `EphemeralRuntimeDriver` without introducing a new machine. |
+| Driver-local destroy legality can stay below `MeerkatMachine` | rejected / landed | Removed the coarse destroy legality check from `EphemeralRuntimeDriver`. The machine/control path already owns the legal source states, and the driver now only realizes the already-decided `Destroyed` cleanup mechanics. |
 | Meerkat pure queries should stay surfaced without formal transitions | passed / landed | Moved the read-only helper/query family into `surface_only_inputs`; runtime/schema audits stayed green and Meerkat TLC generated states dropped from 3,668,832 to 3,113,272 while the raw/phase quotients stayed at 385 / 390. |
 | Meerkat committed visibility publication progress should not stay as top-level shadow state | passed / landed | Removed `committed_visibility_revision` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 59,371 to 45,610 while the raw/phase quotients stayed at 385 / 390. |
 | Meerkat visibility witness provenance should not stay as top-level shadow state | passed / landed | Removed `requested_witnesses` and `filter_witnesses` from the formal state; exact audited parity stayed green and Meerkat TLC distinct states fell from 45,610 to 15,809 while the raw/phase quotients still held at 385 / 390. |

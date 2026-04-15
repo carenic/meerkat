@@ -102,6 +102,10 @@ Current state:
   while driver stop paths only execute the already-decided cleanup mechanics
   (abandoning non-terminal inputs, clearing queue state, clearing silent
   intents)
+- coarse destroy legality no longer lives in the driver either: the machine
+  already owns the legal source states and binding guardrails for destroy, and
+  the driver now only realizes the already-decided `Destroyed` cleanup
+  mechanics
 - attached steered `AcceptWithCompletion` is no longer treated as a queue-only
   self-loop in the formal model: when `request_immediate_processing=true`, the
   checked-in Meerkat machine now models the runtime’s `Attached -> Running`

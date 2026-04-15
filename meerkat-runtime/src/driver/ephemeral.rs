@@ -832,33 +832,17 @@ impl EphemeralRuntimeDriver {
         })
     }
 
-    pub fn destroy(&mut self) -> Result<usize, RuntimeDriverError> {
-        match self.phase {
-            RuntimeState::Initializing
-            | RuntimeState::Idle
-            | RuntimeState::Attached
-            | RuntimeState::Running
-            | RuntimeState::Retired
-            | RuntimeState::Stopped => {
-                self.current_run_id = None;
-                self.pre_run_phase = None;
-                self.transition_phase(RuntimeState::Destroyed);
-            }
-            from => {
-                return Err(RuntimeDriverError::Internal(
-                    crate::runtime_state::RuntimeStateTransitionError {
-                        from,
-                        to: RuntimeState::Destroyed,
-                    }
-                    .to_string(),
-                ));
-            }
-        }
+    pub(crate) fn destroy_cleanup(&mut self) -> usize {
         let abandoned = self.abandon_all_non_terminal(InputAbandonReason::Destroyed);
         self.silent_comms_intents.clear();
         self.rebuild_queue_projections();
         self.debug_assert_queue_projection_alignment();
-        Ok(abandoned)
+        abandoned
+    }
+
+    pub fn destroy(&mut self) -> Result<usize, RuntimeDriverError> {
+        self.set_control_projection(RuntimeState::Destroyed, None, None);
+        Ok(self.destroy_cleanup())
     }
 
     pub(crate) fn stop_runtime_cleanup(&mut self) {
