@@ -47,7 +47,21 @@ pub(crate) enum MobLifecycleInput {
     Destroy,
     StartRun,
     FinishRun,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "cleanup markers retained only for lower-authority table tests after production reset flow stopped using them"
+        )
+    )]
     BeginCleanup,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "cleanup markers retained only for lower-authority table tests after production reset flow stopped using them"
+        )
+    )]
     FinishCleanup,
 }
 
@@ -63,6 +77,13 @@ pub(crate) enum MobLifecycleInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MobLifecycleEffect {
     EmitLifecycleNotice,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "cleanup request effect retained only for lower-authority table tests after production reset flow stopped using it"
+        )
+    )]
     RequestCleanup,
 }
 

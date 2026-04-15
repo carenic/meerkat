@@ -299,6 +299,13 @@ Current state:
   Stored lifecycle phase now remains only as test scaffolding, while production
   lifecycle authority is reduced to field updates plus shared-state publication
   parameterized by the actor's canonical phase.
+- The next cleanup-focused cut removes the last production use of the lifecycle
+  helper's `cleanup_pending` mini-state: reset no longer drives
+  `BeginCleanup` / `FinishCleanup`, so `cleanup_pending` and `RequestCleanup`
+  are now effectively lower-authority test scaffolding rather than live runtime
+  behavior. The top-level checked-in `MobMachine` had already dropped
+  `cleanup_pending`, and production runtime behavior no longer pays rent for it
+  below that boundary either.
 
 ## Notes
 
@@ -333,5 +340,8 @@ Current state:
    legality in `MobLifecycleAuthority` still needs to exist as a separate lower
    authority at all, or whether the next largest win is to collapse more of its
    run-count / cleanup semantics directly under `MobMachine`.
+7. After removing production cleanup choreography, the strongest remaining
+   lifecycle-helper field is `active_run_count`, which now looks like the only
+   live lower-authority state still shaping run completion semantics.
    authority and the lower topology service, plus any remaining top-level
    lifecycle legality that still bypasses the checked-in machine.

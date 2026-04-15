@@ -4572,20 +4572,6 @@ impl MobActor {
             self.flow_engine.bind_topology_coordinator();
         }
         self.lifecycle_authority
-            .apply(MobLifecycleInput::BeginCleanup)
-            .map_err(|error| {
-                MobError::Internal(format!(
-                    "lifecycle BeginCleanup transition failed during reset: {error}"
-                ))
-            })?;
-        self.lifecycle_authority
-            .apply(MobLifecycleInput::FinishCleanup)
-            .map_err(|error| {
-                MobError::Internal(format!(
-                    "lifecycle FinishCleanup transition failed during reset: {error}"
-                ))
-            })?;
-        self.lifecycle_authority
             .apply(MobLifecycleInput::Resume)
             .map_err(|error| {
                 MobError::Internal(format!(
