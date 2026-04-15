@@ -122,7 +122,7 @@ impl EphemeralRuntimeDriver {
     pub fn new(runtime_id: LogicalRuntimeId) -> Self {
         Self {
             runtime_id,
-            control: RuntimeControlAuthority::from_state(RuntimeState::Idle),
+            control: RuntimeControlAuthority::new_idle(),
             ledger: InputLedger::new(),
             queue: InputQueue::new(),
             steer_queue: InputQueue::new(),

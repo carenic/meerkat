@@ -161,8 +161,41 @@ impl RuntimeControlAuthority {
         }
     }
 
-    /// Create an authority initialized to a specific phase (for recovery).
-    pub fn from_state(phase: RuntimeState) -> Self {
+    /// Create an authority in the live Idle state used by fresh drivers.
+    pub fn new_idle() -> Self {
+        Self {
+            phase: RuntimeState::Idle,
+            fields: RuntimeControlFields {
+                current_run_id: None,
+                pre_run_phase: None,
+            },
+        }
+    }
+
+    /// Create an authority from an explicitly restored compatibility state.
+    ///
+    /// This intentionally supports only the narrow public compatibility shell
+    /// we still preserve outside the checked-in `MeerkatMachine`.
+    pub fn from_restored_compatibility_state(
+        phase: RuntimeState,
+    ) -> Result<Self, RuntimeStateTransitionError> {
+        match phase {
+            RuntimeState::Recovering | RuntimeState::Destroyed => Ok(Self {
+                phase,
+                fields: RuntimeControlFields {
+                    current_run_id: None,
+                    pre_run_phase: None,
+                },
+            }),
+            _ => Err(RuntimeStateTransitionError {
+                from: phase,
+                to: phase,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_state_for_test(phase: RuntimeState) -> Self {
         Self {
             phase,
             fields: RuntimeControlFields {
@@ -965,7 +998,9 @@ mod tests {
 
     #[test]
     fn resume_from_explicit_recovering() {
-        let mut auth = RuntimeControlAuthority::from_state(RuntimeState::Recovering);
+        let mut auth =
+            RuntimeControlAuthority::from_restored_compatibility_state(RuntimeState::Recovering)
+                .unwrap();
         let t = auth.apply(RuntimeControlInput::ResumeRequested).unwrap();
         assert_eq!(t.next_phase, RuntimeState::Idle);
     }
@@ -974,6 +1009,23 @@ mod tests {
     fn resume_rejected_from_idle() {
         let mut auth = make_idle();
         assert!(auth.apply(RuntimeControlInput::ResumeRequested).is_err());
+    }
+
+    #[test]
+    fn restored_compatibility_state_rejects_live_phases() {
+        for phase in [
+            RuntimeState::Initializing,
+            RuntimeState::Idle,
+            RuntimeState::Attached,
+            RuntimeState::Running,
+            RuntimeState::Retired,
+            RuntimeState::Stopped,
+        ] {
+            assert!(
+                RuntimeControlAuthority::from_restored_compatibility_state(phase).is_err(),
+                "live phase {phase} should not be restorable through compatibility constructor"
+            );
+        }
     }
 
     // --- ExternalToolDeltaReceived ---
@@ -987,7 +1039,7 @@ mod tests {
             RuntimeState::Recovering,
             RuntimeState::Retired,
         ] {
-            let mut auth = RuntimeControlAuthority::from_state(init_phase);
+            let mut auth = RuntimeControlAuthority::from_state_for_test(init_phase);
             // For Running, we need a run_id to be valid
             if init_phase == RuntimeState::Running {
                 auth.fields.current_run_id = Some(RunId::new());
@@ -1117,7 +1169,7 @@ mod tests {
             RuntimeState::Retired,
             RuntimeState::Stopped,
         ] {
-            let mut auth = RuntimeControlAuthority::from_state(phase);
+            let mut auth = RuntimeControlAuthority::from_state_for_test(phase);
             let t = auth
                 .apply(RuntimeControlInput::DestroyRequested)
                 .unwrap_or_else(|_| panic!("destroy should work from {phase}"));
@@ -1127,7 +1179,9 @@ mod tests {
 
     #[test]
     fn destroy_from_destroyed_is_rejected() {
-        let mut auth = RuntimeControlAuthority::from_state(RuntimeState::Destroyed);
+        let mut auth =
+            RuntimeControlAuthority::from_restored_compatibility_state(RuntimeState::Destroyed)
+                .unwrap();
         assert!(auth.apply(RuntimeControlInput::DestroyRequested).is_err());
     }
 }
