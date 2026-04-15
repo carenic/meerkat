@@ -104,7 +104,7 @@ fn renders_machine_mapping_coverage_with_named_items() {
     assert!(rendered.contains("### Scenarios"));
     assert!(rendered.contains("### Transitions"));
     assert!(rendered.contains("- `PrepareBindingsInitializing`"));
-    assert!(rendered.contains("- `drain_requires_ingress_context`"));
+    assert!(rendered.contains("- `bind-run-boundary-terminal`"));
 }
 
 #[test]

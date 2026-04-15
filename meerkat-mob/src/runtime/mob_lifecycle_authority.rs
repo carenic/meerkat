@@ -208,16 +208,6 @@ impl MobLifecycleAuthority {
     }
 
     #[cfg(test)]
-    #[cfg(test)]
-    pub(crate) fn snapshot(&self) -> MobLifecycleSnapshot {
-        MobLifecycleSnapshot {
-            phase: self.phase,
-            active_run_count: self.fields.active_run_count,
-            cleanup_pending: self.fields.cleanup_pending,
-        }
-    }
-
-    #[cfg(test)]
     pub(crate) fn snapshot_in_phase(
         &self,
         phase: MobState,

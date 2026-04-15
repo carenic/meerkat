@@ -411,7 +411,7 @@ impl MobActor {
 
     fn machine_coordinator_bound(&self) -> bool {
         self.machine_orchestrator_snapshot(self.state())
-            .map_or(true, |snapshot| snapshot.coordinator_bound)
+            .is_none_or(|snapshot| snapshot.coordinator_bound)
     }
 
     fn require_mob_machine_stop(&self) -> Result<(), MobError> {

@@ -546,8 +546,8 @@ impl MobOrchestratorAuthority {
         let (next_phase, next_fields, next_active_flow_count, effects) =
             self.evaluate_in_phase(phase, active_flow_count, input)?;
 
-        self.fields.active_flow_count = next_active_flow_count;
         self.fields = next_fields;
+        self.fields.active_flow_count = next_active_flow_count;
 
         Ok(MobOrchestratorTransition {
             next_phase,
@@ -567,8 +567,8 @@ impl MobOrchestratorMutator for MobOrchestratorAuthority {
 
         // Commit: update canonical state.
         self.phase = next_phase;
-        self.fields.active_flow_count = next_active_flow_count;
         self.fields = next_fields;
+        self.fields.active_flow_count = next_active_flow_count;
 
         Ok(MobOrchestratorTransition {
             next_phase,
