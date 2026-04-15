@@ -134,6 +134,28 @@ pub struct EphemeralRuntimeDriver {
 }
 
 impl EphemeralRuntimeDriver {
+    fn read_control_projection(&self) -> std::sync::RwLockReadGuard<'_, RuntimeControlProjection> {
+        match self.control.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!("runtime control projection lock poisoned");
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn write_control_projection(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, RuntimeControlProjection> {
+        match self.control.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!("runtime control projection lock poisoned");
+                poisoned.into_inner()
+            }
+        }
+    }
+
     pub fn new(runtime_id: LogicalRuntimeId) -> Self {
         Self::new_with_control(
             runtime_id,
@@ -163,10 +185,7 @@ impl EphemeralRuntimeDriver {
     }
 
     fn control_snapshot(&self) -> RuntimeControlProjection {
-        self.control
-            .read()
-            .expect("runtime control projection lock poisoned")
-            .clone()
+        self.read_control_projection().clone()
     }
 
     pub fn set_silent_comms_intents(&mut self, intents: Vec<String>) {
@@ -471,10 +490,7 @@ impl EphemeralRuntimeDriver {
     }
 
     fn set_phase(&mut self, next_phase: RuntimeState) -> RuntimeState {
-        let mut control = self
-            .control
-            .write()
-            .expect("runtime control projection lock poisoned");
+        let mut control = self.write_control_projection();
         let from_phase = control.phase;
         control.phase = next_phase;
         from_phase
@@ -494,18 +510,12 @@ impl EphemeralRuntimeDriver {
         current_run_id: Option<RunId>,
         pre_run_phase: Option<RuntimeState>,
     ) {
-        if self.control_snapshot().phase != next_phase {
-            self.transition_phase(next_phase);
+        if self.control_snapshot().phase == next_phase {
+            self.write_control_projection().phase = next_phase;
         } else {
-            self.control
-                .write()
-                .expect("runtime control projection lock poisoned")
-                .phase = next_phase;
+            self.transition_phase(next_phase);
         }
-        let mut control = self
-            .control
-            .write()
-            .expect("runtime control projection lock poisoned");
+        let mut control = self.write_control_projection();
         control.current_run_id = current_run_id;
         control.pre_run_phase = pre_run_phase;
     }

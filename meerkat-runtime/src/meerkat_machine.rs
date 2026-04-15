@@ -213,10 +213,10 @@ impl DriverEntry {
     ) {
         match self {
             DriverEntry::Ephemeral(d) => {
-                d.set_control_projection(next_phase, current_run_id, pre_run_phase)
+                d.set_control_projection(next_phase, current_run_id, pre_run_phase);
             }
             DriverEntry::Persistent(d) => {
-                d.set_control_projection(next_phase, current_run_id, pre_run_phase)
+                d.set_control_projection(next_phase, current_run_id, pre_run_phase);
             }
         }
     }
@@ -487,10 +487,10 @@ fn machine_validate_stage_drain_snapshot(
     }
 
     let ingress = driver.ingress();
-    let source_queue = if !ingress.steer_queue().is_empty() {
-        ingress.steer_queue()
-    } else {
+    let source_queue = if ingress.steer_queue().is_empty() {
         ingress.queue()
+    } else {
+        ingress.steer_queue()
     };
     if !slice_starts_with(source_queue, contributing_work_ids) {
         return Err(RuntimeDriverError::Internal(
@@ -3766,8 +3766,11 @@ impl MeerkatMachine {
         let control_projection = driver
             .control_projection_handle()
             .read()
-            .expect("runtime control projection lock poisoned")
-            .clone();
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|poisoned| {
+                tracing::error!("runtime control projection lock poisoned");
+                poisoned.into_inner().clone()
+            });
         let control = MeerkatControlSnapshot {
             phase: control_projection.phase,
             current_run_id: control_projection.current_run_id,
