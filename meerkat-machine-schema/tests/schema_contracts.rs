@@ -273,11 +273,7 @@ fn meerkat_machine_merges_turn_admission_tool_visibility_and_peer_directory_stat
         .map(|variant| variant.name.as_str())
         .collect::<Vec<_>>();
 
-    for required in [
-        "current_run_id",
-        "silent_intent_overrides",
-        "staged_visibility_revision",
-    ] {
+    for required in ["current_run_id", "silent_intent_overrides"] {
         assert!(
             field_names.iter().any(|name| name == &required),
             "MeerkatMachine state should retain absorbed field {required}"

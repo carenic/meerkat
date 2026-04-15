@@ -186,6 +186,12 @@ Current state:
   active revision still lives in the lower-authority visibility owner. TLC
   stayed green, the raw quotient dropped from `340` to `260`, and the truthful
   Meerkat graph fell again from `3,835` to `1,773` reachable states.
+- Fast-loop landed: `staged_visibility_revision` was removed from the
+  checked-in Meerkat state too. The machine now treats visibility publication
+  as pure publish-time legality over owner-provided revision inputs rather than
+  as top-level mirrored revision state. TLC stayed green, the raw quotient
+  dropped again from `260` to `196`, and the truthful Meerkat graph fell from
+  `1,773` to `742` reachable states.
 
 ## Full-row Snapshot (2026-04-15)
 

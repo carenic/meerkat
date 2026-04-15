@@ -130,9 +130,9 @@ fn session_tool_visibility_kernel_stages_deferred_requests_without_touching_acti
     .expect("request deferred tools")
     .next_state;
 
-    assert_eq!(
-        requested.fields.get("staged_visibility_revision"),
-        Some(&KernelValue::U64(1))
+    assert!(
+        !requested.fields.contains_key("staged_visibility_revision"),
+        "top-level machine should no longer mirror staged visibility revision",
     );
     assert!(
         !requested.fields.contains_key("active_visibility_revision"),

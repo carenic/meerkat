@@ -62,7 +62,6 @@ pub fn meerkat_machine() -> MachineSchema {
                     "silent_intent_overrides",
                     TypeRef::Set(Box::new(TypeRef::String)),
                 ),
-                field("staged_visibility_revision", TypeRef::U64),
             ],
             init: InitSchema {
                 phase: "Initializing".into(),
@@ -75,7 +74,6 @@ pub fn meerkat_machine() -> MachineSchema {
                     init("current_run_id", Expr::None),
                     init("pre_run_phase", Expr::None),
                     init("silent_intent_overrides", Expr::EmptySet),
-                    init("staged_visibility_revision", Expr::U64(0)),
                 ],
             },
             terminal_phases: vec!["Destroyed".into()],
@@ -228,15 +226,8 @@ pub fn meerkat_machine() -> MachineSchema {
                         "tool_visibility_delta".into(),
                     ],
                 },
-                guards: vec![
-                    session_registered_guard(),
-                    runtime_is_bound_guard(),
-                    reconfigure_visibility_revision_guard(),
-                ],
-                updates: vec![Update::Assign {
-                    field: "staged_visibility_revision".into(),
-                    expr: Expr::Binding("next_active_visibility_revision".into()),
-                }],
+                guards: vec![session_registered_guard(), runtime_is_bound_guard()],
+                updates: vec![],
                 to: "Attached".into(),
                 emit: vec![],
             },
@@ -259,15 +250,8 @@ pub fn meerkat_machine() -> MachineSchema {
                         "tool_visibility_delta".into(),
                     ],
                 },
-                guards: vec![
-                    session_registered_guard(),
-                    runtime_is_bound_guard(),
-                    reconfigure_visibility_revision_guard(),
-                ],
-                updates: vec![Update::Assign {
-                    field: "staged_visibility_revision".into(),
-                    expr: Expr::Binding("next_active_visibility_revision".into()),
-                }],
+                guards: vec![session_registered_guard(), runtime_is_bound_guard()],
+                updates: vec![],
                 to: "Running".into(),
                 emit: vec![],
             },
@@ -475,13 +459,7 @@ pub fn meerkat_machine() -> MachineSchema {
                     variant: "BoundaryApplied".into(),
                     bindings: vec!["revision".into()],
                 },
-                guards: vec![Guard {
-                    name: "revision_not_ahead_of_staged".into(),
-                    expr: Expr::Lte(
-                        Box::new(Expr::Binding("revision".into())),
-                        Box::new(Expr::Field("staged_visibility_revision".into())),
-                    ),
-                }],
+                guards: vec![],
                 updates: vec![],
                 to: "Running".into(),
                 emit: vec![EffectEmit {
@@ -705,10 +683,6 @@ fn reset_session_state() -> Vec<Update> {
             field: "pre_run_phase".into(),
             expr: Expr::None,
         },
-        Update::Assign {
-            field: "staged_visibility_revision".into(),
-            expr: Expr::U64(0),
-        },
     ]
 }
 
@@ -839,10 +813,7 @@ fn stage_persistent_filter_transition(name: &str, phase: &str) -> TransitionSche
             bindings: vec!["filter".into(), "witnesses".into()],
         },
         guards: vec![session_registered_guard()],
-        updates: vec![Update::Assign {
-            field: "staged_visibility_revision".into(),
-            expr: next_staged_visibility_revision_expr(),
-        }],
+        updates: vec![],
         to: phase.into(),
         emit: vec![],
     }
@@ -858,10 +829,7 @@ fn request_deferred_tools_transition(name: &str, phase: &str) -> TransitionSchem
             bindings: vec!["names".into(), "witnesses".into()],
         },
         guards: vec![session_registered_guard()],
-        updates: vec![Update::Assign {
-            field: "staged_visibility_revision".into(),
-            expr: next_staged_visibility_revision_expr(),
-        }],
+        updates: vec![],
         to: phase.into(),
         emit: vec![],
     }
@@ -926,10 +894,7 @@ fn publish_committed_visible_set_transition(name: &str, phase: &str) -> Transiti
                 },
             },
         ],
-        updates: vec![Update::Assign {
-            field: "staged_visibility_revision".into(),
-            expr: Expr::Binding("staged_visibility_revision".into()),
-        }],
+        updates: vec![],
         to: phase.into(),
         emit: vec![EffectEmit {
             variant: "CommittedVisibleSetPublished".into(),
@@ -938,29 +903,6 @@ fn publish_committed_visible_set_transition(name: &str, phase: &str) -> Transiti
                 Expr::Binding("active_visibility_revision".into()),
             )]),
         }],
-    }
-}
-
-fn next_staged_visibility_revision_expr() -> Expr {
-    Expr::Add(
-        Box::new(Expr::Field("staged_visibility_revision".into())),
-        Box::new(Expr::U64(1)),
-    )
-}
-
-fn reconfigure_visibility_revision_guard() -> Guard {
-    Guard {
-        name: "reconfigure_visibility_revision_is_stable_or_bumped".into(),
-        expr: Expr::Or(vec![
-            Expr::Eq(
-                Box::new(Expr::Binding("next_active_visibility_revision".into())),
-                Box::new(Expr::Field("staged_visibility_revision".into())),
-            ),
-            Expr::Eq(
-                Box::new(Expr::Binding("next_active_visibility_revision".into())),
-                Box::new(next_staged_visibility_revision_expr()),
-            ),
-        ]),
     }
 }
 

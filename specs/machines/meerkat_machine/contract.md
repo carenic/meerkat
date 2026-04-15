@@ -15,7 +15,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `current_run_id`: `Option<RunId>`
 - `pre_run_phase`: `Option<String>`
 - `silent_intent_overrides`: `Set<String>`
-- `staged_visibility_revision`: `u64`
 
 ## Inputs
 - `RegisterSession`(session_id: SessionId)
@@ -208,7 +207,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `session_registered`
   - `runtime_is_bound`
-  - `reconfigure_visibility_revision_is_stable_or_bumped`
 - To: `Attached`
 
 ### `ReconfigureSessionLlmIdentityRunning`
@@ -217,7 +215,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `session_registered`
   - `runtime_is_bound`
-  - `reconfigure_visibility_revision_is_stable_or_bumped`
 - To: `Running`
 
 ### `StagePersistentFilterIdle`
@@ -436,8 +433,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ### `BoundaryAppliedPublish`
 - From: `Running`
 - On: `BoundaryApplied`(revision)
-- Guards:
-  - `revision_not_ahead_of_staged`
 - Emits: `CommittedVisibleSetPublished`
 - To: `Running`
 

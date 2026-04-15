@@ -10444,11 +10444,11 @@ async fn modeled_stage_persistent_filter_matches_runtime_after_active_ahead_reco
             .contains_key("active_visibility_revision"),
         "top-level machine should no longer mirror active visibility revision",
     );
-    assert_eq!(
-        before
+    assert!(
+        !before
             .formal_available_fields
-            .get("staged_visibility_revision"),
-        Some(&"0".to_string())
+            .contains_key("staged_visibility_revision"),
+        "top-level machine should no longer mirror staged visibility revision",
     );
 
     let input = runtime_modeled_kernel_input(

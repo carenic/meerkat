@@ -3969,7 +3969,7 @@ impl MeerkatMachine {
             detached_wake_pending,
             detached_wake_signaled,
             epoch_id,
-            visibility_state,
+            _visibility_state,
         ) = {
             let sessions = self.sessions.read().await;
             let entry = sessions.get(session_id)?;
@@ -4200,11 +4200,6 @@ impl MeerkatMachine {
                         .collect::<BTreeSet<_>>(),
                 ),
             );
-            available_fields.insert(
-                "staged_visibility_revision".into(),
-                formal_projection_value(&visibility_state.staged_revision),
-            );
-
             MeerkatFormalStateProjection {
                 available_fields,
                 unavailable_fields: vec!["active_fence_token".into(), "active_generation".into()],
