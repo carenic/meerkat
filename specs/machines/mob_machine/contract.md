@@ -10,7 +10,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `active_member_count`: `u32`
 - `active_run_count`: `u32`
 - `pending_spawn_count`: `u32`
-- `retiring_member_count`: `u32`
 - `wiring_edge_count`: `u32`
 - `coordinator_bound`: `Bool`
 
@@ -121,7 +120,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `EmitTaskNotice`
 
 ## Invariants
-- `retiring_members_do_not_exceed_active_members`
 
 ## Transitions
 ### `SpawnRunning`
@@ -550,7 +548,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `Retire`(agent_runtime_id)
 - Guards:
   - `active_members_present`
-  - `unretired_members_present`
 - Emits: `RequestRuntimeRetire`
 - To: `Running`
 
@@ -559,7 +556,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `Retire`(agent_runtime_id)
 - Guards:
   - `active_members_present`
-  - `unretired_members_present`
 - Emits: `RequestRuntimeRetire`
 - To: `Stopped`
 

@@ -65,6 +65,10 @@ Current state:
   shadow trio `active_identity`, `active_runtime_id`, or `active_fence_token`;
   the remaining `SubmitWork` / flow-start guards now use the authoritative
   active-member counters instead
+- the formal machine no longer carries the dead `retiring_member_count`
+  counter; the retire path now relies directly on `active_member_count`, and
+  the truthful Hopcroft/TLC readout stayed flat because the removed counter was
+  never carrying independent behavior
 - the generated `meerkat_mob_seam` composition now rejects inadmissible queued
   external entry packets instead of deadlocking after terminal Mob shutdown
 
@@ -122,6 +126,14 @@ Current state:
   to `770 -> 138 -> 140 -> 770`, which means the removed fields were still
   contributing artificial labeled distinctions rather than core lifecycle
   behavior.
+- The next tranche removed the dead `retiring_member_count` counter from the
+  top-level formal state and simplified the retire guards/updates to rely on
+  `active_member_count`.
+- That cut also stayed green on the exact lifecycle triangle, and the truthful
+  raw/phase/full Hopcroft readout stayed exactly flat at
+  `770 -> 138 -> 140 -> 770`, which means `retiring_member_count` was fully
+  correlated with the remaining state and never carried independent labeled
+  behavior.
 
 ## Pair Ledger
 
@@ -144,7 +156,7 @@ Current state:
   raw `770 -> 138`, phase `770 -> 140`, full `770 -> 770`.
 - The dominant mixed block (`347` states) is now split primarily by
   `pending_spawn_count`, `wiring_edge_count`, `active_run_count`,
-  `active_member_count`, `coordinator_bound`, and `retiring_member_count`.
+  `active_member_count`, and `coordinator_bound`.
 
 ## Notes
 
@@ -157,7 +169,7 @@ Current state:
 
 ## Next Loop
 
-1. Re-check whether any of the remaining six Mob counter/coordinator fields are
+1. Re-check whether any of the remaining five Mob counter/coordinator fields are
    still representational shadow, or whether the Mob machine is now at its real
    lifecycle/orchestration core.
 2. Keep the same parity-plus-Hopcroft loop as the gate before making broader

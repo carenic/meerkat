@@ -299,9 +299,7 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - scenarios: `spawn-work-terminal`, `retire-respawn-destroy`
 
 ### Invariants
-- `retiring_members_do_not_exceed_active_members`
-  - anchors: `mob_handle_surface`, `mob_actor_authority`
-  - scenarios: `spawn-work-terminal`, `retire-respawn-destroy`
+- `(none)`
 
 
 <!-- GENERATED_COVERAGE_END -->

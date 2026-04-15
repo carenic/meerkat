@@ -413,7 +413,6 @@ fn mob_machine_merges_flow_task_wiring_and_runtime_bridge_state() {
 
     for required in [
         "pending_spawn_count",
-        "retiring_member_count",
         "wiring_edge_count",
         "coordinator_bound",
     ] {

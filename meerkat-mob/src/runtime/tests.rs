@@ -17254,7 +17254,6 @@ struct MobRuntimeParitySnapshotSummary {
     phase: String,
     active_member_count: usize,
     all_member_count: usize,
-    retiring_member_count: usize,
     wiring_edge_count: usize,
     task_count: Option<usize>,
     coordinator_bound: Option<bool>,
@@ -17694,13 +17693,8 @@ async fn mob_runtime_parity_snapshot_summary(
     let phase = handle.status();
     let active_members = handle.list_members().await;
     let all_members = handle.list_all_members().await;
-    let including_retiring = handle.list_members_including_retiring().await;
     let tasks = handle.task_list().await.ok();
     let orchestrator = handle.debug_orchestrator_snapshot().await.ok();
-    let retiring_member_count = including_retiring
-        .iter()
-        .filter(|entry| entry.state == crate::roster::MemberState::Retiring)
-        .count();
     let wiring_edge_count = mob_runtime_parity_wiring_edge_count(&all_members);
     let representative = active_members
         .iter()
@@ -17738,10 +17732,6 @@ async fn mob_runtime_parity_snapshot_summary(
         .expect("serialize pending_spawn_count"),
     );
     formal_available_fields.insert(
-        "retiring_member_count".into(),
-        serde_json::to_string(&retiring_member_count).expect("serialize retiring_member_count"),
-    );
-    formal_available_fields.insert(
         "wiring_edge_count".into(),
         serde_json::to_string(&wiring_edge_count).expect("serialize wiring_edge_count"),
     );
@@ -17768,7 +17758,6 @@ async fn mob_runtime_parity_snapshot_summary(
         phase: phase.as_str().to_string(),
         active_member_count: active_members.len(),
         all_member_count: all_members.len(),
-        retiring_member_count,
         wiring_edge_count,
         task_count: tasks.as_ref().map(std::vec::Vec::len),
         coordinator_bound: orchestrator

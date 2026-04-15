@@ -2,8 +2,8 @@ use indexmap::IndexMap;
 
 use crate::{
     EffectDisposition, EffectDispositionRule, EffectEmit, EnumSchema, Expr, FieldSchema, Guard,
-    InitSchema, InputMatch, InvariantSchema, MachineSchema, RustBinding, StateSchema,
-    TransitionSchema, TypeRef, Update, VariantSchema, machine::TriggerKind,
+    InitSchema, InputMatch, MachineSchema, RustBinding, StateSchema, TransitionSchema, TypeRef,
+    Update, VariantSchema, machine::TriggerKind,
 };
 
 pub fn mob_machine() -> MachineSchema {
@@ -32,7 +32,6 @@ pub fn mob_machine() -> MachineSchema {
                 field("active_member_count", TypeRef::U32),
                 field("active_run_count", TypeRef::U32),
                 field("pending_spawn_count", TypeRef::U32),
-                field("retiring_member_count", TypeRef::U32),
                 field("wiring_edge_count", TypeRef::U32),
                 field("coordinator_bound", TypeRef::Bool),
             ],
@@ -42,7 +41,6 @@ pub fn mob_machine() -> MachineSchema {
                     init("active_member_count", Expr::U64(0)),
                     init("active_run_count", Expr::U64(0)),
                     init("pending_spawn_count", Expr::U64(0)),
-                    init("retiring_member_count", Expr::U64(0)),
                     init("wiring_edge_count", Expr::U64(0)),
                     init("coordinator_bound", Expr::Bool(false)),
                 ],
@@ -99,13 +97,7 @@ pub fn mob_machine() -> MachineSchema {
         },
         helpers: vec![],
         derived: vec![],
-        invariants: vec![InvariantSchema {
-            name: "retiring_members_do_not_exceed_active_members".into(),
-            expr: Expr::Lte(
-                Box::new(Expr::Field("retiring_member_count".into())),
-                Box::new(Expr::Field("active_member_count".into())),
-            ),
-        }],
+        invariants: vec![],
         transitions: vec![
             // Spawn is a Running self-loop: the real runtime starts in Running
             // and does not expose a durable pre-start top-level phase.
@@ -1108,22 +1100,7 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
     });
 
     // Retire: per-phase self-loops for Running and Stopped
-    let retire_guards = vec![
-        Guard {
-            name: "active_members_present".into(),
-            expr: Expr::Gt(
-                Box::new(Expr::Field("active_member_count".into())),
-                Box::new(Expr::U64(0)),
-            ),
-        },
-        Guard {
-            name: "unretired_members_present".into(),
-            expr: Expr::Gt(
-                Box::new(Expr::Field("active_member_count".into())),
-                Box::new(Expr::Field("retiring_member_count".into())),
-            ),
-        },
-    ];
+    let retire_guards = vec![active_members_present_guard()];
     for phase in ["Running", "Stopped"] {
         transitions.push(TransitionSchema {
             name: format!("Retire{phase}"),
@@ -1134,16 +1111,10 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
                 bindings: vec!["agent_runtime_id".into()],
             },
             guards: retire_guards.clone(),
-            updates: vec![
-                Update::Decrement {
-                    field: "active_member_count".into(),
-                    amount: 1,
-                },
-                Update::Assign {
-                    field: "retiring_member_count".into(),
-                    expr: Expr::U64(0),
-                },
-            ],
+            updates: vec![Update::Decrement {
+                field: "active_member_count".into(),
+                amount: 1,
+            }],
             to: phase.into(),
             emit: vec![runtime_observation_emit("RequestRuntimeRetire")],
         });
@@ -1160,16 +1131,10 @@ fn absorbed_mob_transitions() -> Vec<TransitionSchema> {
                 bindings: vec![],
             },
             guards: vec![],
-            updates: vec![
-                Update::Assign {
-                    field: "active_member_count".into(),
-                    expr: Expr::U64(0),
-                },
-                Update::Assign {
-                    field: "retiring_member_count".into(),
-                    expr: Expr::U64(0),
-                },
-            ],
+            updates: vec![Update::Assign {
+                field: "active_member_count".into(),
+                expr: Expr::U64(0),
+            }],
             to: phase.into(),
             emit: vec![lifecycle_notice_emit("retiring")],
         });
@@ -1330,16 +1295,10 @@ fn set_bool(field: &str, value: bool) -> Update {
 
 fn reset_member_runtime_updates() -> Vec<Update> {
     let mut updates = clear_runtime_projection_updates();
-    updates.extend(vec![
-        Update::Assign {
-            field: "pending_spawn_count".into(),
-            expr: Expr::U64(0),
-        },
-        Update::Assign {
-            field: "retiring_member_count".into(),
-            expr: Expr::U64(0),
-        },
-    ]);
+    updates.extend(vec![Update::Assign {
+        field: "pending_spawn_count".into(),
+        expr: Expr::U64(0),
+    }]);
     updates
 }
 
@@ -1352,10 +1311,6 @@ fn reset_mob_projection_updates_with_coordinator(coordinator_bound: bool) -> Vec
     updates.extend(vec![
         Update::Assign {
             field: "pending_spawn_count".into(),
-            expr: Expr::U64(0),
-        },
-        Update::Assign {
-            field: "retiring_member_count".into(),
             expr: Expr::U64(0),
         },
         Update::Assign {
