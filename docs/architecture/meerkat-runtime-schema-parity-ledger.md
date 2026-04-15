@@ -75,6 +75,10 @@ Current state:
   exact full-row pair parity stayed green across the current 10-pair frontier
 - `current_run_id` is now absorbed back into the top-level Meerkat formal
   state and clears on the same terminal/control paths as the live runtime
+- the driver no longer carries a private `RunReturnPhase` shadow enum for
+  coarse run return; the remaining `pre_run_phase` bookkeeping now uses the
+  same real `RuntimeState` projection (`Idle` / `Attached` / `Retired`) that
+  the checked-in machine and parity spine already use
 - attached steered `AcceptWithCompletion` is no longer treated as a queue-only
   self-loop in the formal model: when `request_immediate_processing=true`, the
   checked-in Meerkat machine now models the runtime’s `Attached -> Running`

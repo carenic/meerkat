@@ -56,23 +56,6 @@ pub enum PostAdmissionSignal {
     RequestImmediateProcessing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunReturnPhase {
-    Idle,
-    Attached,
-    Retired,
-}
-
-impl RunReturnPhase {
-    fn as_runtime_state(self) -> RuntimeState {
-        match self {
-            Self::Idle => RuntimeState::Idle,
-            Self::Attached => RuntimeState::Attached,
-            Self::Retired => RuntimeState::Retired,
-        }
-    }
-}
-
 impl PostAdmissionSignal {
     /// Whether the runtime loop should be woken.
     pub fn should_wake(self) -> bool {
@@ -115,8 +98,12 @@ pub struct EphemeralRuntimeDriver {
     phase: RuntimeState,
     /// Active run identity, if a run is currently bound.
     current_run_id: Option<RunId>,
-    /// The coarse phase a run returns to when it terminates.
-    pre_run_phase: Option<RunReturnPhase>,
+    /// The coarse machine phase a run returns to when it terminates.
+    ///
+    /// This is intentionally stored as the real `RuntimeState` projection
+    /// (`Idle`, `Attached`, or `Retired`) rather than a helper-local shadow
+    /// enum so the driver does not invent a parallel return-phase vocabulary.
+    pre_run_phase: Option<RuntimeState>,
     ledger: InputLedger,
     queue: InputQueue,
     steer_queue: InputQueue,
@@ -430,7 +417,7 @@ impl EphemeralRuntimeDriver {
     }
 
     pub fn pre_run_phase(&self) -> Option<RuntimeState> {
-        self.pre_run_phase.map(RunReturnPhase::as_runtime_state)
+        self.pre_run_phase
     }
 
     pub fn can_process_queue(&self) -> bool {
@@ -463,17 +450,11 @@ impl EphemeralRuntimeDriver {
             });
         }
         self.current_run_id = Some(run_id);
-        self.pre_run_phase = Some(match pre_run_phase {
-            RuntimeState::Idle => RunReturnPhase::Idle,
-            RuntimeState::Attached => RunReturnPhase::Attached,
-            RuntimeState::Retired => RunReturnPhase::Retired,
-            RuntimeState::Initializing
-            | RuntimeState::Running
-            | RuntimeState::Stopped
-            | RuntimeState::Destroyed => {
-                unreachable!("run_start_pre_phase_from_phase rejected non-startable phase")
-            }
-        });
+        debug_assert!(matches!(
+            pre_run_phase,
+            RuntimeState::Idle | RuntimeState::Attached | RuntimeState::Retired
+        ));
+        self.pre_run_phase = Some(pre_run_phase);
         self.phase = RuntimeState::Running;
         Ok(())
     }

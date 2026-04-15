@@ -176,6 +176,10 @@ Hopcroft-style behavioral quotient over the reachable graph.
   truth now lives directly with the runtime driver in the same shape the
   checked-in Meerkat machine models, and `RuntimeControlAuthority` no longer
   exists as a second lifecycle owner.
+- Narrowed the remaining driver-side coarse run-return bookkeeping by removing
+  the private `RunReturnPhase` shadow enum; `pre_run_phase` now uses the same
+  checked-in `RuntimeState` projection (`Idle` / `Attached` / `Retired`) that
+  the Meerkat machine and parity spine already use.
 - Taught the generated closed-world composition models to reject queued
   external entry packets that are no longer admissible for the current machine
   state, which removes seam deadlocks without widening the machine transition
