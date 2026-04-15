@@ -286,7 +286,7 @@ impl MobActor {
     }
 
     fn state(&self) -> MobState {
-        self.lifecycle_authority.phase()
+        MobState::from_u8(self.state.load(Ordering::Acquire))
     }
 
     fn mob_handle_for_tools(&self) -> MobHandle {

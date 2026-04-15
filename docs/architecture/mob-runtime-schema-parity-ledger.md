@@ -275,6 +275,11 @@ Current state:
   observable at all. The top-level mob lifecycle projection remains actor /
   lifecycle-owned, and the orchestrator helper is reduced to field + effect
   realization instead of acting like a second hidden phase publisher.
+- The follow-up ownership cut makes `MobActor` itself read coarse phase from
+  that shared top-level state byte instead of asking `MobLifecycleAuthority`
+  for the answer. That aligns the actor with the public handle surface and
+  narrows lifecycle authority to transition realization rather than being the
+  source of truth for top-level phase reads.
 
 ## Notes
 
