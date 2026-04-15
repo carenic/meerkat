@@ -282,6 +282,32 @@ impl DriverEntry {
             DriverEntry::Persistent(d) => d.abandon_pending_inputs(reason).await,
         }
     }
+
+    pub(crate) async fn retire(&mut self) -> Result<RetireReport, RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.retire(),
+            DriverEntry::Persistent(d) => d.retire().await,
+        }
+    }
+
+    pub(crate) async fn reset(&mut self) -> Result<ResetReport, RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.reset(),
+            DriverEntry::Persistent(d) => d.reset().await,
+        }
+    }
+
+    pub(crate) async fn destroy(&mut self) -> Result<DestroyReport, RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => {
+                let abandoned = d.destroy()?;
+                Ok(DestroyReport {
+                    inputs_abandoned: abandoned,
+                })
+            }
+            DriverEntry::Persistent(d) => d.destroy().await,
+        }
+    }
 }
 
 /// Shared completion registry (accessed by adapter for registration and loop for resolution).
@@ -1352,7 +1378,6 @@ impl MeerkatMachine {
 
                 let mut drv = driver.lock().await;
                 let mut report = drv
-                    .as_driver_mut()
                     .retire()
                     .await
                     .map_err(|e| RuntimeControlPlaneError::Internal(e.to_string()))?;
@@ -1443,7 +1468,6 @@ impl MeerkatMachine {
 
                 let mut drv = driver.lock().await;
                 let report = drv
-                    .as_driver_mut()
                     .reset()
                     .await
                     .map_err(|e| RuntimeControlPlaneError::Internal(e.to_string()))?;
@@ -1512,7 +1536,6 @@ impl MeerkatMachine {
 
                 let mut drv = driver.lock().await;
                 let report = drv
-                    .as_driver_mut()
                     .destroy()
                     .await
                     .map_err(|e| RuntimeControlPlaneError::Internal(e.to_string()))?;

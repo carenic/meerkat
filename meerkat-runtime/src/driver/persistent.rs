@@ -254,6 +254,69 @@ impl PersistentRuntimeDriver {
         let _ = RuntimeDriver::recover(self).await?;
         Ok(self.inner.active_input_ids().len())
     }
+
+    pub async fn retire(&mut self) -> Result<crate::traits::RetireReport, RuntimeDriverError> {
+        let checkpoint = self.inner.clone();
+        let report = EphemeralRuntimeDriver::retire(&mut self.inner)?;
+        let input_states = self.inner.input_states_snapshot();
+        if let Err(err) = self
+            .store
+            .atomic_lifecycle_commit(
+                &self.runtime_id,
+                self.runtime_state_for_persistence(),
+                &input_states,
+            )
+            .await
+        {
+            self.inner = checkpoint;
+            return Err(RuntimeDriverError::Internal(format!(
+                "retire persist failed: {err}"
+            )));
+        }
+        Ok(report)
+    }
+
+    pub async fn reset(&mut self) -> Result<crate::traits::ResetReport, RuntimeDriverError> {
+        let checkpoint = self.inner.clone();
+        let report = EphemeralRuntimeDriver::reset(&mut self.inner)?;
+        let input_states = self.inner.input_states_snapshot();
+        if let Err(err) = self
+            .store
+            .atomic_lifecycle_commit(
+                &self.runtime_id,
+                self.runtime_state_for_persistence(),
+                &input_states,
+            )
+            .await
+        {
+            self.inner = checkpoint;
+            return Err(RuntimeDriverError::Internal(format!(
+                "reset persist failed: {err}"
+            )));
+        }
+        Ok(report)
+    }
+
+    pub async fn destroy(&mut self) -> Result<DestroyReport, RuntimeDriverError> {
+        let abandoned = self.inner.destroy()?;
+        let input_states = self.inner.input_states_snapshot();
+        if let Err(err) = self
+            .store
+            .atomic_lifecycle_commit(
+                &self.runtime_id,
+                self.runtime_state_for_persistence(),
+                &input_states,
+            )
+            .await
+        {
+            return Err(RuntimeDriverError::Internal(format!(
+                "destroy persist failed: {err}"
+            )));
+        }
+        Ok(DestroyReport {
+            inputs_abandoned: abandoned,
+        })
+    }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
@@ -628,69 +691,6 @@ impl RuntimeDriver for PersistentRuntimeDriver {
             .await
             .map_err(|e| RuntimeDriverError::Internal(format!("recovery persist failed: {e}")))?;
         Ok(report)
-    }
-
-    async fn retire(&mut self) -> Result<crate::traits::RetireReport, RuntimeDriverError> {
-        let checkpoint = self.inner.clone();
-        let report = EphemeralRuntimeDriver::retire(&mut self.inner)?;
-        let input_states = self.inner.input_states_snapshot();
-        if let Err(err) = self
-            .store
-            .atomic_lifecycle_commit(
-                &self.runtime_id,
-                self.runtime_state_for_persistence(),
-                &input_states,
-            )
-            .await
-        {
-            self.inner = checkpoint;
-            return Err(RuntimeDriverError::Internal(format!(
-                "retire persist failed: {err}"
-            )));
-        }
-        Ok(report)
-    }
-
-    async fn reset(&mut self) -> Result<crate::traits::ResetReport, RuntimeDriverError> {
-        let checkpoint = self.inner.clone();
-        let report = EphemeralRuntimeDriver::reset(&mut self.inner)?;
-        let input_states = self.inner.input_states_snapshot();
-        if let Err(err) = self
-            .store
-            .atomic_lifecycle_commit(
-                &self.runtime_id,
-                self.runtime_state_for_persistence(),
-                &input_states,
-            )
-            .await
-        {
-            self.inner = checkpoint;
-            return Err(RuntimeDriverError::Internal(format!(
-                "reset persist failed: {err}"
-            )));
-        }
-        Ok(report)
-    }
-
-    async fn destroy(&mut self) -> Result<DestroyReport, RuntimeDriverError> {
-        let abandoned = self.inner.destroy()?;
-        let input_states = self.inner.input_states_snapshot();
-        if let Err(err) = self
-            .store
-            .atomic_lifecycle_commit(
-                &self.runtime_id,
-                self.runtime_state_for_persistence(),
-                &input_states,
-            )
-            .await
-        {
-            return Err(RuntimeDriverError::Internal(format!(
-                "destroy persist failed: {err}"
-            )));
-        }
-        Ok(DestroyReport {
-            inputs_abandoned: abandoned,
-        })
     }
 
     fn runtime_state(&self) -> RuntimeState {

@@ -29,8 +29,7 @@ use crate::runtime_ingress_authority::{
 };
 use crate::runtime_state::RuntimeState;
 use crate::traits::{
-    DestroyReport, RecoveryReport, ResetReport, RetireReport, RuntimeControlCommand,
-    RuntimeDriverError,
+    RecoveryReport, ResetReport, RetireReport, RuntimeControlCommand, RuntimeDriverError,
 };
 
 /// Typed post-admission signal that the runtime loop should act on.
@@ -1529,18 +1528,6 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
     }
     fn runtime_state(&self) -> RuntimeState {
         self.phase
-    }
-    async fn retire(&mut self) -> Result<RetireReport, RuntimeDriverError> {
-        EphemeralRuntimeDriver::retire(self)
-    }
-    async fn reset(&mut self) -> Result<ResetReport, RuntimeDriverError> {
-        EphemeralRuntimeDriver::reset(self)
-    }
-    async fn destroy(&mut self) -> Result<DestroyReport, RuntimeDriverError> {
-        let abandoned = EphemeralRuntimeDriver::destroy(self)?;
-        Ok(DestroyReport {
-            inputs_abandoned: abandoned,
-        })
     }
     fn input_state(&self, input_id: &InputId) -> Option<&InputState> {
         self.ledger.get(input_id)

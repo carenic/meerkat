@@ -135,15 +135,6 @@ pub trait RuntimeDriver: Send + Sync {
     /// Recover from a crash/restart.
     async fn recover(&mut self) -> Result<RecoveryReport, RuntimeDriverError>;
 
-    /// Retire the runtime (no new input, abandon pending).
-    async fn retire(&mut self) -> Result<RetireReport, RuntimeDriverError>;
-
-    /// Reset the runtime (abandon all pending input, drain queue).
-    async fn reset(&mut self) -> Result<ResetReport, RuntimeDriverError>;
-
-    /// Destroy the runtime (terminal state, abandon all pending input).
-    async fn destroy(&mut self) -> Result<DestroyReport, RuntimeDriverError>;
-
     /// Get the current runtime state.
     fn runtime_state(&self) -> RuntimeState;
 

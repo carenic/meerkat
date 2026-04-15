@@ -180,6 +180,11 @@ Hopcroft-style behavioral quotient over the reachable graph.
   the private `RunReturnPhase` shadow enum; `pre_run_phase` now uses the same
   checked-in `RuntimeState` projection (`Idle` / `Attached` / `Retired`) that
   the Meerkat machine and parity spine already use.
+- Removed the coarse lifecycle verbs `retire`, `reset`, and `destroy` from the
+  generic `RuntimeDriver` trait. Those lifecycle nouns are now spoken only by
+  `MeerkatMachine` / `RuntimeControlPlane`, while the concrete drivers retain
+  just the realization/persistence helpers needed to apply the machine-owned
+  transition.
 - Taught the generated closed-world composition models to reject queued
   external entry packets that are no longer admissible for the current machine
   state, which removes seam deadlocks without widening the machine transition

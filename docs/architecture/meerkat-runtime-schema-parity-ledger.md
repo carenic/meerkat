@@ -79,6 +79,10 @@ Current state:
   coarse run return; the remaining `pre_run_phase` bookkeeping now uses the
   same real `RuntimeState` projection (`Idle` / `Attached` / `Retired`) that
   the checked-in machine and parity spine already use
+- the generic `RuntimeDriver` trait no longer exposes the coarse lifecycle
+  verbs `retire`, `reset`, or `destroy`; those nouns are now machine/control
+  plane owned, with only concrete driver persistence helpers retaining the
+  mechanics needed to realize the machine-owned transition and durable commit
 - attached steered `AcceptWithCompletion` is no longer treated as a queue-only
   self-loop in the formal model: when `request_immediate_processing=true`, the
   checked-in Meerkat machine now models the runtime’s `Attached -> Running`
