@@ -314,7 +314,7 @@ async fn on_run_failed_rollbacks() {
 
     // Run failed
     driver
-        .run_failed(run_id, "LLM error".into(), true)
+        .run_failed(run_id, vec![input_id.clone()], "LLM error".into(), true)
         .await
         .unwrap();
 
@@ -343,7 +343,7 @@ async fn on_run_failed_requests_wake_for_backlog() {
     driver.stage_input(&input1_id, &run_id).unwrap();
 
     driver
-        .run_failed(run_id, "LLM error".into(), true)
+        .run_failed(run_id, vec![input1_id.clone()], "LLM error".into(), true)
         .await
         .unwrap();
 
@@ -457,7 +457,7 @@ async fn rollback_restores_queue_projection_order() {
     driver.stage_input(&first_id, &run_id).unwrap();
 
     driver
-        .run_failed(run_id, "rollback".into(), true)
+        .run_failed(run_id, vec![first_id.clone()], "rollback".into(), true)
         .await
         .unwrap();
 

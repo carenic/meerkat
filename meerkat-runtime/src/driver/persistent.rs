@@ -83,18 +83,6 @@ impl PersistentRuntimeDriver {
         self.inner.is_idle_or_attached()
     }
 
-    /// Attach an executor (Idle → Attached). Delegates to inner.
-    pub fn attach(&mut self) -> Result<(), crate::runtime_state::RuntimeStateTransitionError> {
-        self.inner.attach()
-    }
-
-    /// Detach an executor (Attached → Idle). Delegates to inner.
-    pub fn detach(
-        &mut self,
-    ) -> Result<Option<RuntimeState>, crate::runtime_state::RuntimeStateTransitionError> {
-        self.inner.detach()
-    }
-
     /// Map runtime state for persistence.
     ///
     /// Attached must never be persisted — on recovery, the executor is
@@ -264,8 +252,7 @@ impl PersistentRuntimeDriver {
         let _ = RuntimeDriver::recover(self).await?;
         if restore_attached && matches!(self.inner.runtime_state(), RuntimeState::Idle) {
             self.inner
-                .attach()
-                .map_err(|err| RuntimeDriverError::Internal(err.to_string()))?;
+                .set_control_projection(RuntimeState::Attached, None, None);
         }
         Ok(self.inner.active_input_ids().len())
     }
@@ -317,7 +304,7 @@ impl PersistentRuntimeDriver {
     }
 
     pub async fn destroy(&mut self) -> Result<DestroyReport, RuntimeDriverError> {
-        let abandoned = self.inner.destroy()?;
+        let abandoned = self.inner.destroy_cleanup();
         let input_states = self.inner.input_states_snapshot();
         if let Err(err) = self
             .store
@@ -339,8 +326,6 @@ impl PersistentRuntimeDriver {
 
     pub async fn finalize_stop_runtime(&mut self) -> Result<(), RuntimeDriverError> {
         let checkpoint = self.inner.clone();
-        self.inner
-            .set_control_projection(RuntimeState::Stopped, None, None);
         self.inner.stop_runtime_cleanup();
         let input_states = self.inner.input_states_snapshot();
         if let Err(err) = self
@@ -430,11 +415,14 @@ impl PersistentRuntimeDriver {
     pub async fn run_failed(
         &mut self,
         run_id: RunId,
+        contributing_input_ids: Vec<InputId>,
         error: String,
         recoverable: bool,
     ) -> Result<(), RuntimeDriverError> {
         let checkpoint = self.inner.clone();
-        self.inner.run_failed(run_id, error, recoverable).await?;
+        self.inner
+            .run_failed(run_id, contributing_input_ids, error, recoverable)
+            .await?;
         let input_states = self.inner.input_states_snapshot();
         if let Err(err) = self
             .store
@@ -702,7 +690,9 @@ impl RuntimeDriver for PersistentRuntimeDriver {
                 RuntimeState::Destroyed
                     if self.inner.runtime_state() != RuntimeState::Destroyed =>
                 {
-                    self.inner.destroy()?;
+                    self.inner
+                        .set_control_projection(RuntimeState::Destroyed, None, None);
+                    self.inner.destroy_cleanup();
                 }
                 _ => {}
             }

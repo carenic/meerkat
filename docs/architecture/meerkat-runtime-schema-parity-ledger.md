@@ -327,6 +327,24 @@ Interpretation:
   machine now validates queue-prefix, staged, and applied-pending-consumption
   preconditions before ingress applies the already-decided queue/lifecycle
   updates
+- runtime-loop batch selection and boundary classification are no longer
+  helper-owned either: the checked-in Meerkat machine now chooses the next
+  steer/prompt batch and classifies its `RunStart` vs `RunCheckpoint`
+  boundary from stored ingress metadata before the helper applies the
+  already-decided queue/lifecycle updates
+- failing contributor ownership is no longer rediscovered in the driver:
+  the checked-in Meerkat machine now passes the explicit staged contributor
+  set into `RunFailed`, instead of letting the runtime scan staged inputs and
+  infer "which inputs were this run" locally on failure
+- coarse `Stopped` / `Destroyed` projection is no longer written by driver
+  cleanup helpers: the checked-in Meerkat machine now commits those phase
+  changes first, and driver stop/destroy paths only perform already-decided
+  cleanup/persistence mechanics
+- coarse input-admission legality is no longer duplicated in the driver
+  either: `MeerkatMachine::Ingest` remains the checked-in owner of phase-gated
+  admission, while `EphemeralRuntimeDriver::accept_input()` now assumes the
+  caller has already passed that coarse lifecycle gate and focuses on
+  durability/policy/ledger mechanics
 - the formal seam is no longer missing the forward Mob -> Meerkat ingress
   request: `SubmitWork` now emits `RequestRuntimeIngress`, the composition
   routes that effect into Meerkat `Ingest`, and that route now carries the
@@ -334,10 +352,16 @@ Interpretation:
   truthful Mob quotient moved to raw/phase/full `207 / 209 / 1323`, which is
   the right signature for adding real routed behavior rather than more
   representative shadow state
-- the outer Meerkat ingress/prepare shell also no longer pre-rejects the same
-  non-accepting phases that the direct driver contract already rejects: the
-  machine boundary now normalizes only the public `Destroyed` error shape while
-  leaving direct legality ownership with `EphemeralRuntimeDriver::accept_input`
+- the checked-in transitions now actually carry those routed fields through
+  execution too: `SubmitWorkRunning` binds `origin`, and Meerkat `Ingest`
+  transitions bind `runtime_id`, `work_id`, and `origin` instead of widening
+  the route shape without threading the new facts through the formal path
+- coarse input-admission legality is now wholly machine-owned: the outer
+  Meerkat ingress/prepare shell no longer pre-rejects phases on its own and
+  `EphemeralRuntimeDriver::accept_input()` no longer repeats the same
+  phase-gated lifecycle check. The checked-in `MeerkatMachine::Ingest` path is
+  now the sole owner of that coarse legality gate, while the driver focuses on
+  durability, policy, and ledger mechanics
 - the generic `RuntimeDriver::on_run_event` hook is gone too: the checked-in
   machine and tests now target concrete `boundary_applied`, `run_completed`,
   and `run_failed` driver helpers instead of routing terminal lifecycle through
@@ -515,27 +539,25 @@ Outcome:
 2. Treat control-plane report counts such as `DestroyReport.inputs_abandoned`
    as lower-authority carrier facts in the exact observable audit unless and
    until the DSL work deliberately lifts them into the top-level machine.
-3. Use the trustworthy post-parity Hopcroft rerun as the Meerkat
-   simplification baseline after the visibility-boundary,
-   LLM/capability-boundary, dead active-work, `current_run_id`, and attached
-   steered/interrupt-bearing accept cuts:
-   raw `11,858 -> 385`, phase `11,858 -> 390`, full `11,858 -> 11,469`,
-   TLC `1,068,719 generated / 11,858 distinct / depth 9`.
+3. Use the trustworthy post-parity Hopcroft rerun as the current Meerkat
+   simplification baseline after the control/ingress owner-reduction cuts:
+   raw `19,459 -> 459`, phase `19,459 -> 464`, full `19,459 -> 19,070`,
+   TLC `1,814,665 generated / 19,459 distinct / depth 9`.
 4. Read that baseline together with the largest-block field projection from
    [`docs/architecture/machine-simplification-proposal.md`](machine-simplification-proposal.md):
-   the dominant Meerkat mixed block is now measured as `4,711` states over
-   `2,169` extended-state tuples, with `1,644` tuples reused across multiple
+   the dominant Meerkat mixed block is now measured as `8,897` states over
+   `4,560` extended-state tuples, with `3,096` tuples reused across multiple
    phases.
 5. Read that baseline together with the now-green Mob lifecycle-triangle
    ledger in
    [`docs/architecture/mob-runtime-schema-parity-ledger.md`](mob-runtime-schema-parity-ledger.md).
-6. Use the next loop to target the remaining Meerkat contributor/batch seam:
-   `RuntimeIngressAuthority` no longer owns legality for
-   `StageDrainSnapshot`, `BoundaryApplied`, or `RunCompleted`, but batch
-   selection policy and the rollback/cancel contributor cases still live below
-   the checked-in machine boundary.
-7. The next remaining formal seam question after that is still narrower than
-   full `WorkRef -> InputId` translation: the forward Mob -> Meerkat route now
-   carries opaque `work_id` plus `origin`, so any remaining omission is about
-   content lowering or minted Meerkat input identity, not about the existence
-   or type of the forwarded ingress request itself.
+6. The remaining Meerkat edge is now narrow and mostly mechanical:
+   `RuntimeIngressAuthority` still applies contributor-state mutation and
+   terminal/dedup side effects below the checked-in machine boundary, even
+   though the coarse lifecycle, batch selection, boundary classification, run
+   identity, and contributor legality have all been lifted out.
+7. The next remaining formal seam question after that is Mob-side rather than
+   composition-side: the forward Mob -> Meerkat route now carries opaque
+   `work_id` plus `origin`, but `MobMachine` still treats `SubmitWork` as one
+   origin-insensitive self-loop even though runtime gives `origin` real
+   external-vs-internal turn semantics before ingress.

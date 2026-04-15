@@ -9,7 +9,6 @@
 
 use std::collections::HashMap;
 
-use meerkat_core::lifecycle::run_primitive::RunApplyBoundary;
 use meerkat_core::lifecycle::{InputId, RunId};
 use meerkat_core::types::HandlingMode;
 
@@ -371,60 +370,6 @@ impl RuntimeIngressAuthority {
     /// Whether the input was classified as a prompt at admission.
     pub fn is_prompt(&self, work_id: &InputId) -> bool {
         self.fields.is_prompt.get(work_id).copied().unwrap_or(false)
-    }
-
-    /// Classify the boundary type for a given input based on stored metadata.
-    ///
-    /// Steer inputs produce `RunCheckpoint` (mid-run injection), Queue inputs
-    /// produce `RunStart` (new turn). The authority owns this classification
-    /// because it stores the per-input handling_mode.
-    pub fn input_boundary(&self, work_id: &InputId) -> RunApplyBoundary {
-        match self.fields.handling_mode.get(work_id) {
-            Some(HandlingMode::Steer) => RunApplyBoundary::RunCheckpoint,
-            _ => RunApplyBoundary::RunStart,
-        }
-    }
-
-    /// Determine the next batch of input IDs to drain.
-    ///
-    /// Implements the batching policy:
-    /// - Steer-first: if steer_queue is non-empty, batch consecutive steer inputs
-    ///   that share the same `RunApplyBoundary` (determined by `boundary_of`).
-    /// - Queue+Prompt: if the next queue item is a prompt, return just that one
-    ///   (prompts always get a dedicated run).
-    /// - Queue (non-prompt): batch all consecutive non-prompt items.
-    ///
-    /// Returns an empty vec if both queues are empty.
-    pub fn drain_next_batch<F>(&self, boundary_of: F) -> Vec<InputId>
-    where
-        F: Fn(&InputId) -> RunApplyBoundary,
-    {
-        if !self.fields.steer_queue.is_empty() {
-            let first = &self.fields.steer_queue[0];
-            let target_boundary = boundary_of(first);
-            return self
-                .fields
-                .steer_queue
-                .iter()
-                .take_while(|id| boundary_of(id) == target_boundary)
-                .cloned()
-                .collect();
-        }
-        if let Some(first) = self.fields.queue.first() {
-            if self.fields.is_prompt.get(first).copied().unwrap_or(false) {
-                // Queue+Prompt → single-item batch (dedicated run)
-                return vec![first.clone()];
-            }
-            // Non-prompt queue items: batch consecutive non-prompt items
-            return self
-                .fields
-                .queue
-                .iter()
-                .take_while(|id| !self.fields.is_prompt.get(*id).copied().unwrap_or(false))
-                .cloned()
-                .collect();
-        }
-        Vec::new()
     }
 
     /// Check if a transition is legal without applying it.

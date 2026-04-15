@@ -233,6 +233,27 @@ Hopcroft-style behavioral quotient over the reachable graph.
   `BoundaryApplied`, and `RunCompleted` out of `RuntimeIngressAuthority` and
   into `MeerkatMachine`. The helper now applies only the already-decided
   queue/lifecycle updates for those run-batch transitions.
+- Moved runtime-loop batch selection and batch-boundary classification out of
+  `RuntimeIngressAuthority` too. The checked-in Meerkat machine now chooses the
+  next steer/prompt batch and its `RunStart` vs `RunCheckpoint` boundary from
+  stored ingress metadata, leaving the helper as queue storage plus mechanical
+  lifecycle application.
+- Moved failing-contributor ownership out of the driver too. `RunFailed` now
+  takes the contributor set explicitly from `MeerkatMachine`, so rollback no
+  longer depends on the runtime locally rediscovering "which staged inputs were
+  this run".
+- Moved coarse `Stopped` / `Destroyed` projection out of driver cleanup
+  helpers. The checked-in machine now commits those phase changes before stop /
+  destroy cleanup runs, leaving the driver responsible only for the already-
+  decided cleanup and persistence mechanics.
+- Removed the last duplicate coarse admission gate in
+  `EphemeralRuntimeDriver::accept_input()`, so phase-gated input legality now
+  lives only in the checked-in `MeerkatMachine::Ingest` path while the driver
+  focuses on durability, policy, and ledger mechanics.
+- Threaded the forward `Mob -> Meerkat` ingress seam fully through the
+  checked-in transitions as well as the routed packet shape: `SubmitWork` now
+  binds `origin`, and Meerkat `Ingest` transitions bind `runtime_id`,
+  `work_id`, and `origin` instead of widening only the route schema.
 - Cleared the full phase-exit workspace gates on the rebased branch tip: `./scripts/repo-cargo nextest run --workspace` finished with 4,305 passing tests / 149 skipped, and `./scripts/repo-cargo clippy --workspace -- -D warnings` finished clean after fixing branch-head regressions in tool-visibility boundary change detection, stale semantic-model expectations, and idle-session LLM hot-swap fallback handling.
 - Regenerated machine/composition artifacts and re-ran schema parity, drift, TLC, render, runtime, and owner tests on top of the landed tranches.
 
@@ -245,8 +266,8 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | MeerkatMachine | Surface-only inputs | 0 | 0 | 0 |
 | MeerkatMachine | Signals | 69 | 67 | -2 |
 | MeerkatMachine | Transitions | 162 | 159 | -3 |
-| MeerkatMachine | TLC generated states | 102,047 | 105,855 | +3,808 |
-| MeerkatMachine | TLC distinct states | 3,959 | 3,959 | 0 |
+| MeerkatMachine | TLC generated states | 102,047 | 1,814,665 | +1,712,618 |
+| MeerkatMachine | TLC distinct states | 3,959 | 19,459 | +15,500 |
 | MeerkatMachine | TLC depth | 9 | 9 | 0 |
 | MobMachine | Phases | 5 | 4 | -1 |
 | MobMachine | Inputs | 39 | 39 | 0 |
@@ -307,6 +328,9 @@ Hopcroft-style behavioral quotient over the reachable graph.
 | Ordinary attachment projection can stay as a direct driver verb | rejected / landed | Replaced `PrepareBindings`, stale-loop republish, and unregister cleanup uses of `attach()` / `detach()` with machine-owned `Idle <-> Attached` projection helpers. This keeps attachment truth in the checked-in Meerkat machine even when the runtime is only repairing a published loop rather than taking a second lifecycle transition. |
 | The formal seam can omit forward Mob -> Meerkat ingress requests | rejected / landed | Added `RequestRuntimeIngress` to `MobMachine`, routed it through `meerkat_mob_seam` into Meerkat `Ingest`, and regenerated the composition artifacts. The truthful Mob Hopcroft baseline moved to raw/phase/full `207 / 209 / 1323`, which is the expected signature for adding real routed behavior rather than a representative identity shadow. |
 | Contributor-set legality can stay as a helper-owned ingress authority concern | rejected / landed | Moved the legality for `StageDrainSnapshot`, `BoundaryApplied`, and `RunCompleted` into `MeerkatMachine`. Queue-prefix and contributor-state preconditions are now validated by the checked-in machine before ingress applies the already-decided queue/lifecycle updates, so the helper no longer decides whether a concrete contributor set may legally become or complete a run. |
+| Batch selection and boundary classification can stay as ingress-helper policy | rejected / landed | Moved steer/prompt batch selection and `RunStart` vs `RunCheckpoint` classification into `MeerkatMachine`. The runtime loop now asks the checked-in machine for the next batch and its boundary instead of delegating those behavior-bearing choices to `RuntimeIngressAuthority`. |
+| Failing contributor ownership can stay as driver-local staged-input discovery | rejected / landed | `RunFailed` now receives the explicit contributor set from `MeerkatMachine`, so rollback no longer depends on the runtime scanning staged inputs and inferring "which inputs were this run" below the machine boundary. |
+| Driver cleanup may keep writing `Stopped` / `Destroyed` coarse projection | rejected / landed | Stop and destroy cleanup helpers no longer decide the final coarse phase. `MeerkatMachine` now writes the `Stopped` / `Destroyed` projection first, and the driver only performs the already-decided cleanup/persistence mechanics. |
 | Attached steered accept can stay collapsed into the queue-only accept surface | rejected / landed | The live runtime can synchronously jump `Attached -> Running` during `AcceptWithCompletion` when admission requests immediate processing. The Meerkat catalog now models that payload-sensitive path explicitly with a run binding, and the targeted runtime/model regression is green. |
 | Running interrupt-bearing accept can stay collapsed into the passive queued accept surface | rejected / landed | The live runtime can request `InterruptYielding` during running queued `AcceptWithCompletion` even when it does not request immediate processing. The checked-in Meerkat machine now models that typed `PostAdmissionSignal("InterruptYielding")` branch explicitly, and both the targeted regression and the exact parity audits stayed green. |
 | Meerkat `Stopped` vs `Retired` can merge internally | rejected | The top-level transition sets diverge in load-bearing ways: `Retired` still accepts `Reset`, `StopRuntimeExecutor`, and `Recycle`, while `Stopped` does not, and the retire path carries archival/drain semantics that phase 1 should keep explicit. |
@@ -359,16 +383,19 @@ We ran three observation modes for each machine:
 | MobMachine | `none` | 1323 | 207 | 84.4% | After restoring the real stale-binding table to `MobMachine` and then adding the forward Mob -> Meerkat ingress-request route, the truthful graph is still strongly quotientable. The remaining state is machine-owned binding/work-routing truth, not representative identity shadow state. |
 | MobMachine | `phase` | 1323 | 209 | 84.2% | Preserving phase still adds only two quotient blocks; `Running` / `Stopped` / `Completed` remain mostly projection even after stale-binding restoration and the forward ingress route. |
 | MobMachine | `full` | 1323 | 1323 | 0.0% | Once the remaining authoritative counters and binding table are preserved, every reachable Mob snapshot is still distinct. |
-| MeerkatMachine | `none` | 19,467 | 466 | 97.6% | After deleting `RuntimeControlAuthority`, absorbing coarse run truth, modeling the retire-drain re-entry explicitly, and then moving ordinary attachment projection out of direct driver verbs, the truthful graph remains highly quotientable. The remaining split drivers are now overwhelmingly checked-in machine facts (`current_run_id`, `pre_run_phase`, visibility state, attachment truth), not helper-owned folklore. |
-| MeerkatMachine | `phase` | 19,467 | 471 | 97.6% | Preserving phase still adds only five quotient blocks, so phase remains almost entirely projection even after the control-absorption tranche and the retire-drain / attachment corrections. |
-| MeerkatMachine | `full` | 19,467 | 19,078 | 2.0% | Preserving the full snapshot still keeps nearly every remaining Meerkat state distinct, but the extra structure now lives in visibility revisions, deferred-name sets, run binding/return state, ingress configuration, and drain state rather than in the deleted helper authority. |
+| MeerkatMachine | `none` | 19,459 | 459 | 97.6% | After the control/ingress owner-reduction cuts, the truthful graph remains highly quotientable. The largest mixed block is now driven by checked-in machine facts like `staged_visibility_revision`, `pre_run_phase`, `active_visibility_revision`, `current_run_id`, `peer_ingress_configured`, and `attachment_live`, not by deleted helper folklore. |
+| MeerkatMachine | `phase` | 19,459 | 464 | 97.6% | Preserving phase still adds only five quotient blocks, so phase remains almost entirely projection even after the latest control/ingress cuts. |
+| MeerkatMachine | `full` | 19,459 | 19,070 | 2.0% | Preserving the full snapshot still keeps nearly every remaining Meerkat state distinct, but the surviving structure now sits in real checked-in machine fields rather than in duplicated helper-owned lifecycle state. |
 
-That rerun also clarified the next architectural blocker. The stale
+That rerun also clarified the remaining architectural blockers. The stale
 `RuntimeControlAuthority` problem is gone, and `RuntimeIngressAuthority` no
-longer owns a handwritten coarse lifecycle or a second derived active run
-identity, but it still owns contributor queues plus stop/reset/destroy/recover
-bookkeeping outside the two checked-in machines. The next honest tranche is
-therefore another absorption step, not a blind simplification cut.
+longer owns coarse lifecycle, batch selection, boundary classification, or a
+second derived active run identity. The remaining Meerkat edge is now narrower:
+ingress still applies contributor-state mutation plus dedup/terminal side
+effects below the checked-in machine boundary. On the Mob side, the forward
+route itself is now complete, but `MobMachine` still treats `SubmitWork` as one
+origin-insensitive self-loop even though runtime gives `origin` real
+external-vs-internal turn semantics before ingress.
 
 All six rows above have now been rerun after the exact runtime/schema parity
 passes on the current branch tip.

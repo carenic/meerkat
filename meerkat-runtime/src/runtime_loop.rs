@@ -646,9 +646,7 @@ async fn process_queue(
             // The authority implements steer-first priority and same-boundary
             // batching for steer inputs; queue inputs follow the prompt-aware
             // batching policy.
-            let batch_ids = d
-                .ingress()
-                .drain_next_batch(|id| d.ingress().input_boundary(id));
+            let batch_ids = crate::meerkat_machine::machine_select_runtime_loop_batch(&d);
 
             if batch_ids.is_empty() {
                 return false;
@@ -671,11 +669,11 @@ async fn process_queue(
             // staging failure.
             let staged_ids: Vec<_> = staged_inputs.iter().map(|(id, _)| id.clone()).collect();
 
-            // Use the authority's boundary classification (derived from stored metadata)
-            // instead of the shell-level input_boundary function.
+            // The checked-in Meerkat machine now owns runtime-loop batch
+            // boundary classification over the stored ingress metadata.
             let boundary = staged_inputs
                 .first()
-                .map(|(id, _)| d.ingress().input_boundary(id))
+                .map(|(id, _)| crate::meerkat_machine::machine_input_boundary(&d, id))
                 .unwrap_or(RunApplyBoundary::RunStart);
             let primitive = inputs_to_primitive_with_boundary(&staged_inputs, boundary);
             let contributing_input_ids = staged_inputs

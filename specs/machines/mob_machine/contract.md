@@ -17,7 +17,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ## Inputs
 - `Spawn`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation)
-- `SubmitWork`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, work_id: WorkId)
+- `SubmitWork`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, work_id: WorkId, origin: String)
 - `RunFlow`
 - `CancelFlow`
 - `FlowStatus`
@@ -106,7 +106,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ## Effects
 - `RequestRuntimeBinding`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation)
-- `RequestRuntimeIngress`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, work_id: WorkId)
+- `RequestRuntimeIngress`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, work_id: WorkId, origin: String)
 - `RequestRuntimeRetire`
 - `RequestRuntimeDestroy`
 - `EmitMemberLifecycleNotice`(kind: String)
@@ -138,7 +138,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `SubmitWorkRunning`
 - From: `Running`
-- On: `SubmitWork`(agent_runtime_id, fence_token, work_id)
+- On: `SubmitWork`(agent_runtime_id, fence_token, work_id, origin)
 - Guards:
   - `active_members_present`
   - `current_binding_matches`

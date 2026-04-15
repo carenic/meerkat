@@ -50,7 +50,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `Abort`(session_id: SessionId)
 - `AbortAll`
 - `Wait`(session_id: SessionId)
-- `Ingest`(runtime_id: AgentRuntimeId)
+- `Ingest`(runtime_id: AgentRuntimeId, work_id: WorkId, origin: String)
 - `PublishEvent`(kind: String)
 - `RuntimeState`(runtime_id: String)
 - `LoadBoundaryReceipt`(runtime_id: String, sequence: u64)
@@ -738,7 +738,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `IngestIdle`
 - From: `Idle`
-- On: `Ingest`(runtime_id)
+- On: `Ingest`(runtime_id, work_id, origin)
 - Guards:
   - `session_registered`
 - Emits: `ResolveAdmission`
@@ -746,7 +746,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `IngestAttached`
 - From: `Attached`
-- On: `Ingest`(runtime_id)
+- On: `Ingest`(runtime_id, work_id, origin)
 - Guards:
   - `session_registered`
 - Emits: `ResolveAdmission`
@@ -754,7 +754,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `IngestRunning`
 - From: `Running`
-- On: `Ingest`(runtime_id)
+- On: `Ingest`(runtime_id, work_id, origin)
 - Guards:
   - `session_registered`
 - Emits: `ResolveAdmission`

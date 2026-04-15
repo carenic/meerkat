@@ -3,7 +3,7 @@ EXTENDS TLC, Naturals, Sequences, FiniteSets
 
 \* Generated semantic machine model for MobMachine.
 
-CONSTANTS AgentIdentityValues, AgentRuntimeIdValues, BooleanValues, FenceTokenValues, GenerationValues, NatValues, SetOfAgentRuntimeIdValues, WorkIdValues
+CONSTANTS AgentIdentityValues, AgentRuntimeIdValues, BooleanValues, FenceTokenValues, GenerationValues, NatValues, SetOfAgentRuntimeIdValues, StringValues, WorkIdValues
 
 None == [tag |-> "none", value |-> "none"]
 Some(v) == [tag |-> "some", value |-> v]
@@ -58,7 +58,7 @@ ObserveRuntimeReady(agent_runtime_id, fence_token) ==
     /\ UNCHANGED << live_runtime_ids, runtime_fence_tokens, active_member_count, active_run_count, pending_spawn_count, wiring_edge_count, coordinator_bound >>
 
 
-SubmitWorkRunning(agent_runtime_id, fence_token, work_id) ==
+SubmitWorkRunning(agent_runtime_id, fence_token, work_id, origin) ==
     /\ phase = "Running"
     /\ (active_member_count > 0)
     /\ ((agent_runtime_id \in live_runtime_ids) /\ ((IF agent_runtime_id \in DOMAIN runtime_fence_tokens THEN runtime_fence_tokens[agent_runtime_id] ELSE "None") = fence_token))
@@ -703,7 +703,7 @@ CancelAllWorkRunning(agent_runtime_id, fence_token) ==
 Next ==
     \/ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E generation \in GenerationValues : SpawnRunning(agent_identity, agent_runtime_id, fence_token, generation)
     \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : ObserveRuntimeReady(agent_runtime_id, fence_token)
-    \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E work_id \in WorkIdValues : SubmitWorkRunning(agent_runtime_id, fence_token, work_id)
+    \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E work_id \in WorkIdValues : \E origin \in StringValues : SubmitWorkRunning(agent_runtime_id, fence_token, work_id, origin)
     \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E work_id \in WorkIdValues : ObserveWorkCompleted(agent_runtime_id, fence_token, work_id)
     \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E work_id \in WorkIdValues : ObserveWorkFailed(agent_runtime_id, fence_token, work_id)
     \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E work_id \in WorkIdValues : ObserveWorkCancelled(agent_runtime_id, fence_token, work_id)

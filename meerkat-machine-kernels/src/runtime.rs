@@ -1243,6 +1243,10 @@ mod tests {
                         ),
                         ("fence_token".into(), KernelValue::U64(41)),
                         ("work_id".into(), KernelValue::String("work-1".into())),
+                        (
+                            "origin".into(),
+                            KernelValue::String("mob.submit_work".into()),
+                        ),
                     ]),
                 },
             )

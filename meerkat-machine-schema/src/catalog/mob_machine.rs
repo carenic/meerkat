@@ -182,6 +182,7 @@ pub fn mob_machine() -> MachineSchema {
                         "agent_runtime_id".into(),
                         "fence_token".into(),
                         "work_id".into(),
+                        "origin".into(),
                     ],
                 },
                 guards: vec![

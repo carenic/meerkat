@@ -1778,7 +1778,7 @@ fn absorbed_meerkat_transitions() -> Vec<TransitionSchema> {
             &format!("Ingest{phase}"),
             phase,
             "Ingest",
-            vec!["runtime_id"],
+            vec!["runtime_id", "work_id", "origin"],
             vec![],
             vec![simple_emit("ResolveAdmission")],
             vec![session_registered_guard()],

@@ -3,7 +3,7 @@ EXTENDS TLC, Naturals, Sequences, FiniteSets
 
 \* Generated semantic machine model for MeerkatMachine.
 
-CONSTANTS AgentRuntimeIdValues, BooleanValues, FenceTokenValues, GenerationValues, InputIdValues, NatValues, RunIdValues, SessionIdValues, SessionLlmCapabilitySurfaceStatusValues, SessionLlmCapabilitySurfaceValues, SessionLlmIdentityValues, SessionToolVisibilityDeltaValues, SessionToolVisibilityStateValues, SetOfStringValues, StringValues, ToolFilterValues, ToolVisibilityWitnessValues
+CONSTANTS AgentRuntimeIdValues, BooleanValues, FenceTokenValues, GenerationValues, InputIdValues, NatValues, RunIdValues, SessionIdValues, SessionLlmCapabilitySurfaceStatusValues, SessionLlmCapabilitySurfaceValues, SessionLlmIdentityValues, SessionToolVisibilityDeltaValues, SessionToolVisibilityStateValues, SetOfStringValues, StringValues, ToolFilterValues, ToolVisibilityWitnessValues, WorkIdValues
 
 None == [tag |-> "none", value |-> "none"]
 Some(v) == [tag |-> "some", value |-> v]
@@ -907,7 +907,7 @@ EnsureDrainRunningRunning ==
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, peer_ingress_configured, silent_intent_overrides, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, staged_visibility_revision >>
 
 
-IngestIdle(runtime_id) ==
+IngestIdle(runtime_id, work_id, origin) ==
     /\ phase = "Idle"
     /\ (session_id # None)
     /\ phase' = "Idle"
@@ -915,7 +915,7 @@ IngestIdle(runtime_id) ==
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, peer_ingress_configured, drain_running, silent_intent_overrides, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, staged_visibility_revision >>
 
 
-IngestAttached(runtime_id) ==
+IngestAttached(runtime_id, work_id, origin) ==
     /\ phase = "Attached"
     /\ (session_id # None)
     /\ phase' = "Attached"
@@ -923,7 +923,7 @@ IngestAttached(runtime_id) ==
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, active_generation, attachment_live, current_run_id, pre_run_phase, peer_ingress_configured, drain_running, silent_intent_overrides, active_requested_deferred_names, staged_requested_deferred_names, active_visibility_revision, staged_visibility_revision >>
 
 
-IngestRunning(runtime_id) ==
+IngestRunning(runtime_id, work_id, origin) ==
     /\ phase = "Running"
     /\ (session_id # None)
     /\ phase' = "Running"
@@ -1520,9 +1520,9 @@ Next ==
     \/ AbortAllStopped
     \/ EnsureDrainRunningAttached
     \/ EnsureDrainRunningRunning
-    \/ \E runtime_id \in AgentRuntimeIdValues : IngestIdle(runtime_id)
-    \/ \E runtime_id \in AgentRuntimeIdValues : IngestAttached(runtime_id)
-    \/ \E runtime_id \in AgentRuntimeIdValues : IngestRunning(runtime_id)
+    \/ \E runtime_id \in AgentRuntimeIdValues : \E work_id \in WorkIdValues : \E origin \in StringValues : IngestIdle(runtime_id, work_id, origin)
+    \/ \E runtime_id \in AgentRuntimeIdValues : \E work_id \in WorkIdValues : \E origin \in StringValues : IngestAttached(runtime_id, work_id, origin)
+    \/ \E runtime_id \in AgentRuntimeIdValues : \E work_id \in WorkIdValues : \E origin \in StringValues : IngestRunning(runtime_id, work_id, origin)
     \/ \E kind \in StringValues : PublishEventIdle(kind)
     \/ \E kind \in StringValues : PublishEventAttached(kind)
     \/ \E kind \in StringValues : PublishEventRunning(kind)

@@ -29,6 +29,7 @@ use meerkat_core::comms_drain_lifecycle_authority::{
 use meerkat_core::generated::{protocol_comms_drain_abort, protocol_comms_drain_spawn};
 use meerkat_core::lifecycle::core_executor::CoreApplyOutput;
 use meerkat_core::lifecycle::run_control::RunControlCommand;
+use meerkat_core::lifecycle::run_primitive::RunApplyBoundary;
 use meerkat_core::lifecycle::{InputId, RunId};
 use meerkat_core::types::SessionId;
 use meerkat_core::{
@@ -264,12 +265,19 @@ impl DriverEntry {
     pub(crate) async fn run_failed(
         &mut self,
         run_id: RunId,
+        contributing_input_ids: Vec<InputId>,
         error: String,
         recoverable: bool,
     ) -> Result<(), RuntimeDriverError> {
         match self {
-            DriverEntry::Ephemeral(d) => d.run_failed(run_id, error, recoverable).await,
-            DriverEntry::Persistent(d) => d.run_failed(run_id, error, recoverable).await,
+            DriverEntry::Ephemeral(d) => {
+                d.run_failed(run_id, contributing_input_ids, error, recoverable)
+                    .await
+            }
+            DriverEntry::Persistent(d) => {
+                d.run_failed(run_id, contributing_input_ids, error, recoverable)
+                    .await
+            }
         }
     }
 
@@ -335,7 +343,7 @@ impl DriverEntry {
     pub(crate) async fn destroy(&mut self) -> Result<DestroyReport, RuntimeDriverError> {
         match self {
             DriverEntry::Ephemeral(d) => {
-                let abandoned = d.destroy()?;
+                let abandoned = d.destroy_cleanup();
                 Ok(DestroyReport {
                     inputs_abandoned: abandoned,
                 })
@@ -410,6 +418,41 @@ fn machine_apply_run_return_projection(
 
 fn slice_starts_with(seq: &[InputId], prefix: &[InputId]) -> bool {
     prefix.len() <= seq.len() && seq[..prefix.len()] == *prefix
+}
+
+pub(crate) fn machine_input_boundary(driver: &DriverEntry, work_id: &InputId) -> RunApplyBoundary {
+    match driver.ingress().handling_mode(work_id) {
+        Some(meerkat_core::types::HandlingMode::Steer) => RunApplyBoundary::RunCheckpoint,
+        _ => RunApplyBoundary::RunStart,
+    }
+}
+
+pub(crate) fn machine_select_runtime_loop_batch(driver: &DriverEntry) -> Vec<InputId> {
+    let ingress = driver.ingress();
+    if !ingress.steer_queue().is_empty() {
+        let first = &ingress.steer_queue()[0];
+        let target_boundary = machine_input_boundary(driver, first);
+        return ingress
+            .steer_queue()
+            .iter()
+            .take_while(|id| machine_input_boundary(driver, id) == target_boundary)
+            .cloned()
+            .collect();
+    }
+
+    if let Some(first) = ingress.queue().first() {
+        if ingress.is_prompt(first) {
+            return vec![first.clone()];
+        }
+        return ingress
+            .queue()
+            .iter()
+            .take_while(|id| !ingress.is_prompt(id))
+            .cloned()
+            .collect();
+    }
+
+    Vec::new()
 }
 
 fn machine_validate_stage_drain_snapshot(
@@ -500,6 +543,46 @@ fn machine_validate_run_completed(
     Ok(())
 }
 
+fn machine_staged_contributors(driver: &DriverEntry) -> Vec<InputId> {
+    driver
+        .as_driver()
+        .active_input_ids()
+        .into_iter()
+        .filter(|work_id| {
+            driver
+                .as_driver()
+                .input_state(work_id)
+                .map(InputState::current_state)
+                == Some(InputLifecycleState::Staged)
+        })
+        .collect()
+}
+
+fn machine_validate_run_failed(
+    driver: &DriverEntry,
+    contributing_work_ids: &[InputId],
+) -> Result<(), RuntimeDriverError> {
+    if contributing_work_ids.is_empty() {
+        return Err(RuntimeDriverError::Internal(
+            "run failed requires at least one staged contributor".to_string(),
+        ));
+    }
+
+    for work_id in contributing_work_ids {
+        let lifecycle = driver
+            .as_driver()
+            .input_state(work_id)
+            .map(InputState::current_state);
+        if lifecycle != Some(InputLifecycleState::Staged) {
+            return Err(RuntimeDriverError::Internal(format!(
+                "run failed requires staged contributors, but {work_id:?} is {lifecycle:?}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 async fn machine_stop_runtime(driver: &mut DriverEntry) -> Result<(), RuntimeDriverError> {
     match driver.runtime_state() {
         RuntimeState::Initializing
@@ -518,7 +601,30 @@ async fn machine_stop_runtime(driver: &mut DriverEntry) -> Result<(), RuntimeDri
         }
     }
 
+    driver.set_control_projection(RuntimeState::Stopped, None, None);
     driver.finalize_stop_runtime().await
+}
+
+async fn machine_destroy(driver: &mut DriverEntry) -> Result<DestroyReport, RuntimeDriverError> {
+    match driver.runtime_state() {
+        RuntimeState::Initializing | RuntimeState::Destroyed => {
+            return Err(RuntimeDriverError::Internal(
+                RuntimeStateTransitionError {
+                    from: driver.runtime_state(),
+                    to: RuntimeState::Destroyed,
+                }
+                .to_string(),
+            ));
+        }
+        RuntimeState::Idle
+        | RuntimeState::Attached
+        | RuntimeState::Running
+        | RuntimeState::Retired
+        | RuntimeState::Stopped => {}
+    }
+
+    driver.set_control_projection(RuntimeState::Destroyed, None, None);
+    driver.destroy().await
 }
 
 async fn machine_retire(driver: &mut DriverEntry) -> Result<RetireReport, RuntimeDriverError> {
@@ -681,9 +787,12 @@ pub(crate) async fn commit_runtime_loop_run(
         .await
     {
         let unwind_run_id = run_id.clone();
+        let staged_input_ids = machine_staged_contributors(&driver);
+        machine_validate_run_failed(&driver, &staged_input_ids)?;
         if let Err(unwind_err) = driver
             .run_failed(
                 unwind_run_id.clone(),
+                staged_input_ids,
                 format!("boundary commit failed: {err}"),
                 true,
             )
@@ -735,8 +844,10 @@ pub(crate) async fn fail_runtime_loop_run(
     let next_phase =
         crate::runtime_state::run_return_phase_from_pre_run_phase(driver.pre_run_phase());
     let failed_run_id = run_id.clone();
+    let staged_input_ids = machine_staged_contributors(&driver);
+    machine_validate_run_failed(&driver, &staged_input_ids)?;
     driver
-        .run_failed(failed_run_id.clone(), error, true)
+        .run_failed(failed_run_id.clone(), staged_input_ids, error, true)
         .await
         .map_err(|run_err| {
             RuntimeDriverError::Internal(format!("failed to record run-failed event: {run_err}"))
@@ -1955,8 +2066,7 @@ impl MeerkatMachine {
                 }
 
                 let mut drv = driver.lock().await;
-                let report = drv
-                    .destroy()
+                let report = machine_destroy(&mut drv)
                     .await
                     .map_err(|e| RuntimeControlPlaneError::Internal(e.to_string()))?;
                 drop(drv);

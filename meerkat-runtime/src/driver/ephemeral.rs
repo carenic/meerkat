@@ -435,26 +435,6 @@ impl EphemeralRuntimeDriver {
         }));
     }
 
-    pub fn attach(&mut self) -> Result<(), crate::runtime_state::RuntimeStateTransitionError> {
-        if self.phase != RuntimeState::Idle {
-            return Err(crate::runtime_state::RuntimeStateTransitionError {
-                from: self.phase,
-                to: RuntimeState::Attached,
-            });
-        }
-        self.transition_phase(RuntimeState::Attached);
-        Ok(())
-    }
-    pub fn detach(
-        &mut self,
-    ) -> Result<Option<RuntimeState>, crate::runtime_state::RuntimeStateTransitionError> {
-        if self.phase == RuntimeState::Attached {
-            self.transition_phase(RuntimeState::Idle);
-            Ok(Some(RuntimeState::Attached))
-        } else {
-            Ok(None)
-        }
-    }
     pub(crate) fn set_control_projection(
         &mut self,
         next_phase: RuntimeState,
@@ -806,11 +786,6 @@ impl EphemeralRuntimeDriver {
         abandoned
     }
 
-    pub fn destroy(&mut self) -> Result<usize, RuntimeDriverError> {
-        self.set_control_projection(RuntimeState::Destroyed, None, None);
-        Ok(self.destroy_cleanup())
-    }
-
     pub(crate) fn stop_runtime_cleanup(&mut self) {
         self.abandon_all_non_terminal(InputAbandonReason::Stopped);
         self.silent_comms_intents.clear();
@@ -819,7 +794,6 @@ impl EphemeralRuntimeDriver {
     }
 
     pub(crate) fn finalize_stop_runtime(&mut self) {
-        self.set_control_projection(RuntimeState::Stopped, None, None);
         self.stop_runtime_cleanup();
     }
 
@@ -1069,17 +1043,12 @@ impl EphemeralRuntimeDriver {
     pub async fn run_failed(
         &mut self,
         run_id: RunId,
+        contributing_input_ids: Vec<InputId>,
         _error: String,
         _recoverable: bool,
     ) -> Result<(), RuntimeDriverError> {
-        let staged_ids: Vec<InputId> = self
-            .ledger
-            .iter()
-            .filter(|(_, s)| s.current_state() == InputLifecycleState::Staged)
-            .map(|(id, _)| id.clone())
-            .collect();
         match self.ingress.apply(RuntimeIngressInput::RunFailed {
-            contributing_work_ids: staged_ids.clone(),
+            contributing_work_ids: contributing_input_ids.clone(),
         }) {
             Ok(transition) => {
                 self.process_ingress_effects(&transition.effects);
@@ -1093,7 +1062,7 @@ impl EphemeralRuntimeDriver {
             }
         }
 
-        self.rollback_staged(&staged_ids)
+        self.rollback_staged(&contributing_input_ids)
             .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
         Ok(())
     }
@@ -1153,15 +1122,6 @@ impl EphemeralRuntimeDriver {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
     async fn accept_input(&mut self, input: Input) -> Result<AcceptOutcome, RuntimeDriverError> {
-        let control_phase = self.phase;
-        match control_phase.can_accept_input() {
-            true => {}
-            false => {
-                return Err(RuntimeDriverError::NotReady {
-                    state: control_phase,
-                });
-            }
-        }
         if let Err(e) = validate_durability(&input) {
             match e {
                 DurabilityError::DerivedForbidden { .. }
