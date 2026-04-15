@@ -298,6 +298,10 @@ Interpretation:
   non-accepting phases that the direct driver contract already rejects: the
   machine boundary now normalizes only the public `Destroyed` error shape while
   leaving direct legality ownership with `EphemeralRuntimeDriver::accept_input`
+- the generic `RuntimeDriver::on_run_event` hook is gone too: the checked-in
+  machine and tests now target concrete `boundary_applied`, `run_completed`,
+  and `run_failed` driver helpers instead of routing terminal lifecycle through
+  an opaque catch-all run-event surface
 
 ## Resolution Rubric
 

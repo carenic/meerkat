@@ -352,11 +352,11 @@ async fn boundary_applied_persists_atomically() {
         sequence: 0,
     };
     driver
-        .on_run_event(meerkat_core::lifecycle::RunEvent::BoundaryApplied {
-            run_id: run_id.clone(),
-            receipt: receipt.clone(),
-            session_snapshot: Some(b"session-data".to_vec()),
-        })
+        .boundary_applied(
+            run_id.clone(),
+            receipt.clone(),
+            Some(b"session-data".to_vec()),
+        )
         .await
         .unwrap();
 

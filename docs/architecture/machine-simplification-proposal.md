@@ -741,6 +741,11 @@ The important read is now sharper than the earlier partial dump story:
   not reopen parity either: direct admission legality is now owned in one
   place by `EphemeralRuntimeDriver::accept_input`, while the machine boundary
   preserves only the outward `Destroyed` error normalization
+- removing the generic `RuntimeDriver::on_run_event` hook did not reopen
+  parity either: the checked-in machine now speaks only concrete
+  `boundary_applied`, `run_completed`, and `run_failed` lifecycle helpers when
+  realizing run terminals, instead of delegating through an opaque catch-all
+  run-event trait surface
 - preserving the full snapshot still keeps almost every remaining state
   distinct (`19,078`), which tells us the field tuple is still doing most of
   the real work even after the retire-drain correction

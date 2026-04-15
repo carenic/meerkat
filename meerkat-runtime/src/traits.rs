@@ -2,7 +2,7 @@
 //!
 //! These define the interface between surfaces and the runtime control-plane.
 
-use meerkat_core::lifecycle::{InputId, RunEvent, RunId};
+use meerkat_core::lifecycle::{InputId, RunId};
 use serde::{Deserialize, Serialize};
 
 use crate::accept::AcceptOutcome;
@@ -114,9 +114,6 @@ pub trait RuntimeDriver: Send + Sync {
         &mut self,
         event: RuntimeEventEnvelope,
     ) -> Result<(), RuntimeDriverError>;
-
-    /// Handle a run event (from core).
-    async fn on_run_event(&mut self, event: RunEvent) -> Result<(), RuntimeDriverError>;
 
     /// Recover from a crash/restart.
     async fn recover(&mut self) -> Result<RecoveryReport, RuntimeDriverError>;

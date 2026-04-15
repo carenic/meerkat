@@ -238,6 +238,45 @@ impl DriverEntry {
         }
     }
 
+    pub(crate) async fn boundary_applied(
+        &mut self,
+        run_id: RunId,
+        receipt: meerkat_core::lifecycle::RunBoundaryReceipt,
+        session_snapshot: Option<Vec<u8>>,
+    ) -> Result<(), RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => {
+                d.boundary_applied(run_id, receipt, session_snapshot).await
+            }
+            DriverEntry::Persistent(d) => {
+                d.boundary_applied(run_id, receipt, session_snapshot).await
+            }
+        }
+    }
+
+    pub(crate) async fn run_completed(
+        &mut self,
+        run_id: RunId,
+        consumed_input_ids: Vec<InputId>,
+    ) -> Result<(), RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.run_completed(run_id, consumed_input_ids).await,
+            DriverEntry::Persistent(d) => d.run_completed(run_id, consumed_input_ids).await,
+        }
+    }
+
+    pub(crate) async fn run_failed(
+        &mut self,
+        run_id: RunId,
+        error: String,
+        recoverable: bool,
+    ) -> Result<(), RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.run_failed(run_id, error, recoverable).await,
+            DriverEntry::Persistent(d) => d.run_failed(run_id, error, recoverable).await,
+        }
+    }
+
     /// Stage an input (Queued → Staged).
     pub(crate) fn stage_input(
         &mut self,
@@ -350,21 +389,11 @@ pub(crate) async fn commit_runtime_loop_run(
 ) -> Result<(), RuntimeDriverError> {
     let mut driver = driver.lock().await;
     if let Err(err) = driver
-        .as_driver_mut()
-        .on_run_event(meerkat_core::lifecycle::RunEvent::BoundaryApplied {
-            run_id: run_id.clone(),
-            receipt,
-            session_snapshot,
-        })
+        .boundary_applied(run_id.clone(), receipt, session_snapshot)
         .await
     {
         if let Err(unwind_err) = driver
-            .as_driver_mut()
-            .on_run_event(meerkat_core::lifecycle::RunEvent::RunFailed {
-                run_id,
-                error: format!("boundary commit failed: {err}"),
-                recoverable: true,
-            })
+            .run_failed(run_id, format!("boundary commit failed: {err}"), true)
             .await
         {
             return Err(RuntimeDriverError::Internal(format!(
@@ -377,11 +406,7 @@ pub(crate) async fn commit_runtime_loop_run(
     }
 
     driver
-        .as_driver_mut()
-        .on_run_event(meerkat_core::lifecycle::RunEvent::RunCompleted {
-            run_id,
-            consumed_input_ids,
-        })
+        .run_completed(run_id, consumed_input_ids)
         .await
         .map_err(|err| {
             RuntimeDriverError::Internal(format!(
@@ -399,12 +424,7 @@ pub(crate) async fn fail_runtime_loop_run(
 ) -> Result<(), RuntimeDriverError> {
     let mut driver = driver.lock().await;
     driver
-        .as_driver_mut()
-        .on_run_event(meerkat_core::lifecycle::RunEvent::RunFailed {
-            run_id,
-            error,
-            recoverable: true,
-        })
+        .run_failed(run_id, error, true)
         .await
         .map_err(|run_err| {
             RuntimeDriverError::Internal(format!("failed to record run-failed event: {run_err}"))
@@ -1939,45 +1959,22 @@ impl MeerkatMachine {
                         .clone()
                 };
 
-                let mut driver = driver.lock().await;
-                if let Err(err) = driver
-                    .as_driver_mut()
-                    .on_run_event(meerkat_core::lifecycle::RunEvent::BoundaryApplied {
-                        run_id: run_id.clone(),
-                        receipt: output.receipt,
-                        session_snapshot: output.session_snapshot,
-                    })
-                    .await
+                if let Err(err) = commit_runtime_loop_run(
+                    &driver,
+                    run_id,
+                    vec![input_id],
+                    output.receipt,
+                    output.session_snapshot,
+                )
+                .await
                 {
-                    if let Err(unwind_err) = driver
-                        .as_driver_mut()
-                        .on_run_event(meerkat_core::lifecycle::RunEvent::RunFailed {
-                            run_id,
-                            error: format!("boundary commit failed: {err}"),
-                            recoverable: true,
-                        })
-                        .await
-                    {
-                        return Err(RuntimeDriverError::Internal(format!(
-                            "runtime boundary commit failed: {err}; additionally failed to unwind runtime state: {unwind_err}"
-                        )));
+                    let should_unregister =
+                        !err.to_string().contains("runtime boundary commit failed");
+                    if should_unregister {
+                        self.unregister_session_inner(&session_id).await;
                     }
                     return Err(RuntimeDriverError::Internal(format!(
-                        "runtime boundary commit failed: {err}"
-                    )));
-                }
-                if let Err(err) = driver
-                    .as_driver_mut()
-                    .on_run_event(meerkat_core::lifecycle::RunEvent::RunCompleted {
-                        run_id,
-                        consumed_input_ids: vec![input_id],
-                    })
-                    .await
-                {
-                    drop(driver);
-                    self.unregister_session_inner(&session_id).await;
-                    return Err(RuntimeDriverError::Internal(format!(
-                        "failed to persist runtime completion snapshot: {err}"
+                        "runtime commit failed: {err}"
                     )));
                 }
 
@@ -1999,17 +1996,7 @@ impl MeerkatMachine {
                         .clone()
                 };
 
-                let mut driver = driver.lock().await;
-                if let Err(run_err) = driver
-                    .as_driver_mut()
-                    .on_run_event(meerkat_core::lifecycle::RunEvent::RunFailed {
-                        run_id,
-                        error,
-                        recoverable: true,
-                    })
-                    .await
-                {
-                    drop(driver);
+                if let Err(run_err) = fail_runtime_loop_run(&driver, run_id, error).await {
                     self.unregister_session_inner(&session_id).await;
                     return Err(RuntimeDriverError::Internal(format!(
                         "failed to persist runtime failure snapshot: {run_err}"

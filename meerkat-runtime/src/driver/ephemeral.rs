@@ -7,7 +7,7 @@
 //! - S24 ephemeral recovery
 //! - S25 retire/reset/destroy lifecycle operations
 
-use meerkat_core::lifecycle::{InputId, RunEvent, RunId};
+use meerkat_core::lifecycle::{InputId, RunBoundaryReceipt, RunId};
 use meerkat_core::types::HandlingMode;
 
 use crate::accept::AcceptOutcome;
@@ -1212,6 +1212,124 @@ impl EphemeralRuntimeDriver {
         self.debug_assert_queue_projection_alignment();
         abandoned
     }
+
+    pub async fn run_completed(
+        &mut self,
+        run_id: RunId,
+        consumed_input_ids: Vec<InputId>,
+    ) -> Result<(), RuntimeDriverError> {
+        self.validate_active_run_id(&run_id)
+            .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
+        let next_phase =
+            crate::runtime_state::run_return_phase_from_pre_run_phase(self.pre_run_phase());
+        match self.ingress.apply(RuntimeIngressInput::RunCompleted {
+            contributing_work_ids: consumed_input_ids.clone(),
+        }) {
+            Ok(transition) => {
+                self.process_ingress_effects(&transition.effects);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    run_id = ?run_id,
+                    error = %err,
+                    "ingress authority rejected RunCompleted"
+                );
+            }
+        }
+
+        self.consume_inputs(&consumed_input_ids, &run_id)
+            .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
+        self.apply_run_return_projection(&run_id, next_phase)
+            .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn run_failed(
+        &mut self,
+        run_id: RunId,
+        _error: String,
+        _recoverable: bool,
+    ) -> Result<(), RuntimeDriverError> {
+        self.validate_active_run_id(&run_id)
+            .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
+        let next_phase =
+            crate::runtime_state::run_return_phase_from_pre_run_phase(self.pre_run_phase());
+        let staged_ids: Vec<InputId> = self
+            .ledger
+            .iter()
+            .filter(|(_, s)| s.current_state() == InputLifecycleState::Staged)
+            .map(|(id, _)| id.clone())
+            .collect();
+        match self.ingress.apply(RuntimeIngressInput::RunFailed {
+            contributing_work_ids: staged_ids.clone(),
+        }) {
+            Ok(transition) => {
+                self.process_ingress_effects(&transition.effects);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    run_id = ?run_id,
+                    error = %err,
+                    "ingress authority rejected RunFailed"
+                );
+            }
+        }
+
+        self.rollback_staged(&staged_ids)
+            .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
+        self.apply_run_return_projection(&run_id, next_phase)
+            .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn boundary_applied(
+        &mut self,
+        run_id: RunId,
+        receipt: RunBoundaryReceipt,
+        _session_snapshot: Option<Vec<u8>>,
+    ) -> Result<(), RuntimeDriverError> {
+        self.validate_active_run_id(&run_id)
+            .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
+        match self.ingress.apply(RuntimeIngressInput::BoundaryApplied {
+            contributing_work_ids: receipt.contributing_input_ids.clone(),
+            boundary_sequence: receipt.sequence,
+        }) {
+            Ok(transition) => {
+                self.process_ingress_effects(&transition.effects);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    run_id = ?run_id,
+                    boundary_sequence = receipt.sequence,
+                    error = %err,
+                    "ingress authority rejected BoundaryApplied"
+                );
+            }
+        }
+
+        for input_id in &receipt.contributing_input_ids {
+            if let Some(state) = self.ledger.get_mut(input_id) {
+                let applied = state
+                    .apply(InputLifecycleInput::MarkApplied {
+                        run_id: run_id.clone(),
+                    })
+                    .is_ok();
+                let _ = state.apply(InputLifecycleInput::MarkAppliedPendingConsumption {
+                    boundary_sequence: receipt.sequence,
+                });
+                if applied {
+                    self.events
+                        .push(self.make_envelope(RuntimeEvent::InputLifecycle(
+                            InputLifecycleEvent::Applied {
+                                input_id: input_id.clone(),
+                                run_id: run_id.clone(),
+                            },
+                        )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
@@ -1359,158 +1477,6 @@ impl crate::traits::RuntimeDriver for EphemeralRuntimeDriver {
         &mut self,
         _event: RuntimeEventEnvelope,
     ) -> Result<(), RuntimeDriverError> {
-        Ok(())
-    }
-
-    async fn on_run_event(&mut self, event: RunEvent) -> Result<(), RuntimeDriverError> {
-        match event {
-            RunEvent::RunCompleted {
-                run_id,
-                consumed_input_ids,
-            } => {
-                self.validate_active_run_id(&run_id)
-                    .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
-                let next_phase =
-                    crate::runtime_state::run_return_phase_from_pre_run_phase(self.pre_run_phase());
-                // Ingress authority: RunCompleted clears the current contributor
-                // set; active run identity is owned by the control machine.
-                match self.ingress.apply(RuntimeIngressInput::RunCompleted {
-                    contributing_work_ids: consumed_input_ids.clone(),
-                }) {
-                    Ok(transition) => {
-                        self.process_ingress_effects(&transition.effects);
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            run_id = ?run_id,
-                            error = %err,
-                            "ingress authority rejected RunCompleted"
-                        );
-                    }
-                }
-
-                self.consume_inputs(&consumed_input_ids, &run_id)
-                    .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
-                self.apply_run_return_projection(&run_id, next_phase)
-                    .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
-            }
-            RunEvent::RunFailed { ref run_id, .. } => {
-                self.validate_active_run_id(run_id)
-                    .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
-                let next_phase =
-                    crate::runtime_state::run_return_phase_from_pre_run_phase(self.pre_run_phase());
-                let staged_ids: Vec<InputId> = self
-                    .ledger
-                    .iter()
-                    .filter(|(_, s)| s.current_state() == InputLifecycleState::Staged)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                // Ingress authority: RunFailed rolls back the current contributor
-                // set; active run identity is owned by the control machine.
-                match self.ingress.apply(RuntimeIngressInput::RunFailed {
-                    contributing_work_ids: staged_ids.clone(),
-                }) {
-                    Ok(transition) => {
-                        self.process_ingress_effects(&transition.effects);
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            run_id = ?run_id,
-                            error = %err,
-                            "ingress authority rejected RunFailed"
-                        );
-                    }
-                }
-
-                self.rollback_staged(&staged_ids)
-                    .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
-                // Wake decision is authority-driven: the ingress authority emits
-                // WakeRuntime when rolled-back inputs are re-enqueued (above).
-                self.apply_run_return_projection(run_id, next_phase)
-                    .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
-            }
-            RunEvent::RunCancelled { ref run_id, .. } => {
-                self.validate_active_run_id(run_id)
-                    .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
-                let next_phase =
-                    crate::runtime_state::run_return_phase_from_pre_run_phase(self.pre_run_phase());
-                let staged_ids: Vec<InputId> = self
-                    .ledger
-                    .iter()
-                    .filter(|(_, s)| s.current_state() == InputLifecycleState::Staged)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                // Ingress authority: RunCancelled rolls back the current contributor
-                // set; active run identity is owned by the control machine.
-                match self.ingress.apply(RuntimeIngressInput::RunCancelled {
-                    contributing_work_ids: staged_ids.clone(),
-                }) {
-                    Ok(transition) => {
-                        self.process_ingress_effects(&transition.effects);
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            run_id = ?run_id,
-                            error = %err,
-                            "ingress authority rejected RunCancelled"
-                        );
-                    }
-                }
-
-                self.rollback_staged(&staged_ids)
-                    .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
-                // Wake decision is authority-driven: the ingress authority emits
-                // WakeRuntime when rolled-back inputs are re-enqueued (above).
-                self.apply_run_return_projection(run_id, next_phase)
-                    .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
-            }
-            RunEvent::RunStarted { .. } => {}
-            RunEvent::BoundaryApplied {
-                run_id, receipt, ..
-            } => {
-                self.validate_active_run_id(&run_id)
-                    .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
-                match self.ingress.apply(RuntimeIngressInput::BoundaryApplied {
-                    contributing_work_ids: receipt.contributing_input_ids.clone(),
-                    boundary_sequence: receipt.sequence,
-                }) {
-                    Ok(transition) => {
-                        self.process_ingress_effects(&transition.effects);
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            run_id = ?run_id,
-                            boundary_sequence = receipt.sequence,
-                            error = %err,
-                            "ingress authority rejected BoundaryApplied"
-                        );
-                    }
-                }
-
-                for input_id in &receipt.contributing_input_ids {
-                    if let Some(state) = self.ledger.get_mut(input_id) {
-                        let applied = state
-                            .apply(InputLifecycleInput::MarkApplied {
-                                run_id: run_id.clone(),
-                            })
-                            .is_ok();
-                        let _ = state.apply(InputLifecycleInput::MarkAppliedPendingConsumption {
-                            boundary_sequence: receipt.sequence,
-                        });
-                        if applied {
-                            self.events
-                                .push(self.make_envelope(RuntimeEvent::InputLifecycle(
-                                    InputLifecycleEvent::Applied {
-                                        input_id: input_id.clone(),
-                                        run_id: run_id.clone(),
-                                    },
-                                )));
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
         Ok(())
     }
 

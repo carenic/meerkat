@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use meerkat_core::BlobStore;
-use meerkat_core::lifecycle::{InputId, RunEvent};
+use meerkat_core::lifecycle::{InputId, RunBoundaryReceipt, RunId};
 
 use crate::accept::AcceptOutcome;
 use crate::driver::ephemeral::handling_mode_from_policy;
@@ -336,6 +336,99 @@ impl PersistentRuntimeDriver {
         }
         Ok(())
     }
+
+    pub async fn boundary_applied(
+        &mut self,
+        run_id: RunId,
+        receipt: RunBoundaryReceipt,
+        session_snapshot: Option<Vec<u8>>,
+    ) -> Result<(), RuntimeDriverError> {
+        let checkpoint = self.inner.clone();
+        self.inner
+            .boundary_applied(run_id, receipt.clone(), session_snapshot.clone())
+            .await?;
+        if self
+            .store
+            .load_boundary_receipt(&self.runtime_id, &receipt.run_id, receipt.sequence)
+            .await
+            .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let input_updates: Vec<InputState> = receipt
+            .contributing_input_ids
+            .iter()
+            .filter_map(|id| self.inner.input_state(id).cloned())
+            .collect();
+
+        self.store
+            .atomic_apply(
+                &self.runtime_id,
+                session_snapshot
+                    .map(|session_snapshot| crate::store::SessionDelta { session_snapshot }),
+                receipt,
+                input_updates,
+                None,
+            )
+            .await
+            .map_err(|e| {
+                self.inner = checkpoint;
+                RuntimeDriverError::Internal(format!("runtime boundary commit failed: {e}"))
+            })?;
+        Ok(())
+    }
+
+    pub async fn run_completed(
+        &mut self,
+        run_id: RunId,
+        consumed_input_ids: Vec<InputId>,
+    ) -> Result<(), RuntimeDriverError> {
+        let checkpoint = self.inner.clone();
+        self.inner.run_completed(run_id, consumed_input_ids).await?;
+        let input_states = self.inner.input_states_snapshot();
+        if let Err(err) = self
+            .store
+            .atomic_lifecycle_commit(
+                &self.runtime_id,
+                self.runtime_state_for_persistence(),
+                &input_states,
+            )
+            .await
+        {
+            self.inner = checkpoint;
+            return Err(RuntimeDriverError::Internal(format!(
+                "terminal event persist failed: {err}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub async fn run_failed(
+        &mut self,
+        run_id: RunId,
+        error: String,
+        recoverable: bool,
+    ) -> Result<(), RuntimeDriverError> {
+        let checkpoint = self.inner.clone();
+        self.inner.run_failed(run_id, error, recoverable).await?;
+        let input_states = self.inner.input_states_snapshot();
+        if let Err(err) = self
+            .store
+            .atomic_lifecycle_commit(
+                &self.runtime_id,
+                self.runtime_state_for_persistence(),
+                &input_states,
+            )
+            .await
+        {
+            self.inner = checkpoint;
+            return Err(RuntimeDriverError::Internal(format!(
+                "terminal event persist failed: {err}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
@@ -383,76 +476,6 @@ impl RuntimeDriver for PersistentRuntimeDriver {
         event: RuntimeEventEnvelope,
     ) -> Result<(), RuntimeDriverError> {
         self.inner.on_runtime_event(event).await
-    }
-
-    async fn on_run_event(&mut self, event: RunEvent) -> Result<(), RuntimeDriverError> {
-        match event {
-            // BoundaryApplied persists the receipt and the applied state atomically.
-            RunEvent::BoundaryApplied {
-                ref receipt,
-                ref session_snapshot,
-                ..
-            } => {
-                let checkpoint = self.inner.clone();
-                self.inner.on_run_event(event.clone()).await?;
-                if self
-                    .store
-                    .load_boundary_receipt(&self.runtime_id, &receipt.run_id, receipt.sequence)
-                    .await
-                    .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?
-                    .is_some()
-                {
-                    return Ok(());
-                }
-                let input_updates: Vec<InputState> = receipt
-                    .contributing_input_ids
-                    .iter()
-                    .filter_map(|id| self.inner.input_state(id).cloned())
-                    .collect();
-
-                self.store
-                    .atomic_apply(
-                        &self.runtime_id,
-                        session_snapshot.clone().map(|session_snapshot| {
-                            crate::store::SessionDelta { session_snapshot }
-                        }),
-                        receipt.clone(),
-                        input_updates,
-                        None, // session_store_key — caller provides if dual-store needed
-                    )
-                    .await
-                    .map_err(|e| {
-                        self.inner = checkpoint;
-                        RuntimeDriverError::Internal(format!("runtime boundary commit failed: {e}"))
-                    })?;
-            }
-            RunEvent::RunCompleted { .. }
-            | RunEvent::RunFailed { .. }
-            | RunEvent::RunCancelled { .. } => {
-                let checkpoint = self.inner.clone();
-                self.inner.on_run_event(event).await?;
-                let input_states = self.inner.input_states_snapshot();
-                if let Err(err) = self
-                    .store
-                    .atomic_lifecycle_commit(
-                        &self.runtime_id,
-                        self.runtime_state_for_persistence(),
-                        &input_states,
-                    )
-                    .await
-                {
-                    self.inner = checkpoint;
-                    return Err(RuntimeDriverError::Internal(format!(
-                        "terminal event persist failed: {err}"
-                    )));
-                }
-            }
-            _ => {
-                self.inner.on_run_event(event).await?;
-            }
-        }
-
-        Ok(())
     }
 
     async fn recover(&mut self) -> Result<RecoveryReport, RuntimeDriverError> {

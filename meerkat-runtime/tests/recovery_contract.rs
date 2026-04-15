@@ -10,7 +10,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use meerkat_core::BlobStore;
 use meerkat_core::lifecycle::run_primitive::RunApplyBoundary;
-use meerkat_core::lifecycle::{InputId, RunBoundaryReceipt, RunEvent, RunId};
+use meerkat_core::lifecycle::{InputId, RunBoundaryReceipt, RunId};
 use meerkat_runtime::identifiers::LogicalRuntimeId;
 use meerkat_runtime::input::{
     Input, InputDurability, InputHeader, InputOrigin, InputVisibility, PromptInput,
@@ -514,11 +514,11 @@ async fn recovery_ephemeral_driver_contract_keeps_applied_boundary_inputs_out_of
     driver.stage_input(&first_id, &run_id).unwrap();
     driver.stage_input(&second_id, &run_id).unwrap();
     driver
-        .on_run_event(RunEvent::BoundaryApplied {
-            run_id: run_id.clone(),
-            receipt: make_receipt(run_id, vec![first_id.clone(), second_id.clone()], 0),
-            session_snapshot: Some(make_session_snapshot()),
-        })
+        .boundary_applied(
+            run_id.clone(),
+            make_receipt(run_id, vec![first_id.clone(), second_id.clone()], 0),
+            Some(make_session_snapshot()),
+        )
         .await
         .unwrap();
 

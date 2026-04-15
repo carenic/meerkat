@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use chrono::Utc;
-use meerkat_core::lifecycle::{InputId, RunEvent, RunId};
+use meerkat_core::lifecycle::{InputId, RunId};
 use meerkat_runtime::{
     ContinuationInput, EphemeralRuntimeDriver, Input, InputDurability, InputHeader,
     InputLifecycleEvent, InputLifecycleState, InputOrigin, InputVisibility, LogicalRuntimeId,
@@ -290,10 +290,7 @@ async fn on_run_completed_consumes() {
 
     // Run completed
     driver
-        .on_run_event(RunEvent::RunCompleted {
-            run_id: run_id.clone(),
-            consumed_input_ids: vec![input_id.clone()],
-        })
+        .run_completed(run_id.clone(), vec![input_id.clone()])
         .await
         .unwrap();
 
@@ -317,11 +314,7 @@ async fn on_run_failed_rollbacks() {
 
     // Run failed
     driver
-        .on_run_event(RunEvent::RunFailed {
-            run_id,
-            error: "LLM error".into(),
-            recoverable: true,
-        })
+        .run_failed(run_id, "LLM error".into(), true)
         .await
         .unwrap();
 
@@ -350,11 +343,7 @@ async fn on_run_failed_requests_wake_for_backlog() {
     driver.stage_input(&input1_id, &run_id).unwrap();
 
     driver
-        .on_run_event(RunEvent::RunFailed {
-            run_id,
-            error: "LLM error".into(),
-            recoverable: true,
-        })
+        .run_failed(run_id, "LLM error".into(), true)
         .await
         .unwrap();
 
@@ -468,11 +457,7 @@ async fn rollback_restores_queue_projection_order() {
     driver.stage_input(&first_id, &run_id).unwrap();
 
     driver
-        .on_run_event(RunEvent::RunFailed {
-            run_id,
-            error: "rollback".into(),
-            recoverable: true,
-        })
+        .run_failed(run_id, "rollback".into(), true)
         .await
         .unwrap();
 
@@ -575,13 +560,7 @@ async fn retired_can_drain_queue_via_run_cycle() {
     driver.apply_input(&input_id, &run_id).unwrap();
 
     // Complete run → returns to Retired (not Idle)
-    driver
-        .on_run_event(RunEvent::RunCompleted {
-            run_id,
-            consumed_input_ids: vec![input_id],
-        })
-        .await
-        .unwrap();
+    driver.run_completed(run_id, vec![input_id]).await.unwrap();
 
     assert_eq!(driver.runtime_state(), RuntimeState::Retired);
     assert!(driver.queue().is_empty());
