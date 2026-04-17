@@ -1,12 +1,14 @@
 //! Per-model capability rows for Anthropic models.
 //!
-//! Seed values are intentionally matched to the current `profile()` output so
-//! that `schema_builder::build_params_schema(caps) == profile_for(...).params_schema`
-//! for every catalog model before the switchover. Correctness fixes land in a
-//! later commit with updated rows + golden schema snapshots.
+//! All values are cited against authoritative Anthropic primary sources:
+//! `platform.claude.com/docs/en/about-claude/models/*` and the
+//! feature pages (`effort`, `extended-thinking`, `adaptive-thinking`,
+//! `context-windows`, `compaction`, `structured-outputs`).
 
 use super::{BetaHeader, BetaValue, ModelCapabilities, ThinkingSupport};
 use crate::catalog::ModelTier;
+
+// ── Beta headers ──────────────────────────────────────────────────────────
 
 const BETA_COMPACTION: BetaHeader = BetaHeader {
     feature: "compaction",
@@ -26,30 +28,55 @@ const BETA_INTERLEAVED_THINKING: BetaHeader = BetaHeader {
     header_value: "interleaved-thinking-2025-05-14",
 };
 
-const BETA_OUTPUT_300K: BetaValue<u32> = BetaValue {
-    header: "anthropic-beta: output-300k-2026-03-24",
-    value: 300_000,
-};
-
-const OPUS_46_BETAS: &[BetaHeader] = &[
+/// Headers advertised for models with adaptive thinking + compaction
+/// (Opus 4.7, Opus 4.6, Sonnet 4.6).
+const ADAPTIVE_COMPACTION_BETAS: &[BetaHeader] = &[
     BETA_COMPACTION,
     BETA_STRUCTURED_OUTPUT,
     BETA_INTERLEAVED_THINKING,
 ];
 
-const STANDARD_BETAS: &[BetaHeader] = &[BETA_STRUCTURED_OUTPUT, BETA_INTERLEAVED_THINKING];
+/// Headers advertised for models with interleaved thinking but no compaction
+/// (Opus 4.5, Sonnet 4.5).
+const LEGACY_THINKING_BETAS: &[BetaHeader] = &[BETA_STRUCTURED_OUTPUT, BETA_INTERLEAVED_THINKING];
 
-const OPUS_46_EFFORT: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+/// Batch API extended-output beta (300k cap). Applies to Opus 4.7 / 4.6 /
+/// Sonnet 4.6 per the official Models overview.
+const BETA_OUTPUT_300K: BetaValue<u32> = BetaValue {
+    header: "anthropic-beta: output-300k-2026-03-24",
+    value: 300_000,
+};
+
+// ── Effort tiers ──────────────────────────────────────────────────────────
+
+/// Effort tiers accepted by Opus 4.7 only; `xhigh` sits between `high` and `max`.
+const OPUS_47_EFFORT: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// Effort tiers shared by Opus 4.6, Opus 4.5, and Sonnet 4.6.
+const CLAUDE_4_EFFORT: &[&str] = &["low", "medium", "high", "max"];
+
+// ── Catalog rows ─────────────────────────────────────────────────────────
 
 /// Capability rows for Anthropic catalog models.
-///
-/// **Note**: these rows reflect the *pre-correctness-fix* schema — they match
-/// what the heuristic-based `profile()` function currently emits so the parity
-/// test passes. Authoritative per-model corrections (Opus 4.7's adaptive-only
-/// thinking, Opus 4.6 dropping xhigh, Opus 4.6 1M context, etc.) land in a
-/// later commit.
 pub const CAPABILITIES: &[ModelCapabilities] = &[
-    // Opus 4.7 — currently shares the opus46 schema bucket with Opus 4.6.
+    // Claude Opus 4.7
+    //
+    // Sources:
+    //   - Models overview:
+    //     https://platform.claude.com/docs/en/about-claude/models/overview
+    //     (1M context, 128k sync output)
+    //   - Migration guide:
+    //     https://platform.claude.com/docs/en/about-claude/models/migration-guide
+    //     (rejects non-default temperature/top_p/top_k; manual thinking returns 400)
+    //   - Adaptive thinking:
+    //     https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
+    //     (adaptive-only; off by default unless thinking: {type: "adaptive"})
+    //   - Effort:
+    //     https://platform.claude.com/docs/en/build-with-claude/effort
+    //     (supported, values low/medium/high/xhigh/max, xhigh is Opus-4.7-only, no beta header)
+    //   - Compaction:
+    //     https://platform.claude.com/docs/en/build-with-claude/compaction
+    //     (supported; compact-2026-01-12 beta header)
     ModelCapabilities {
         id: "claude-opus-4-7",
         provider: "anthropic",
@@ -57,86 +84,129 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         tier: ModelTier::Recommended,
         model_family: "claude-opus-4",
         context_window: 1_000_000,
-        max_output_tokens: 32_768,
+        max_output_tokens: 128_000,
         context_window_beta: None,
         max_output_tokens_beta: Some(BETA_OUTPUT_300K),
         vision: true,
         image_tool_results: true,
         inline_video: false,
-        supports_temperature: true,
+        supports_temperature: false,
         supports_top_p: false,
-        supports_top_k: true,
-        thinking: ThinkingSupport::AnthropicAdaptiveAndEnabled,
+        supports_top_k: false,
+        thinking: ThinkingSupport::AnthropicAdaptiveOnly,
         supports_reasoning: false,
-        effort_levels: OPUS_46_EFFORT,
+        effort_levels: OPUS_47_EFFORT,
         supports_web_search: true,
         supports_inference_geo: true,
         supports_compaction: true,
         supports_structured_output: true,
         supports_legacy_penalties: false,
-        supports_thinking_budget_legacy: true,
-        beta_headers: OPUS_46_BETAS,
+        supports_thinking_budget_legacy: false,
+        beta_headers: ADAPTIVE_COMPACTION_BETAS,
         call_timeout_secs: Some(300),
     },
-    // Opus 4.6 — opus46 schema bucket.
+    // Claude Opus 4.6
+    //
+    // Sources:
+    //   - Models overview:
+    //     https://platform.claude.com/docs/en/about-claude/models/overview
+    //     (1M context, 128k sync output, output-300k-2026-03-24 batch beta)
+    //   - Extended thinking:
+    //     https://platform.claude.com/docs/en/build-with-claude/extended-thinking
+    //     (both adaptive and enabled accepted; enabled deprecated but functional)
+    //   - Effort:
+    //     https://platform.claude.com/docs/en/build-with-claude/effort
+    //     (supported, low/medium/high/max; no xhigh)
     ModelCapabilities {
         id: "claude-opus-4-6",
         provider: "anthropic",
         display_name: "Claude Opus 4.6",
         tier: ModelTier::Supported,
         model_family: "claude-opus-4",
-        context_window: 200_000,
-        max_output_tokens: 32_768,
+        context_window: 1_000_000,
+        max_output_tokens: 128_000,
         context_window_beta: None,
         max_output_tokens_beta: Some(BETA_OUTPUT_300K),
         vision: true,
         image_tool_results: true,
         inline_video: false,
         supports_temperature: true,
-        supports_top_p: false,
+        supports_top_p: true,
         supports_top_k: true,
         thinking: ThinkingSupport::AnthropicAdaptiveAndEnabled,
         supports_reasoning: false,
-        effort_levels: OPUS_46_EFFORT,
+        effort_levels: CLAUDE_4_EFFORT,
         supports_web_search: true,
         supports_inference_geo: true,
         supports_compaction: true,
         supports_structured_output: true,
         supports_legacy_penalties: false,
         supports_thinking_budget_legacy: true,
-        beta_headers: OPUS_46_BETAS,
+        beta_headers: ADAPTIVE_COMPACTION_BETAS,
         call_timeout_secs: Some(300),
     },
-    // Sonnet 4.6 — standard schema bucket today.
+    // Claude Sonnet 4.6
+    //
+    // Sources:
+    //   - Models overview:
+    //     https://platform.claude.com/docs/en/about-claude/models/overview
+    //     (1M context, 64k sync output, output-300k-2026-03-24 batch beta)
+    //   - Extended thinking:
+    //     https://platform.claude.com/docs/en/build-with-claude/extended-thinking
+    //     (both adaptive and enabled accepted)
+    //   - Effort:
+    //     https://platform.claude.com/docs/en/build-with-claude/effort
+    //     (supported, low/medium/high/max)
+    //   - Compaction:
+    //     https://platform.claude.com/docs/en/build-with-claude/compaction
+    //     (supported via compact-2026-01-12)
     ModelCapabilities {
         id: "claude-sonnet-4-6",
         provider: "anthropic",
         display_name: "Claude Sonnet 4.6",
         tier: ModelTier::Recommended,
         model_family: "claude-sonnet-4",
-        context_window: 200_000,
-        max_output_tokens: 16_384,
+        context_window: 1_000_000,
+        max_output_tokens: 64_000,
         context_window_beta: None,
-        max_output_tokens_beta: None,
+        max_output_tokens_beta: Some(BETA_OUTPUT_300K),
         vision: true,
         image_tool_results: true,
         inline_video: false,
         supports_temperature: true,
-        supports_top_p: false,
+        supports_top_p: true,
         supports_top_k: true,
-        thinking: ThinkingSupport::AnthropicEnabledOnly,
+        thinking: ThinkingSupport::AnthropicAdaptiveAndEnabled,
         supports_reasoning: false,
-        effort_levels: &[],
+        effort_levels: CLAUDE_4_EFFORT,
         supports_web_search: true,
-        supports_inference_geo: false,
-        supports_compaction: false,
+        supports_inference_geo: true,
+        supports_compaction: true,
         supports_structured_output: true,
         supports_legacy_penalties: false,
         supports_thinking_budget_legacy: true,
-        beta_headers: STANDARD_BETAS,
+        beta_headers: ADAPTIVE_COMPACTION_BETAS,
         call_timeout_secs: Some(120),
     },
-    // Sonnet 4.5 — standard schema bucket.
+    // Claude Sonnet 4.5
+    //
+    // Sources:
+    //   - Context windows:
+    //     https://platform.claude.com/docs/en/build-with-claude/context-windows
+    //     (200k only; no 1M beta documented for Sonnet 4.5)
+    //   - Models overview:
+    //     https://platform.claude.com/docs/en/about-claude/models/overview
+    //     (64k sync output)
+    //   - Adaptive thinking:
+    //     https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
+    //     ("Older models (Sonnet 4.5, Opus 4.5) do not support adaptive thinking
+    //      and require thinking.type: enabled with budget_tokens.")
+    //   - Effort:
+    //     https://platform.claude.com/docs/en/build-with-claude/effort
+    //     (NOT in the supported-models list — Sonnet 4.5 does not support effort)
+    //   - Structured outputs:
+    //     https://platform.claude.com/docs/en/build-with-claude/structured-outputs
+    //     (explicitly lists claude-sonnet-4-5)
     ModelCapabilities {
         id: "claude-sonnet-4-5",
         provider: "anthropic",
@@ -144,29 +214,43 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         tier: ModelTier::Supported,
         model_family: "claude-sonnet-4",
         context_window: 200_000,
-        max_output_tokens: 16_384,
+        max_output_tokens: 64_000,
         context_window_beta: None,
         max_output_tokens_beta: None,
         vision: true,
         image_tool_results: true,
         inline_video: false,
         supports_temperature: true,
-        supports_top_p: false,
+        supports_top_p: true,
         supports_top_k: true,
         thinking: ThinkingSupport::AnthropicEnabledOnly,
         supports_reasoning: false,
         effort_levels: &[],
         supports_web_search: true,
-        supports_inference_geo: false,
+        supports_inference_geo: true,
         supports_compaction: false,
         supports_structured_output: true,
         supports_legacy_penalties: false,
         supports_thinking_budget_legacy: true,
-        beta_headers: STANDARD_BETAS,
+        beta_headers: LEGACY_THINKING_BETAS,
         call_timeout_secs: Some(120),
     },
-    // Opus 4.5 — standard schema bucket (but real docs say effort IS supported;
-    // correctness fix lands later).
+    // Claude Opus 4.5
+    //
+    // Sources:
+    //   - Models overview:
+    //     https://platform.claude.com/docs/en/about-claude/models/overview
+    //     (200k context, 64k sync output)
+    //   - Adaptive thinking:
+    //     https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
+    //     (Opus 4.5 requires manual enabled mode; adaptive not supported)
+    //   - Effort:
+    //     https://platform.claude.com/docs/en/build-with-claude/effort
+    //     (supported — in the Mythos/Opus 4.7/Opus 4.6/Sonnet 4.6/Opus 4.5 list;
+    //      values low/medium/high/max)
+    //   - Compaction:
+    //     https://platform.claude.com/docs/en/build-with-claude/compaction
+    //     (NOT supported — Opus 4.5 is not in the supported-models list)
     ModelCapabilities {
         id: "claude-opus-4-5",
         provider: "anthropic",
@@ -174,25 +258,25 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         tier: ModelTier::Supported,
         model_family: "claude-opus-4",
         context_window: 200_000,
-        max_output_tokens: 32_768,
+        max_output_tokens: 64_000,
         context_window_beta: None,
         max_output_tokens_beta: None,
         vision: true,
         image_tool_results: true,
         inline_video: false,
         supports_temperature: true,
-        supports_top_p: false,
+        supports_top_p: true,
         supports_top_k: true,
         thinking: ThinkingSupport::AnthropicEnabledOnly,
         supports_reasoning: false,
-        effort_levels: &[],
+        effort_levels: CLAUDE_4_EFFORT,
         supports_web_search: true,
-        supports_inference_geo: false,
+        supports_inference_geo: true,
         supports_compaction: false,
         supports_structured_output: true,
         supports_legacy_penalties: false,
         supports_thinking_budget_legacy: true,
-        beta_headers: STANDARD_BETAS,
+        beta_headers: LEGACY_THINKING_BETAS,
         call_timeout_secs: Some(300),
     },
 ];
