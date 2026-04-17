@@ -1706,6 +1706,13 @@ impl AgentFactory {
         let mut provider = provider;
         let llm_client: Arc<dyn LlmClient> = match build_config.llm_client_override.as_ref() {
             Some(client) => Arc::clone(client),
+            None if std::env::var("RKAT_TEST_CLIENT").ok().as_deref() == Some("1") => {
+                // Test shim: when RKAT_TEST_CLIENT=1 is set by integration
+                // tests, short-circuit to an in-process TestClient so tests
+                // don't need real provider credentials. This mirrors the
+                // legacy DefaultClientFactory::create_client behavior.
+                Arc::new(meerkat_client::TestClient::default())
+            }
             None => {
                 // Self-hosted routes through the legacy path until it's
                 // folded into the backend-kind taxonomy.
