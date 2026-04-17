@@ -1385,7 +1385,7 @@ machine! {
 
         // AcquireAuthLease: per-phase self-loop, unconditional
         transition AcquireAuthLease {
-            per_phase [Idle, Attached, Running, Retired, Stopped]
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input AcquireAuthLease { binding_key, expires_at }
             update {
                 self.auth_expiring_leases.remove(binding_key);
@@ -1400,7 +1400,7 @@ machine! {
 
         // MarkAuthExpiring: only legal from valid → expiring
         transition MarkAuthExpiring {
-            per_phase [Idle, Attached, Running, Retired, Stopped]
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input MarkAuthExpiring { binding_key }
             guard "lease_is_valid" { self.auth_valid_leases.contains(binding_key) }
             update {
@@ -1414,7 +1414,7 @@ machine! {
 
         // BeginAuthRefresh: legal from valid or expiring → refreshing
         transition BeginAuthRefresh {
-            per_phase [Idle, Attached, Running, Retired, Stopped]
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input BeginAuthRefresh { binding_key }
             guard "lease_not_refreshing" {
                 self.auth_valid_leases.contains(binding_key)
@@ -1431,7 +1431,7 @@ machine! {
 
         // CompleteAuthRefresh: only legal from refreshing → valid
         transition CompleteAuthRefresh {
-            per_phase [Idle, Attached, Running, Retired, Stopped]
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input CompleteAuthRefresh { binding_key, new_expires_at, now }
             guard "lease_is_refreshing" { self.auth_refreshing_leases.contains(binding_key) }
             update {
@@ -1445,7 +1445,7 @@ machine! {
 
         // AuthRefreshFailed (transient): refreshing → expiring
         transition AuthRefreshFailedTransient {
-            per_phase [Idle, Attached, Running, Retired, Stopped]
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input AuthRefreshFailed { binding_key, permanent }
             guard "lease_is_refreshing" { self.auth_refreshing_leases.contains(binding_key) }
             guard "not_permanent" { permanent == false }
@@ -1459,7 +1459,7 @@ machine! {
 
         // AuthRefreshFailed (permanent): refreshing → reauth_required
         transition AuthRefreshFailedPermanent {
-            per_phase [Idle, Attached, Running, Retired, Stopped]
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input AuthRefreshFailed { binding_key, permanent }
             guard "lease_is_refreshing" { self.auth_refreshing_leases.contains(binding_key) }
             guard "is_permanent" { permanent == true }
@@ -1474,7 +1474,7 @@ machine! {
 
         // MarkReauthRequired: any known state → reauth_required
         transition MarkReauthRequired {
-            per_phase [Idle, Attached, Running, Retired, Stopped]
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input MarkReauthRequired { binding_key }
             guard "lease_exists" {
                 self.auth_valid_leases.contains(binding_key)
@@ -1494,7 +1494,7 @@ machine! {
 
         // ReleaseAuthLease: removes entry from every set and expiry map
         transition ReleaseAuthLease {
-            per_phase [Idle, Attached, Running, Retired, Stopped]
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input ReleaseAuthLease { binding_key }
             update {
                 self.auth_valid_leases.remove(binding_key);

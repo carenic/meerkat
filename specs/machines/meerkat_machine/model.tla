@@ -1272,6 +1272,18 @@ RecycleFromAttached ==
     /\ UNCHANGED << session_id, active_runtime_id, pre_run_phase, silent_intent_overrides, auth_valid_leases, auth_expiring_leases, auth_refreshing_leases, auth_reauth_required_leases, auth_expires_at >>
 
 
+AcquireAuthLeaseInitializing(binding_key, expires_at) ==
+    /\ phase = "Initializing"
+    /\ phase' = "Initializing"
+    /\ model_step_count' = model_step_count + 1
+    /\ auth_valid_leases' = (auth_valid_leases \cup {binding_key})
+    /\ auth_expiring_leases' = (auth_expiring_leases \ {binding_key})
+    /\ auth_refreshing_leases' = (auth_refreshing_leases \ {binding_key})
+    /\ auth_reauth_required_leases' = (auth_reauth_required_leases \ {binding_key})
+    /\ auth_expires_at' = MapSet(auth_expires_at, binding_key, expires_at)
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides >>
+
+
 AcquireAuthLeaseIdle(binding_key, expires_at) ==
     /\ phase = "Idle"
     /\ phase' = "Idle"
@@ -1332,6 +1344,16 @@ AcquireAuthLeaseStopped(binding_key, expires_at) ==
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides >>
 
 
+MarkAuthExpiringInitializing(binding_key) ==
+    /\ phase = "Initializing"
+    /\ (binding_key \in auth_valid_leases)
+    /\ phase' = "Initializing"
+    /\ model_step_count' = model_step_count + 1
+    /\ auth_valid_leases' = (auth_valid_leases \ {binding_key})
+    /\ auth_expiring_leases' = (auth_expiring_leases \cup {binding_key})
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, auth_refreshing_leases, auth_reauth_required_leases, auth_expires_at >>
+
+
 MarkAuthExpiringIdle(binding_key) ==
     /\ phase = "Idle"
     /\ (binding_key \in auth_valid_leases)
@@ -1380,6 +1402,17 @@ MarkAuthExpiringStopped(binding_key) ==
     /\ auth_valid_leases' = (auth_valid_leases \ {binding_key})
     /\ auth_expiring_leases' = (auth_expiring_leases \cup {binding_key})
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, auth_refreshing_leases, auth_reauth_required_leases, auth_expires_at >>
+
+
+BeginAuthRefreshInitializing(binding_key) ==
+    /\ phase = "Initializing"
+    /\ ((binding_key \in auth_valid_leases) \/ (binding_key \in auth_expiring_leases))
+    /\ phase' = "Initializing"
+    /\ model_step_count' = model_step_count + 1
+    /\ auth_valid_leases' = (auth_valid_leases \ {binding_key})
+    /\ auth_expiring_leases' = (auth_expiring_leases \ {binding_key})
+    /\ auth_refreshing_leases' = (auth_refreshing_leases \cup {binding_key})
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, auth_reauth_required_leases, auth_expires_at >>
 
 
 BeginAuthRefreshIdle(binding_key) ==
@@ -1437,6 +1470,17 @@ BeginAuthRefreshStopped(binding_key) ==
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, auth_reauth_required_leases, auth_expires_at >>
 
 
+CompleteAuthRefreshInitializing(binding_key, new_expires_at, now) ==
+    /\ phase = "Initializing"
+    /\ (binding_key \in auth_refreshing_leases)
+    /\ phase' = "Initializing"
+    /\ model_step_count' = model_step_count + 1
+    /\ auth_valid_leases' = (auth_valid_leases \cup {binding_key})
+    /\ auth_refreshing_leases' = (auth_refreshing_leases \ {binding_key})
+    /\ auth_expires_at' = MapSet(auth_expires_at, binding_key, new_expires_at)
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, auth_expiring_leases, auth_reauth_required_leases >>
+
+
 CompleteAuthRefreshIdle(binding_key, new_expires_at, now) ==
     /\ phase = "Idle"
     /\ (binding_key \in auth_refreshing_leases)
@@ -1490,6 +1534,17 @@ CompleteAuthRefreshStopped(binding_key, new_expires_at, now) ==
     /\ auth_refreshing_leases' = (auth_refreshing_leases \ {binding_key})
     /\ auth_expires_at' = MapSet(auth_expires_at, binding_key, new_expires_at)
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, auth_expiring_leases, auth_reauth_required_leases >>
+
+
+AuthRefreshFailedTransientInitializing(binding_key, permanent) ==
+    /\ phase = "Initializing"
+    /\ (binding_key \in auth_refreshing_leases)
+    /\ (permanent = FALSE)
+    /\ phase' = "Initializing"
+    /\ model_step_count' = model_step_count + 1
+    /\ auth_expiring_leases' = (auth_expiring_leases \cup {binding_key})
+    /\ auth_refreshing_leases' = (auth_refreshing_leases \ {binding_key})
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, auth_valid_leases, auth_reauth_required_leases, auth_expires_at >>
 
 
 AuthRefreshFailedTransientIdle(binding_key, permanent) ==
@@ -1547,6 +1602,17 @@ AuthRefreshFailedTransientStopped(binding_key, permanent) ==
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, auth_valid_leases, auth_reauth_required_leases, auth_expires_at >>
 
 
+AuthRefreshFailedPermanentInitializing(binding_key, permanent) ==
+    /\ phase = "Initializing"
+    /\ (binding_key \in auth_refreshing_leases)
+    /\ (permanent = TRUE)
+    /\ phase' = "Initializing"
+    /\ model_step_count' = model_step_count + 1
+    /\ auth_refreshing_leases' = (auth_refreshing_leases \ {binding_key})
+    /\ auth_reauth_required_leases' = (auth_reauth_required_leases \cup {binding_key})
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, auth_valid_leases, auth_expiring_leases, auth_expires_at >>
+
+
 AuthRefreshFailedPermanentIdle(binding_key, permanent) ==
     /\ phase = "Idle"
     /\ (binding_key \in auth_refreshing_leases)
@@ -1600,6 +1666,18 @@ AuthRefreshFailedPermanentStopped(binding_key, permanent) ==
     /\ auth_refreshing_leases' = (auth_refreshing_leases \ {binding_key})
     /\ auth_reauth_required_leases' = (auth_reauth_required_leases \cup {binding_key})
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, auth_valid_leases, auth_expiring_leases, auth_expires_at >>
+
+
+MarkReauthRequiredInitializing(binding_key) ==
+    /\ phase = "Initializing"
+    /\ ((binding_key \in auth_valid_leases) \/ (binding_key \in auth_expiring_leases) \/ (binding_key \in auth_refreshing_leases))
+    /\ phase' = "Initializing"
+    /\ model_step_count' = model_step_count + 1
+    /\ auth_valid_leases' = (auth_valid_leases \ {binding_key})
+    /\ auth_expiring_leases' = (auth_expiring_leases \ {binding_key})
+    /\ auth_refreshing_leases' = (auth_refreshing_leases \ {binding_key})
+    /\ auth_reauth_required_leases' = (auth_reauth_required_leases \cup {binding_key})
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, auth_expires_at >>
 
 
 MarkReauthRequiredIdle(binding_key) ==
@@ -1660,6 +1738,18 @@ MarkReauthRequiredStopped(binding_key) ==
     /\ auth_refreshing_leases' = (auth_refreshing_leases \ {binding_key})
     /\ auth_reauth_required_leases' = (auth_reauth_required_leases \cup {binding_key})
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, auth_expires_at >>
+
+
+ReleaseAuthLeaseInitializing(binding_key) ==
+    /\ phase = "Initializing"
+    /\ phase' = "Initializing"
+    /\ model_step_count' = model_step_count + 1
+    /\ auth_valid_leases' = (auth_valid_leases \ {binding_key})
+    /\ auth_expiring_leases' = (auth_expiring_leases \ {binding_key})
+    /\ auth_refreshing_leases' = (auth_refreshing_leases \ {binding_key})
+    /\ auth_reauth_required_leases' = (auth_reauth_required_leases \ {binding_key})
+    /\ auth_expires_at' = MapRemove(auth_expires_at, binding_key)
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides >>
 
 
 ReleaseAuthLeaseIdle(binding_key) ==
@@ -1865,41 +1955,49 @@ Next ==
     \/ ShutdownSurfaceRunning
     \/ RecycleFromIdleOrRetired
     \/ RecycleFromAttached
+    \/ \E binding_key \in StringValues : \E expires_at \in 0..2 : AcquireAuthLeaseInitializing(binding_key, expires_at)
     \/ \E binding_key \in StringValues : \E expires_at \in 0..2 : AcquireAuthLeaseIdle(binding_key, expires_at)
     \/ \E binding_key \in StringValues : \E expires_at \in 0..2 : AcquireAuthLeaseAttached(binding_key, expires_at)
     \/ \E binding_key \in StringValues : \E expires_at \in 0..2 : AcquireAuthLeaseRunning(binding_key, expires_at)
     \/ \E binding_key \in StringValues : \E expires_at \in 0..2 : AcquireAuthLeaseRetired(binding_key, expires_at)
     \/ \E binding_key \in StringValues : \E expires_at \in 0..2 : AcquireAuthLeaseStopped(binding_key, expires_at)
+    \/ \E binding_key \in StringValues : MarkAuthExpiringInitializing(binding_key)
     \/ \E binding_key \in StringValues : MarkAuthExpiringIdle(binding_key)
     \/ \E binding_key \in StringValues : MarkAuthExpiringAttached(binding_key)
     \/ \E binding_key \in StringValues : MarkAuthExpiringRunning(binding_key)
     \/ \E binding_key \in StringValues : MarkAuthExpiringRetired(binding_key)
     \/ \E binding_key \in StringValues : MarkAuthExpiringStopped(binding_key)
+    \/ \E binding_key \in StringValues : BeginAuthRefreshInitializing(binding_key)
     \/ \E binding_key \in StringValues : BeginAuthRefreshIdle(binding_key)
     \/ \E binding_key \in StringValues : BeginAuthRefreshAttached(binding_key)
     \/ \E binding_key \in StringValues : BeginAuthRefreshRunning(binding_key)
     \/ \E binding_key \in StringValues : BeginAuthRefreshRetired(binding_key)
     \/ \E binding_key \in StringValues : BeginAuthRefreshStopped(binding_key)
+    \/ \E binding_key \in StringValues : \E new_expires_at \in 0..2 : \E now \in 0..2 : CompleteAuthRefreshInitializing(binding_key, new_expires_at, now)
     \/ \E binding_key \in StringValues : \E new_expires_at \in 0..2 : \E now \in 0..2 : CompleteAuthRefreshIdle(binding_key, new_expires_at, now)
     \/ \E binding_key \in StringValues : \E new_expires_at \in 0..2 : \E now \in 0..2 : CompleteAuthRefreshAttached(binding_key, new_expires_at, now)
     \/ \E binding_key \in StringValues : \E new_expires_at \in 0..2 : \E now \in 0..2 : CompleteAuthRefreshRunning(binding_key, new_expires_at, now)
     \/ \E binding_key \in StringValues : \E new_expires_at \in 0..2 : \E now \in 0..2 : CompleteAuthRefreshRetired(binding_key, new_expires_at, now)
     \/ \E binding_key \in StringValues : \E new_expires_at \in 0..2 : \E now \in 0..2 : CompleteAuthRefreshStopped(binding_key, new_expires_at, now)
+    \/ \E binding_key \in StringValues : \E permanent \in BOOLEAN : AuthRefreshFailedTransientInitializing(binding_key, permanent)
     \/ \E binding_key \in StringValues : \E permanent \in BOOLEAN : AuthRefreshFailedTransientIdle(binding_key, permanent)
     \/ \E binding_key \in StringValues : \E permanent \in BOOLEAN : AuthRefreshFailedTransientAttached(binding_key, permanent)
     \/ \E binding_key \in StringValues : \E permanent \in BOOLEAN : AuthRefreshFailedTransientRunning(binding_key, permanent)
     \/ \E binding_key \in StringValues : \E permanent \in BOOLEAN : AuthRefreshFailedTransientRetired(binding_key, permanent)
     \/ \E binding_key \in StringValues : \E permanent \in BOOLEAN : AuthRefreshFailedTransientStopped(binding_key, permanent)
+    \/ \E binding_key \in StringValues : \E permanent \in BOOLEAN : AuthRefreshFailedPermanentInitializing(binding_key, permanent)
     \/ \E binding_key \in StringValues : \E permanent \in BOOLEAN : AuthRefreshFailedPermanentIdle(binding_key, permanent)
     \/ \E binding_key \in StringValues : \E permanent \in BOOLEAN : AuthRefreshFailedPermanentAttached(binding_key, permanent)
     \/ \E binding_key \in StringValues : \E permanent \in BOOLEAN : AuthRefreshFailedPermanentRunning(binding_key, permanent)
     \/ \E binding_key \in StringValues : \E permanent \in BOOLEAN : AuthRefreshFailedPermanentRetired(binding_key, permanent)
     \/ \E binding_key \in StringValues : \E permanent \in BOOLEAN : AuthRefreshFailedPermanentStopped(binding_key, permanent)
+    \/ \E binding_key \in StringValues : MarkReauthRequiredInitializing(binding_key)
     \/ \E binding_key \in StringValues : MarkReauthRequiredIdle(binding_key)
     \/ \E binding_key \in StringValues : MarkReauthRequiredAttached(binding_key)
     \/ \E binding_key \in StringValues : MarkReauthRequiredRunning(binding_key)
     \/ \E binding_key \in StringValues : MarkReauthRequiredRetired(binding_key)
     \/ \E binding_key \in StringValues : MarkReauthRequiredStopped(binding_key)
+    \/ \E binding_key \in StringValues : ReleaseAuthLeaseInitializing(binding_key)
     \/ \E binding_key \in StringValues : ReleaseAuthLeaseIdle(binding_key)
     \/ \E binding_key \in StringValues : ReleaseAuthLeaseAttached(binding_key)
     \/ \E binding_key \in StringValues : ReleaseAuthLeaseRunning(binding_key)

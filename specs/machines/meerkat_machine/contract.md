@@ -1196,6 +1196,12 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `InitiateRecycle`
 - To: `Attached`
 
+### `AcquireAuthLeaseInitializing`
+- From: `Initializing`
+- On: `AcquireAuthLease`(binding_key, expires_at)
+- Emits: `EmitAuthLifecycleEvent`
+- To: `Initializing`
+
 ### `AcquireAuthLeaseIdle`
 - From: `Idle`
 - On: `AcquireAuthLease`(binding_key, expires_at)
@@ -1225,6 +1231,14 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `AcquireAuthLease`(binding_key, expires_at)
 - Emits: `EmitAuthLifecycleEvent`
 - To: `Stopped`
+
+### `MarkAuthExpiringInitializing`
+- From: `Initializing`
+- On: `MarkAuthExpiring`(binding_key)
+- Guards:
+  - `lease_is_valid`
+- Emits: `EmitAuthLifecycleEvent`, `WakeRefreshLoop`
+- To: `Initializing`
 
 ### `MarkAuthExpiringIdle`
 - From: `Idle`
@@ -1266,6 +1280,14 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `EmitAuthLifecycleEvent`, `WakeRefreshLoop`
 - To: `Stopped`
 
+### `BeginAuthRefreshInitializing`
+- From: `Initializing`
+- On: `BeginAuthRefresh`(binding_key)
+- Guards:
+  - `lease_not_refreshing`
+- Emits: `EmitAuthLifecycleEvent`
+- To: `Initializing`
+
 ### `BeginAuthRefreshIdle`
 - From: `Idle`
 - On: `BeginAuthRefresh`(binding_key)
@@ -1306,6 +1328,14 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `EmitAuthLifecycleEvent`
 - To: `Stopped`
 
+### `CompleteAuthRefreshInitializing`
+- From: `Initializing`
+- On: `CompleteAuthRefresh`(binding_key, new_expires_at, now)
+- Guards:
+  - `lease_is_refreshing`
+- Emits: `EmitAuthLifecycleEvent`
+- To: `Initializing`
+
 ### `CompleteAuthRefreshIdle`
 - From: `Idle`
 - On: `CompleteAuthRefresh`(binding_key, new_expires_at, now)
@@ -1345,6 +1375,15 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `lease_is_refreshing`
 - Emits: `EmitAuthLifecycleEvent`
 - To: `Stopped`
+
+### `AuthRefreshFailedTransientInitializing`
+- From: `Initializing`
+- On: `AuthRefreshFailed`(binding_key, permanent)
+- Guards:
+  - `lease_is_refreshing`
+  - `not_permanent`
+- Emits: `EmitAuthLifecycleEvent`
+- To: `Initializing`
 
 ### `AuthRefreshFailedTransientIdle`
 - From: `Idle`
@@ -1391,6 +1430,15 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `EmitAuthLifecycleEvent`
 - To: `Stopped`
 
+### `AuthRefreshFailedPermanentInitializing`
+- From: `Initializing`
+- On: `AuthRefreshFailed`(binding_key, permanent)
+- Guards:
+  - `lease_is_refreshing`
+  - `is_permanent`
+- Emits: `EmitAuthLifecycleEvent`, `EmitAuthReauthNotice`
+- To: `Initializing`
+
 ### `AuthRefreshFailedPermanentIdle`
 - From: `Idle`
 - On: `AuthRefreshFailed`(binding_key, permanent)
@@ -1436,6 +1484,14 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `EmitAuthLifecycleEvent`, `EmitAuthReauthNotice`
 - To: `Stopped`
 
+### `MarkReauthRequiredInitializing`
+- From: `Initializing`
+- On: `MarkReauthRequired`(binding_key)
+- Guards:
+  - `lease_exists`
+- Emits: `EmitAuthLifecycleEvent`, `EmitAuthReauthNotice`
+- To: `Initializing`
+
 ### `MarkReauthRequiredIdle`
 - From: `Idle`
 - On: `MarkReauthRequired`(binding_key)
@@ -1475,6 +1531,11 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `lease_exists`
 - Emits: `EmitAuthLifecycleEvent`, `EmitAuthReauthNotice`
 - To: `Stopped`
+
+### `ReleaseAuthLeaseInitializing`
+- From: `Initializing`
+- On: `ReleaseAuthLease`(binding_key)
+- To: `Initializing`
 
 ### `ReleaseAuthLeaseIdle`
 - From: `Idle`
