@@ -2473,7 +2473,18 @@ async fn handle_auth_command(command: AuthCommands, scope: &RuntimeScope) -> any
             }
         }
         AuthCommands::Logout { profile_id } => {
-            interactive_logout(&profile_id, scope).await?;
+            #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
+            {
+                interactive_logout(&profile_id, scope).await?;
+            }
+            #[cfg(not(all(feature = "anthropic", feature = "openai", feature = "gemini")))]
+            {
+                let _ = profile_id;
+                anyhow::bail!(
+                    "`rkat auth logout` requires the `anthropic`, `openai`, and `gemini` \
+                     features to be enabled at build time."
+                );
+            }
         }
     }
     Ok(())
@@ -2503,6 +2514,7 @@ async fn handle_auth_command(command: AuthCommands, scope: &RuntimeScope) -> any
 //   7. Post-success: TokenStore location, expiry (human-delta), refresh
 //      status, and concrete copy-paste commands for next steps.
 
+#[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 #[derive(Debug, Clone, Copy)]
 enum LoginProvider {
     Anthropic,
@@ -2510,6 +2522,7 @@ enum LoginProvider {
     Google,
 }
 
+#[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 impl LoginProvider {
     fn parse(raw: &str) -> Option<Self> {
         match raw.to_ascii_lowercase().trim() {
@@ -2561,6 +2574,7 @@ impl LoginProvider {
     }
 }
 
+#[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 const ALL_LOGIN_PROVIDERS: &[LoginProvider] = &[
     LoginProvider::Anthropic,
     LoginProvider::OpenAi,
@@ -2572,6 +2586,7 @@ fn auth_supports_ansi() -> bool {
     std::io::stderr().is_terminal() && std::env::var("NO_COLOR").is_err()
 }
 
+#[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 fn auth_bold(s: &str) -> String {
     if auth_supports_ansi() {
         format!("\x1b[1m{s}\x1b[0m")
@@ -2579,6 +2594,7 @@ fn auth_bold(s: &str) -> String {
         s.to_string()
     }
 }
+#[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 fn auth_dim(s: &str) -> String {
     if auth_supports_ansi() {
         format!("\x1b[2m{s}\x1b[0m")
@@ -2593,6 +2609,7 @@ fn auth_green(s: &str) -> String {
         s.to_string()
     }
 }
+#[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 fn auth_yellow(s: &str) -> String {
     if auth_supports_ansi() {
         format!("\x1b[33m{s}\x1b[0m")
@@ -2600,6 +2617,7 @@ fn auth_yellow(s: &str) -> String {
         s.to_string()
     }
 }
+#[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 fn auth_cyan(s: &str) -> String {
     if auth_supports_ansi() {
         format!("\x1b[36m{s}\x1b[0m")
@@ -2608,6 +2626,7 @@ fn auth_cyan(s: &str) -> String {
     }
 }
 
+#[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 fn print_step(num: u8, total: u8, text: &str) {
     eprintln!(
         "\n{}  {}",
@@ -2616,18 +2635,22 @@ fn print_step(num: u8, total: u8, text: &str) {
     );
 }
 
+#[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 fn print_ok(text: &str) {
     eprintln!("  {} {}", auth_green("✓"), text);
 }
 
+#[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 fn print_warn(text: &str) {
     eprintln!("  {} {}", auth_yellow("!"), text);
 }
 
+#[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 fn print_hint(text: &str) {
     eprintln!("    {} {}", auth_dim("hint"), auth_dim(text));
 }
 
+#[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 fn prompt_line(label: &str) -> anyhow::Result<String> {
     use std::io::Write;
     let mut out = std::io::stderr();
@@ -2638,6 +2661,7 @@ fn prompt_line(label: &str) -> anyhow::Result<String> {
     Ok(line.trim().to_string())
 }
 
+#[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 fn resolve_login_provider(hint: Option<&str>) -> anyhow::Result<LoginProvider> {
     if let Some(raw) = hint {
         return LoginProvider::parse(raw).ok_or_else(|| {
@@ -2942,6 +2966,7 @@ async fn interactive_login(
     Ok(())
 }
 
+#[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 async fn interactive_logout(profile_id: &str, _scope: &RuntimeScope) -> anyhow::Result<()> {
     use meerkat_client::auth_store::{TokenKey, TokenStoreBackend};
 

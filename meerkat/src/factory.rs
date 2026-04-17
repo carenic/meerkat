@@ -1301,9 +1301,9 @@ impl AgentFactory {
         {
             let _ = registry;
             let _ = identity;
-            return Err(FactoryError::UnsupportedProvider(
+            Err(FactoryError::UnsupportedProvider(
                 "self_hosted requires the openai feature".to_string(),
-            ));
+            ))
         }
 
         #[cfg(feature = "openai")]
