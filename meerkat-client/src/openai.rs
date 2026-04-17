@@ -22,6 +22,11 @@ pub struct OpenAiClient {
     api_key: Option<String>,
     base_url: String,
     http: reqwest::Client,
+    /// Extra headers emitted on every request (e.g. `ChatGPT-Account-ID`,
+    /// `X-OpenAI-Fedramp`). Populated by provider runtimes when the
+    /// backend is the ChatGPT backend and the OAuth token's JWT carries
+    /// identity claims per Codex `bearer_auth_provider.rs:23-38`.
+    extra_headers: Vec<(String, String)>,
 }
 
 impl OpenAiClient {
@@ -79,7 +84,21 @@ impl OpenAiClient {
             api_key,
             base_url,
             http,
+            extra_headers: Vec::new(),
         }
+    }
+
+    /// Install a set of (name, value) headers to include on every request.
+    ///
+    /// ChatGPT-backend callers pass `ChatGPT-Account-ID` and optionally
+    /// `X-OpenAI-Fedramp` here.
+    pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
+    pub fn extra_headers(&self) -> &[(String, String)] {
+        &self.extra_headers
     }
 
     /// Set custom base URL
@@ -390,15 +409,17 @@ impl LlmClient for OpenAiClient {
         let inner: LlmStream<'a> = Box::pin(async_stream::try_stream! {
             let body = self.build_request_body(request)?;
 
-            let request_builder = self
+            let mut request_builder = self
                 .http
                 .post(format!("{}/v1/responses", self.base_url))
                 .header("Content-Type", "application/json");
-            let request_builder = if let Some(api_key) = &self.api_key {
-                request_builder.header("Authorization", format!("Bearer {api_key}"))
-            } else {
-                request_builder
-            };
+            if let Some(api_key) = &self.api_key {
+                request_builder =
+                    request_builder.header("Authorization", format!("Bearer {api_key}"));
+            }
+            for (name, value) in &self.extra_headers {
+                request_builder = request_builder.header(name, value);
+            }
             let response = request_builder
                 .json(&body)
                 .send()

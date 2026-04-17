@@ -110,6 +110,31 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
             "Get the effective model catalog (built-in plus config-backed entries)",
             "ModelsCatalogResponse",
         ),
+        // Auth-profile management (Phase 4c — always available).
+        RpcMethodDescriptor::basic("auth/profile/list", "List configured auth profiles"),
+        RpcMethodDescriptor::basic("auth/profile/get", "Get one auth profile by id"),
+        RpcMethodDescriptor::basic("auth/profile/create", "Create an auth profile"),
+        RpcMethodDescriptor::basic("auth/profile/delete", "Delete an auth profile"),
+        RpcMethodDescriptor::basic(
+            "auth/profile/test",
+            "Dry-run the auth profile's resolve path and return its status",
+        ),
+        RpcMethodDescriptor::basic(
+            "auth/login/start",
+            "Begin an OAuth login; returns authorize URL, state, PKCE verifier",
+        ),
+        RpcMethodDescriptor::basic(
+            "auth/login/complete",
+            "Finish an OAuth login by exchanging an authorization code",
+        ),
+        RpcMethodDescriptor::basic(
+            "auth/login/device_start",
+            "Begin a device-code OAuth login; returns user-code + verification URL",
+        ),
+        RpcMethodDescriptor::basic("auth/status/get", "Get auth status for a profile"),
+        RpcMethodDescriptor::basic("auth/logout", "Revoke + remove persisted credentials"),
+        RpcMethodDescriptor::basic("realm/list", "List realms with binding summaries"),
+        RpcMethodDescriptor::basic("realm/get", "Get one realm's full connection set"),
     ];
 
     if options.blob_enabled {

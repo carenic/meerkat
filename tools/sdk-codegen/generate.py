@@ -414,6 +414,15 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
     append_python_dataclass("ModelsCatalogResponse", schemas.get("models", {}), "Response payload for models/catalog.")
     append_python_dataclass("WireModelProfile", schemas.get("models", {}), "Wire-level model capability profile.")
 
+    # Phase 4c — connection/auth wire types.
+    append_python_dataclass("WireConnectionRef", wire_schema, "Session-facing reference to a binding inside a realm.")
+    append_python_dataclass("WireBackendProfile", wire_schema, "Backend profile projected for the wire.")
+    append_python_dataclass("WireAuthProfile", wire_schema, "Auth profile projected for the wire (secret material not included).")
+    append_python_dataclass("WireProviderBinding", wire_schema, "Provider binding: backend+auth pair plus policy.")
+    append_python_dataclass("WireRealmConnectionSet", wire_schema, "Full realm connection set (backends, auth profiles, bindings).")
+    append_python_dataclass("WireAuthStatus", wire_schema, "Auth profile health snapshot.")
+    append_python_alias("WireAuthError", wire_schema, "Auth error (tagged variant).")
+
     # Keep aliases after the dataclasses they reference. Unlike annotations, alias
     # assignments are evaluated eagerly at import time.
     append_python_alias("WireContentBlock", wire_schema, "Wire-safe content block.")
@@ -651,6 +660,15 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
     append_typescript_interface("ProviderCatalog", schemas.get("models", {}))
     append_typescript_interface("ModelsCatalogResponse", schemas.get("models", {}))
     append_typescript_interface("WireModelProfile", schemas.get("models", {}))
+
+    # Phase 4c — connection/auth wire types.
+    append_typescript_interface("WireConnectionRef", wire_schema)
+    append_typescript_interface("WireBackendProfile", wire_schema)
+    append_typescript_interface("WireAuthProfile", wire_schema)
+    append_typescript_interface("WireProviderBinding", wire_schema)
+    append_typescript_interface("WireRealmConnectionSet", wire_schema)
+    append_typescript_interface("WireAuthStatus", wire_schema)
+    append_typescript_alias("WireAuthError", wire_schema)
 
     (output_dir / "types.ts").write_text(types_content)
 

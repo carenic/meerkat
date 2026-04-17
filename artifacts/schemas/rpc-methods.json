@@ -21,14 +21,91 @@
       "name": "session/history"
     },
     {
+      "description": "Remove session",
+      "name": "session/archive"
+    },
+    {
+      "description": "Start a new turn on existing session",
+      "name": "turn/start"
+    },
+    {
+      "description": "Cancel in-flight turn",
+      "name": "turn/interrupt"
+    },
+    {
+      "description": "Read config",
+      "name": "config/get"
+    },
+    {
+      "description": "Replace config",
+      "name": "config/set"
+    },
+    {
+      "description": "Merge-patch config",
+      "name": "config/patch"
+    },
+    {
+      "description": "Get runtime capabilities",
+      "name": "capabilities/get"
+    },
+    {
+      "description": "Get the effective model catalog (built-in plus config-backed entries)",
+      "name": "models/catalog",
+      "result_type": "ModelsCatalogResponse"
+    },
+    {
+      "description": "List configured auth profiles",
+      "name": "auth/profile/list"
+    },
+    {
+      "description": "Get one auth profile by id",
+      "name": "auth/profile/get"
+    },
+    {
+      "description": "Create an auth profile",
+      "name": "auth/profile/create"
+    },
+    {
+      "description": "Delete an auth profile",
+      "name": "auth/profile/delete"
+    },
+    {
+      "description": "Dry-run the auth profile's resolve path and return its status",
+      "name": "auth/profile/test"
+    },
+    {
+      "description": "Begin an OAuth login; returns authorize URL, state, PKCE verifier",
+      "name": "auth/login/start"
+    },
+    {
+      "description": "Finish an OAuth login by exchanging an authorization code",
+      "name": "auth/login/complete"
+    },
+    {
+      "description": "Begin a device-code OAuth login; returns user-code + verification URL",
+      "name": "auth/login/device_start"
+    },
+    {
+      "description": "Get auth status for a profile",
+      "name": "auth/status/get"
+    },
+    {
+      "description": "Revoke + remove persisted credentials",
+      "name": "auth/logout"
+    },
+    {
+      "description": "List realms with binding summaries",
+      "name": "realm/list"
+    },
+    {
+      "description": "Get one realm's full connection set",
+      "name": "realm/get"
+    },
+    {
       "description": "Fetch raw blob payload metadata and bytes by blob id",
       "name": "blob/get",
       "params_type": "BlobGetParams",
       "result_type": "BlobPayload"
-    },
-    {
-      "description": "Remove session",
-      "name": "session/archive"
     },
     {
       "description": "Queue a runtime-backed external event",
@@ -104,35 +181,6 @@
       "name": "schedule/call",
       "params_type": "ScheduleToolCallParams",
       "result_type": "Value"
-    },
-    {
-      "description": "Start a new turn on existing session",
-      "name": "turn/start"
-    },
-    {
-      "description": "Cancel in-flight turn",
-      "name": "turn/interrupt"
-    },
-    {
-      "description": "Read config",
-      "name": "config/get"
-    },
-    {
-      "description": "Replace config",
-      "name": "config/set"
-    },
-    {
-      "description": "Merge-patch config",
-      "name": "config/patch"
-    },
-    {
-      "description": "Get runtime capabilities",
-      "name": "capabilities/get"
-    },
-    {
-      "description": "Get the effective model catalog (built-in plus config-backed entries)",
-      "name": "models/catalog",
-      "result_type": "ModelsCatalogResponse"
     },
     {
       "description": "List available skills",

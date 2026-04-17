@@ -85,20 +85,67 @@ pub struct AnthropicRouteHints {}
 #[non_exhaustive]
 pub struct GoogleRouteHints {}
 
+/// ChatGPT-specific claims lifted from the ID token per Codex
+/// `token_data.rs:71-160`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[non_exhaustive]
-pub struct OpenAiAuthMetadata {}
+pub struct OpenAiAuthMetadata {
+    /// `chatgpt_plan_type` — e.g. "free", "plus", "pro", "enterprise".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+    /// `chatgpt_user_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// `chatgpt_account_id` — used as the `ChatGPT-Account-ID` wire header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    /// `chatgpt_account_is_fedramp` — when true, emit `X-OpenAI-Fedramp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_fedramp: Option<bool>,
+    /// Primary email address on the account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+}
 
+/// Anthropic-specific metadata (subscription tier for Claude.ai OAuth,
+/// Bedrock/Vertex/Foundry region/project hints).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[non_exhaustive]
-pub struct AnthropicAuthMetadata {}
+pub struct AnthropicAuthMetadata {
+    /// Claude.ai subscription tier ("free" / "pro" / "max" / "team").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_tier: Option<String>,
+    /// AWS region for Bedrock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_region: Option<String>,
+    /// GCP project ID for Vertex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertex_project_id: Option<String>,
+    /// GCP region for Vertex / Vertex model endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertex_region: Option<String>,
+    /// Azure deployment URL prefix for Foundry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foundry_deployment: Option<String>,
+}
 
+/// Google-specific metadata (ADC account, Vertex project/region hints).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[non_exhaustive]
-pub struct GoogleAuthMetadata {}
+pub struct GoogleAuthMetadata {
+    /// Identifier for the Google account (email address).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_email: Option<String>,
+    /// GCP project ID for Vertex / Code Assist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Preferred region for Vertex model endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// Code Assist user tier ("free" / "standard" / "enterprise").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_assist_tier: Option<String>,
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
