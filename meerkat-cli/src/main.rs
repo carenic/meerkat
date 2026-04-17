@@ -2459,7 +2459,18 @@ async fn handle_auth_command(command: AuthCommands, scope: &RuntimeScope) -> any
             }
         }
         AuthCommands::Login { provider } => {
-            interactive_login(provider.as_deref(), scope).await?;
+            #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
+            {
+                interactive_login(provider.as_deref(), scope).await?;
+            }
+            #[cfg(not(all(feature = "anthropic", feature = "openai", feature = "gemini")))]
+            {
+                let _ = provider;
+                anyhow::bail!(
+                    "`rkat auth login` requires the `anthropic`, `openai`, and `gemini` \
+                     features to be enabled at build time."
+                );
+            }
         }
         AuthCommands::Logout { profile_id } => {
             interactive_logout(&profile_id, scope).await?;
@@ -2667,6 +2678,7 @@ fn resolve_login_provider(hint: Option<&str>) -> anyhow::Result<LoginProvider> {
     })
 }
 
+#[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 async fn interactive_login(
     provider_hint: Option<&str>,
     _scope: &RuntimeScope,
