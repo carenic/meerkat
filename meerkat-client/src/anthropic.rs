@@ -1702,6 +1702,22 @@ mod tests {
     }
 
     #[test]
+    fn test_build_request_body_effort_xhigh_opus_47() -> Result<(), Box<dyn std::error::Error>> {
+        let client = AnthropicClient::new("test-key".to_string())?;
+
+        let request = LlmRequest::new(
+            "claude-opus-4-7",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_provider_param("effort", "xhigh");
+
+        let body = client.build_request_body(&request)?;
+
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+        Ok(())
+    }
+
+    #[test]
     fn test_build_request_body_effort_with_structured_output()
     -> Result<(), Box<dyn std::error::Error>> {
         let client = AnthropicClient::new("test-key".to_string())?;

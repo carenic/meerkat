@@ -60,7 +60,7 @@ const CATALOG_DATA: &[CatalogEntry] = &[
         display_name: "Claude Opus 4.7",
         provider: "anthropic",
         tier: ModelTier::Recommended,
-        context_window: Some(200_000),
+        context_window: Some(1_000_000),
         max_output_tokens: Some(32_768),
     },
     CatalogEntry {

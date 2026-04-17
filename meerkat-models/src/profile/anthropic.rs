@@ -121,12 +121,15 @@ pub struct AnthropicThinkingEnabled {
 }
 
 /// Effort levels for Anthropic output config.
+///
+/// `XHigh` was introduced with Claude Opus 4.7 and sits between `High` and `Max`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AnthropicEffort {
     Low,
     Medium,
     High,
+    XHigh,
     Max,
 }
 
@@ -278,5 +281,30 @@ mod tests {
     fn schemas_are_valid_objects() {
         assert!(opus46_params_schema().is_object());
         assert!(standard_params_schema().is_object());
+    }
+
+    #[test]
+    fn anthropic_effort_serializes_lowercase() -> Result<(), serde_json::Error> {
+        assert_eq!(
+            serde_json::to_value(AnthropicEffort::Low)?,
+            serde_json::json!("low"),
+        );
+        assert_eq!(
+            serde_json::to_value(AnthropicEffort::Medium)?,
+            serde_json::json!("medium"),
+        );
+        assert_eq!(
+            serde_json::to_value(AnthropicEffort::High)?,
+            serde_json::json!("high"),
+        );
+        assert_eq!(
+            serde_json::to_value(AnthropicEffort::XHigh)?,
+            serde_json::json!("xhigh"),
+        );
+        assert_eq!(
+            serde_json::to_value(AnthropicEffort::Max)?,
+            serde_json::json!("max"),
+        );
+        Ok(())
     }
 }
