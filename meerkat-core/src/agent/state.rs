@@ -661,6 +661,41 @@ where
 
             match self.state {
                 LoopState::CallingLlm => {
+                    // 0. Auth lease check (Phase 1.5-rev).
+                    //    If the session routes through a connection_ref and the
+                    //    lease is in `reauth_required`, emit a SYSTEM NOTICE and
+                    //    abort this run — the provider call would fail anyway
+                    //    and the notice gives the agent actionable guidance.
+                    //
+                    //    Strip any prior synthetic AuthReauthRequired notices so
+                    //    the current state is unambiguously reflected.
+                    self.session.messages_mut().retain(|message| {
+                        !is_synthetic_notice(message, SystemNoticeKind::AuthReauthRequired)
+                    });
+                    if let (Some(handle), Some(binding_key)) = (
+                        self.auth_lease_handle.as_deref(),
+                        self.connection_ref_binding_key.as_deref(),
+                    ) {
+                        let snapshot = handle.snapshot(binding_key);
+                        if snapshot.state.as_deref() == Some("reauth_required") {
+                            let notice = format!(
+                                "Connection `{binding_key}` requires re-authentication. \
+                                 Run `rkat auth login` for the provider, then retry."
+                            );
+                            self.session.push(synthetic_notice_message(
+                                SystemNoticeKind::AuthReauthRequired,
+                                notice.clone(),
+                            ));
+                            self.pending_fatal_diagnostic = Some(AgentError::InternalError(
+                                format!("auth_reauth_required: {notice}"),
+                            ));
+                            self.apply_turn_input(TurnExecutionInput::FatalFailure {
+                                run_id: run_id.clone(),
+                            })?;
+                            return self.build_result(turn_count, tool_call_count).await;
+                        }
+                    }
+
                     // 1. Poll external updates BEFORE tool capture so newly
                     //    connected tools are visible in the same LLM call.
                     let ext = self.tools.poll_external_updates().await;

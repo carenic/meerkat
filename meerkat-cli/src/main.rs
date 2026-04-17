@@ -8065,7 +8065,15 @@ async fn execute_mob_deploy_internal(
                 Box::new(tokio::io::stdout()),
             )
         });
-        run_rpc_surface(scope, effective_config, &archive, prompt, reader, writer).await?
+        Box::pin(run_rpc_surface(
+            scope,
+            effective_config,
+            &archive,
+            prompt,
+            reader,
+            writer,
+        ))
+        .await?
     } else {
         let session_service =
             build_deploy_mob_session_service(scope, effective_config.clone()).await?;

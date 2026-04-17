@@ -2548,6 +2548,13 @@ impl AgentFactory {
             builder = builder.with_turn_state_handle(Arc::clone(&bindings.turn_state));
             builder = builder
                 .with_external_tool_surface_handle(Arc::clone(&bindings.external_tool_surface));
+            builder = builder.with_auth_lease_handle(Arc::clone(&bindings.auth_lease));
+        }
+        // Phase 1.5-rev: identify which connection_ref this agent routes
+        // through so the runner can key auth-lease lifecycle transitions.
+        if let Some(cref) = &build_config.connection_ref {
+            builder = builder
+                .with_connection_ref_binding_key(format!("{}:{}", cref.realm_id, cref.binding_id));
         }
 
         // 12h. Wire completion feed + enrichment for cursor-based delivery
