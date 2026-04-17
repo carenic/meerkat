@@ -1,0 +1,207 @@
+//! Auth lease, credential-material kinds, authorizer trait, and refresh semantics.
+//!
+//! `meerkat-core` owns the trait shape; concrete lease implementations
+//! (`StaticLease`, `DynamicLease`) live in `meerkat-client/src/runtime/binding.rs`.
+//! `meerkat-core` declares none of the Phase 2 shim surface — the
+//! `ResolvedConnection.shim_credential` seam is entirely on the client side.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use super::error::AuthError;
+use super::metadata::AuthMetadata;
+
+/// Why a refresh or re-resolution was triggered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AuthRefreshReason {
+    StartupValidation,
+    Preflight,
+    Unauthorized,
+    ExpiringSoon,
+    Manual,
+    ConnectionChanged,
+}
+
+/// The resolved credential material. `meerkat-client` resolvers produce
+/// this and wrap it in an [`AuthLease`]. Phase 2 clients do not introspect
+/// its contents — the Phase 2 shim reads
+/// `ResolvedConnection.shim_credential` instead.
+#[derive(Clone)]
+pub enum ResolvedAuthKind {
+    /// A vector of `(name, value)` header pairs. Phase 2 may populate this
+    /// with a placeholder or leave it empty; Phase 3 will populate it with
+    /// provider-correct wire headers when `build_client` owns HTTP assembly.
+    StaticHeaders(Vec<(String, String)>),
+    /// A runtime authorizer invoked per request. Phase 2 `build_client`
+    /// cannot use this with the legacy provider clients — it returns
+    /// `ProviderClientError::DynamicAuthorizerNotYetSupportedInShimMode`.
+    DynamicAuthorizer(Arc<dyn HttpAuthorizer>),
+    /// No credential material (e.g., self-hosted without auth).
+    None,
+}
+
+impl std::fmt::Debug for ResolvedAuthKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StaticHeaders(headers) => f
+                .debug_tuple("StaticHeaders")
+                .field(&headers.len())
+                .finish(),
+            Self::DynamicAuthorizer(auth) => f
+                .debug_tuple("DynamicAuthorizer")
+                .field(&auth.label())
+                .finish(),
+            Self::None => f.debug_struct("None").finish(),
+        }
+    }
+}
+
+/// Surface-safe projection of the resolved credential state. Returned by
+/// external resolver handles (WASM, desktop bridges) where shipping a full
+/// trait object is not practical.
+#[derive(Debug, Clone)]
+pub enum ResolvedAuthEnvelope {
+    StaticHeaders {
+        headers: Vec<(String, String)>,
+        metadata: AuthMetadata,
+        expires_at: Option<DateTime<Utc>>,
+    },
+    DynamicAuthorizer {
+        metadata: AuthMetadata,
+        expires_at: Option<DateTime<Utc>>,
+    },
+    None {
+        metadata: AuthMetadata,
+    },
+}
+
+/// Minimal request view passed to a dynamic authorizer.
+pub struct HttpAuthorizationRequest<'a> {
+    pub method: &'a str,
+    pub url: &'a str,
+    pub headers: &'a mut Vec<(String, String)>,
+}
+
+/// Dynamic authorizer trait. Used when auth artifacts need to be computed
+/// per request (ADC, refreshed OAuth bearer, etc.).
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait HttpAuthorizer: Send + Sync {
+    async fn authorize(&self, req: &mut HttpAuthorizationRequest<'_>) -> Result<(), AuthError>;
+    fn label(&self) -> &str;
+}
+
+/// Trait contract for a resolved credential lease. `meerkat-core` declares
+/// only generic lifecycle methods. No Phase 2 shim surface lives here.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait AuthLease: Send + Sync {
+    fn kind(&self) -> &ResolvedAuthKind;
+    fn metadata(&self) -> &AuthMetadata;
+    fn expires_at(&self) -> Option<DateTime<Utc>>;
+    fn source_label(&self) -> &str;
+    async fn refresh(&self, reason: AuthRefreshReason) -> Result<(), AuthError>;
+}
+
+/// Non-secret constraints on a resolved binding (per-realm or per-profile).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AuthConstraints {
+    #[serde(default)]
+    pub require_workspace_id: bool,
+    #[serde(default)]
+    pub require_account_id: bool,
+    #[serde(default)]
+    pub allow_interactive_login: bool,
+    #[serde(default = "default_true")]
+    pub allow_refresh: bool,
+}
+
+impl Default for AuthConstraints {
+    fn default() -> Self {
+        Self {
+            require_workspace_id: false,
+            require_account_id: false,
+            allow_interactive_login: false,
+            allow_refresh: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_reason_roundtrip() {
+        let r = AuthRefreshReason::ExpiringSoon;
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(s, "\"expiring_soon\"");
+    }
+
+    #[test]
+    fn resolved_auth_kind_debug_smoke() {
+        let k = ResolvedAuthKind::StaticHeaders(vec![("k".into(), "v".into())]);
+        assert!(format!("{k:?}").contains("StaticHeaders"));
+        let n = ResolvedAuthKind::None;
+        assert!(format!("{n:?}").contains("None"));
+    }
+
+    #[test]
+    fn auth_constraints_defaults() {
+        let c = AuthConstraints::default();
+        assert!(!c.require_workspace_id);
+        assert!(!c.require_account_id);
+        assert!(!c.allow_interactive_login);
+        assert!(c.allow_refresh, "allow_refresh defaults to true");
+    }
+
+    // Minimal stub lease to exercise object-safety of the trait.
+    struct StubLease {
+        kind: ResolvedAuthKind,
+        metadata: AuthMetadata,
+        source_label: String,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AuthLease for StubLease {
+        fn kind(&self) -> &ResolvedAuthKind {
+            &self.kind
+        }
+        fn metadata(&self) -> &AuthMetadata {
+            &self.metadata
+        }
+        fn expires_at(&self) -> Option<DateTime<Utc>> {
+            None
+        }
+        fn source_label(&self) -> &str {
+            &self.source_label
+        }
+        async fn refresh(&self, _reason: AuthRefreshReason) -> Result<(), AuthError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn stub_lease_is_object_safe() {
+        let lease: Arc<dyn AuthLease> = Arc::new(StubLease {
+            kind: ResolvedAuthKind::None,
+            metadata: AuthMetadata::default(),
+            source_label: "stub".into(),
+        });
+        assert_eq!(lease.source_label(), "stub");
+        assert!(matches!(lease.kind(), ResolvedAuthKind::None));
+        assert!(lease.refresh(AuthRefreshReason::Manual).await.is_ok());
+    }
+}

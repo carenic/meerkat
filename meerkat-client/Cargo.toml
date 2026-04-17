@@ -21,6 +21,7 @@ thiserror = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 async-stream = { workspace = true }
+chrono = { workspace = true }
 tracing = { workspace = true }
 slab = "0.4"
 indexmap = "2"

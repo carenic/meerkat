@@ -1,0 +1,249 @@
+//! ProviderRuntimeRegistry — maps Provider → Arc<dyn ProviderRuntime>.
+//!
+//! Also houses `ResolverEnvironment`, the explicit env-injection seam that
+//! replaces direct `std::env::var` calls in the new resolution stack.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+
+use meerkat_core::{AuthError, Provider, RealmConnectionSet, ResolvedAuthEnvelope};
+
+use crate::runtime::binding::{ResolvedConnection, ValidatedBinding};
+use crate::runtime::errors::{ProviderAuthError, ProviderBindingError, ProviderClientError};
+use crate::runtime::provider_runtime::ProviderRuntime;
+use crate::types::LlmClient;
+
+// Provider runtimes — re-exported under feature flags.
+#[cfg(feature = "anthropic")]
+use crate::providers::anthropic::AnthropicProviderRuntime;
+#[cfg(feature = "gemini")]
+use crate::providers::google::GoogleProviderRuntime;
+#[cfg(feature = "openai")]
+use crate::providers::openai::OpenAiProviderRuntime;
+
+/// Closure that looks up an environment variable by name. Injected into
+/// [`ResolverEnvironment`] so the new resolution stack never calls
+/// `std::env::var` directly.
+pub type EnvLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// Closure that returns the current time. Injected for test determinism.
+pub type NowFn = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+
+/// Explicit environment passed to provider resolvers.
+///
+/// `env_lookup` replaces direct `std::env::var` calls — the resolution
+/// stack reads env only through this closure. Tests seed a closure that
+/// returns programmed values; production wiring uses
+/// [`ResolverEnvironment::with_process_env`].
+pub struct ResolverEnvironment {
+    pub env_lookup: EnvLookup,
+    pub external_resolvers: BTreeMap<String, Arc<dyn ExternalAuthResolverHandle>>,
+    pub now: NowFn,
+}
+
+impl ResolverEnvironment {
+    /// Testing default — env lookup always returns None, no external
+    /// resolvers, `now` returns the current UTC time.
+    pub fn testing() -> Self {
+        Self {
+            env_lookup: Arc::new(|_| None),
+            external_resolvers: BTreeMap::new(),
+            now: Arc::new(Utc::now),
+        }
+    }
+
+    /// Wraps `std::env::var` in a closure so the new stack never reads env
+    /// directly.
+    pub fn with_process_env() -> Self {
+        Self {
+            env_lookup: Arc::new(|key| std::env::var(key).ok()),
+            external_resolvers: BTreeMap::new(),
+            now: Arc::new(Utc::now),
+        }
+    }
+
+    /// Register an external auth resolver under a handle name.
+    pub fn with_external_resolver(
+        mut self,
+        handle: impl Into<String>,
+        resolver: Arc<dyn ExternalAuthResolverHandle>,
+    ) -> Self {
+        self.external_resolvers.insert(handle.into(), resolver);
+        self
+    }
+
+    /// Seed a custom env lookup closure (for tests).
+    pub fn with_env_lookup<F>(mut self, lookup: F) -> Self
+    where
+        F: Fn(&str) -> Option<String> + Send + Sync + 'static,
+    {
+        self.env_lookup = Arc::new(lookup);
+        self
+    }
+}
+
+impl Default for ResolverEnvironment {
+    fn default() -> Self {
+        Self::testing()
+    }
+}
+
+/// Minimal Phase-2 external-auth handle. Just `resolve` — refresh/status
+/// surfaces land later.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait ExternalAuthResolverHandle: Send + Sync {
+    async fn resolve(&self, binding: &ValidatedBinding) -> Result<ResolvedAuthEnvelope, AuthError>;
+}
+
+/// Registry mapping Provider → runtime implementation.
+pub struct ProviderRuntimeRegistry {
+    runtimes: BTreeMap<Provider, Arc<dyn ProviderRuntime>>,
+}
+
+impl ProviderRuntimeRegistry {
+    /// Empty registry — no runtimes registered.
+    pub fn empty() -> Self {
+        Self {
+            runtimes: BTreeMap::new(),
+        }
+    }
+
+    /// Default registry with all feature-gated runtimes registered.
+    pub fn default_registry() -> Self {
+        let mut r = Self::empty();
+        #[cfg(feature = "openai")]
+        {
+            r.runtimes
+                .insert(Provider::OpenAI, Arc::new(OpenAiProviderRuntime));
+        }
+        #[cfg(feature = "anthropic")]
+        {
+            r.runtimes
+                .insert(Provider::Anthropic, Arc::new(AnthropicProviderRuntime));
+        }
+        #[cfg(feature = "gemini")]
+        {
+            r.runtimes
+                .insert(Provider::Gemini, Arc::new(GoogleProviderRuntime));
+        }
+        r
+    }
+
+    /// Install a custom runtime, replacing any previously registered
+    /// runtime for that provider.
+    pub fn with_runtime(mut self, runtime: Arc<dyn ProviderRuntime>) -> Self {
+        self.runtimes.insert(runtime.provider_id(), runtime);
+        self
+    }
+
+    pub fn get(&self, provider: Provider) -> Option<&Arc<dyn ProviderRuntime>> {
+        self.runtimes.get(&provider)
+    }
+
+    /// Resolve a binding from a realm connection set through the matching
+    /// provider runtime.
+    ///
+    /// **Scaffolding stub.** Returns `ProviderAuthError::ScaffoldingStub`
+    /// until L2.12 lands the real dispatch. Until then, the T2 integration
+    /// test fails at its assertion (not at a panic).
+    pub async fn resolve(
+        &self,
+        _realm: &RealmConnectionSet,
+        _binding_id: &str,
+        _env: &ResolverEnvironment,
+    ) -> Result<ResolvedConnection, ProviderAuthError> {
+        Err(ProviderAuthError::ScaffoldingStub)
+    }
+
+    /// Build a client from a resolved connection through the matching
+    /// provider runtime.
+    ///
+    /// **Scaffolding stub.** Returns `ProviderClientError::ScaffoldingStub`
+    /// until L2.12.
+    pub fn build_client(
+        &self,
+        _connection: ResolvedConnection,
+    ) -> Result<Arc<dyn LlmClient>, ProviderClientError> {
+        Err(ProviderClientError::ScaffoldingStub)
+    }
+}
+
+impl Default for ProviderRuntimeRegistry {
+    fn default() -> Self {
+        Self::default_registry()
+    }
+}
+
+/// Also expose `ProviderBindingError` so callers can map validate failures
+/// alongside the other registry errors.
+pub use crate::runtime::errors::ProviderBindingError as RegistryBindingError;
+
+// Top-level resolve expects certain error variants — ensure they compile.
+#[allow(dead_code)]
+fn _compile_proof_of_error_wiring() -> ProviderBindingError {
+    ProviderBindingError::UnsupportedCombination {
+        backend: "x".into(),
+        auth: "y".into(),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn testing_env_has_none_lookup() {
+        let env = ResolverEnvironment::testing();
+        assert!((env.env_lookup)("ANYTHING").is_none());
+    }
+
+    #[test]
+    fn custom_env_lookup() {
+        let env = ResolverEnvironment::testing().with_env_lookup(|k| {
+            if k == "OPENAI_API_KEY" {
+                Some("sk-fake".into())
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            (env.env_lookup)("OPENAI_API_KEY").as_deref(),
+            Some("sk-fake")
+        );
+        assert!((env.env_lookup)("OTHER").is_none());
+    }
+
+    #[test]
+    fn default_registry_populated_by_features() {
+        let r = ProviderRuntimeRegistry::default();
+        #[cfg(feature = "openai")]
+        assert!(r.get(Provider::OpenAI).is_some());
+        #[cfg(feature = "anthropic")]
+        assert!(r.get(Provider::Anthropic).is_some());
+        #[cfg(feature = "gemini")]
+        assert!(r.get(Provider::Gemini).is_some());
+
+        // SelfHosted has no runtime registered in Phase 2.
+        assert!(r.get(Provider::SelfHosted).is_none());
+    }
+
+    #[test]
+    fn resolve_returns_scaffolding_stub() {
+        let r = ProviderRuntimeRegistry::default();
+        let realm = RealmConnectionSet {
+            realm_id: "dev".into(),
+            backends: Default::default(),
+            auth_profiles: Default::default(),
+            bindings: Default::default(),
+            default_binding: None,
+        };
+        let env = ResolverEnvironment::testing();
+        let result = futures::executor::block_on(r.resolve(&realm, "x", &env));
+        assert!(matches!(result, Err(ProviderAuthError::ScaffoldingStub)));
+    }
+}

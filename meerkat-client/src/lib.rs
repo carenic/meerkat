@@ -31,6 +31,12 @@ pub mod openai_compatible;
 #[cfg(feature = "gemini")]
 pub mod gemini;
 
+// === Provider runtime (Phase 2 — parallel stack, not yet wired to
+// AgentFactory — see
+// /Users/luka/.claude/plans/yes-make-a-plan-shimmying-bengio.md) ===
+pub mod providers;
+pub mod runtime;
+
 pub use adapter::LlmClientAdapter;
 pub use block_assembler::{BlockAssembler, BlockKey, StreamAssemblyError};
 pub use error::LlmError;
@@ -51,3 +57,20 @@ pub use openai_compatible::{OpenAiCompatibleClient, OpenAiCompatibleMode};
 
 #[cfg(feature = "gemini")]
 pub use gemini::GeminiClient;
+
+// Provider-runtime re-exports (Phase 2).
+pub use runtime::{
+    DynamicLease, ExternalAuthResolverHandle, NormalizedAuthMethod, NormalizedBackendKind,
+    ProviderAuthError, ProviderBindingError, ProviderClientError, ProviderRuntime,
+    ProviderRuntimeRegistry, ResolvedConnection, ResolverEnvironment, ShimCredential, StaticLease,
+    ValidatedBinding,
+};
+
+#[cfg(feature = "anthropic")]
+pub use providers::anthropic::{
+    AnthropicAuthMethod, AnthropicBackendKind, AnthropicProviderRuntime,
+};
+#[cfg(feature = "gemini")]
+pub use providers::google::{GoogleAuthMethod, GoogleBackendKind, GoogleProviderRuntime};
+#[cfg(feature = "openai")]
+pub use providers::openai::{OpenAiAuthMethod, OpenAiBackendKind, OpenAiProviderRuntime};

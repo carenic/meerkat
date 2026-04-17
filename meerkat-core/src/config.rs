@@ -2,6 +2,7 @@
 //!
 //! Supports layered configuration: defaults → file → env (secrets only) → CLI
 
+use crate::connection::RealmConfigSection;
 use crate::mcp_config::McpServerConfig;
 use crate::{
     budget::BudgetLimits,
@@ -44,6 +45,13 @@ pub struct Config {
     pub skills: crate::skills_config::SkillsConfig,
     pub self_hosted: SelfHostedConfig,
     pub provider_tools: ProviderToolsConfig,
+    /// Realm-scoped connection sets (backend profiles, auth profiles,
+    /// bindings). TOML keys use the singular `[realm.<id>.*]` namespace
+    /// even though the Rust field is plural-adjacent — `#[serde(rename)]`
+    /// bridges the two. See
+    /// `/Users/luka/.claude/plans/yes-make-a-plan-shimmying-bengio.md`.
+    #[serde(rename = "realm", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub realm: BTreeMap<String, RealmConfigSection>,
 }
 
 impl Default for Config {
@@ -74,6 +82,7 @@ impl Default for Config {
             skills: crate::skills_config::SkillsConfig::default(),
             self_hosted: SelfHostedConfig::default(),
             provider_tools: ProviderToolsConfig::default(),
+            realm: BTreeMap::new(),
         }
     }
 }
