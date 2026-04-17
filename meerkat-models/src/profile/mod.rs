@@ -7,6 +7,7 @@
 pub mod anthropic;
 pub mod gemini;
 pub mod openai;
+pub mod schema_builder;
 
 use serde::{Deserialize, Serialize};
 
