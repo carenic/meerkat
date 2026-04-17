@@ -888,18 +888,26 @@ impl MethodRouter {
             "auth/profile/get" => {
                 handlers::auth::handle_auth_profile_get(id, params, &self.runtime).await
             }
-            "auth/profile/create" => handlers::auth::handle_auth_profile_create(id).await,
-            "auth/profile/delete" => handlers::auth::handle_auth_profile_delete(id).await,
+            "auth/profile/create" => {
+                handlers::auth::handle_auth_profile_create(id, params, &self.runtime).await
+            }
+            "auth/profile/delete" => {
+                handlers::auth::handle_auth_profile_delete(id, params, &self.runtime).await
+            }
             "auth/profile/test" => {
                 handlers::auth::handle_auth_profile_test(id, params, &self.runtime).await
             }
-            "auth/login/start" => handlers::auth::handle_auth_login_start(id).await,
-            "auth/login/complete" => handlers::auth::handle_auth_login_complete(id).await,
-            "auth/login/device_start" => handlers::auth::handle_auth_login_device_start(id).await,
+            "auth/login/start" => handlers::auth::handle_auth_login_start(id, params).await,
+            "auth/login/complete" => {
+                handlers::auth::handle_auth_login_complete(id, params, &self.runtime).await
+            }
+            "auth/login/device_start" => {
+                handlers::auth::handle_auth_login_device_start(id, params).await
+            }
             "auth/status/get" => {
                 handlers::auth::handle_auth_status_get(id, params, &self.runtime).await
             }
-            "auth/logout" => handlers::auth::handle_auth_logout(id).await,
+            "auth/logout" => handlers::auth::handle_auth_logout(id, params, &self.runtime).await,
             "realm/list" => handlers::auth::handle_realm_list(id, &self.runtime).await,
             "realm/get" => handlers::auth::handle_realm_get(id, params, &self.runtime).await,
             "config/get" => {

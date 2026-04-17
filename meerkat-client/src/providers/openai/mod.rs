@@ -105,6 +105,13 @@ impl ProviderRuntime for OpenAiProviderRuntime {
             }
         };
 
+        // ChatGPT account metadata lifted from the persisted OAuth bundle
+        // (account_id → ChatGPT-Account-ID wire header; is_fedramp →
+        // X-OpenAI-Fedramp wire header).
+        let mut chatgpt_account_id: Option<String> = None;
+        let mut chatgpt_is_fedramp: Option<bool> = None;
+        let mut chatgpt_plan_type: Option<String> = None;
+
         let shim_credential = match auth_method {
             OpenAiAuthMethod::ApiKey | OpenAiAuthMethod::StaticBearer => {
                 resolve_simple_secret(&binding.auth_profile.source, env, binding).await?
@@ -133,6 +140,21 @@ impl ProviderRuntime for OpenAiProviderRuntime {
                         .await
                         .map_err(|e| ProviderAuthError::SourceResolutionFailed(e.to_string()))?
                         .ok_or(ProviderAuthError::Auth(AuthError::InteractiveLoginRequired))?;
+
+                    // Lift ChatGPT-specific claims from the id_token
+                    // (if present) or fall back to the top-level
+                    // account_id field on the persisted bundle.
+                    chatgpt_account_id = persisted.account_id.clone();
+                    if let Some(id_token) = persisted.id_token.as_deref()
+                        && let Ok(claims) = crate::auth_oauth::jwt::decode_payload(id_token)
+                    {
+                        let lifted = oauth::ChatGptIdClaims::lift_from_claims(&claims.raw);
+                        if chatgpt_account_id.is_none() {
+                            chatgpt_account_id = lifted.account_id;
+                        }
+                        chatgpt_is_fedramp = lifted.is_fedramp;
+                        chatgpt_plan_type = lifted.plan_type;
+                    }
 
                     match auth_method {
                         OpenAiAuthMethod::ExternalChatGptTokens => {
@@ -190,8 +212,28 @@ impl ProviderRuntime for OpenAiProviderRuntime {
             }
         };
 
+        // Build AuthMetadata populating ChatGPT identity claims so
+        // build_client can emit the ChatGPT-Account-ID + X-OpenAI-Fedramp
+        // wire headers.
+        let mut metadata = AuthMetadata::default();
+        if chatgpt_account_id.is_some()
+            || chatgpt_is_fedramp.is_some()
+            || chatgpt_plan_type.is_some()
+        {
+            metadata.account_id = chatgpt_account_id.clone();
+            metadata.plan = chatgpt_plan_type.clone();
+            metadata.provider_metadata = Some(meerkat_core::ProviderAuthMetadata::OpenAi(
+                meerkat_core::OpenAiAuthMetadata {
+                    plan_type: chatgpt_plan_type,
+                    user_id: None,
+                    account_id: chatgpt_account_id,
+                    is_fedramp: chatgpt_is_fedramp,
+                    email: None,
+                },
+            ));
+        }
         let lease: Arc<dyn meerkat_core::AuthLease> = Arc::new(StaticLease::empty(
-            AuthMetadata::default(),
+            metadata,
             format!("openai:{}", binding.auth_profile.id),
         ));
 
@@ -223,6 +265,16 @@ impl ProviderRuntime for OpenAiProviderRuntime {
             }
             ShimCredential::None => return Err(ProviderClientError::NoCredentialMaterial),
         };
+        // Pull account identity + fedramp from the resolved lease's
+        // AuthMetadata so the ChatGPT backend can emit the wire
+        // headers Codex's bearer_auth_provider.rs:23-38 requires.
+        let (account_id, is_fedramp) = match connection.auth_lease.metadata().provider_metadata {
+            Some(meerkat_core::ProviderAuthMetadata::OpenAi(ref m)) => {
+                (m.account_id.clone(), m.is_fedramp)
+            }
+            _ => (connection.auth_lease.metadata().account_id.clone(), None),
+        };
+
         match backend_kind {
             OpenAiBackendKind::OpenAiApi => {
                 // S1-verified: OpenAiClient::new returns Self (infallible).
@@ -235,7 +287,23 @@ impl ProviderRuntime for OpenAiProviderRuntime {
                 Ok(Arc::new(client))
             }
             OpenAiBackendKind::ChatGptBackend => {
-                Err(ProviderClientError::MissingFeature("openai-chatgpt-auth"))
+                // ChatGPT backend: emit account_id + fedramp wire
+                // headers per Codex bearer_auth_provider.rs:23-38.
+                let base_url = connection
+                    .backend_profile
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| OpenAiBackendKind::ChatGptBackend.default_base_url().into());
+                let mut extra_headers: Vec<(String, String)> = Vec::new();
+                if let Some(acct) = account_id {
+                    extra_headers.push((oauth::CHATGPT_ACCOUNT_HEADER.to_string(), acct));
+                }
+                if matches!(is_fedramp, Some(true)) {
+                    extra_headers.push((oauth::FEDRAMP_HEADER.to_string(), "true".to_string()));
+                }
+                let client = crate::openai::OpenAiClient::new_with_base_url(secret, base_url)
+                    .with_extra_headers(extra_headers);
+                Ok(Arc::new(client))
             }
         }
     }

@@ -502,7 +502,7 @@ class WireAuthStatus:
 
 
 # Stable wire kind for auth errors. Mirrors `meerkat_core::AuthErrorKind`
-on the wire as a normalized string.
+# on the wire as a normalized string.
 WireAuthError = dict[str, Any]
 
 # Wire-safe content block (no `source_path` — internal only).

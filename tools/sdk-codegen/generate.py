@@ -375,7 +375,10 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
         }
         alias_type, _ = _python_type_from_schema(schema_root, schema, local_defs)
         doc = schema.get("description", default_doc) if isinstance(schema, dict) else default_doc
-        types_content += f"\n# {doc}\n{name} = {alias_type}\n"
+        # Ensure multi-line descriptions are fully commented out.
+        doc_lines = str(doc).splitlines() or [""]
+        doc_block = "\n".join(f"# {line}" for line in doc_lines)
+        types_content += f"\n{doc_block}\n{name} = {alias_type}\n"
 
     append_python_dataclass("McpAddParams", params_schema, "Request payload for mcp/add.")
     append_python_dataclass("McpRemoveParams", params_schema, "Request payload for mcp/remove.")
