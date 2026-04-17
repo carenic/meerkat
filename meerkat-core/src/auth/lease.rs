@@ -63,16 +63,23 @@ impl std::fmt::Debug for ResolvedAuthKind {
 
 /// Surface-safe projection of the resolved credential state. Returned by
 /// external resolver handles (WASM, desktop bridges) where shipping a full
-/// trait object is not practical.
-#[derive(Debug, Clone)]
+/// trait object is not practical. Serde-roundtrippable so WASM/RPC bridges
+/// can cross the process boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResolvedAuthEnvelope {
     StaticHeaders {
         headers: Vec<(String, String)>,
         metadata: AuthMetadata,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
         expires_at: Option<DateTime<Utc>>,
     },
     DynamicAuthorizer {
         metadata: AuthMetadata,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
         expires_at: Option<DateTime<Utc>>,
     },
     None {
@@ -164,6 +171,48 @@ mod tests {
         assert!(!c.require_account_id);
         assert!(!c.allow_interactive_login);
         assert!(c.allow_refresh, "allow_refresh defaults to true");
+    }
+
+    #[test]
+    fn resolved_auth_envelope_serde_roundtrip() {
+        let meta = AuthMetadata {
+            account_id: Some("acct_x".into()),
+            ..AuthMetadata::default()
+        };
+        // Headers variant.
+        let env = ResolvedAuthEnvelope::StaticHeaders {
+            headers: vec![("Authorization".into(), "Bearer xyz".into())],
+            metadata: meta,
+            expires_at: None,
+        };
+        let s = serde_json::to_string(&env).unwrap();
+        assert!(s.contains("\"kind\":\"static_headers\""));
+        let back: ResolvedAuthEnvelope = serde_json::from_str(&s).unwrap();
+        match back {
+            ResolvedAuthEnvelope::StaticHeaders {
+                headers, metadata, ..
+            } => {
+                assert_eq!(headers.len(), 1);
+                assert_eq!(metadata.account_id.as_deref(), Some("acct_x"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // Dynamic + None variants.
+        let dyn_env = ResolvedAuthEnvelope::DynamicAuthorizer {
+            metadata: AuthMetadata::default(),
+            expires_at: None,
+        };
+        let s = serde_json::to_string(&dyn_env).unwrap();
+        assert!(s.contains("dynamic_authorizer"));
+        let _back: ResolvedAuthEnvelope = serde_json::from_str(&s).unwrap();
+
+        let none_env = ResolvedAuthEnvelope::None {
+            metadata: AuthMetadata::default(),
+        };
+        let s = serde_json::to_string(&none_env).unwrap();
+        assert!(s.contains("\"kind\":\"none\""));
+        let _back: ResolvedAuthEnvelope = serde_json::from_str(&s).unwrap();
     }
 
     // Minimal stub lease to exercise object-safety of the trait.

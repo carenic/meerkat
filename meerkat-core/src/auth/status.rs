@@ -77,4 +77,21 @@ mod tests {
         assert_eq!(back.kind, summary.kind);
         assert_eq!(back.message, summary.message);
     }
+
+    #[cfg(feature = "schema")]
+    #[test]
+    fn auth_status_emits_json_schema() {
+        // Proves that the JsonSchema derive works without panicking and
+        // produces a non-trivial schema object. L1.5 requirement.
+        let schema = schemars::schema_for!(AuthStatus);
+        let json = serde_json::to_value(&schema).unwrap();
+        // The schema must have a top-level object with properties.
+        assert!(json.is_object());
+        let props = json
+            .get("properties")
+            .expect("AuthStatus schema has properties");
+        assert!(props.get("profile_id").is_some());
+        assert!(props.get("provider").is_some());
+        assert!(props.get("needs_reauth").is_some());
+    }
 }

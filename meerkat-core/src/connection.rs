@@ -148,34 +148,110 @@ pub struct RealmConnectionSet {
 
 impl RealmConnectionSet {
     /// Validate and materialize a realm connection set from its config
-    /// section.
-    ///
-    /// **Scaffolding stub.** Returns
-    /// [`ProviderBindingError::ScaffoldingStub`] until the Phase 1 leaf
-    /// slice (L1.10) lands the real implementation. The
-    /// scaffolding-sentinel sweep at end of Phase 2 asserts zero
-    /// remaining references to this variant.
+    /// section. Normalizes provider strings into the typed
+    /// [`Provider`] enum and verifies that every binding references
+    /// existing backend and auth profiles whose providers agree.
     pub fn from_config(
-        _realm_id: &str,
-        _section: &RealmConfigSection,
+        realm_id: &str,
+        section: &RealmConfigSection,
     ) -> Result<Self, ProviderBindingError> {
-        Err(ProviderBindingError::ScaffoldingStub)
+        let mut backends: BTreeMap<String, BackendProfile> = BTreeMap::new();
+        for (id, cfg) in &section.backend {
+            let provider = Provider::parse_strict(&cfg.provider)
+                .ok_or_else(|| ProviderBindingError::UnknownProviderName(cfg.provider.clone()))?;
+            let backend = BackendProfile {
+                id: id.clone(),
+                provider,
+                backend_kind: cfg.backend_kind.clone(),
+                base_url: cfg.base_url.clone(),
+                options: cfg.options.clone(),
+            };
+            // id uniqueness within a single BTreeMap key space is
+            // guaranteed by the map itself; no extra check needed.
+            backends.insert(id.clone(), backend);
+        }
+
+        let mut auth_profiles: BTreeMap<String, AuthProfile> = BTreeMap::new();
+        for (id, cfg) in &section.auth {
+            let provider = Provider::parse_strict(&cfg.provider)
+                .ok_or_else(|| ProviderBindingError::UnknownProviderName(cfg.provider.clone()))?;
+            let profile = AuthProfile {
+                id: id.clone(),
+                provider,
+                auth_method: cfg.auth_method.clone(),
+                source: cfg.source.clone(),
+                storage: cfg.storage.clone().unwrap_or_default(),
+                constraints: cfg.constraints.clone(),
+                metadata_defaults: cfg.metadata_defaults.clone(),
+            };
+            auth_profiles.insert(id.clone(), profile);
+        }
+
+        let mut bindings: BTreeMap<String, ProviderBinding> = BTreeMap::new();
+        for (id, cfg) in &section.binding {
+            let backend = backends
+                .get(&cfg.backend_profile)
+                .ok_or_else(|| ProviderBindingError::UnknownBackend(cfg.backend_profile.clone()))?;
+            let auth = auth_profiles
+                .get(&cfg.auth_profile)
+                .ok_or_else(|| ProviderBindingError::UnknownAuth(cfg.auth_profile.clone()))?;
+            if backend.provider != auth.provider {
+                return Err(ProviderBindingError::ProviderMismatch {
+                    binding: id.clone(),
+                    backend: backend.provider,
+                    auth: auth.provider,
+                });
+            }
+            let binding = ProviderBinding {
+                id: id.clone(),
+                backend_profile: cfg.backend_profile.clone(),
+                auth_profile: cfg.auth_profile.clone(),
+                default_model: cfg.default_model.clone(),
+                policy: cfg.policy.clone(),
+            };
+            bindings.insert(id.clone(), binding);
+        }
+
+        Ok(Self {
+            realm_id: realm_id.to_string(),
+            backends,
+            auth_profiles,
+            bindings,
+            default_binding: section.default_binding.clone(),
+        })
     }
 
     /// Resolve a binding by id. Returns the binding plus its referenced
     /// backend and auth profiles.
-    ///
-    /// **Scaffolding stub.** Returns
-    /// [`ProviderBindingError::ScaffoldingStub`] until L1.9.
     pub fn lookup_binding(
         &self,
-        _id: &str,
+        id: &str,
     ) -> Result<(&ProviderBinding, &BackendProfile, &AuthProfile), ProviderBindingError> {
-        Err(ProviderBindingError::ScaffoldingStub)
+        let binding = self
+            .bindings
+            .get(id)
+            .ok_or_else(|| ProviderBindingError::UnknownBinding(id.to_string()))?;
+        let backend = self
+            .backends
+            .get(&binding.backend_profile)
+            .ok_or_else(|| ProviderBindingError::UnknownBackend(binding.backend_profile.clone()))?;
+        let auth = self
+            .auth_profiles
+            .get(&binding.auth_profile)
+            .ok_or_else(|| ProviderBindingError::UnknownAuth(binding.auth_profile.clone()))?;
+        Ok((binding, backend, auth))
     }
 }
 
 /// Validation / reference-resolution errors for a realm connection set.
+///
+/// The plan originally listed a `DuplicateId(String)` variant; it's been
+/// omitted because `RealmConfigSection` uses `BTreeMap<String, ...>` for
+/// backends/auth/bindings, so duplicate ids within one category are
+/// impossible at ingestion time. Cross-category id sharing is harmless
+/// (lookups are category-keyed). If a future code path constructs a
+/// `RealmConfigSection` programmatically and needs duplicate detection,
+/// add the variant back alongside the check.
 #[derive(Debug, Clone, Error, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -192,12 +268,8 @@ pub enum ProviderBindingError {
         backend: Provider,
         auth: Provider,
     },
-    #[error("duplicate id: {0}")]
-    DuplicateId(String),
     #[error("unknown provider name: {0}")]
     UnknownProviderName(String),
-    #[error("realm connection scaffolding stub — replace with real impl")]
-    ScaffoldingStub,
 }
 
 // ---------------------------------------------------------------------
@@ -284,25 +356,77 @@ mod tests {
 
     #[test]
     fn credential_source_spec_serde() {
-        let src = CredentialSourceSpec::Env {
-            env: "OPENAI_API_KEY".into(),
-        };
-        let s = serde_json::to_string(&src).unwrap();
-        assert!(s.contains("\"kind\":\"env\""));
-        assert!(s.contains("OPENAI_API_KEY"));
-        let back: CredentialSourceSpec = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, src);
+        for src in [
+            CredentialSourceSpec::InlineSecret {
+                secret: "sk-x".into(),
+            },
+            CredentialSourceSpec::Env {
+                env: "OPENAI_API_KEY".into(),
+            },
+            CredentialSourceSpec::ManagedStore {
+                profile: "default".into(),
+            },
+            CredentialSourceSpec::ExternalResolver {
+                handle: "desktop".into(),
+            },
+            CredentialSourceSpec::PlatformDefault,
+        ] {
+            let s = serde_json::to_string(&src).unwrap();
+            let back: CredentialSourceSpec = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, src);
+        }
     }
 
     #[test]
-    fn from_config_returns_scaffolding_stub() {
-        // Phase 1 scaffolding: until L1.10 lands, from_config returns a
-        // typed ScaffoldingStub error, not a panic. This ensures the T1
-        // integration test can execute through the boundary and fail at
-        // its final assertion.
+    fn credential_source_spec_rejects_unknown_kind() {
+        let bad = r#"{"kind":"nonexistent","foo":"bar"}"#;
+        let err = serde_json::from_str::<CredentialSourceSpec>(bad).unwrap_err();
+        assert!(
+            err.to_string().contains("nonexistent") || err.to_string().contains("unknown variant"),
+            "serde error should mention unknown variant: {err}",
+        );
+    }
+
+    #[test]
+    fn credential_storage_spec_serde_roundtrip_all_variants() {
+        for storage in [
+            CredentialStorageSpec::Keyring,
+            CredentialStorageSpec::File {
+                path: std::path::PathBuf::from("/tmp/meerkat-secret.json"),
+            },
+            CredentialStorageSpec::Auto,
+            CredentialStorageSpec::Ephemeral,
+            CredentialStorageSpec::HostManaged,
+        ] {
+            let s = serde_json::to_string(&storage).unwrap();
+            let back: CredentialStorageSpec = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, storage);
+        }
+        assert_eq!(
+            CredentialStorageSpec::default(),
+            CredentialStorageSpec::Auto
+        );
+    }
+
+    #[test]
+    fn from_config_empty_section_yields_empty_set() {
         let section = RealmConfigSection::default();
-        let result = RealmConnectionSet::from_config("dev", &section);
-        assert_eq!(result, Err(ProviderBindingError::ScaffoldingStub));
+        let set = RealmConnectionSet::from_config("dev", &section).expect("empty section is valid");
+        assert_eq!(set.realm_id, "dev");
+        assert!(set.backends.is_empty());
+        assert!(set.auth_profiles.is_empty());
+        assert!(set.bindings.is_empty());
+        assert_eq!(set.default_binding, None);
+    }
+
+    #[test]
+    fn lookup_binding_returns_unknown_binding() {
+        let set = RealmConnectionSet::from_config("dev", &RealmConfigSection::default())
+            .expect("empty section valid");
+        let err = set
+            .lookup_binding("missing")
+            .expect_err("empty set has no bindings");
+        assert_eq!(err, ProviderBindingError::UnknownBinding("missing".into()));
     }
 
     #[test]
