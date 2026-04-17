@@ -26,6 +26,7 @@ pub use backend::AnthropicBackendKind;
 
 /// Allowed (backend, auth) combinations for Anthropic.
 pub const ALLOWED_BINDINGS: &[(AnthropicBackendKind, AnthropicAuthMethod)] = &[
+    // Native Anthropic API.
     (
         AnthropicBackendKind::AnthropicApi,
         AnthropicAuthMethod::ApiKey,
@@ -44,6 +45,41 @@ pub const ALLOWED_BINDINGS: &[(AnthropicBackendKind, AnthropicAuthMethod)] = &[
     ),
     (
         AnthropicBackendKind::AnthropicApi,
+        AnthropicAuthMethod::ExternalAuthorizer,
+    ),
+    // Bedrock.
+    (
+        AnthropicBackendKind::Bedrock,
+        AnthropicAuthMethod::BedrockBearer,
+    ),
+    (
+        AnthropicBackendKind::Bedrock,
+        AnthropicAuthMethod::BedrockAwsSigv4,
+    ),
+    (
+        AnthropicBackendKind::Bedrock,
+        AnthropicAuthMethod::ExternalAuthorizer,
+    ),
+    // Vertex.
+    (
+        AnthropicBackendKind::Vertex,
+        AnthropicAuthMethod::VertexGoogleAuth,
+    ),
+    (
+        AnthropicBackendKind::Vertex,
+        AnthropicAuthMethod::ExternalAuthorizer,
+    ),
+    // Foundry.
+    (
+        AnthropicBackendKind::Foundry,
+        AnthropicAuthMethod::FoundryApiKey,
+    ),
+    (
+        AnthropicBackendKind::Foundry,
+        AnthropicAuthMethod::FoundryAzureAd,
+    ),
+    (
+        AnthropicBackendKind::Foundry,
         AnthropicAuthMethod::ExternalAuthorizer,
     ),
 ];
@@ -109,11 +145,24 @@ impl ProviderRuntime for AnthropicProviderRuntime {
         };
 
         let shim_credential = match auth_method {
-            AnthropicAuthMethod::ApiKey | AnthropicAuthMethod::StaticBearer => {
+            AnthropicAuthMethod::ApiKey
+            | AnthropicAuthMethod::StaticBearer
+            | AnthropicAuthMethod::BedrockBearer
+            | AnthropicAuthMethod::FoundryApiKey => {
+                // All of these resolve to a simple static secret.
                 resolve_simple_secret(&binding.auth_profile.source, env, binding).await?
             }
             AnthropicAuthMethod::ExternalAuthorizer => {
                 resolve_external_authorizer(&binding.auth_profile.source, env, binding).await?
+            }
+            AnthropicAuthMethod::BedrockAwsSigv4
+            | AnthropicAuthMethod::VertexGoogleAuth
+            | AnthropicAuthMethod::FoundryAzureAd => {
+                // Dynamic authorizer cases — build_client constructs the
+                // concrete authorizer (AwsSts / GoogleAuth / AzureAd) and
+                // attaches it to an AnthropicClient or BedrockClient with
+                // the binding's base_url.
+                ShimCredential::Authorizer
             }
             AnthropicAuthMethod::ClaudeAiOauth | AnthropicAuthMethod::OauthToApiKey => {
                 #[cfg(all(not(target_arch = "wasm32"), feature = "oauth"))]
@@ -228,25 +277,96 @@ impl ProviderRuntime for AnthropicProviderRuntime {
                 ));
             }
         };
-        let secret = match connection.shim_credential {
-            ShimCredential::Secret(s) => s,
-            ShimCredential::Authorizer => {
-                return Err(ProviderClientError::DynamicAuthorizerNotYetSupportedInShimMode);
-            }
-            ShimCredential::None => return Err(ProviderClientError::NoCredentialMaterial),
-        };
-        match backend_kind {
-            AnthropicBackendKind::AnthropicApi => {
-                // S1a-verified: AnthropicClient::new returns Result<Self, LlmError>.
-                let mut client = crate::anthropic::AnthropicClient::new(secret)
+        match (backend_kind, &connection.shim_credential) {
+            // Native Anthropic API — plain x-api-key auth.
+            (AnthropicBackendKind::AnthropicApi, ShimCredential::Secret(secret)) => {
+                let mut client = crate::anthropic::AnthropicClient::new(secret.clone())
                     .map_err(ProviderClientError::ClientInit)?;
                 if let Some(url) = &connection.backend_profile.base_url {
                     client = client.with_base_url(url.clone());
-                    // S1d: with_base_url swallows rebuild errors. Phase 3
-                    // owns the HTTP path and fixes this.
                 }
                 Ok(Arc::new(client))
             }
+            // Foundry API-key — same shape as native, different base URL.
+            (AnthropicBackendKind::Foundry, ShimCredential::Secret(secret)) => {
+                let mut client = crate::anthropic::AnthropicClient::new(secret.clone())
+                    .map_err(ProviderClientError::ClientInit)?;
+                if let Some(url) = &connection.backend_profile.base_url {
+                    client = client.with_base_url(url.clone());
+                }
+                Ok(Arc::new(client))
+            }
+            // Bedrock static bearer (AWS_BEARER_TOKEN_BEDROCK) — works over
+            // the Messages API with `Authorization: Bearer`, base URL
+            // supplied by the BackendProfile. BedrockClient (event-stream)
+            // lands in a follow-up; native bearer auth is wire-compatible
+            // with AnthropicClient today.
+            (AnthropicBackendKind::Bedrock, ShimCredential::Secret(secret)) => {
+                // The Bedrock native API uses an `AWS4-HMAC-SHA256` /
+                // `Bearer` dichotomy; for bearer mode we inject via
+                // Authorization header. AnthropicClient doesn't expose
+                // that directly; Bedrock event-stream parsing is a
+                // separate client. Until it lands, bearer-mode Bedrock
+                // falls through with a typed error.
+                let _ = secret; // intentionally unused until Bedrock client lands
+                Err(ProviderClientError::MissingFeature(
+                    "anthropic-bedrock-client (event-stream parser — tracked)",
+                ))
+            }
+            // Dynamic authorizer flows: Vertex (Google Bearer), Foundry
+            // Azure AD (Bearer), Bedrock SigV4. AnthropicClient supports
+            // Bearer-style authorizers (Vertex + Foundry AzureAd) via
+            // .authorizer(...). Bedrock SigV4 needs a new client for the
+            // event-stream wire protocol — tracked separately.
+            (
+                AnthropicBackendKind::Vertex | AnthropicBackendKind::Foundry,
+                ShimCredential::Authorizer,
+            ) => {
+                // Authorizer-backed Bearer flow. We need the concrete
+                // HttpAuthorizer — in the current Phase 4b shim, we
+                // construct it here from the binding metadata.
+                // `ResolvedConnection.auth_lease` carries the authorizer
+                // for DynamicAuthorizer leases; we extract it.
+                let authorizer = match connection.auth_lease.kind() {
+                    meerkat_core::ResolvedAuthKind::DynamicAuthorizer(auth) => auth.clone(),
+                    _ => {
+                        return Err(ProviderClientError::MissingFeature(
+                            "anthropic-dynamic-authorizer-lease-mismatch",
+                        ));
+                    }
+                };
+                let base_url = connection
+                    .backend_profile
+                    .base_url
+                    .clone()
+                    .unwrap_or_default();
+                let client = crate::anthropic::AnthropicClient::builder(String::new())
+                    .base_url(base_url)
+                    .authorizer(authorizer)
+                    .build()
+                    .map_err(ProviderClientError::ClientInit)?;
+                Ok(Arc::new(client))
+            }
+            (AnthropicBackendKind::Bedrock, ShimCredential::Authorizer) => {
+                // Bedrock SigV4 with dynamic AwsStsAuthorizer — requires
+                // event-stream parsing. Tracked.
+                Err(ProviderClientError::MissingFeature(
+                    "anthropic-bedrock-sigv4 (event-stream parser — tracked)",
+                ))
+            }
+            (AnthropicBackendKind::Vertex, ShimCredential::Secret(_)) => {
+                // Vertex with a raw secret doesn't match any allowed
+                // binding combination, but if it gets here, fall back
+                // to the Messages API via static bearer. Typically
+                // Vertex uses VertexGoogleAuth (authorizer path).
+                Err(ProviderClientError::MissingFeature(
+                    "anthropic-vertex-static-secret (use vertex_google_auth)",
+                ))
+            }
+            (_, ShimCredential::Authorizer) => {
+                Err(ProviderClientError::DynamicAuthorizerNotYetSupportedInShimMode)
+            }
+            (_, ShimCredential::None) => Err(ProviderClientError::NoCredentialMaterial),
         }
     }
 }

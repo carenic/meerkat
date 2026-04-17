@@ -30,6 +30,11 @@ pub struct AnthropicClient {
     connect_timeout: Duration,
     request_timeout: Duration,
     pool_idle_timeout: Duration,
+    /// Dynamic authorizer — when set, replaces the `x-api-key` header
+    /// path with `HttpAuthorizer::authorize` invocation (used for
+    /// Vertex and Foundry backends where the Bearer token is acquired
+    /// at request time from Google Auth / Azure AD).
+    authorizer: Option<std::sync::Arc<dyn meerkat_core::HttpAuthorizer>>,
 }
 
 /// Builder for AnthropicClient
@@ -39,6 +44,7 @@ pub struct AnthropicClientBuilder {
     connect_timeout: Duration,
     request_timeout: Duration,
     pool_idle_timeout: Duration,
+    authorizer: Option<std::sync::Arc<dyn meerkat_core::HttpAuthorizer>>,
 }
 
 impl AnthropicClientBuilder {
@@ -49,12 +55,24 @@ impl AnthropicClientBuilder {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             pool_idle_timeout: DEFAULT_POOL_IDLE_TIMEOUT,
+            authorizer: None,
         }
     }
 
     /// Set custom base URL
     pub fn base_url(mut self, url: String) -> Self {
         self.base_url = url;
+        self
+    }
+
+    /// Attach a dynamic authorizer (Vertex/Foundry Bearer token path).
+    /// When set, `x-api-key` is NOT sent; the authorizer injects its
+    /// own headers (typically `Authorization: Bearer <token>`).
+    pub fn authorizer(
+        mut self,
+        authorizer: std::sync::Arc<dyn meerkat_core::HttpAuthorizer>,
+    ) -> Self {
+        self.authorizer = Some(authorizer);
         self
     }
 
@@ -100,6 +118,7 @@ impl AnthropicClientBuilder {
             connect_timeout,
             request_timeout,
             pool_idle_timeout,
+            authorizer: self.authorizer,
         })
     }
 }
@@ -640,11 +659,36 @@ impl LlmClient for AnthropicClient {
                 betas.push("compact-2026-01-12");
             }
 
+            let url = format!("{}/v1/messages", self.base_url);
             let mut req = self.http
-                .post(format!("{}/v1/messages", self.base_url))
-                .header("x-api-key", &self.api_key)
+                .post(&url)
                 .header("anthropic-version", "2023-06-01")
                 .header("Content-Type", "application/json");
+
+            // Auth: dynamic authorizer takes precedence over x-api-key.
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(authorizer) = &self.authorizer {
+                let mut extra: Vec<(String, String)> = Vec::new();
+                let mut auth_req = meerkat_core::HttpAuthorizationRequest {
+                    method: "POST",
+                    url: &url,
+                    headers: &mut extra,
+                };
+                authorizer.authorize(&mut auth_req).await.map_err(|e| {
+                    LlmError::AuthenticationFailed {
+                        message: format!("authorizer failed: {e}"),
+                    }
+                })?;
+                for (k, v) in extra {
+                    req = req.header(k, v);
+                }
+            } else {
+                req = req.header("x-api-key", &self.api_key);
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                req = req.header("x-api-key", &self.api_key);
+            }
 
             if !betas.is_empty() {
                 req = req.header("anthropic-beta", betas.join(","));
