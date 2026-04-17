@@ -1775,6 +1775,64 @@ class MeerkatClient:
         input_ids = result.get("input_ids", [])
         return [str(input_id) for input_id in input_ids]
 
+    # -- Auth + realm (Phase 4d) -------------------------------------------
+    #
+    # These wrappers cover the RPC catalog's auth/* and realm/* methods.
+    # Write-side methods (create/delete/login/logout) are currently
+    # server-stubbed with INVALID_REQUEST pointing to the CLI; the wrappers
+    # surface whatever the server returns.
+
+    async def realm_list(self) -> dict[str, Any]:
+        return await self._request("realm/list", {})
+
+    async def realm_get(self, realm_id: str) -> dict[str, Any]:
+        return await self._request("realm/get", {"realm_id": realm_id})
+
+    async def auth_profile_list(self, realm_id: str) -> dict[str, Any]:
+        return await self._request("auth/profile/list", {"realm_id": realm_id})
+
+    async def auth_profile_get(self, realm_id: str, profile_id: str) -> dict[str, Any]:
+        return await self._request(
+            "auth/profile/get",
+            {"realm_id": realm_id, "profile_id": profile_id},
+        )
+
+    async def auth_profile_create(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await self._request("auth/profile/create", params)
+
+    async def auth_profile_delete(self, realm_id: str, profile_id: str) -> dict[str, Any]:
+        return await self._request(
+            "auth/profile/delete",
+            {"realm_id": realm_id, "profile_id": profile_id},
+        )
+
+    async def auth_profile_test(self, realm_id: str, binding_id: str) -> dict[str, Any]:
+        return await self._request(
+            "auth/profile/test",
+            {"realm_id": realm_id, "binding_id": binding_id},
+        )
+
+    async def auth_login_start(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await self._request("auth/login/start", params)
+
+    async def auth_login_complete(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await self._request("auth/login/complete", params)
+
+    async def auth_login_device_start(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await self._request("auth/login/device_start", params)
+
+    async def auth_status_get(self, realm_id: str, profile_id: str) -> dict[str, Any]:
+        return await self._request(
+            "auth/status/get",
+            {"realm_id": realm_id, "profile_id": profile_id},
+        )
+
+    async def auth_logout(self, realm_id: str, profile_id: str) -> dict[str, Any]:
+        return await self._request(
+            "auth/logout",
+            {"realm_id": realm_id, "profile_id": profile_id},
+        )
+
     # -- Transport ---------------------------------------------------------
 
     async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
