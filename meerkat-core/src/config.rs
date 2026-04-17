@@ -1921,7 +1921,7 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = Config::default();
-        assert_eq!(config.agent.model, "claude-opus-4-6");
+        assert_eq!(config.agent.model, "claude-opus-4-7");
         assert_eq!(config.agent.max_tokens_per_turn, 16384);
         assert_eq!(config.retry.max_retries, 3);
     }
@@ -1930,7 +1930,7 @@ mod tests {
     fn test_config_layering() {
         // 1. Test defaults
         let config = Config::default();
-        assert_eq!(config.agent.model, "claude-opus-4-6");
+        assert_eq!(config.agent.model, "claude-opus-4-7");
         assert_eq!(config.budget.max_tokens, None);
 
         // 2. Test env override (secrets only)

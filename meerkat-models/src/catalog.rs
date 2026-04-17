@@ -56,10 +56,18 @@ const PROVIDER_NAMES: &[&str] = &["anthropic", "gemini", "openai"];
 const CATALOG_DATA: &[CatalogEntry] = &[
     // ── Anthropic ──────────────────────────────────────────────────────
     CatalogEntry {
+        id: "claude-opus-4-7",
+        display_name: "Claude Opus 4.7",
+        provider: "anthropic",
+        tier: ModelTier::Recommended,
+        context_window: Some(200_000),
+        max_output_tokens: Some(32_768),
+    },
+    CatalogEntry {
         id: "claude-opus-4-6",
         display_name: "Claude Opus 4.6",
         provider: "anthropic",
-        tier: ModelTier::Recommended,
+        tier: ModelTier::Supported,
         context_window: Some(200_000),
         max_output_tokens: Some(32_768),
     },
@@ -132,7 +140,7 @@ const CATALOG_DATA: &[CatalogEntry] = &[
 ];
 
 /// Default model ID per provider. First recommended model wins.
-const DEFAULT_ANTHROPIC: &str = "claude-opus-4-6";
+const DEFAULT_ANTHROPIC: &str = "claude-opus-4-7";
 const DEFAULT_OPENAI: &str = "gpt-5.4";
 const DEFAULT_GEMINI: &str = "gemini-3-flash-preview";
 

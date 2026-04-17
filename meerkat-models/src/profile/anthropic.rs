@@ -187,6 +187,7 @@ mod tests {
 
     #[test]
     fn claude_opus_detected() {
+        assert_eq!(detect_family("claude-opus-4-7"), Some("claude-opus-4"));
         assert_eq!(detect_family("claude-opus-4-6"), Some("claude-opus-4"));
         assert_eq!(detect_family("claude-opus-4-5"), Some("claude-opus-4"));
     }
@@ -205,7 +206,8 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_thinking_only_opus_46() {
+    fn adaptive_thinking_only_opus_46_and_47() {
+        assert!(supports_adaptive_thinking("claude-opus-4-7"));
         assert!(supports_adaptive_thinking("claude-opus-4-6"));
         assert!(!supports_adaptive_thinking("claude-sonnet-4-6"));
         assert!(!supports_adaptive_thinking("claude-opus-4-5"));
