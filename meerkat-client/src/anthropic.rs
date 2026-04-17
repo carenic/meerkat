@@ -105,6 +105,23 @@ impl AnthropicClientBuilder {
 }
 
 impl AnthropicClient {
+    /// Runtime override: force-enable temperature for this request even if the
+    /// model profile says unsupported. Useful for proxied or custom deployments.
+    pub(crate) const INTERNAL_SUPPORTS_TEMPERATURE: &'static str = "__meerkat_supports_temperature";
+
+    fn model_supports_temperature(model: &str) -> bool {
+        meerkat_models::profile::anthropic::supports_temperature(model)
+    }
+
+    fn request_supports_temperature(request: &LlmRequest) -> bool {
+        request
+            .provider_params
+            .as_ref()
+            .and_then(|params| params.get(Self::INTERNAL_SUPPORTS_TEMPERATURE))
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| Self::model_supports_temperature(&request.model))
+    }
+
     /// Create a new Anthropic client with the given API key and default HTTP settings
     pub fn new(api_key: String) -> Result<Self, LlmError> {
         AnthropicClientBuilder::new(api_key).build()
@@ -370,7 +387,8 @@ impl AnthropicClient {
             body["system"] = Value::String(system);
         }
 
-        if let Some(temp) = request.temperature
+        if Self::request_supports_temperature(request)
+            && let Some(temp) = request.temperature
             && let Some(num) = serde_json::Number::from_f64(temp as f64)
         {
             body["temperature"] = Value::Number(num);
@@ -1333,6 +1351,60 @@ mod tests {
         let thinking = &body["thinking"];
         assert_eq!(thinking["type"], "enabled");
         assert_eq!(thinking["budget_tokens"], 10000);
+        Ok(())
+    }
+
+    #[test]
+    fn test_request_omits_temperature_for_opus_47() -> Result<(), Box<dyn std::error::Error>> {
+        let client = AnthropicClient::new("test-key".to_string())?;
+        let request = LlmRequest::new(
+            "claude-opus-4-7",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_temperature(0.3);
+
+        let body = client.build_request_body(&request)?;
+        assert!(
+            body.get("temperature").is_none(),
+            "claude-opus-4-7 requests must not include temperature (API rejects non-default)",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_request_keeps_temperature_for_opus_46() -> Result<(), Box<dyn std::error::Error>> {
+        let client = AnthropicClient::new("test-key".to_string())?;
+        let request = LlmRequest::new(
+            "claude-opus-4-6",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_temperature(0.3);
+
+        let body = client.build_request_body(&request)?;
+        let temp = body
+            .get("temperature")
+            .and_then(Value::as_f64)
+            .expect("temperature should be present for opus 4.6");
+        assert!((temp - 0.3).abs() < 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn test_request_internal_flag_forces_temperature_on_opus_47()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let client = AnthropicClient::new("test-key".to_string())?;
+        let request = LlmRequest::new(
+            "claude-opus-4-7",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        )
+        .with_temperature(0.3)
+        .with_provider_param(AnthropicClient::INTERNAL_SUPPORTS_TEMPERATURE, true);
+
+        let body = client.build_request_body(&request)?;
+        assert!(
+            body.get("temperature").is_some(),
+            "internal override must force-include temperature",
+        );
         Ok(())
     }
 
