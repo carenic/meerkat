@@ -45,7 +45,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_legacy_penalties: true,
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
-        call_timeout_secs: 600,
+        call_timeout_secs: Some(600),
     },
     ModelCapabilities {
         id: "gpt-5.3-codex",
@@ -75,6 +75,6 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_legacy_penalties: true,
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
-        call_timeout_secs: 600,
+        call_timeout_secs: Some(600),
     },
 ];

@@ -102,7 +102,8 @@ pub struct ModelCapabilities {
 
     // ── Runtime ───────────────────────────────────────────────────────
     /// Authoritative default call timeout in seconds for this model.
-    pub call_timeout_secs: u64,
+    /// `None` means the model has no profiled default (unknown family).
+    pub call_timeout_secs: Option<u64>,
 }
 
 /// A capability value that is only available when a specific beta header is set.

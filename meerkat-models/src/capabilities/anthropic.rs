@@ -76,7 +76,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_legacy_penalties: false,
         supports_thinking_budget_legacy: true,
         beta_headers: OPUS_46_BETAS,
-        call_timeout_secs: 300,
+        call_timeout_secs: Some(300),
     },
     // Opus 4.6 — opus46 schema bucket.
     ModelCapabilities {
@@ -105,7 +105,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_legacy_penalties: false,
         supports_thinking_budget_legacy: true,
         beta_headers: OPUS_46_BETAS,
-        call_timeout_secs: 300,
+        call_timeout_secs: Some(300),
     },
     // Sonnet 4.6 — standard schema bucket today.
     ModelCapabilities {
@@ -134,7 +134,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_legacy_penalties: false,
         supports_thinking_budget_legacy: true,
         beta_headers: STANDARD_BETAS,
-        call_timeout_secs: 120,
+        call_timeout_secs: Some(120),
     },
     // Sonnet 4.5 — standard schema bucket.
     ModelCapabilities {
@@ -163,7 +163,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_legacy_penalties: false,
         supports_thinking_budget_legacy: true,
         beta_headers: STANDARD_BETAS,
-        call_timeout_secs: 120,
+        call_timeout_secs: Some(120),
     },
     // Opus 4.5 — standard schema bucket (but real docs say effort IS supported;
     // correctness fix lands later).
@@ -193,6 +193,6 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_legacy_penalties: false,
         supports_thinking_budget_legacy: true,
         beta_headers: STANDARD_BETAS,
-        call_timeout_secs: 300,
+        call_timeout_secs: Some(300),
     },
 ];

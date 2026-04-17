@@ -35,7 +35,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_legacy_penalties: false,
         supports_thinking_budget_legacy: true,
         beta_headers: &[],
-        call_timeout_secs: 120,
+        call_timeout_secs: Some(120),
     },
     ModelCapabilities {
         id: "gemini-3.1-pro-preview",
@@ -63,7 +63,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_legacy_penalties: false,
         supports_thinking_budget_legacy: true,
         beta_headers: &[],
-        call_timeout_secs: 600,
+        call_timeout_secs: Some(600),
     },
     ModelCapabilities {
         id: "gemini-3.1-flash-lite-preview",
@@ -91,6 +91,6 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_legacy_penalties: false,
         supports_thinking_budget_legacy: true,
         beta_headers: &[],
-        call_timeout_secs: 120,
+        call_timeout_secs: Some(120),
     },
 ];
