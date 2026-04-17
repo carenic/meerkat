@@ -37,6 +37,17 @@ pub mod gemini;
 pub mod providers;
 pub mod runtime;
 
+// === Token storage + refresh coordination + OAuth helpers (Phase 4a) ===
+// Non-wasm by construction: filesystem, keyring, and OS lockfile primitives
+// are not available in the browser. WASM-facing auth uses the external
+// resolver seam (Phase 4d.wasm).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod auth_oauth;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod auth_store;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod authorizers;
+
 pub use adapter::LlmClientAdapter;
 pub use block_assembler::{BlockAssembler, BlockKey, StreamAssemblyError};
 pub use error::LlmError;
