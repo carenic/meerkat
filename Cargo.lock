@@ -2639,12 +2639,14 @@ name = "meerkat-integration-tests"
 version = "0.5.2"
 dependencies = [
  "async-trait",
+ "futures",
  "meerkat",
  "meerkat-client",
  "meerkat-core",
  "meerkat-machine-kernels",
  "meerkat-mob",
  "meerkat-mob-mcp",
+ "meerkat-models",
  "meerkat-rpc",
  "meerkat-runtime",
  "meerkat-session",
