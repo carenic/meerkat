@@ -70,7 +70,7 @@ impl std::fmt::Debug for ValidatedBinding {
     }
 }
 
-// Plan §6.11 deleted the `ShimCredential` enum. Credential material
+// Plan §6.11 deleted the legacy marker enum. Credential material
 // lives in the `auth_lease` directly: `StaticHeaders` with a
 // `__secret__` entry for simple-secret flows, `DynamicAuthorizer` for
 // authorizer-backed flows. `build_client` reads
@@ -148,12 +148,6 @@ impl StaticLease {
             expires_at,
             source_label: source_label.into(),
         }
-    }
-
-    /// Empty-header variant — used by Phase 2 resolvers that don't yet
-    /// project real wire headers.
-    pub fn empty(metadata: AuthMetadata, source_label: impl Into<String>) -> Self {
-        Self::new(Vec::new(), metadata, None, source_label)
     }
 }
 
@@ -241,8 +235,12 @@ mod tests {
 
     #[tokio::test]
     async fn static_lease_satisfies_trait() {
-        let lease: Arc<dyn AuthLease> =
-            Arc::new(StaticLease::empty(AuthMetadata::default(), "test"));
+        let lease: Arc<dyn AuthLease> = Arc::new(StaticLease::new(
+            Vec::new(),
+            AuthMetadata::default(),
+            None,
+            "test",
+        ));
         assert!(matches!(lease.kind(), ResolvedAuthKind::StaticHeaders(_)));
         assert_eq!(lease.source_label(), "test");
         assert!(lease.refresh(AuthRefreshReason::Manual).await.is_ok());

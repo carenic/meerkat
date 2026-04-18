@@ -250,7 +250,7 @@ impl ProviderRuntime for OpenAiProviderRuntime {
                 None,
                 source_label,
             )),
-            None => Arc::new(StaticLease::empty(metadata, source_label)),
+            None => Arc::new(StaticLease::new(Vec::new(), metadata, None, source_label)),
         };
 
         Ok(ResolvedConnection {
@@ -279,7 +279,7 @@ impl ProviderRuntime for OpenAiProviderRuntime {
         // request uses HttpAuthorizer::authorize for headers rather
         // than Authorization: Bearer <api_key>. Plan §6.11: read the
         // authorizer from the auth lease directly instead of the
-        // (deleted ShimCredential side channel).
+        // (deleted side channel).
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(authorizer) = connection.resolved_authorizer() {
             let base_url = connection

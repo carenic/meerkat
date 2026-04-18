@@ -242,7 +242,12 @@ impl ProviderRuntime for AnthropicProviderRuntime {
                 None,
                 source_label,
             )),
-            None => Arc::new(StaticLease::empty(AuthMetadata::default(), source_label)),
+            None => Arc::new(StaticLease::new(
+                Vec::new(),
+                AuthMetadata::default(),
+                None,
+                source_label,
+            )),
         };
 
         Ok(ResolvedConnection {
