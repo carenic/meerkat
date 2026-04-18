@@ -143,6 +143,25 @@ impl ProviderRuntime for AnthropicProviderRuntime {
             }
         };
 
+        // Plan §4b.12: metadata carried on the lease. Populated below
+        // when the ClaudeAiOauth / OauthToApiKey path finds an id_token
+        // with user:profile claims.
+        #[cfg_attr(
+            not(all(not(target_arch = "wasm32"), feature = "oauth")),
+            allow(unused_mut)
+        )]
+        let mut anthropic_email: Option<String> = None;
+        #[cfg_attr(
+            not(all(not(target_arch = "wasm32"), feature = "oauth")),
+            allow(unused_mut)
+        )]
+        let mut anthropic_user_id: Option<String> = None;
+        #[cfg_attr(
+            not(all(not(target_arch = "wasm32"), feature = "oauth")),
+            allow(unused_mut)
+        )]
+        let mut anthropic_subscription_tier: Option<String> = None;
+
         // Plan §6.11: Option<String> for secret material; None for
         // authorizer-backed paths (build_client constructs the concrete
         // HttpAuthorizer for AWS SigV4 / Google / Azure AD at build time).
@@ -181,6 +200,15 @@ impl ProviderRuntime for AnthropicProviderRuntime {
                         .await
                         .map_err(|e| ProviderAuthError::SourceResolutionFailed(e.to_string()))?
                         .ok_or(ProviderAuthError::Auth(AuthError::InteractiveLoginRequired))?;
+                    // Plan §4b.12: lift id_token claims.
+                    if let Some(id_token) = persisted.id_token.as_deref()
+                        && let Ok(claims) = crate::auth_oauth::jwt::decode_payload(id_token)
+                    {
+                        let lifted = oauth::AnthropicIdClaims::lift_from_claims(&claims.raw);
+                        anthropic_email = lifted.email;
+                        anthropic_user_id = lifted.user_id;
+                        anthropic_subscription_tier = lifted.subscription_tier;
+                    }
 
                     let secret = match auth_method {
                         AnthropicAuthMethod::OauthToApiKey => persisted
@@ -232,14 +260,34 @@ impl ProviderRuntime for AnthropicProviderRuntime {
             }
         };
 
-        // Plan §6.11: populate the lease with resolved secret as a
-        // typed InlineSecret variant, or an empty lease for authorizer
-        // paths (build_client constructs AWS SigV4 / GoogleAuth / AzureAd).
+        // Plan §6.11 + §4b.12: populate the lease with resolved secret
+        // as a typed InlineSecret variant, or an empty lease for
+        // authorizer paths. Attach id_token-lifted claims as
+        // `ProviderAuthMetadata::Anthropic`.
+        let mut metadata = AuthMetadata::default();
+        if anthropic_email.is_some()
+            || anthropic_user_id.is_some()
+            || anthropic_subscription_tier.is_some()
+        {
+            metadata.account_id = anthropic_user_id
+                .clone()
+                .or_else(|| anthropic_email.clone());
+            metadata.plan = anthropic_subscription_tier.clone();
+            metadata.provider_metadata = Some(meerkat_core::ProviderAuthMetadata::Anthropic(
+                meerkat_core::AnthropicAuthMetadata {
+                    subscription_tier: anthropic_subscription_tier,
+                    aws_region: None,
+                    vertex_project_id: None,
+                    vertex_region: None,
+                    foundry_deployment: None,
+                },
+            ));
+        }
         let source_label = format!("anthropic:{}", binding.auth_profile.id);
         let lease: Arc<dyn meerkat_core::AuthLease> = match secret_opt {
             Some(secret) => Arc::new(StaticLease::inline_secret(
                 secret,
-                AuthMetadata::default(),
+                metadata,
                 None,
                 source_label,
             )),

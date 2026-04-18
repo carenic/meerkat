@@ -122,6 +122,41 @@ pub enum AnthropicOAuthError {
 
 /// Per-binding Anthropic OAuth runtime. Holds the token store, refresh
 /// coordinator, and OAuth endpoint config for one `(realm, binding)` pair.
+/// Anthropic OIDC id_token claims lifted out of the Claude.ai OAuth
+/// flow. Claude Code's `user:profile` scope surfaces the signed-in
+/// user's email + subscription tier via the id_token when issued.
+/// Not every Claude.ai response returns an id_token — callers handle
+/// `Default::default()`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AnthropicIdClaims {
+    pub email: Option<String>,
+    pub user_id: Option<String>,
+    /// Claude.ai subscription tier when surfaced ("free" / "pro" /
+    /// "max" / "team"). Provider-specific non-OIDC claim.
+    pub subscription_tier: Option<String>,
+}
+
+impl AnthropicIdClaims {
+    pub fn lift_from_claims(raw: &serde_json::Value) -> Self {
+        fn get_str(v: &serde_json::Value, key: &str) -> Option<String> {
+            v.get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        }
+        Self {
+            email: get_str(raw, "email"),
+            user_id: get_str(raw, "sub"),
+            // Anthropic emits subscription tier under multiple key
+            // variants across claim versions. We probe the two most
+            // common shapes — absent → None is fine, the field is
+            // optional in AnthropicAuthMetadata.
+            subscription_tier: get_str(raw, "subscription_tier")
+                .or_else(|| get_str(raw, "claude_ai_subscription"))
+                .or_else(|| get_str(raw, "plan_type")),
+        }
+    }
+}
+
 pub struct AnthropicOAuthRuntime {
     http: reqwest::Client,
     token_store: Arc<dyn TokenStore>,

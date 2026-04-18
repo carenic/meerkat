@@ -101,6 +101,35 @@ pub enum GoogleCodeAssistOAuthError {
 // Runtime
 // ---------------------------------------------------------------------
 
+/// Google OIDC id_token claims lifted out of the Code Assist OAuth
+/// flow. The flow requests `userinfo.email` + `userinfo.profile`
+/// scopes, so the id_token carries the standard OIDC claims.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GoogleIdClaims {
+    /// OIDC `email` claim (the signed-in user's address).
+    pub email: Option<String>,
+    /// OIDC `sub` claim (stable Google account ID).
+    pub user_id: Option<String>,
+    /// OIDC `hd` (hosted-domain) claim for Google Workspace accounts.
+    pub hosted_domain: Option<String>,
+}
+
+impl GoogleIdClaims {
+    /// Lift standard OIDC claims from a decoded JWT payload value.
+    pub fn lift_from_claims(raw: &serde_json::Value) -> Self {
+        fn get_str(v: &serde_json::Value, key: &str) -> Option<String> {
+            v.get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        }
+        Self {
+            email: get_str(raw, "email"),
+            user_id: get_str(raw, "sub"),
+            hosted_domain: get_str(raw, "hd"),
+        }
+    }
+}
+
 pub struct GoogleCodeAssistOAuthRuntime {
     http: reqwest::Client,
     token_store: Arc<dyn TokenStore>,

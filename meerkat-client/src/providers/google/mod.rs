@@ -114,6 +114,20 @@ impl ProviderRuntime for GoogleProviderRuntime {
             }
         };
 
+        // Plan §4b.12: Google metadata carried on the lease. Populated
+        // below when the GoogleOauth path finds an id_token with
+        // standard OIDC claims.
+        #[cfg_attr(
+            not(all(not(target_arch = "wasm32"), feature = "oauth")),
+            allow(unused_mut)
+        )]
+        let mut google_email: Option<String> = None;
+        #[cfg_attr(
+            not(all(not(target_arch = "wasm32"), feature = "oauth")),
+            allow(unused_mut)
+        )]
+        let mut google_user_id: Option<String> = None;
+
         // Plan §6.11: Option<String> for secret material; None for
         // authorizer-backed paths (Adc / ComputeAdc / ExternalAuthorizer).
         let secret_opt: Option<String> = match auth_method {
@@ -148,6 +162,14 @@ impl ProviderRuntime for GoogleProviderRuntime {
                         .await
                         .map_err(|e| ProviderAuthError::SourceResolutionFailed(e.to_string()))?
                         .ok_or(ProviderAuthError::Auth(AuthError::InteractiveLoginRequired))?;
+                    // Plan §4b.12: lift OIDC claims into AuthMetadata.
+                    if let Some(id_token) = persisted.id_token.as_deref()
+                        && let Ok(claims) = crate::auth_oauth::jwt::decode_payload(id_token)
+                    {
+                        let lifted = oauth::GoogleIdClaims::lift_from_claims(&claims.raw);
+                        google_email = lifted.email;
+                        google_user_id = lifted.user_id;
+                    }
                     use chrono::{Duration, Utc};
                     let fresh = persisted
                         .expires_at
@@ -188,14 +210,27 @@ impl ProviderRuntime for GoogleProviderRuntime {
             }
         };
 
-        // Plan §6.11: populate the lease with resolved secret as a
-        // typed InlineSecret variant, or an empty lease for authorizer
-        // paths (build_client constructs ADC / Compute / OAuth flows).
+        // Plan §6.11 + §4b.12: populate the lease with resolved secret
+        // as a typed InlineSecret variant, or an empty lease for
+        // authorizer paths. Attach any OIDC claims lifted from the
+        // Code Assist id_token as `ProviderAuthMetadata::Google`.
+        let mut metadata = AuthMetadata::default();
+        if google_email.is_some() || google_user_id.is_some() {
+            metadata.account_id = google_user_id.clone().or_else(|| google_email.clone());
+            metadata.provider_metadata = Some(meerkat_core::ProviderAuthMetadata::Google(
+                meerkat_core::GoogleAuthMetadata {
+                    account_email: google_email,
+                    project_id: None,
+                    region: None,
+                    code_assist_tier: None,
+                },
+            ));
+        }
         let source_label = format!("google:{}", binding.auth_profile.id);
         let lease: Arc<dyn meerkat_core::AuthLease> = match secret_opt {
             Some(secret) => Arc::new(StaticLease::inline_secret(
                 secret,
-                AuthMetadata::default(),
+                metadata,
                 None,
                 source_label,
             )),
