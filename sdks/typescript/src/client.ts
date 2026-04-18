@@ -1728,6 +1728,18 @@ export class MeerkatClient {
     return this.request("auth/login/device_start", params);
   }
 
+  async authLoginDeviceComplete(
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    return this.request("auth/login/device_complete", params);
+  }
+
+  async authLoginProvisionApiKey(
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    return this.request("auth/login/provision_api_key", params);
+  }
+
   async authStatusGet(realmId: string, profileId: string): Promise<unknown> {
     return this.request("auth/status/get", {
       realm_id: realmId,
