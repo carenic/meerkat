@@ -277,7 +277,7 @@ impl ProviderRuntime for AnthropicProviderRuntime {
         // SigV4 / Vertex GoogleAuth / Foundry AzureAd /
         // ExternalAuthorizer-DynamicAuthorizer); resolved_secret()
         // returns Some when the lease is a StaticHeaders with the
-        // `__secret__` synthetic key (api_key / static_bearer /
+        // the resolved inline secret (api_key / static_bearer /
         // oauth_to_api_key / bedrock_bearer / pre-resolved Bearer).
         let authorizer_opt = connection.resolved_authorizer();
         let secret_opt = connection.resolved_secret();
@@ -371,7 +371,7 @@ impl ProviderRuntime for AnthropicProviderRuntime {
                 "bedrock-backend not available on wasm32",
             )),
             // Vertex with a pre-resolved bearer secret (ExternalAuthorizer
-            // producing a StaticHeaders envelope with __secret__).
+            // producing an InlineSecret envelope).
             #[cfg(not(target_arch = "wasm32"))]
             AnthropicBackendKind::Vertex => {
                 let base_url = connection

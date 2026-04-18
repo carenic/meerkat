@@ -72,7 +72,7 @@ fn refresh_path_terminates_in_reauth_required_on_permanent_failure() {
     assert_eq!(
         handle.snapshot(key).state.as_deref(),
         Some("reauth_required"),
-        "permanent refresh failure must land in reauth_required (emits EmitAuthReauthNotice effect)"
+        "permanent refresh failure must land in reauth_required (runner snapshot-polls this state to emit a session notice; dogma §1/§19: the DSL state is the sole canonical truth, no redundant effect emission)"
     );
 }
 

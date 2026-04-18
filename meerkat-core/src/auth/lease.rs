@@ -77,6 +77,18 @@ impl std::fmt::Debug for ResolvedAuthKind {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResolvedAuthEnvelope {
+    /// A pre-resolved raw secret (api key, bearer token, OAuth access
+    /// token). Plan §6.11 + dogma §5 closure: replaces the legacy
+    /// `StaticHeaders` with a synthetic `"__secret__"` header-key
+    /// convention. External resolvers that produce simple secrets
+    /// should use this variant.
+    InlineSecret {
+        secret: String,
+        metadata: AuthMetadata,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+        expires_at: Option<DateTime<Utc>>,
+    },
     StaticHeaders {
         headers: Vec<(String, String)>,
         metadata: AuthMetadata,

@@ -1,11 +1,11 @@
 //! Shared resolver helpers used by provider runtimes.
 //!
 //! Plan §6.11 closure: resolvers return credential material directly
-//! (a `String` secret or a resolved `Arc<dyn HttpAuthorizer>` via the
-//! external-resolver envelope's `__secret__` convention) instead of the
-//! plan §6.11 deletion. Simple-secret paths cover
-//! `InlineSecret` / `Env` / `ExternalResolver` (with `"__secret__"` key)
-//! for `api_key` / `static_bearer` auth methods. The external-authorizer
+//! (a `String` secret). Simple-secret paths cover `InlineSecret` /
+//! `Env` / `ExternalResolver` (via the typed
+//! `ResolvedAuthEnvelope::InlineSecret` variant — dogma §5 closure
+//! replaced the `"__secret__"` synthetic-header-key convention) for
+//! `api_key` / `static_bearer` auth methods. The external-authorizer
 //! resolver surfaces upstream AuthError by calling the resolver handle
 //! but the real `Arc<dyn HttpAuthorizer>` is constructed by the
 //! provider runtime at build time (cloud-specific clients depend on
@@ -18,8 +18,8 @@ use crate::runtime::registry::ResolverEnvironment;
 
 /// Resolve a [`CredentialSourceSpec`] into a single secret string. Used
 /// by api_key / static_bearer auth methods. Returns the resolved secret
-/// directly; the provider runtime wraps it in a `StaticLease` with the
-/// `__secret__` synthetic header for transport to `build_client`.
+/// directly; the provider runtime wraps it via
+/// `StaticLease::inline_secret` for transport to `build_client`.
 pub async fn resolve_simple_secret(
     source: &CredentialSourceSpec,
     env: &ResolverEnvironment,
@@ -97,23 +97,29 @@ pub async fn resolve_external_authorizer(
     Ok(())
 }
 
-/// Extract a simple secret from a `StaticHeaders` envelope using the
-/// `"__secret__"` synthetic header convention. Errors on any other
-/// envelope shape.
+/// Extract a simple secret from a resolved envelope. Dogma §5:
+/// `ResolvedAuthEnvelope::InlineSecret` is the typed canonical
+/// variant. The legacy `StaticHeaders` shape is still accepted
+/// transitively — a single header maps to the secret — but external
+/// resolvers should produce the typed variant directly.
 fn extract_secret_from_envelope(
     envelope: ResolvedAuthEnvelope,
 ) -> Result<String, ProviderAuthError> {
     match envelope {
-        ResolvedAuthEnvelope::StaticHeaders { headers, .. } => headers
-            .into_iter()
-            .find_map(|(k, v)| if k == "__secret__" { Some(v) } else { None })
-            .ok_or_else(|| {
-                ProviderAuthError::SourceResolutionFailed(
-                    "external resolver produced StaticHeaders without a '__secret__' key; \
-                     api_key/static_bearer path cannot extract credential material"
+        ResolvedAuthEnvelope::InlineSecret { secret, .. } => Ok(secret),
+        ResolvedAuthEnvelope::StaticHeaders { headers, .. } => {
+            if let [(_, value)] = headers.as_slice() {
+                Ok(value.clone())
+            } else {
+                Err(ProviderAuthError::SourceResolutionFailed(
+                    "external resolver returned StaticHeaders with \
+                     multiple entries; api_key/static_bearer path \
+                     requires InlineSecret or a single-entry \
+                     StaticHeaders envelope"
                         .into(),
-                )
-            }),
+                ))
+            }
+        }
         ResolvedAuthEnvelope::DynamicAuthorizer { .. } => {
             Err(ProviderAuthError::SourceResolutionFailed(
                 "external resolver returned DynamicAuthorizer envelope; \
@@ -131,9 +137,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_secret_happy_path() {
-        let env = ResolvedAuthEnvelope::StaticHeaders {
-            headers: vec![("__secret__".into(), "sk-x".into())],
+    fn extract_secret_inline_variant() {
+        let env = ResolvedAuthEnvelope::InlineSecret {
+            secret: "sk-x".into(),
             metadata: Default::default(),
             expires_at: None,
         };
@@ -141,9 +147,27 @@ mod tests {
     }
 
     #[test]
-    fn extract_secret_missing_key_errors() {
+    fn extract_secret_single_header_legacy() {
+        // Back-compat: a single-header StaticHeaders envelope is still
+        // accepted. Multi-header envelopes (which previously carried
+        // the `__secret__` key alongside other wire headers) are an
+        // error — external resolvers should use the typed InlineSecret
+        // variant.
         let env = ResolvedAuthEnvelope::StaticHeaders {
-            headers: vec![("Authorization".into(), "Bearer x".into())],
+            headers: vec![("Authorization".into(), "Bearer sk-y".into())],
+            metadata: Default::default(),
+            expires_at: None,
+        };
+        assert_eq!(extract_secret_from_envelope(env).unwrap(), "Bearer sk-y");
+    }
+
+    #[test]
+    fn extract_secret_multi_header_errors() {
+        let env = ResolvedAuthEnvelope::StaticHeaders {
+            headers: vec![
+                ("Authorization".into(), "Bearer x".into()),
+                ("X-Provider-Id".into(), "acct".into()),
+            ],
             metadata: Default::default(),
             expires_at: None,
         };

@@ -124,7 +124,7 @@ impl ProviderRuntime for OpenAiProviderRuntime {
         let mut chatgpt_plan_type: Option<String> = None;
 
         // Plan §6.11: resolve credential material to Option<String>.
-        // `Some(secret)` lands in the lease as a __secret__ header.
+        // `Some(secret)` lands in the lease as a typed InlineSecret lease.
         // `None` means authorizer-backed (ExternalAuthorizer on non-wasm)
         // — the lease stays empty and build_client emits a typed error
         // when no DynamicLease path is available.
@@ -294,7 +294,7 @@ impl ProviderRuntime for OpenAiProviderRuntime {
                     .with_authorizer(authorizer);
             return Ok(Arc::new(client));
         }
-        // No __secret__ header and no DynamicAuthorizer kind: the
+        // No inline secret and no DynamicAuthorizer kind: the
         // lease was constructed empty. Surface as missing credential
         // material (or MissingFeature on wasm32 where authorizers
         // don't compile) so surfaces get a typed error.
