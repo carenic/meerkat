@@ -112,7 +112,15 @@ fn phase6_deletions() -> Vec<(&'static str, &'static str)> {
             "ShimCredential",
             "meerkat-client::runtime::binding::ShimCredential (plan §6.11)",
         ),
-        ("StaticLease::empty", "StaticLease::empty (plan §6.11)"),
+        // The needle "StaticLease::empty(" (with open paren) matches the
+        // deleted `StaticLease::empty()` constructor but not the
+        // task #24 replacement `StaticLease::empty_lease(...)` (which
+        // constructs a lease with ResolvedAuthKind::None for
+        // authorizer-backed paths).
+        (
+            "StaticLease::empty(",
+            "StaticLease::empty(...) (plan §6.11)",
+        ),
         (
             "ProviderConfig::Anthropic",
             "ProviderConfig::Anthropic (plan §6.9)",
