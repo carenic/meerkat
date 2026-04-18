@@ -23,6 +23,7 @@ ENTRIES=(
   "meerkat-core=${ROOT}/meerkat-core"
   "meerkat-schedule=${ROOT}/meerkat-schedule"
   "meerkat-client=${ROOT}/meerkat-client"
+  "meerkat-providers=${ROOT}/meerkat-providers"
   "meerkat-store=${ROOT}/meerkat-store"
   "meerkat-tools=${ROOT}/meerkat-tools"
   "meerkat-runtime=${ROOT}/meerkat-runtime"

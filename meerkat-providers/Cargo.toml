@@ -61,6 +61,9 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
+schemars = { workspace = true }
+axum = { workspace = true }
+meerkat-models = { workspace = true }
 
 [features]
 default = ["anthropic", "openai", "gemini"]
