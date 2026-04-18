@@ -1208,9 +1208,43 @@ impl AgentFactory {
         if matches!(identity.provider, Provider::SelfHosted) {
             return self.build_self_hosted_client_for_identity(&registry, identity);
         }
-        let (api_key, base_url) = self.resolve_provider_credentials(identity.provider, config);
-        self.build_llm_client(identity.provider, api_key, base_url)
+
+        // Phase 6 hot-swap routing: compose a synthetic RealmConnection-
+        // Set from the Config + env (same precedence as build_agent's
+        // env-fallback path: ProviderConfig > providers.api_keys > env)
+        // and resolve through ProviderRuntimeRegistry. Test-mode shim
+        // honored identically to build_agent so hot-swap never needs
+        // real credentials under RKAT_TEST_CLIENT=1.
+        if std::env::var("RKAT_TEST_CLIENT").ok().as_deref() == Some("1") {
+            return Ok(Arc::new(meerkat_client::TestClient::default()));
+        }
+        let (inline, _base_url) = self.resolve_provider_credentials(identity.provider, config);
+        let realm = match inline {
+            Some(secret) => meerkat_core::RealmConnectionSet::synthesize_inline_default(
+                identity.provider,
+                secret,
+            ),
+            None => meerkat_core::RealmConnectionSet::synthesize_env_default(identity.provider),
+        };
+        #[allow(unused_mut)]
+        let mut env = meerkat_client::ResolverEnvironment::with_process_env();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(store) = self.token_store.clone() {
+                env = env.with_token_store(store);
+            }
+            if let Some(coord) = self.refresh_coord.clone() {
+                env = env.with_refresh_coordinator(coord);
+            }
+        }
+        let provider_registry = meerkat_client::ProviderRuntimeRegistry::default();
+        let connection = provider_registry
+            .resolve(&realm, "default", &env)
             .await
+            .map_err(|e| FactoryError::ClientCreationFailed(e.to_string()))?;
+        provider_registry
+            .build_client(connection)
+            .map_err(|e| FactoryError::ClientCreationFailed(e.to_string()))
     }
 
     fn model_registry(&self, config: &Config) -> Result<ModelRegistry, BuildAgentError> {
