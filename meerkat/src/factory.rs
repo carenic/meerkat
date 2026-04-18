@@ -669,17 +669,48 @@ pub fn provider_key(provider: Provider) -> &'static str {
 /// Dogma §1: one canonical owner for "env-var credential fallback" —
 /// this projection — instead of a helper in the factory body.
 fn synthesize_realm_from_config(
-    _config: &Config,
+    config: &Config,
     provider: Provider,
 ) -> meerkat_core::RealmConnectionSet {
+    // Alias kept so internal access names are stable through the §6.9/§6.10
+    // cut without touching the whole body.
+    let _config = config;
     // Plan §6.9 + §6.10 deleted the legacy `config.provider` enum and
-    // the `providers.{api_keys,base_urls}` shared maps. The only
-    // remaining precedence layer for connection_ref-less builds is
-    // env vars (RKAT_*-prefixed overrides + native `<P>_API_KEY`).
-    // Surfaces that previously populated the deleted shared map now
-    // build a `[realm.<id>]` config via
-    // `RealmConfigSection::from_inline_api_keys` and pass
-    // `connection_ref: Some(...)` through AgentBuildConfig instead.
+    // the `providers.{api_keys,base_urls}` shared maps. Precedence for
+    // connection_ref-less builds is:
+    //   1. Config.realm: if the user has a `[realm.default]` block
+    //      containing a binding for this provider, reuse it so users
+    //      don't need to also pass connection_ref when the realm maps
+    //      one-to-one onto the inferred provider.
+    //   2. env vars (RKAT_*-prefixed overrides + native `<P>_API_KEY`).
+    // Surfaces with multi-binding realms should pass connection_ref
+    // explicitly through AgentBuildConfig.
+
+    // Layer 1: realm config match. If any realm has a binding whose
+    // backend_profile provider matches, promote it to the synthesized
+    // realm for this resolution. Preserves "realm-populates-creds"
+    // behavior WASM and multi-provider factories depend on.
+    let realm_match = _config.realm.iter().find_map(|(realm_id, section)| {
+        let provider_str = provider.as_str();
+        for (binding_id, binding) in &section.binding {
+            if let Some(backend) = section.backend.get(&binding.backend_profile)
+                && backend.provider == provider_str
+            {
+                return Some((realm_id.clone(), binding_id.clone(), section));
+            }
+        }
+        None
+    });
+    if let Some((realm_id, binding_id, section)) = realm_match
+        && let Ok(mut set) = meerkat_core::RealmConnectionSet::from_config(&realm_id, section)
+    {
+        // Re-target default_binding so downstream code uses the
+        // matched binding even when the user's section had a
+        // different default.
+        set.default_binding = Some(binding_id);
+        return set;
+    }
+
     let mut api_key: Option<String> = None;
 
     if api_key.is_none() {
@@ -1742,7 +1773,11 @@ impl AgentFactory {
                                 // helper in this factory body owns the
                                 // decision (dogma §1, plan §6.1).
                                 let realm = synthesize_realm_from_config(config, provider);
-                                (realm, "default".to_string())
+                                let binding_id = realm
+                                    .default_binding
+                                    .clone()
+                                    .unwrap_or_else(|| "default".to_string());
+                                (realm, binding_id)
                             }
                         };
 
