@@ -1742,20 +1742,13 @@ impl AgentFactory {
                                 (realm, conn_ref.binding_id.clone())
                             }
                             None => {
-                                // Three equivalent legacy paths, all
-                                // routed through the same registry:
-                                //   (a) (deleted in plan §6.10)
-                                //   (b) `config.provider` enum with
-                                //       provider-specific api_key
-                                //       (ProviderConfig::{Anthropic,
-                                //        OpenAI, Gemini} legacy block).
-                                //   (c) env var ANTHROPIC_API_KEY etc.
-                                // (a) and (b) synthesize with InlineSecret,
-                                // (c) synthesizes with Env source.
-                                // Precedence is encapsulated in
-                                // synthesize_realm_from_config so no
-                                // helper in this factory body owns the
-                                // decision (dogma §1, plan §6.1).
+                                // Env-default fallback (plan §6.4 revised
+                                // 2026-04-18): no connection_ref, no realm
+                                // preconfigured → synthesize a realm with
+                                // `CredentialSourceSpec::Env` and route
+                                // through the same registry. Dogma §5
+                                // compliant: env reads go through the
+                                // resolver's env_lookup, not this caller.
                                 let realm = synthesize_realm_from_config(config, provider);
                                 let binding_id = realm
                                     .default_binding

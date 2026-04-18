@@ -219,10 +219,7 @@ fn default_max_tokens() -> u32 {
 
 #[derive(Debug, Deserialize)]
 struct Credentials {
-    /// Backward-compat single key (treated as anthropic fallback).
-    #[serde(default)]
-    api_key: Option<String>,
-    /// Per-provider API keys — preferred over `api_key`.
+    /// Per-provider API keys. At least one must be set.
     #[serde(default)]
     anthropic_api_key: Option<String>,
     #[serde(default)]
@@ -231,10 +228,7 @@ struct Credentials {
     gemini_api_key: Option<String>,
     #[serde(default = "default_model")]
     model: Option<String>,
-    /// Backward-compat single base URL — mapped to the default model's provider.
-    #[serde(default)]
-    base_url: Option<String>,
-    /// Per-provider base URLs — take precedence over `base_url`.
+    /// Per-provider base URLs. Unset providers default to the upstream vendor URL.
     #[serde(default)]
     anthropic_base_url: Option<String>,
     #[serde(default)]
@@ -253,10 +247,7 @@ fn default_model() -> Option<String> {
 
 #[derive(Debug, Deserialize)]
 struct RuntimeConfig {
-    /// Backward-compat single key (treated as anthropic fallback).
-    #[serde(default)]
-    api_key: Option<String>,
-    /// Per-provider API keys — preferred over `api_key`.
+    /// Per-provider API keys. At least one must be set.
     #[serde(default)]
     anthropic_api_key: Option<String>,
     #[serde(default)]
@@ -265,10 +256,7 @@ struct RuntimeConfig {
     gemini_api_key: Option<String>,
     #[serde(default = "default_model")]
     model: Option<String>,
-    /// Backward-compat single base URL — mapped to the default model's provider.
-    #[serde(default)]
-    base_url: Option<String>,
-    /// Per-provider base URLs — take precedence over `base_url`.
+    /// Per-provider base URLs. Unset providers default to the upstream vendor URL.
     #[serde(default)]
     anthropic_base_url: Option<String>,
     #[serde(default)]
@@ -360,11 +348,10 @@ fn populate_realm_from_api_keys(
 /// Resolve per-provider API keys into a map consumed by
 /// [`populate_realm_from_api_keys`].
 ///
-/// `api_key` is the backward-compat single key (treated as anthropic fallback).
-/// Per-provider fields take precedence when set. Empty/whitespace-only keys are
-/// treated as missing so callers get a fast failure instead of a deferred auth error.
+/// Empty/whitespace-only keys are treated as missing so callers get a fast failure
+/// instead of a deferred auth error. Plan §6 dogma §5: typed per-provider fields
+/// only — no bare `api_key` folklore that means "anthropic by convention".
 fn build_provider_api_keys(
-    api_key: Option<&str>,
     anthropic_api_key: Option<&str>,
     openai_api_key: Option<&str>,
     gemini_api_key: Option<&str>,
@@ -378,9 +365,7 @@ fn build_provider_api_keys(
     }
 
     let mut keys = HashMap::new();
-    // Per-provider keys take precedence; api_key is anthropic fallback.
-    let anthropic = non_blank(anthropic_api_key).or(non_blank(api_key));
-    if let Some(k) = anthropic {
+    if let Some(k) = non_blank(anthropic_api_key) {
         keys.insert("anthropic".into(), k.to_string());
     }
     if let Some(k) = non_blank(openai_api_key) {
@@ -392,7 +377,7 @@ fn build_provider_api_keys(
     if keys.is_empty() {
         return Err(err_js(
             "invalid_config",
-            "at least one API key must be provided (api_key, anthropic_api_key, openai_api_key, or gemini_api_key)",
+            "at least one API key must be provided (anthropic_api_key, openai_api_key, or gemini_api_key)",
         ));
     }
     Ok(keys)
@@ -401,15 +386,12 @@ fn build_provider_api_keys(
 /// Resolve per-provider base URLs into a map keyed by provider name
 /// that `populate_realm_from_api_keys` applies to the backend profiles.
 ///
-/// Per-provider fields (`anthropic_base_url`, etc.) take precedence. The
-/// backward-compat single `base_url` is mapped to the default model's inferred
-/// provider as a fallback.
+/// Plan §6 dogma §5: typed per-provider fields only — no bare `base_url`
+/// folklore that maps to "whichever provider the default model infers to".
 fn build_provider_base_urls(
-    base_url: Option<&str>,
     anthropic_base_url: Option<&str>,
     openai_base_url: Option<&str>,
     gemini_base_url: Option<&str>,
-    model: &str,
 ) -> Option<HashMap<String, String>> {
     fn non_blank(s: Option<&str>) -> Option<&str> {
         match s {
@@ -428,24 +410,7 @@ fn build_provider_base_urls(
     if let Some(url) = non_blank(gemini_base_url) {
         urls.insert("gemini".into(), url.to_string());
     }
-    // Backward-compat: single base_url maps to the default model's provider,
-    // but only if no per-provider URL was set for that provider.
-    if let Some(url) = non_blank(base_url) {
-        if let Some(provider) = infer_provider_name(model) {
-            urls.entry(provider.to_string())
-                .or_insert_with(|| url.to_string());
-        } else {
-            tracing::warn!(model, "base_url ignored: cannot infer provider from model");
-        }
-    }
     if urls.is_empty() { None } else { Some(urls) }
-}
-
-/// Infer the provider name from a model string. Used by bootstrap-
-/// level base URL resolution; plan §6.14 deleted the per-session
-/// base URL override (`resolve_session_base_url`).
-fn infer_provider_name(model: &str) -> Option<&'static str> {
-    meerkat_core::Provider::infer_from_model(model).map(|p| p.as_str())
 }
 
 /// Build the shared service infrastructure from a Config populated with provider keys.
@@ -1117,7 +1082,7 @@ fn build_wasm_tool_dispatcher() -> Result<Arc<dyn meerkat_core::AgentToolDispatc
 /// Primary bootstrap: parse a mobpack and create service infrastructure.
 ///
 /// `mobpack_bytes`: tar.gz mobpack archive.
-/// `credentials_json`: `{ "api_key": "sk-...", "anthropic_api_key"?: "...", "openai_api_key"?: "...", "gemini_api_key"?: "...", "model"?: "claude-sonnet-4-5" }`
+/// `credentials_json`: `{ "anthropic_api_key"?: "...", "openai_api_key"?: "...", "gemini_api_key"?: "...", "model"?: "claude-sonnet-4-5" }`
 ///
 /// Stores an `EphemeralSessionService<FactoryAgentBuilder>` and a `MobMcpState`
 /// in a `thread_local! RuntimeState` for subsequent mob/comms calls.
@@ -1130,7 +1095,6 @@ pub fn init_runtime(mobpack_bytes: &[u8], credentials_json: &str) -> Result<JsVa
         serde_json::from_str(credentials_json).map_err(|e| err_str("invalid_credentials", e))?;
 
     let api_keys = build_provider_api_keys(
-        creds.api_key.as_deref(),
         creds.anthropic_api_key.as_deref(),
         creds.openai_api_key.as_deref(),
         creds.gemini_api_key.as_deref(),
@@ -1144,11 +1108,9 @@ pub fn init_runtime(mobpack_bytes: &[u8], credentials_json: &str) -> Result<JsVa
 
     let providers: Vec<String> = api_keys.keys().cloned().collect();
     let base_urls = build_provider_base_urls(
-        creds.base_url.as_deref(),
         creds.anthropic_base_url.as_deref(),
         creds.openai_base_url.as_deref(),
         creds.gemini_base_url.as_deref(),
-        &model,
     );
     let mut config = Config::default();
     config.agent.model.clone_from(&model);
@@ -1179,7 +1141,7 @@ pub fn init_runtime(mobpack_bytes: &[u8], credentials_json: &str) -> Result<JsVa
 
 /// Advanced bare-bones bootstrap without a mobpack.
 ///
-/// `config_json`: `{ "api_key"?: "sk-...", "anthropic_api_key"?: "...", "openai_api_key"?: "...", "gemini_api_key"?: "...", "model"?: "claude-sonnet-4-5", "max_sessions"?: 64 }`
+/// `config_json`: `{ "anthropic_api_key"?: "...", "openai_api_key"?: "...", "gemini_api_key"?: "...", "model"?: "claude-sonnet-4-5", "max_sessions"?: 64 }`
 #[wasm_bindgen]
 pub fn init_runtime_from_config(config_json: &str) -> Result<JsValue, JsValue> {
     init_tracing();
@@ -1188,7 +1150,6 @@ pub fn init_runtime_from_config(config_json: &str) -> Result<JsValue, JsValue> {
         serde_json::from_str(config_json).map_err(|e| err_str("invalid_config", e))?;
 
     let api_keys = build_provider_api_keys(
-        rt_config.api_key.as_deref(),
         rt_config.anthropic_api_key.as_deref(),
         rt_config.openai_api_key.as_deref(),
         rt_config.gemini_api_key.as_deref(),
@@ -1203,11 +1164,9 @@ pub fn init_runtime_from_config(config_json: &str) -> Result<JsValue, JsValue> {
 
     let providers: Vec<String> = api_keys.keys().cloned().collect();
     let base_urls = build_provider_base_urls(
-        rt_config.base_url.as_deref(),
         rt_config.anthropic_base_url.as_deref(),
         rt_config.openai_base_url.as_deref(),
         rt_config.gemini_base_url.as_deref(),
-        &model,
     );
     let mut config = Config::default();
     config.agent.model.clone_from(&model);

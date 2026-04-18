@@ -1740,9 +1740,6 @@ pub enum ConfigError {
     #[error("Missing required field: {0}")]
     MissingField(String),
 
-    #[error("Missing API key: {0}")]
-    MissingApiKey(&'static str),
-
     #[error("Internal error: {0}")]
     InternalError(String),
 

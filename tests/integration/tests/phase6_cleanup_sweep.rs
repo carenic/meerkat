@@ -177,11 +177,33 @@ fn phase6_deletions() -> Vec<(&'static str, &'static str)> {
             "pub struct ProviderResolver",
             "ProviderResolver struct (plan §6.6)",
         ),
+        // Plan §6.5: provider clients' legacy env-reading constructors
+        // (OpenAiClient::from_env, AnthropicClient::from_env,
+        // GeminiClient::from_env) — zero callers; env fallback belongs
+        // to the resolver env_lookup seam, not bypass constructors.
+        (
+            "pub fn from_env() -> Result<Self, LlmError>",
+            "provider client from_env constructors (plan §6.5)",
+        ),
+        // Plan §6 dogma §5: no bare `api_key` / `base_url` catch-all
+        // fields on browser-facing init structs — the "anthropic by
+        // convention" fallback is string-convention folklore.
+        (
+            "api_key: Option<String>,\n    /// Per-provider API keys",
+            "Credentials/RuntimeConfig bare api_key field (plan §6 dogma §5)",
+        ),
+        (
+            "base_url: Option<String>,\n    /// Per-provider base URLs",
+            "Credentials/RuntimeConfig bare base_url field (plan §6 dogma §5)",
+        ),
+        (
+            "ConfigError::MissingApiKey",
+            "ConfigError::MissingApiKey orphan variant (plan §6.3 spirit)",
+        ),
     ]
 }
 
 #[test]
-#[ignore = "plan §6.16 — flips green once Phase 6 slices 6.1–6.15 ship"]
 fn phase6_deleted_symbols_have_zero_production_hits() {
     let root = repo_root();
     let self_path = root.join("tests/integration/tests/phase6_cleanup_sweep.rs");

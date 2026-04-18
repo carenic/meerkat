@@ -69,16 +69,6 @@ impl GeminiClient {
         self
     }
 
-    /// Create from environment variable GEMINI_API_KEY
-    pub fn from_env() -> Result<Self, LlmError> {
-        let api_key = std::env::var("RKAT_GEMINI_API_KEY")
-            .or_else(|_| {
-                std::env::var("GEMINI_API_KEY").or_else(|_| std::env::var("GOOGLE_API_KEY"))
-            })
-            .map_err(|_| LlmError::InvalidApiKey)?;
-        Ok(Self::new(api_key))
-    }
-
     /// Build request body for Gemini API
     fn build_request_body(&self, request: &LlmRequest) -> Result<Value, LlmError> {
         let mut contents = Vec::new();

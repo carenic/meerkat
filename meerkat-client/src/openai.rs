@@ -130,14 +130,6 @@ impl OpenAiClient {
         self
     }
 
-    /// Create from environment variable OPENAI_API_KEY
-    pub fn from_env() -> Result<Self, LlmError> {
-        let api_key = std::env::var("RKAT_OPENAI_API_KEY")
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .map_err(|_| LlmError::InvalidApiKey)?;
-        Ok(Self::new(api_key))
-    }
-
     /// Build request body for OpenAI Responses API
     fn build_request_body(&self, request: &LlmRequest) -> Result<Value, LlmError> {
         let input = Self::convert_to_responses_input(&request.messages)?;

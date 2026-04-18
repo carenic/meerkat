@@ -151,14 +151,6 @@ impl AnthropicClient {
         AnthropicClientBuilder::new(api_key)
     }
 
-    /// Create from environment variable ANTHROPIC_API_KEY
-    pub fn from_env() -> Result<Self, LlmError> {
-        let api_key = std::env::var("RKAT_ANTHROPIC_API_KEY")
-            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-            .map_err(|_| LlmError::InvalidApiKey)?;
-        Self::new(api_key)
-    }
-
     /// Set custom base URL
     pub fn with_base_url(mut self, url: String) -> Self {
         #[cfg(not(target_arch = "wasm32"))]
