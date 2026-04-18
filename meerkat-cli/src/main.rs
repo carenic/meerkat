@@ -1033,6 +1033,30 @@ enum AuthCommands {
         profile_id: String,
     },
 
+    /// Delete an auth profile's persisted credentials from the TokenStore.
+    /// The realm config entry itself is declarative — this removes the
+    /// secret/token material bound to `<realm>:<profile_id>`.
+    ProfileDelete {
+        /// Realm id.
+        #[arg(long, default_value = "dev")]
+        realm: String,
+
+        /// Auth profile id.
+        profile_id: String,
+
+        /// Skip interactive confirmation.
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+    },
+
+    /// List all backend / auth / binding tuples across every realm in the
+    /// active config.
+    Bindings {
+        /// Restrict to a specific realm id (defaults to all realms).
+        #[arg(long)]
+        realm: Option<String>,
+    },
+
     /// Dry-run a provider binding through the provider runtime registry.
     Test {
         /// Realm id.
@@ -1043,8 +1067,9 @@ enum AuthCommands {
         binding_id: String,
     },
 
-    /// Print auth profile status (placeholder — full TokenStore-backed
-    /// status wiring lands alongside the interactive OAuth flow).
+    /// Print auth profile status — reports realm config shape and the
+    /// state of the persisted TokenStore entry (auth_mode, expiry,
+    /// refresh attempt count).
     Status {
         /// Realm id.
         #[arg(long, default_value = "dev")]
@@ -1054,16 +1079,43 @@ enum AuthCommands {
         profile_id: String,
     },
 
-    /// Announce that the interactive CLI login flow lives in a follow-up
-    /// commit (with clear pointer to configure env-var auth for now).
+    /// Sign in to a provider and persist the resolved credential into the
+    /// TokenStore. Interactive (OAuth) when `--secret` is omitted; scripted
+    /// (inline api key) with `--non-interactive --secret`.
     Login {
-        /// Provider (for docs/help only in this placeholder).
+        /// Provider — `anthropic` / `openai` / `gemini` (positional or
+        /// selected interactively when absent).
         provider: Option<String>,
+
+        /// Target backend kind (e.g. `anthropic_api`, `openai_api`,
+        /// `chatgpt_backend`, `google_genai`). Defaults to the
+        /// provider's primary backend.
+        #[arg(long)]
+        backend: Option<String>,
+
+        /// Auth method (e.g. `api_key`, `managed_chatgpt_oauth`,
+        /// `claude_ai_oauth`, `google_oauth`). Defaults to the primary
+        /// interactive flow for the provider.
+        #[arg(long)]
+        method: Option<String>,
+
+        /// Skip interactive prompts — resolve the secret from
+        /// `--secret` (or stdin if not given) and write directly to
+        /// TokenStore. Intended for CI / scripted provisioning.
+        #[arg(long, requires = "provider")]
+        non_interactive: bool,
+
+        /// Inline secret for `--non-interactive` flows. For
+        /// interactive flows the secret is captured via OAuth and
+        /// this flag is ignored.
+        #[arg(long, requires = "non_interactive")]
+        secret: Option<String>,
     },
 
-    /// Announce the CLI logout path lives in a follow-up commit.
+    /// Clear persisted credentials for an auth profile from the TokenStore.
     Logout {
-        /// Auth profile id.
+        /// Auth profile id (either `realm:binding` or bare `binding` — the
+        /// latter assumes realm `dev`).
         profile_id: String,
     },
 }
@@ -2463,29 +2515,204 @@ async fn handle_auth_command(command: AuthCommands, scope: &RuntimeScope) -> any
                 .ok_or_else(|| anyhow::anyhow!("Unknown realm '{realm}'"))?;
             let realm_set = meerkat_core::RealmConnectionSet::from_config(&realm, section)
                 .map_err(|e| anyhow::anyhow!("Realm config invalid: {e}"))?;
-            match realm_set.auth_profiles.get(&profile_id) {
-                Some(profile) => {
-                    println!("profile_id: {}", profile.id);
-                    println!("provider:   {}", profile.provider.as_str());
-                    println!("auth_method:{}", profile.auth_method);
-                    println!("state:      unknown (full TokenStore-backed status lands in a");
-                    println!("            follow-up commit alongside interactive OAuth)");
+            let Some(profile) = realm_set.auth_profiles.get(&profile_id) else {
+                anyhow::bail!("Auth profile '{realm}:{profile_id}' not found in realm '{realm}'");
+            };
+            println!("profile_id:  {}", profile.id);
+            println!("provider:    {}", profile.provider.as_str());
+            println!("auth_method: {}", profile.auth_method);
+            println!("source_kind: {}", source_kind_label(&profile.source));
+            // TokenStore lookup: `<realm>:<profile_id>` is the canonical key.
+            #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
+            {
+                use meerkat_client::auth_store::{TokenKey, TokenStoreBackend};
+                let store = TokenStoreBackend::default_auto()
+                    .map_err(|e| anyhow::anyhow!("Cannot open TokenStore: {e}"))?
+                    .open()
+                    .map_err(|e| anyhow::anyhow!("Cannot open TokenStore: {e}"))?;
+                let key = TokenKey::new(&realm, &profile_id);
+                match store
+                    .load(&key)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("TokenStore load failed: {e}"))?
+                {
+                    Some(tokens) => {
+                        println!("state:       present");
+                        println!("auth_mode:   {:?}", tokens.auth_mode);
+                        println!(
+                            "has_secret:  {}",
+                            tokens
+                                .primary_secret
+                                .as_ref()
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false)
+                        );
+                        println!(
+                            "has_refresh: {}",
+                            tokens
+                                .refresh_token
+                                .as_ref()
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false)
+                        );
+                        if let Some(expires_at) = tokens.expires_at {
+                            println!("expires_at:  {}", expires_at.to_rfc3339());
+                        }
+                        if let Some(last_refresh) = tokens.last_refresh {
+                            println!("last_refresh:{}", last_refresh.to_rfc3339());
+                        }
+                        if let Some(account_id) = tokens.account_id.as_ref() {
+                            println!("account_id:  {account_id}");
+                        }
+                        if !tokens.scopes.is_empty() {
+                            println!("scopes:      {}", tokens.scopes.join(", "));
+                        }
+                        println!("backend:     {}", store.backend_name());
+                    }
+                    None => {
+                        println!("state:       absent");
+                        println!("backend:     {}", store.backend_name());
+                        println!(
+                            "note:        no persisted credential for '{realm}:{profile_id}';"
+                        );
+                        println!(
+                            "             run `rkat auth login {}` or rely on env-var fallback.",
+                            profile.provider.as_str(),
+                        );
+                    }
                 }
-                None => {
-                    anyhow::bail!(
-                        "Auth profile '{realm}:{profile_id}' not found in realm '{realm}'"
+            }
+            #[cfg(not(all(feature = "anthropic", feature = "openai", feature = "gemini")))]
+            {
+                println!("state:       unknown (TokenStore disabled at build time)");
+            }
+        }
+        AuthCommands::ProfileDelete {
+            realm,
+            profile_id,
+            yes,
+        } => {
+            let section = config
+                .realm
+                .get(&realm)
+                .ok_or_else(|| anyhow::anyhow!("Unknown realm '{realm}'"))?;
+            let realm_set = meerkat_core::RealmConnectionSet::from_config(&realm, section)
+                .map_err(|e| anyhow::anyhow!("Realm config invalid: {e}"))?;
+            if !realm_set.auth_profiles.contains_key(&profile_id) {
+                anyhow::bail!("Auth profile '{realm}:{profile_id}' not found in realm '{realm}'");
+            }
+            if !yes {
+                use std::io::{BufRead, Write};
+                eprint!("Delete persisted credentials for '{realm}:{profile_id}'? [y/N]: ");
+                std::io::stderr().flush().ok();
+                let stdin = std::io::stdin();
+                let line = stdin
+                    .lock()
+                    .lines()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("no confirmation on stdin"))??;
+                if !matches!(line.trim(), "y" | "Y" | "yes" | "YES") {
+                    eprintln!("cancelled");
+                    return Ok(());
+                }
+            }
+            #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
+            {
+                use meerkat_client::auth_store::{TokenKey, TokenStoreBackend};
+                let store = TokenStoreBackend::default_auto()
+                    .map_err(|e| anyhow::anyhow!("Cannot open TokenStore: {e}"))?
+                    .open()
+                    .map_err(|e| anyhow::anyhow!("Cannot open TokenStore: {e}"))?;
+                let key = TokenKey::new(&realm, &profile_id);
+                let present = store
+                    .load(&key)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("TokenStore load failed: {e}"))?;
+                if present.is_some() {
+                    store
+                        .clear(&key)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("TokenStore clear failed: {e}"))?;
+                    println!("deleted: {}:{}", key.realm_id, key.binding_id);
+                } else {
+                    println!(
+                        "nothing to delete: no persisted credential for '{realm}:{profile_id}'"
+                    );
+                }
+            }
+            #[cfg(not(all(feature = "anthropic", feature = "openai", feature = "gemini")))]
+            {
+                anyhow::bail!(
+                    "`rkat auth profile delete` requires the `anthropic`, `openai`, and `gemini` \
+                     features to be enabled at build time."
+                );
+            }
+        }
+        AuthCommands::Bindings {
+            realm: realm_filter,
+        } => {
+            if config.realm.is_empty() {
+                println!(
+                    "No realms configured. Add a [realm.<id>] section to your config or use the \
+                     env-var auth fallback."
+                );
+                return Ok(());
+            }
+            println!(
+                "REALM              BINDING              BACKEND_PROFILE      AUTH_PROFILE         DEFAULT_MODEL"
+            );
+            for (realm_id, section) in &config.realm {
+                if let Some(filter) = realm_filter.as_deref()
+                    && filter != realm_id
+                {
+                    continue;
+                }
+                let realm_set =
+                    match meerkat_core::RealmConnectionSet::from_config(realm_id, section) {
+                        Ok(set) => set,
+                        Err(e) => {
+                            println!("(realm '{realm_id}' config invalid: {e})");
+                            continue;
+                        }
+                    };
+                for (binding_id, binding) in &realm_set.bindings {
+                    println!(
+                        "{:<19}{:<21}{:<21}{:<21}{}",
+                        realm_id,
+                        binding_id,
+                        binding.backend_profile,
+                        binding.auth_profile,
+                        binding.default_model.as_deref().unwrap_or("(inherit)"),
                     );
                 }
             }
         }
-        AuthCommands::Login { provider } => {
+        AuthCommands::Login {
+            provider,
+            backend,
+            method,
+            non_interactive,
+            secret,
+        } => {
             #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
             {
-                interactive_login(provider.as_deref(), scope).await?;
+                if non_interactive {
+                    noninteractive_login(
+                        provider.as_deref(),
+                        backend.as_deref(),
+                        method.as_deref(),
+                        secret.as_deref(),
+                        scope,
+                    )
+                    .await?;
+                } else {
+                    let _ = (backend, method);
+                    interactive_login(provider.as_deref(), scope).await?;
+                }
             }
             #[cfg(not(all(feature = "anthropic", feature = "openai", feature = "gemini")))]
             {
-                let _ = provider;
+                let _ = (provider, backend, method, non_interactive, secret);
                 anyhow::bail!(
                     "`rkat auth login` requires the `anthropic`, `openai`, and `gemini` \
                      features to be enabled at build time."
@@ -2723,6 +2950,94 @@ fn resolve_login_provider(hint: Option<&str>) -> anyhow::Result<LoginProvider> {
 }
 
 #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
+/// Plan §4d.cli.1: non-interactive login path. Resolves the secret
+/// (from `--secret` or stdin), validates against the requested
+/// (backend, method) shape, and writes an api_key-style entry into
+/// the TokenStore. Intended for CI / scripted provisioning where an
+/// OAuth flow can't run.
+#[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
+async fn noninteractive_login(
+    provider_hint: Option<&str>,
+    backend_hint: Option<&str>,
+    method_hint: Option<&str>,
+    secret: Option<&str>,
+    _scope: &RuntimeScope,
+) -> anyhow::Result<()> {
+    use meerkat_client::auth_store::{
+        PersistedAuthMode, PersistedTokens, TokenKey, TokenStoreBackend,
+    };
+
+    let provider = provider_hint
+        .ok_or_else(|| anyhow::anyhow!("--non-interactive requires a positional <provider> arg"))?;
+    let provider_lc = provider.to_lowercase();
+    if !matches!(provider_lc.as_str(), "anthropic" | "openai" | "gemini") {
+        anyhow::bail!("unknown provider '{provider}' — expected anthropic / openai / gemini");
+    }
+
+    let method = method_hint.unwrap_or("api_key");
+    if method != "api_key" && method != "static_bearer" {
+        anyhow::bail!(
+            "--non-interactive login supports only --method api_key|static_bearer; \
+             OAuth-backed methods (managed_chatgpt_oauth, claude_ai_oauth, google_oauth, \
+             oauth_to_api_key) require the interactive browser flow"
+        );
+    }
+
+    let backend =
+        backend_hint
+            .map(ToString::to_string)
+            .unwrap_or_else(|| match provider_lc.as_str() {
+                "anthropic" => "anthropic_api".to_string(),
+                "openai" => "openai_api".to_string(),
+                _ => "google_genai".to_string(),
+            });
+
+    let secret_value = match secret {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => {
+            use std::io::BufRead;
+            eprintln!("Secret for {provider}/{backend}/{method} (reading from stdin):");
+            let stdin = std::io::stdin();
+            let line = stdin
+                .lock()
+                .lines()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("no secret on stdin"))??;
+            if line.trim().is_empty() {
+                anyhow::bail!("empty secret");
+            }
+            line.trim().to_string()
+        }
+    };
+
+    let store = TokenStoreBackend::default_auto()?.open()?;
+    let key = TokenKey::new("dev", format!("default_{provider_lc}"));
+    let auth_mode = if method == "static_bearer" {
+        PersistedAuthMode::StaticBearer
+    } else {
+        PersistedAuthMode::ApiKey
+    };
+    let persisted = PersistedTokens {
+        auth_mode,
+        primary_secret: Some(secret_value),
+        refresh_token: None,
+        id_token: None,
+        expires_at: None,
+        last_refresh: Some(chrono::Utc::now()),
+        scopes: vec![],
+        account_id: None,
+        metadata: serde_json::json!({
+            "provider": provider_lc,
+            "backend_kind": backend,
+            "auth_method": method,
+            "source": "rkat auth login --non-interactive",
+        }),
+    };
+    store.save(&key, &persisted).await?;
+    println!("ok: wrote api_key for {provider_lc} into TokenStore under dev:default_{provider_lc}");
+    Ok(())
+}
+
 async fn interactive_login(
     provider_hint: Option<&str>,
     _scope: &RuntimeScope,
