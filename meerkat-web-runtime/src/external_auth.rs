@@ -120,7 +120,7 @@ pub struct WasmExternalAuthResolver;
 impl meerkat_providers::ExternalAuthResolverHandle for WasmExternalAuthResolver {
     async fn resolve(
         &self,
-        binding: &meerkat_providers::runtime::binding::ValidatedBinding,
+        binding: &meerkat_providers::ValidatedBinding,
     ) -> Result<meerkat_core::ResolvedAuthEnvelope, meerkat_core::AuthError> {
         let binding_key = format!("{}:{}", binding.auth_profile.id, binding.backend_profile.id,);
         let promise = invoke_external_auth_resolver(&binding_key).map_err(|e| {

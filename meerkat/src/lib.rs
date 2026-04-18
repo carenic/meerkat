@@ -383,17 +383,19 @@ pub use meerkat_llm_core::provider_runtime::{
 pub fn default_provider_registry() -> meerkat_llm_core::provider_runtime::ProviderRuntimeRegistry {
     #[allow(unused_mut)]
     let mut r = meerkat_llm_core::provider_runtime::ProviderRuntimeRegistry::empty();
-    #[cfg(feature = "anthropic")]
+    // Per-provider runtimes are non-wasm by construction (they depend on
+    // meerkat-auth-core for OAuth/IAM which requires filesystem/keyring).
+    #[cfg(all(feature = "anthropic", not(target_arch = "wasm32")))]
     {
         r = r.with_runtime(std::sync::Arc::new(
             meerkat_anthropic::AnthropicProviderRuntime,
         ));
     }
-    #[cfg(feature = "openai")]
+    #[cfg(all(feature = "openai", not(target_arch = "wasm32")))]
     {
         r = r.with_runtime(std::sync::Arc::new(meerkat_openai::OpenAiProviderRuntime));
     }
-    #[cfg(feature = "gemini")]
+    #[cfg(all(feature = "gemini", not(target_arch = "wasm32")))]
     {
         r = r.with_runtime(std::sync::Arc::new(meerkat_gemini::GoogleProviderRuntime));
     }
