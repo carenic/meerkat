@@ -254,6 +254,43 @@ fn default_registry_populated_by_features() {
     assert!(registry.get(Provider::SelfHosted).is_none());
 }
 
+/// Plan §5.6 — distributed-mob member binding orthogonality.
+///
+/// Two mob members configured with two different `connection_ref`s
+/// must resolve to two different credentials. The real contamination
+/// risk is at the resolver layer (shared caches, shared token stores,
+/// shared auth profile state) — if it was going to happen, it would
+/// happen there. This test drives concurrent resolves from the same
+/// ResolverEnvironment against two bindings with different InlineSecret
+/// sources and asserts the resolved secrets match the bindings, not
+/// each other. Concurrent ordering is deliberate (tokio::join!).
+///
+/// Full mob-spawn orthogonality belongs in meerkat-mob integration
+/// tests; this test is the resolver-layer contract proof.
+#[tokio::test]
+async fn concurrent_resolves_preserve_per_binding_isolation() {
+    let registry = ProviderRuntimeRegistry::default();
+    let realm = fixture_realm();
+    let env = ResolverEnvironment::testing();
+
+    let (a, b) = tokio::join!(
+        registry.resolve(&realm, "default_openai", &env),
+        registry.resolve(&realm, "default_anthropic", &env),
+    );
+    let a = a.expect("openai binding resolves");
+    let b = b.expect("anthropic binding resolves");
+    assert_eq!(a.resolved_secret().as_deref(), Some("sk-openai"));
+    assert_eq!(b.resolved_secret().as_deref(), Some("sk-anthropic"));
+    assert_ne!(
+        a.resolved_secret(),
+        b.resolved_secret(),
+        "two bindings with two different InlineSecrets must resolve to two \
+         different credentials; shared-state contamination would surface here",
+    );
+    assert_eq!(a.provider, Provider::OpenAI);
+    assert_eq!(b.provider, Provider::Anthropic);
+}
+
 /// Plan §4a.14 + §4b.13 closure: a realm configured with
 /// `CredentialSourceSpec::Command` must actually execute the subprocess
 /// via `CommandCredentialRunner` and surface its stdout as the
