@@ -14,12 +14,12 @@
 //!   consulted per-session).
 //! - [`register_external_auth_resolver`] — wasm_bindgen entry point
 //!   that the host page calls to install the resolver.
-//! - [`build_session_request_with_connection_ref`] — replacement for
-//!   the legacy flat-path `build_direct_session_request` that routes
-//!   through the provider-runtime registry. When the resolved binding
-//!   uses an `ExternalResolver` credential source, the registry looks
-//!   up this handle's callback, awaits it, and wires the returned
-//!   token into the LLM client's Authorization header.
+//! - [`build_session_request_with_connection_ref`] — the post-§6.14
+//!   session-request builder that routes through the provider-runtime
+//!   registry. When the resolved binding uses an `ExternalResolver`
+//!   credential source, the registry looks up this handle's callback,
+//!   awaits it, and wires the returned token into the LLM client's
+//!   Authorization header.
 //!
 //! The callback shape matches plan §Phase 4d.wasm:
 //!

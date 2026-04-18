@@ -448,34 +448,9 @@ fn build_provider_base_urls(
     if urls.is_empty() { None } else { Some(urls) }
 }
 
-/// Resolve the effective base URL for a single session's LLM client.
-///
-/// Per-provider fields take precedence; `base_url` is the backward-compat fallback
-/// for the model's inferred provider.
-fn resolve_session_base_url(
-    base_url: Option<&str>,
-    anthropic_base_url: Option<&str>,
-    openai_base_url: Option<&str>,
-    gemini_base_url: Option<&str>,
-    model: &str,
-) -> Option<String> {
-    let provider = infer_provider_name(model)?;
-    let per_provider = match provider {
-        "anthropic" => anthropic_base_url,
-        "openai" => openai_base_url,
-        "gemini" => gemini_base_url,
-        _ => None,
-    };
-    per_provider
-        .or(base_url)
-        .filter(|s| !s.trim().is_empty())
-        .map(ToString::to_string)
-}
-
-/// Infer the provider name from a model string.
-///
-/// Delegates to the canonical `Provider::infer_from_model` in meerkat-core.
-/// Returns `None` for unrecognized models (caller should error, not default).
+/// Infer the provider name from a model string. Used by bootstrap-
+/// level base URL resolution; plan §6.14 deleted the per-session
+/// base URL override (`resolve_session_base_url`).
 fn infer_provider_name(model: &str) -> Option<&'static str> {
     meerkat_core::Provider::infer_from_model(model).map(|p| p.as_str())
 }
@@ -828,40 +803,11 @@ fn looks_like_windows_absolute(path: &str) -> bool {
         && (bytes[2] == b'/' || bytes[2] == b'\\')
 }
 
-// ═══════════════════════════════════════════════════════════
-// Provider Resolution
-// ═══════════════════════════════════════════════════════════
-
-fn create_llm_client(
-    model: &str,
-    api_key: &str,
-    base_url: Option<&str>,
-) -> Result<Arc<dyn meerkat_client::types::LlmClient>, String> {
-    if model.starts_with("claude") {
-        let mut builder = meerkat_client::anthropic::AnthropicClientBuilder::new(api_key.into());
-        if let Some(url) = base_url {
-            builder = builder.base_url(url.into());
-        }
-        let client = builder
-            .build()
-            .map_err(|e| format!("failed to create Anthropic client: {e}"))?;
-        Ok(Arc::new(client))
-    } else if model.starts_with("gpt") || model.starts_with("chatgpt") {
-        let client = if let Some(url) = base_url {
-            meerkat_client::openai::OpenAiClient::new_with_base_url(api_key.into(), url.into())
-        } else {
-            meerkat_client::openai::OpenAiClient::new(api_key.into())
-        };
-        Ok(Arc::new(client))
-    } else {
-        let client = if let Some(url) = base_url {
-            meerkat_client::gemini::GeminiClient::new_with_base_url(api_key.into(), url.into())
-        } else {
-            meerkat_client::gemini::GeminiClient::new(api_key.into())
-        };
-        Ok(Arc::new(client))
-    }
-}
+// Plan §6.14 deleted the legacy flat-path `create_llm_client` helper.
+// Per-session LlmClient construction now flows through AgentFactory::
+// build_agent via the provider runtime registry seeded at bootstrap
+// (init_runtime_from_config / init_runtime_from_mobpack populate
+// `config.realm` via `populate_realm_from_api_keys`).
 
 // ═══════════════════════════════════════════════════════════
 // JS Tool Callbacks — register tool implementations from JavaScript
@@ -1295,37 +1241,28 @@ fn next_runtime_handle(state: &mut RuntimeState) -> u32 {
     handle
 }
 
-fn build_direct_session_request(
+fn build_session_request_with_connection_ref(
     config: &SessionConfig,
     system_prompt: Option<String>,
 ) -> Result<meerkat_core::service::CreateSessionRequest, JsValue> {
     if config.model.trim().is_empty() {
         return Err(err_js("invalid_config", "model must not be empty"));
     }
-    let api_key = config.api_key.as_deref().unwrap_or("");
-    if api_key.is_empty() {
-        return Err(err_js("invalid_config", "api_key must not be empty"));
-    }
 
-    // Resolve effective base URL: per-provider fields take precedence over single base_url.
-    let effective_base_url = resolve_session_base_url(
-        config.base_url.as_deref(),
-        config.anthropic_base_url.as_deref(),
-        config.openai_base_url.as_deref(),
-        config.gemini_base_url.as_deref(),
-        &config.model,
-    );
+    // Plan §6.14 eliminates the legacy flat-path LlmClient construction:
+    // credentials must be set at bootstrap (init_runtime_from_config /
+    // init_runtime_from_mobpack) — which populates `config.realm` via
+    // `populate_realm_from_api_keys` — or the host page registers an
+    // external-auth resolver. Per-session api_key / base_url fields are
+    // still parsed but now serve only as optional per-provider base URL
+    // overrides for bootstrap-configured providers; inline per-session
+    // secrets are no longer honored.
 
     // Reject reserved mob labels in caller-supplied labels map.
     meerkat::surface::validate_raw_labels(config.labels.as_ref())
         .map_err(|e| err_js("invalid_config", &e))?;
 
-    // Create LLM client.
-    let llm_client = create_llm_client(&config.model, api_key, effective_base_url.as_deref())
-        .map_err(|e| err_str("provider_error", e))?;
-
     let mut build_config = AgentBuildConfig::new(&config.model);
-    build_config.llm_client_override = Some(llm_client);
     if let Some(name) = config.comms_name.clone() {
         build_config.comms_name = Some(name);
         build_config.keep_alive = config.keep_alive;
@@ -1356,7 +1293,7 @@ fn create_runtime_backed_session(
 ) -> Result<u32, JsValue> {
     let session_service = with_runtime_state(|state| Ok(state.session_service.clone()))?;
     let keep_alive = config.comms_name.is_some() && config.keep_alive;
-    let request = build_direct_session_request(&config, system_prompt)?;
+    let request = build_session_request_with_connection_ref(&config, system_prompt)?;
 
     let created = futures::executor::block_on(session_service.create_session(request))
         .map_err(err_session)?;
