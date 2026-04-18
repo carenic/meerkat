@@ -22,6 +22,8 @@ machine! {
             auth_refreshing_leases: Set<String>,
             auth_reauth_required_leases: Set<String>,
             auth_expires_at: Map<String, u64>,
+            auth_last_refresh: Map<String, u64>,
+            auth_refresh_attempt: Map<String, u64>,
         }
 
         init(Initializing) {
@@ -36,6 +38,8 @@ machine! {
             auth_refreshing_leases = EmptySet,
             auth_reauth_required_leases = EmptySet,
             auth_expires_at = EmptyMap,
+            auth_last_refresh = EmptyMap,
+            auth_refresh_attempt = EmptyMap,
         }
 
         terminal [Destroyed]
@@ -1483,6 +1487,8 @@ machine! {
                 self.auth_refreshing_leases.remove(binding_key);
                 self.auth_valid_leases.insert(binding_key);
                 self.auth_expires_at.insert(binding_key, new_expires_at);
+                self.auth_last_refresh.insert(binding_key, now);
+                self.auth_refresh_attempt.insert(binding_key, 0);
             }
             to Idle
             emit EmitAuthLifecycleEvent { binding_key: binding_key, new_state: "valid" }
@@ -1497,6 +1503,7 @@ machine! {
             update {
                 self.auth_refreshing_leases.remove(binding_key);
                 self.auth_expiring_leases.insert(binding_key);
+                self.auth_refresh_attempt.insert(binding_key, 1);
             }
             to Idle
             emit EmitAuthLifecycleEvent { binding_key: binding_key, new_state: "expiring" }
@@ -1511,6 +1518,7 @@ machine! {
             update {
                 self.auth_refreshing_leases.remove(binding_key);
                 self.auth_reauth_required_leases.insert(binding_key);
+                self.auth_refresh_attempt.insert(binding_key, 1);
             }
             to Idle
             emit EmitAuthLifecycleEvent { binding_key: binding_key, new_state: "reauth_required" }
@@ -1545,6 +1553,8 @@ machine! {
                 self.auth_refreshing_leases.remove(binding_key);
                 self.auth_reauth_required_leases.remove(binding_key);
                 self.auth_expires_at.remove(binding_key);
+                self.auth_last_refresh.remove(binding_key);
+                self.auth_refresh_attempt.remove(binding_key);
             }
             to Idle
         }

@@ -20,6 +20,8 @@ machine! {
             auth_refreshing_leases: Set<String>,
             auth_reauth_required_leases: Set<String>,
             auth_expires_at: Map<String, u64>,
+            auth_last_refresh: Map<String, u64>,
+            auth_refresh_attempt: Map<String, u64>,
         }
 
         init(Initializing) {
@@ -34,6 +36,8 @@ machine! {
             auth_refreshing_leases = EmptySet,
             auth_reauth_required_leases = EmptySet,
             auth_expires_at = EmptyMap,
+            auth_last_refresh = EmptyMap,
+            auth_refresh_attempt = EmptyMap,
         }
 
         terminal [Destroyed]

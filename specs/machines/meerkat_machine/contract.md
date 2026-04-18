@@ -18,6 +18,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `auth_refreshing_leases`: `Set<String>`
 - `auth_reauth_required_leases`: `Set<String>`
 - `auth_expires_at`: `Map<String, u64>`
+- `auth_last_refresh`: `Map<String, u64>`
+- `auth_refresh_attempt`: `Map<String, u64>`
 
 ## Inputs
 - `RegisterSession`(session_id: SessionId)

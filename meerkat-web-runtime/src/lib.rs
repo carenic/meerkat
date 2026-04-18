@@ -183,22 +183,15 @@ struct MobDefinitionHeader {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionConfig {
     model: String,
+    /// Optional realm-qualified binding reference in `realm:binding`
+    /// form (plan §4d.wasm.2). When set, overrides the default
+    /// provider-match from bootstrap-populated `config.realm`.
     #[serde(default)]
-    api_key: Option<String>,
+    connection_ref: Option<String>,
     #[serde(default)]
     system_prompt: Option<String>,
     #[serde(default = "default_max_tokens")]
     max_tokens: u32,
-    /// Backward-compat single base URL — mapped to the inferred provider.
-    #[serde(default)]
-    base_url: Option<String>,
-    /// Per-provider base URLs — take precedence over `base_url`.
-    #[serde(default)]
-    anthropic_base_url: Option<String>,
-    #[serde(default)]
-    openai_base_url: Option<String>,
-    #[serde(default)]
-    gemini_base_url: Option<String>,
     /// Enable comms for this session (registers in InprocRegistry).
     #[serde(default)]
     comms_name: Option<String>,
@@ -1242,27 +1235,33 @@ fn next_runtime_handle(state: &mut RuntimeState) -> u32 {
 }
 
 fn build_session_request_with_connection_ref(
+    connection_ref: Option<&str>,
+    model: &str,
     config: &SessionConfig,
     system_prompt: Option<String>,
 ) -> Result<meerkat_core::service::CreateSessionRequest, JsValue> {
-    if config.model.trim().is_empty() {
+    // Plan §4d.wasm.2 real signature: (connection_ref, model, session_config,
+    // system_prompt). Credentials flow through bootstrap-populated
+    // `config.realm` (populate_realm_from_api_keys) or the host's
+    // registered external-auth resolver. No per-session api_key.
+    if model.trim().is_empty() {
         return Err(err_js("invalid_config", "model must not be empty"));
     }
-
-    // Plan §6.14 eliminates the legacy flat-path LlmClient construction:
-    // credentials must be set at bootstrap (init_runtime_from_config /
-    // init_runtime_from_mobpack) — which populates `config.realm` via
-    // `populate_realm_from_api_keys` — or the host page registers an
-    // external-auth resolver. Per-session api_key / base_url fields are
-    // still parsed but now serve only as optional per-provider base URL
-    // overrides for bootstrap-configured providers; inline per-session
-    // secrets are no longer honored.
 
     // Reject reserved mob labels in caller-supplied labels map.
     meerkat::surface::validate_raw_labels(config.labels.as_ref())
         .map_err(|e| err_js("invalid_config", &e))?;
 
-    let mut build_config = AgentBuildConfig::new(&config.model);
+    let mut build_config = AgentBuildConfig::new(model);
+    if let Some(conn) = connection_ref {
+        let parsed = meerkat_core::ConnectionRef::parse(conn).ok_or_else(|| {
+            err_js(
+                "invalid_config",
+                "connection_ref must be in `realm:binding` form",
+            )
+        })?;
+        build_config.connection_ref = Some(parsed);
+    }
     if let Some(name) = config.comms_name.clone() {
         build_config.comms_name = Some(name);
         build_config.keep_alive = config.keep_alive;
@@ -1293,7 +1292,13 @@ fn create_runtime_backed_session(
 ) -> Result<u32, JsValue> {
     let session_service = with_runtime_state(|state| Ok(state.session_service.clone()))?;
     let keep_alive = config.comms_name.is_some() && config.keep_alive;
-    let request = build_session_request_with_connection_ref(&config, system_prompt)?;
+    let model = config.model.clone();
+    let request = build_session_request_with_connection_ref(
+        config.connection_ref.as_deref(),
+        &model,
+        &config,
+        system_prompt,
+    )?;
 
     let created = futures::executor::block_on(session_service.create_session(request))
         .map_err(err_session)?;

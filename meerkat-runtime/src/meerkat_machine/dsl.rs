@@ -293,6 +293,14 @@ machine! {
             auth_refreshing_leases: Set<String>,
             auth_reauth_required_leases: Set<String>,
             auth_expires_at: Map<String, u64>,
+            // Plan §1.5r.1: observability counters for the refresh
+            // loop. `auth_last_refresh` captures the wall-clock (unix
+            // seconds) of the most recent CompleteAuthRefresh for
+            // each binding_key. `auth_refresh_attempt` counts
+            // consecutive AuthRefreshFailed events per binding_key,
+            // resetting on CompleteAuthRefresh.
+            auth_last_refresh: Map<String, u64>,
+            auth_refresh_attempt: Map<String, u64>,
 
             // --- Registration substate ---
             registration_phase: String,
@@ -387,6 +395,8 @@ machine! {
             auth_refreshing_leases = EmptySet,
             auth_reauth_required_leases = EmptySet,
             auth_expires_at = EmptyMap,
+            auth_last_refresh = EmptyMap,
+            auth_refresh_attempt = EmptyMap,
             // Registration substate
             registration_phase = "Queuing",
             // Comms drain substate
@@ -3212,6 +3222,8 @@ machine! {
                 self.auth_refreshing_leases.remove(binding_key);
                 self.auth_valid_leases.insert(binding_key);
                 self.auth_expires_at.insert(binding_key, new_expires_at);
+                self.auth_last_refresh.insert(binding_key, now);
+                self.auth_refresh_attempt.insert(binding_key, 0);
             }
             to Idle
             emit EmitAuthLifecycleEvent { binding_key: binding_key, new_state: "valid" }
@@ -3225,6 +3237,15 @@ machine! {
             update {
                 self.auth_refreshing_leases.remove(binding_key);
                 self.auth_expiring_leases.insert(binding_key);
+                // Plan §1.5r.1: mark a failed-refresh attempt. The DSL
+                // update syntax is constrained to simple ops (insert /
+                // remove / scalar arithmetic on named fields — no
+                // closure-chained Option handling on Map::get). Use a
+                // simple indicator write: 1 = last attempt failed;
+                // CompleteAuthRefresh resets to 0. External observability
+                // (handle.snapshot + a polling consumer) can derive
+                // consecutive-failure counts.
+                self.auth_refresh_attempt.insert(binding_key, 1);
             }
             to Idle
             emit EmitAuthLifecycleEvent { binding_key: binding_key, new_state: "expiring" }
@@ -3238,6 +3259,15 @@ machine! {
             update {
                 self.auth_refreshing_leases.remove(binding_key);
                 self.auth_reauth_required_leases.insert(binding_key);
+                // Plan §1.5r.1: mark a failed-refresh attempt. The DSL
+                // update syntax is constrained to simple ops (insert /
+                // remove / scalar arithmetic on named fields — no
+                // closure-chained Option handling on Map::get). Use a
+                // simple indicator write: 1 = last attempt failed;
+                // CompleteAuthRefresh resets to 0. External observability
+                // (handle.snapshot + a polling consumer) can derive
+                // consecutive-failure counts.
+                self.auth_refresh_attempt.insert(binding_key, 1);
             }
             to Idle
             emit EmitAuthLifecycleEvent { binding_key: binding_key, new_state: "reauth_required" }
@@ -3270,6 +3300,8 @@ machine! {
                 self.auth_refreshing_leases.remove(binding_key);
                 self.auth_reauth_required_leases.remove(binding_key);
                 self.auth_expires_at.remove(binding_key);
+                self.auth_last_refresh.remove(binding_key);
+                self.auth_refresh_attempt.remove(binding_key);
             }
             to Idle
         }
