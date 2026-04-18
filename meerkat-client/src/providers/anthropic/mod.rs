@@ -291,36 +291,77 @@ impl ProviderRuntime for AnthropicProviderRuntime {
                  — registry dispatch invariant violated"
             ),
         };
-        match (backend_kind, &connection.shim_credential) {
+        // Plan §6.11: derive credential material from the auth lease
+        // directly, not from ShimCredential. resolved_authorizer()
+        // returns Some when the lease is a DynamicAuthorizer (Bedrock
+        // SigV4 / Vertex GoogleAuth / Foundry AzureAd /
+        // ExternalAuthorizer-DynamicAuthorizer); resolved_secret()
+        // returns Some when the lease is a StaticHeaders with the
+        // `__secret__` synthetic key (api_key / static_bearer /
+        // oauth_to_api_key / bedrock_bearer / pre-resolved Bearer).
+        let authorizer_opt = connection.resolved_authorizer();
+        let secret_opt = connection.resolved_secret();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(authorizer) = authorizer_opt {
+            // All authorizer-backed backends wire the same way:
+            // AnthropicClient with .authorizer(...) + .base_url(...).
+            // Bedrock / Vertex require a non-empty base URL; AnthropicApi
+            // falls back to its default.
+            let base_url = match backend_kind {
+                AnthropicBackendKind::Bedrock => connection
+                    .backend_profile
+                    .base_url
+                    .clone()
+                    .filter(|u| !u.is_empty())
+                    .ok_or_else(|| {
+                        ProviderClientError::InvalidBaseUrl(
+                            "bedrock backend requires BackendProfile.base_url".to_string(),
+                        )
+                    })?,
+                AnthropicBackendKind::Vertex | AnthropicBackendKind::Foundry => connection
+                    .backend_profile
+                    .base_url
+                    .clone()
+                    .unwrap_or_default(),
+                AnthropicBackendKind::AnthropicApi => connection
+                    .backend_profile
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| {
+                        AnthropicBackendKind::AnthropicApi.default_base_url().into()
+                    }),
+            };
+            let client = crate::anthropic::AnthropicClient::builder(String::new())
+                .authorizer(authorizer)
+                .base_url(base_url)
+                .build()
+                .map_err(ProviderClientError::ClientInit)?;
+            return Ok(Arc::new(client));
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        if authorizer_opt.is_some() {
+            return Err(ProviderClientError::MissingFeature(
+                "authorizer-backed auth not available on wasm32",
+            ));
+        }
+
+        let secret = secret_opt.ok_or(ProviderClientError::NoCredentialMaterial)?;
+
+        match backend_kind {
             // Native Anthropic API — plain x-api-key auth.
-            (AnthropicBackendKind::AnthropicApi, ShimCredential::Secret(secret)) => {
-                let mut client = crate::anthropic::AnthropicClient::new(secret.clone())
+            AnthropicBackendKind::AnthropicApi | AnthropicBackendKind::Foundry => {
+                let mut client = crate::anthropic::AnthropicClient::new(secret)
                     .map_err(ProviderClientError::ClientInit)?;
                 if let Some(url) = &connection.backend_profile.base_url {
                     client = client.with_base_url(url.clone());
                 }
                 Ok(Arc::new(client))
             }
-            // Foundry API-key — same shape as native, different base URL.
-            (AnthropicBackendKind::Foundry, ShimCredential::Secret(secret)) => {
-                let mut client = crate::anthropic::AnthropicClient::new(secret.clone())
-                    .map_err(ProviderClientError::ClientInit)?;
-                if let Some(url) = &connection.backend_profile.base_url {
-                    client = client.with_base_url(url.clone());
-                }
-                Ok(Arc::new(client))
-            }
-            // Bedrock static bearer (AWS_BEARER_TOKEN_BEDROCK) — per
-            // plan §Phase 4b.6 method `bedrock_bearer`, this path
-            // targets the Messages API via base_url override supplied
-            // by the BackendProfile and injects
-            // `Authorization: Bearer <token>`. AnthropicClient's
-            // authorizer seam accepts a StaticBearerAuthorizer for
-            // this pattern — no Bedrock-specific LlmClient needed for
-            // the bearer subpath (the SigV4 subpath uses
-            // AwsStsAuthorizer, which is a separate variant below).
+            // Bedrock static bearer (AWS_BEARER_TOKEN_BEDROCK).
             #[cfg(not(target_arch = "wasm32"))]
-            (AnthropicBackendKind::Bedrock, ShimCredential::Secret(secret)) => {
+            AnthropicBackendKind::Bedrock => {
                 let base_url = connection
                     .backend_profile
                     .base_url
@@ -335,12 +376,9 @@ impl ProviderRuntime for AnthropicProviderRuntime {
                     })?;
                 let authorizer: std::sync::Arc<dyn meerkat_core::HttpAuthorizer> =
                     std::sync::Arc::new(crate::authorizers::StaticBearerAuthorizer::new(
-                        secret.clone(),
+                        secret,
                         "bedrock-bearer",
                     ));
-                // Use a placeholder api_key — AnthropicClient with an
-                // authorizer suppresses x-api-key in favor of the
-                // authorizer-injected Authorization header.
                 let client = crate::anthropic::AnthropicClient::builder(String::new())
                     .authorizer(authorizer)
                     .base_url(base_url)
@@ -349,84 +387,13 @@ impl ProviderRuntime for AnthropicProviderRuntime {
                 Ok(Arc::new(client))
             }
             #[cfg(target_arch = "wasm32")]
-            (AnthropicBackendKind::Bedrock, ShimCredential::Secret(_)) => Err(
-                ProviderClientError::MissingFeature("bedrock-backend not available on wasm32"),
-            ),
-            // Dynamic authorizer flows: Vertex (Google Bearer), Foundry
-            // Azure AD (Bearer), Bedrock SigV4. AnthropicClient supports
-            // Bearer-style authorizers (Vertex + Foundry AzureAd) via
-            // .authorizer(...). Bedrock SigV4 needs a new client for the
-            // event-stream wire protocol — tracked separately.
-            (
-                AnthropicBackendKind::Vertex | AnthropicBackendKind::Foundry,
-                ShimCredential::Authorizer,
-            ) => {
-                // Authorizer-backed Bearer flow. The resolver produces
-                // a DynamicAuthorizer lease exclusively for this
-                // ShimCredential::Authorizer path (contract between
-                // resolve_binding and build_client in this runtime).
-                // A non-DynamicAuthorizer lease here would be a
-                // resolver-invariant violation.
-                let authorizer = match connection.auth_lease.kind() {
-                    meerkat_core::ResolvedAuthKind::DynamicAuthorizer(auth) => auth.clone(),
-                    other => unreachable!(
-                        "Anthropic Vertex/Foundry with ShimCredential::Authorizer \
-                         requires a DynamicAuthorizer lease kind, got {other:?} — \
-                         resolver invariant violated"
-                    ),
-                };
-                let base_url = connection
-                    .backend_profile
-                    .base_url
-                    .clone()
-                    .unwrap_or_default();
-                let client = crate::anthropic::AnthropicClient::builder(String::new())
-                    .base_url(base_url)
-                    .authorizer(authorizer)
-                    .build()
-                    .map_err(ProviderClientError::ClientInit)?;
-                Ok(Arc::new(client))
-            }
-            (AnthropicBackendKind::Bedrock, ShimCredential::Authorizer) => {
-                // Bedrock SigV4 with dynamic AwsStsAuthorizer — the
-                // authorizer signs each request; AnthropicClient's
-                // authorizer seam injects headers. Note: Bedrock's
-                // *native* API uses AWS event-stream framing for SSE;
-                // the Messages-API-compatible endpoint (anthropic.*
-                // family on Bedrock Messages API) works with the
-                // Anthropic SSE wire, so a Bearer-style authorizer
-                // path suffices for supported model ids. Native
-                // event-stream parsing for non-Messages models is
-                // tracked separately.
-                let authorizer = match connection.auth_lease.kind() {
-                    meerkat_core::ResolvedAuthKind::DynamicAuthorizer(auth) => auth.clone(),
-                    _ => unreachable!(
-                        "Bedrock with ShimCredential::Authorizer requires a \
-                         DynamicAuthorizer lease kind — resolver invariant violated"
-                    ),
-                };
-                let base_url = connection
-                    .backend_profile
-                    .base_url
-                    .clone()
-                    .filter(|u| !u.is_empty())
-                    .ok_or_else(|| {
-                        ProviderClientError::InvalidBaseUrl(
-                            "bedrock backend requires BackendProfile.base_url".to_string(),
-                        )
-                    })?;
-                let client = crate::anthropic::AnthropicClient::builder(String::new())
-                    .authorizer(authorizer)
-                    .base_url(base_url)
-                    .build()
-                    .map_err(ProviderClientError::ClientInit)?;
-                Ok(Arc::new(client))
-            }
+            AnthropicBackendKind::Bedrock => Err(ProviderClientError::MissingFeature(
+                "bedrock-backend not available on wasm32",
+            )),
+            // Vertex with a pre-resolved bearer secret (ExternalAuthorizer
+            // producing a StaticHeaders envelope with __secret__).
             #[cfg(not(target_arch = "wasm32"))]
-            (AnthropicBackendKind::Vertex, ShimCredential::Secret(secret)) => {
-                // Vertex with a pre-resolved bearer secret (e.g.
-                // ExternalAuthorizer produced an envelope carrying a
-                // Bearer token). Wire as StaticBearerAuthorizer.
+            AnthropicBackendKind::Vertex => {
                 let base_url = connection
                     .backend_profile
                     .base_url
@@ -441,7 +408,7 @@ impl ProviderRuntime for AnthropicProviderRuntime {
                     })?;
                 let authorizer: std::sync::Arc<dyn meerkat_core::HttpAuthorizer> =
                     std::sync::Arc::new(crate::authorizers::StaticBearerAuthorizer::new(
-                        secret.clone(),
+                        secret,
                         "vertex-bearer",
                     ));
                 let client = crate::anthropic::AnthropicClient::builder(String::new())
@@ -452,42 +419,9 @@ impl ProviderRuntime for AnthropicProviderRuntime {
                 Ok(Arc::new(client))
             }
             #[cfg(target_arch = "wasm32")]
-            (AnthropicBackendKind::Vertex, ShimCredential::Secret(_)) => {
-                Err(ProviderClientError::MissingFeature(
-                    "vertex-backend with authorizer-backed auth not available on wasm32",
-                ))
-            }
-            // AnthropicApi + ExternalAuthorizer producing a
-            // DynamicAuthorizer envelope lands here. Wire through the
-            // authorizer seam same as Vertex/Foundry.
-            #[cfg(not(target_arch = "wasm32"))]
-            (AnthropicBackendKind::AnthropicApi, ShimCredential::Authorizer) => {
-                let authorizer = match connection.auth_lease.kind() {
-                    meerkat_core::ResolvedAuthKind::DynamicAuthorizer(auth) => auth.clone(),
-                    other => unreachable!(
-                        "AnthropicApi ShimCredential::Authorizer requires DynamicAuthorizer \
-                         lease kind, got {other:?} — resolver invariant violated"
-                    ),
-                };
-                let base_url = connection
-                    .backend_profile
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| {
-                        AnthropicBackendKind::AnthropicApi.default_base_url().into()
-                    });
-                let client = crate::anthropic::AnthropicClient::builder(String::new())
-                    .authorizer(authorizer)
-                    .base_url(base_url)
-                    .build()
-                    .map_err(ProviderClientError::ClientInit)?;
-                Ok(Arc::new(client))
-            }
-            #[cfg(target_arch = "wasm32")]
-            (_, ShimCredential::Authorizer) => Err(ProviderClientError::MissingFeature(
-                "authorizer-backed auth not available on wasm32",
+            AnthropicBackendKind::Vertex => Err(ProviderClientError::MissingFeature(
+                "vertex-backend with authorizer-backed auth not available on wasm32",
             )),
-            (_, ShimCredential::None) => Err(ProviderClientError::NoCredentialMaterial),
         }
     }
 }
