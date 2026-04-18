@@ -179,6 +179,7 @@ mod factory;
 pub use factory::{
     AgentBuildConfig, AgentFactory, BuildAgentError, DynAgent,
     decode_llm_client_override_from_service, encode_llm_client_override_for_service, provider_key,
+    resolve_provider_api_key,
 };
 
 mod persistence;

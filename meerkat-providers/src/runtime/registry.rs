@@ -14,7 +14,7 @@ use meerkat_core::{AuthError, Provider, RealmConnectionSet, ResolvedAuthEnvelope
 use crate::runtime::binding::{ResolvedConnection, ValidatedBinding};
 use crate::runtime::errors::{ProviderAuthError, ProviderBindingError, ProviderClientError};
 use crate::runtime::provider_runtime::ProviderRuntime;
-use crate::types::LlmClient;
+use meerkat_client::LlmClient;
 
 // Provider runtimes — re-exported under feature flags.
 #[cfg(feature = "anthropic")]

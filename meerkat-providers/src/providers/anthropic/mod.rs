@@ -18,7 +18,7 @@ use crate::runtime::errors::{ProviderAuthError, ProviderBindingError, ProviderCl
 use crate::runtime::provider_runtime::ProviderRuntime;
 use crate::runtime::registry::ResolverEnvironment;
 use crate::runtime::resolver::{resolve_external_authorizer, resolve_simple_secret};
-use crate::types::LlmClient;
+use meerkat_client::LlmClient;
 
 pub use auth::AnthropicAuthMethod;
 pub use backend::AnthropicBackendKind;
@@ -360,7 +360,7 @@ impl ProviderRuntime for AnthropicProviderRuntime {
                         AnthropicBackendKind::AnthropicApi.default_base_url().into()
                     }),
             };
-            let client = crate::anthropic::AnthropicClient::builder(String::new())
+            let client = meerkat_client::AnthropicClient::builder(String::new())
                 .authorizer(authorizer)
                 .base_url(base_url)
                 .build()
@@ -380,7 +380,7 @@ impl ProviderRuntime for AnthropicProviderRuntime {
         match backend_kind {
             // Native Anthropic API — plain x-api-key auth.
             AnthropicBackendKind::AnthropicApi | AnthropicBackendKind::Foundry => {
-                let mut client = crate::anthropic::AnthropicClient::new(secret)
+                let mut client = meerkat_client::AnthropicClient::new(secret)
                     .map_err(ProviderClientError::ClientInit)?;
                 if let Some(url) = &connection.backend_profile.base_url {
                     client = client.with_base_url(url.clone());
@@ -407,7 +407,7 @@ impl ProviderRuntime for AnthropicProviderRuntime {
                         secret,
                         "bedrock-bearer",
                     ));
-                let client = crate::anthropic::AnthropicClient::builder(String::new())
+                let client = meerkat_client::AnthropicClient::builder(String::new())
                     .authorizer(authorizer)
                     .base_url(base_url)
                     .build()
@@ -439,7 +439,7 @@ impl ProviderRuntime for AnthropicProviderRuntime {
                         secret,
                         "vertex-bearer",
                     ));
-                let client = crate::anthropic::AnthropicClient::builder(String::new())
+                let client = meerkat_client::AnthropicClient::builder(String::new())
                     .authorizer(authorizer)
                     .base_url(base_url)
                     .build()

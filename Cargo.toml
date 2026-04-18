@@ -5,6 +5,7 @@ members = [
     "meerkat-models",
     "meerkat-core",
     "meerkat-client",
+    "meerkat-providers",
     "meerkat-schedule",
     "meerkat-store",
     "meerkat-tools",
@@ -123,6 +124,7 @@ tempfile = "3.14"
 meerkat-models = { version = "0.6.0", path = "meerkat-models" }
 meerkat-core = { version = "0.6.0", path = "meerkat-core" }
 meerkat-client = { version = "0.6.0", path = "meerkat-client", default-features = false }
+meerkat-providers = { version = "0.6.0", path = "meerkat-providers", default-features = false }
 meerkat-schedule = { version = "0.6.0", path = "meerkat-schedule" }
 meerkat-tools = { version = "0.6.0", path = "meerkat-tools", default-features = false }
 meerkat-mcp = { version = "0.6.0", path = "meerkat-mcp" }

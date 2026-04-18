@@ -18,7 +18,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
-use meerkat_client::auth_oauth::{
+use meerkat_providers::auth_oauth::{
     DevicePollOutcome, OAuthEndpoints, PkcePair, exchange_authorization_code,
     exchange_refresh_token, poll_device_code, request_device_code, run_loopback_callback,
 };
@@ -56,7 +56,10 @@ async fn loopback_rejects_state_mismatch() {
     });
     let err = handle.wait(Duration::from_secs(5)).await.unwrap_err();
     assert!(
-        matches!(err, meerkat_client::auth_oauth::OAuthError::StateMismatch),
+        matches!(
+            err,
+            meerkat_providers::auth_oauth::OAuthError::StateMismatch
+        ),
         "got {err:?}"
     );
 }
@@ -76,7 +79,7 @@ async fn loopback_surfaces_access_denied() {
     });
     let err = handle.wait(Duration::from_secs(5)).await.unwrap_err();
     assert!(
-        matches!(err, meerkat_client::auth_oauth::OAuthError::UserDenied),
+        matches!(err, meerkat_providers::auth_oauth::OAuthError::UserDenied),
         "got {err:?}"
     );
 }
@@ -88,7 +91,7 @@ async fn loopback_times_out_if_no_callback_fires() {
         .unwrap();
     let err = handle.wait(Duration::from_millis(200)).await.unwrap_err();
     assert!(
-        matches!(err, meerkat_client::auth_oauth::OAuthError::Timeout),
+        matches!(err, meerkat_providers::auth_oauth::OAuthError::Timeout),
         "got {err:?}"
     );
 }

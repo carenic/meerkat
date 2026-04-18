@@ -8,7 +8,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use meerkat_client::auth_store::{
+use meerkat_providers::auth_store::{
     EphemeralTokenStore, FileTokenStore, PersistedAuthMode, PersistedTokens, TokenKey, TokenStore,
 };
 
@@ -199,8 +199,10 @@ async fn file_save_sets_0o600_perms() {
 #[ignore = "AutoTokenStore hits the real OS keychain when native-keyring is enabled; opt in with --include-ignored"]
 async fn auto_round_trip_falls_back_to_file() {
     let temp = tempfile::tempdir().unwrap();
-    let store =
-        meerkat_client::auth_store::AutoTokenStore::new(temp.path().to_path_buf(), "meerkat-test");
+    let store = meerkat_providers::auth_store::AutoTokenStore::new(
+        temp.path().to_path_buf(),
+        "meerkat-test",
+    );
     let key = k("dev", "default_openai");
     let tokens = sample_api_key();
 
@@ -216,7 +218,7 @@ fn backend_names_are_stable_strings() {
     assert_eq!(FileTokenStore::new("/tmp/x").backend_name(), "file");
     assert_eq!(EphemeralTokenStore::new().backend_name(), "ephemeral");
     assert_eq!(
-        meerkat_client::auth_store::AutoTokenStore::new("/tmp/x", "svc").backend_name(),
+        meerkat_providers::auth_store::AutoTokenStore::new("/tmp/x", "svc").backend_name(),
         "auto",
     );
 }

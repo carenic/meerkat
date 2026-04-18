@@ -13,11 +13,11 @@
 
 use std::collections::BTreeMap;
 
-use meerkat_client::{ProviderAuthError, ProviderRuntimeRegistry, ResolverEnvironment};
 use meerkat_core::{
     AuthProfile, BackendProfile, BindingPolicy, CredentialSourceSpec, Provider, ProviderBinding,
     RealmConnectionSet,
 };
+use meerkat_providers::{ProviderAuthError, ProviderRuntimeRegistry, ResolverEnvironment};
 
 /// Build an in-memory RealmConnectionSet carrying one binding per provider
 /// with InlineSecret auth.
@@ -238,7 +238,7 @@ fn unsupported_combination_surfaces_typed_error() {
     assert!(
         matches!(
             err,
-            ProviderAuthError::Binding(meerkat_client::ProviderBindingError::ProviderMismatch)
+            ProviderAuthError::Binding(meerkat_providers::ProviderBindingError::ProviderMismatch)
         ),
         "expected ProviderAuthError::Binding(ProviderMismatch), got {err:?}",
     );

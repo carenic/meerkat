@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::FutureExt;
-use meerkat_client::auth_store::{
+use meerkat_providers::auth_store::{
     InMemoryCoordinator, PersistedTokens, RefreshCoordinator, RefreshError, TokenKey,
 };
 

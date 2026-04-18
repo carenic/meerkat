@@ -13,6 +13,7 @@ meerkat-core
 meerkat-schedule
 meerkat-contracts
 meerkat-client
+meerkat-providers
 meerkat-store
 meerkat-tools
 meerkat-runtime

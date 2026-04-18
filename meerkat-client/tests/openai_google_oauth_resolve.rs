@@ -14,16 +14,16 @@ use std::sync::Arc;
 
 use chrono::{Duration as ChronoDuration, Utc};
 
-use meerkat_client::auth_store::{
-    EphemeralTokenStore, PersistedAuthMode, PersistedTokens, TokenKey, TokenStore,
-};
-use meerkat_client::providers::google::oauth as g_oauth;
-use meerkat_client::providers::openai::oauth as o_oauth;
-use meerkat_client::runtime::{ProviderRuntimeRegistry, ResolverEnvironment};
 use meerkat_core::{
     AuthProfileConfig, BackendProfileConfig, CredentialSourceSpec, ProviderBindingConfig,
     RealmConfigSection, RealmConnectionSet,
 };
+use meerkat_providers::auth_store::{
+    EphemeralTokenStore, PersistedAuthMode, PersistedTokens, TokenKey, TokenStore,
+};
+use meerkat_providers::providers::google::oauth as g_oauth;
+use meerkat_providers::providers::openai::oauth as o_oauth;
+use meerkat_providers::runtime::{ProviderRuntimeRegistry, ResolverEnvironment};
 
 fn openai_realm(backend_kind: &str, auth_method: &str) -> RealmConnectionSet {
     let mut backend = BTreeMap::new();
@@ -202,7 +202,7 @@ async fn openai_chatgpt_oauth_missing_tokens_surfaces_interactive_login_required
     assert!(
         matches!(
             err,
-            meerkat_client::ProviderAuthError::Auth(
+            meerkat_providers::ProviderAuthError::Auth(
                 meerkat_core::AuthError::InteractiveLoginRequired
             )
         ),

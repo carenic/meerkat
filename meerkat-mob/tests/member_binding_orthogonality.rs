@@ -21,9 +21,9 @@
 
 use std::sync::Arc;
 
-use meerkat_client::{ProviderRuntimeRegistry, ResolverEnvironment};
 use meerkat_core::auth::ResolvedAuthKind;
 use meerkat_core::{RealmConfigSection, RealmConnectionSet};
+use meerkat_providers::{ProviderRuntimeRegistry, ResolverEnvironment};
 
 fn realm_with_anthropic_key(realm_id: &str, key: &str) -> RealmConnectionSet {
     let section = RealmConfigSection::from_inline_api_keys(&[("anthropic", key)]);

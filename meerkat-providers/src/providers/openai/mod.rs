@@ -18,7 +18,7 @@ use crate::runtime::errors::{ProviderAuthError, ProviderBindingError, ProviderCl
 use crate::runtime::provider_runtime::ProviderRuntime;
 use crate::runtime::registry::ResolverEnvironment;
 use crate::runtime::resolver::{resolve_external_authorizer, resolve_simple_secret};
-use crate::types::LlmClient;
+use meerkat_client::LlmClient;
 
 pub use auth::OpenAiAuthMethod;
 pub use backend::OpenAiBackendKind;
@@ -289,9 +289,10 @@ impl ProviderRuntime for OpenAiProviderRuntime {
                 .base_url
                 .clone()
                 .unwrap_or_else(|| backend_kind.default_base_url().into());
-            let client =
-                crate::openai::OpenAiClient::new_with_optional_api_key_and_base_url(None, base_url)
-                    .with_authorizer(authorizer);
+            let client = meerkat_client::OpenAiClient::new_with_optional_api_key_and_base_url(
+                None, base_url,
+            )
+            .with_authorizer(authorizer);
             return Ok(Arc::new(client));
         }
         // No inline secret and no DynamicAuthorizer kind: the
@@ -323,9 +324,9 @@ impl ProviderRuntime for OpenAiProviderRuntime {
                 // S1-verified: OpenAiClient::new returns Self (infallible).
                 let client = match &connection.backend_profile.base_url {
                     Some(url) => {
-                        crate::openai::OpenAiClient::new_with_base_url(secret, url.clone())
+                        meerkat_client::OpenAiClient::new_with_base_url(secret, url.clone())
                     }
-                    None => crate::openai::OpenAiClient::new(secret),
+                    None => meerkat_client::OpenAiClient::new(secret),
                 };
                 Ok(Arc::new(client))
             }
@@ -344,7 +345,7 @@ impl ProviderRuntime for OpenAiProviderRuntime {
                 if matches!(is_fedramp, Some(true)) {
                     extra_headers.push((auth::FEDRAMP_HEADER.to_string(), "true".to_string()));
                 }
-                let client = crate::openai::OpenAiClient::new_with_base_url(secret, base_url)
+                let client = meerkat_client::OpenAiClient::new_with_base_url(secret, base_url)
                     .with_extra_headers(extra_headers);
                 Ok(Arc::new(client))
             }

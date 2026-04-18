@@ -10,7 +10,7 @@ use meerkat_core::{AuthProfile, BackendProfile, Provider};
 use crate::runtime::binding::{ResolvedConnection, ValidatedBinding};
 use crate::runtime::errors::{ProviderAuthError, ProviderBindingError, ProviderClientError};
 use crate::runtime::registry::ResolverEnvironment;
-use crate::types::LlmClient;
+use meerkat_client::LlmClient;
 
 /// Per-provider runtime contract: validate a binding, resolve credentials,
 /// construct an LlmClient.

@@ -27,8 +27,8 @@ use axum::routing::{get, post};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
-use meerkat_client::authorizers::{GoogleAuthAuthorizer, GoogleAuthChain};
 use meerkat_core::{HttpAuthorizationRequest, HttpAuthorizer};
+use meerkat_providers::authorizers::{GoogleAuthAuthorizer, GoogleAuthChain};
 
 const TEST_PRIVATE_KEY: &str = include_str!("fixtures/test_sa_key.pem");
 

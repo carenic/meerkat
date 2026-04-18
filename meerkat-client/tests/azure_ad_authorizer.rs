@@ -22,8 +22,8 @@ use axum::routing::post;
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
-use meerkat_client::authorizers::{AzureAdAuthorizer, AzureClientCredentials};
 use meerkat_core::{HttpAuthorizationRequest, HttpAuthorizer};
+use meerkat_providers::authorizers::{AzureAdAuthorizer, AzureClientCredentials};
 
 #[derive(Deserialize, Clone)]
 struct TokenForm {
@@ -171,7 +171,7 @@ async fn from_env_reads_azure_credentials() {
     let err = AzureClientCredentials::from_env(|_| None).unwrap_err();
     assert!(matches!(
         err,
-        meerkat_client::authorizers::AzureAuthError::MissingEnv("AZURE_TENANT_ID")
+        meerkat_providers::authorizers::AzureAuthError::MissingEnv("AZURE_TENANT_ID")
     ));
 }
 

@@ -9,8 +9,8 @@
 #![cfg(all(not(target_arch = "wasm32"), feature = "aws-auth"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use meerkat_client::authorizers::{AwsCredentialProvider, AwsStsAuthorizer};
 use meerkat_core::{HttpAuthorizationRequest, HttpAuthorizer};
+use meerkat_providers::authorizers::{AwsCredentialProvider, AwsStsAuthorizer};
 
 fn static_provider() -> AwsCredentialProvider {
     AwsCredentialProvider::Static {

@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use crate::error::LlmError;
+use meerkat_client::LlmError;
 
 /// Binding-validation errors raised by a provider runtime.
 #[derive(Debug, Error, PartialEq, Eq)]

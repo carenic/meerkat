@@ -84,18 +84,16 @@ pub struct OpenAiLiveClient {
 
 impl OpenAiLiveClient {
     /// Create a new OpenAI live client.
+    ///
+    /// Callers should acquire the api key via
+    /// `meerkat::resolve_provider_api_key(config, Provider::OpenAI)` so
+    /// env reads flow through the canonical `ProviderRuntimeRegistry`
+    /// resolver path (dogma §1/§7/§14). Direct env reads inside this
+    /// crate are forbidden — see plan §6.5.
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
         }
-    }
-
-    /// Create a client from environment variables with `RKAT_*` precedence.
-    pub fn from_env() -> Result<Self, LlmError> {
-        let api_key = std::env::var("RKAT_OPENAI_API_KEY")
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .map_err(|_| LlmError::InvalidApiKey)?;
-        Ok(Self::new(api_key))
     }
 }
 
@@ -2005,6 +2003,7 @@ mod tests {
                 provider: Provider::OpenAI,
                 self_hosted_server_id: None,
                 provider_params: None,
+                connection_ref: None,
             },
             vec![ToolDef {
                 name: "send_request".to_string(),
@@ -3834,6 +3833,7 @@ mod tests {
             provider: Provider::OpenAI,
             self_hosted_server_id: None,
             provider_params: None,
+            connection_ref: None,
         };
         assert_eq!(
             openai_realtime_connect_model(&semantic_identity),
@@ -3845,6 +3845,7 @@ mod tests {
             provider: Provider::OpenAI,
             self_hosted_server_id: None,
             provider_params: None,
+            connection_ref: None,
         };
         assert_eq!(
             openai_realtime_connect_model(&realtime_identity),
