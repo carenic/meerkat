@@ -55,6 +55,7 @@ chrono = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 clap = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
 
 [features]
 default = ["comms", "mcp", "mob", "schedule"]
@@ -69,6 +70,7 @@ tokio = { workspace = true, features = ["test-util", "macros"] }
 futures = { workspace = true }
 async-stream = { workspace = true }
 tempfile = { workspace = true }
+tokio-tungstenite = "0.28"
 
 [lints]
 workspace = true

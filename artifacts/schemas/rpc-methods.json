@@ -199,10 +199,34 @@
       "name": "skills/inspect"
     },
     {
+      "description": "Get bootstrap metadata for opening a realtime channel",
+      "name": "realtime/open_info",
+      "params_type": "RealtimeOpenRequest",
+      "result_type": "RealtimeOpenInfo"
+    },
+    {
+      "description": "Get product-layer realtime channel status for a target",
+      "name": "realtime/status",
+      "params_type": "RealtimeStatusParams",
+      "result_type": "RealtimeStatusResult"
+    },
+    {
+      "description": "Get product-layer realtime capabilities for a target",
+      "name": "realtime/capabilities",
+      "params_type": "RealtimeCapabilitiesParams",
+      "result_type": "RealtimeCapabilitiesResult"
+    },
+    {
       "description": "Get a session runtime's current state",
       "name": "runtime/state",
       "params_type": "RuntimeStateParams",
       "result_type": "RuntimeStateResult"
+    },
+    {
+      "description": "Get a session runtime's realtime attachment status",
+      "name": "runtime/realtime_attachment_status",
+      "params_type": "RuntimeRealtimeAttachmentStatusParams",
+      "result_type": "RuntimeRealtimeAttachmentStatusResult"
     },
     {
       "description": "Accept a runtime input for a session",
@@ -327,12 +351,48 @@
       "name": "mob/force_cancel"
     },
     {
+      "description": "Attach live voice intent to a mob member",
+      "name": "mob/realtime_attach",
+      "params_type": "MobRealtimeAttachParams",
+      "result_type": "MobRealtimeAttachResult"
+    },
+    {
+      "description": "Detach live voice intent from a mob member",
+      "name": "mob/realtime_detach",
+      "params_type": "MobRealtimeDetachParams",
+      "result_type": "MobRealtimeDetachResult"
+    },
+    {
       "description": "Start a turn on a mob member by identity",
       "name": "mob/turn_start"
     },
     {
       "description": "Get live status for a mob member",
       "name": "mob/member_status"
+    },
+    {
+      "description": "Point-in-time aggregate of mob status plus member list",
+      "name": "mob/snapshot"
+    },
+    {
+      "description": "Destroy a mob and surface the structured MobDestroyReport",
+      "name": "mob/destroy"
+    },
+    {
+      "description": "Rotate the supervisor bridge for all members of a mob",
+      "name": "mob/rotate_supervisor"
+    },
+    {
+      "description": "Submit a unit of work to a mob member through the work lane",
+      "name": "mob/submit_work"
+    },
+    {
+      "description": "Cancel a previously submitted unit of work",
+      "name": "mob/cancel_work"
+    },
+    {
+      "description": "Cancel all in-flight work for a mob member",
+      "name": "mob/cancel_all_work"
     },
     {
       "description": "Wait for kickoff completion for a member",
