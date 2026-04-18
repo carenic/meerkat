@@ -601,10 +601,6 @@ pub enum BuildAgentError {
     #[error("Cannot infer provider from model '{model}'")]
     UnknownProvider { model: String },
 
-    /// API key is not set for the resolved provider.
-    #[error("API key not set for provider '{provider}'")]
-    MissingApiKey { provider: String },
-
     /// Realm-scoped connection binding failed to resolve into a client.
     ///
     /// Produced by the Phase 3 `ProviderRuntimeRegistry` dispatch path
@@ -1805,13 +1801,14 @@ impl AgentFactory {
                         .resolve(&realm, &binding_id, &env)
                         .await
                         .map_err(|e| {
-                            // Preserve MissingApiKey error shape for the
-                            // env-var fallback so CLI surfaces continue to
-                            // prompt the user with a precise message.
+                            // CLI surfaces prompt the user by parsing the
+                            // error message; keep the env-default text
+                            // stable for that contract.
                             if is_env_default {
-                                BuildAgentError::MissingApiKey {
-                                    provider: provider_key(provider).to_string(),
-                                }
+                                BuildAgentError::ConnectionResolution(format!(
+                                    "API key not set for provider '{}'",
+                                    provider_key(provider)
+                                ))
                             } else {
                                 BuildAgentError::ConnectionResolution(e.to_string())
                             }
