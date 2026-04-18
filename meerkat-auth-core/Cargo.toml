@@ -93,6 +93,11 @@ ignored = [
     "hex",
     "sha2",
     "getrandom",
+    "http",
+    "indexmap",
+    "schemars",
+    "tokio_with_wasm",
+    "tracing",
 ]
 
 [lints]

@@ -13,12 +13,10 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-meerkat-core = { workspace = true }
 meerkat-llm-core = { workspace = true }
 meerkat-auth-core = { workspace = true, default-features = false }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util", "macros"] }
 
 [features]
 default = ["oauth"]

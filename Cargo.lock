@@ -3163,19 +3163,15 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
- "base64",
  "chrono",
  "futures",
  "getrandom 0.3.4",
- "indexmap",
  "meerkat-auth-core",
- "meerkat-contracts",
  "meerkat-core",
  "meerkat-llm-core",
  "reqwest",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio_with_wasm",
@@ -3331,7 +3327,6 @@ dependencies = [
  "getrandom 0.3.4",
  "indexmap",
  "meerkat-auth-core",
- "meerkat-contracts",
  "meerkat-core",
  "meerkat-llm-core",
  "reqwest",
@@ -3339,9 +3334,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
- "tokio",
  "tokio_with_wasm",
- "tracing",
 ]
 
 [[package]]
@@ -3555,7 +3548,6 @@ dependencies = [
  "meerkat-machine-dsl",
  "meerkat-machine-kernels",
  "meerkat-machine-schema",
- "meerkat-providers",
  "meerkat-runtime",
  "meerkat-session",
  "meerkat-store",
@@ -3624,7 +3616,6 @@ version = "0.6.0"
 dependencies = [
  "meerkat-core",
  "schemars 1.2.1",
- "serde",
  "serde_json",
 ]
 
@@ -3661,9 +3652,7 @@ name = "meerkat-providers"
 version = "0.6.0"
 dependencies = [
  "meerkat-auth-core",
- "meerkat-core",
  "meerkat-llm-core",
- "tokio",
 ]
 
 [[package]]
@@ -3906,7 +3895,6 @@ dependencies = [
  "getrandom 0.3.4",
  "js-sys",
  "meerkat",
- "meerkat-client",
  "meerkat-comms",
  "meerkat-core",
  "meerkat-hooks",

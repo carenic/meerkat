@@ -13,6 +13,7 @@
 //! (2026-04-18).
 
 pub mod runtime {
+    #[cfg(not(target_arch = "wasm32"))]
     pub use meerkat_auth_core::resolver::{resolve_external_authorizer, resolve_simple_secret};
     pub use meerkat_llm_core::provider_runtime::{
         AuthLease, DynamicLease, ExternalAuthResolverHandle, NormalizedAuthMethod,
@@ -29,12 +30,17 @@ pub use meerkat_llm_core::provider_runtime::{
     ValidatedBinding,
 };
 
+// auth-core impls are non-wasm by construction (filesystem, keyring,
+// OS lockfile primitives are not available in the browser).
+#[cfg(not(target_arch = "wasm32"))]
 pub mod auth_oauth {
     pub use meerkat_auth_core::auth_oauth::*;
 }
+#[cfg(not(target_arch = "wasm32"))]
 pub mod auth_store {
     pub use meerkat_auth_core::auth_store::*;
 }
+#[cfg(not(target_arch = "wasm32"))]
 pub mod authorizers {
     pub use meerkat_auth_core::authorizers::*;
 }
