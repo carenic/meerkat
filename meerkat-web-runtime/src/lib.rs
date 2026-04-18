@@ -328,7 +328,44 @@ struct RuntimeState {
     js_tools: Vec<JsToolEntry>,
 }
 
-/// Resolve per-provider API keys into a `Config.providers.api_keys` map.
+/// Populate `config.realm["default"]` with InlineSecret-backed bindings
+/// for each provider in `api_keys`. Plan §6.10 replacement for the
+/// deleted shared settings write path (plan §6.10).
+/// The first provider becomes the default binding; per-provider base
+/// URLs, when provided via `base_urls`, are applied to the matching
+/// backend profile.
+fn populate_realm_from_api_keys(
+    config: &mut meerkat_core::Config,
+    api_keys: &HashMap<String, String>,
+    base_urls: Option<&HashMap<String, String>>,
+) {
+    let mut entries: Vec<(&str, &str)> = api_keys
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    // Deterministic order: anthropic first (historical default), then
+    // openai, gemini, everything else alphabetically.
+    entries.sort_by_key(|(k, _)| match *k {
+        "anthropic" => 0,
+        "openai" => 1,
+        "gemini" | "google" => 2,
+        _ => 3,
+    });
+
+    let mut section = meerkat_core::RealmConfigSection::from_inline_api_keys(&entries);
+    if let Some(urls) = base_urls {
+        for (provider, url) in urls {
+            let id = format!("default_{provider}");
+            if let Some(bp) = section.backend.get_mut(&id) {
+                bp.base_url = Some(url.clone());
+            }
+        }
+    }
+    config.realm.insert("default".to_string(), section);
+}
+
+/// Resolve per-provider API keys into a map consumed by
+/// [`populate_realm_from_api_keys`].
 ///
 /// `api_key` is the backward-compat single key (treated as anthropic fallback).
 /// Per-provider fields take precedence when set. Empty/whitespace-only keys are
@@ -368,7 +405,8 @@ fn build_provider_api_keys(
     Ok(keys)
 }
 
-/// Resolve per-provider base URLs into a `Config.providers.base_urls` map.
+/// Resolve per-provider base URLs into a map keyed by provider name
+/// that `populate_realm_from_api_keys` applies to the backend profiles.
 ///
 /// Per-provider fields (`anthropic_base_url`, etc.) take precedence. The
 /// backward-compat single `base_url` is mapped to the default model's inferred
@@ -451,7 +489,7 @@ fn build_service_infrastructure(
     let mut builder = meerkat::FactoryAgentBuilder::new(factory, config);
 
     // NO default_llm_client — build_agent() resolves the correct provider per-model
-    // from Config.providers.api_keys. This is architecturally correct: per-agent
+    // from realm config bindings. This is architecturally correct: per-agent
     // provider agnosticity works the same way on WASM as on all other surfaces.
 
     let tools = build_wasm_tool_dispatcher().map_err(|e| err_str("tool_error", e))?;
@@ -1154,16 +1192,16 @@ pub fn init_runtime(mobpack_bytes: &[u8], credentials_json: &str) -> Result<JsVa
     });
 
     let providers: Vec<String> = api_keys.keys().cloned().collect();
-    let mut config = Config::default();
-    config.agent.model.clone_from(&model);
-    config.providers.api_keys = Some(api_keys);
-    config.providers.base_urls = build_provider_base_urls(
+    let base_urls = build_provider_base_urls(
         creds.base_url.as_deref(),
         creds.anthropic_base_url.as_deref(),
         creds.openai_base_url.as_deref(),
         creds.gemini_base_url.as_deref(),
         &model,
     );
+    let mut config = Config::default();
+    config.agent.model.clone_from(&model);
+    populate_realm_from_api_keys(&mut config, &api_keys, base_urls.as_ref());
 
     let (session_service, mob_state) = build_service_infrastructure(config, MAX_SESSIONS)?;
 
@@ -1213,16 +1251,16 @@ pub fn init_runtime_from_config(config_json: &str) -> Result<JsValue, JsValue> {
     let max_sessions = rt_config.max_sessions;
 
     let providers: Vec<String> = api_keys.keys().cloned().collect();
-    let mut config = Config::default();
-    config.agent.model.clone_from(&model);
-    config.providers.api_keys = Some(api_keys);
-    config.providers.base_urls = build_provider_base_urls(
+    let base_urls = build_provider_base_urls(
         rt_config.base_url.as_deref(),
         rt_config.anthropic_base_url.as_deref(),
         rt_config.openai_base_url.as_deref(),
         rt_config.gemini_base_url.as_deref(),
         &model,
     );
+    let mut config = Config::default();
+    config.agent.model.clone_from(&model);
+    populate_realm_from_api_keys(&mut config, &api_keys, base_urls.as_ref());
 
     let (session_service, mob_state) = build_service_infrastructure(config, max_sessions)?;
 
@@ -2483,8 +2521,6 @@ pub fn close_subscription(handle: u32) -> Result<(), JsValue> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(target_arch = "wasm32"))]
-    use super::build_service_infrastructure;
     use super::{
         EventSubscription, SUBSCRIPTIONS, SubscriptionInner, close_subscription,
         merge_runtime_system_context_state, poll_subscription,
@@ -2494,6 +2530,8 @@ mod tests {
         append_system_context, create_session_simple, destroy_session, get_session_state,
         init_runtime_from_config,
     };
+    #[cfg(not(target_arch = "wasm32"))]
+    use super::{build_service_infrastructure, populate_realm_from_api_keys};
     #[cfg(not(target_arch = "wasm32"))]
     use super::{helper_result_payload, spawn_member_result_payload, spawn_result_payload};
     #[cfg(not(target_arch = "wasm32"))]
@@ -2606,10 +2644,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn mob_append_system_context_targets_member_session() {
         let mut config = Config::default();
-        config.providers.api_keys = Some(HashMap::from([(
-            "anthropic".to_string(),
-            "sk-test".to_string(),
-        )]));
+        populate_realm_from_api_keys(
+            &mut config,
+            &HashMap::from([("anthropic".to_string(), "sk-test".to_string())]),
+            None,
+        );
         let (service, mob_state) =
             build_service_infrastructure(config, 8).expect("build runtime services");
 
@@ -2747,10 +2786,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn helper_result_payload_returns_identity_native_fields() {
         let mut config = Config::default();
-        config.providers.api_keys = Some(HashMap::from([(
-            "anthropic".to_string(),
-            "sk-test".to_string(),
-        )]));
+        populate_realm_from_api_keys(
+            &mut config,
+            &HashMap::from([("anthropic".to_string(), "sk-test".to_string())]),
+            None,
+        );
         let (_service, mob_state) =
             build_service_infrastructure(config, 8).expect("build runtime services");
 

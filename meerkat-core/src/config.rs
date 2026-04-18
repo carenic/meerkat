@@ -35,7 +35,6 @@ pub struct Config {
     pub max_tokens: u32,
     pub shell: ShellDefaults,
     pub store: StoreConfig,
-    pub providers: ProviderSettings,
     pub comms: CommsRuntimeConfig,
     pub compaction: CompactionRuntimeConfig,
     pub limits: LimitsConfig,
@@ -71,7 +70,6 @@ impl Default for Config {
             max_tokens,
             shell: ShellDefaults::default(),
             store: StoreConfig::default(),
-            providers: ProviderSettings::default(),
             comms: CommsRuntimeConfig::default(),
             compaction: CompactionRuntimeConfig::default(),
             limits: LimitsConfig::default(),
@@ -308,9 +306,6 @@ impl Config {
         }
         if other.store != StoreConfig::default() {
             self.store = other.store;
-        }
-        if other.providers != ProviderSettings::default() {
-            self.providers = other.providers;
         }
         if other.comms != CommsRuntimeConfig::default() {
             self.comms = other.comms;
@@ -953,13 +948,10 @@ pub struct StoreConfig {
     pub database_dir: Option<PathBuf>,
 }
 
-/// Provider settings sourced from config.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(default)]
-pub struct ProviderSettings {
-    pub base_urls: Option<HashMap<String, String>>,
-    pub api_keys: Option<HashMap<String, String>>,
-}
+// Plan §6.10 deleted `ProviderSettings` entirely. Per-provider api keys
+// and base URLs now live exclusively in `[realm.<id>]` config blocks
+// (programmatically constructed via `RealmConfigSection::from_inline_api_keys`
+// for surfaces that receive credentials at bootstrap).
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
@@ -1296,7 +1288,7 @@ pub enum CommsRuntimeMode {
 //     consumed through `ProviderRuntimeRegistry::resolve`.
 //
 // The legacy `config.provider = ProviderConfig::{Anthropic,OpenAI,Gemini}`
-// block and the `providers.api_keys` / `providers.base_urls` maps are
+// block and the legacy shared settings maps are
 // removed in the same 0.6.0 cutover (plan §6.10).
 
 /// Storage configuration
@@ -2127,32 +2119,13 @@ bearer_token = "secret-token"
         );
     }
 
-    #[test]
-    fn test_merge_providers_section_replaces_non_default() {
-        let mut base = Config::default();
-        base.providers.base_urls = Some(HashMap::from([
-            ("anthropic".to_string(), "https://a.example".to_string()),
-            ("openai".to_string(), "https://o.example".to_string()),
-        ]));
-
-        let mut other = Config::default();
-        other.providers.base_urls = Some(HashMap::from([(
-            "openai".to_string(),
-            "https://override.example".to_string(),
-        )]));
-
-        base.merge(other);
-        let urls = base
-            .providers
-            .base_urls
-            .expect("providers.base_urls missing");
-        assert_eq!(urls.len(), 1);
-        assert_eq!(
-            urls.get("openai").map(String::as_str),
-            Some("https://override.example")
-        );
-        assert!(!urls.contains_key("anthropic"));
-    }
+    // Plan §6.10 deleted the ProviderSettings struct (and its api_keys /
+    // base_urls maps) entirely. The corresponding merge test that
+    // asserted the "non-default other replaces self" semantics went
+    // with it. Realm-scoped base_urls now live in
+    // `[realm.<id>.backend.<b>.base_url]` and round-trip through the
+    // normal TOML merge path that the
+    // `test_merge_extraction_prompt_survives_layering` case exercises.
 
     #[test]
     fn test_merge_toml_tools_omitted_fields_preserve_lower_layer() {

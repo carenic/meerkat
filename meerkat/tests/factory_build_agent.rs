@@ -272,19 +272,18 @@ async fn build_agent_without_override_fails_missing_api_key() {
     );
 }
 
-/// 2b. Provider API key from `providers.api_keys[<p>]` is honored when
-///     env vars are absent. Plan §6.9 removed the `config.provider =
-///     ProviderConfig::X` legacy block; this test now exercises the
-///     shared-map path instead.
+/// 2b. Provider API key from a `[realm.default]` inline-secret binding is
+///     honored when env vars are absent. Plan §6.9/§6.10 removed both
+///     the legacy enum block and the shared settings map; this test
+///     now exercises the realm-based path.
 #[tokio::test]
 async fn build_agent_uses_provider_config_api_key() {
     let temp = tempfile::tempdir().unwrap();
     let factory = temp_factory(&temp);
     let mut config = Config::default();
-    config.providers.api_keys = Some(std::collections::HashMap::from([(
-        "openai".to_string(),
-        "test-openai-key".to_string(),
-    )]));
+    let section =
+        meerkat_core::RealmConfigSection::from_inline_api_keys(&[("openai", "test-openai-key")]);
+    config.realm.insert("default".to_string(), section);
 
     let build_config = AgentBuildConfig::new("gpt-5.2");
     let result = factory.build_agent(build_config, &config).await;

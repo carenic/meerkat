@@ -287,7 +287,7 @@ impl RealmConnectionSet {
 
     /// Synthesize a default realm with an inline secret instead of an env
     /// lookup. Used when callers have already read the api key from a
-    /// config file (legacy `config.providers.api_keys` path).
+    /// config file (legacy credential-map path).
     pub fn synthesize_inline_default(provider: Provider, secret: String) -> Self {
         Self::synthesize_default(provider, Some(secret))
     }
@@ -415,6 +415,81 @@ pub struct RealmConfigSection {
     pub binding: BTreeMap<String, ProviderBindingConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_binding: Option<String>,
+}
+
+impl RealmConfigSection {
+    /// Programmatic constructor for a realm populated from per-provider
+    /// inline api keys. Used by surfaces (notably the WASM browser
+    /// runtime) that receive credentials as plain strings at bootstrap
+    /// and need to translate them into the realm-based config shape
+    /// consumed by `AgentFactory::build_agent`.
+    ///
+    /// For each (provider, secret) pair, emits:
+    ///   - a `BackendProfileConfig { provider, backend_kind: "<p>_api" }`
+    ///   - an `AuthProfileConfig` with `CredentialSourceSpec::InlineSecret`
+    ///   - a `ProviderBindingConfig` wiring the two
+    ///
+    /// The first provider in the input list becomes the
+    /// `default_binding` so that build_agent's connection_ref-less
+    /// code path can resolve through this realm. Plan §6.10 replacement
+    /// for the deleted `ProviderSettings.api_keys` map.
+    pub fn from_inline_api_keys(entries: &[(&str, &str)]) -> Self {
+        let mut backend = BTreeMap::new();
+        let mut auth = BTreeMap::new();
+        let mut binding = BTreeMap::new();
+        let mut default_binding: Option<String> = None;
+
+        for (idx, (provider, secret)) in entries.iter().enumerate() {
+            let id = format!("default_{provider}");
+            let backend_kind = match *provider {
+                "anthropic" => "anthropic_api",
+                "openai" => "openai_api",
+                "gemini" | "google" => "google_genai",
+                other => other,
+            };
+            backend.insert(
+                id.clone(),
+                BackendProfileConfig {
+                    provider: provider.to_string(),
+                    backend_kind: backend_kind.to_string(),
+                    base_url: None,
+                    options: serde_json::Value::Null,
+                },
+            );
+            auth.insert(
+                id.clone(),
+                AuthProfileConfig {
+                    provider: provider.to_string(),
+                    auth_method: "api_key".to_string(),
+                    source: CredentialSourceSpec::InlineSecret {
+                        secret: (*secret).to_string(),
+                    },
+                    storage: Some(CredentialStorageSpec::Ephemeral),
+                    constraints: AuthConstraints::default(),
+                    metadata_defaults: AuthMetadataDefaults::default(),
+                },
+            );
+            binding.insert(
+                id.clone(),
+                ProviderBindingConfig {
+                    backend_profile: id.clone(),
+                    auth_profile: id.clone(),
+                    default_model: None,
+                    policy: BindingPolicy::default(),
+                },
+            );
+            if idx == 0 {
+                default_binding = Some(id);
+            }
+        }
+
+        Self {
+            backend,
+            auth,
+            binding,
+            default_binding,
+        }
+    }
 }
 
 /// Serialized backend profile (pre-normalization).

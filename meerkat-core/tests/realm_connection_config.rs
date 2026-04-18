@@ -17,13 +17,10 @@ use meerkat_core::{
 };
 
 /// Canonical TOML fixture used across the happy-path and negative tests.
-/// Intentionally mixes new `[realm.*]` tables with flat `[providers]`
-/// config to prove the legacy path is unaffected.
+/// Post plan §6.10 the legacy `[providers]` flat table is deleted — the
+/// fixture now exercises the `[realm.*]` ingestion path exclusively.
 const CANONICAL_TOML: &str = r#"
 max_tokens = 4096
-
-[providers]
-api_keys = { openai = "flat-key" }
 
 [realm.dev.backend.openai_default]
 provider = "openai"
@@ -79,19 +76,10 @@ fn canonical_toml_populates_config_realm_without_regressing_flat_provider() {
     // implemented. Flat [provider]/[providers] tables still parse.
     let config = load_config();
 
-    // Flat legacy path untouched: top-level fields and flat [providers]
-    // still parse alongside the new [realm.*] tables.
+    // Top-level scalar fields parse alongside [realm.*] tables.
     assert_eq!(config.max_tokens, 4096);
-    assert_eq!(
-        config
-            .providers
-            .api_keys
-            .as_ref()
-            .and_then(|m| m.get("openai")),
-        Some(&"flat-key".to_string()),
-    );
 
-    // New realm path populated.
+    // Realm path populated.
     let section = dev_section(&config);
     assert_eq!(section.backend.len(), 2, "two backends in fixture");
     assert_eq!(section.auth.len(), 2, "two auth profiles in fixture");

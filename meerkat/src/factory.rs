@@ -661,30 +661,26 @@ pub fn provider_key(provider: Provider) -> &'static str {
 /// for runtime resolution (Phase 6.1 replacement for the deleted
 /// legacy credential-precedence helper).
 ///
-/// Precedence (post plan §6.9 cutover):
-///   1. `config.providers.api_keys[<provider>]` (shared map — scheduled
-///      for deletion in plan §6.10).
-///   2. env var `RKAT_<P>_API_KEY` -> `<P>_API_KEY` -> `GOOGLE_API_KEY` (Gemini only).
+/// Precedence (post plan §6.9/§6.10 cutover):
+///   1. env var `RKAT_<P>_API_KEY` -> `<P>_API_KEY` -> `GOOGLE_API_KEY` (Gemini only).
 ///
-/// Layer 1 synthesizes with `InlineSecret`; layer 2 synthesizes with
-/// `Env`, which the resolver's `env_lookup` seam reads at resolve time.
-/// Dogma §1: one canonical owner for "legacy credential precedence" —
+/// The env-var layer synthesizes a realm with `CredentialSourceSpec::Env`,
+/// which the resolver's `env_lookup` seam reads at resolve time.
+/// Dogma §1: one canonical owner for "env-var credential fallback" —
 /// this projection — instead of a helper in the factory body.
 fn synthesize_realm_from_config(
-    config: &Config,
+    _config: &Config,
     provider: Provider,
 ) -> meerkat_core::RealmConnectionSet {
-    let mut api_key = config
-        .providers
-        .api_keys
-        .as_ref()
-        .and_then(|map| map.get(provider_key(provider)).cloned());
-
-    // Plan §6.9 deleted the per-provider `config.provider = ProviderConfig::X`
-    // block; legacy TOML consumers with a block of that shape now need
-    // to use `[realm.<id>]` configs or env vars instead. The
-    // `providers.api_keys` shared map (scheduled for deletion in §6.10)
-    // is still honored for back-compat during 0.6.0.
+    // Plan §6.9 + §6.10 deleted the legacy `config.provider` enum and
+    // the `providers.{api_keys,base_urls}` shared maps. The only
+    // remaining precedence layer for connection_ref-less builds is
+    // env vars (RKAT_*-prefixed overrides + native `<P>_API_KEY`).
+    // Surfaces that previously populated the deleted shared map now
+    // build a `[realm.<id>]` config via
+    // `RealmConfigSection::from_inline_api_keys` and pass
+    // `connection_ref: Some(...)` through AgentBuildConfig instead.
+    let mut api_key: Option<String> = None;
 
     if api_key.is_none() {
         if std::env::var("RKAT_TEST_CLIENT").ok().as_deref() == Some("1") {
@@ -1733,8 +1729,7 @@ impl AgentFactory {
                             None => {
                                 // Three equivalent legacy paths, all
                                 // routed through the same registry:
-                                //   (a) `config.providers.api_keys[provider]`
-                                //       — TOML config-declared secret.
+                                //   (a) (deleted in plan §6.10)
                                 //   (b) `config.provider` enum with
                                 //       provider-specific api_key
                                 //       (ProviderConfig::{Anthropic,
