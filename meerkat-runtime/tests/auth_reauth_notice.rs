@@ -129,3 +129,28 @@ fn release_clears_all_state() {
     assert_eq!(handle.snapshot(key).state, None);
     assert_eq!(handle.snapshot(key).expires_at, None);
 }
+
+/// AuthLeaseSnapshot preserves expires_at through the acquire →
+/// snapshot round-trip. This is the read-path the agent runner's
+/// TTL sampler consults to decide whether to call mark_expiring.
+#[test]
+fn snapshot_preserves_expires_at_for_ttl_sampler() {
+    let handle = RuntimeAuthLeaseHandle::ephemeral();
+    let key = "ttl:binding";
+
+    // Lease with a specific expiry timestamp.
+    handle.acquire_lease(key, 1_700_000_000).unwrap();
+    let snap = handle.snapshot(key);
+    assert_eq!(snap.state.as_deref(), Some("valid"));
+    assert_eq!(snap.expires_at, Some(1_700_000_000));
+
+    // After CompleteAuthRefresh, expires_at updates.
+    handle.mark_expiring(key).unwrap();
+    handle.begin_refresh(key).unwrap();
+    handle
+        .complete_refresh(key, 1_800_000_000, 1_750_000_000)
+        .unwrap();
+    let snap = handle.snapshot(key);
+    assert_eq!(snap.state.as_deref(), Some("valid"));
+    assert_eq!(snap.expires_at, Some(1_800_000_000));
+}

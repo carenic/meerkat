@@ -682,6 +682,36 @@ where
                         self.connection_ref_binding_key.as_deref(),
                     ) {
                         let snapshot = handle.snapshot(binding_key);
+
+                        // TTL sampler — Phase 1.5-rev refresh-loop leg
+                        // (b): when the lease is still `valid` but the
+                        // resolver's recorded expires_at is within 60s
+                        // of now, drive MarkAuthExpiring so the runner
+                        // (next iteration) sees `expiring` and fires
+                        // begin_refresh. Comparing DSL-recorded TTL
+                        // against SystemTime is shell-mechanics; the
+                        // DSL's transition guard enforces legality.
+                        if snapshot.state.as_deref() == Some("valid")
+                            && let Some(expires_at) = snapshot.expires_at
+                        {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            // Leases within 60s of expiry (or already
+                            // past) trigger expiring. Max sentinel
+                            // (u64::MAX) means "no expiry" —
+                            // api_key/env-var leases land here and
+                            // never expire.
+                            if expires_at != u64::MAX && expires_at <= now.saturating_add(60) {
+                                let _ = handle.mark_expiring(binding_key);
+                            }
+                        }
+
+                        // Re-read state — may have moved to `expiring`
+                        // via the TTL check above; the match arm then
+                        // drives begin_refresh on this same iteration.
+                        let snapshot = handle.snapshot(binding_key);
                         match snapshot.state.as_deref() {
                             // expiring → drive BeginAuthRefresh input so
                             // the DSL transitions into `refreshing`.
