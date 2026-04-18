@@ -244,10 +244,22 @@ impl ProviderRuntime for OpenAiProviderRuntime {
                 },
             ));
         }
-        let lease: Arc<dyn meerkat_core::AuthLease> = Arc::new(StaticLease::empty(
-            metadata,
-            format!("openai:{}", binding.auth_profile.id),
-        ));
+        // Plan §6.11 migration: populate the lease with real credential
+        // material (StaticLease with __secret__ header OR empty for the
+        // authorizer path). shim_credential stays as a mirror until
+        // other providers are migrated and it can be deleted entirely.
+        let source_label = format!("openai:{}", binding.auth_profile.id);
+        let lease: Arc<dyn meerkat_core::AuthLease> = match &shim_credential {
+            ShimCredential::Secret(s) => Arc::new(StaticLease::new(
+                vec![("__secret__".to_string(), s.clone())],
+                metadata,
+                None,
+                source_label,
+            )),
+            ShimCredential::Authorizer | ShimCredential::None => {
+                Arc::new(StaticLease::empty(metadata, source_label))
+            }
+        };
 
         Ok(ResolvedConnection {
             provider: Provider::OpenAI,

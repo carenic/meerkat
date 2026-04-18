@@ -132,6 +132,32 @@ impl std::fmt::Debug for ResolvedConnection {
     }
 }
 
+impl ResolvedConnection {
+    /// Extract the resolved secret (api key, bearer token) from the
+    /// auth lease via the `"__secret__"` synthetic header convention.
+    /// Returns `None` if the lease is a `DynamicAuthorizer`, has no
+    /// `__secret__` header, or is empty. Plan §6.11: new build_client
+    /// code paths read this instead of `shim_credential`.
+    pub fn resolved_secret(&self) -> Option<String> {
+        match self.auth_lease.kind() {
+            meerkat_core::ResolvedAuthKind::StaticHeaders(headers) => headers
+                .iter()
+                .find_map(|(k, v)| (k == "__secret__").then(|| v.clone())),
+            _ => None,
+        }
+    }
+
+    /// Extract the resolved dynamic authorizer (AWS SigV4, Google Auth,
+    /// Azure AD, ExternalAuthorizer-backed) from the auth lease. Returns
+    /// `None` for static-headers leases. Plan §6.11.
+    pub fn resolved_authorizer(&self) -> Option<Arc<dyn HttpAuthorizer>> {
+        match self.auth_lease.kind() {
+            meerkat_core::ResolvedAuthKind::DynamicAuthorizer(auth) => Some(auth.clone()),
+            _ => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // Lease implementations
 // ---------------------------------------------------------------------

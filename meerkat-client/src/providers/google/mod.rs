@@ -196,10 +196,22 @@ impl ProviderRuntime for GoogleProviderRuntime {
             }
         };
 
-        let lease: Arc<dyn meerkat_core::AuthLease> = Arc::new(StaticLease::empty(
-            AuthMetadata::default(),
-            format!("google:{}", binding.auth_profile.id),
-        ));
+        // Plan §6.11 migration: populate the lease with real credential
+        // material (StaticLease with __secret__ header OR empty for the
+        // authorizer path — build_client constructs the concrete
+        // HttpAuthorizer on-demand for ADC / Compute / OAuth flows).
+        let source_label = format!("google:{}", binding.auth_profile.id);
+        let lease: Arc<dyn meerkat_core::AuthLease> = match &shim_credential {
+            ShimCredential::Secret(s) => Arc::new(StaticLease::new(
+                vec![("__secret__".to_string(), s.clone())],
+                AuthMetadata::default(),
+                None,
+                source_label,
+            )),
+            ShimCredential::Authorizer | ShimCredential::None => {
+                Arc::new(StaticLease::empty(AuthMetadata::default(), source_label))
+            }
+        };
 
         Ok(ResolvedConnection {
             provider: Provider::Gemini,
