@@ -262,13 +262,14 @@ impl ProviderRuntime for OpenAiProviderRuntime {
         &self,
         connection: ResolvedConnection,
     ) -> Result<Arc<dyn LlmClient>, ProviderClientError> {
+        // ProviderRuntimeRegistry dispatches on Provider enum; non-OpenAI
+        // arms are unreachable at runtime.
         let backend_kind = match connection.backend {
             NormalizedBackendKind::OpenAi(k) => k,
-            _ => {
-                return Err(ProviderClientError::MissingFeature(
-                    "openai-provider-mismatch",
-                ));
-            }
+            other => unreachable!(
+                "OpenAiProviderRuntime received non-OpenAi backend: {other:?} \
+                 — registry dispatch invariant violated"
+            ),
         };
         let secret = match connection.shim_credential {
             ShimCredential::Secret(s) => s,

@@ -214,13 +214,14 @@ impl ProviderRuntime for GoogleProviderRuntime {
         &self,
         connection: ResolvedConnection,
     ) -> Result<Arc<dyn LlmClient>, ProviderClientError> {
+        // ProviderRuntimeRegistry dispatches on Provider enum; non-Google
+        // arms are unreachable at runtime.
         let backend_kind = match connection.backend {
             NormalizedBackendKind::Google(k) => k,
-            _ => {
-                return Err(ProviderClientError::MissingFeature(
-                    "google-provider-mismatch",
-                ));
-            }
+            other => unreachable!(
+                "GoogleProviderRuntime received non-Google backend: {other:?} \
+                 — registry dispatch invariant violated"
+            ),
         };
         let secret = match connection.shim_credential {
             ShimCredential::Secret(s) => s,
@@ -240,9 +241,39 @@ impl ProviderRuntime for GoogleProviderRuntime {
                 };
                 Ok(Arc::new(client))
             }
-            GoogleBackendKind::VertexAi => Err(ProviderClientError::MissingFeature("google-adc")),
+            GoogleBackendKind::VertexAi => {
+                // VertexAi `api_key_express` + `bearer_api_key` use the
+                // Vertex-region URL (per BackendProfile.base_url) with
+                // the same generative-language wire as GoogleGenAi. ADC
+                // + ExternalAuthorizer paths arrive via the Authorizer
+                // ShimCredential arm (not here). For a raw secret, we
+                // treat it as the api_key_express path.
+                let base_url = connection
+                    .backend_profile
+                    .base_url
+                    .clone()
+                    .filter(|u| !u.is_empty())
+                    .ok_or_else(|| {
+                        ProviderClientError::InvalidBaseUrl(
+                            "vertex_ai backend requires BackendProfile.base_url \
+                             (e.g. https://<region>-aiplatform.googleapis.com)"
+                                .to_string(),
+                        )
+                    })?;
+                let client = crate::gemini::GeminiClient::new_with_base_url(secret, base_url);
+                Ok(Arc::new(client))
+            }
             GoogleBackendKind::GoogleCodeAssist => {
-                Err(ProviderClientError::MissingFeature("google-code-assist"))
+                // Code Assist without a dynamic authorizer is not a
+                // supported combination — the allowed matrix pairs
+                // CodeAssist with GoogleOauth / ComputeAdc / ExternalAuthorizer
+                // (all Authorizer-backed, not Secret-backed). Secret-
+                // backed CodeAssist would require implementing the Code
+                // Assist gRPC-style wire surface (tracked).
+                Err(ProviderClientError::MissingFeature(
+                    "google-code-assist (authorizer required; Secret-backed Code Assist \
+                     not in allowed matrix)",
+                ))
             }
         }
     }

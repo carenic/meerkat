@@ -269,13 +269,15 @@ impl ProviderRuntime for AnthropicProviderRuntime {
         &self,
         connection: ResolvedConnection,
     ) -> Result<Arc<dyn LlmClient>, ProviderClientError> {
+        // ProviderRuntimeRegistry dispatches on Provider enum, so this
+        // runtime only receives Anthropic-backend connections. The match
+        // is defensive; the non-Anthropic arms are unreachable at runtime.
         let backend_kind = match connection.backend {
             NormalizedBackendKind::Anthropic(k) => k,
-            _ => {
-                return Err(ProviderClientError::MissingFeature(
-                    "anthropic-provider-mismatch",
-                ));
-            }
+            other => unreachable!(
+                "AnthropicProviderRuntime received non-Anthropic backend: {other:?} \
+                 — registry dispatch invariant violated"
+            ),
         };
         match (backend_kind, &connection.shim_credential) {
             // Native Anthropic API — plain x-api-key auth.
@@ -342,18 +344,19 @@ impl ProviderRuntime for AnthropicProviderRuntime {
                 AnthropicBackendKind::Vertex | AnthropicBackendKind::Foundry,
                 ShimCredential::Authorizer,
             ) => {
-                // Authorizer-backed Bearer flow. We need the concrete
-                // HttpAuthorizer — in the current Phase 4b shim, we
-                // construct it here from the binding metadata.
-                // `ResolvedConnection.auth_lease` carries the authorizer
-                // for DynamicAuthorizer leases; we extract it.
+                // Authorizer-backed Bearer flow. The resolver produces
+                // a DynamicAuthorizer lease exclusively for this
+                // ShimCredential::Authorizer path (contract between
+                // resolve_binding and build_client in this runtime).
+                // A non-DynamicAuthorizer lease here would be a
+                // resolver-invariant violation.
                 let authorizer = match connection.auth_lease.kind() {
                     meerkat_core::ResolvedAuthKind::DynamicAuthorizer(auth) => auth.clone(),
-                    _ => {
-                        return Err(ProviderClientError::MissingFeature(
-                            "anthropic-dynamic-authorizer-lease-mismatch",
-                        ));
-                    }
+                    other => unreachable!(
+                        "Anthropic Vertex/Foundry with ShimCredential::Authorizer \
+                         requires a DynamicAuthorizer lease kind, got {other:?} — \
+                         resolver invariant violated"
+                    ),
                 };
                 let base_url = connection
                     .backend_profile
@@ -368,20 +371,67 @@ impl ProviderRuntime for AnthropicProviderRuntime {
                 Ok(Arc::new(client))
             }
             (AnthropicBackendKind::Bedrock, ShimCredential::Authorizer) => {
-                // Bedrock SigV4 with dynamic AwsStsAuthorizer — requires
-                // event-stream parsing. Tracked.
-                Err(ProviderClientError::MissingFeature(
-                    "anthropic-bedrock-sigv4 (event-stream parser — tracked)",
-                ))
+                // Bedrock SigV4 with dynamic AwsStsAuthorizer — the
+                // authorizer signs each request; AnthropicClient's
+                // authorizer seam injects headers. Note: Bedrock's
+                // *native* API uses AWS event-stream framing for SSE;
+                // the Messages-API-compatible endpoint (anthropic.*
+                // family on Bedrock Messages API) works with the
+                // Anthropic SSE wire, so a Bearer-style authorizer
+                // path suffices for supported model ids. Native
+                // event-stream parsing for non-Messages models is
+                // tracked separately.
+                let authorizer = match connection.auth_lease.kind() {
+                    meerkat_core::ResolvedAuthKind::DynamicAuthorizer(auth) => auth.clone(),
+                    _ => unreachable!(
+                        "Bedrock with ShimCredential::Authorizer requires a \
+                         DynamicAuthorizer lease kind — resolver invariant violated"
+                    ),
+                };
+                let base_url = connection
+                    .backend_profile
+                    .base_url
+                    .clone()
+                    .filter(|u| !u.is_empty())
+                    .ok_or_else(|| {
+                        ProviderClientError::InvalidBaseUrl(
+                            "bedrock backend requires BackendProfile.base_url".to_string(),
+                        )
+                    })?;
+                let client = crate::anthropic::AnthropicClient::builder(String::new())
+                    .authorizer(authorizer)
+                    .base_url(base_url)
+                    .build()
+                    .map_err(ProviderClientError::ClientInit)?;
+                Ok(Arc::new(client))
             }
-            (AnthropicBackendKind::Vertex, ShimCredential::Secret(_)) => {
-                // Vertex with a raw secret doesn't match any allowed
-                // binding combination, but if it gets here, fall back
-                // to the Messages API via static bearer. Typically
-                // Vertex uses VertexGoogleAuth (authorizer path).
-                Err(ProviderClientError::MissingFeature(
-                    "anthropic-vertex-static-secret (use vertex_google_auth)",
-                ))
+            (AnthropicBackendKind::Vertex, ShimCredential::Secret(secret)) => {
+                // Vertex with a pre-resolved bearer secret (e.g.
+                // ExternalAuthorizer produced an envelope carrying a
+                // Bearer token). Wire as StaticBearerAuthorizer.
+                let base_url = connection
+                    .backend_profile
+                    .base_url
+                    .clone()
+                    .filter(|u| !u.is_empty())
+                    .ok_or_else(|| {
+                        ProviderClientError::InvalidBaseUrl(
+                            "vertex backend requires BackendProfile.base_url \
+                             (e.g. https://<region>-aiplatform.googleapis.com)"
+                                .to_string(),
+                        )
+                    })?;
+                let authorizer: std::sync::Arc<dyn meerkat_core::HttpAuthorizer> =
+                    std::sync::Arc::new(crate::authorizers::StaticBearerAuthorizer::new(
+                        secret.clone(),
+                        "vertex-bearer",
+                    ));
+                let client = crate::anthropic::AnthropicClient::builder(String::new())
+                    .authorizer(authorizer)
+                    .base_url(base_url)
+                    .build()
+                    .map_err(ProviderClientError::ClientInit)?;
+                Ok(Arc::new(client))
             }
             (_, ShimCredential::Authorizer) => {
                 Err(ProviderClientError::DynamicAuthorizerNotYetSupportedInShimMode)
