@@ -17,6 +17,11 @@ pub struct GeminiClient {
     api_key: String,
     base_url: String,
     http: reqwest::Client,
+    /// Dynamic authorizer — when set, replaces the `x-goog-api-key`
+    /// header path with `HttpAuthorizer::authorize` invocation (used
+    /// for Code Assist + Vertex ADC backends where the Bearer token
+    /// is acquired at request time from Google auth / metadata server).
+    authorizer: Option<std::sync::Arc<dyn meerkat_core::HttpAuthorizer>>,
 }
 
 impl GeminiClient {
@@ -37,6 +42,7 @@ impl GeminiClient {
             api_key,
             base_url,
             http,
+            authorizer: None,
         }
     }
 
@@ -48,6 +54,18 @@ impl GeminiClient {
             self.http = http;
         }
         self.base_url = url;
+        self
+    }
+
+    /// Attach a dynamic authorizer (Code Assist / Vertex ADC Bearer
+    /// token path). When set, `x-goog-api-key` is NOT sent; the
+    /// authorizer injects its own headers (typically
+    /// `Authorization: Bearer <token>`).
+    pub fn with_authorizer(
+        mut self,
+        authorizer: std::sync::Arc<dyn meerkat_core::HttpAuthorizer>,
+    ) -> Self {
+        self.authorizer = Some(authorizer);
         self
     }
 
@@ -873,10 +891,32 @@ impl LlmClient for GeminiClient {
                 self.base_url, request.model
             );
 
-            let response = self.http
-                .post(url)
-                .header("Content-Type", "application/json")
-                .header("x-goog-api-key", &self.api_key)
+            // Auth path: if an authorizer is attached (Code Assist /
+            // Vertex ADC Bearer flow), collect its headers via the
+            // HttpAuthorizer trait; otherwise fall back to x-goog-api-key.
+            let mut req = self.http
+                .post(&url)
+                .header("Content-Type", "application/json");
+            if let Some(authorizer) = &self.authorizer {
+                let mut extra: Vec<(String, String)> = Vec::new();
+                let mut auth_req = meerkat_core::HttpAuthorizationRequest {
+                    method: "POST",
+                    url: &url,
+                    headers: &mut extra,
+                };
+                authorizer
+                    .authorize(&mut auth_req)
+                    .await
+                    .map_err(|e| LlmError::AuthenticationFailed {
+                        message: format!("gemini authorizer failed: {e}"),
+                    })?;
+                for (name, value) in extra {
+                    req = req.header(name, value);
+                }
+            } else {
+                req = req.header("x-goog-api-key", &self.api_key);
+            }
+            let response = req
                 .json(&body)
                 .send()
                 .await

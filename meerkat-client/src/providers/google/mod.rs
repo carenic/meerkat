@@ -223,10 +223,42 @@ impl ProviderRuntime for GoogleProviderRuntime {
                  — registry dispatch invariant violated"
             ),
         };
+        // Authorizer-backed path (Vertex ADC, Code Assist GoogleOauth/
+        // ComputeAdc, ExternalAuthorizer-dynamic). Must run before the
+        // simpler Secret-extraction match because the Authorizer needs
+        // backend-specific wiring (Vertex vs Code Assist base URLs).
+        #[cfg(not(target_arch = "wasm32"))]
+        if matches!(connection.shim_credential, ShimCredential::Authorizer) {
+            let authorizer = match connection.auth_lease.kind() {
+                meerkat_core::ResolvedAuthKind::DynamicAuthorizer(auth) => auth.clone(),
+                other => unreachable!(
+                    "Google ShimCredential::Authorizer requires DynamicAuthorizer \
+                     lease kind, got {other:?} — resolver invariant violated"
+                ),
+            };
+            let base_url = connection
+                .backend_profile
+                .base_url
+                .clone()
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| {
+                    ProviderClientError::InvalidBaseUrl(
+                        "Google authorizer-backed backends require \
+                         BackendProfile.base_url"
+                            .to_string(),
+                    )
+                })?;
+            let client = crate::gemini::GeminiClient::new_with_base_url(String::new(), base_url)
+                .with_authorizer(authorizer);
+            return Ok(Arc::new(client));
+        }
         let secret = match connection.shim_credential {
             ShimCredential::Secret(s) => s,
             ShimCredential::Authorizer => {
-                return Err(ProviderClientError::DynamicAuthorizerNotYetSupportedInShimMode);
+                // On wasm32 authorizers are compiled out.
+                return Err(ProviderClientError::MissingFeature(
+                    "google-authorizer-backed auth not available on wasm32",
+                ));
             }
             ShimCredential::None => return Err(ProviderClientError::NoCredentialMaterial),
         };
@@ -264,16 +296,46 @@ impl ProviderRuntime for GoogleProviderRuntime {
                 Ok(Arc::new(client))
             }
             GoogleBackendKind::GoogleCodeAssist => {
-                // Code Assist without a dynamic authorizer is not a
-                // supported combination — the allowed matrix pairs
-                // CodeAssist with GoogleOauth / ComputeAdc / ExternalAuthorizer
-                // (all Authorizer-backed, not Secret-backed). Secret-
-                // backed CodeAssist would require implementing the Code
-                // Assist gRPC-style wire surface (tracked).
-                Err(ProviderClientError::MissingFeature(
-                    "google-code-assist (authorizer required; Secret-backed Code Assist \
-                     not in allowed matrix)",
-                ))
+                // Code Assist with a pre-resolved bearer secret (e.g.
+                // ExternalAuthorizer→Secret subpath, where the host
+                // resolved an OAuth access token via its own flow).
+                // Wire as GeminiClient with StaticBearerAuthorizer
+                // pointed at the Code Assist base URL. Requires
+                // BackendProfile.base_url (Code Assist endpoint varies
+                // by tier — production is
+                // https://cloudcode-pa.googleapis.com).
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let base_url = connection
+                        .backend_profile
+                        .base_url
+                        .clone()
+                        .filter(|u| !u.is_empty())
+                        .ok_or_else(|| {
+                            ProviderClientError::InvalidBaseUrl(
+                                "google_code_assist backend requires \
+                                 BackendProfile.base_url (e.g. \
+                                 https://cloudcode-pa.googleapis.com)"
+                                    .to_string(),
+                            )
+                        })?;
+                    let authorizer: std::sync::Arc<dyn meerkat_core::HttpAuthorizer> =
+                        std::sync::Arc::new(crate::authorizers::StaticBearerAuthorizer::new(
+                            secret,
+                            "code-assist-bearer",
+                        ));
+                    let client =
+                        crate::gemini::GeminiClient::new_with_base_url(String::new(), base_url)
+                            .with_authorizer(authorizer);
+                    Ok(Arc::new(client))
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = secret;
+                    Err(ProviderClientError::MissingFeature(
+                        "google_code_assist backend not available on wasm32",
+                    ))
+                }
             }
         }
     }
