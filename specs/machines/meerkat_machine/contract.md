@@ -140,7 +140,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `CloseSurfaceConnection`
 - `RejectSurfaceCall`
 - `EmitAuthLifecycleEvent`(binding_key: String, new_state: String)
-- `EmitAuthReauthNotice`(binding_key: String)
 - `WakeRefreshLoop`(binding_key: String)
 
 ## Invariants
@@ -1437,7 +1436,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `lease_is_refreshing`
   - `is_permanent`
-- Emits: `EmitAuthLifecycleEvent`, `EmitAuthReauthNotice`
+- Emits: `EmitAuthLifecycleEvent`
 - To: `Initializing`
 
 ### `AuthRefreshFailedPermanentIdle`
@@ -1446,7 +1445,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `lease_is_refreshing`
   - `is_permanent`
-- Emits: `EmitAuthLifecycleEvent`, `EmitAuthReauthNotice`
+- Emits: `EmitAuthLifecycleEvent`
 - To: `Idle`
 
 ### `AuthRefreshFailedPermanentAttached`
@@ -1455,7 +1454,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `lease_is_refreshing`
   - `is_permanent`
-- Emits: `EmitAuthLifecycleEvent`, `EmitAuthReauthNotice`
+- Emits: `EmitAuthLifecycleEvent`
 - To: `Attached`
 
 ### `AuthRefreshFailedPermanentRunning`
@@ -1464,7 +1463,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `lease_is_refreshing`
   - `is_permanent`
-- Emits: `EmitAuthLifecycleEvent`, `EmitAuthReauthNotice`
+- Emits: `EmitAuthLifecycleEvent`
 - To: `Running`
 
 ### `AuthRefreshFailedPermanentRetired`
@@ -1473,7 +1472,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `lease_is_refreshing`
   - `is_permanent`
-- Emits: `EmitAuthLifecycleEvent`, `EmitAuthReauthNotice`
+- Emits: `EmitAuthLifecycleEvent`
 - To: `Retired`
 
 ### `AuthRefreshFailedPermanentStopped`
@@ -1482,7 +1481,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `lease_is_refreshing`
   - `is_permanent`
-- Emits: `EmitAuthLifecycleEvent`, `EmitAuthReauthNotice`
+- Emits: `EmitAuthLifecycleEvent`
 - To: `Stopped`
 
 ### `MarkReauthRequiredInitializing`
@@ -1490,7 +1489,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `MarkReauthRequired`(binding_key)
 - Guards:
   - `lease_exists`
-- Emits: `EmitAuthLifecycleEvent`, `EmitAuthReauthNotice`
+- Emits: `EmitAuthLifecycleEvent`
 - To: `Initializing`
 
 ### `MarkReauthRequiredIdle`
@@ -1498,7 +1497,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `MarkReauthRequired`(binding_key)
 - Guards:
   - `lease_exists`
-- Emits: `EmitAuthLifecycleEvent`, `EmitAuthReauthNotice`
+- Emits: `EmitAuthLifecycleEvent`
 - To: `Idle`
 
 ### `MarkReauthRequiredAttached`
@@ -1506,7 +1505,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `MarkReauthRequired`(binding_key)
 - Guards:
   - `lease_exists`
-- Emits: `EmitAuthLifecycleEvent`, `EmitAuthReauthNotice`
+- Emits: `EmitAuthLifecycleEvent`
 - To: `Attached`
 
 ### `MarkReauthRequiredRunning`
@@ -1514,7 +1513,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `MarkReauthRequired`(binding_key)
 - Guards:
   - `lease_exists`
-- Emits: `EmitAuthLifecycleEvent`, `EmitAuthReauthNotice`
+- Emits: `EmitAuthLifecycleEvent`
 - To: `Running`
 
 ### `MarkReauthRequiredRetired`
@@ -1522,7 +1521,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `MarkReauthRequired`(binding_key)
 - Guards:
   - `lease_exists`
-- Emits: `EmitAuthLifecycleEvent`, `EmitAuthReauthNotice`
+- Emits: `EmitAuthLifecycleEvent`
 - To: `Retired`
 
 ### `MarkReauthRequiredStopped`
@@ -1530,7 +1529,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `MarkReauthRequired`(binding_key)
 - Guards:
   - `lease_exists`
-- Emits: `EmitAuthLifecycleEvent`, `EmitAuthReauthNotice`
+- Emits: `EmitAuthLifecycleEvent`
 - To: `Stopped`
 
 ### `ReleaseAuthLeaseInitializing`

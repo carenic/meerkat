@@ -666,11 +666,15 @@ where
                     //    DSL (see meerkat-machine-schema/src/catalog/dsl/
                     //    meerkat_machine.rs). The runner's role here is
                     //    *mechanism*: it drives DSL-legal transitions when
-                    //    the observable state calls for them, and consumes
-                    //    the DSL's own EmitAuthReauthNotice effect by
-                    //    surfacing a synthetic system notice. The runner
-                    //    never decides terminal *class* — it only acts on
-                    //    the state the machine has already committed to.
+                    //    the observable state calls for them, and emits a
+                    //    synthetic session notice when the projected DSL
+                    //    state is `reauth_required`. The runner never
+                    //    decides terminal *class* — it only surfaces the
+                    //    state the machine has already committed to.
+                    //    (Plan §1.5r.9: snapshot-poll is the canonical
+                    //    runner-side mechanism; dogma §3 "rebuild
+                    //    projections" permits the read; no redundant DSL
+                    //    effect is declared.)
                     //
                     //    Strip prior synthetic AuthReauthRequired notices
                     //    so the notice always reflects current DSL state.
@@ -733,12 +737,11 @@ where
                                 // this path isn't load-bearing correctness.
                                 let _ = handle.begin_refresh(binding_key);
                             }
-                            // reauth_required → consume the machine-owned
-                            // EmitAuthReauthNotice effect as a synthetic
-                            // session-level system notice, then terminate
-                            // the run. The DSL has already decided that
-                            // this binding cannot proceed; the runner only
-                            // surfaces that decision.
+                            // reauth_required → project the DSL state into a
+                            // synthetic session-level system notice, then
+                            // terminate the run. The DSL has already
+                            // decided that this binding cannot proceed;
+                            // the runner only surfaces that decision.
                             Some("reauth_required") => {
                                 let notice = format!(
                                     "Connection `{binding_key}` requires re-authentication. \

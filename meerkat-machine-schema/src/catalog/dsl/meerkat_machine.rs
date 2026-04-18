@@ -197,7 +197,6 @@ machine! {
             RejectSurfaceCall,
             // Auth lease lifecycle effects (Phase 1.5-rev)
             EmitAuthLifecycleEvent { binding_key: String, new_state: String },
-            EmitAuthReauthNotice { binding_key: String },
             WakeRefreshLoop { binding_key: String },
         }
 
@@ -247,7 +246,6 @@ machine! {
         disposition RejectSurfaceCall => external,
         // Auth lease lifecycle dispositions (Phase 1.5-rev)
         disposition EmitAuthLifecycleEvent => external,
-        disposition EmitAuthReauthNotice => external,
         disposition WakeRefreshLoop => local,
 
         // =====================================================================
@@ -302,14 +300,15 @@ machine! {
         //     post-condition "refreshing keys are not simultaneously in
         //     another state" which is a consequence of (a).
         //
-        // (b) `EmitAuthReauthNotice` fires iff state becomes
-        //     reauth_required — verified structurally by transition
-        //     construction: only the two `AuthRefreshFailedPermanent`
-        //     and `MarkReauthRequired` transitions emit the effect, and
-        //     both land in `auth_reauth_required_leases`. No other
-        //     transition writes to that set. No additional TLC
-        //     invariant is declarable without an effect-log primitive;
-        //     this structural guarantee is covered by the
+        // (b) Reauth-required notice surfacing: per plan §1.5r.9 the
+        //     runner's CallingLlm arm reads the DSL state via
+        //     `auth_lease_handle.snapshot()` and emits a synthetic
+        //     session notice when it observes `reauth_required`. The
+        //     DSL state (a binding_key in `auth_reauth_required_leases`)
+        //     is the sole canonical truth; no redundant effect is
+        //     declared or emitted (plan §1.5r.3 originally named an
+        //     `EmitAuthReauthNotice` effect — deleted in the dogma
+        //     §1/§19 closure honest-audit cleanup). The
         //     `auth_reauth_notice.rs` test's
         //     `refresh_path_terminates_in_reauth_required_on_permanent_failure`
         //     check.
@@ -1515,7 +1514,6 @@ machine! {
             }
             to Idle
             emit EmitAuthLifecycleEvent { binding_key: binding_key, new_state: "reauth_required" }
-            emit EmitAuthReauthNotice { binding_key: binding_key }
         }
 
         // MarkReauthRequired: any known state → reauth_required
@@ -1535,7 +1533,6 @@ machine! {
             }
             to Idle
             emit EmitAuthLifecycleEvent { binding_key: binding_key, new_state: "reauth_required" }
-            emit EmitAuthReauthNotice { binding_key: binding_key }
         }
 
         // ReleaseAuthLease: removes entry from every set and expiry map

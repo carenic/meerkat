@@ -195,7 +195,6 @@ machine! {
             RejectSurfaceCall,
             // Auth lease lifecycle effects (Phase 1.5-rev)
             EmitAuthLifecycleEvent { binding_key: String, new_state: String },
-            EmitAuthReauthNotice { binding_key: String },
             WakeRefreshLoop { binding_key: String },
         }
 
@@ -245,7 +244,6 @@ machine! {
         disposition RejectSurfaceCall => external,
         // Auth lease lifecycle dispositions (Phase 1.5-rev)
         disposition EmitAuthLifecycleEvent => external,
-        disposition EmitAuthReauthNotice => external,
         disposition WakeRefreshLoop => local,
 
         // =====================================================================
@@ -1459,7 +1457,6 @@ machine! {
             }
             to Idle
             emit EmitAuthLifecycleEvent { binding_key: binding_key, new_state: "reauth_required" }
-            emit EmitAuthReauthNotice { binding_key: binding_key }
         }
 
         transition MarkReauthRequired {
@@ -1478,7 +1475,6 @@ machine! {
             }
             to Idle
             emit EmitAuthLifecycleEvent { binding_key: binding_key, new_state: "reauth_required" }
-            emit EmitAuthReauthNotice { binding_key: binding_key }
         }
 
         transition ReleaseAuthLease {

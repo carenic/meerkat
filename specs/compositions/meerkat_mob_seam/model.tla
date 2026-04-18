@@ -3719,7 +3719,7 @@ meerkat_AuthRefreshFailedPermanentInitializing(arg_binding_key, arg_permanent) =
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "AuthRefreshFailedPermanentInitializing"], [machine |-> "meerkat", variant |-> "EmitAuthReauthNotice", payload |-> [binding_key |-> packet.payload.binding_key], effect_id |-> (model_step_count + 1), source_transition |-> "AuthRefreshFailedPermanentInitializing"] }
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "AuthRefreshFailedPermanentInitializing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "AuthRefreshFailedPermanentInitializing", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Initializing"]}
        /\ model_step_count' = model_step_count + 1
 
@@ -3742,7 +3742,7 @@ meerkat_AuthRefreshFailedPermanentIdle(arg_binding_key, arg_permanent) ==
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "AuthRefreshFailedPermanentIdle"], [machine |-> "meerkat", variant |-> "EmitAuthReauthNotice", payload |-> [binding_key |-> packet.payload.binding_key], effect_id |-> (model_step_count + 1), source_transition |-> "AuthRefreshFailedPermanentIdle"] }
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "AuthRefreshFailedPermanentIdle"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "AuthRefreshFailedPermanentIdle", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Idle"]}
        /\ model_step_count' = model_step_count + 1
 
@@ -3765,7 +3765,7 @@ meerkat_AuthRefreshFailedPermanentAttached(arg_binding_key, arg_permanent) ==
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "AuthRefreshFailedPermanentAttached"], [machine |-> "meerkat", variant |-> "EmitAuthReauthNotice", payload |-> [binding_key |-> packet.payload.binding_key], effect_id |-> (model_step_count + 1), source_transition |-> "AuthRefreshFailedPermanentAttached"] }
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "AuthRefreshFailedPermanentAttached"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "AuthRefreshFailedPermanentAttached", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Attached"]}
        /\ model_step_count' = model_step_count + 1
 
@@ -3788,7 +3788,7 @@ meerkat_AuthRefreshFailedPermanentRunning(arg_binding_key, arg_permanent) ==
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "AuthRefreshFailedPermanentRunning"], [machine |-> "meerkat", variant |-> "EmitAuthReauthNotice", payload |-> [binding_key |-> packet.payload.binding_key], effect_id |-> (model_step_count + 1), source_transition |-> "AuthRefreshFailedPermanentRunning"] }
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "AuthRefreshFailedPermanentRunning"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "AuthRefreshFailedPermanentRunning", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Running"]}
        /\ model_step_count' = model_step_count + 1
 
@@ -3811,7 +3811,7 @@ meerkat_AuthRefreshFailedPermanentRetired(arg_binding_key, arg_permanent) ==
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "AuthRefreshFailedPermanentRetired"], [machine |-> "meerkat", variant |-> "EmitAuthReauthNotice", payload |-> [binding_key |-> packet.payload.binding_key], effect_id |-> (model_step_count + 1), source_transition |-> "AuthRefreshFailedPermanentRetired"] }
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "AuthRefreshFailedPermanentRetired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "AuthRefreshFailedPermanentRetired", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Retired"]}
        /\ model_step_count' = model_step_count + 1
 
@@ -3834,7 +3834,7 @@ meerkat_AuthRefreshFailedPermanentStopped(arg_binding_key, arg_permanent) ==
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "AuthRefreshFailedPermanentStopped"], [machine |-> "meerkat", variant |-> "EmitAuthReauthNotice", payload |-> [binding_key |-> packet.payload.binding_key], effect_id |-> (model_step_count + 1), source_transition |-> "AuthRefreshFailedPermanentStopped"] }
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "AuthRefreshFailedPermanentStopped"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "AuthRefreshFailedPermanentStopped", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Stopped"]}
        /\ model_step_count' = model_step_count + 1
 
@@ -3857,7 +3857,7 @@ meerkat_MarkReauthRequiredInitializing(arg_binding_key) ==
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredInitializing"], [machine |-> "meerkat", variant |-> "EmitAuthReauthNotice", payload |-> [binding_key |-> packet.payload.binding_key], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredInitializing"] }
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredInitializing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "MarkReauthRequiredInitializing", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Initializing"]}
        /\ model_step_count' = model_step_count + 1
 
@@ -3880,7 +3880,7 @@ meerkat_MarkReauthRequiredIdle(arg_binding_key) ==
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredIdle"], [machine |-> "meerkat", variant |-> "EmitAuthReauthNotice", payload |-> [binding_key |-> packet.payload.binding_key], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredIdle"] }
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredIdle"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "MarkReauthRequiredIdle", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Idle"]}
        /\ model_step_count' = model_step_count + 1
 
@@ -3903,7 +3903,7 @@ meerkat_MarkReauthRequiredAttached(arg_binding_key) ==
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredAttached"], [machine |-> "meerkat", variant |-> "EmitAuthReauthNotice", payload |-> [binding_key |-> packet.payload.binding_key], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredAttached"] }
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredAttached"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "MarkReauthRequiredAttached", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Attached"]}
        /\ model_step_count' = model_step_count + 1
 
@@ -3926,7 +3926,7 @@ meerkat_MarkReauthRequiredRunning(arg_binding_key) ==
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredRunning"], [machine |-> "meerkat", variant |-> "EmitAuthReauthNotice", payload |-> [binding_key |-> packet.payload.binding_key], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredRunning"] }
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredRunning"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "MarkReauthRequiredRunning", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Running"]}
        /\ model_step_count' = model_step_count + 1
 
@@ -3949,7 +3949,7 @@ meerkat_MarkReauthRequiredRetired(arg_binding_key) ==
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredRetired"], [machine |-> "meerkat", variant |-> "EmitAuthReauthNotice", payload |-> [binding_key |-> packet.payload.binding_key], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredRetired"] }
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredRetired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "MarkReauthRequiredRetired", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Retired"]}
        /\ model_step_count' = model_step_count + 1
 
@@ -3972,7 +3972,7 @@ meerkat_MarkReauthRequiredStopped(arg_binding_key) ==
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredStopped"], [machine |-> "meerkat", variant |-> "EmitAuthReauthNotice", payload |-> [binding_key |-> packet.payload.binding_key], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredStopped"] }
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "EmitAuthLifecycleEvent", payload |-> [binding_key |-> packet.payload.binding_key, new_state |-> "reauth_required"], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredStopped"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "MarkReauthRequiredStopped", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Stopped"]}
        /\ model_step_count' = model_step_count + 1
 
