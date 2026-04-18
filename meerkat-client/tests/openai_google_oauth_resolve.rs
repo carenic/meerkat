@@ -2,7 +2,7 @@
 //! through the provider runtime.
 //!
 //! Covers the same choke-point as the Anthropic test: persisted tokens
-//! → resolve returns ShimCredential::Secret(access_token). Also verifies
+//! → resolve returns an inline secret. Also verifies
 //! the external_chatgpt_tokens path and the Google api_key_express path
 //! (which routes through the simple-secret resolver).
 
@@ -19,7 +19,7 @@ use meerkat_client::auth_store::{
 };
 use meerkat_client::providers::google::oauth as g_oauth;
 use meerkat_client::providers::openai::oauth as o_oauth;
-use meerkat_client::runtime::{ProviderRuntimeRegistry, ResolverEnvironment, ShimCredential};
+use meerkat_client::runtime::{ProviderRuntimeRegistry, ResolverEnvironment};
 use meerkat_core::{
     AuthProfileConfig, BackendProfileConfig, CredentialSourceSpec, ProviderBindingConfig,
     RealmConfigSection, RealmConnectionSet,
@@ -152,8 +152,8 @@ async fn openai_managed_chatgpt_oauth_fresh_token_resolves() {
         .await
         .expect("fresh ChatGPT tokens should resolve");
     assert_eq!(
-        connection.shim_credential,
-        ShimCredential::Secret("fresh-chatgpt-access".into()),
+        connection.resolved_secret(),
+        Some("fresh-chatgpt-access".to_string()),
     );
 }
 
@@ -184,8 +184,8 @@ async fn openai_external_chatgpt_tokens_returns_persisted_access() {
         .await
         .expect("external tokens should resolve");
     assert_eq!(
-        connection.shim_credential,
-        ShimCredential::Secret("externally-managed-access".into()),
+        connection.resolved_secret(),
+        Some("externally-managed-access".to_string()),
     );
 }
 
@@ -242,8 +242,8 @@ async fn google_oauth_fresh_token_resolves() {
         .await
         .expect("fresh Google OAuth tokens should resolve");
     assert_eq!(
-        connection.shim_credential,
-        ShimCredential::Secret("fresh-google-access".into()),
+        connection.resolved_secret(),
+        Some("fresh-google-access".to_string()),
     );
 }
 
@@ -256,7 +256,9 @@ async fn google_adc_returns_authorizer_marker() {
         .resolve(&realm, "default_google", &env)
         .await
         .unwrap();
-    assert_eq!(connection.shim_credential, ShimCredential::Authorizer);
+    // Adc path: empty lease (build_client constructs the authorizer).
+    assert_eq!(connection.resolved_secret(), None);
+    assert!(connection.resolved_authorizer().is_none());
 }
 
 #[tokio::test]
@@ -269,7 +271,7 @@ async fn google_api_key_express_resolves_inline_secret() {
         .await
         .unwrap();
     assert_eq!(
-        connection.shim_credential,
-        ShimCredential::Secret("vertex-express-key".into()),
+        connection.resolved_secret(),
+        Some("vertex-express-key".to_string()),
     );
 }

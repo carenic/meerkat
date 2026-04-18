@@ -12,8 +12,7 @@ use async_trait::async_trait;
 use meerkat_core::{AuthError, AuthMetadata, AuthProfile, BackendProfile, Provider};
 
 use crate::runtime::binding::{
-    NormalizedAuthMethod, NormalizedBackendKind, ResolvedConnection, ShimCredential, StaticLease,
-    ValidatedBinding,
+    NormalizedAuthMethod, NormalizedBackendKind, ResolvedConnection, StaticLease, ValidatedBinding,
 };
 use crate::runtime::errors::{ProviderAuthError, ProviderBindingError, ProviderClientError};
 use crate::runtime::provider_runtime::ProviderRuntime;
@@ -124,12 +123,18 @@ impl ProviderRuntime for OpenAiProviderRuntime {
         )]
         let mut chatgpt_plan_type: Option<String> = None;
 
-        let shim_credential = match auth_method {
+        // Plan §6.11: resolve credential material to Option<String>.
+        // `Some(secret)` lands in the lease as a __secret__ header.
+        // `None` means authorizer-backed (ExternalAuthorizer on non-wasm)
+        // — the lease stays empty and build_client emits a typed error
+        // when no DynamicLease path is available.
+        let secret_opt: Option<String> = match auth_method {
             OpenAiAuthMethod::ApiKey | OpenAiAuthMethod::StaticBearer => {
-                resolve_simple_secret(&binding.auth_profile.source, env, binding).await?
+                Some(resolve_simple_secret(&binding.auth_profile.source, env, binding).await?)
             }
             OpenAiAuthMethod::ExternalAuthorizer => {
-                resolve_external_authorizer(&binding.auth_profile.source, env, binding).await?
+                resolve_external_authorizer(&binding.auth_profile.source, env, binding).await?;
+                None
             }
             OpenAiAuthMethod::ManagedChatGptOauth | OpenAiAuthMethod::ExternalChatGptTokens => {
                 #[cfg(all(not(target_arch = "wasm32"), feature = "oauth"))]
@@ -153,9 +158,6 @@ impl ProviderRuntime for OpenAiProviderRuntime {
                         .map_err(|e| ProviderAuthError::SourceResolutionFailed(e.to_string()))?
                         .ok_or(ProviderAuthError::Auth(AuthError::InteractiveLoginRequired))?;
 
-                    // Lift ChatGPT-specific claims from the id_token
-                    // (if present) or fall back to the top-level
-                    // account_id field on the persisted bundle.
                     chatgpt_account_id = persisted.account_id.clone();
                     if let Some(id_token) = persisted.id_token.as_deref()
                         && let Ok(claims) = crate::auth_oauth::jwt::decode_payload(id_token)
@@ -168,17 +170,11 @@ impl ProviderRuntime for OpenAiProviderRuntime {
                         chatgpt_plan_type = lifted.plan_type;
                     }
 
-                    match auth_method {
-                        OpenAiAuthMethod::ExternalChatGptTokens => {
-                            // External tokens are not refreshed by
-                            // meerkat — the host manages the lifecycle.
-                            // We just read the persisted access_token.
-                            let secret = persisted
-                                .primary_secret
-                                .clone()
-                                .ok_or(ProviderAuthError::Auth(AuthError::MissingSecret))?;
-                            ShimCredential::Secret(secret)
-                        }
+                    let access = match auth_method {
+                        OpenAiAuthMethod::ExternalChatGptTokens => persisted
+                            .primary_secret
+                            .clone()
+                            .ok_or(ProviderAuthError::Auth(AuthError::MissingSecret))?,
                         OpenAiAuthMethod::ManagedChatGptOauth => {
                             use chrono::{Duration, Utc};
                             let fresh = persisted
@@ -186,7 +182,7 @@ impl ProviderRuntime for OpenAiProviderRuntime {
                                 .is_none_or(|exp| exp - Utc::now() > Duration::seconds(60));
                             if let (true, Some(access)) = (fresh, persisted.primary_secret.clone())
                             {
-                                ShimCredential::Secret(access)
+                                access
                             } else {
                                 let coord = env.refresh_coord.clone().unwrap_or_else(|| {
                                     Arc::new(crate::auth_store::InMemoryCoordinator::new())
@@ -199,7 +195,7 @@ impl ProviderRuntime for OpenAiProviderRuntime {
                                     endpoints,
                                     key,
                                 );
-                                let access = runtime.get_or_refresh_access_token().await.map_err(
+                                runtime.get_or_refresh_access_token().await.map_err(
                                     |e| match e {
                                         oauth::OpenAiOAuthError::InteractiveLoginRequired => {
                                             ProviderAuthError::Auth(
@@ -210,12 +206,12 @@ impl ProviderRuntime for OpenAiProviderRuntime {
                                             other.to_string(),
                                         ),
                                     },
-                                )?;
-                                ShimCredential::Secret(access)
+                                )?
                             }
                         }
                         _ => unreachable!("arm guarded by outer match"),
-                    }
+                    };
+                    Some(access)
                 }
                 #[cfg(not(all(not(target_arch = "wasm32"), feature = "oauth")))]
                 {
@@ -244,21 +240,17 @@ impl ProviderRuntime for OpenAiProviderRuntime {
                 },
             ));
         }
-        // Plan §6.11 migration: populate the lease with real credential
-        // material (StaticLease with __secret__ header OR empty for the
-        // authorizer path). shim_credential stays as a mirror until
-        // other providers are migrated and it can be deleted entirely.
+        // Plan §6.11: populate the lease with the resolved secret as
+        // a __secret__ header, or an empty lease for authorizer paths.
         let source_label = format!("openai:{}", binding.auth_profile.id);
-        let lease: Arc<dyn meerkat_core::AuthLease> = match &shim_credential {
-            ShimCredential::Secret(s) => Arc::new(StaticLease::new(
-                vec![("__secret__".to_string(), s.clone())],
+        let lease: Arc<dyn meerkat_core::AuthLease> = match secret_opt {
+            Some(secret) => Arc::new(StaticLease::new(
+                vec![("__secret__".to_string(), secret)],
                 metadata,
                 None,
                 source_label,
             )),
-            ShimCredential::Authorizer | ShimCredential::None => {
-                Arc::new(StaticLease::empty(metadata, source_label))
-            }
+            None => Arc::new(StaticLease::empty(metadata, source_label)),
         };
 
         Ok(ResolvedConnection {
@@ -266,7 +258,6 @@ impl ProviderRuntime for OpenAiProviderRuntime {
             backend: NormalizedBackendKind::OpenAi(backend_kind),
             backend_profile: binding.backend_profile.clone(),
             auth_lease: lease,
-            shim_credential,
         })
     }
 
@@ -288,7 +279,7 @@ impl ProviderRuntime for OpenAiProviderRuntime {
         // request uses HttpAuthorizer::authorize for headers rather
         // than Authorization: Bearer <api_key>. Plan §6.11: read the
         // authorizer from the auth lease directly instead of the
-        // ShimCredential side channel.
+        // (deleted ShimCredential side channel).
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(authorizer) = connection.resolved_authorizer() {
             let base_url = connection

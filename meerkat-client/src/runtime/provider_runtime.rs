@@ -53,7 +53,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::runtime::binding::{NormalizedAuthMethod, NormalizedBackendKind, ShimCredential};
+    use crate::runtime::binding::{NormalizedAuthMethod, NormalizedBackendKind};
     use meerkat_core::{AuthMetadata, BindingPolicy, ResolvedAuthKind};
 
     // Minimal MockRuntime to exercise object safety and trait wiring.
@@ -96,7 +96,6 @@ mod tests {
 
         // Exercise the other method signatures to prove trait object wiring.
         let _env = ResolverEnvironment::testing();
-        let _ = ShimCredential::None;
         let _ = ResolvedAuthKind::None;
         let _ = AuthMetadata::default();
         let _ = BindingPolicy::default();

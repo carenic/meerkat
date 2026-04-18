@@ -12,8 +12,7 @@ use async_trait::async_trait;
 use meerkat_core::{AuthError, AuthMetadata, AuthProfile, BackendProfile, Provider};
 
 use crate::runtime::binding::{
-    NormalizedAuthMethod, NormalizedBackendKind, ResolvedConnection, ShimCredential, StaticLease,
-    ValidatedBinding,
+    NormalizedAuthMethod, NormalizedBackendKind, ResolvedConnection, StaticLease, ValidatedBinding,
 };
 use crate::runtime::errors::{ProviderAuthError, ProviderBindingError, ProviderClientError};
 use crate::runtime::provider_runtime::ProviderRuntime;
@@ -144,33 +143,26 @@ impl ProviderRuntime for AnthropicProviderRuntime {
             }
         };
 
-        let shim_credential = match auth_method {
+        // Plan §6.11: Option<String> for secret material; None for
+        // authorizer-backed paths (build_client constructs the concrete
+        // HttpAuthorizer for AWS SigV4 / Google / Azure AD at build time).
+        let secret_opt: Option<String> = match auth_method {
             AnthropicAuthMethod::ApiKey
             | AnthropicAuthMethod::StaticBearer
             | AnthropicAuthMethod::BedrockBearer
             | AnthropicAuthMethod::FoundryApiKey => {
-                // All of these resolve to a simple static secret.
-                resolve_simple_secret(&binding.auth_profile.source, env, binding).await?
+                Some(resolve_simple_secret(&binding.auth_profile.source, env, binding).await?)
             }
             AnthropicAuthMethod::ExternalAuthorizer => {
-                resolve_external_authorizer(&binding.auth_profile.source, env, binding).await?
+                resolve_external_authorizer(&binding.auth_profile.source, env, binding).await?;
+                None
             }
             AnthropicAuthMethod::BedrockAwsSigv4
             | AnthropicAuthMethod::VertexGoogleAuth
-            | AnthropicAuthMethod::FoundryAzureAd => {
-                // Dynamic authorizer cases — build_client constructs the
-                // concrete authorizer (AwsSts / GoogleAuth / AzureAd) and
-                // attaches it to an AnthropicClient or BedrockClient with
-                // the binding's base_url.
-                ShimCredential::Authorizer
-            }
+            | AnthropicAuthMethod::FoundryAzureAd => None,
             AnthropicAuthMethod::ClaudeAiOauth | AnthropicAuthMethod::OauthToApiKey => {
                 #[cfg(all(not(target_arch = "wasm32"), feature = "oauth"))]
                 {
-                    // Read persisted tokens from the token store (if one is
-                    // wired into the env). The interactive login flow runs
-                    // in the CLI/surface layer (Phase 4d); this path only
-                    // retrieves + refreshes the persisted credential.
                     let store = env
                         .token_store
                         .as_ref()
@@ -190,31 +182,20 @@ impl ProviderRuntime for AnthropicProviderRuntime {
                         .map_err(|e| ProviderAuthError::SourceResolutionFailed(e.to_string()))?
                         .ok_or(ProviderAuthError::Auth(AuthError::InteractiveLoginRequired))?;
 
-                    match auth_method {
-                        AnthropicAuthMethod::OauthToApiKey => {
-                            // The OAuth→API-key provisioning flow converts
-                            // the OAuth token into a long-lived API key at
-                            // login time. Here we just read the stored key.
-                            let secret = persisted
-                                .primary_secret
-                                .clone()
-                                .ok_or(ProviderAuthError::Auth(AuthError::MissingSecret))?;
-                            ShimCredential::Secret(secret)
-                        }
+                    let secret = match auth_method {
+                        AnthropicAuthMethod::OauthToApiKey => persisted
+                            .primary_secret
+                            .clone()
+                            .ok_or(ProviderAuthError::Auth(AuthError::MissingSecret))?,
                         AnthropicAuthMethod::ClaudeAiOauth => {
-                            // For claude_ai_oauth, the persisted bundle
-                            // carries an access_token + refresh_token. If
-                            // the access_token is still fresh, use it
-                            // directly; otherwise refresh.
                             use chrono::{Duration, Utc};
                             let fresh = persisted
                                 .expires_at
                                 .is_none_or(|exp| exp - Utc::now() > Duration::seconds(60));
                             if let (true, Some(access)) = (fresh, persisted.primary_secret.clone())
                             {
-                                ShimCredential::Secret(access)
+                                access
                             } else {
-                                // Need refresh — drive through OAuth runtime.
                                 let coord = env.refresh_coord.clone().unwrap_or_else(|| {
                                     Arc::new(crate::auth_store::InMemoryCoordinator::new())
                                 });
@@ -226,7 +207,7 @@ impl ProviderRuntime for AnthropicProviderRuntime {
                                     endpoints,
                                     key,
                                 );
-                                let access = runtime.get_or_refresh_access_token().await.map_err(
+                                runtime.get_or_refresh_access_token().await.map_err(
                                     |e| match e {
                                         oauth::AnthropicOAuthError::InteractiveLoginRequired => {
                                             ProviderAuthError::Auth(
@@ -237,12 +218,12 @@ impl ProviderRuntime for AnthropicProviderRuntime {
                                             other.to_string(),
                                         ),
                                     },
-                                )?;
-                                ShimCredential::Secret(access)
+                                )?
                             }
                         }
                         _ => unreachable!("arm guarded by outer match"),
-                    }
+                    };
+                    Some(secret)
                 }
                 #[cfg(not(all(not(target_arch = "wasm32"), feature = "oauth")))]
                 {
@@ -251,21 +232,17 @@ impl ProviderRuntime for AnthropicProviderRuntime {
             }
         };
 
-        // Plan §6.11 migration: populate the lease with real credential
-        // material (StaticLease with __secret__ header OR empty for the
-        // authorizer path — build_client constructs the concrete
-        // HttpAuthorizer on-demand for AWS SigV4 / Google / Azure AD).
+        // Plan §6.11: populate the lease with resolved secret as a
+        // __secret__ header, or an empty lease for authorizer paths.
         let source_label = format!("anthropic:{}", binding.auth_profile.id);
-        let lease: Arc<dyn meerkat_core::AuthLease> = match &shim_credential {
-            ShimCredential::Secret(s) => Arc::new(StaticLease::new(
-                vec![("__secret__".to_string(), s.clone())],
+        let lease: Arc<dyn meerkat_core::AuthLease> = match secret_opt {
+            Some(secret) => Arc::new(StaticLease::new(
+                vec![("__secret__".to_string(), secret)],
                 AuthMetadata::default(),
                 None,
                 source_label,
             )),
-            ShimCredential::Authorizer | ShimCredential::None => {
-                Arc::new(StaticLease::empty(AuthMetadata::default(), source_label))
-            }
+            None => Arc::new(StaticLease::empty(AuthMetadata::default(), source_label)),
         };
 
         Ok(ResolvedConnection {
@@ -273,7 +250,6 @@ impl ProviderRuntime for AnthropicProviderRuntime {
             backend: NormalizedBackendKind::Anthropic(backend_kind),
             backend_profile: binding.backend_profile.clone(),
             auth_lease: lease,
-            shim_credential,
         })
     }
 
@@ -292,7 +268,7 @@ impl ProviderRuntime for AnthropicProviderRuntime {
             ),
         };
         // Plan §6.11: derive credential material from the auth lease
-        // directly, not from ShimCredential. resolved_authorizer()
+        // directly, directly from the lease. resolved_authorizer()
         // returns Some when the lease is a DynamicAuthorizer (Bedrock
         // SigV4 / Vertex GoogleAuth / Foundry AzureAd /
         // ExternalAuthorizer-DynamicAuthorizer); resolved_secret()

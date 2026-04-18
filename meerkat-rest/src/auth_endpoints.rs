@@ -289,10 +289,8 @@ pub async fn test_auth_profile(
                         "state": "valid",
                         "provider": conn.provider.as_str(),
                         "backend_profile_id": conn.backend_profile.id,
-                        "has_credential": !matches!(
-                            conn.shim_credential,
-                            meerkat_client::ShimCredential::None
-                        ),
+                        "has_credential": conn.resolved_secret().is_some()
+                            || conn.resolved_authorizer().is_some(),
                     })),
                 )
                     .into_response(),

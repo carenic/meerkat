@@ -56,7 +56,7 @@ pub enum ProviderClientError {
     MissingFeature(&'static str),
     #[error("provider client init failed: {0}")]
     ClientInit(#[from] LlmError),
-    #[error("no credential material (ResolvedConnection.shim_credential is ShimCredential::None)")]
+    #[error("no credential material (auth_lease is empty)")]
     NoCredentialMaterial,
     #[error("dynamic authorizer requires Phase 3 owned HTTP path")]
     DynamicAuthorizerNotYetSupportedInShimMode,

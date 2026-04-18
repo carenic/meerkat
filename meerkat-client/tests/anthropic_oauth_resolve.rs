@@ -3,7 +3,7 @@
 //!
 //! Covers the full choke-point: TokenStore has persisted tokens for a
 //! `(realm, binding)` → ProviderRuntimeRegistry.resolve returns a
-//! `ResolvedConnection` whose `ShimCredential::Secret` is the persisted
+//! `ResolvedConnection` whose resolved inline secret is the persisted
 //! access token (or a freshly-refreshed one).
 //!
 //! Also covers the `oauth_to_api_key` path: persisted api_key entry
@@ -27,7 +27,7 @@ use meerkat_client::auth_store::{
     EphemeralTokenStore, PersistedAuthMode, PersistedTokens, TokenKey, TokenStore,
 };
 use meerkat_client::providers::anthropic::oauth;
-use meerkat_client::runtime::{ProviderRuntimeRegistry, ResolverEnvironment, ShimCredential};
+use meerkat_client::runtime::{ProviderRuntimeRegistry, ResolverEnvironment};
 use meerkat_core::{
     AuthProfileConfig, BackendProfileConfig, CredentialSourceSpec, ProviderBindingConfig,
     RealmConfigSection, RealmConnectionSet,
@@ -75,7 +75,7 @@ fn realm_with_oauth_binding(auth_method: &str) -> RealmConnectionSet {
     RealmConnectionSet::from_config("dev", &section).unwrap()
 }
 
-// --- Fresh OAuth bundle → ShimCredential::Secret ---------------------
+// --- Fresh OAuth bundle → inline secret ---------------------
 
 #[tokio::test]
 async fn claude_ai_oauth_fresh_token_returns_access_token() {
@@ -109,8 +109,8 @@ async fn claude_ai_oauth_fresh_token_returns_access_token() {
         .await
         .expect("fresh OAuth tokens should resolve");
     assert_eq!(
-        connection.shim_credential,
-        ShimCredential::Secret("fresh-access-xyz".into()),
+        connection.resolved_secret(),
+        Some("fresh-access-xyz".to_string()),
     );
 }
 
@@ -232,8 +232,8 @@ async fn oauth_to_api_key_returns_persisted_api_key() {
         .await
         .expect("persisted api_key should resolve");
     assert_eq!(
-        connection.shim_credential,
-        ShimCredential::Secret("sk-ant-api03-xyz".into()),
+        connection.resolved_secret(),
+        Some("sk-ant-api03-xyz".to_string()),
     );
 }
 

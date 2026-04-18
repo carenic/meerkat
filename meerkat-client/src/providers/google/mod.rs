@@ -12,8 +12,7 @@ use async_trait::async_trait;
 use meerkat_core::{AuthError, AuthMetadata, AuthProfile, BackendProfile, Provider};
 
 use crate::runtime::binding::{
-    NormalizedAuthMethod, NormalizedBackendKind, ResolvedConnection, ShimCredential, StaticLease,
-    ValidatedBinding,
+    NormalizedAuthMethod, NormalizedBackendKind, ResolvedConnection, StaticLease, ValidatedBinding,
 };
 use crate::runtime::errors::{ProviderAuthError, ProviderBindingError, ProviderClientError};
 use crate::runtime::provider_runtime::ProviderRuntime;
@@ -115,27 +114,19 @@ impl ProviderRuntime for GoogleProviderRuntime {
             }
         };
 
-        let shim_credential = match auth_method {
-            GoogleAuthMethod::ApiKey | GoogleAuthMethod::BearerApiKey => {
-                resolve_simple_secret(&binding.auth_profile.source, env, binding).await?
+        // Plan §6.11: Option<String> for secret material; None for
+        // authorizer-backed paths (Adc / ComputeAdc / ExternalAuthorizer).
+        let secret_opt: Option<String> = match auth_method {
+            GoogleAuthMethod::ApiKey
+            | GoogleAuthMethod::BearerApiKey
+            | GoogleAuthMethod::ApiKeyExpress => {
+                Some(resolve_simple_secret(&binding.auth_profile.source, env, binding).await?)
             }
             GoogleAuthMethod::ExternalAuthorizer => {
-                resolve_external_authorizer(&binding.auth_profile.source, env, binding).await?
+                resolve_external_authorizer(&binding.auth_profile.source, env, binding).await?;
+                None
             }
-            // api_key_express uses the simple-secret path (it's just an
-            // API key passed through Vertex).
-            GoogleAuthMethod::ApiKeyExpress => {
-                resolve_simple_secret(&binding.auth_profile.source, env, binding).await?
-            }
-            // ADC / compute ADC drive through GoogleAuthAuthorizer at
-            // request time; we return the authorizer marker via the
-            // ResolvedConnection's shim_credential.
-            GoogleAuthMethod::Adc | GoogleAuthMethod::ComputeAdc => {
-                // The real authorizer is constructed by build_client /
-                // Phase 6 owned-HTTP; here we mark the credential as
-                // dynamic.
-                ShimCredential::Authorizer
-            }
+            GoogleAuthMethod::Adc | GoogleAuthMethod::ComputeAdc => None,
             GoogleAuthMethod::GoogleOauth => {
                 #[cfg(all(not(target_arch = "wasm32"), feature = "oauth"))]
                 {
@@ -161,8 +152,10 @@ impl ProviderRuntime for GoogleProviderRuntime {
                     let fresh = persisted
                         .expires_at
                         .is_none_or(|exp| exp - Utc::now() > Duration::seconds(60));
-                    if let (true, Some(access)) = (fresh, persisted.primary_secret.clone()) {
-                        ShimCredential::Secret(access)
+                    let access = if let (true, Some(access)) =
+                        (fresh, persisted.primary_secret.clone())
+                    {
+                        access
                     } else {
                         let coord = env.refresh_coord.clone().unwrap_or_else(|| {
                             Arc::new(crate::auth_store::InMemoryCoordinator::new())
@@ -174,20 +167,19 @@ impl ProviderRuntime for GoogleProviderRuntime {
                             endpoints,
                             key,
                         );
-                        let access =
-                            runtime
-                                .get_or_refresh_access_token()
-                                .await
-                                .map_err(|e| match e {
-                                    oauth::GoogleCodeAssistOAuthError::InteractiveLoginRequired => {
-                                        ProviderAuthError::Auth(AuthError::InteractiveLoginRequired)
-                                    }
-                                    other => {
-                                        ProviderAuthError::SourceResolutionFailed(other.to_string())
-                                    }
-                                })?;
-                        ShimCredential::Secret(access)
-                    }
+                        runtime
+                            .get_or_refresh_access_token()
+                            .await
+                            .map_err(|e| match e {
+                                oauth::GoogleCodeAssistOAuthError::InteractiveLoginRequired => {
+                                    ProviderAuthError::Auth(AuthError::InteractiveLoginRequired)
+                                }
+                                other => {
+                                    ProviderAuthError::SourceResolutionFailed(other.to_string())
+                                }
+                            })?
+                    };
+                    Some(access)
                 }
                 #[cfg(not(all(not(target_arch = "wasm32"), feature = "oauth")))]
                 {
@@ -196,21 +188,17 @@ impl ProviderRuntime for GoogleProviderRuntime {
             }
         };
 
-        // Plan §6.11 migration: populate the lease with real credential
-        // material (StaticLease with __secret__ header OR empty for the
-        // authorizer path — build_client constructs the concrete
-        // HttpAuthorizer on-demand for ADC / Compute / OAuth flows).
+        // Plan §6.11: populate the lease with resolved secret as a
+        // __secret__ header, or an empty lease for authorizer paths.
         let source_label = format!("google:{}", binding.auth_profile.id);
-        let lease: Arc<dyn meerkat_core::AuthLease> = match &shim_credential {
-            ShimCredential::Secret(s) => Arc::new(StaticLease::new(
-                vec![("__secret__".to_string(), s.clone())],
+        let lease: Arc<dyn meerkat_core::AuthLease> = match secret_opt {
+            Some(secret) => Arc::new(StaticLease::new(
+                vec![("__secret__".to_string(), secret)],
                 AuthMetadata::default(),
                 None,
                 source_label,
             )),
-            ShimCredential::Authorizer | ShimCredential::None => {
-                Arc::new(StaticLease::empty(AuthMetadata::default(), source_label))
-            }
+            None => Arc::new(StaticLease::empty(AuthMetadata::default(), source_label)),
         };
 
         Ok(ResolvedConnection {
@@ -218,7 +206,6 @@ impl ProviderRuntime for GoogleProviderRuntime {
             backend: NormalizedBackendKind::Google(backend_kind),
             backend_profile: binding.backend_profile.clone(),
             auth_lease: lease,
-            shim_credential,
         })
     }
 
@@ -285,7 +272,7 @@ impl ProviderRuntime for GoogleProviderRuntime {
                 // Vertex-region URL (per BackendProfile.base_url) with
                 // the same generative-language wire as GoogleGenAi. ADC
                 // + ExternalAuthorizer paths arrive via the Authorizer
-                // ShimCredential arm (not here). For a raw secret, we
+                // (deleted shim path). For a raw secret, we
                 // treat it as the api_key_express path.
                 let base_url = connection
                     .backend_profile

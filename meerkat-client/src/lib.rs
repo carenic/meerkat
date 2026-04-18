@@ -73,7 +73,7 @@ pub use gemini::GeminiClient;
 pub use runtime::{
     DynamicLease, ExternalAuthResolverHandle, NormalizedAuthMethod, NormalizedBackendKind,
     ProviderAuthError, ProviderBindingError, ProviderClientError, ProviderRuntime,
-    ProviderRuntimeRegistry, ResolvedConnection, ResolverEnvironment, ShimCredential, StaticLease,
+    ProviderRuntimeRegistry, ResolvedConnection, ResolverEnvironment, StaticLease,
     ValidatedBinding,
 };
 

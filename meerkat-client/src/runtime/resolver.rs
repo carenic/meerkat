@@ -1,28 +1,34 @@
 //! Shared resolver helpers used by provider runtimes.
 //!
-//! Phase 2 only covers the simple-secret shape: `InlineSecret` / `Env` /
-//! `ExternalResolver` (via the `"__secret__"` synthetic header key) for
-//! `api_key`/`static_bearer` auth methods, plus the external-authorizer
-//! path. Managed-store and platform-default sources surface as
-//! `InteractiveLoginRequired` — Phase 3 adds the managed store.
+//! Plan §6.11 closure: resolvers return credential material directly
+//! (a `String` secret or a resolved `Arc<dyn HttpAuthorizer>` via the
+//! external-resolver envelope's `__secret__` convention) instead of the
+//! plan §6.11 deletion. Simple-secret paths cover
+//! `InlineSecret` / `Env` / `ExternalResolver` (with `"__secret__"` key)
+//! for `api_key` / `static_bearer` auth methods. The external-authorizer
+//! resolver surfaces upstream AuthError by calling the resolver handle
+//! but the real `Arc<dyn HttpAuthorizer>` is constructed by the
+//! provider runtime at build time (cloud-specific clients depend on
+//! SDKs that can't serde-roundtrip).
 
 use meerkat_core::{AuthError, CredentialSourceSpec, ResolvedAuthEnvelope};
 
-use crate::runtime::binding::ShimCredential;
 use crate::runtime::errors::ProviderAuthError;
 use crate::runtime::registry::ResolverEnvironment;
 
-/// Resolve a [`CredentialSourceSpec`] into a single secret string. Used by
-/// api_key / static_bearer auth methods.
+/// Resolve a [`CredentialSourceSpec`] into a single secret string. Used
+/// by api_key / static_bearer auth methods. Returns the resolved secret
+/// directly; the provider runtime wraps it in a `StaticLease` with the
+/// `__secret__` synthetic header for transport to `build_client`.
 pub async fn resolve_simple_secret(
     source: &CredentialSourceSpec,
     env: &ResolverEnvironment,
     binding: &crate::runtime::binding::ValidatedBinding,
-) -> Result<ShimCredential, ProviderAuthError> {
+) -> Result<String, ProviderAuthError> {
     match source {
-        CredentialSourceSpec::InlineSecret { secret } => Ok(ShimCredential::Secret(secret.clone())),
+        CredentialSourceSpec::InlineSecret { secret } => Ok(secret.clone()),
         CredentialSourceSpec::Env { env: var } => match (env.env_lookup)(var) {
-            Some(value) => Ok(ShimCredential::Secret(value)),
+            Some(value) => Ok(value),
             None => Err(ProviderAuthError::Auth(AuthError::MissingSecret)),
         },
         CredentialSourceSpec::ExternalResolver { handle } => {
@@ -33,22 +39,12 @@ pub async fn resolve_simple_secret(
             let envelope = resolver.resolve(binding).await?;
             extract_secret_from_envelope(envelope)
         }
-        CredentialSourceSpec::Command { .. } => {
-            // Command-backed credentials are resolved by
-            // `CommandCredentialRunner` under the provider runtime; they
-            // don't resolve through the simple-secret path. Provider
-            // runtimes that want command bearer tokens should construct
-            // the runner themselves and feed the result into the lease.
-            Err(ProviderAuthError::SourceResolutionFailed(
-                "CredentialSourceSpec::Command requires a provider-specific runner; \
-                 not reachable from the simple-secret resolver"
-                    .into(),
-            ))
-        }
+        CredentialSourceSpec::Command { .. } => Err(ProviderAuthError::SourceResolutionFailed(
+            "CredentialSourceSpec::Command requires a provider-specific runner; \
+             not reachable from the simple-secret resolver"
+                .into(),
+        )),
         CredentialSourceSpec::FileDescriptor { .. } => {
-            // File-descriptor credentials are a host-scoped concern
-            // (inherit an FD from the launching process). Provider
-            // runtimes that want fd-delivered tokens read them directly.
             Err(ProviderAuthError::SourceResolutionFailed(
                 "CredentialSourceSpec::FileDescriptor requires a host-scoped reader; \
                  not reachable from the simple-secret resolver"
@@ -61,14 +57,17 @@ pub async fn resolve_simple_secret(
     }
 }
 
-/// External auth for `external_authorizer` method — does not require a raw
-/// secret; produces `ShimCredential::Authorizer` so `build_client` can
-/// reject it with the typed Phase-3-deferred error.
+/// External auth for `external_authorizer` method. Calls the host-
+/// registered resolver to surface any upstream `AuthError` before the
+/// provider runtime constructs its concrete `HttpAuthorizer`. Returns
+/// `Ok(())` on success — the provider runtime is responsible for
+/// wiring the backend-specific authorizer (Bedrock SigV4, Vertex
+/// GoogleAuth, Foundry AzureAd, etc.) into a `DynamicLease`.
 pub async fn resolve_external_authorizer(
     source: &CredentialSourceSpec,
     env: &ResolverEnvironment,
     binding: &crate::runtime::binding::ValidatedBinding,
-) -> Result<ShimCredential, ProviderAuthError> {
+) -> Result<(), ProviderAuthError> {
     let CredentialSourceSpec::ExternalResolver { handle } = source else {
         return Err(ProviderAuthError::SourceResolutionFailed(format!(
             "external_authorizer auth requires CredentialSourceSpec::ExternalResolver, \
@@ -79,32 +78,35 @@ pub async fn resolve_external_authorizer(
         .external_resolvers
         .get(handle)
         .ok_or_else(|| ProviderAuthError::ExternalResolverMissing(handle.clone()))?;
-    // Call the resolver to surface any upstream AuthError, but the shim
-    // treats the credential as an opaque Authorizer marker.
     let _envelope = resolver.resolve(binding).await?;
-    Ok(ShimCredential::Authorizer)
+    Ok(())
 }
 
-/// Phase-2 convention: a resolver's `StaticHeaders` envelope carries a
-/// `("__secret__", value)` pair when the caller expects a simple secret.
-/// Real provider header emission is a Phase 3 concern.
+/// Extract a simple secret from a `StaticHeaders` envelope using the
+/// `"__secret__"` synthetic header convention. Errors on any other
+/// envelope shape.
 fn extract_secret_from_envelope(
     envelope: ResolvedAuthEnvelope,
-) -> Result<ShimCredential, ProviderAuthError> {
+) -> Result<String, ProviderAuthError> {
     match envelope {
         ResolvedAuthEnvelope::StaticHeaders { headers, .. } => headers
             .into_iter()
             .find_map(|(k, v)| if k == "__secret__" { Some(v) } else { None })
-            .map(ShimCredential::Secret)
             .ok_or_else(|| {
                 ProviderAuthError::SourceResolutionFailed(
                     "external resolver produced StaticHeaders without a '__secret__' key; \
-                     Phase 2 shim cannot extract credential material"
+                     api_key/static_bearer path cannot extract credential material"
                         .into(),
                 )
             }),
-        ResolvedAuthEnvelope::DynamicAuthorizer { .. } => Ok(ShimCredential::Authorizer),
-        ResolvedAuthEnvelope::None { .. } => Ok(ShimCredential::None),
+        ResolvedAuthEnvelope::DynamicAuthorizer { .. } => {
+            Err(ProviderAuthError::SourceResolutionFailed(
+                "external resolver returned DynamicAuthorizer envelope; \
+                 use external_authorizer auth method instead"
+                    .into(),
+            ))
+        }
+        ResolvedAuthEnvelope::None { .. } => Err(ProviderAuthError::Auth(AuthError::MissingSecret)),
     }
 }
 
@@ -120,8 +122,7 @@ mod tests {
             metadata: Default::default(),
             expires_at: None,
         };
-        let cred = extract_secret_from_envelope(env).unwrap();
-        assert_eq!(cred, ShimCredential::Secret("sk-x".into()));
+        assert_eq!(extract_secret_from_envelope(env).unwrap(), "sk-x");
     }
 
     #[test]
@@ -136,21 +137,24 @@ mod tests {
     }
 
     #[test]
-    fn extract_dynamic_envelope_returns_authorizer() {
+    fn extract_dynamic_envelope_errors() {
         let env = ResolvedAuthEnvelope::DynamicAuthorizer {
             metadata: Default::default(),
             expires_at: None,
         };
-        let cred = extract_secret_from_envelope(env).unwrap();
-        assert_eq!(cred, ShimCredential::Authorizer);
+        let err = extract_secret_from_envelope(env).unwrap_err();
+        assert!(matches!(err, ProviderAuthError::SourceResolutionFailed(_)));
     }
 
     #[test]
-    fn extract_none_envelope_returns_none() {
+    fn extract_none_envelope_errors() {
         let env = ResolvedAuthEnvelope::None {
             metadata: Default::default(),
         };
-        let cred = extract_secret_from_envelope(env).unwrap();
-        assert_eq!(cred, ShimCredential::None);
+        let err = extract_secret_from_envelope(env).unwrap_err();
+        assert!(matches!(
+            err,
+            ProviderAuthError::Auth(AuthError::MissingSecret)
+        ));
     }
 }

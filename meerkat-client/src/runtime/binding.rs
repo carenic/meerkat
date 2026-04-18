@@ -70,55 +70,20 @@ impl std::fmt::Debug for ValidatedBinding {
     }
 }
 
-/// Phase-2-only shim seam carrying resolved credential material.
-///
-/// `build_client` reads this to hand a secret (or an "authorizer not
-/// supported in shim mode" indicator) to the existing `AnthropicClient` /
-/// `OpenAiClient` / `GeminiClient` constructors. Phase 3 deletes this
-/// enum when the runtime layer owns HTTP request assembly directly.
-#[derive(Clone)]
-pub enum ShimCredential {
-    /// A simple secret string (api key, static bearer). The most common
-    /// Phase 2 shape.
-    Secret(String),
-    /// A dynamic authorizer was resolved, but the existing provider
-    /// clients cannot accept one — `build_client` returns
-    /// `ProviderClientError::DynamicAuthorizerNotYetSupportedInShimMode`.
-    Authorizer,
-    /// No credential material — `build_client` returns
-    /// `ProviderClientError::NoCredentialMaterial`.
-    None,
-}
-
-impl std::fmt::Debug for ShimCredential {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Secret(_) => f.debug_tuple("Secret").field(&"<redacted>").finish(),
-            Self::Authorizer => f.debug_struct("Authorizer").finish(),
-            Self::None => f.debug_struct("None").finish(),
-        }
-    }
-}
-
-impl PartialEq for ShimCredential {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Secret(a), Self::Secret(b)) => a == b,
-            (Self::Authorizer, Self::Authorizer) | (Self::None, Self::None) => true,
-            _ => false,
-        }
-    }
-}
+// Plan §6.11 deleted the `ShimCredential` enum. Credential material
+// lives in the `auth_lease` directly: `StaticHeaders` with a
+// `__secret__` entry for simple-secret flows, `DynamicAuthorizer` for
+// authorizer-backed flows. `build_client` reads
+// `ResolvedConnection::resolved_secret()` / `resolved_authorizer()`.
 
 /// A fully resolved connection carries the trait-object lease alongside
-/// the Phase-2 shim secret and backend metadata.
+/// backend metadata.
 #[derive(Clone)]
 pub struct ResolvedConnection {
     pub provider: Provider,
     pub backend: NormalizedBackendKind,
     pub backend_profile: Arc<BackendProfile>,
     pub auth_lease: Arc<dyn AuthLease>,
-    pub shim_credential: ShimCredential,
 }
 
 impl std::fmt::Debug for ResolvedConnection {
@@ -127,7 +92,6 @@ impl std::fmt::Debug for ResolvedConnection {
             .field("provider", &self.provider)
             .field("backend", &self.backend)
             .field("backend_profile_id", &self.backend_profile.id)
-            .field("shim_credential", &self.shim_credential)
             .finish()
     }
 }
@@ -187,7 +151,7 @@ impl StaticLease {
     }
 
     /// Empty-header variant — used by Phase 2 resolvers that don't yet
-    /// project wire-correct headers (see ShimCredential). Phase 3 populates.
+    /// project real wire headers.
     pub fn empty(metadata: AuthMetadata, source_label: impl Into<String>) -> Self {
         Self::new(Vec::new(), metadata, None, source_label)
     }
@@ -215,7 +179,7 @@ impl AuthLease for StaticLease {
 }
 
 /// Dynamic lease wrapping a runtime authorizer. Phase 2 build_client does
-/// not accept this shape — ShimCredential::Authorizer propagates and
+/// not accept this shape — authorizer-backed flows use this directly
 /// `build_client` returns DynamicAuthorizerNotYetSupportedInShimMode.
 pub struct DynamicLease {
     authorizer: Arc<dyn HttpAuthorizer>,
@@ -273,30 +237,7 @@ impl AuthLease for DynamicLease {
 mod tests {
     use super::*;
 
-    #[test]
-    fn shim_credential_partial_eq() {
-        assert_eq!(ShimCredential::None, ShimCredential::None);
-        assert_eq!(ShimCredential::Authorizer, ShimCredential::Authorizer);
-        assert_eq!(
-            ShimCredential::Secret("sk-x".into()),
-            ShimCredential::Secret("sk-x".into()),
-        );
-        assert_ne!(ShimCredential::None, ShimCredential::Authorizer);
-        assert_ne!(
-            ShimCredential::Secret("a".into()),
-            ShimCredential::Secret("b".into()),
-        );
-    }
-
-    #[test]
-    fn shim_credential_debug_redacts_secret() {
-        let debug = format!("{:?}", ShimCredential::Secret("sk-totally-real".into()));
-        assert!(
-            debug.contains("redacted"),
-            "expected redaction, got {debug:?}"
-        );
-        assert!(!debug.contains("sk-totally-real"));
-    }
+    // Plan §6.11 deleted the §6.11 deletion artifact cleanup.
 
     #[tokio::test]
     async fn static_lease_satisfies_trait() {

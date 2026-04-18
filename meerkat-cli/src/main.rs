@@ -2446,7 +2446,7 @@ async fn handle_auth_command(command: AuthCommands, scope: &RuntimeScope) -> any
                     println!("backend_profile_id: {}", conn.backend_profile.id);
                     println!(
                         "has_credential: {}",
-                        !matches!(conn.shim_credential, meerkat_client::ShimCredential::None),
+                        conn.resolved_secret().is_some() || conn.resolved_authorizer().is_some(),
                     );
                 }
                 Err(e) => {

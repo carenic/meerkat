@@ -13,9 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use meerkat_client::{
-    ProviderAuthError, ProviderRuntimeRegistry, ResolverEnvironment, ShimCredential,
-};
+use meerkat_client::{ProviderAuthError, ProviderRuntimeRegistry, ResolverEnvironment};
 use meerkat_core::{
     AuthProfile, BackendProfile, BindingPolicy, CredentialSourceSpec, Provider, ProviderBinding,
     RealmConnectionSet,
@@ -106,9 +104,9 @@ async fn openai_api_key_roundtrip_resolves_and_builds_client() {
 
     // C2 observable: credential material is a simple Secret.
     assert_eq!(
-        connection.shim_credential,
-        ShimCredential::Secret("sk-openai".into()),
-        "InlineSecret should materialize as ShimCredential::Secret",
+        connection.resolved_secret(),
+        Some("sk-openai".to_string()),
+        "InlineSecret should materialize as Some(secret)",
     );
     assert_eq!(connection.provider, Provider::OpenAI);
 
@@ -131,8 +129,8 @@ async fn anthropic_api_key_roundtrip_resolves_and_builds_client() {
         .expect("Phase 2 L2.12 should make resolve() return Ok for default_anthropic");
 
     assert_eq!(
-        connection.shim_credential,
-        ShimCredential::Secret("sk-anthropic".into()),
+        connection.resolved_secret(),
+        Some("sk-anthropic".to_string()),
     );
     assert_eq!(connection.provider, Provider::Anthropic);
 
@@ -153,10 +151,7 @@ async fn google_api_key_roundtrip_resolves_and_builds_client() {
         .await
         .expect("Phase 2 L2.12 should make resolve() return Ok for default_google");
 
-    assert_eq!(
-        connection.shim_credential,
-        ShimCredential::Secret("sk-google".into()),
-    );
+    assert_eq!(connection.resolved_secret(), Some("sk-google".to_string()),);
     assert_eq!(connection.provider, Provider::Gemini);
 
     let client = registry
@@ -258,6 +253,6 @@ fn default_registry_populated_by_features() {
     assert!(registry.get(Provider::SelfHosted).is_none());
 }
 
-// C3 negative observable (ShimCredential::None → NoCredentialMaterial) is
+// C3 negative observable (empty-lease -> NoCredentialMaterial) is
 // anchored in per-provider mod.rs unit tests since a ResolvedConnection
 // cannot be constructed externally without resolve_binding producing one.
