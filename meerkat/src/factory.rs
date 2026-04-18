@@ -661,14 +661,12 @@ pub fn provider_key(provider: Provider) -> &'static str {
 /// for runtime resolution (Phase 6.1 replacement for the deleted
 /// legacy credential-precedence helper).
 ///
-/// Precedence matches the legacy factory path to keep on-disk TOML
-/// configurations and env-var workflows working unchanged through the
-/// 0.6.0 cutover:
-///   1. `config.provider = ProviderConfig::{Anthropic,OpenAI,Gemini} { api_key }` (legacy per-provider block)
-///   2. `config.providers.api_keys[<provider>]` (legacy shared map)
-///   3. env var `RKAT_<P>_API_KEY` -> `<P>_API_KEY` -> `GOOGLE_API_KEY` (Gemini only)
+/// Precedence (post plan §6.9 cutover):
+///   1. `config.providers.api_keys[<provider>]` (shared map — scheduled
+///      for deletion in plan §6.10).
+///   2. env var `RKAT_<P>_API_KEY` -> `<P>_API_KEY` -> `GOOGLE_API_KEY` (Gemini only).
 ///
-/// Layers 1+2 synthesize with `InlineSecret`; layer 3 synthesizes with
+/// Layer 1 synthesizes with `InlineSecret`; layer 2 synthesizes with
 /// `Env`, which the resolver's `env_lookup` seam reads at resolve time.
 /// Dogma §1: one canonical owner for "legacy credential precedence" —
 /// this projection — instead of a helper in the factory body.
@@ -682,24 +680,11 @@ fn synthesize_realm_from_config(
         .as_ref()
         .and_then(|map| map.get(provider_key(provider)).cloned());
 
-    match (&config.provider, provider) {
-        (meerkat_core::ProviderConfig::Anthropic { api_key: k, .. }, Provider::Anthropic) => {
-            if k.is_some() {
-                api_key = k.clone();
-            }
-        }
-        (meerkat_core::ProviderConfig::OpenAI { api_key: k, .. }, Provider::OpenAI) => {
-            if k.is_some() {
-                api_key = k.clone();
-            }
-        }
-        (meerkat_core::ProviderConfig::Gemini { api_key: k }, Provider::Gemini) => {
-            if k.is_some() {
-                api_key = k.clone();
-            }
-        }
-        _ => {}
-    }
+    // Plan §6.9 deleted the per-provider `config.provider = ProviderConfig::X`
+    // block; legacy TOML consumers with a block of that shape now need
+    // to use `[realm.<id>]` configs or env vars instead. The
+    // `providers.api_keys` shared map (scheduled for deletion in §6.10)
+    // is still honored for back-compat during 0.6.0.
 
     if api_key.is_none() {
         if std::env::var("RKAT_TEST_CLIENT").ok().as_deref() == Some("1") {

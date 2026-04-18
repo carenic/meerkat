@@ -93,7 +93,6 @@ pub use meerkat_core::{
     OutputSchema,
     // Provider
     Provider,
-    ProviderConfig,
     ResponseStatus,
     ResultShape,
     RetryConfig,

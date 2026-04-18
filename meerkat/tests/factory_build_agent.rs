@@ -18,10 +18,10 @@ use meerkat_client::{LlmClient, TestClient};
 use meerkat_comms::{CommsRuntime, ResolvedCommsConfig, TrustedPeer, identity::Keypair};
 use meerkat_core::service::{MobToolAuthorityContext, OpaquePrincipalToken};
 use meerkat_core::{
-    AgentToolDispatcher, Config, Provider, ProviderConfig, SelfHostedApiStyle,
-    SelfHostedModelConfig, SelfHostedServerConfig, SelfHostedTransport, Session, SessionId,
-    SessionLlmIdentity, SessionMetadata, SessionTooling, ToolCallView, ToolCategoryOverride,
-    ToolDef, ToolDispatchOutcome, ToolError, UserMessage,
+    AgentToolDispatcher, Config, Provider, SelfHostedApiStyle, SelfHostedModelConfig,
+    SelfHostedServerConfig, SelfHostedTransport, Session, SessionId, SessionLlmIdentity,
+    SessionMetadata, SessionTooling, ToolCallView, ToolCategoryOverride, ToolDef,
+    ToolDispatchOutcome, ToolError, UserMessage,
 };
 use meerkat_schedule::{MemoryScheduleStore, ScheduleService, ScheduleToolDispatcher};
 use meerkat_store::{SessionFilter, SessionStore, SessionStoreError};
@@ -272,18 +272,19 @@ async fn build_agent_without_override_fails_missing_api_key() {
     );
 }
 
-/// 2b. Provider API key from config.provider is honored when env vars are absent.
+/// 2b. Provider API key from `providers.api_keys[<p>]` is honored when
+///     env vars are absent. Plan §6.9 removed the `config.provider =
+///     ProviderConfig::X` legacy block; this test now exercises the
+///     shared-map path instead.
 #[tokio::test]
 async fn build_agent_uses_provider_config_api_key() {
     let temp = tempfile::tempdir().unwrap();
     let factory = temp_factory(&temp);
-    let config = Config {
-        provider: ProviderConfig::OpenAI {
-            api_key: Some("test-openai-key".to_string()),
-            base_url: None,
-        },
-        ..Config::default()
-    };
+    let mut config = Config::default();
+    config.providers.api_keys = Some(std::collections::HashMap::from([(
+        "openai".to_string(),
+        "test-openai-key".to_string(),
+    )]));
 
     let build_config = AgentBuildConfig::new("gpt-5.2");
     let result = factory.build_agent(build_config, &config).await;

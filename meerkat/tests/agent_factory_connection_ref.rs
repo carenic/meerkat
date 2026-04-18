@@ -288,14 +288,17 @@ async fn llm_client_override_beats_connection_ref() {
 
 #[tokio::test]
 async fn build_agent_without_connection_ref_uses_flat_path() {
+    // Plan §6.9 deleted the legacy per-provider config block. The flat path now relies on the
+    // `providers.api_keys` shared map (§6.10 target) or env vars. This
+    // test asserts the shared-map path: no connection_ref, api_key
+    // resolved from the map, agent builds successfully.
     let temp = tempfile::tempdir().unwrap();
     let factory = temp_factory(&temp);
     let mut config = config_with_realm();
-    // Also configure flat provider API key so the flat path can build.
-    config.provider = meerkat_core::ProviderConfig::OpenAI {
-        api_key: Some("flat-key".into()),
-        base_url: None,
-    };
+    config.providers.api_keys = Some(std::collections::HashMap::from([(
+        "openai".to_string(),
+        "flat-key".to_string(),
+    )]));
 
     let build = AgentBuildConfig::new("gpt-5.2");
     // No connection_ref — flat path must run unchanged.
