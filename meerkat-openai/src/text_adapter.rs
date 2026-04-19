@@ -259,23 +259,23 @@ fn convert_messages(messages: &[Message]) -> Result<(Option<String>, Vec<Item>),
                     let parts = u
                         .content
                         .iter()
-                        .filter_map(|block| match block {
+                        .map(|block| match block {
                             ContentBlock::Text { text } => {
-                                Some(ContentPart::InputText { text: text.clone() })
+                                ContentPart::InputText { text: text.clone() }
                             }
                             ContentBlock::Image {
                                 media_type, data, ..
                             } => match data {
-                                ImageData::Inline { data } => Some(ContentPart::InputText {
+                                ImageData::Inline { data } => ContentPart::InputText {
                                     text: format!("[image {media_type} data:{} bytes]", data.len()),
-                                }),
-                                ImageData::Blob { .. } => Some(ContentPart::InputText {
+                                },
+                                ImageData::Blob { .. } => ContentPart::InputText {
                                     text: block.text_projection().into_owned(),
-                                }),
+                                },
                             },
-                            _ => Some(ContentPart::InputText {
+                            _ => ContentPart::InputText {
                                 text: block.text_projection().into_owned(),
-                            }),
+                            },
                         })
                         .collect::<Vec<_>>();
                     if !parts.is_empty() {
