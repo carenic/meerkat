@@ -3947,6 +3947,28 @@ impl MobActor {
                 }
                 return Err(start_error);
             }
+        } else {
+            // Turn-driven mob members still need a persistent comms drain:
+            // async peer requests/responses arrive between user turns (think
+            // realtime audio operators calling `send_request` and waiting for
+            // `send_response`). Without a drain running, the
+            // `peer_response_terminal` notice never reaches the session's
+            // runtime queue, so the wake path is dead. The drain-spawn seam
+            // is independent of `config.keep_alive` (which the mock session
+            // services overload as "block on start_turn"), so we drive it
+            // explicitly here for turn-driven members that have a bridge
+            // session and a comms runtime.
+            #[cfg(all(not(target_arch = "wasm32"), feature = "runtime-adapter"))]
+            if let (Some(adapter), Some(bridge_session_id)) =
+                (self.runtime_adapter.clone(), member_ref.bridge_session_id())
+            {
+                let comms_runtime = self.provisioner.comms_runtime(&member_ref).await;
+                if comms_runtime.is_some() {
+                    let _ = adapter
+                        .maybe_spawn_comms_drain(bridge_session_id, true, comms_runtime)
+                        .await;
+                }
+            }
         }
 
         // auto_wire_parent: wire to the actual spawner member when the spawn
