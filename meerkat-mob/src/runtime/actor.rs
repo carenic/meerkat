@@ -3963,6 +3963,16 @@ impl MobActor {
                 (self.runtime_adapter.clone(), member_ref.bridge_session_id())
             {
                 let comms_runtime = self.provisioner.comms_runtime(&member_ref).await;
+                if std::env::var_os("RKAT_TRACE_COMMS_DRAIN_BIND").is_some()
+                    && let Some(runtime) = comms_runtime.as_ref()
+                {
+                    tracing::info!(
+                        agent_identity = %agent_identity,
+                        session_id = %bridge_session_id,
+                        comms_ptr = ?Arc::as_ptr(runtime),
+                        "mob turn-driven spawn binding comms drain"
+                    );
+                }
                 if comms_runtime.is_some() {
                     let _ = adapter
                         .maybe_spawn_comms_drain(bridge_session_id, true, comms_runtime)
