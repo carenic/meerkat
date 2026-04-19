@@ -32,8 +32,8 @@ use meerkat_core::{
 use meerkat_llm_core::{LlmClient, LlmDoneOutcome, LlmError, LlmEvent, LlmRequest, LlmStream};
 
 use oai_rt_rs::protocol::models::{
-    ContentPart, ConversationMode, Item, OutputModalities, ResponseConfig, Role, SessionUpdate,
-    SessionUpdateConfig, Tool, Usage as OaiUsage,
+    ContentPart, ConversationMode, Item, MaxTokens, OutputModalities, ResponseConfig, Role,
+    SessionUpdate, SessionUpdateConfig, Temperature, Tool, Usage as OaiUsage,
 };
 use oai_rt_rs::{ClientEvent, RealtimeClient, ServerEvent};
 
@@ -104,13 +104,25 @@ impl LlmClient for OpenAiRealtimeTextAdapter {
             // Kick off inference. Stateless conversation mode to avoid
             // surprise coupling to any prior server-side conversation
             // state — we replayed the full history above.
+            //
+            // Propagate the session-level LlmRequest tunables so
+            // realtime turns honor the same max_output_tokens / temperature
+            // as the Responses-API path. Temperatures outside the realtime
+            // protocol's accepted [0.0, 2.0] range are dropped rather than
+            // rejected — the upstream constructor returns a typed error we
+            // do not want to elevate mid-stream.
+            let max_output_tokens =
+                (request.max_tokens > 0).then_some(MaxTokens::Count(request.max_tokens));
+            let temperature = request
+                .temperature
+                .and_then(|t| Temperature::new(t).ok());
             let response_config = ResponseConfig {
                 conversation: Some(ConversationMode::None),
                 output_modalities: Some(OutputModalities::Text),
                 instructions: instructions.clone(),
                 tools: Some(tools.clone()),
-                max_output_tokens: None,
-                temperature: None,
+                max_output_tokens,
+                temperature,
                 ..ResponseConfig::default()
             };
             client
@@ -163,9 +175,18 @@ impl LlmClient for OpenAiRealtimeTextAdapter {
                         let args = if arguments.trim().is_empty() {
                             serde_json::json!({})
                         } else {
-                            serde_json::from_str(&arguments).unwrap_or_else(|_| {
-                                serde_json::Value::String(arguments.clone())
-                            })
+                            match serde_json::from_str::<serde_json::Value>(&arguments) {
+                                Ok(value) => value,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        call_id = %call_id,
+                                        tool = %name,
+                                        error = %err,
+                                        "openai realtime: tool_call arguments failed JSON parse; falling back to raw string"
+                                    );
+                                    serde_json::Value::String(arguments.clone())
+                                }
+                            }
                         };
                         stop_reason = StopReason::ToolUse;
                         yield LlmEvent::ToolCallComplete {
