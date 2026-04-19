@@ -1636,6 +1636,9 @@ async fn spawn_stdio_process(
         "RKAT_OPENAI_REALTIME_TRACE_JSON",
         "RKAT_OPENAI_REALTIME_TRACE_LIFECYCLE",
         "RKAT_OPENAI_REALTIME_TRACE_ACTIVE_RESPONSE",
+        "RKAT_RPC_TRACE_FILE",
+        "RUST_LOG",
+        "RUST_BACKTRACE",
     ] {
         if let Ok(value) = std::env::var(passthrough) {
             cmd.env(passthrough, value);
