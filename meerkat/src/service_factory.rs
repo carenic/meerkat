@@ -722,7 +722,10 @@ mod tests {
             .build_agent(build_config, &Config::default())
             .await
             .map_err(|err| format!("{err}"))?;
-        Ok(FactoryAgent { agent })
+        Ok(FactoryAgent {
+            agent,
+            session_context: None,
+        })
     }
 
     #[tokio::test]

@@ -4152,4 +4152,160 @@ mod tests {
             .expect("reattach should start");
         assert_eq!(status.deadline_at, None);
     }
+
+    // -----------------------------------------------------------------------
+    // W2-E: ProjectionFreshness typed state machine tests.
+    //
+    // Invariant tests are paired: each transition has a positive case
+    // (proves the transition advances as specified) and a negative case
+    // (proves the transition refuses to fire on the wrong precondition).
+    // This symmetry is the lesson from W1-B (admission-only trust cut
+    // that silently broke send-resolution when only positive cases were
+    // covered): both directions of change must be asserted.
+    // -----------------------------------------------------------------------
+
+    use super::ProjectionFreshness;
+
+    #[test]
+    fn projection_freshness_clean_advances_to_stale_immediate_when_idle() {
+        // Positive: idle session, context advances, frontier transitions
+        // to StaleImmediate carrying the new watermark.
+        let fresh = ProjectionFreshness::Clean { baseline_ms: 100 };
+        let advanced = fresh.on_context_advanced(200, /* turn_in_flight */ false);
+        assert_eq!(
+            advanced,
+            ProjectionFreshness::StaleImmediate { new_at_ms: 200 }
+        );
+    }
+
+    #[test]
+    fn projection_freshness_clean_advances_to_stale_deferred_when_turn_in_flight() {
+        // Positive: mid-turn advance records as `StaleDeferred` so the
+        // refresh is held until turn end (preserves barge-in continuity).
+        let fresh = ProjectionFreshness::Clean { baseline_ms: 100 };
+        let advanced = fresh.on_context_advanced(200, /* turn_in_flight */ true);
+        assert_eq!(
+            advanced,
+            ProjectionFreshness::StaleDeferred { new_at_ms: 200 }
+        );
+    }
+
+    #[test]
+    fn projection_freshness_non_monotonic_advance_is_ignored() {
+        // Negative: an advance at or below the current baseline is a
+        // no-op. The consumer must not transition into a stale state
+        // on a tick that doesn't actually advance canonical truth.
+        let fresh = ProjectionFreshness::Clean { baseline_ms: 300 };
+        assert_eq!(
+            fresh.on_context_advanced(300, false),
+            ProjectionFreshness::Clean { baseline_ms: 300 },
+        );
+        assert_eq!(
+            fresh.on_context_advanced(250, false),
+            ProjectionFreshness::Clean { baseline_ms: 300 },
+        );
+    }
+
+    #[test]
+    fn projection_freshness_turn_completed_promotes_deferred_to_immediate() {
+        // Positive: this is the specific s71 turn-8 fix. A StaleDeferred
+        // entry (canonical truth advanced mid-turn, e.g. peer-response
+        // terminal) must promote to StaleImmediate when the turn
+        // completes so the drain site picks it up.
+        let deferred = ProjectionFreshness::StaleDeferred { new_at_ms: 500 };
+        let promoted = deferred.on_turn_completed();
+        assert_eq!(
+            promoted,
+            ProjectionFreshness::StaleImmediate { new_at_ms: 500 }
+        );
+    }
+
+    #[test]
+    fn projection_freshness_turn_completed_does_not_alter_clean_state() {
+        // Negative: turn completion on a Clean frontier is a no-op. The
+        // drain must not re-fire against a session that has no pending
+        // advance — this was the failure mode where own-turn commits
+        // masqueraded as external advances under the old flag-based
+        // state (D4 / issue #260).
+        let clean = ProjectionFreshness::Clean { baseline_ms: 42 };
+        assert_eq!(clean.on_turn_completed(), clean);
+    }
+
+    #[test]
+    fn projection_freshness_turn_completed_is_idempotent_on_immediate() {
+        // Negative: repeated turn-completion ticks against an already-
+        // immediate stale entry must not regress (e.g. to Clean) or
+        // duplicate the stale reason. The drain is the only transition
+        // that should clear it.
+        let immediate = ProjectionFreshness::StaleImmediate { new_at_ms: 500 };
+        assert_eq!(immediate.on_turn_completed(), immediate);
+    }
+
+    #[test]
+    fn projection_freshness_refresh_clears_stale_and_advances_baseline() {
+        // Positive: a successful refresh drain resets the frontier to
+        // Clean with the refreshed watermark.
+        let stale = ProjectionFreshness::StaleImmediate { new_at_ms: 700 };
+        let refreshed = stale.on_refreshed(720);
+        assert_eq!(refreshed, ProjectionFreshness::Clean { baseline_ms: 720 });
+    }
+
+    #[test]
+    fn projection_freshness_refresh_keeps_highest_observed_watermark() {
+        // Negative: if the post-refresh DSL watermark is lower than the
+        // stale `new_at_ms` we already saw, the refreshed baseline must
+        // still reflect the highest observed watermark — regressing the
+        // baseline would leave the next SessionContextAdvanced tick
+        // misclassified as non-advancing and silently drop refreshes.
+        let stale = ProjectionFreshness::StaleImmediate { new_at_ms: 700 };
+        let refreshed = stale.on_refreshed(680);
+        assert_eq!(refreshed, ProjectionFreshness::Clean { baseline_ms: 700 });
+    }
+
+    #[test]
+    fn projection_freshness_is_stale_immediate_only_for_immediate_variant() {
+        // Tight invariant used by the drain gate. Must not fire for
+        // Clean or StaleDeferred.
+        assert!(
+            !ProjectionFreshness::Clean { baseline_ms: 0 }.is_stale_immediate(),
+            "Clean must not be drain-eligible",
+        );
+        assert!(
+            !ProjectionFreshness::StaleDeferred { new_at_ms: 0 }.is_stale_immediate(),
+            "StaleDeferred must not be drain-eligible — turn-end pulls the trigger",
+        );
+        assert!(
+            ProjectionFreshness::StaleImmediate { new_at_ms: 0 }.is_stale_immediate(),
+            "StaleImmediate must be drain-eligible",
+        );
+    }
+
+    #[test]
+    fn projection_freshness_deferred_coalesces_highest_new_at() {
+        // Multiple mid-turn advances (e.g. peer-response terminal, then
+        // a tool-result append) must coalesce to the highest watermark,
+        // not lose ticks.
+        let mut state = ProjectionFreshness::Clean { baseline_ms: 100 };
+        state = state.on_context_advanced(200, true);
+        state = state.on_context_advanced(300, true);
+        assert_eq!(state, ProjectionFreshness::StaleDeferred { new_at_ms: 300 });
+    }
+
+    #[test]
+    fn projection_freshness_idle_advance_supersedes_previous_deferred() {
+        // After a turn completion, the deferred promotes to immediate.
+        // A subsequent advance while idle must keep the state immediate
+        // and update the watermark — not regress to Deferred.
+        let deferred = ProjectionFreshness::StaleDeferred { new_at_ms: 200 };
+        let promoted = deferred.on_turn_completed();
+        assert_eq!(
+            promoted,
+            ProjectionFreshness::StaleImmediate { new_at_ms: 200 }
+        );
+        let updated = promoted.on_context_advanced(400, false);
+        assert_eq!(
+            updated,
+            ProjectionFreshness::StaleImmediate { new_at_ms: 400 }
+        );
+    }
 }

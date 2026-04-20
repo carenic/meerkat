@@ -56,6 +56,11 @@ fn meerkat_machine_inputs_equal_runtime_manifest_exactly() {
         "PeerRequestTimedOut",
         "PeerRequestReceived",
         "PeerResponseReplied",
+        // W2-E (issue #264): session-context advancement is driven via
+        // `SessionContextHandle` (meerkat-core/src/handles.rs) from the
+        // session task's `publish_summary` path, not through
+        // `MeerkatMachineCommand`.
+        "AdvanceSessionContext",
     ];
     let actual: BTreeSet<&str> = variant_names(&schema.inputs.variants)
         .into_iter()
