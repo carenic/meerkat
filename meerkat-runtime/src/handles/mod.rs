@@ -31,6 +31,7 @@ mod mcp_server_lifecycle;
 mod peer_comms;
 mod peer_interaction;
 mod session_admission;
+mod session_context;
 mod turn_state;
 
 pub use auth_lease::RuntimeAuthLeaseHandle;
@@ -40,6 +41,7 @@ pub use mcp_server_lifecycle::RuntimeMcpServerLifecycleHandle;
 pub use peer_comms::RuntimePeerCommsHandle;
 pub use peer_interaction::RuntimePeerInteractionHandle;
 pub use session_admission::RuntimeSessionAdmissionHandle;
+pub use session_context::RuntimeSessionContextHandle;
 pub use turn_state::RuntimeTurnStateHandle;
 
 /// Shared handle over a session's real `MeerkatMachineAuthority`.

@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use axum::{
     Router,
@@ -915,21 +915,37 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                     let mut product_turn_in_flight = false;
                     let mut product_turn_committed = false;
                     let mut product_output_started = false;
-                    let mut projection_refresh_dirty = false;
-                    let mut projection_known_updated_at =
-                        current_projection_updated_at(&state.runtime, binding.as_ref())
-                            .await
-                            .unwrap_or(SystemTime::UNIX_EPOCH);
                     let mut last_visible_status = Some(opened_status);
                     let mut poll_interval = tokio::time::interval(RECONNECT_POLL_INTERVAL);
                     poll_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                    let (projection_refresh_tx, mut projection_refresh_rx) = mpsc::channel(8);
-                    let mut projection_refresh_task = spawn_projection_refresh_task(
-                        Arc::clone(&state.runtime),
-                        binding.as_ref(),
-                        projection_refresh_tx.clone(),
-                    )
-                    .await;
+
+                    // W2-E: install a typed observer on the session's DSL
+                    // handle so `SessionContextAdvanced` effects arrive as
+                    // typed notifications instead of a hand-polled watch
+                    // channel. The handle also provides the initial
+                    // watermark atomically — the same value the DSL will
+                    // emit on the next tick — eliminating the two-read
+                    // race on `session.state.updated_at` that forced
+                    // retries on three tests in `.config/nextest.toml`.
+                    let (projection_refresh_tx, mut projection_refresh_rx) =
+                        mpsc::channel::<u64>(16);
+                    let session_context_handle =
+                        resolve_session_context_handle(&state.runtime, binding.as_ref()).await;
+                    let initial_baseline_ms = session_context_handle
+                        .as_ref()
+                        .map(|h| h.current_watermark_ms())
+                        .unwrap_or(0);
+                    if let Some(handle) = session_context_handle.as_ref() {
+                        let observer: Arc<
+                            dyn meerkat_core::handles::SessionContextAdvancedObserver,
+                        > = Arc::new(ProjectionRefreshObserver {
+                            notify_tx: projection_refresh_tx.clone(),
+                        });
+                        handle.install_observer(observer);
+                    }
+                    let mut projection_freshness = ProjectionFreshness::Clean {
+                        baseline_ms: initial_baseline_ms,
+                    };
 
                     loop {
                         tokio::select! {
@@ -1237,7 +1253,10 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                                     // the interruption semantics entirely. Refresh only
                                                     // when this input chunk is arriving on a cleanly
                                                     // idle provider session.
-                                                    if !preempt && !product_turn_in_flight && projection_refresh_dirty {
+                                                    if !preempt
+                                                        && !product_turn_in_flight
+                                                        && projection_freshness.is_stale_immediate()
+                                                    {
                                                         // Derived provider projections should refresh
                                                         // only when canonical Meerkat state has
                                                         // actually changed since the last successful
@@ -1264,15 +1283,16 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                                             .await;
                                                             continue;
                                                         }
-                                                        projection_refresh_dirty = false;
-                                                        if let Ok(current_updated_at) = current_projection_updated_at(
-                                                            &state.runtime,
-                                                            binding.as_ref(),
-                                                        )
-                                                        .await
-                                                        {
-                                                            projection_known_updated_at = current_updated_at;
-                                                        }
+                                                        // W2-E: refresh landed. Advance the typed
+                                                        // freshness state to `Clean { baseline }`
+                                                        // using the current DSL watermark. No
+                                                        // hand-maintained dirty flag.
+                                                        let watermark_ms = session_context_handle
+                                                            .as_ref()
+                                                            .map(|h| h.current_watermark_ms())
+                                                            .unwrap_or(0);
+                                                        projection_freshness =
+                                                            projection_freshness.on_refreshed(watermark_ms);
                                                     }
                                                     let (respond_tx, respond_rx) = oneshot::channel();
                                                     let _ = product_session
@@ -1410,28 +1430,28 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                 }
                             }
                             refresh = projection_refresh_rx.recv() => {
-                                let Some(updated_at) = refresh else {
+                                // W2-E: typed `SessionContextAdvanced` effect
+                                // arrived from the DSL handle's observer. Fold
+                                // into `projection_freshness`, then drain any
+                                // siblings that queued while we were awaiting
+                                // (the DSL can emit back-to-back advances
+                                // during a single summary publish burst, so
+                                // coalesce to the highest watermark).
+                                let Some(updated_at_ms) = refresh else {
                                     continue;
                                 };
-                                if updated_at <= projection_known_updated_at {
-                                    continue;
-                                }
-                                // D4 / issue #260: drain sibling notifies that were queued while
-                                // this one was in flight (our own turn may have produced several
-                                // commits back-to-back). For external mutations while the product
-                                // session is idle we must still refresh the provider projection —
-                                // a newer canonical session `updated_at` means there is new state
-                                // the provider session has not absorbed yet.
-                                let mut max_notified = updated_at;
+                                let mut max_notified = updated_at_ms;
                                 while let Ok(next_notified) = projection_refresh_rx.try_recv() {
                                     if next_notified > max_notified {
                                         max_notified = next_notified;
                                     }
                                 }
-                                if let Some(product_session) = product_session.as_mut() {
-                                    if product_turn_in_flight {
-                                        projection_refresh_dirty = true;
-                                    } else if let Err(error) = refresh_product_session_projection(
+                                projection_freshness = projection_freshness
+                                    .on_context_advanced(max_notified, product_turn_in_flight);
+                                if let Some(product_session) = product_session.as_mut()
+                                    && projection_freshness.is_stale_immediate()
+                                {
+                                    if let Err(error) = refresh_product_session_projection(
                                         &state.runtime,
                                         binding.as_ref(),
                                         turning_mode,
@@ -1445,13 +1465,13 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                             &RealtimeServerFrame::ChannelError(error),
                                         )
                                         .await;
-                                    } else if let Ok(current_updated_at) = current_projection_updated_at(
-                                        &state.runtime,
-                                        binding.as_ref(),
-                                    )
-                                    .await
-                                    {
-                                        projection_known_updated_at = current_updated_at;
+                                    } else {
+                                        let watermark_ms = session_context_handle
+                                            .as_ref()
+                                            .map(|h| h.current_watermark_ms())
+                                            .unwrap_or(0);
+                                        projection_freshness =
+                                            projection_freshness.on_refreshed(watermark_ms);
                                     }
                                 }
                             }
@@ -1571,15 +1591,37 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                                 .await;
                                             }
                                         }
-                                        if advances_projection_known_state
-                                            && let Ok(current_updated_at) = current_projection_updated_at(
-                                                &state.runtime,
-                                                binding.as_ref(),
-                                            )
-                                            .await
-                                            && current_updated_at > projection_known_updated_at
-                                        {
-                                            projection_known_updated_at = current_updated_at;
+                                        // W2-E: own-turn commits (user transcript append,
+                                        // assistant-output append, tool-dispatch mutation) also
+                                        // emit `SessionContextAdvanced` effects, same as external
+                                        // mutations do. Advance the local `projection_freshness`
+                                        // baseline for these canonical own-turn commits so the
+                                        // observer-pushed tick that follows doesn't leave the
+                                        // state in `StaleImmediate` for our own output.
+                                        if advances_projection_known_state {
+                                            let watermark_ms = session_context_handle
+                                                .as_ref()
+                                                .map(|h| h.current_watermark_ms())
+                                                .unwrap_or(0);
+                                            // Drain any queued observer notifies so the baseline
+                                            // reflects the same high-water mark the DSL holds —
+                                            // without transitioning to stale for ticks we already
+                                            // accounted for via the DSL.
+                                            while let Ok(notified_at) =
+                                                projection_refresh_rx.try_recv()
+                                            {
+                                                projection_freshness = projection_freshness
+                                                    .on_context_advanced(
+                                                        notified_at,
+                                                        product_turn_in_flight,
+                                                    );
+                                            }
+                                            if watermark_ms
+                                                > projection_freshness.baseline_ms()
+                                            {
+                                                projection_freshness =
+                                                    projection_freshness.on_refreshed(watermark_ms);
+                                            }
                                         }
                                         if turn_committed {
                                             product_turn_committed = true;
@@ -1604,52 +1646,40 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                             product_turn_in_flight = false;
                                             product_turn_committed = false;
                                             product_output_started = false;
-                                            // D4 / issue #260: dirty semantics are "external
-                                            // mutation happened during this turn that our provider
-                                            // session hasn't absorbed." Our own-turn commits
-                                            // (user transcript append on TurnCommitted; assistant
-                                            // output append on Finalize) also trigger the projection
-                                            // refresh task's notify — but those aren't external.
-                                            // Drain any pending notifies, advance
-                                            // projection_known_updated_at to the current runtime
-                                            // state, and if known == current (no mutation beyond
-                                            // our own commits is pending) clear the dirty flag
-                                            // before deciding whether to refresh.
-                                            while let Ok(notified_at) = projection_refresh_rx.try_recv() {
-                                                if notified_at > projection_known_updated_at {
-                                                    projection_known_updated_at = notified_at;
-                                                }
-                                            }
-                                            if let Ok(current_updated_at) = current_projection_updated_at(
-                                                &state.runtime,
-                                                binding.as_ref(),
-                                            )
-                                            .await
+                                            // W2-E: promote `StaleDeferred` → `StaleImmediate`
+                                            // at turn end. This is the specific fix for the s71
+                                            // turn-8 regression: a peer-response terminal
+                                            // advanced the session mid-turn while the provider
+                                            // turn was live, landing as `StaleDeferred`; the old
+                                            // hand-maintained flag missed promoting it on turn
+                                            // end because the drain gate checked
+                                            // `projection_refresh_dirty` rather than the
+                                            // typed stale state.
+                                            //
+                                            // Drain any queued sibling notifies before
+                                            // transitioning so the promoted new_at carries the
+                                            // highest observed watermark.
+                                            while let Ok(notified_at) =
+                                                projection_refresh_rx.try_recv()
                                             {
-                                                if current_updated_at > projection_known_updated_at {
-                                                    projection_known_updated_at = current_updated_at;
-                                                }
-                                                if projection_refresh_dirty
-                                                    && current_updated_at == projection_known_updated_at
-                                                {
-                                                    // No external mutation — the "dirty" notify we
-                                                    // saw was our own turn's commit. Clear dirty so
-                                                    // we don't reconstruct the provider session for
-                                                    // state the session already produced.
-                                                    projection_refresh_dirty = false;
-                                                }
+                                                projection_freshness = projection_freshness
+                                                    .on_context_advanced(notified_at, true);
                                             }
-                                            if projection_refresh_dirty
-                                                && let Some(product_session) = product_session.as_mut()
+                                            projection_freshness =
+                                                projection_freshness.on_turn_completed();
+                                            if projection_freshness.is_stale_immediate()
+                                                && let Some(product_session) =
+                                                    product_session.as_mut()
                                             {
-                                                if let Err(error) = refresh_product_session_projection(
-                                                    &state.runtime,
-                                                    binding.as_ref(),
-                                                    turning_mode,
-                                                    state.host.session_factory.clone(),
-                                                    product_session,
-                                                )
-                                                .await
+                                                if let Err(error) =
+                                                    refresh_product_session_projection(
+                                                        &state.runtime,
+                                                        binding.as_ref(),
+                                                        turning_mode,
+                                                        state.host.session_factory.clone(),
+                                                        product_session,
+                                                    )
+                                                    .await
                                                 {
                                                     let _ = send_server_frame(
                                                         &mut socket,
@@ -1657,16 +1687,12 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                                     )
                                                     .await;
                                                 } else {
-                                                    projection_refresh_dirty = false;
-                                                    if let Ok(current_updated_at) = current_projection_updated_at(
-                                                        &state.runtime,
-                                                        binding.as_ref(),
-                                                    )
-                                                    .await
-                                                    {
-                                                        projection_known_updated_at =
-                                                            current_updated_at;
-                                                    }
+                                                    let watermark_ms = session_context_handle
+                                                        .as_ref()
+                                                        .map(|h| h.current_watermark_ms())
+                                                        .unwrap_or(0);
+                                                    projection_freshness = projection_freshness
+                                                        .on_refreshed(watermark_ms);
                                                 }
                                             }
                                         }
@@ -1675,11 +1701,19 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                         product_turn_in_flight = false;
                                         product_turn_committed = false;
                                         product_output_started = false;
-                                        projection_refresh_dirty = false;
+                                        // W2-E: the observer remains installed on the
+                                        // session's DSL handle — no separate task to abort.
+                                        // The freshness state resets to the current
+                                        // watermark so a fresh provider session opens
+                                        // with a `Clean` baseline.
+                                        let watermark_ms = session_context_handle
+                                            .as_ref()
+                                            .map(|h| h.current_watermark_ms())
+                                            .unwrap_or(0);
+                                        projection_freshness = ProjectionFreshness::Clean {
+                                            baseline_ms: watermark_ms,
+                                        };
                                         product_session = None;
-                                        if let Some(task) = projection_refresh_task.take() {
-                                            task.abort();
-                                        }
                                         if let Err(error) = require_product_session_reattach(
                                             &state.runtime,
                                             binding.as_ref(),
@@ -1709,11 +1743,17 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                         product_turn_in_flight = false;
                                         product_turn_committed = false;
                                         product_output_started = false;
-                                        projection_refresh_dirty = false;
+                                        // W2-E: observer lifetime is bound to the DSL
+                                        // handle; no separate task to abort. Reset
+                                        // freshness to a fresh `Clean` baseline.
+                                        let watermark_ms = session_context_handle
+                                            .as_ref()
+                                            .map(|h| h.current_watermark_ms())
+                                            .unwrap_or(0);
+                                        projection_freshness = ProjectionFreshness::Clean {
+                                            baseline_ms: watermark_ms,
+                                        };
                                         product_session = None;
-                                        if let Some(task) = projection_refresh_task.take() {
-                                            task.abort();
-                                        }
                                         if retryable {
                                             if let Err(error) = require_product_session_reattach(
                                                 &state.runtime,
@@ -1841,20 +1881,21 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                                 Ok(new_product_session) => {
                                                     if let Some(new_product_session) = new_product_session {
                                                         product_session = Some(new_product_session);
-                                                        projection_refresh_task = spawn_projection_refresh_task(
-                                                            Arc::clone(&state.runtime),
-                                                            binding.as_ref(),
-                                                            projection_refresh_tx.clone(),
-                                                        )
-                                                        .await;
-                                                        if let Ok(current_updated_at) = current_projection_updated_at(
-                                                            &state.runtime,
-                                                            binding.as_ref(),
-                                                        )
-                                                        .await
-                                                        {
-                                                            projection_known_updated_at = current_updated_at;
-                                                        }
+                                                        // W2-E: observer is installed on the
+                                                        // session's DSL handle for the
+                                                        // socket's lifetime; reconnect
+                                                        // doesn't require re-installing it.
+                                                        // Reset the freshness baseline to
+                                                        // the current DSL watermark so the
+                                                        // rebuilt provider session starts
+                                                        // `Clean`.
+                                                        let watermark_ms = session_context_handle
+                                                            .as_ref()
+                                                            .map(|h| h.current_watermark_ms())
+                                                            .unwrap_or(0);
+                                                        projection_freshness = ProjectionFreshness::Clean {
+                                                            baseline_ms: watermark_ms,
+                                                        };
                                                     }
                                                     if let Ok(projection) = current_binding_projection(
                                                         &state.runtime,
@@ -1959,9 +2000,11 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                     if !cleanup_performed {
                         let _ = cleanup_realtime_binding(&state.runtime, binding.as_ref()).await;
                     }
-                    if let Some(task) = projection_refresh_task.take() {
-                        task.abort();
-                    }
+                    // W2-E: observer lifetime is bound to `session_context_handle`
+                    // which drops here. The DSL-side `install_observer` stores a
+                    // `Weak`, so downgraded references become no-ops after this
+                    // drop — no separate task to abort.
+                    drop(session_context_handle);
                     state.host.release_open(&registered).await;
                 }
                 Err(error) => {
@@ -2863,29 +2906,6 @@ async fn resolve_primary_session_id(
     }
 }
 
-async fn current_projection_updated_at(
-    runtime: &SessionRuntime,
-    binding: Option<&RealtimeSocketBinding>,
-) -> Result<SystemTime, RealtimeChannelErrorFrame> {
-    let session_id = resolve_primary_session_id(
-        runtime,
-        binding,
-        "realtime projection refresh is not wired to a primary session binding",
-    )
-    .await?;
-    runtime
-        .read_session(&session_id)
-        .await
-        .map(|session| session.state.updated_at)
-        .map_err(|error| RealtimeChannelErrorFrame {
-            code: RealtimeErrorCode::RuntimeInternal,
-            message: format!(
-                "failed to read canonical session state for realtime projection: {error:?}"
-            ),
-            details: None,
-        })
-}
-
 async fn refresh_product_session_projection(
     runtime: &SessionRuntime,
     binding: Option<&RealtimeSocketBinding>,
@@ -2935,36 +2955,150 @@ async fn refresh_product_session_projection(
     Ok(())
 }
 
-async fn spawn_projection_refresh_task(
-    runtime: Arc<SessionRuntime>,
+/// Typed projection-freshness state for the realtime socket (W2-E / issue #264).
+///
+/// Replaces the hand-wired `projection_refresh_dirty: bool` +
+/// `projection_known_updated_at: SystemTime` pair with a single state that
+/// carries the same information typed. Transitions are driven by three
+/// inputs:
+///   1. `SessionContextAdvanced { updated_at_ms }` effect arrival (observer
+///      notify): advance `Clean` baseline if idle; mark `StaleDeferred` if
+///      a turn is in flight; mark `StaleImmediate` otherwise.
+///   2. Turn-lifecycle transition (`logical_turn_completed`): promote
+///      `StaleDeferred` to `StaleImmediate` and drain.
+///   3. Input-chunk arrival with `!product_turn_in_flight`: drain
+///      `StaleImmediate` at the canonical refresh site.
+///
+/// The discriminant is always one of:
+///   - `Clean { baseline }`: provider projection matches canonical session
+///     state as of `baseline`. No refresh owed.
+///   - `StaleDeferred { new_at }`: canonical state advanced to `new_at`
+///     while the provider turn is live; refresh blocked until the turn
+///     terminates so barge-in continuity isn't broken.
+///   - `StaleImmediate { new_at }`: refresh owed at the next drain site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionFreshness {
+    Clean { baseline_ms: u64 },
+    StaleDeferred { new_at_ms: u64 },
+    StaleImmediate { new_at_ms: u64 },
+}
+
+impl ProjectionFreshness {
+    fn baseline_ms(&self) -> u64 {
+        match *self {
+            Self::Clean { baseline_ms } => baseline_ms,
+            Self::StaleDeferred { new_at_ms } | Self::StaleImmediate { new_at_ms } => new_at_ms,
+        }
+    }
+
+    /// Transition on a `SessionContextAdvanced` observer tick.
+    ///
+    /// `turn_in_flight`: whether the provider-managed turn is currently
+    /// running. When `true`, the advance is recorded as `StaleDeferred`
+    /// so barge-in continuity is preserved. When `false`, it's recorded
+    /// as `StaleImmediate` so the next drain site picks it up.
+    ///
+    /// Ticks below the current baseline are ignored (non-monotonic —
+    /// shouldn't happen because the DSL guard filters them, but belt +
+    /// suspenders at the consumer too).
+    fn on_context_advanced(self, advanced_at_ms: u64, turn_in_flight: bool) -> Self {
+        if advanced_at_ms <= self.baseline_ms() {
+            return self;
+        }
+        if turn_in_flight {
+            Self::StaleDeferred {
+                new_at_ms: advanced_at_ms,
+            }
+        } else {
+            // Promote any deferred pending-stale into immediate so the
+            // consumer refreshes at the next available drain site.
+            Self::StaleImmediate {
+                new_at_ms: advanced_at_ms,
+            }
+        }
+    }
+
+    /// Transition on `logical_turn_completed`.
+    ///
+    /// `StaleDeferred` → `StaleImmediate` so the turn-end drain site
+    /// picks up the pending refresh. This is the specific fix for the
+    /// s71 turn-8 regression (peer-response terminal advanced the
+    /// session mid-turn, which used to land as a dirty flag that
+    /// never drained until the next input chunk).
+    fn on_turn_completed(self) -> Self {
+        match self {
+            Self::StaleDeferred { new_at_ms } => Self::StaleImmediate { new_at_ms },
+            other => other,
+        }
+    }
+
+    /// Transition after a successful refresh drain.
+    fn on_refreshed(self, now_ms: u64) -> Self {
+        // `now_ms` should be the updated_at_ms read back from the session
+        // immediately post-refresh (which advances on our own commit).
+        // Fall back to the previous new_at if we didn't get one — the
+        // important invariant is "no longer stale".
+        let baseline_ms = match self {
+            Self::Clean { baseline_ms } => baseline_ms.max(now_ms),
+            Self::StaleDeferred { new_at_ms } | Self::StaleImmediate { new_at_ms } => {
+                new_at_ms.max(now_ms)
+            }
+        };
+        Self::Clean { baseline_ms }
+    }
+
+    fn is_stale_immediate(&self) -> bool {
+        matches!(self, Self::StaleImmediate { .. })
+    }
+}
+
+/// Observer installed on the session's [`SessionContextHandle`] to push
+/// `SessionContextAdvanced` effect emissions into the realtime socket's
+/// event loop. The loop consumes these as a `tokio::select` arm, same
+/// place the old `projection_refresh_rx` sat.
+struct ProjectionRefreshObserver {
+    notify_tx: mpsc::Sender<u64>,
+}
+
+impl meerkat_core::handles::SessionContextAdvancedObserver for ProjectionRefreshObserver {
+    fn on_session_context_advanced(&self, updated_at_ms: u64) {
+        // `try_send`: the observer is invoked under the DSL authority
+        // lock (see `HandleDslAuthority::apply_input_with_effects`). A
+        // blocking send here would risk deadlock; dropping a tick on a
+        // full queue is fine because the loop coalesces any backlog via
+        // `projection_refresh_rx.try_recv()` before processing, and the
+        // DSL guarantees monotonic watermarks so the next observed tick
+        // supersedes any we missed.
+        let _ = self.notify_tx.try_send(updated_at_ms);
+    }
+}
+
+/// Resolve the session's [`SessionContextHandle`] for this socket by
+/// re-preparing bindings via the runtime adapter. Returns `None` when the
+/// socket has no bound session yet — the observer is then never installed
+/// and the realtime socket runs in "no projection refresh" mode (which is
+/// fine: standalone / unbound sockets have nothing to refresh).
+async fn resolve_session_context_handle(
+    runtime: &SessionRuntime,
     binding: Option<&RealtimeSocketBinding>,
-    notify_tx: mpsc::Sender<SystemTime>,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<Arc<dyn meerkat_core::handles::SessionContextHandle>> {
     let session_id = resolve_primary_session_id(
-        runtime.as_ref(),
+        runtime,
         binding,
         "realtime projection refresh is not wired to a primary session binding",
     )
     .await
     .ok()?;
-    let initial_updated_at = runtime
-        .read_session(&session_id)
+    // `prepare_bindings` re-binds the session's DSL authority to a fresh
+    // runtime epoch; the `session_context` field on the returned bindings
+    // is the canonical handle shared by every other consumer of this
+    // session's DSL authority.
+    let bindings = runtime
+        .runtime_adapter()
+        .prepare_bindings(session_id)
         .await
-        .ok()?
-        .state
-        .updated_at;
-    Some(tokio::spawn(async move {
-        let mut last_updated_at = initial_updated_at;
-        while let Ok(updated_at) = runtime
-            .wait_for_session_mutation_after(&session_id, last_updated_at)
-            .await
-        {
-            last_updated_at = updated_at;
-            if notify_tx.send(updated_at).await.is_err() {
-                break;
-            }
-        }
-    }))
+        .ok()?;
+    Some(Arc::clone(&bindings.session_context))
 }
 
 async fn handle_channel_input(

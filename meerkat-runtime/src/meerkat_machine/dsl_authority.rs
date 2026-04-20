@@ -154,6 +154,7 @@ pub(crate) fn project_state(
         mcp_server_states: std::collections::BTreeMap::new(),
         pending_peer_requests: std::collections::BTreeMap::new(),
         inbound_peer_requests: std::collections::BTreeMap::new(),
+        last_session_context_updated_at_ms: 0,
     }
 }
 
