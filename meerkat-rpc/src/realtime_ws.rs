@@ -1594,34 +1594,39 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                         // W2-E: own-turn commits (user transcript append,
                                         // assistant-output append, tool-dispatch mutation) also
                                         // emit `SessionContextAdvanced` effects, same as external
-                                        // mutations do. Advance the local `projection_freshness`
-                                        // baseline for these canonical own-turn commits so the
-                                        // observer-pushed tick that follows doesn't leave the
-                                        // state in `StaleImmediate` for our own output.
+                                        // mutations do. Clear any pending stale state those ticks
+                                        // may have left behind — our own-turn commit is not an
+                                        // external mutation the provider session needs to
+                                        // absorb. Without this, a queued observer tick could
+                                        // have transitioned state to `StaleDeferred` before the
+                                        // `update` arm ran, and the subsequent
+                                        // `logical_turn_completed` promotion would fire a
+                                        // spurious provider-session rebuild for our own-turn
+                                        // transcript commit (the fix the old
+                                        // `known == current => clear dirty` check encoded).
                                         if advances_projection_known_state {
                                             let watermark_ms = session_context_handle
                                                 .as_ref()
                                                 .map(|h| h.current_watermark_ms())
                                                 .unwrap_or(0);
-                                            // Drain any queued observer notifies so the baseline
-                                            // reflects the same high-water mark the DSL holds —
-                                            // without transitioning to stale for ticks we already
-                                            // accounted for via the DSL.
-                                            while let Ok(notified_at) =
+                                            // Drain any queued observer notifies so they don't
+                                            // land in the wrong phase. Pass `false` so they
+                                            // don't transition into `StaleDeferred` — the DSL
+                                            // already recorded this advance, and we're about to
+                                            // consume it via `on_refreshed` below.
+                                            while let Ok(_notified_at) =
                                                 projection_refresh_rx.try_recv()
                                             {
-                                                projection_freshness = projection_freshness
-                                                    .on_context_advanced(
-                                                        notified_at,
-                                                        product_turn_in_flight,
-                                                    );
+                                                // Intentionally discarded. The canonical DSL
+                                                // watermark is authoritative; the observer just
+                                                // signalled us to look.
                                             }
-                                            if watermark_ms
-                                                > projection_freshness.baseline_ms()
-                                            {
-                                                projection_freshness =
-                                                    projection_freshness.on_refreshed(watermark_ms);
-                                            }
+                                            // Reset to `Clean` at the current DSL watermark. This
+                                            // supersedes any `StaleDeferred { new_at_ms }` that
+                                            // might have been set by an observer notify that
+                                            // arrived before this `update` arm ran.
+                                            projection_freshness =
+                                                projection_freshness.on_refreshed(watermark_ms);
                                         }
                                         if turn_committed {
                                             product_turn_committed = true;
