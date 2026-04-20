@@ -788,6 +788,11 @@ impl MethodRouter {
                 handlers::event::handle_external_event(id, params, self.runtime.clone()).await
             }
             #[cfg(not(feature = "mini-surface"))]
+            "session/peer_response_terminal" => {
+                handlers::event::handle_peer_response_terminal(id, params, self.runtime.clone())
+                    .await
+            }
+            #[cfg(not(feature = "mini-surface"))]
             "session/inject_context" => self.handle_session_inject_context(id, params).await,
             #[cfg(not(feature = "mini-surface"))]
             "session/stream_open" => self.handle_session_stream_open(id, params).await,
@@ -2882,6 +2887,7 @@ mod tests {
         assert!(method_names.contains(&"session/create"));
         assert!(method_names.contains(&"session/history"));
         assert!(method_names.contains(&"session/external_event"));
+        assert!(method_names.contains(&"session/peer_response_terminal"));
         assert!(method_names.contains(&"session/inject_context"));
         assert!(method_names.contains(&"turn/start"));
         assert!(
@@ -4173,8 +4179,7 @@ mod tests {
     }
 
     #[cfg(not(feature = "mini-surface"))]
-    #[tokio::test]
-    async fn archived_session_read_remains_available_and_mutations_reject() {
+    async fn archived_session_read_remains_available_and_mutations_reject_inner() {
         let (router, _notif_rx) = test_router().await;
 
         let create_resp = router
@@ -4210,7 +4215,7 @@ mod tests {
             .unwrap();
         assert!(
             read_resp.error.is_none(),
-            "archived session should remain readable: {read_resp:?}"
+            "archived session should remain readable"
         );
         let read = result_value(&read_resp);
         assert_eq!(read["session_id"], session_id);
@@ -5638,10 +5643,16 @@ mod tests {
                         && notif.params["event"]["payload"]["prompt"]
                             .as_str()
                             .is_some_and(|prompt| prompt.contains(injected_text))),
-                    "archived session must not emit a later run_started that replays dropped staged context: {notif:?}"
+                    "archived session must not emit a later run_started that replays dropped staged context"
                 );
             }
         }
+    }
+
+    #[cfg(not(feature = "mini-surface"))]
+    #[tokio::test]
+    async fn archived_session_read_remains_available_and_mutations_reject() {
+        Box::pin(archived_session_read_remains_available_and_mutations_reject_inner()).await;
     }
 
     /// 7. `turn/start` returns a result for an existing session.
