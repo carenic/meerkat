@@ -89,28 +89,76 @@ pub enum AuthLeasePhase {
     Released,
 }
 
+/// Typed classification of why a DSL transition was rejected.
+///
+/// Emitted by the generated kernel's `apply` / `apply_signal` methods and
+/// bridged into [`DslTransitionError::kind`]. Callers that fire
+/// idempotently (realtime dispatchers, monotonic watermark advances,
+/// etc.) inspect this to distinguish "input was out of scope for this
+/// phase" (a real error) from "input was recognised but the guard dropped
+/// it" (a successful no-op).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DslRejectionKind {
+    /// No transition is declared for this `(phase, trigger)` pair — the
+    /// shell fired an input that is semantically out of scope for the
+    /// current phase. This is a programming mistake on the shell side.
+    NoMatchingTransition,
+    /// A transition is declared for this `(phase, trigger)` pair but
+    /// every candidate transition's guard evaluated false. Callers
+    /// firing idempotently treat this as a no-op; callers firing
+    /// unconditionally treat it as a user-visible error.
+    GuardRejected,
+}
+
 /// Error surfaced when a DSL transition is rejected.
 ///
-/// Wraps the generated kernel's `NoMatchingTransition` and carries the
-/// transition name for diagnostics. Trait impls populate `context` from the
-/// trait method name so callers can tell which handle rejected.
+/// Wraps the generated kernel's typed rejection. Trait impls populate
+/// `context` from the trait method name so callers can tell which handle
+/// rejected; `kind` lets callers distinguish guard rejection from
+/// out-of-scope input without substring-matching the rendered message.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("DSL transition rejected in {context}: {reason}")]
 pub struct DslTransitionError {
     /// Name of the trait method / DSL variant whose transition was rejected.
     pub context: &'static str,
+    /// Typed classification of the rejection — see [`DslRejectionKind`].
+    pub kind: DslRejectionKind,
     /// Underlying rejection reason (typically the generated
-    /// `NoMatchingTransition { phase, trigger }` formatted).
+    /// `NoMatchingTransition`/`GuardRejected` formatted).
     pub reason: String,
 }
 
 impl DslTransitionError {
-    /// Construct a new transition error with the given context and reason.
+    /// Construct a `NoMatchingTransition` error with the given context
+    /// and reason. Back-compat constructor used by legacy callers that
+    /// haven't adopted the typed `kind` field; new code paths should
+    /// prefer [`DslTransitionError::no_matching`] or
+    /// [`DslTransitionError::guard_rejected`] for clarity.
     pub fn new(context: &'static str, reason: impl Into<String>) -> Self {
+        Self::no_matching(context, reason)
+    }
+
+    /// Construct an error with `kind = NoMatchingTransition`.
+    pub fn no_matching(context: &'static str, reason: impl Into<String>) -> Self {
         Self {
             context,
+            kind: DslRejectionKind::NoMatchingTransition,
             reason: reason.into(),
         }
+    }
+
+    /// Construct an error with `kind = GuardRejected`.
+    pub fn guard_rejected(context: &'static str, reason: impl Into<String>) -> Self {
+        Self {
+            context,
+            kind: DslRejectionKind::GuardRejected,
+            reason: reason.into(),
+        }
+    }
+
+    /// True iff this rejection came from a guard evaluating false.
+    pub fn is_guard_rejected(&self) -> bool {
+        self.kind == DslRejectionKind::GuardRejected
     }
 }
 
@@ -956,4 +1004,92 @@ pub trait InteractionStreamCleanupObserver: Send + Sync {
     /// map entry so subsequent fires fail the guard), but observers should
     /// tolerate redundant calls defensively.
     fn on_interaction_stream_cleanup(&self, corr_id: PeerCorrelationId);
+}
+
+// ---------------------------------------------------------------------------
+// RealtimeProductTurnHandle (U9 / dogma #4 — realtime WS lifecycle owner)
+// ---------------------------------------------------------------------------
+
+/// Realtime product-turn lifecycle phase (U9 / dogma #4).
+///
+/// Canonical typed mirror of the DSL-owned
+/// `realtime_product_turn_phase` field. The realtime-WS shell reads this
+/// enum via [`RealtimeProductTurnHandle::current_phase`] instead of
+/// tracking `product_turn_in_flight` / `product_turn_committed` /
+/// `product_output_started` as shell locals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum RealtimeProductTurnPhase {
+    /// No turn in flight on the provider session.
+    #[default]
+    Idle,
+    /// Input accepted by the provider; no `TurnCommitted` or output
+    /// delta observed yet.
+    AwaitingProgress,
+    /// `TurnCommitted` arrived but no output delta / tool call yet.
+    Committed,
+    /// Output delta / tool call arrived but `TurnCommitted` not yet.
+    OutputStarted,
+    /// Both `TurnCommitted` and output delta observed — preemption on a
+    /// subsequent input chunk is semantically sound.
+    Preemptible,
+}
+
+/// Realtime product-turn lifecycle DSL handle (U9 / dogma #4).
+///
+/// Routes every lifecycle observation (input accepted, TurnCommitted,
+/// output delta / tool call, interrupt, logical turn terminal) into the
+/// session's MeerkatMachine DSL. Idempotent fires (e.g., a second
+/// `turn_committed()` call on the same turn) are guard-rejected at the
+/// DSL layer and surfaced as `Ok(false)` so the shell can fire
+/// unconditionally.
+///
+/// The shell reads [`current_phase`] / [`is_in_flight`] /
+/// [`should_preempt_on_input`] for routing decisions; no shell-local
+/// boolean state, no helper-local event matching.
+pub trait RealtimeProductTurnHandle: Send + Sync {
+    /// Fire `ProductTurnInFlight`. Returns `Ok(true)` when the turn
+    /// advanced from `Idle`; `Ok(false)` when already in-flight.
+    fn turn_in_flight(&self) -> Result<bool, DslTransitionError>;
+
+    /// Fire `ProductTurnCommitted`. Returns `Ok(true)` when the phase
+    /// advanced (`AwaitingProgress` → `Committed`, or `OutputStarted` →
+    /// `Preemptible`); `Ok(false)` otherwise.
+    fn turn_committed(&self) -> Result<bool, DslTransitionError>;
+
+    /// Fire `ProductOutputStarted`. Returns `Ok(true)` when the phase
+    /// advanced (`AwaitingProgress` → `OutputStarted`, or `Committed` →
+    /// `Preemptible`); `Ok(false)` otherwise.
+    fn output_started(&self) -> Result<bool, DslTransitionError>;
+
+    /// Fire `ProductTurnInterrupted`. Returns `Ok(true)` when the
+    /// output-started milestone was cleared (`Preemptible` →
+    /// `Committed`, or `OutputStarted` → `AwaitingProgress`); `Ok(false)`
+    /// otherwise.
+    fn turn_interrupted(&self) -> Result<bool, DslTransitionError>;
+
+    /// Fire `ProductTurnTerminal`. Returns `Ok(true)` when the phase
+    /// advanced back to `Idle` from any non-`Idle` phase; `Ok(false)`
+    /// when already `Idle`.
+    fn turn_terminal(&self) -> Result<bool, DslTransitionError>;
+
+    /// Read the current typed phase from the DSL.
+    fn current_phase(&self) -> RealtimeProductTurnPhase;
+
+    /// True iff the provider session has an active turn (any non-`Idle`
+    /// phase). Used by the realtime-WS projection-refresh gate.
+    fn is_in_flight(&self) -> bool {
+        self.current_phase() != RealtimeProductTurnPhase::Idle
+    }
+
+    /// True iff an input chunk arriving now should preempt the current
+    /// provider-managed turn — i.e. the turn has reached `Preemptible`.
+    ///
+    /// Preemption is only sound once the committed turn has visible
+    /// assistant-side progress. Before that, the provider remains the
+    /// semantic owner of whether the current input stream still belongs
+    /// to the same utterance; preempting early would cancel a response
+    /// before the assistant has had a chance to speak.
+    fn should_preempt_on_input(&self) -> bool {
+        self.current_phase() == RealtimeProductTurnPhase::Preemptible
+    }
 }

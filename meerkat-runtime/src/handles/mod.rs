@@ -24,6 +24,26 @@ use std::sync::{Arc, Mutex};
 use crate::meerkat_machine::dsl as mm_dsl;
 use meerkat_core::handles::DslTransitionError;
 
+/// Bridge the generated kernel's `MeerkatMachineTransitionError` into a
+/// typed [`DslTransitionError`]. Keeps the `kind` field accurate so
+/// callers that distinguish guard rejection from out-of-scope input
+/// (e.g., realtime dispatchers firing idempotently) never need to
+/// substring-match the rendered message.
+fn map_kernel_error(
+    err: mm_dsl::MeerkatMachineTransitionError,
+    context: &'static str,
+) -> DslTransitionError {
+    let reason = err.to_string();
+    match err {
+        mm_dsl::MeerkatMachineTransitionError::GuardRejected { .. } => {
+            DslTransitionError::guard_rejected(context, reason)
+        }
+        mm_dsl::MeerkatMachineTransitionError::NoMatchingTransition { .. } => {
+            DslTransitionError::no_matching(context, reason)
+        }
+    }
+}
+
 mod auth_lease;
 mod comms_drain;
 mod external_tool_surface;
@@ -31,6 +51,7 @@ mod interaction_stream;
 mod mcp_server_lifecycle;
 mod peer_comms;
 mod peer_interaction;
+mod realtime_product_turn;
 mod session_admission;
 mod session_claim;
 mod session_context;
@@ -43,6 +64,7 @@ pub use interaction_stream::RuntimeInteractionStreamHandle;
 pub use mcp_server_lifecycle::RuntimeMcpServerLifecycleHandle;
 pub use peer_comms::RuntimePeerCommsHandle;
 pub use peer_interaction::RuntimePeerInteractionHandle;
+pub use realtime_product_turn::RuntimeRealtimeProductTurnHandle;
 pub use session_admission::RuntimeSessionAdmissionHandle;
 pub use session_claim::RuntimeSessionClaimRegistry;
 pub use session_context::RuntimeSessionContextHandle;
@@ -115,7 +137,7 @@ impl HandleDslAuthority {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         mm_dsl::MeerkatMachineMutator::apply(&mut *guard, input)
             .map(|transition| transition.effects)
-            .map_err(|err| DslTransitionError::new(context, format!("{err}")))
+            .map_err(|err| map_kernel_error(err, context))
     }
 
     /// Apply a DSL signal under the shared authority's mutex.
@@ -131,7 +153,7 @@ impl HandleDslAuthority {
         guard
             .apply_signal(signal)
             .map(|_| ())
-            .map_err(|err| DslTransitionError::new(context, format!("{err}")))
+            .map_err(|err| map_kernel_error(err, context))
     }
 
     /// Clone the current DSL state under the shared authority's mutex.

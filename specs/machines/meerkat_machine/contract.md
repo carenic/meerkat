@@ -25,6 +25,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `last_session_context_updated_at_ms`: `u64`
 - `reserved_interaction_streams`: `Set<PeerCorrelationId>`
 - `attached_interaction_streams`: `Set<PeerCorrelationId>`
+- `realtime_product_turn_phase`: `RealtimeProductTurnPhase`
 - `peer_ingress_owner_kind`: `PeerIngressOwnerKind`
 - `peer_ingress_comms_runtime_id`: `Option<CommsRuntimeId>`
 - `peer_ingress_mob_id`: `Option<MobId>`
@@ -91,6 +92,11 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `InteractionStreamCompleted`(corr_id: PeerCorrelationId)
 - `InteractionStreamExpired`(corr_id: PeerCorrelationId)
 - `InteractionStreamClosedEarly`(corr_id: PeerCorrelationId)
+- `ProductTurnInFlight`
+- `ProductTurnCommitted`
+- `ProductOutputStarted`
+- `ProductTurnInterrupted`
+- `ProductTurnTerminal`
 - `BeginLiveTopologyReconfigure`(authority_epoch: u64)
 - `MarkLiveTopologyDetached`
 - `ApplyLiveTopologyIdentity`
@@ -187,6 +193,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `SessionContextAdvanced`(updated_at_ms: u64)
 - `InteractionStreamStateChanged`(corr_id: PeerCorrelationId, new_state: InteractionStreamState)
 - `InteractionStreamCleanup`(corr_id: PeerCorrelationId)
+- `RealtimeProductTurnPhaseChanged`(new_phase: RealtimeProductTurnPhase)
 - `LiveTopologyPhaseChanged`
 
 ## Invariants
@@ -2234,6 +2241,390 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `is_attached`
 - Emits: `InteractionStreamStateChanged`, `InteractionStreamCleanup`
+- To: `Stopped`
+
+### `ProductTurnInFlightInitializing`
+- From: `Initializing`
+- On: `ProductTurnInFlight`()
+- Guards:
+  - `only_from_idle`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Initializing`
+
+### `ProductTurnInFlightIdle`
+- From: `Idle`
+- On: `ProductTurnInFlight`()
+- Guards:
+  - `only_from_idle`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Idle`
+
+### `ProductTurnInFlightAttached`
+- From: `Attached`
+- On: `ProductTurnInFlight`()
+- Guards:
+  - `only_from_idle`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Attached`
+
+### `ProductTurnInFlightRunning`
+- From: `Running`
+- On: `ProductTurnInFlight`()
+- Guards:
+  - `only_from_idle`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Running`
+
+### `ProductTurnInFlightRetired`
+- From: `Retired`
+- On: `ProductTurnInFlight`()
+- Guards:
+  - `only_from_idle`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Retired`
+
+### `ProductTurnInFlightStopped`
+- From: `Stopped`
+- On: `ProductTurnInFlight`()
+- Guards:
+  - `only_from_idle`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Stopped`
+
+### `ProductTurnCommittedFromAwaitingInitializing`
+- From: `Initializing`
+- On: `ProductTurnCommitted`()
+- Guards:
+  - `from_awaiting`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Initializing`
+
+### `ProductTurnCommittedFromAwaitingIdle`
+- From: `Idle`
+- On: `ProductTurnCommitted`()
+- Guards:
+  - `from_awaiting`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Idle`
+
+### `ProductTurnCommittedFromAwaitingAttached`
+- From: `Attached`
+- On: `ProductTurnCommitted`()
+- Guards:
+  - `from_awaiting`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Attached`
+
+### `ProductTurnCommittedFromAwaitingRunning`
+- From: `Running`
+- On: `ProductTurnCommitted`()
+- Guards:
+  - `from_awaiting`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Running`
+
+### `ProductTurnCommittedFromAwaitingRetired`
+- From: `Retired`
+- On: `ProductTurnCommitted`()
+- Guards:
+  - `from_awaiting`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Retired`
+
+### `ProductTurnCommittedFromAwaitingStopped`
+- From: `Stopped`
+- On: `ProductTurnCommitted`()
+- Guards:
+  - `from_awaiting`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Stopped`
+
+### `ProductTurnCommittedFromOutputInitializing`
+- From: `Initializing`
+- On: `ProductTurnCommitted`()
+- Guards:
+  - `from_output_started`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Initializing`
+
+### `ProductTurnCommittedFromOutputIdle`
+- From: `Idle`
+- On: `ProductTurnCommitted`()
+- Guards:
+  - `from_output_started`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Idle`
+
+### `ProductTurnCommittedFromOutputAttached`
+- From: `Attached`
+- On: `ProductTurnCommitted`()
+- Guards:
+  - `from_output_started`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Attached`
+
+### `ProductTurnCommittedFromOutputRunning`
+- From: `Running`
+- On: `ProductTurnCommitted`()
+- Guards:
+  - `from_output_started`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Running`
+
+### `ProductTurnCommittedFromOutputRetired`
+- From: `Retired`
+- On: `ProductTurnCommitted`()
+- Guards:
+  - `from_output_started`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Retired`
+
+### `ProductTurnCommittedFromOutputStopped`
+- From: `Stopped`
+- On: `ProductTurnCommitted`()
+- Guards:
+  - `from_output_started`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Stopped`
+
+### `ProductOutputStartedFromAwaitingInitializing`
+- From: `Initializing`
+- On: `ProductOutputStarted`()
+- Guards:
+  - `from_awaiting`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Initializing`
+
+### `ProductOutputStartedFromAwaitingIdle`
+- From: `Idle`
+- On: `ProductOutputStarted`()
+- Guards:
+  - `from_awaiting`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Idle`
+
+### `ProductOutputStartedFromAwaitingAttached`
+- From: `Attached`
+- On: `ProductOutputStarted`()
+- Guards:
+  - `from_awaiting`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Attached`
+
+### `ProductOutputStartedFromAwaitingRunning`
+- From: `Running`
+- On: `ProductOutputStarted`()
+- Guards:
+  - `from_awaiting`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Running`
+
+### `ProductOutputStartedFromAwaitingRetired`
+- From: `Retired`
+- On: `ProductOutputStarted`()
+- Guards:
+  - `from_awaiting`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Retired`
+
+### `ProductOutputStartedFromAwaitingStopped`
+- From: `Stopped`
+- On: `ProductOutputStarted`()
+- Guards:
+  - `from_awaiting`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Stopped`
+
+### `ProductOutputStartedFromCommittedInitializing`
+- From: `Initializing`
+- On: `ProductOutputStarted`()
+- Guards:
+  - `from_committed`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Initializing`
+
+### `ProductOutputStartedFromCommittedIdle`
+- From: `Idle`
+- On: `ProductOutputStarted`()
+- Guards:
+  - `from_committed`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Idle`
+
+### `ProductOutputStartedFromCommittedAttached`
+- From: `Attached`
+- On: `ProductOutputStarted`()
+- Guards:
+  - `from_committed`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Attached`
+
+### `ProductOutputStartedFromCommittedRunning`
+- From: `Running`
+- On: `ProductOutputStarted`()
+- Guards:
+  - `from_committed`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Running`
+
+### `ProductOutputStartedFromCommittedRetired`
+- From: `Retired`
+- On: `ProductOutputStarted`()
+- Guards:
+  - `from_committed`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Retired`
+
+### `ProductOutputStartedFromCommittedStopped`
+- From: `Stopped`
+- On: `ProductOutputStarted`()
+- Guards:
+  - `from_committed`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Stopped`
+
+### `ProductTurnInterruptedFromPreemptibleInitializing`
+- From: `Initializing`
+- On: `ProductTurnInterrupted`()
+- Guards:
+  - `from_preemptible`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Initializing`
+
+### `ProductTurnInterruptedFromPreemptibleIdle`
+- From: `Idle`
+- On: `ProductTurnInterrupted`()
+- Guards:
+  - `from_preemptible`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Idle`
+
+### `ProductTurnInterruptedFromPreemptibleAttached`
+- From: `Attached`
+- On: `ProductTurnInterrupted`()
+- Guards:
+  - `from_preemptible`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Attached`
+
+### `ProductTurnInterruptedFromPreemptibleRunning`
+- From: `Running`
+- On: `ProductTurnInterrupted`()
+- Guards:
+  - `from_preemptible`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Running`
+
+### `ProductTurnInterruptedFromPreemptibleRetired`
+- From: `Retired`
+- On: `ProductTurnInterrupted`()
+- Guards:
+  - `from_preemptible`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Retired`
+
+### `ProductTurnInterruptedFromPreemptibleStopped`
+- From: `Stopped`
+- On: `ProductTurnInterrupted`()
+- Guards:
+  - `from_preemptible`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Stopped`
+
+### `ProductTurnInterruptedFromOutputInitializing`
+- From: `Initializing`
+- On: `ProductTurnInterrupted`()
+- Guards:
+  - `from_output_started`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Initializing`
+
+### `ProductTurnInterruptedFromOutputIdle`
+- From: `Idle`
+- On: `ProductTurnInterrupted`()
+- Guards:
+  - `from_output_started`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Idle`
+
+### `ProductTurnInterruptedFromOutputAttached`
+- From: `Attached`
+- On: `ProductTurnInterrupted`()
+- Guards:
+  - `from_output_started`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Attached`
+
+### `ProductTurnInterruptedFromOutputRunning`
+- From: `Running`
+- On: `ProductTurnInterrupted`()
+- Guards:
+  - `from_output_started`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Running`
+
+### `ProductTurnInterruptedFromOutputRetired`
+- From: `Retired`
+- On: `ProductTurnInterrupted`()
+- Guards:
+  - `from_output_started`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Retired`
+
+### `ProductTurnInterruptedFromOutputStopped`
+- From: `Stopped`
+- On: `ProductTurnInterrupted`()
+- Guards:
+  - `from_output_started`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Stopped`
+
+### `ProductTurnTerminalInitializing`
+- From: `Initializing`
+- On: `ProductTurnTerminal`()
+- Guards:
+  - `not_already_idle`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Initializing`
+
+### `ProductTurnTerminalIdle`
+- From: `Idle`
+- On: `ProductTurnTerminal`()
+- Guards:
+  - `not_already_idle`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Idle`
+
+### `ProductTurnTerminalAttached`
+- From: `Attached`
+- On: `ProductTurnTerminal`()
+- Guards:
+  - `not_already_idle`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Attached`
+
+### `ProductTurnTerminalRunning`
+- From: `Running`
+- On: `ProductTurnTerminal`()
+- Guards:
+  - `not_already_idle`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Running`
+
+### `ProductTurnTerminalRetired`
+- From: `Retired`
+- On: `ProductTurnTerminal`()
+- Guards:
+  - `not_already_idle`
+- Emits: `RealtimeProductTurnPhaseChanged`
+- To: `Retired`
+
+### `ProductTurnTerminalStopped`
+- From: `Stopped`
+- On: `ProductTurnTerminal`()
+- Guards:
+  - `not_already_idle`
+- Emits: `RealtimeProductTurnPhaseChanged`
 - To: `Stopped`
 
 ### `BeginLiveTopologyReconfigureIdle`
