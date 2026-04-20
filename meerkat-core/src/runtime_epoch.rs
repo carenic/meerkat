@@ -248,6 +248,14 @@ impl std::fmt::Debug for SessionRuntimeBindings {
 ///   Suitable for WASM, tests, embedded, and doc examples.
 /// - `SessionOwned`: factory consumes pre-created bindings from the runtime
 ///   epoch owner. Never creates a competing registry.
+///
+/// The `SessionOwned` variant is intentionally large — it carries the full
+/// bundle of Arc-wrapped DSL handles and registries. Since `SessionOwned`
+/// is the common case on every runtime-backed surface (RPC, REST, MCP),
+/// boxing it to shrink the enum would regress the hot path. The
+/// `StandaloneEphemeral` path only appears in WASM, tests, and
+/// standalone embedded runs.
+#[allow(clippy::large_enum_variant)]
 pub enum RuntimeBuildMode {
     /// Standalone: factory creates local-only ephemeral bindings.
     StandaloneEphemeral,
