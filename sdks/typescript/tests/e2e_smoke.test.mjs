@@ -510,7 +510,7 @@ describe("Live Smoke: TypeScript SDK", { skip: !binaryPath }, () => {
     it(
       "Scenario 59: realtime channel session exchange through the packaged SDK",
       { skip: !hasAnthropicKey() },
-      async () => withoutOpenAiRealtimeEnv(async () => {
+      async () => {
       const scenario = "Scenario 59";
       const client = await withStepTimeout(
         scenario,
@@ -610,7 +610,7 @@ describe("Live Smoke: TypeScript SDK", { skip: !binaryPath }, () => {
         }
       })());
       assert.equal(closed.type, "channel.closed");
-      }),
+      },
     );
   }
 });
