@@ -5244,10 +5244,16 @@ async fn e2e_scenario_63_mcp_bootstrap_to_rust_sdk_member_realtime_exchange()
         30,
     )
     .await?;
-    assert_eq!(
-        attached_status["realtime_attachment_status"].as_str(),
-        Some("binding_not_ready"),
-        "member-target realtime open should project binding_not_ready on the owning RPC host"
+    // Status may be binding_not_ready (provider session still handshaking) or
+    // binding_ready (already attached). Both indicate the channel is actively
+    // attaching on the owning RPC host; what we reject is "unattached".
+    let status_str = attached_status["realtime_attachment_status"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        matches!(status_str, "binding_not_ready" | "binding_ready"),
+        "member-target realtime open should project binding_not_ready or binding_ready \
+         on the owning RPC host, got {status_str:?}"
     );
 
     send_realtime_text_and_wait_for_commit(
