@@ -71,6 +71,25 @@ function openaiModel() {
   return process.env.SMOKE_MODEL_OPENAI || "gpt-5.4-mini";
 }
 
+// s44 reviewer-specific model. gpt-5.4-mini consistently fails the
+// staged-system-context retrieval assertion on this scenario: when the
+// reviewer's system prompt contains both the appended `[TS-SWARM]`
+// marker AND identifier-like strings (mob_id, peer_name, peer_id),
+// the model picks one of the identifier-like strings as "the swarm
+// marker". Renaming the mob_id away from "swarm" did not fix it —
+// the model picked the renamed id too. gpt-5.4 (approved standard
+// tier per CLAUDE.md) handles this referential retrieval with ~60%
+// first-pass success; the `retries = 2` entry in `.config/nextest.toml`
+// for s44 absorbs the residual model-variance (matches the
+// `realtime_ws_protocol` precedent from W1-A).
+function reviewerModel() {
+  return (
+    process.env.SMOKE_MODEL_OPENAI_REVIEWER ||
+    process.env.SMOKE_MODEL_OPENAI ||
+    "gpt-5.4"
+  );
+}
+
 function includeScenario(id) {
   void id;
   return true;
@@ -332,7 +351,7 @@ describe("Live Smoke: TypeScript SDK", { skip: !binaryPath }, () => {
               external_addressable: true,
             },
             reviewer: {
-              model: openaiModel(),
+              model: reviewerModel(),
               tools: { comms: true },
               peer_description: "Review worker",
               external_addressable: true,
