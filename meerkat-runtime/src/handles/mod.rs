@@ -138,6 +138,20 @@ impl HandleDslAuthority {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.state.clone()
     }
+
+    /// Run `body` under the shared authority's mutex. The closure observes
+    /// the DSL state atomically with any side effects it performs on the
+    /// handle's external state (e.g. installing an observer before any
+    /// further `apply_input_with_effects` can run). Locking order must
+    /// match the order used by `apply_input_with_effects` (DSL first) so
+    /// callers can safely acquire additional locks inside the closure.
+    pub fn with_state_lock<R>(&self, body: impl FnOnce(&mm_dsl::MeerkatMachineState) -> R) -> R {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        body(&guard.state)
+    }
 }
 
 impl std::fmt::Debug for HandleDslAuthority {

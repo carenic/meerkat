@@ -636,6 +636,30 @@ pub trait SessionContextHandle: Send + Sync {
     /// emission. Implementations without an installed observer drop the
     /// effect on the floor (standalone / WASM paths).
     fn install_observer(&self, observer: Arc<dyn SessionContextAdvancedObserver>);
+
+    /// Atomically install a typed observer and return the current watermark
+    /// as a single critical section. Implementations MUST hold the same
+    /// authority lock that `context_advanced` uses for both the watermark
+    /// read and the observer installation, so no `SessionContextAdvanced`
+    /// effect can slip between "sampled baseline" and "observer visible".
+    ///
+    /// Callers use the returned `u64` as their `ProjectionFreshness`
+    /// baseline; any subsequent `context_advanced` tick is guaranteed to
+    /// either (a) have already been included in the returned watermark, or
+    /// (b) be visible to the observer. The `current_watermark_ms` +
+    /// `install_observer` pair is NOT a substitute: a transition can land
+    /// between those two non-atomic steps and be lost to both the baseline
+    /// and the observer.
+    fn install_observer_with_baseline(
+        &self,
+        observer: Arc<dyn SessionContextAdvancedObserver>,
+    ) -> u64 {
+        // Default combines the two primitives for backwards compatibility
+        // with any external impls that do not yet override this method.
+        // Runtime impls override to provide the atomic guarantee.
+        self.install_observer(observer);
+        self.current_watermark_ms()
+    }
 }
 
 /// Observer invoked by [`SessionContextHandle`] when a DSL

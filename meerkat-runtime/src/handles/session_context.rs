@@ -114,4 +114,31 @@ impl SessionContextHandle for RuntimeSessionContextHandle {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(&observer));
     }
+
+    fn install_observer_with_baseline(
+        &self,
+        observer: Arc<dyn SessionContextAdvancedObserver>,
+    ) -> u64 {
+        // Atomic critical section: hold the DSL authority lock while
+        // installing the observer. Any `context_advanced` call that runs
+        // concurrently either (a) completes before this function acquires
+        // the DSL lock — its advance is recorded in the returned baseline
+        // and its observer-notify is dropped because no observer is
+        // installed yet, or (b) blocks until we release the DSL lock —
+        // by then the observer is installed, so the next `context_advanced`
+        // notify lands. In both cases the consumer's baseline and the
+        // observer's effect stream agree on the frontier.
+        //
+        // Locking order matches `apply_input_with_effects` (DSL first,
+        // observer second) so this critical section cannot deadlock with
+        // a concurrent transition.
+        self.dsl.with_state_lock(|state| {
+            *self
+                .observer
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Arc::downgrade(&observer));
+            state.last_session_context_updated_at_ms
+        })
+    }
 }

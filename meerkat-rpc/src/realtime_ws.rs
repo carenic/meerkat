@@ -915,6 +915,29 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                     let mut product_turn_in_flight = false;
                     let mut product_turn_committed = false;
                     let mut product_output_started = false;
+                    // Gates for proactive reconnect on clean provider-session
+                    // close (`RealtimeProductSessionUpdate::Closed`). A clean
+                    // close is treated as a mid-work disconnect worth
+                    // proactively re-opening only when the client has issued
+                    // work that is still in flight from the channel's
+                    // perspective:
+                    //   * `client_has_submitted_input` flips to true the
+                    //     first time the client's input chunk is accepted by
+                    //     the provider session. Before that point the
+                    //     channel has no client-requested work to recover,
+                    //     so reconnecting would race against callers that
+                    //     observe `open_calls` immediately after the
+                    //     terminal event (see the tool-call routing test).
+                    //   * `last_turn_terminally_completed` flips to true on
+                    //     a `TurnCompleted` with a terminal stop reason and
+                    //     back to false when a new turn starts. A Close
+                    //     after a terminal turn has already satisfied the
+                    //     client's request, so the channel can stay idle
+                    //     until the client next submits input.
+                    // Error paths still reconnect unconditionally because
+                    // Error is not a clean close.
+                    let mut client_has_submitted_input = false;
+                    let mut last_turn_terminally_completed = false;
                     let mut last_visible_status = Some(opened_status);
                     let mut poll_interval = tokio::time::interval(RECONNECT_POLL_INTERVAL);
                     poll_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -922,27 +945,29 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                     // W2-E: install a typed observer on the session's DSL
                     // handle so `SessionContextAdvanced` effects arrive as
                     // typed notifications instead of a hand-polled watch
-                    // channel. The handle also provides the initial
-                    // watermark atomically — the same value the DSL will
-                    // emit on the next tick — eliminating the two-read
-                    // race on `session.state.updated_at` that forced
-                    // retries on three tests in `.config/nextest.toml`.
+                    // channel. `install_observer_with_baseline` captures
+                    // the current watermark AND installs the observer in
+                    // a single critical section under the DSL authority
+                    // lock, so no tick can slip between the sampled
+                    // baseline and the observer becoming visible.
+                    // Separate `current_watermark_ms` + `install_observer`
+                    // calls would re-introduce the original two-read race
+                    // the handle abstraction is meant to eliminate.
                     let (projection_refresh_tx, mut projection_refresh_rx) =
                         mpsc::channel::<u64>(16);
                     let session_context_handle =
                         resolve_session_context_handle(&state.runtime, binding.as_ref()).await;
-                    let initial_baseline_ms = session_context_handle
-                        .as_ref()
-                        .map(|h| h.current_watermark_ms())
-                        .unwrap_or(0);
-                    if let Some(handle) = session_context_handle.as_ref() {
+                    let initial_baseline_ms = if let Some(handle) = session_context_handle.as_ref()
+                    {
                         let observer: Arc<
                             dyn meerkat_core::handles::SessionContextAdvancedObserver,
                         > = Arc::new(ProjectionRefreshObserver {
                             notify_tx: projection_refresh_tx.clone(),
                         });
-                        handle.install_observer(observer);
-                    }
+                        handle.install_observer_with_baseline(observer)
+                    } else {
+                        0
+                    };
                     let mut projection_freshness = ProjectionFreshness::Clean {
                         baseline_ms: initial_baseline_ms,
                     };
@@ -1308,6 +1333,16 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                                                 product_output_started = false;
                                                             }
                                                             product_turn_in_flight = true;
+                                                            // Client-initiated work has now
+                                                            // started on the provider session.
+                                                            // Any subsequent clean close while
+                                                            // this flag is set AND no terminal
+                                                            // turn completion has cleared the
+                                                            // mid-work gate is treated as a
+                                                            // mid-work disconnect, so the poll
+                                                            // loop can reconnect proactively.
+                                                            client_has_submitted_input = true;
+                                                            last_turn_terminally_completed = false;
                                                         }
                                                         Ok(Err(error)) => {
                                                             let _ = send_server_frame(
@@ -1640,6 +1675,14 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                             // between-turn edit and spuriously reconstruct the
                                             // provider session.
                                             product_turn_in_flight = true;
+                                            // A provider-issued tool call is
+                                            // not yet a terminal turn
+                                            // completion, so a subsequent
+                                            // clean close must not treat the
+                                            // preceding turn as "finished"
+                                            // when deciding whether to
+                                            // auto-reconnect.
+                                            last_turn_terminally_completed = false;
                                         }
                                         if output_started {
                                             product_output_started = true;
@@ -1651,6 +1694,13 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                             product_turn_in_flight = false;
                                             product_turn_committed = false;
                                             product_output_started = false;
+                                            // Record that the last in-flight
+                                            // turn reached a terminal stop
+                                            // reason so a subsequent clean
+                                            // close is treated as "session
+                                            // finished the requested work"
+                                            // rather than a mid-turn drop.
+                                            last_turn_terminally_completed = true;
                                             // W2-E: promote `StaleDeferred` → `StaleImmediate`
                                             // at turn end. This is the specific fix for the s71
                                             // turn-8 regression: a peer-response terminal
@@ -1719,11 +1769,35 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                             baseline_ms: watermark_ms,
                                         };
                                         product_session = None;
-                                        if let Err(error) = require_product_session_reattach(
-                                            &state.runtime,
-                                            binding.as_ref(),
-                                        )
-                                        .await
+                                        // Only flip the binding into
+                                        // `ReattachRequired` — which kicks off
+                                        // the poll-driven reconnect cycle —
+                                        // when the client has actually issued
+                                        // work against this session AND that
+                                        // work has not yet reached a terminal
+                                        // turn completion. Without any client
+                                        // input, a clean close is just
+                                        // "provider ended the session" with
+                                        // nothing to resume, and proactively
+                                        // re-opening would race against
+                                        // callers that read `open_calls`
+                                        // immediately after the terminal
+                                        // event (e.g. the tool-call routing
+                                        // coverage test). If the last turn
+                                        // already completed terminally, the
+                                        // provider delivered everything the
+                                        // client asked for — a follow-up
+                                        // clean close is the session
+                                        // finishing, not a mid-turn drop, so
+                                        // there is nothing to recover.
+                                        let needs_reattach =
+                                            client_has_submitted_input && !last_turn_terminally_completed;
+                                        if needs_reattach
+                                            && let Err(error) = require_product_session_reattach(
+                                                &state.runtime,
+                                                binding.as_ref(),
+                                            )
+                                            .await
                                         {
                                             let _ = send_server_frame(
                                                 &mut socket,
