@@ -4,10 +4,9 @@ use serde_json::value::RawValue;
 
 use meerkat_contracts::{
     ErrorCode, RealtimeCapabilities, RealtimeCapabilitiesParams, RealtimeCapabilitiesResult,
-    RealtimeChannelState, RealtimeChannelStatus, RealtimeChannelTarget, RealtimeOpenRequest,
-    RealtimeStatusParams, RealtimeStatusResult,
+    RealtimeChannelState, RealtimeChannelStatus, RealtimeOpenRequest, RealtimeStatusParams,
+    RealtimeStatusResult,
 };
-use meerkat_core::SessionId;
 use meerkat_runtime::service_ext::SessionServiceRuntimeExt;
 
 use super::{RpcResponseExt, parse_params};
@@ -79,31 +78,62 @@ pub(crate) fn realtime_status_from_runtime(
     }
 }
 
-fn parse_session_target(raw: &str) -> Result<SessionId, String> {
-    SessionId::parse(raw).map_err(|err| err.to_string())
+/// W3-H: resolve a RealtimeChannelTarget to a concrete bridge session id.
+/// On mob-enabled builds this routes through the MobMcpState resolver
+/// (SessionTarget parses directly; MobMember reads the MobMachine's
+/// canonical binding map). On mob-disabled builds MobMember targets are
+/// rejected with INVALID_PARAMS, and SessionTarget parses directly.
+#[cfg(feature = "mob")]
+async fn resolve_realtime_target_session(
+    target: &meerkat_contracts::RealtimeChannelTarget,
+    mob_state: &std::sync::Arc<meerkat_mob_mcp::MobMcpState>,
+) -> Result<meerkat_core::types::SessionId, String> {
+    mob_state
+        .resolve_realtime_target_session(target)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[cfg(not(feature = "mob"))]
+async fn resolve_realtime_target_session(
+    target: &meerkat_contracts::RealtimeChannelTarget,
+) -> Result<meerkat_core::types::SessionId, String> {
+    match target {
+        meerkat_contracts::RealtimeChannelTarget::SessionTarget { session_id } => {
+            meerkat_core::types::SessionId::parse(session_id)
+                .map_err(|err| format!("invalid session target: {err}"))
+        }
+        meerkat_contracts::RealtimeChannelTarget::MobMember { .. } => Err(
+            "mob-member realtime targets require this host to be built with the `mob` feature"
+                .to_string(),
+        ),
+    }
 }
 
 pub async fn handle_realtime_status(
     id: Option<RpcId>,
     params: Option<&RawValue>,
     adapter: &dyn SessionServiceRuntimeExt,
+    #[cfg(feature = "mob")] mob_state: &std::sync::Arc<meerkat_mob_mcp::MobMcpState>,
 ) -> RpcResponse {
     let params: RealtimeStatusParams = match parse_params(params) {
         Ok(params) => params,
         Err(response) => return response.with_id(id),
     };
 
-    let status = match params.target {
-        RealtimeChannelTarget::SessionTarget { session_id } => {
-            let session_id = match parse_session_target(&session_id) {
-                Ok(session_id) => session_id,
-                Err(err) => return RpcResponse::error(id, error::INVALID_PARAMS, err),
-            };
-            match adapter.realtime_attachment_status(&session_id).await {
-                Ok(status) => realtime_status_from_runtime(status),
-                Err(err) => return RpcResponse::error(id, error::INVALID_PARAMS, err.to_string()),
-            }
-        }
+    let session_id = match resolve_realtime_target_session(
+        &params.target,
+        #[cfg(feature = "mob")]
+        mob_state,
+    )
+    .await
+    {
+        Ok(sid) => sid,
+        Err(err) => return RpcResponse::error(id, error::INVALID_PARAMS, err),
+    };
+    let status = match adapter.realtime_attachment_status(&session_id).await {
+        Ok(status) => realtime_status_from_runtime(status),
+        Err(err) => return RpcResponse::error(id, error::INVALID_PARAMS, err.to_string()),
     };
 
     RpcResponse::success(id, RealtimeStatusResult { status })
@@ -114,29 +144,30 @@ pub async fn handle_realtime_capabilities(
     params: Option<&RawValue>,
     adapter: &dyn SessionServiceRuntimeExt,
     realtime_ws_host: Option<&crate::realtime_ws::RealtimeWsHost>,
+    #[cfg(feature = "mob")] mob_state: &std::sync::Arc<meerkat_mob_mcp::MobMcpState>,
 ) -> RpcResponse {
     let params: RealtimeCapabilitiesParams = match parse_params(params) {
         Ok(params) => params,
         Err(response) => return response.with_id(id),
     };
 
-    match &params.target {
-        RealtimeChannelTarget::SessionTarget { session_id } => {
-            let session_id = match parse_session_target(session_id) {
-                Ok(session_id) => session_id,
-                Err(err) => return RpcResponse::error(id, error::INVALID_PARAMS, err),
-            };
-            if let Err(err) = adapter.realtime_attachment_status(&session_id).await {
-                return RpcResponse::error(id, error::INVALID_PARAMS, err.to_string());
-            }
-        }
+    let session_id = match resolve_realtime_target_session(
+        &params.target,
+        #[cfg(feature = "mob")]
+        mob_state,
+    )
+    .await
+    {
+        Ok(sid) => sid,
+        Err(err) => return RpcResponse::error(id, error::INVALID_PARAMS, err),
+    };
+    if let Err(err) = adapter.realtime_attachment_status(&session_id).await {
+        return RpcResponse::error(id, error::INVALID_PARAMS, err.to_string());
     }
 
-    let capabilities = match params.target {
-        RealtimeChannelTarget::SessionTarget { .. } => realtime_ws_host
-            .and_then(crate::realtime_ws::RealtimeWsHost::session_factory_capabilities)
-            .unwrap_or_else(conservative_phase_one_capabilities),
-    };
+    let capabilities = realtime_ws_host
+        .and_then(crate::realtime_ws::RealtimeWsHost::session_factory_capabilities)
+        .unwrap_or_else(conservative_phase_one_capabilities);
 
     RpcResponse::success(id, RealtimeCapabilitiesResult { capabilities })
 }
@@ -147,29 +178,30 @@ pub async fn handle_realtime_open_info(
     adapter: &dyn SessionServiceRuntimeExt,
     realtime_ws_host: Option<&crate::realtime_ws::RealtimeWsHost>,
     realm_id: Option<&str>,
+    #[cfg(feature = "mob")] mob_state: &std::sync::Arc<meerkat_mob_mcp::MobMcpState>,
 ) -> RpcResponse {
     let params: RealtimeOpenRequest = match parse_params(params) {
         Ok(params) => params,
         Err(response) => return response.with_id(id),
     };
 
-    match &params.target {
-        RealtimeChannelTarget::SessionTarget { session_id } => {
-            let session_id = match parse_session_target(session_id) {
-                Ok(session_id) => session_id,
-                Err(err) => return RpcResponse::error(id, error::INVALID_PARAMS, err),
-            };
-            if let Err(err) = adapter.realtime_attachment_status(&session_id).await {
-                return RpcResponse::error(id, error::INVALID_PARAMS, err.to_string());
-            }
-        }
+    let session_id = match resolve_realtime_target_session(
+        &params.target,
+        #[cfg(feature = "mob")]
+        mob_state,
+    )
+    .await
+    {
+        Ok(sid) => sid,
+        Err(err) => return RpcResponse::error(id, error::INVALID_PARAMS, err),
+    };
+    if let Err(err) = adapter.realtime_attachment_status(&session_id).await {
+        return RpcResponse::error(id, error::INVALID_PARAMS, err.to_string());
     }
 
-    let capabilities = match &params.target {
-        RealtimeChannelTarget::SessionTarget { .. } => realtime_ws_host
-            .and_then(crate::realtime_ws::RealtimeWsHost::session_factory_capabilities)
-            .unwrap_or_else(conservative_phase_one_capabilities),
-    };
+    let capabilities = realtime_ws_host
+        .and_then(crate::realtime_ws::RealtimeWsHost::session_factory_capabilities)
+        .unwrap_or_else(conservative_phase_one_capabilities);
     if !capabilities.turning_modes.contains(&params.turning_mode) {
         return RpcResponse::error(
             id,

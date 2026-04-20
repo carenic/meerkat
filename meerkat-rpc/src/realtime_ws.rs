@@ -68,10 +68,9 @@ struct PendingOpenEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum RealtimeTargetKey {
     Session(String),
-    // Placeholder variant retained for pattern-exhaustiveness on binding
-    // enum (T5i kept the empty variant for the SocketBinding pattern match);
-    // never constructed post-T5i.
-    #[allow(dead_code)]
+    // W3-H: first-class mob-member routing (γ — the server resolves current
+    // bridge session on every tick from the MobMachine binding map; the
+    // channel survives respawn rotation without any SDK round-trip).
     MobMember {
         mob_id: String,
         agent_identity: String,
@@ -84,6 +83,13 @@ impl From<&meerkat_contracts::RealtimeChannelTarget> for RealtimeTargetKey {
             meerkat_contracts::RealtimeChannelTarget::SessionTarget { session_id } => {
                 Self::Session(session_id.clone())
             }
+            meerkat_contracts::RealtimeChannelTarget::MobMember {
+                mob_id,
+                agent_identity,
+            } => Self::MobMember {
+                mob_id: mob_id.clone(),
+                agent_identity: agent_identity.clone(),
+            },
         }
     }
 }
@@ -95,10 +101,75 @@ struct ActiveTargetEntry {
     observer_fanout: Option<broadcast::Sender<RealtimeServerFrame>>,
 }
 
+/// The kind of target a realtime WS session is bound to.
+///
+/// W3-H / dogma #4: the `MobMemberPrimary` variant carries identity + mob_id
+/// as the canonical anchor plus a task-local `current_session_id` that the
+/// server updates as the MobMachine rotates the binding. Reads run in the
+/// same tokio task that owns the binding, so `current_session_id` needs no
+/// synchronization primitive — the observer select! arm and the poll-loop
+/// arms alternate, not race.
 #[derive(Debug, Clone)]
 enum RealtimeSocketBinding {
+    /// Standalone session primary — pinned to one session id for the
+    /// channel's lifetime. Used for `RealtimeChannelTarget::SessionTarget`.
     SessionPrimary { session_id: SessionId },
+    /// Standalone session observer. Same pinning as SessionPrimary but
+    /// read-only.
     SessionObserver { session_id: SessionId },
+    /// W3-H: mob-member primary. The server resolves the current bridge
+    /// session on every tick from the MobMachine binding map via the
+    /// observer-driven `current_session_id` field. Respawn rotation
+    /// mutates this in-place from the observer select! arm; the channel
+    /// survives without any SDK round-trip.
+    ///
+    /// `mob_id` and `agent_identity` are kept on the variant so the
+    /// observer arm filters incoming binding events to only those for
+    /// this channel's identity.
+    ///
+    /// Only constructed when the `mob` feature is enabled — without it
+    /// the `RealtimeChannelTarget::MobMember` branch of
+    /// `bind_realtime_target` rejects the channel with
+    /// `RealtimeErrorCode::InvalidTarget` before any binding of this
+    /// variant would be materialized.
+    #[cfg(feature = "mob")]
+    #[allow(dead_code)]
+    MobMemberPrimary {
+        mob_id: meerkat_mob::ids::MobId,
+        agent_identity: meerkat_mob::ids::AgentIdentity,
+        current_session_id: SessionId,
+    },
+}
+
+impl RealtimeSocketBinding {
+    /// Return the bridge session id this binding currently points at.
+    /// Central read-point for the poll loop — all helpers that used to
+    /// pattern-match `SessionPrimary { session_id }` route through here so
+    /// `MobMemberPrimary`'s mutable `current_session_id` is visible to
+    /// runtime-adapter queries (`realtime_attachment_status`, `attach_live`,
+    /// `detach_live`, …).
+    fn current_session_id(&self) -> &SessionId {
+        match self {
+            Self::SessionPrimary { session_id } | Self::SessionObserver { session_id } => {
+                session_id
+            }
+            #[cfg(feature = "mob")]
+            Self::MobMemberPrimary {
+                current_session_id, ..
+            } => current_session_id,
+        }
+    }
+
+    /// Returns true if this binding represents a primary channel (owns the
+    /// runtime attachment lifecycle) rather than an observer.
+    fn is_primary(&self) -> bool {
+        match self {
+            Self::SessionPrimary { .. } => true,
+            Self::SessionObserver { .. } => false,
+            #[cfg(feature = "mob")]
+            Self::MobMemberPrimary { .. } => true,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -860,7 +931,7 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                             return;
                         }
                     };
-                    let (opened_status, binding, mut product_session) = match bind_realtime_target(
+                    let bound = match bind_realtime_target(
                         &state.runtime,
                         &accepted,
                         state.host.session_factory(),
@@ -874,6 +945,28 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                             return;
                         }
                     };
+                    let opened_status = bound.status;
+                    // `binding` needs `mut` for the mob-enabled observer arm
+                    // that rewrites MobMemberPrimary.current_session_id on
+                    // Rotated events; without the feature the field never
+                    // mutates, hence the conditional allow.
+                    #[cfg_attr(not(feature = "mob"), allow(unused_mut))]
+                    let mut binding = bound.binding;
+                    let mut product_session = bound.bridge;
+                    // W3-H: `realtime_binding_events` is `Some` only for
+                    // `RealtimeChannelTarget::MobMember` channels on a
+                    // mob-enabled build. Without the `mob` feature, the
+                    // receiver type is unreachable at compile time; we bind
+                    // a placeholder that the observer select! arm polls but
+                    // that never produces a value, so the arm is inert.
+                    #[cfg(feature = "mob")]
+                    let mut realtime_binding_events = bound.binding_events;
+                    // W3-H: `realtime_binding_events` is `Some` only for
+                    // MobMember channels. The main select! loop below adds a
+                    // new arm that consumes from this receiver, updating
+                    // `binding`'s `current_session_id` on Rotated events and
+                    // closing with `RealtimeErrorCode::BindingReleased` on
+                    // Released events.
                     let uses_product_session = product_session.is_some();
                     let expected_audio_input_format =
                         accepted.capabilities.audio_input_format.clone();
@@ -1179,14 +1272,15 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                                         "realtime provider session is reconnecting; wait for the channel to become ready",
                                                     )
                                                     .await;
-                                                } else if let Some(RealtimeSocketBinding::SessionPrimary {
-                                                    session_id,
-                                                }) = binding.as_ref()
+                                                } else if let Some(binding_ref) = binding.as_ref()
+                                                    && binding_ref.is_primary()
                                                 {
                                                     if let Err(error) = state
                                                         .runtime
                                                         .runtime_adapter()
-                                                        .interrupt_current_run(session_id)
+                                                        .interrupt_current_run(
+                                                            binding_ref.current_session_id(),
+                                                        )
                                                         .await
                                                     {
                                                         let _ = send_server_frame(
@@ -1983,6 +2077,199 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                     let _ = send_server_frame(&mut socket, &frame).await;
                                 }
                             }
+                            // W3-H: MobMember channels subscribe to the mob's
+                            // MemberRealtimeBindingEvent broadcast at
+                            // bind_realtime_target time. This arm routes those
+                            // typed effects into the WS binding's mutable
+                            // current_session_id (on Rotated) or emits a
+                            // typed BindingReleased terminal frame + closes
+                            // the channel (on Released). Events for other
+                            // identities on the same mob are silently
+                            // ignored; the mob publishes across all members'
+                            // lifecycles on one channel.
+                            //
+                            // The arm is compiled unconditionally because
+                            // `tokio::select!` macro arms cannot carry
+                            // `#[cfg(...)]`, but when the `mob` feature is
+                            // disabled the future resolves to
+                            // `std::future::pending()` (no-op) and the body
+                            // is skipped via the mob-gated `let Some(event)`.
+                            binding_event = binding_event_future(
+                                #[cfg(feature = "mob")]
+                                realtime_binding_events.as_mut(),
+                            ) => {
+                                #[cfg(feature = "mob")]
+                                {
+                                    use meerkat_mob::runtime::state::MemberRealtimeBindingEvent;
+                                    match binding_event {
+                                        Some(Ok(MemberRealtimeBindingEvent::Rotated {
+                                            mob_id: event_mob_id,
+                                            agent_identity: event_identity,
+                                            new_session_id,
+                                            ..
+                                        })) => {
+                                            if let Some(RealtimeSocketBinding::MobMemberPrimary {
+                                                mob_id,
+                                                agent_identity,
+                                                current_session_id,
+                                            }) = binding.as_mut()
+                                                && *mob_id == event_mob_id
+                                                && *agent_identity == event_identity
+                                            {
+                                                tracing::debug!(
+                                                    %event_mob_id,
+                                                    %event_identity,
+                                                    old = %current_session_id,
+                                                    new = %new_session_id,
+                                                    "realtime WS: rotating current_session_id"
+                                                );
+                                                // Register the rotated bridge session with
+                                                // the runtime adapter BEFORE swapping the
+                                                // pointer. The pre-dispatch router path
+                                                // only registers the initial session id;
+                                                // rotations go through the MobMachine
+                                                // broadcast and never cross the RPC
+                                                // handler, so the new session's executor
+                                                // would be missing and the next status
+                                                // poll would hit `NotReady(Destroyed)`
+                                                // surfaced as `InvalidTarget` (s58 fix).
+                                                if let Err(err) = state
+                                                    .runtime
+                                                    .ensure_runtime_session_for_rotation(
+                                                        &new_session_id,
+                                                    )
+                                                    .await
+                                                {
+                                                    tracing::warn!(
+                                                        %event_mob_id,
+                                                        %event_identity,
+                                                        %new_session_id,
+                                                        %err,
+                                                        "realtime WS: failed to register rotated session executor; next status poll may fail"
+                                                    );
+                                                }
+                                                // Attach the new session as a live
+                                                // realtime binding so subsequent status
+                                                // polls see it. Mirrors the
+                                                // `attach_live` call on initial bind for
+                                                // MobMember primaries.
+                                                if let Err(err) = state
+                                                    .runtime
+                                                    .runtime_adapter()
+                                                    .attach_live(&new_session_id)
+                                                    .await
+                                                {
+                                                    tracing::warn!(
+                                                        %event_mob_id,
+                                                        %event_identity,
+                                                        %new_session_id,
+                                                        ?err,
+                                                        "realtime WS: failed to attach rotated session"
+                                                    );
+                                                }
+                                                // Detach the old session so the runtime
+                                                // doesn't hold a stale live attachment
+                                                // for a bridge session that's already
+                                                // been retired.
+                                                let _ = state
+                                                    .runtime
+                                                    .runtime_adapter()
+                                                    .detach_live(current_session_id)
+                                                    .await;
+                                                *current_session_id = new_session_id;
+                                                // Reset projection baseline so the
+                                                // poll-loop's next status tick is
+                                                // evaluated against the freshly
+                                                // rotated session.
+                                                projection_freshness = ProjectionFreshness::Clean {
+                                                    baseline_ms: session_context_handle
+                                                        .as_ref()
+                                                        .map(|h| h.current_watermark_ms())
+                                                        .unwrap_or(0),
+                                                };
+                                            }
+                                        }
+                                        Some(Ok(MemberRealtimeBindingEvent::Released {
+                                            mob_id: event_mob_id,
+                                            agent_identity: event_identity,
+                                            session_id: _released_session_id,
+                                        })) => {
+                                            if let Some(RealtimeSocketBinding::MobMemberPrimary {
+                                                mob_id,
+                                                agent_identity,
+                                                ..
+                                            }) = binding.as_ref()
+                                                && *mob_id == event_mob_id
+                                                && *agent_identity == event_identity
+                                            {
+                                                tracing::debug!(
+                                                    %event_mob_id,
+                                                    %event_identity,
+                                                    "realtime WS: binding released; closing channel"
+                                                );
+                                                let _ = send_server_frame(
+                                                    &mut socket,
+                                                    &RealtimeServerFrame::ChannelError(
+                                                        RealtimeChannelErrorFrame {
+                                                            code: RealtimeErrorCode::BindingReleased,
+                                                            message:
+                                                                "mob member retired; realtime binding released"
+                                                                    .to_string(),
+                                                            details: None,
+                                                        },
+                                                    ),
+                                                )
+                                                .await;
+                                                let _ = send_server_frame(
+                                                    &mut socket,
+                                                    &RealtimeServerFrame::ChannelClosed(
+                                                        RealtimeChannelClosedFrame {
+                                                            reason: Some(
+                                                                RealtimeErrorCode::BindingReleased
+                                                                    .to_string(),
+                                                            ),
+                                                        },
+                                                    ),
+                                                )
+                                                .await;
+                                                break;
+                                            }
+                                        }
+                                        Some(Ok(MemberRealtimeBindingEvent::Set { .. })) => {
+                                            // Set events arrive for fresh bindings
+                                            // on identities other than ours, or
+                                            // for our identity right as the WS
+                                            // opens (already reflected in the
+                                            // binding state). No action needed.
+                                        }
+                                        Some(Err(())) => {
+                                            // Lagged — slow consumer. The
+                                            // canonical binding map remains the
+                                            // source of truth; next poll-loop
+                                            // tick re-reads via
+                                            // realtime_attachment_status on the
+                                            // current session_id. No action.
+                                            tracing::warn!(
+                                                "realtime WS: binding event subscriber lagged"
+                                            );
+                                        }
+                                        None => {
+                                            // Broadcast closed (mob actor
+                                            // exited). The channel's attached
+                                            // session will also terminate shortly
+                                            // via its own path; no typed action
+                                            // needed here.
+                                        }
+                                    }
+                                }
+                                #[cfg(not(feature = "mob"))]
+                                {
+                                    // Without the `mob` feature, the future
+                                    // is `pending()` and this arm is never
+                                    // reached. `binding_event` is `()`.
+                                    let _ = binding_event;
+                                }
+                            }
                             _ = poll_interval.tick() => {
                                 let now = Instant::now();
                                 let now_utc = Utc::now();
@@ -2145,6 +2432,30 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                         .await;
                                     }
                                     Err(error) => {
+                                        // W3-H: for MobMember channels, a poll-loop
+                                        // status error against a Destroyed bridge
+                                        // session is a legitimate transient — the
+                                        // MobMachine's MemberRealtimeBindingRotated
+                                        // event may arrive microseconds later,
+                                        // pointing at the replacement session. Don't
+                                        // hard-close; skip this tick and let the
+                                        // observer select! arm handle the rotation.
+                                        // A SessionTarget (pinned) in the same state
+                                        // is terminal because there is no rotation
+                                        // path to wait for.
+                                        if binding_is_mob_member(binding.as_ref())
+                                            && matches!(
+                                                error.code,
+                                                RealtimeErrorCode::InvalidTarget
+                                                    | RealtimeErrorCode::RuntimeNotReady
+                                            )
+                                        {
+                                            tracing::debug!(
+                                                ?error,
+                                                "realtime WS: tolerating transient status error on MobMember channel while waiting for binding rotation"
+                                            );
+                                            continue;
+                                        }
                                         let _ = send_server_frame(
                                             &mut socket,
                                             &RealtimeServerFrame::ChannelError(error),
@@ -2260,6 +2571,24 @@ fn validate_input_chunk_audio_format(
     })
 }
 
+/// W3-H: true when the binding is a MobMember primary — used by the poll
+/// loop's status-error branch to distinguish transient rotation-window
+/// failures (tolerable) from pinned-session SessionTarget failures (terminal).
+/// Gated so the `MobMemberPrimary` variant is not referenced on non-mob
+/// builds where it doesn't exist.
+#[cfg(feature = "mob")]
+fn binding_is_mob_member(binding: Option<&RealtimeSocketBinding>) -> bool {
+    matches!(
+        binding,
+        Some(RealtimeSocketBinding::MobMemberPrimary { .. })
+    )
+}
+
+#[cfg(not(feature = "mob"))]
+fn binding_is_mob_member(_binding: Option<&RealtimeSocketBinding>) -> bool {
+    false
+}
+
 async fn send_protocol_error(
     socket: &mut WebSocket,
     code: RealtimeErrorCode,
@@ -2276,18 +2605,44 @@ async fn send_protocol_error(
     .await
 }
 
+/// W3-H: select!-compatible future factory for the member-realtime-binding
+/// event arm. On mob-enabled builds this awaits the broadcast receiver (or
+/// `std::future::pending()` when the channel is a SessionTarget and thus
+/// has no receiver); on mob-disabled builds it is always `pending()` and
+/// the arm is inert — kept compiled so the select! macro (which doesn't
+/// support `#[cfg(...)]` arms) still parses.
+#[cfg(feature = "mob")]
+async fn binding_event_future(
+    rx: Option<
+        &mut tokio::sync::broadcast::Receiver<
+            meerkat_mob::runtime::state::MemberRealtimeBindingEvent,
+        >,
+    >,
+) -> Option<Result<meerkat_mob::runtime::state::MemberRealtimeBindingEvent, ()>> {
+    match rx {
+        Some(rx) => match rx.recv().await {
+            Ok(event) => Some(Ok(event)),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some(Err(())),
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// Placeholder for no-mob builds — MobMember channels are rejected at
+/// `bind_realtime_target`, so the select! arm never fires. We still need
+/// a compilable `Future<Output = ()>` because the macro cannot carry
+/// `#[cfg(...)]` on arms.
+#[cfg(not(feature = "mob"))]
+async fn binding_event_future() -> () {
+    std::future::pending().await
+}
+
 async fn bind_realtime_target(
     runtime: &SessionRuntime,
     accepted: &AcceptedRealtimeOpen,
     session_factory: Option<Arc<dyn RealtimeSessionFactory>>,
-) -> Result<
-    (
-        RealtimeChannelStatus,
-        Option<RealtimeSocketBinding>,
-        Option<RealtimeProductSessionBridge>,
-    ),
-    RealtimeChannelErrorFrame,
-> {
+) -> Result<BindRealtimeTargetOutput, RealtimeChannelErrorFrame> {
     match &accepted.request.target {
         meerkat_contracts::RealtimeChannelTarget::SessionTarget { session_id } => {
             let session_id =
@@ -2308,11 +2663,13 @@ async fn bind_realtime_target(
                         session_factory,
                     )
                     .await?;
-                    Ok((
+                    Ok(BindRealtimeTargetOutput {
                         status,
-                        Some(RealtimeSocketBinding::SessionPrimary { session_id }),
-                        Some(bridge),
-                    ))
+                        binding: Some(RealtimeSocketBinding::SessionPrimary { session_id }),
+                        bridge: Some(bridge),
+                        #[cfg(feature = "mob")]
+                        binding_events: None,
+                    })
                 } else {
                     runtime
                         .runtime_adapter()
@@ -2326,11 +2683,13 @@ async fn bind_realtime_target(
                         .map(session_projection_from_runtime)
                         .map(projection_to_channel_status)
                         .map_err(|err| runtime_error_frame(err, "status"))?;
-                    Ok((
+                    Ok(BindRealtimeTargetOutput {
                         status,
-                        Some(RealtimeSocketBinding::SessionPrimary { session_id }),
-                        None,
-                    ))
+                        binding: Some(RealtimeSocketBinding::SessionPrimary { session_id }),
+                        bridge: None,
+                        #[cfg(feature = "mob")]
+                        binding_events: None,
+                    })
                 }
             } else {
                 let status = runtime
@@ -2340,14 +2699,139 @@ async fn bind_realtime_target(
                     .map(session_projection_from_runtime)
                     .map(projection_to_channel_status)
                     .map_err(|err| runtime_error_frame(err, "status"))?;
-                Ok((
+                Ok(BindRealtimeTargetOutput {
                     status,
-                    Some(RealtimeSocketBinding::SessionObserver { session_id }),
-                    None,
-                ))
+                    binding: Some(RealtimeSocketBinding::SessionObserver { session_id }),
+                    bridge: None,
+                    #[cfg(feature = "mob")]
+                    binding_events: None,
+                })
             }
         }
+        #[cfg(feature = "mob")]
+        meerkat_contracts::RealtimeChannelTarget::MobMember {
+            mob_id,
+            agent_identity,
+        } => {
+            // W3-H: resolve the identity's current bridge session from the
+            // MobMachine's canonical binding map, then subscribe to the
+            // mob's binding-event broadcast so respawn-driven rotations
+            // arrive as typed events rather than being lost to the
+            // session-id pin the SDK used to maintain client-side.
+            if !matches!(
+                accepted.request.role,
+                meerkat_contracts::RealtimeChannelRole::Primary
+            ) {
+                return Err(RealtimeChannelErrorFrame {
+                    code: RealtimeErrorCode::InvalidTarget,
+                    message:
+                        "observer role is not supported for mob-member targets in this release"
+                            .to_string(),
+                    details: None,
+                });
+            }
+            let mob_state = runtime
+                .mob_state()
+                .ok_or_else(|| RealtimeChannelErrorFrame {
+                    code: RealtimeErrorCode::InvalidTarget,
+                    message:
+                        "mob-member channels require the mob feature to be enabled on this host"
+                            .to_string(),
+                    details: None,
+                })?;
+            let dsl_mob_id = meerkat_mob::ids::MobId::from(mob_id.as_str());
+            let mob_handle = mob_state.handle_for(&dsl_mob_id).await.map_err(|err| {
+                RealtimeChannelErrorFrame {
+                    code: RealtimeErrorCode::InvalidTarget,
+                    message: format!("mob {mob_id:?} not found or handle unavailable: {err}"),
+                    details: None,
+                }
+            })?;
+            let dsl_agent_identity = meerkat_mob::ids::AgentIdentity::from(agent_identity.as_str());
+            let current_session_id = mob_handle
+                .current_realtime_binding(dsl_agent_identity.clone())
+                .await
+                .map_err(|err| RealtimeChannelErrorFrame {
+                    code: RealtimeErrorCode::RuntimeInternal,
+                    message: format!("failed to query current realtime binding: {err}"),
+                    details: None,
+                })?
+                .ok_or_else(|| RealtimeChannelErrorFrame {
+                    code: RealtimeErrorCode::InvalidTarget,
+                    message: format!(
+                        "mob {mob_id:?} has no realtime binding for identity {agent_identity:?}"
+                    ),
+                    details: None,
+                })?;
+            let binding_events = mob_handle.subscribe_realtime_binding_events();
+            let binding = RealtimeSocketBinding::MobMemberPrimary {
+                mob_id: dsl_mob_id,
+                agent_identity: dsl_agent_identity,
+                current_session_id: current_session_id.clone(),
+            };
+            if let Some(session_factory) = session_factory {
+                let (status, bridge) = open_product_session_bridge(
+                    runtime,
+                    &current_session_id,
+                    accepted.request.turning_mode,
+                    session_factory,
+                )
+                .await?;
+                Ok(BindRealtimeTargetOutput {
+                    status,
+                    binding: Some(binding),
+                    bridge: Some(bridge),
+                    binding_events: Some(binding_events),
+                })
+            } else {
+                runtime
+                    .runtime_adapter()
+                    .attach_live(&current_session_id)
+                    .await
+                    .map_err(|err| runtime_error_frame(err, "attach"))?;
+                let status = runtime
+                    .runtime_adapter()
+                    .realtime_attachment_status(&current_session_id)
+                    .await
+                    .map(session_projection_from_runtime)
+                    .map(projection_to_channel_status)
+                    .map_err(|err| runtime_error_frame(err, "status"))?;
+                Ok(BindRealtimeTargetOutput {
+                    status,
+                    binding: Some(binding),
+                    bridge: None,
+                    binding_events: Some(binding_events),
+                })
+            }
+        }
+        #[cfg(not(feature = "mob"))]
+        meerkat_contracts::RealtimeChannelTarget::MobMember { .. } => {
+            Err(RealtimeChannelErrorFrame {
+                code: RealtimeErrorCode::InvalidTarget,
+                message:
+                    "mob-member realtime channels require this host to be built with the `mob` feature"
+                        .to_string(),
+                details: None,
+            })
+        }
     }
+}
+
+/// Output of `bind_realtime_target` — grouped into a struct so the MobMember
+/// branch can return an optional binding-event Receiver without exploding
+/// tuple arity across the poll-loop call site.
+struct BindRealtimeTargetOutput {
+    status: RealtimeChannelStatus,
+    binding: Option<RealtimeSocketBinding>,
+    bridge: Option<RealtimeProductSessionBridge>,
+    /// W3-H: receiver for the mob's MemberRealtimeBindingEvent broadcast.
+    /// `Some` for MobMember channels, `None` for SessionTarget and for all
+    /// channels when the `mob` feature is disabled (those paths never
+    /// materialize a MobMember binding).
+    #[cfg(feature = "mob")]
+    binding_events: Option<
+        tokio::sync::broadcast::Receiver<meerkat_mob::runtime::state::MemberRealtimeBindingEvent>,
+    >,
 }
 
 async fn open_product_session_bridge(
@@ -2408,18 +2892,22 @@ async fn cleanup_realtime_binding(
     runtime: &SessionRuntime,
     binding: Option<&RealtimeSocketBinding>,
 ) -> Result<(), RealtimeChannelErrorFrame> {
-    match binding {
-        Some(RealtimeSocketBinding::SessionPrimary { session_id }) => runtime
-            .runtime_adapter()
-            .detach_live(session_id)
-            .await
-            .map_err(|err| runtime_error_frame(err, "detach")),
-        Some(RealtimeSocketBinding::SessionObserver { session_id }) => {
-            let _ = session_id;
-            Ok(())
-        }
-        None => Ok(()),
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    // Observer channels do not own the runtime attachment; detach is a
+    // primary-only responsibility. MobMember primaries detach the current
+    // bridge session — whichever session the observer-driven
+    // `current_session_id` resolves to now (the one the WS was last
+    // actively pinned to before close).
+    if !binding.is_primary() {
+        return Ok(());
     }
+    runtime
+        .runtime_adapter()
+        .detach_live(binding.current_session_id())
+        .await
+        .map_err(|err| runtime_error_frame(err, "detach"))
 }
 
 fn projection_to_channel_status(projection: RealtimeBindingProjection) -> RealtimeChannelStatus {
@@ -2467,22 +2955,19 @@ async fn current_binding_projection(
     runtime: &SessionRuntime,
     binding: Option<&RealtimeSocketBinding>,
 ) -> Result<RealtimeBindingProjection, RealtimeChannelErrorFrame> {
-    match binding {
-        Some(
-            RealtimeSocketBinding::SessionPrimary { session_id }
-            | RealtimeSocketBinding::SessionObserver { session_id },
-        ) => runtime
-            .runtime_adapter()
-            .realtime_attachment_status(session_id)
-            .await
-            .map(session_projection_from_runtime)
-            .map_err(|err| runtime_error_frame(err, "status")),
-        None => Err(RealtimeChannelErrorFrame {
+    let Some(binding) = binding else {
+        return Err(RealtimeChannelErrorFrame {
             code: RealtimeErrorCode::ChannelNotBound,
             message: "realtime frame routing is not wired to the substrate yet".to_string(),
             details: None,
-        }),
-    }
+        });
+    };
+    runtime
+        .runtime_adapter()
+        .realtime_attachment_status(binding.current_session_id())
+        .await
+        .map(session_projection_from_runtime)
+        .map_err(|err| runtime_error_frame(err, "status"))
 }
 
 fn session_projection_from_runtime(
@@ -2551,29 +3036,32 @@ async fn attempt_realtime_reconnect(
     turning_mode: meerkat_contracts::RealtimeTurningMode,
     session_factory: Option<Arc<dyn RealtimeSessionFactory>>,
 ) -> Result<Option<RealtimeProductSessionBridge>, RealtimeChannelErrorFrame> {
-    match binding {
-        Some(RealtimeSocketBinding::SessionPrimary { session_id }) => {
-            if let Some(session_factory) = session_factory {
-                let (_status, bridge) =
-                    open_product_session_bridge(runtime, session_id, turning_mode, session_factory)
-                        .await?;
-                Ok(Some(bridge))
-            } else {
-                runtime
-                    .runtime_adapter()
-                    .attach_live(session_id)
-                    .await
-                    .map_err(|err| runtime_error_frame(err, "reattach"))?;
-                Ok(None)
-            }
-        }
-        Some(RealtimeSocketBinding::SessionObserver { .. }) | None => {
-            Err(RealtimeChannelErrorFrame {
-                code: RealtimeErrorCode::ChannelNotBound,
-                message: "observer channels do not own realtime reconnect attempts".to_string(),
-                details: None,
-            })
-        }
+    let Some(binding) = binding else {
+        return Err(RealtimeChannelErrorFrame {
+            code: RealtimeErrorCode::ChannelNotBound,
+            message: "reconnect invoked on unbound channel".to_string(),
+            details: None,
+        });
+    };
+    if !binding.is_primary() {
+        return Err(RealtimeChannelErrorFrame {
+            code: RealtimeErrorCode::ChannelNotBound,
+            message: "observer channels do not own realtime reconnect attempts".to_string(),
+            details: None,
+        });
+    }
+    let session_id = binding.current_session_id();
+    if let Some(session_factory) = session_factory {
+        let (_status, bridge) =
+            open_product_session_bridge(runtime, session_id, turning_mode, session_factory).await?;
+        Ok(Some(bridge))
+    } else {
+        runtime
+            .runtime_adapter()
+            .attach_live(session_id)
+            .await
+            .map_err(|err| runtime_error_frame(err, "reattach"))?;
+        Ok(None)
     }
 }
 
@@ -2651,14 +3139,20 @@ async fn require_product_session_reattach(
     runtime: &SessionRuntime,
     binding: Option<&RealtimeSocketBinding>,
 ) -> Result<(), RealtimeChannelErrorFrame> {
-    match binding {
-        Some(RealtimeSocketBinding::SessionPrimary { session_id }) => runtime
-            .runtime_adapter()
-            .require_realtime_attachment_reattach(session_id)
-            .await
-            .map_err(|err| runtime_error_frame(err, "reattach")),
-        Some(RealtimeSocketBinding::SessionObserver { .. }) | None => Ok(()),
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    // Observer-style bindings don't own reattach mechanics. For mob-member
+    // primaries the observer has already rotated `current_session_id` to
+    // the new bridge, so require-reattach should target that.
+    if !binding.is_primary() {
+        return Ok(());
     }
+    runtime
+        .runtime_adapter()
+        .require_realtime_attachment_reattach(binding.current_session_id())
+        .await
+        .map_err(|err| runtime_error_frame(err, "reattach"))
 }
 
 async fn run_product_session_actor(
@@ -3111,7 +3605,7 @@ async fn resolve_primary_session_id(
 ) -> Result<SessionId, RealtimeChannelErrorFrame> {
     let _ = runtime;
     match binding {
-        Some(RealtimeSocketBinding::SessionPrimary { session_id }) => Ok(session_id.clone()),
+        Some(b) if b.is_primary() => Ok(b.current_session_id().clone()),
         _ => Err(RealtimeChannelErrorFrame {
             code: RealtimeErrorCode::ChannelNotBound,
             message: not_bound_message.to_string(),
@@ -3705,15 +4199,19 @@ mod tests {
     }
 
     #[test]
-    fn realtime_socket_binding_has_no_mob_member_variants() {
-        // Lock-in: after Phase 5G/T5i there are no mob-member realtime bindings.
-        // The exhaustive match below won't compile if MemberPrimary or
-        // MemberObserver variants ever reappear — absence of those arms is the
-        // proof.
+    fn realtime_socket_binding_has_expected_variants() {
+        // W3-H / dogma #4: exhaustive-match lock-in. After the γ migration
+        // the socket-binding enum has three variants — SessionPrimary /
+        // SessionObserver for standalone-session channels and
+        // MobMemberPrimary for identity-anchored channels that survive
+        // respawn rotation via observer-driven binding updates. New
+        // variants must update this proof and the current_session_id /
+        // is_primary helpers together.
         fn _proof(binding: RealtimeSocketBinding) {
             match binding {
                 RealtimeSocketBinding::SessionPrimary { .. } => {}
                 RealtimeSocketBinding::SessionObserver { .. } => {}
+                RealtimeSocketBinding::MobMemberPrimary { .. } => {}
             }
         }
     }
