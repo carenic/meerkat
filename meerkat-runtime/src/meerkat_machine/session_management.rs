@@ -71,6 +71,12 @@ impl MeerkatMachine {
 
         let (ops_lifecycle, epoch_id, cursor_state) =
             self.recover_or_create_ops_state(&session_id).await;
+
+        let tool_visibility_owner = Arc::new(MachineToolVisibilityOwner::new());
+        // Bind the DSL authority into the visibility owner so its staging
+        // trait calls route through the canonical DSL counter
+        // `next_staged_visibility_revision` (dogma round 4, wave 2b #12).
+        tool_visibility_owner.bind_dsl_authority(Arc::clone(&dsl_authority));
         let session_entry = RuntimeSessionEntry {
             mutation_gate: Arc::new(Mutex::new(())),
             control_projection,
@@ -79,7 +85,7 @@ impl MeerkatMachine {
             epoch_id,
             cursor_state,
             completions: Arc::new(Mutex::new(crate::completion::CompletionRegistry::new())),
-            tool_visibility_owner: Arc::new(MachineToolVisibilityOwner::new()),
+            tool_visibility_owner,
             current_llm_identity: None,
             current_capability_surface: None,
             capability_surface_status: SessionLlmCapabilitySurfaceStatus::Unresolved,
@@ -258,6 +264,10 @@ impl MeerkatMachine {
                     let driver = Arc::new(Mutex::new(recovered_entry));
                     let completions =
                         Arc::new(Mutex::new(crate::completion::CompletionRegistry::new()));
+                    let tool_visibility_owner = Arc::new(MachineToolVisibilityOwner::new());
+                    // Bind the DSL authority before the entry is inserted — any
+                    // subsequent staging trait call must see the bound authority.
+                    tool_visibility_owner.bind_dsl_authority(Arc::clone(&dsl_authority));
                     sessions.insert(
                         session_id.clone(),
                         RuntimeSessionEntry {
@@ -268,7 +278,7 @@ impl MeerkatMachine {
                             epoch_id: recovered_epoch,
                             cursor_state: recovered_cursors,
                             completions: completions.clone(),
-                            tool_visibility_owner: Arc::new(MachineToolVisibilityOwner::new()),
+                            tool_visibility_owner,
                             current_llm_identity: None,
                             current_capability_surface: None,
                             capability_surface_status:

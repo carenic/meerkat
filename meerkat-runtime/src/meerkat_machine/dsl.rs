@@ -172,57 +172,223 @@ impl OperationKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct SessionLlmIdentity(pub String);
+/// Typed mirror of [`meerkat_core::Provider`] for use inside DSL bridging
+/// types. Closed 5-variant enum; the seam carries the discriminant directly
+/// rather than a JSON-encoded string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum Provider {
+    #[default]
+    Anthropic,
+    OpenAI,
+    Gemini,
+    SelfHosted,
+    Other,
+}
 
-impl<T: Into<String>> From<T> for SessionLlmIdentity {
-    fn from(s: T) -> Self {
-        Self(s.into())
+impl From<meerkat_core::provider::Provider> for Provider {
+    fn from(p: meerkat_core::provider::Provider) -> Self {
+        match p {
+            meerkat_core::provider::Provider::Anthropic => Self::Anthropic,
+            meerkat_core::provider::Provider::OpenAI => Self::OpenAI,
+            meerkat_core::provider::Provider::Gemini => Self::Gemini,
+            meerkat_core::provider::Provider::SelfHosted => Self::SelfHosted,
+            meerkat_core::provider::Provider::Other => Self::Other,
+        }
     }
+}
+
+impl From<Provider> for meerkat_core::provider::Provider {
+    fn from(p: Provider) -> Self {
+        match p {
+            Provider::Anthropic => Self::Anthropic,
+            Provider::OpenAI => Self::OpenAI,
+            Provider::Gemini => Self::Gemini,
+            Provider::SelfHosted => Self::SelfHosted,
+            Provider::Other => Self::Other,
+        }
+    }
+}
+
+/// Typed mirror of [`meerkat_core::ConnectionRef`] — structural two-string
+/// projection (`realm_id` + `binding_id`) with bidirectional `From`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ConnectionRef {
+    pub realm_id: String,
+    pub binding_id: String,
+}
+
+impl From<&meerkat_core::ConnectionRef> for ConnectionRef {
+    fn from(r: &meerkat_core::ConnectionRef) -> Self {
+        Self {
+            realm_id: r.realm_id.clone(),
+            binding_id: r.binding_id.clone(),
+        }
+    }
+}
+
+impl From<ConnectionRef> for meerkat_core::ConnectionRef {
+    fn from(r: ConnectionRef) -> Self {
+        Self {
+            realm_id: r.realm_id,
+            binding_id: r.binding_id,
+        }
+    }
+}
+
+/// Typed mirror of [`meerkat_core::SessionLlmIdentity`] — structural field
+/// projection with typed `Provider` and `ConnectionRef` mirrors. The
+/// `provider_params` payload is a legitimately open-set `serde_json::Value`
+/// at the persistence boundary (arbitrary provider-specific options), so it
+/// rides on a stable JSON-serialization field inside the DSL — never parsed
+/// back as a discriminant inside any guard or transition.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct SessionLlmIdentity {
+    pub model: String,
+    pub provider: Provider,
+    pub self_hosted_server_id: Option<String>,
+    /// Stable JSON serialization of the open-set `provider_params` payload.
+    /// Carried as an opaque identity token; DSL guards never inspect its
+    /// content. Boundary-legitimate per the dogma round-4 brief's
+    /// "variable JSON payload" carve-out applied at field granularity.
+    pub provider_params_repr: Option<String>,
+    pub connection_ref: Option<ConnectionRef>,
 }
 
 impl SessionLlmIdentity {
     pub fn from_domain(id: &meerkat_core::SessionLlmIdentity) -> Self {
-        Self::from(serde_json::to_string(id).unwrap_or_else(|_| "{}".to_string()))
+        Self {
+            model: id.model.clone(),
+            provider: Provider::from(id.provider),
+            self_hosted_server_id: id.self_hosted_server_id.clone(),
+            provider_params_repr: id
+                .provider_params
+                .as_ref()
+                .map(|v| serde_json::to_string(v).unwrap_or_default()),
+            connection_ref: id.connection_ref.as_ref().map(ConnectionRef::from),
+        }
     }
 }
 
+/// Typed mirror of [`meerkat_core::SessionToolVisibilityState`] —
+/// structural projection using typed `ToolFilter` / `ToolVisibilityWitness`
+/// mirrors plus ordered name sets for deterministic Ord/Hash.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct SessionToolVisibilityState(pub String);
-
-impl<T: Into<String>> From<T> for SessionToolVisibilityState {
-    fn from(s: T) -> Self {
-        Self(s.into())
-    }
+pub struct SessionToolVisibilityState {
+    pub capability_base_filter: ToolFilter,
+    pub inherited_base_filter: ToolFilter,
+    pub active_filter: ToolFilter,
+    pub staged_filter: ToolFilter,
+    pub active_requested_deferred_names: std::collections::BTreeSet<String>,
+    pub staged_requested_deferred_names: std::collections::BTreeSet<String>,
+    pub active_revision: u64,
+    pub staged_revision: u64,
+    pub requested_witnesses: std::collections::BTreeMap<String, ToolVisibilityWitness>,
+    pub filter_witnesses: std::collections::BTreeMap<String, ToolVisibilityWitness>,
 }
 
 impl SessionToolVisibilityState {
     pub fn from_domain(id: &meerkat_core::SessionToolVisibilityState) -> Self {
-        Self::from(serde_json::to_string(id).unwrap_or_else(|_| "{}".to_string()))
+        Self {
+            capability_base_filter: ToolFilter::from(&id.capability_base_filter),
+            inherited_base_filter: ToolFilter::from(&id.inherited_base_filter),
+            active_filter: ToolFilter::from(&id.active_filter),
+            staged_filter: ToolFilter::from(&id.staged_filter),
+            active_requested_deferred_names: id.active_requested_deferred_names.clone(),
+            staged_requested_deferred_names: id.staged_requested_deferred_names.clone(),
+            active_revision: id.active_revision,
+            staged_revision: id.staged_revision,
+            requested_witnesses: id
+                .requested_witnesses
+                .iter()
+                .map(|(k, w)| (k.clone(), ToolVisibilityWitness::from(w)))
+                .collect(),
+            filter_witnesses: id
+                .filter_witnesses
+                .iter()
+                .map(|(k, w)| (k.clone(), ToolVisibilityWitness::from(w)))
+                .collect(),
+        }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct SessionLlmCapabilitySurface(pub String);
+/// Typed mirror of
+/// [`crate::meerkat_machine_types::SessionLlmCapabilitySurface`] — structural
+/// projection of the boolean capability matrix plus optional call timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct SessionLlmCapabilitySurface {
+    pub supports_temperature: bool,
+    pub supports_thinking: bool,
+    pub supports_reasoning: bool,
+    pub inline_video: bool,
+    pub vision: bool,
+    pub image_tool_results: bool,
+    pub supports_web_search: bool,
+    pub realtime: bool,
+    pub call_timeout_secs: Option<u64>,
+}
 
-impl<T: Into<String>> From<T> for SessionLlmCapabilitySurface {
-    fn from(s: T) -> Self {
-        Self(s.into())
+impl From<&crate::meerkat_machine_types::SessionLlmCapabilitySurface>
+    for SessionLlmCapabilitySurface
+{
+    fn from(s: &crate::meerkat_machine_types::SessionLlmCapabilitySurface) -> Self {
+        Self {
+            supports_temperature: s.supports_temperature,
+            supports_thinking: s.supports_thinking,
+            supports_reasoning: s.supports_reasoning,
+            inline_video: s.inline_video,
+            vision: s.vision,
+            image_tool_results: s.image_tool_results,
+            supports_web_search: s.supports_web_search,
+            realtime: s.realtime,
+            call_timeout_secs: s.call_timeout_secs,
+        }
     }
 }
 
 impl SessionLlmCapabilitySurface {
     pub fn from_domain(id: &crate::meerkat_machine_types::SessionLlmCapabilitySurface) -> Self {
-        Self::from(serde_json::to_string(id).unwrap_or_else(|_| "{}".to_string()))
+        Self::from(id)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct SessionLlmCapabilitySurfaceStatus(pub String);
+/// Typed capability-surface resolution status. Closed mirror of
+/// [`crate::meerkat_machine_types::SessionLlmCapabilitySurfaceStatus`] —
+/// replaces the former JSON-stringified wrapper the DSL used to carry the
+/// two-state discriminant across the seam.
+///
+/// The DSL stores the variant directly on `ReconfigureSessionLlmIdentity`
+/// flow state; the shell maps to/from the domain enum via the `From` impls
+/// below — no `serde_json::to_string`, no string compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum SessionLlmCapabilitySurfaceStatus {
+    Resolved,
+    #[default]
+    Unresolved,
+}
 
-impl<T: Into<String>> From<T> for SessionLlmCapabilitySurfaceStatus {
-    fn from(s: T) -> Self {
-        Self(s.into())
+impl From<crate::meerkat_machine_types::SessionLlmCapabilitySurfaceStatus>
+    for SessionLlmCapabilitySurfaceStatus
+{
+    fn from(status: crate::meerkat_machine_types::SessionLlmCapabilitySurfaceStatus) -> Self {
+        match status {
+            crate::meerkat_machine_types::SessionLlmCapabilitySurfaceStatus::Resolved => {
+                Self::Resolved
+            }
+            crate::meerkat_machine_types::SessionLlmCapabilitySurfaceStatus::Unresolved => {
+                Self::Unresolved
+            }
+        }
+    }
+}
+
+impl From<SessionLlmCapabilitySurfaceStatus>
+    for crate::meerkat_machine_types::SessionLlmCapabilitySurfaceStatus
+{
+    fn from(status: SessionLlmCapabilitySurfaceStatus) -> Self {
+        match status {
+            SessionLlmCapabilitySurfaceStatus::Resolved => Self::Resolved,
+            SessionLlmCapabilitySurfaceStatus::Unresolved => Self::Unresolved,
+        }
     }
 }
 
@@ -230,52 +396,145 @@ impl SessionLlmCapabilitySurfaceStatus {
     pub fn from_domain(
         id: &crate::meerkat_machine_types::SessionLlmCapabilitySurfaceStatus,
     ) -> Self {
-        Self::from(serde_json::to_string(id).unwrap_or_else(|_| "\"unknown\"".to_string()))
+        Self::from(*id)
     }
 }
 
+/// Typed mirror of
+/// [`crate::meerkat_machine_types::SessionToolVisibilityDelta`] — structural
+/// projection using typed `ToolFilter` mirrors plus the two boolean change
+/// flags. Replaces the former `format!("{id:?}")` Debug-stringified wrapper.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct SessionToolVisibilityDelta(pub String);
-
-impl<T: Into<String>> From<T> for SessionToolVisibilityDelta {
-    fn from(s: T) -> Self {
-        Self(s.into())
-    }
+pub struct SessionToolVisibilityDelta {
+    pub previous_capability_base_filter: ToolFilter,
+    pub current_capability_base_filter: ToolFilter,
+    pub committed_visible_set_changed: bool,
+    pub revision_bumped: bool,
 }
 
 impl SessionToolVisibilityDelta {
     pub fn from_domain(id: &crate::meerkat_machine_types::SessionToolVisibilityDelta) -> Self {
-        Self::from(format!("{id:?}"))
+        Self {
+            previous_capability_base_filter: ToolFilter::from(&id.previous_capability_base_filter),
+            current_capability_base_filter: ToolFilter::from(&id.current_capability_base_filter),
+            committed_visible_set_changed: id.committed_visible_set_changed,
+            revision_bumped: id.revision_bumped,
+        }
     }
 }
 
+/// Typed mirror of [`meerkat_core::ToolFilter`] — closed 3-variant
+/// discriminant with a `BTreeSet<String>` name payload for
+/// `Allow`/`Deny` so the value is `Ord + Hash` and deterministic across
+/// iteration, matching the R3 `InputAbandonReason::MaxAttemptsExhausted {
+/// attempts }` pattern of carrying the discriminant's companion data in a
+/// field with stable ordering.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct ToolFilter(pub String);
+pub enum ToolFilter {
+    #[default]
+    All,
+    Allow(std::collections::BTreeSet<String>),
+    Deny(std::collections::BTreeSet<String>),
+}
 
-impl<T: Into<String>> From<T> for ToolFilter {
-    fn from(s: T) -> Self {
-        Self(s.into())
+impl From<&meerkat_core::ToolFilter> for ToolFilter {
+    fn from(f: &meerkat_core::ToolFilter) -> Self {
+        match f {
+            meerkat_core::ToolFilter::All => Self::All,
+            meerkat_core::ToolFilter::Allow(names) => Self::Allow(names.iter().cloned().collect()),
+            meerkat_core::ToolFilter::Deny(names) => Self::Deny(names.iter().cloned().collect()),
+        }
+    }
+}
+
+impl From<ToolFilter> for meerkat_core::ToolFilter {
+    fn from(f: ToolFilter) -> Self {
+        match f {
+            ToolFilter::All => Self::All,
+            ToolFilter::Allow(names) => Self::Allow(names.into_iter().collect()),
+            ToolFilter::Deny(names) => Self::Deny(names.into_iter().collect()),
+        }
     }
 }
 
 impl ToolFilter {
     pub fn from_domain(id: &meerkat_core::ToolFilter) -> Self {
-        Self::from(serde_json::to_string(id).unwrap_or_else(|_| "\"all\"".to_string()))
+        Self::from(id)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct ToolVisibilityWitness(pub String);
+/// Typed mirror of [`meerkat_core::types::ToolSourceKind`] — closed
+/// 10-variant discriminant for tool provenance classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum ToolSourceKind {
+    #[default]
+    Builtin,
+    Shell,
+    Comms,
+    Memory,
+    Schedule,
+    Mob,
+    MobTasks,
+    Callback,
+    Mcp,
+    RustBundle,
+}
 
-impl<T: Into<String>> From<T> for ToolVisibilityWitness {
-    fn from(s: T) -> Self {
-        Self(s.into())
+impl From<&meerkat_core::types::ToolSourceKind> for ToolSourceKind {
+    fn from(k: &meerkat_core::types::ToolSourceKind) -> Self {
+        match k {
+            meerkat_core::types::ToolSourceKind::Builtin => Self::Builtin,
+            meerkat_core::types::ToolSourceKind::Shell => Self::Shell,
+            meerkat_core::types::ToolSourceKind::Comms => Self::Comms,
+            meerkat_core::types::ToolSourceKind::Memory => Self::Memory,
+            meerkat_core::types::ToolSourceKind::Schedule => Self::Schedule,
+            meerkat_core::types::ToolSourceKind::Mob => Self::Mob,
+            meerkat_core::types::ToolSourceKind::MobTasks => Self::MobTasks,
+            meerkat_core::types::ToolSourceKind::Callback => Self::Callback,
+            meerkat_core::types::ToolSourceKind::Mcp => Self::Mcp,
+            meerkat_core::types::ToolSourceKind::RustBundle => Self::RustBundle,
+        }
+    }
+}
+
+/// Typed mirror of [`meerkat_core::types::ToolProvenance`] — structural
+/// projection carried inside [`ToolVisibilityWitness`], using the typed
+/// `ToolSourceKind` discriminant mirror.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ToolProvenance {
+    pub kind: ToolSourceKind,
+    pub source_id: String,
+}
+
+impl From<&meerkat_core::types::ToolProvenance> for ToolProvenance {
+    fn from(p: &meerkat_core::types::ToolProvenance) -> Self {
+        Self {
+            kind: ToolSourceKind::from(&p.kind),
+            source_id: p.source_id.clone(),
+        }
+    }
+}
+
+/// Typed mirror of [`meerkat_core::ToolVisibilityWitness`] — structural
+/// projection of the two optional witness fields.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ToolVisibilityWitness {
+    pub stable_owner_key: Option<String>,
+    pub last_seen_provenance: Option<ToolProvenance>,
+}
+
+impl From<&meerkat_core::ToolVisibilityWitness> for ToolVisibilityWitness {
+    fn from(w: &meerkat_core::ToolVisibilityWitness) -> Self {
+        Self {
+            stable_owner_key: w.stable_owner_key.clone(),
+            last_seen_provenance: w.last_seen_provenance.as_ref().map(ToolProvenance::from),
+        }
     }
 }
 
 impl ToolVisibilityWitness {
     pub fn from_domain(id: &meerkat_core::ToolVisibilityWitness) -> Self {
-        Self::from(serde_json::to_string(id).unwrap_or_else(|_| "{}".to_string()))
+        Self::from(id)
     }
 }
 
@@ -1461,8 +1720,18 @@ machine! {
             drain_mode: Option<DrainMode>,
 
             // --- Visibility substate ---
-            active_filter: String,
-            staged_filter: String,
+            //
+            // `next_staged_visibility_revision` is the DSL-owned monotonic
+            // counter that mints staged-revision tokens (dogma round 4,
+            // wave 2b #12). `StageVisibilityFilter` / `StageDeferredNames` /
+            // `RequestDeferredTools` increment it in their `update {}` and
+            // write the new value into `staged_visibility_revision` in the
+            // same atomic transition; the shell's `MachineToolVisibilityOwner`
+            // reads the minted value back and applies it to its projection
+            // rather than minting independently.
+            next_staged_visibility_revision: u64,
+            active_filter: ToolFilter,
+            staged_filter: ToolFilter,
             active_visibility_revision: u64,
             staged_visibility_revision: u64,
             active_deferred_names: Set<String>,
@@ -1688,8 +1957,9 @@ machine! {
             drain_phase = DrainPhase::Inactive,
             drain_mode = None,
             // Visibility substate
-            active_filter = "",
-            staged_filter = "",
+            next_staged_visibility_revision = 0,
+            active_filter = ToolFilter::All,
+            staged_filter = ToolFilter::All,
             active_visibility_revision = 0,
             staged_visibility_revision = 0,
             active_deferred_names = EmptySet,
@@ -1913,10 +2183,22 @@ machine! {
             DrainExitedClean,
             DrainExitedRespawnable,
             // Visibility inputs
-            StageVisibilityFilter { filter: String, revision: u64 },
-            CommitVisibilityFilter { filter: String, revision: u64 },
+            // Dogma round 4, wave 2b #12: `StageVisibilityFilter` no longer
+            // accepts a revision parameter — the DSL mints it via
+            // `next_staged_visibility_revision` in the transition's update.
+            StageVisibilityFilter { filter: ToolFilter },
+            CommitVisibilityFilter { filter: ToolFilter, revision: u64 },
             StageDeferredNames { names: Set<String> },
             CommitDeferredNames { names: Set<String> },
+            // Sync the DSL monotonic staged-revision counter to at least the
+            // max of externally-installed active/staged revisions. Fired
+            // from the shell's `replace_visibility_state` path (recovery
+            // and LLM-reconfigure hot-swap), so subsequent
+            // `StageVisibilityFilter` / `StageDeferredNames` mints advance
+            // from the already-durable high-water mark rather than 0 —
+            // preserving `max(active, staged)`-advance across external
+            // state installs.
+            SyncVisibilityRevisions { active_revision: u64, staged_revision: u64 },
             SurfaceRegister { surface_id: String },
             SurfaceStageAdd { surface_id: String, now_ms: u64 },
             SurfaceStageRemove { surface_id: String, now_ms: u64 },
@@ -2580,7 +2862,17 @@ machine! {
             guard "active_requested_subset_of_staged_requested" {
                 for_all(requested_name in active_requested_deferred_names, staged_requested_deferred_names.contains(requested_name))
             }
-            update {}
+            update {
+                // Sync the DSL monotonic counter to at least the published
+                // active revision — guard `active_not_behind_staged` already
+                // ensures active >= staged, so max == active here. Keeps the
+                // counter honest when external callers install a visibility
+                // state that advanced past the DSL's local history
+                // (e.g. recovery, cross-session hot-swap).
+                if active_visibility_revision > self.next_staged_visibility_revision {
+                    self.next_staged_visibility_revision = active_visibility_revision;
+                }
+            }
             to Idle
             emit CommittedVisibleSetPublished { revision: active_visibility_revision }
         }
@@ -2601,7 +2893,11 @@ machine! {
             guard "active_requested_subset_of_staged_requested" {
                 for_all(requested_name in active_requested_deferred_names, staged_requested_deferred_names.contains(requested_name))
             }
-            update {}
+            update {
+                if active_visibility_revision > self.next_staged_visibility_revision {
+                    self.next_staged_visibility_revision = active_visibility_revision;
+                }
+            }
             to Attached
             emit CommittedVisibleSetPublished { revision: active_visibility_revision }
         }
@@ -2622,7 +2918,11 @@ machine! {
             guard "active_requested_subset_of_staged_requested" {
                 for_all(requested_name in active_requested_deferred_names, staged_requested_deferred_names.contains(requested_name))
             }
-            update {}
+            update {
+                if active_visibility_revision > self.next_staged_visibility_revision {
+                    self.next_staged_visibility_revision = active_visibility_revision;
+                }
+            }
             to Running
             emit CommittedVisibleSetPublished { revision: active_visibility_revision }
         }
@@ -2643,7 +2943,11 @@ machine! {
             guard "active_requested_subset_of_staged_requested" {
                 for_all(requested_name in active_requested_deferred_names, staged_requested_deferred_names.contains(requested_name))
             }
-            update {}
+            update {
+                if active_visibility_revision > self.next_staged_visibility_revision {
+                    self.next_staged_visibility_revision = active_visibility_revision;
+                }
+            }
             to Retired
             emit CommittedVisibleSetPublished { revision: active_visibility_revision }
         }
@@ -2664,7 +2968,11 @@ machine! {
             guard "active_requested_subset_of_staged_requested" {
                 for_all(requested_name in active_requested_deferred_names, staged_requested_deferred_names.contains(requested_name))
             }
-            update {}
+            update {
+                if active_visibility_revision > self.next_staged_visibility_revision {
+                    self.next_staged_visibility_revision = active_visibility_revision;
+                }
+            }
             to Stopped
             emit CommittedVisibleSetPublished { revision: active_visibility_revision }
         }
@@ -4779,13 +5087,18 @@ machine! {
         // Absorbed substate transitions — Visibility
         // =====================================================================
 
-        // StageVisibilityFilter: stage a new tool filter + revision
+        // StageVisibilityFilter: stage a new tool filter; DSL mints the new
+        // staged-revision token via `next_staged_visibility_revision`
+        // (dogma round 4, wave 2b #12 — single-owner monotonic). The shell
+        // reads the minted value back via
+        // `MeerkatMachine::stage_session_dsl_input_with_minted_revision`.
         transition StageVisibilityFilter {
             per_phase [Idle, Attached, Running, Retired, Stopped]
-            on input StageVisibilityFilter { filter, revision }
+            on input StageVisibilityFilter { filter }
             update {
+                self.next_staged_visibility_revision = self.next_staged_visibility_revision + 1;
                 self.staged_filter = filter;
-                self.staged_visibility_revision = revision;
+                self.staged_visibility_revision = self.next_staged_visibility_revision;
             }
             to Idle
             emit RefreshVisibleSurfaceSet
@@ -4803,12 +5116,16 @@ machine! {
             emit RefreshVisibleSurfaceSet
         }
 
-        // StageDeferredNames: stage a set of deferred tool names
+        // StageDeferredNames: stage a set of deferred tool names; DSL mints
+        // the new staged-revision token via `next_staged_visibility_revision`
+        // (dogma round 4, wave 2b #12). Shell reads the minted value back.
         transition StageDeferredNames {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input StageDeferredNames { names }
             update {
+                self.next_staged_visibility_revision = self.next_staged_visibility_revision + 1;
                 self.staged_deferred_names = names;
+                self.staged_visibility_revision = self.next_staged_visibility_revision;
             }
             to Idle
             emit RefreshVisibleSurfaceSet
@@ -4823,6 +5140,28 @@ machine! {
             }
             to Idle
             emit RefreshVisibleSurfaceSet
+        }
+
+        // SyncVisibilityRevisions: external-install water-mark reconciliation.
+        // Fired by the shell whenever an external durable visibility state is
+        // installed (recovery, cross-session hot-swap, LLM reconfigure). Keeps
+        // the DSL monotonic counter honest against externally-minted revisions
+        // so subsequent `StageVisibilityFilter` / `StageDeferredNames` mints
+        // continue advancing from the high-water mark rather than the DSL's
+        // local 0. Idempotent: guarded as a no-op when counter is already at
+        // or above the installed max.
+        transition SyncVisibilityRevisions {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input SyncVisibilityRevisions { active_revision, staged_revision }
+            update {
+                if active_revision > self.next_staged_visibility_revision {
+                    self.next_staged_visibility_revision = active_revision;
+                }
+                if staged_revision > self.next_staged_visibility_revision {
+                    self.next_staged_visibility_revision = staged_revision;
+                }
+            }
+            to Idle
         }
 
         // =====================================================================
