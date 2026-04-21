@@ -18,6 +18,26 @@ pub enum Status {
     Failed,
 }
 
+impl From<Status> for meerkat_core::interaction::ResponseStatus {
+    fn from(s: Status) -> Self {
+        match s {
+            Status::Accepted => meerkat_core::interaction::ResponseStatus::Accepted,
+            Status::Completed => meerkat_core::interaction::ResponseStatus::Completed,
+            Status::Failed => meerkat_core::interaction::ResponseStatus::Failed,
+        }
+    }
+}
+
+impl From<meerkat_core::interaction::ResponseStatus> for Status {
+    fn from(s: meerkat_core::interaction::ResponseStatus) -> Self {
+        match s {
+            meerkat_core::interaction::ResponseStatus::Accepted => Status::Accepted,
+            meerkat_core::interaction::ResponseStatus::Completed => Status::Completed,
+            meerkat_core::interaction::ResponseStatus::Failed => Status::Failed,
+        }
+    }
+}
+
 /// The kind of message being sent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]

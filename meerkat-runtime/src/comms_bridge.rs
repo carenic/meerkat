@@ -4,8 +4,10 @@
 //! input families used by the comms classification bridge.
 
 use chrono::Utc;
+#[cfg(test)]
+use meerkat_core::interaction::ResponseStatus;
 use meerkat_core::interaction::{
-    InboxInteraction, InteractionContent, PeerInputCandidate, PeerInputClass, ResponseStatus,
+    InboxInteraction, InteractionContent, PeerInputCandidate, PeerInputClass,
 };
 use meerkat_core::lifecycle::InputId;
 
@@ -112,20 +114,49 @@ fn map_convention(interaction: &InboxInteraction) -> PeerConvention {
             in_reply_to,
             ..
         } => {
+            // Single source of truth for response terminality: meerkat-core's
+            // `classify_response_terminality`. No raw `ResponseStatus`
+            // matching here — the inbox classifier and comms drain delegate
+            // to the same call.
             let request_id = in_reply_to.to_string();
-            match status {
-                ResponseStatus::Completed => PeerConvention::ResponseTerminal {
-                    request_id,
-                    status: ResponseTerminalStatus::Completed,
-                },
-                ResponseStatus::Failed => PeerConvention::ResponseTerminal {
-                    request_id,
-                    status: ResponseTerminalStatus::Failed,
-                },
-                ResponseStatus::Accepted => PeerConvention::ResponseProgress {
-                    request_id,
-                    phase: ResponseProgressPhase::Accepted,
-                },
+            match meerkat_core::interaction::classify_response_terminality(*status) {
+                meerkat_core::interaction::TerminalityClass::Progress => {
+                    PeerConvention::ResponseProgress {
+                        request_id,
+                        phase: ResponseProgressPhase::Accepted,
+                    }
+                }
+                meerkat_core::interaction::TerminalityClass::Terminal { disposition } => {
+                    let term = match disposition {
+                        meerkat_core::interaction::TerminalDisposition::Completed => {
+                            ResponseTerminalStatus::Completed
+                        }
+                        meerkat_core::interaction::TerminalDisposition::Failed => {
+                            ResponseTerminalStatus::Failed
+                        }
+                        other => {
+                            tracing::warn!(
+                                disposition = ?other,
+                                "unknown terminal disposition; treating as Failed"
+                            );
+                            ResponseTerminalStatus::Failed
+                        }
+                    };
+                    PeerConvention::ResponseTerminal {
+                        request_id,
+                        status: term,
+                    }
+                }
+                other => {
+                    tracing::warn!(
+                        class = ?other,
+                        "unknown terminality class; routing response as progress (non-terminal)"
+                    );
+                    PeerConvention::ResponseProgress {
+                        request_id,
+                        phase: ResponseProgressPhase::Accepted,
+                    }
+                }
             }
         }
     }

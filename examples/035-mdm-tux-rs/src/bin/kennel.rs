@@ -131,9 +131,8 @@ async fn main() -> anyhow::Result<()> {
             while let Ok((stream, _)) = listener.accept().await {
                 let (kp, tp, sender) = (kp.clone(), tp.clone(), inbox.clone());
                 tokio::spawn(async move {
-                    let snapshot = tp.read().clone();
                     let _ = meerkat_comms::handle_connection(
-                        stream, true, &kp, &snapshot, &sender,
+                        stream, true, &kp, &tp, &sender,
                     )
                     .await;
                 });

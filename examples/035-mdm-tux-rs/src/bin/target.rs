@@ -561,9 +561,8 @@ async fn spawn_comms_listener(comms_runtime: &Arc<CommsRuntime>) -> anyhow::Resu
         while let Ok((stream, _)) = listener.accept().await {
             let (kp, tp, sender) = (keypair.clone(), trusted.clone(), inbox_sender.clone());
             tokio::spawn(async move {
-                let snapshot = tp.read().clone();
                 let _ =
-                    meerkat_comms::handle_connection(stream, true, &kp, &snapshot, &sender).await;
+                    meerkat_comms::handle_connection(stream, true, &kp, &tp, &sender).await;
             });
         }
     });
