@@ -110,91 +110,114 @@ impl IngressClassificationContext {
                         .unwrap_or_else(|| envelope.from.to_peer_id())
                 });
 
-                let (raw_kind, class, lifecycle_peer, request_id, auth_exempt) =
-                    match &envelope.kind {
-                        MessageKind::Message { .. } => (
-                            RawPeerKind::Message,
-                            PeerInputClass::ActionableMessage,
-                            None,
-                            None,
-                            false,
-                        ),
-                        MessageKind::Request { intent, params, .. } => {
-                            let typed_intent = MessageIntent::from(intent.as_str());
-                            let auth_exempt = AUTH_EXEMPT_REQUEST_INTENTS
-                                .iter()
-                                .any(|candidate| *candidate == intent);
-                            match typed_intent {
-                                MessageIntent::PeerAdded => {
-                                    let peer = params
-                                        .get("peer")
-                                        .and_then(|v| v.as_str())
-                                        .filter(|s| !s.is_empty())
-                                        .unwrap_or(from_name.as_str())
-                                        .to_string();
-                                    (
-                                        RawPeerKind::PeerLifecycleAdded,
-                                        PeerInputClass::PeerLifecycleAdded,
-                                        Some(peer),
-                                        Some(envelope.id.to_string()),
-                                        auth_exempt,
-                                    )
-                                }
-                                MessageIntent::PeerRetired => {
-                                    let peer = params
-                                        .get("peer")
-                                        .and_then(|v| v.as_str())
-                                        .filter(|s| !s.is_empty())
-                                        .unwrap_or(from_name.as_str())
-                                        .to_string();
-                                    (
-                                        RawPeerKind::PeerLifecycleRetired,
-                                        PeerInputClass::PeerLifecycleRetired,
-                                        Some(peer),
-                                        Some(envelope.id.to_string()),
-                                        auth_exempt,
-                                    )
-                                }
-                                _ if self.silent_intents.contains(intent.as_str()) => (
-                                    RawPeerKind::SilentRequest,
-                                    PeerInputClass::SilentRequest,
-                                    None,
+                let (raw_kind, class, lifecycle_peer, request_id, auth_exempt) = match &envelope
+                    .kind
+                {
+                    MessageKind::Message { .. } => (
+                        RawPeerKind::Message,
+                        PeerInputClass::ActionableMessage,
+                        None,
+                        None,
+                        false,
+                    ),
+                    MessageKind::Request { intent, params, .. } => {
+                        let typed_intent = MessageIntent::from(intent.as_str());
+                        let auth_exempt = AUTH_EXEMPT_REQUEST_INTENTS
+                            .iter()
+                            .any(|candidate| *candidate == intent);
+                        match typed_intent {
+                            MessageIntent::PeerAdded => {
+                                let peer = params
+                                    .get("peer")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or(from_name.as_str())
+                                    .to_string();
+                                (
+                                    RawPeerKind::PeerLifecycleAdded,
+                                    PeerInputClass::PeerLifecycleAdded,
+                                    Some(peer),
                                     Some(envelope.id.to_string()),
                                     auth_exempt,
-                                ),
-                                _ => (
-                                    RawPeerKind::Request,
-                                    PeerInputClass::ActionableRequest,
-                                    None,
-                                    Some(envelope.id.to_string()),
-                                    auth_exempt,
-                                ),
+                                )
                             }
+                            MessageIntent::PeerRetired => {
+                                let peer = params
+                                    .get("peer")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or(from_name.as_str())
+                                    .to_string();
+                                (
+                                    RawPeerKind::PeerLifecycleRetired,
+                                    PeerInputClass::PeerLifecycleRetired,
+                                    Some(peer),
+                                    Some(envelope.id.to_string()),
+                                    auth_exempt,
+                                )
+                            }
+                            _ if self.silent_intents.contains(intent.as_str()) => (
+                                RawPeerKind::SilentRequest,
+                                PeerInputClass::SilentRequest,
+                                None,
+                                Some(envelope.id.to_string()),
+                                auth_exempt,
+                            ),
+                            _ => (
+                                RawPeerKind::Request,
+                                PeerInputClass::ActionableRequest,
+                                None,
+                                Some(envelope.id.to_string()),
+                                auth_exempt,
+                            ),
                         }
-                        MessageKind::Response {
-                            in_reply_to,
-                            status,
-                            ..
-                        } => (
-                            match status {
-                                crate::types::Status::Accepted => RawPeerKind::ResponseProgress,
-                                crate::types::Status::Completed | crate::types::Status::Failed => {
-                                    RawPeerKind::ResponseTerminal
+                    }
+                    MessageKind::Response {
+                        in_reply_to,
+                        status,
+                        ..
+                    } => {
+                        // Single source of truth for response terminality:
+                        // meerkat-core's `classify_response_terminality`.
+                        // No raw `ResponseStatus` matching here — that's
+                        // how "terminal" drifts from one call site to
+                        // another.
+                        let core_status: meerkat_core::interaction::ResponseStatus =
+                            (*status).into();
+                        let raw_kind =
+                            match meerkat_core::interaction::classify_response_terminality(
+                                core_status,
+                            ) {
+                                meerkat_core::interaction::TerminalityClass::Progress => {
+                                    RawPeerKind::ResponseProgress
                                 }
-                            },
+                                meerkat_core::interaction::TerminalityClass::Terminal {
+                                    ..
+                                } => RawPeerKind::ResponseTerminal,
+                                other => {
+                                    tracing::warn!(
+                                        class = ?other,
+                                        "unknown terminality class; routing response as progress (non-terminal)"
+                                    );
+                                    RawPeerKind::ResponseProgress
+                                }
+                            };
+                        (
+                            raw_kind,
                             PeerInputClass::Response,
                             None,
                             Some(in_reply_to.to_string()),
                             false,
-                        ),
-                        MessageKind::Ack { in_reply_to } => (
-                            RawPeerKind::Ack,
-                            PeerInputClass::Ack,
-                            None,
-                            Some(in_reply_to.to_string()),
-                            false,
-                        ),
-                    };
+                        )
+                    }
+                    MessageKind::Ack { in_reply_to } => (
+                        RawPeerKind::Ack,
+                        PeerInputClass::Ack,
+                        None,
+                        Some(in_reply_to.to_string()),
+                        false,
+                    ),
+                };
 
                 let text_projection = match &envelope.kind {
                     MessageKind::Message { body, .. } => {

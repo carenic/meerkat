@@ -9,8 +9,10 @@ use meerkat_comms::{
     CommsConfig, Inbox, Keypair, MessageKind, PubKey, Router, TrustedPeer, TrustedPeers,
     handle_connection,
 };
+use parking_lot::RwLock;
 use serde_json::json;
 use std::path::Path;
+use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::{TcpListener, UnixListener};
 
@@ -43,7 +45,10 @@ async fn bind_tcp_or_skip(addr: &str) -> Option<TcpListener> {
     }
 }
 
-/// Helper to set up mutual trust between two peers
+/// Helper to set up mutual trust between two peers.
+///
+/// Returns shared `Arc<RwLock<TrustedPeers>>` handles — the same shape the
+/// router owns and `handle_connection` now reads through.
 fn setup_mutual_trust(
     name_a: &str,
     pubkey_a: &PubKey,
@@ -51,26 +56,26 @@ fn setup_mutual_trust(
     name_b: &str,
     pubkey_b: &PubKey,
     addr_b: &str,
-) -> (TrustedPeers, TrustedPeers) {
+) -> (Arc<RwLock<TrustedPeers>>, Arc<RwLock<TrustedPeers>>) {
     // Peer A trusts Peer B
-    let a_trusts = TrustedPeers {
+    let a_trusts = Arc::new(RwLock::new(TrustedPeers {
         peers: vec![TrustedPeer {
             name: name_b.to_string(),
             pubkey: *pubkey_b,
             addr: addr_b.to_string(),
             meta: meerkat_comms::PeerMeta::default(),
         }],
-    };
+    }));
 
     // Peer B trusts Peer A
-    let b_trusts = TrustedPeers {
+    let b_trusts = Arc::new(RwLock::new(TrustedPeers {
         peers: vec![TrustedPeer {
             name: name_a.to_string(),
             pubkey: *pubkey_a,
             addr: addr_a.to_string(),
             meta: meerkat_comms::PeerMeta::default(),
         }],
-    };
+    }));
 
     (a_trusts, b_trusts)
 }
@@ -79,8 +84,8 @@ fn setup_mutual_trust(
 struct E2EHarness {
     peer_a_keypair: Keypair,
     peer_b_keypair: Keypair,
-    peer_a_trust: TrustedPeers,
-    peer_b_trust: TrustedPeers,
+    peer_a_trust: Arc<RwLock<TrustedPeers>>,
+    peer_b_trust: Arc<RwLock<TrustedPeers>>,
 }
 
 impl E2EHarness {
@@ -119,11 +124,13 @@ fn test_e2e_harness() {
     assert!(
         harness
             .peer_a_trust
+            .read()
             .is_trusted(&harness.peer_b_keypair.public_key())
     );
     assert!(
         harness
             .peer_b_trust
+            .read()
             .is_trusted(&harness.peer_a_keypair.public_key())
     );
 
@@ -131,16 +138,18 @@ fn test_e2e_harness() {
     assert_eq!(
         harness
             .peer_a_trust
+            .read()
             .get_by_name("peer-b")
-            .map(|p| &p.pubkey),
-        Some(&harness.peer_b_keypair.public_key())
+            .map(|p| p.pubkey),
+        Some(harness.peer_b_keypair.public_key())
     );
     assert_eq!(
         harness
             .peer_b_trust
+            .read()
             .get_by_name("peer-a")
-            .map(|p| &p.pubkey),
-        Some(&harness.peer_a_keypair.public_key())
+            .map(|p| p.pubkey),
+        Some(harness.peer_a_keypair.public_key())
     );
 }
 
@@ -159,12 +168,12 @@ fn test_e2e_mutual_trust_setup() {
     );
 
     // Alice trusts Bob
-    assert!(a_trusts.is_trusted(&peer_b_keypair.public_key()));
-    assert!(!a_trusts.is_trusted(&peer_a_keypair.public_key()));
+    assert!(a_trusts.read().is_trusted(&peer_b_keypair.public_key()));
+    assert!(!a_trusts.read().is_trusted(&peer_a_keypair.public_key()));
 
     // Bob trusts Alice
-    assert!(b_trusts.is_trusted(&peer_a_keypair.public_key()));
-    assert!(!b_trusts.is_trusted(&peer_b_keypair.public_key()));
+    assert!(b_trusts.read().is_trusted(&peer_a_keypair.public_key()));
+    assert!(!b_trusts.read().is_trusted(&peer_b_keypair.public_key()));
 }
 
 #[tokio::test]
@@ -210,7 +219,7 @@ async fn integration_real_uds_message_exchange() {
 
     // Peer A sends a message
     let (_, inbox_sender_a) = Inbox::new();
-    let router_a = Router::new(
+    let router_a = Router::with_shared_peers(
         peer_a_keypair,
         peer_a_trust,
         CommsConfig::default(),
@@ -277,7 +286,7 @@ async fn integration_real_tcp_message_exchange() {
 
     // Peer A sends a message
     let (_, inbox_sender_a) = Inbox::new();
-    let router_a = Router::new(
+    let router_a = Router::with_shared_peers(
         peer_a_keypair,
         peer_a_trust,
         CommsConfig::default(),
@@ -392,16 +401,16 @@ async fn integration_real_untrusted_rejected() {
     let _untrusted_keypair = make_keypair();
 
     // A trusts B, but B does NOT trust A (empty trust list)
-    let peer_a_trust = TrustedPeers {
+    let peer_a_trust = Arc::new(RwLock::new(TrustedPeers {
         peers: vec![TrustedPeer {
             name: "peer-b".to_string(),
             pubkey: peer_b_keypair.public_key(),
             addr: addr_b.clone(),
             meta: meerkat_comms::PeerMeta::default(),
         }],
-    };
+    }));
 
-    let peer_b_trust = TrustedPeers { peers: vec![] }; // B trusts no one
+    let peer_b_trust = Arc::new(RwLock::new(TrustedPeers { peers: vec![] })); // B trusts no one
 
     // Start peer B listening
     let Some(listener_b) = bind_uds_or_skip(&sock_b) else {
@@ -426,7 +435,7 @@ async fn integration_real_untrusted_rejected() {
 
     // A sends a message (will connect, but B will reject it as untrusted)
     let (_, inbox_sender_a) = Inbox::new();
-    let router_a = Router::new(
+    let router_a = Router::with_shared_peers(
         peer_a_keypair,
         peer_a_trust,
         CommsConfig::default(),
@@ -471,7 +480,7 @@ async fn integration_real_concurrent_multi_peer() {
     let addr_c = format!("uds://{}", sock_c.display());
 
     // A trusts B and C
-    let peer_a_trust = TrustedPeers {
+    let peer_a_trust = Arc::new(RwLock::new(TrustedPeers {
         peers: vec![
             TrustedPeer {
                 name: "peer-b".to_string(),
@@ -486,27 +495,27 @@ async fn integration_real_concurrent_multi_peer() {
                 meta: meerkat_comms::PeerMeta::default(),
             },
         ],
-    };
+    }));
 
     // B trusts A
-    let peer_b_trust = TrustedPeers {
+    let peer_b_trust = Arc::new(RwLock::new(TrustedPeers {
         peers: vec![TrustedPeer {
             name: "peer-a".to_string(),
             pubkey: peer_a_keypair.public_key(),
             addr: addr_a.clone(),
             meta: meerkat_comms::PeerMeta::default(),
         }],
-    };
+    }));
 
     // C trusts A
-    let peer_c_trust = TrustedPeers {
+    let peer_c_trust = Arc::new(RwLock::new(TrustedPeers {
         peers: vec![TrustedPeer {
             name: "peer-a".to_string(),
             pubkey: peer_a_keypair.public_key(),
             addr: addr_a.clone(),
             meta: meerkat_comms::PeerMeta::default(),
         }],
-    };
+    }));
 
     // Start listeners for B and C
     let Some(listener_b) = bind_uds_or_skip(&sock_b) else {
@@ -549,7 +558,7 @@ async fn integration_real_concurrent_multi_peer() {
 
     // A sends messages to both B and C concurrently
     let (_, inbox_sender_a) = Inbox::new();
-    let router_a = Router::new(
+    let router_a = Router::with_shared_peers(
         peer_a_keypair,
         peer_a_trust,
         CommsConfig::default(),

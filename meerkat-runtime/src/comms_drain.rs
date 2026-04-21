@@ -562,9 +562,17 @@ fn validate_bind_request(
             ),
         ));
     }
-    if let Some(actual_peer_id) = comms_runtime.public_key()
-        && actual_peer_id != payload.expected_peer_id
-    {
+    // Canonical identity must be present to validate the request's
+    // expected_peer_id. Missing runtime identity is a typed internal
+    // invariant failure, not a silent "skip the check" path — otherwise
+    // caller-supplied `expected_peer_id` would never be challenged.
+    let Some(actual_peer_id) = comms_runtime.public_key() else {
+        return Err((
+            BridgeRejectionCause::Internal,
+            "bind member failed: runtime public key unavailable".to_string(),
+        ));
+    };
+    if actual_peer_id != payload.expected_peer_id {
         return Err((
             BridgeRejectionCause::InvalidPeerSpec,
             format!(
@@ -900,6 +908,22 @@ async fn try_handle_supervisor_bridge_command(
                 .await
             {
                 Ok(()) => {
+                    // Canonical identity only: the BindMember reply echoes
+                    // the runtime's own public key, never `payload.expected_peer_id`.
+                    // A caller-supplied identity can't cross the canonical
+                    // boundary — if the runtime cannot produce its own
+                    // identity, that is a typed internal invariant failure,
+                    // not a silent fallback.
+                    let Some(peer_id) = comms_runtime.public_key() else {
+                        send_bridge_failure(
+                            comms_runtime,
+                            candidate,
+                            BridgeRejectionCause::Internal,
+                            "bind member failed: runtime public key unavailable",
+                        )
+                        .await;
+                        return true;
+                    };
                     *supervisor_state = Some(AuthorizedSupervisorState {
                         supervisor: supervisor_spec.clone(),
                         epoch: payload.epoch,
@@ -909,9 +933,7 @@ async fn try_handle_supervisor_bridge_command(
                         candidate,
                         meerkat_core::interaction::ResponseStatus::Completed,
                         BridgeReply::BindMember(BridgeBindResponse {
-                            peer_id: comms_runtime
-                                .public_key()
-                                .unwrap_or(payload.expected_peer_id),
+                            peer_id,
                             address: canonicalize_bridge_address(&advertised_address),
                             capabilities: bridge_capabilities(),
                         }),
