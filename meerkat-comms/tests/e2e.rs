@@ -361,7 +361,7 @@ async fn integration_real_request_response_flow() {
 
     // A sends a Request to B
     let (_, inbox_sender_a) = Inbox::new();
-    let router_a = Router::new(
+    let router_a = Router::with_shared_peers(
         peer_a_keypair,
         peer_a_trust.clone(),
         CommsConfig::default(),
