@@ -24,9 +24,39 @@
  * ```
  */
 
+import { Buffer } from "node:buffer";
+
 // ---------------------------------------------------------------------------
 // Shared value types
 // ---------------------------------------------------------------------------
+
+/**
+ * Re-encode the wire `"identity:generation"` display string that appears
+ * on event scope frames into the canonical opaque `AgentRuntimeRef`
+ * token. Returns `undefined` for absent values; returns `""` for
+ * malformed values (unlike the object form in `client.ts` which throws —
+ * events flow through many code paths and softer degradation is
+ * acceptable for frame metadata).
+ */
+function encodeAgentRuntimeRefFromDisplay(raw: unknown): string | undefined {
+  if (raw == null) {
+    return undefined;
+  }
+  const display = String(raw);
+  const sep = display.lastIndexOf(":");
+  if (sep <= 0 || sep >= display.length - 1) {
+    return "";
+  }
+  const identity = display.slice(0, sep);
+  const generationStr = display.slice(sep + 1);
+  const generation = Number(generationStr);
+  if (!identity || !Number.isFinite(generation) || !Number.isInteger(generation)) {
+    return "";
+  }
+  const payload = JSON.stringify({ i: identity, g: generation });
+  const b64 = Buffer.from(payload, "utf-8").toString("base64");
+  return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
 
 /** Token usage for a single LLM turn. */
 export interface Usage {
@@ -72,9 +102,14 @@ export type StreamScopeFrame =
       readonly scope: "mob_member";
       readonly flow_run_id: string;
       readonly agent_identity: string;
+      /**
+       * Opaque incarnation handle. Compare for equality to detect
+       * incarnation rotation; internals are not parseable. Encoded
+       * client-side from the wire `"identity:generation"` display string,
+       * matching the `MemberRef` pattern.
+       */
       readonly agent_runtime_id?: string;
       readonly fence_token?: number;
-      readonly generation?: number;
     };
 
 export interface ScopedAgentEvent {
@@ -441,12 +476,9 @@ export function parseEvent(raw: Record<string, unknown>): StreamEvent {
           scope: "mob_member",
           flow_run_id: String(frame.flow_run_id ?? ""),
           agent_identity: String(frame.agent_identity ?? ""),
-          agent_runtime_id:
-            frame.agent_runtime_id != null ? String(frame.agent_runtime_id) : undefined,
+          agent_runtime_id: encodeAgentRuntimeRefFromDisplay(frame.agent_runtime_id),
           fence_token:
             typeof frame.fence_token === "number" ? frame.fence_token : undefined,
-          generation:
-            typeof frame.generation === "number" ? frame.generation : undefined,
         } as StreamScopeFrame;
       }
       return {

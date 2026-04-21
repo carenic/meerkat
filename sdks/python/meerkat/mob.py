@@ -88,9 +88,12 @@ MobMemberSnapshot = TypedDict(
     "MobMemberSnapshot",
     {
         "status": str,
+        # Opaque incarnation handle. Public callers treat this as a
+        # compare-for-equality token; the encoding is a base64url payload
+        # minted client-side from the wire `{identity, generation}`
+        # shape, matching the `MemberRef` pattern (dogma round 1).
         "agent_runtime_id": str,
         "fence_token": int,
-        "generation": NotRequired[int],
         "output_preview": NotRequired[str],
         "error": NotRequired[str],
         "tokens_used": int,
@@ -119,9 +122,9 @@ MobKickoffMemberSnapshot = TypedDict(
     "MobKickoffMemberSnapshot",
     {
         "agent_identity": str,
+        # See `MobMemberSnapshot.agent_runtime_id` — opaque incarnation handle.
         "agent_runtime_id": str,
         "fence_token": int,
-        "generation": NotRequired[int],
         "status": str,
         "output_preview": NotRequired[str],
         "error": NotRequired[str],

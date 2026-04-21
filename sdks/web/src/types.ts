@@ -391,9 +391,14 @@ export interface MobPeerConnectivitySnapshot {
 /** Point-in-time execution snapshot for a mob member. */
 export interface MobMemberSnapshot {
   status: string;
+  /**
+   * Opaque incarnation handle. Compare for equality to detect incarnation
+   * rotation; internals are not parseable. Encoded client-side from the
+   * wire `{identity, generation}` shape, matching the `MemberRef`
+   * pattern.
+   */
   agent_runtime_id: string;
   fence_token: number;
-  generation?: number;
   output_preview?: string;
   error?: string;
   tokens_used: number;
@@ -415,6 +420,11 @@ export interface MobHelperResult {
 /** Envelope wrapping an agent event with metadata. */
 export interface EventEnvelope {
   agent_identity?: string;
+  /**
+   * Opaque incarnation handle. Compare for equality to detect incarnation
+   * rotation; internals are not parseable. Matches the `MemberRef`
+   * pattern.
+   */
   agent_runtime_id?: string;
   fence_token?: number;
   cursor?: string | number;

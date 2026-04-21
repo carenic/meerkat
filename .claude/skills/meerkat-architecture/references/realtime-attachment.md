@@ -22,8 +22,8 @@ attach/detach RPC.
 
 Public vocabulary:
 
-- `runtime/realtime_attachment_status` — runtime-owned status projection (single session)
-- `runtime/realtime_attachment_statuses` — batch projection
+- `session/realtime_attachment_status` — runtime-owned status projection (single session)
+- `session/realtime_attachment_statuses` — batch projection
 - `realtime/open_info` / `realtime/status` / `realtime/capabilities` — product-layer bootstrap
 
 Previously public methods, now deleted:

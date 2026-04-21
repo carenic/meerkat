@@ -232,43 +232,52 @@ pub fn rest_path_catalog() -> Vec<RestPathDescriptor> {
             )],
         ),
         RestPathDescriptor::new(
-            "/runtime/{id}/state",
-            vec![RestOperationDescriptor::new("get", "Get runtime state")],
-        ),
-        RestPathDescriptor::new(
-            "/runtime/{id}/realtime_attachment_status",
+            "/sessions/{id}/runtime-state",
             vec![RestOperationDescriptor::new(
                 "get",
-                "Get runtime-owned realtime attachment status for a session",
+                "Get a session's current runtime state",
             )],
         ),
         RestPathDescriptor::new(
-            "/runtime/{id}/accept",
+            "/sessions/{id}/realtime-attachment-status",
+            vec![RestOperationDescriptor::new(
+                "get",
+                "Get a session's realtime attachment status",
+            )],
+        ),
+        RestPathDescriptor::new(
+            "/sessions/{id}/accept-input",
             vec![RestOperationDescriptor::new(
                 "post",
-                "Accept a runtime input",
+                "Accept a runtime input for a session",
             )],
         ),
         RestPathDescriptor::new(
-            "/runtime/{id}/retire",
-            vec![RestOperationDescriptor::new("post", "Retire a runtime")],
-        ),
-        RestPathDescriptor::new(
-            "/runtime/{id}/reset",
-            vec![RestOperationDescriptor::new("post", "Reset a runtime")],
-        ),
-        RestPathDescriptor::new(
-            "/input/{id}/list",
+            "/sessions/{id}/retire-runtime",
             vec![RestOperationDescriptor::new(
-                "get",
-                "List runtime inputs for a session",
+                "post",
+                "Retire a session runtime",
             )],
         ),
         RestPathDescriptor::new(
-            "/input/{session_id}/{input_id}",
+            "/sessions/{id}/reset-runtime",
+            vec![RestOperationDescriptor::new(
+                "post",
+                "Reset a session runtime",
+            )],
+        ),
+        RestPathDescriptor::new(
+            "/sessions/{id}/inputs",
             vec![RestOperationDescriptor::new(
                 "get",
-                "Get a runtime input state",
+                "List active inputs for a session",
+            )],
+        ),
+        RestPathDescriptor::new(
+            "/sessions/{session_id}/inputs/{input_id}",
+            vec![RestOperationDescriptor::new(
+                "get",
+                "Get the state of a specific input on a session",
             )],
         ),
         RestPathDescriptor::new(
@@ -414,7 +423,7 @@ mod tests {
             "/config",
             "/schedules",
             "/schedules/{id}/occurrences",
-            "/runtime/{id}/realtime_attachment_status",
+            "/sessions/{id}/realtime-attachment-status",
             "/mob/{id}/members/{agent_identity}/status",
             "/mob/{id}/members/{agent_identity}/realtime/attach",
             "/mob/{id}/members/{agent_identity}/realtime/detach",

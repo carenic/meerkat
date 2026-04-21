@@ -557,7 +557,7 @@ async fn e2e_scenario_16_kitchen_sink() {
     send_request(
         &mut writer,
         &serde_json::json!({
-            "jsonrpc":"2.0","id":id,"method":"runtime/state",
+            "jsonrpc":"2.0","id":id,"method":"session/runtime_state",
             "params":{"session_id": deferred_session}
         }),
     )
@@ -565,7 +565,7 @@ async fn e2e_scenario_16_kitchen_sink() {
     let resp = timeout(t, read_response(&mut reader)).await.unwrap();
     assert!(
         resp["error"].is_null(),
-        "runtime/state failed for deferred session: {resp}"
+        "session/runtime_state failed for deferred session: {resp}"
     );
     // RPC surface eagerly attaches an executor for all sessions (including
     // deferred ones), so the runtime state is Attached, not Idle.
@@ -575,7 +575,7 @@ async fn e2e_scenario_16_kitchen_sink() {
     send_request(
         &mut writer,
         &serde_json::json!({
-            "jsonrpc":"2.0","id":id,"method":"runtime/accept",
+            "jsonrpc":"2.0","id":id,"method":"session/accept_input",
             "params":{
                 "session_id": deferred_session,
                 "input": {
@@ -599,7 +599,7 @@ async fn e2e_scenario_16_kitchen_sink() {
     let resp = timeout(t, read_response(&mut reader)).await.unwrap();
     assert!(
         resp["error"].is_null(),
-        "runtime/accept failed for deferred session: {resp}"
+        "session/accept_input failed for deferred session: {resp}"
     );
     assert_eq!(resp["result"]["outcome_type"].as_str(), Some("accepted"));
     let deferred_input_id = resp["result"]["input_id"].as_str().unwrap().to_string();
@@ -610,7 +610,7 @@ async fn e2e_scenario_16_kitchen_sink() {
         send_request(
             &mut writer,
             &serde_json::json!({
-                "jsonrpc":"2.0","id":id,"method":"input/state",
+                "jsonrpc":"2.0","id":id,"method":"session/input_state",
                 "params":{"session_id": deferred_session, "input_id": deferred_input_id}
             }),
         )
@@ -618,7 +618,7 @@ async fn e2e_scenario_16_kitchen_sink() {
         let resp = timeout(t, read_response(&mut reader)).await.unwrap();
         assert!(
             resp["error"].is_null(),
-            "input/state failed for deferred session: {resp}"
+            "session/input_state failed for deferred session: {resp}"
         );
         if resp["result"]["current_state"].as_str() == Some("consumed") {
             consumed = true;
@@ -628,7 +628,7 @@ async fn e2e_scenario_16_kitchen_sink() {
     }
     assert!(
         consumed,
-        "runtime/accept should fully consume the deferred-session input before continuing"
+        "session/accept_input should fully consume the deferred-session input before continuing"
     );
 
     let mut deferred_runtime_text = String::new();

@@ -1123,17 +1123,17 @@ pub fn router(state: AppState) -> Router {
         .route("/realtime/open_info", post(realtime_open_info))
         .route("/realtime/status", post(realtime_status))
         .route("/realtime/capabilities", post(realtime_capabilities))
-        // v9 runtime/input endpoints
-        .route("/runtime/{id}/state", get(runtime_state))
+        // Session-scoped runtime / input endpoints.
+        .route("/sessions/{id}/runtime-state", get(runtime_state))
         .route(
-            "/runtime/{id}/realtime_attachment_status",
+            "/sessions/{id}/realtime-attachment-status",
             get(runtime_realtime_attachment_status),
         )
-        .route("/runtime/{id}/accept", post(runtime_accept))
-        .route("/runtime/{id}/retire", post(runtime_retire))
-        .route("/runtime/{id}/reset", post(runtime_reset))
-        .route("/input/{id}/list", get(input_list))
-        .route("/input/{session_id}/{input_id}", get(input_state))
+        .route("/sessions/{id}/accept-input", post(runtime_accept))
+        .route("/sessions/{id}/retire-runtime", post(runtime_retire))
+        .route("/sessions/{id}/reset-runtime", post(runtime_reset))
+        .route("/sessions/{id}/inputs", get(input_list))
+        .route("/sessions/{session_id}/inputs/{input_id}", get(input_state))
         // Phase 4d — auth + realm endpoints.
         .route(
             "/auth/profiles",
@@ -1278,7 +1278,7 @@ async fn ensure_runtime_session_registered(
     Ok(())
 }
 
-/// GET /runtime/{id}/state
+/// GET /sessions/{id}/runtime-state
 async fn runtime_state(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1298,7 +1298,7 @@ async fn runtime_state(
     Ok(Json(json!({"session_id": sid.to_string(), "state": rs})))
 }
 
-/// GET /runtime/{id}/realtime_attachment_status
+/// GET /sessions/{id}/realtime-attachment-status
 async fn runtime_realtime_attachment_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1579,7 +1579,7 @@ async fn realtime_open_info(
         .into_response())
 }
 
-/// POST /runtime/{id}/accept
+/// POST /sessions/{id}/accept-input
 async fn runtime_accept(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1622,7 +1622,7 @@ async fn runtime_accept(
 }
 
 /// Translate an in-process [`meerkat_runtime::AcceptOutcome`] into the REST
-/// JSON shape exposed at `POST /runtime/{id}/accept`.
+/// JSON shape exposed at `POST /sessions/{id}/accept-input`.
 ///
 /// `AcceptOutcome` is a domain envelope without `Serialize`; the wire-facing
 /// projection is materialized here to keep parity with prior responses.
@@ -1653,7 +1653,7 @@ fn accept_outcome_to_json(outcome: meerkat_runtime::AcceptOutcome) -> Value {
     }
 }
 
-/// POST /runtime/{id}/retire
+/// POST /sessions/{id}/retire-runtime
 async fn runtime_retire(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1673,7 +1673,7 @@ async fn runtime_retire(
     Ok(Json(json!({"inputs_abandoned": report.inputs_abandoned})))
 }
 
-/// POST /runtime/{id}/reset
+/// POST /sessions/{id}/reset-runtime
 async fn runtime_reset(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1693,7 +1693,7 @@ async fn runtime_reset(
     Ok(Json(json!({"inputs_abandoned": report.inputs_abandoned})))
 }
 
-/// GET /input/{id}/list
+/// GET /sessions/{id}/inputs
 async fn input_list(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1714,7 +1714,7 @@ async fn input_list(
     Ok(Json(json!({"input_ids": id_strs})))
 }
 
-/// GET /input/{session_id}/{input_id}
+/// GET /sessions/{session_id}/inputs/{input_id}
 async fn input_state(
     State(state): State<AppState>,
     Path((session_id_str, input_id_str)): Path<(String, String)>,
@@ -5345,7 +5345,7 @@ mod tests {
 
         let request = axum::http::Request::builder()
             .method("GET")
-            .uri(format!("/runtime/{session_id}/state"))
+            .uri(format!("/sessions/{session_id}/runtime-state"))
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
@@ -5412,7 +5412,7 @@ mod tests {
         let session_id = create_result.session_id.to_string();
         let request = axum::http::Request::builder()
             .method("GET")
-            .uri(format!("/runtime/{session_id}/realtime_attachment_status"))
+            .uri(format!("/sessions/{session_id}/realtime-attachment-status"))
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(request).await.unwrap();

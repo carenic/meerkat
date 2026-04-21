@@ -41,12 +41,12 @@ CANONICAL_APP_RPC_METHODS = {
     "realtime/open_info",
     "realtime/status",
     "realtime/capabilities",
-    "runtime/state",
-    "runtime/accept",
-    "runtime/retire",
-    "runtime/reset",
-    "input/state",
-    "input/list",
+    "session/runtime_state",
+    "session/accept_input",
+    "session/retire_runtime",
+    "session/reset_runtime",
+    "session/input_state",
+    "session/inputs",
     "mob/create",
     "mob/list",
     "mob/status",
@@ -111,12 +111,12 @@ RPC_PUBLIC_WRAPPERS: dict[str, tuple[type, str]] = {
     "realtime/open_info": (MeerkatClient, "realtime_open_info"),
     "realtime/status": (MeerkatClient, "realtime_status"),
     "realtime/capabilities": (MeerkatClient, "realtime_capabilities"),
-    "runtime/state": (MeerkatClient, "runtime_state"),
-    "runtime/accept": (MeerkatClient, "runtime_accept"),
-    "runtime/retire": (MeerkatClient, "runtime_retire"),
-    "runtime/reset": (MeerkatClient, "runtime_reset"),
-    "input/state": (MeerkatClient, "input_state"),
-    "input/list": (MeerkatClient, "input_list"),
+    "session/runtime_state": (MeerkatClient, "runtime_state"),
+    "session/accept_input": (MeerkatClient, "runtime_accept"),
+    "session/retire_runtime": (MeerkatClient, "runtime_retire"),
+    "session/reset_runtime": (MeerkatClient, "runtime_reset"),
+    "session/input_state": (MeerkatClient, "input_state"),
+    "session/inputs": (MeerkatClient, "input_list"),
     "mob/create": (MeerkatClient, "create_mob"),
     "mob/list": (MeerkatClient, "list_mobs"),
     "mob/status": (Mob, "status"),
@@ -334,3 +334,67 @@ async def test_get_mob_profile_not_found_returns_none():
 
     result = await client.get_mob_profile("worker")
     assert result is None
+
+
+def test_sdk_never_uses_deprecated_runtime_or_input_method_strings():
+    """Row 29 regression gate: the public Python SDK must not re-introduce
+    the infrastructure-shaped `runtime/*` or `input/*` method verbs.
+    """
+    import pathlib
+
+    sdk_src = pathlib.Path(__file__).parent.parent / "meerkat"
+    forbidden = [
+        '"runtime/state"',
+        '"runtime/accept"',
+        '"runtime/retire"',
+        '"runtime/reset"',
+        '"runtime/realtime_attachment_status"',
+        '"runtime/realtime_attachment_statuses"',
+        '"input/state"',
+        '"input/list"',
+    ]
+    for path in sdk_src.rglob("*.py"):
+        if "generated" in path.parts:
+            continue
+        text = path.read_text()
+        for needle in forbidden:
+            assert needle not in text, (
+                f"Deprecated method string {needle!r} must not appear in {path}"
+            )
+
+
+def test_encode_agent_runtime_ref_is_opaque_and_strict():
+    """Row 31 regression gate: the SDK must emit an opaque
+    ``AgentRuntimeRef`` handle, not a parseable ``"identity:generation"``
+    string. The canonical wire shape is ``{"identity": "...", "generation": N}``;
+    anything else is a protocol error that must surface as a typed
+    ``MeerkatError``.
+    """
+    import base64
+    import json as _json
+
+    from meerkat.client import MeerkatError, _encode_agent_runtime_ref
+
+    # Non-canonical shapes are typed errors.
+    with pytest.raises(MeerkatError):
+        _encode_agent_runtime_ref("worker:1")
+    with pytest.raises(MeerkatError):
+        _encode_agent_runtime_ref({"agent_identity": "worker", "generation": 1})
+    with pytest.raises(MeerkatError):
+        _encode_agent_runtime_ref({"identity": "worker"})
+
+    # Canonical form yields a deterministic opaque token whose internals
+    # decode to the short ``{i, g}`` key schema — so equality comparison
+    # works across SDKs and callers cannot sniff the display string.
+    token = _encode_agent_runtime_ref({"identity": "worker", "generation": 2})
+    assert isinstance(token, str) and token
+    # Token must NOT carry the parseable display form.
+    assert ":" not in token
+    # Decoding is an SDK-internal detail for testing; callers must not
+    # reach for it.
+    padded = token + "=" * (-len(token) % 4)
+    decoded = _json.loads(base64.urlsafe_b64decode(padded))
+    assert decoded == {"i": "worker", "g": 2}
+
+    # Absence threads through as None.
+    assert _encode_agent_runtime_ref(None) is None
