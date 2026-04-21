@@ -113,12 +113,22 @@ impl ToolVisibilityOwner for MachineToolVisibilityOwner {
         visibility_state: SessionToolVisibilityState,
     ) -> Result<(), ToolScopeApplyError> {
         // Sync the DSL monotonic counter up to the externally-installed
-        // revisions before we overwrite the owner-held state. The DSL owns
-        // `next_staged_visibility_revision`; without this sync, subsequent
-        // `stage_*` calls would mint revisions starting from 0 again and
-        // regress behind the durable state we just installed (dogma round
-        // 4, wave 2b #12 — single monotonic source, honest across recovery
-        // / hot-swap boundaries).
+        // revisions before we overwrite the owner-held state. The DSL
+        // owns `next_staged_visibility_revision`; without this sync,
+        // subsequent `stage_*` calls on a session whose durable state
+        // was just replaced (recovery, LLM hot-swap, shell-side
+        // projection re-install) would mint revisions starting from 0
+        // and regress behind the durable state just installed (dogma
+        // round 4, wave 2b #12 — single monotonic source, honest across
+        // recovery / hot-swap boundaries).
+        //
+        // The DSL guard on `SyncVisibilityRevisions` makes the call
+        // idempotent: when the installed revisions are at or below the
+        // counter the transition is guard-rejected (no-op), which the
+        // DSL classifies for us. Firing unconditionally is correct —
+        // the guard is the single place that decides whether the sync
+        // advances state, not a shell-side pre-check on the input
+        // fields.
         let slot = self
             .dsl_authority
             .read()
@@ -130,16 +140,25 @@ impl ToolVisibilityOwner for MachineToolVisibilityOwner {
             let mut guard = authority
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            super::dsl::MeerkatMachineMutator::apply(
+            match super::dsl::MeerkatMachineMutator::apply(
                 &mut *guard,
                 super::dsl::MeerkatMachineInput::SyncVisibilityRevisions {
                     active_revision: visibility_state.active_revision,
                     staged_revision: visibility_state.staged_revision,
                 },
-            )
-            .map_err(|err| ToolScopeApplyError::Owner {
-                message: super::dsl_authority::map_error(err, "SyncVisibilityRevisions"),
-            })?;
+            ) {
+                Ok(_) => {}
+                // Typed guard rejection is the idempotent no-op case:
+                // neither revision advances the counter. Treat as
+                // success — the installed state is already reflected in
+                // the DSL counter.
+                Err(super::dsl::MeerkatMachineTransitionError::GuardRejected { .. }) => {}
+                Err(err) => {
+                    return Err(ToolScopeApplyError::Owner {
+                        message: super::dsl_authority::map_error(err, "SyncVisibilityRevisions"),
+                    });
+                }
+            }
         }
         let mut state = self.state.write().map_err(|_| ToolScopeApplyError::Owner {
             message: "machine visibility state lock poisoned".to_string(),

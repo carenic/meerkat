@@ -5148,11 +5148,22 @@ machine! {
         // the DSL monotonic counter honest against externally-minted revisions
         // so subsequent `StageVisibilityFilter` / `StageDeferredNames` mints
         // continue advancing from the high-water mark rather than the DSL's
-        // local 0. Idempotent: guarded as a no-op when counter is already at
-        // or above the installed max.
+        // local 0.
+        //
+        // Typed idempotence via guard: the transition fires only when at
+        // least one of the installed revisions exceeds the counter. When
+        // both revisions are at or below the counter (e.g., fresh-build
+        // with default-zero visibility state on a never-advanced counter,
+        // or recovery replay of a state the DSL already reflects), the
+        // guard rejects and the caller sees `Ok(false)` — no shell-side
+        // input-value pre-check, no silent no-op update.
         transition SyncVisibilityRevisions {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input SyncVisibilityRevisions { active_revision, staged_revision }
+            guard "counter_advances" {
+                active_revision > self.next_staged_visibility_revision
+                || staged_revision > self.next_staged_visibility_revision
+            }
             update {
                 if active_revision > self.next_staged_visibility_revision {
                     self.next_staged_visibility_revision = active_revision;

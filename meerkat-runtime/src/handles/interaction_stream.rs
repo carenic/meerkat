@@ -74,24 +74,45 @@ impl RuntimeInteractionStreamHandle {
         input: mm_dsl::MeerkatMachineInput,
         context: &'static str,
     ) -> Result<(), DslTransitionError> {
-        let effects = self.dsl.apply_input_with_effects(input, context)?;
-        let observer_opt = self
-            .cleanup_observer
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .and_then(Weak::upgrade);
-        if let Some(observer) = observer_opt {
-            for effect in effects {
-                if let mm_dsl::MeerkatMachineEffect::InteractionStreamCleanup { corr_id } = effect {
-                    match dsl_corr_id_to_core(corr_id.clone()) {
-                        Some(core_id) => observer.on_interaction_stream_cleanup(core_id),
-                        None => tracing::error!(
-                            raw = %corr_id.0,
-                            context = context,
-                            "InteractionStreamCleanup: DSL emitted a corr_id that is not a valid UUID — broken invariant; skipping observer dispatch"
-                        ),
-                    }
+        // Sample observer UNDER the DSL lock, dispatch OUTSIDE — same
+        // race-closing pattern as `session_context.rs`.
+        type CleanupTarget = Result<PeerCorrelationId, String>;
+        let dispatch: Option<(
+            Arc<dyn InteractionStreamCleanupObserver>,
+            Vec<CleanupTarget>,
+        )> = self
+            .dsl
+            .apply_input_with_effects_and_sample(input, context, |effects| {
+                let observer_opt = self
+                    .cleanup_observer
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .and_then(Weak::upgrade);
+                let observer = observer_opt?;
+                let targets: Vec<CleanupTarget> = effects
+                    .iter()
+                    .filter_map(|effect| match effect {
+                        mm_dsl::MeerkatMachineEffect::InteractionStreamCleanup { corr_id } => {
+                            Some(match dsl_corr_id_to_core(corr_id.clone()) {
+                                Some(core_id) => Ok(core_id),
+                                None => Err(corr_id.0.clone()),
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                Some((observer, targets))
+            })?;
+        if let Some((observer, targets)) = dispatch {
+            for target in targets {
+                match target {
+                    Ok(core_id) => observer.on_interaction_stream_cleanup(core_id),
+                    Err(raw) => tracing::error!(
+                        raw = %raw,
+                        context = context,
+                        "InteractionStreamCleanup: DSL emitted a corr_id that is not a valid UUID — broken invariant; skipping observer dispatch"
+                    ),
                 }
             }
         }
