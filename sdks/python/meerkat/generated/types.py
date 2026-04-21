@@ -171,13 +171,13 @@ class MobUnwireParams:
 
 @dataclass
 class RuntimeStateParams:
-    """Request payload for `runtime/state`."""
+    """Request payload for `session/runtime_state`."""
     session_id: str = ''
 
 
 @dataclass
 class RuntimeRealtimeAttachmentStatusParams:
-    """Request payload for `runtime/realtime_attachment_status`."""
+    """Request payload for `session/realtime_attachment_status`."""
     session_id: str = ''
 
 
@@ -205,33 +205,33 @@ class RealtimeCapabilitiesParams:
 
 @dataclass
 class RuntimeAcceptParams:
-    """Request payload for `runtime/accept`."""
+    """Request payload for `session/accept_input`."""
     input: Any = None
     session_id: str = ''
 
 
 @dataclass
 class RuntimeRetireParams:
-    """Request payload for `runtime/retire`."""
+    """Request payload for `session/retire_runtime`."""
     session_id: str = ''
 
 
 @dataclass
 class RuntimeResetParams:
-    """Request payload for `runtime/reset`."""
+    """Request payload for `session/reset_runtime`."""
     session_id: str = ''
 
 
 @dataclass
 class InputStateParams:
-    """Request payload for `input/state`."""
+    """Request payload for `session/input_state`."""
     input_id: str = ''
     session_id: str = ''
 
 
 @dataclass
 class InputListParams:
-    """Request payload for `input/list`."""
+    """Request payload for `session/inputs`."""
     session_id: str = ''
 
 
@@ -313,13 +313,13 @@ class MobUnwireResult:
 
 @dataclass
 class RuntimeStateResult:
-    """Response payload for `runtime/state`."""
+    """Response payload for `session/runtime_state`."""
     state: Literal['initializing', 'idle', 'attached', 'running', 'retired', 'stopped', 'destroyed'] = None
 
 
 @dataclass
 class RuntimeRealtimeAttachmentStatusResult:
-    """Response payload for `runtime/realtime_attachment_status`."""
+    """Response payload for `session/realtime_attachment_status`."""
     status: Literal['unattached', 'intent_present_unbound', 'binding_not_ready', 'binding_ready', 'replacement_pending', 'reattach_required'] = None
 
 
@@ -465,7 +465,7 @@ class RealtimeChannelClosedFrame:
 
 @dataclass
 class RuntimeAcceptResult:
-    """Response payload for `runtime/accept`."""
+    """Response payload for `session/accept_input`."""
     existing_id: Optional[str] = None
     input_id: Optional[str] = None
     outcome_type: Literal['accepted', 'deduplicated', 'rejected'] = None
@@ -476,14 +476,14 @@ class RuntimeAcceptResult:
 
 @dataclass
 class RuntimeRetireResult:
-    """Response payload for `runtime/retire`."""
+    """Response payload for `session/retire_runtime`."""
     inputs_abandoned: int = 0
     inputs_pending_drain: int = 0
 
 
 @dataclass
 class RuntimeResetResult:
-    """Response payload for `runtime/reset`."""
+    """Response payload for `session/reset_runtime`."""
     inputs_abandoned: int = 0
 
 
@@ -518,7 +518,7 @@ class WireInputState:
 
 @dataclass
 class InputListResult:
-    """Response payload for `input/list`."""
+    """Response payload for `session/inputs`."""
     input_ids: list[str] = field(default_factory=list)
 
 
@@ -756,7 +756,7 @@ RealtimeClientFrame = dict[str, Any]
 # Server-to-client realtime frame.
 RealtimeServerFrame = dict[str, Any]
 
-# Discriminator for `runtime/accept` responses.
+# Discriminator for `session/accept_input` responses.
 RuntimeAcceptOutcomeType = Literal['accepted', 'deduplicated', 'rejected']
 
 # Public input lifecycle state projection used by RPC surfaces.
@@ -784,5 +784,5 @@ WireModelTier = str
 # in [`CommsCommandRequest::into_command`].
 CommsCommandRequest = dict[str, Any]
 
-# Response payload for `input/state`.
+# Response payload for `session/input_state`.
 InputStateResult = Optional[WireInputState]

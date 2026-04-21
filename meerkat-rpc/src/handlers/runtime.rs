@@ -1,5 +1,5 @@
-//! v9 runtime RPC handlers — runtime/state, runtime/accept, runtime/retire, runtime/reset,
-//! input/state, input/list.
+//! v9 runtime RPC handlers — session/runtime_state, session/accept_input, session/retire_runtime, session/reset_runtime,
+//! session/input_state, session/inputs.
 
 use serde_json::value::RawValue;
 
@@ -184,7 +184,7 @@ pub(crate) fn to_wire_accept_result(
 
 // ---- Handlers ----
 
-/// Handle `runtime/state` — get the runtime state for a session.
+/// Handle `session/runtime_state` — get the runtime state for a session.
 pub async fn handle_runtime_state(
     id: Option<RpcId>,
     params: Option<&RawValue>,
@@ -211,7 +211,7 @@ pub async fn handle_runtime_state(
     }
 }
 
-/// Handle `runtime/realtime_attachment_status` — get live attachment status for a session.
+/// Handle `session/realtime_attachment_status` — get live attachment status for a session.
 pub async fn handle_runtime_realtime_attachment_status(
     id: Option<RpcId>,
     params: Option<&RawValue>,
@@ -240,8 +240,8 @@ pub async fn handle_runtime_realtime_attachment_status(
     }
 }
 
-/// Handle `runtime/realtime_attachment_statuses` — batch variant of
-/// `runtime/realtime_attachment_status`.
+/// Handle `session/realtime_attachment_statuses` — batch variant of
+/// `session/realtime_attachment_status`.
 ///
 /// Preserves request order in the response so clients can zip by index.
 /// Per-session failures (bad id, adapter error) are captured in the entry's
@@ -287,7 +287,7 @@ pub async fn handle_runtime_realtime_attachment_statuses(
     RpcResponse::success(id, RuntimeRealtimeAttachmentStatusesResult { entries })
 }
 
-/// Handle `runtime/accept` — accept an input for a session.
+/// Handle `session/accept_input` — accept an input for a session.
 pub async fn handle_runtime_accept(
     id: Option<RpcId>,
     params: Option<&RawValue>,
@@ -331,7 +331,7 @@ pub async fn handle_runtime_accept(
     }
 }
 
-/// Handle `runtime/retire` — retire a session's runtime.
+/// Handle `session/retire_runtime` — retire a session's runtime.
 pub async fn handle_runtime_retire(
     id: Option<RpcId>,
     params: Option<&RawValue>,
@@ -361,7 +361,7 @@ pub async fn handle_runtime_retire(
     }
 }
 
-/// Handle `runtime/reset` — reset a session's runtime.
+/// Handle `session/reset_runtime` — reset a session's runtime.
 pub async fn handle_runtime_reset(
     id: Option<RpcId>,
     params: Option<&RawValue>,
@@ -390,7 +390,7 @@ pub async fn handle_runtime_reset(
     }
 }
 
-/// Handle `input/state` — get the state of a specific input.
+/// Handle `session/input_state` — get the state of a specific input.
 pub async fn handle_input_state(
     id: Option<RpcId>,
     params: Option<&RawValue>,
@@ -423,7 +423,7 @@ pub async fn handle_input_state(
     }
 }
 
-/// Handle `input/list` — list active inputs for a session.
+/// Handle `session/inputs` — list active inputs for a session.
 pub async fn handle_input_list(
     id: Option<RpcId>,
     params: Option<&RawValue>,

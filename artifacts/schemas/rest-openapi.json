@@ -82,16 +82,6 @@
         "summary": "Health check"
       }
     },
-    "/input/{id}/list": {
-      "get": {
-        "summary": "List runtime inputs for a session"
-      }
-    },
-    "/input/{session_id}/{input_id}": {
-      "get": {
-        "summary": "Get a runtime input state"
-      }
-    },
     "/mob/{id}/events": {
       "get": {
         "summary": "SSE mob event stream"
@@ -162,31 +152,6 @@
         "summary": "Get product-layer realtime channel status for a target"
       }
     },
-    "/runtime/{id}/accept": {
-      "post": {
-        "summary": "Accept a runtime input"
-      }
-    },
-    "/runtime/{id}/realtime_attachment_status": {
-      "get": {
-        "summary": "Get runtime-owned realtime attachment status for a session"
-      }
-    },
-    "/runtime/{id}/reset": {
-      "post": {
-        "summary": "Reset a runtime"
-      }
-    },
-    "/runtime/{id}/retire": {
-      "post": {
-        "summary": "Retire a runtime"
-      }
-    },
-    "/runtime/{id}/state": {
-      "get": {
-        "summary": "Get runtime state"
-      }
-    },
     "/schedule/call": {
       "post": {
         "summary": "Invoke a schedule tool"
@@ -247,6 +212,11 @@
         "summary": "Get session details"
       }
     },
+    "/sessions/{id}/accept-input": {
+      "post": {
+        "summary": "Accept a runtime input for a session"
+      }
+    },
     "/sessions/{id}/events": {
       "get": {
         "summary": "SSE event stream"
@@ -260,6 +230,11 @@
     "/sessions/{id}/history": {
       "get": {
         "summary": "Get full session history"
+      }
+    },
+    "/sessions/{id}/inputs": {
+      "get": {
+        "summary": "List active inputs for a session"
       }
     },
     "/sessions/{id}/interrupt": {
@@ -290,9 +265,39 @@
         "summary": "Continue session with new message"
       }
     },
+    "/sessions/{id}/peer-response-terminal": {
+      "post": {
+        "summary": "Admit a correlated terminal peer response through the typed runtime ingress"
+      }
+    },
+    "/sessions/{id}/realtime-attachment-status": {
+      "get": {
+        "summary": "Get a session's realtime attachment status"
+      }
+    },
+    "/sessions/{id}/reset-runtime": {
+      "post": {
+        "summary": "Reset a session runtime"
+      }
+    },
+    "/sessions/{id}/retire-runtime": {
+      "post": {
+        "summary": "Retire a session runtime"
+      }
+    },
+    "/sessions/{id}/runtime-state": {
+      "get": {
+        "summary": "Get a session's current runtime state"
+      }
+    },
     "/sessions/{id}/system_context": {
       "post": {
         "summary": "Append system context to a session"
+      }
+    },
+    "/sessions/{session_id}/inputs/{input_id}": {
+      "get": {
+        "summary": "Get the state of a specific input on a session"
       }
     },
     "/skills": {

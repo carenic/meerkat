@@ -57,29 +57,32 @@ interface MobWasmBindings {
   close_subscription: (handle: number) => void;
 }
 
+/**
+ * Parse the canonical `{identity, generation}` wire shape for an
+ * `AgentRuntimeId`. Any other shape is a protocol error — no string
+ * legacy form, no `agent_identity` alias, no fabrication.
+ */
 function parseAgentRuntimeId(raw: unknown): { value: string; generation?: number } {
-  if (typeof raw === 'string') {
-    return { value: raw };
+  if (raw == null) {
+    return { value: '' };
   }
-  if (raw && typeof raw === 'object') {
-    const record = raw as Record<string, unknown>;
-    const identity =
-      record.identity != null
-        ? String(record.identity)
-        : (record.agent_identity != null ? String(record.agent_identity) : '');
-    const generationRaw = record.generation;
-    const generation =
-      typeof generationRaw === 'number' && Number.isFinite(generationRaw)
-        ? generationRaw
-        : undefined;
-    if (identity.length > 0 && generation !== undefined) {
-      return { value: `${identity}:${generation}`, generation };
-    }
-    if (identity.length > 0) {
-      return { value: identity, generation };
-    }
+  if (typeof raw !== 'object') {
+    throw new Error(
+      `Invalid agent_runtime_id wire shape: expected object, got ${typeof raw}`,
+    );
   }
-  return { value: '' };
+  const record = raw as Record<string, unknown>;
+  const identity = record.identity;
+  const generationRaw = record.generation;
+  if (
+    typeof identity !== 'string' ||
+    identity.length === 0 ||
+    typeof generationRaw !== 'number' ||
+    !Number.isFinite(generationRaw)
+  ) {
+    throw new Error('Invalid agent_runtime_id wire shape: missing identity/generation');
+  }
+  return { value: `${identity}:${generationRaw}`, generation: generationRaw };
 }
 
 /** Capability-bearing handle for one mob member. */
@@ -109,7 +112,6 @@ export class Member {
       }),
     );
     const receipt = JSON.parse(json) as Partial<MemberDeliveryReceipt>;
-    const legacyIdentity = (receipt as { identity?: unknown }).identity;
     const memberRef =
       typeof receipt.member_ref === 'string' && receipt.member_ref.length > 0
         ? receipt.member_ref
@@ -117,13 +119,11 @@ export class Member {
     if (!memberRef) {
       throw new Error('Invalid mob member delivery response: missing member_ref');
     }
+    if (typeof receipt.agent_identity !== 'string' || receipt.agent_identity.length === 0) {
+      throw new Error('Invalid mob member delivery response: missing agent_identity');
+    }
     return {
-      agent_identity:
-        typeof receipt.agent_identity === 'string' && receipt.agent_identity.length > 0
-          ? receipt.agent_identity
-          : typeof legacyIdentity === 'string' && legacyIdentity.length > 0
-            ? legacyIdentity
-          : this.agentIdentity,
+      agent_identity: receipt.agent_identity,
       member_ref: memberRef,
       handling_mode: receipt.handling_mode ?? handlingMode,
     };
@@ -154,50 +154,21 @@ export class Mob {
 
   /** Spawn one or more agents into the mob. */
   async spawn(specs: SpawnSpec[]): Promise<SpawnResult[]> {
-    let json: string;
-    try {
-      json = await this.bindings.mob_spawn(
-        this.mobId,
-        JSON.stringify(specs),
-      );
-    } catch (error) {
-      const message = String(error);
-      if (!message.includes("missing field")) {
-        throw error;
+    const json = await this.bindings.mob_spawn(
+      this.mobId,
+      JSON.stringify(specs),
+    );
+    return (JSON.parse(json) as Array<Partial<SpawnResult> & Record<string, unknown>>).map((entry) => {
+      if (typeof entry.agent_identity !== 'string' || entry.agent_identity.length === 0) {
+        throw new Error('Invalid mob spawn response: missing agent_identity');
       }
-      const legacyIdentityKey = ["meerkat", "id"].join("_");
-      const legacySpecs = specs.map((spec) => ({
-        profile: spec.profile,
-        [legacyIdentityKey]: spec.agent_identity,
-        runtime_mode: spec.runtime_mode,
-        initial_message: spec.initial_message,
-        labels: spec.labels,
-        context: spec.context,
-        generation: spec.generation,
-        additional_instructions: spec.additional_instructions,
-      }));
-      json = await this.bindings.mob_spawn(
-        this.mobId,
-        JSON.stringify(legacySpecs),
-      );
-    }
-    return (JSON.parse(json) as Array<Partial<SpawnResult> & Record<string, unknown>>).map((entry, index) => {
-      const requestedIdentity = specs[index]?.agent_identity ?? '';
-      const agentIdentity =
-        typeof entry.agent_identity === 'string'
-          ? entry.agent_identity
-          : requestedIdentity;
-      const memberRef =
-        typeof entry.member_ref === 'string' && entry.member_ref.length > 0
-          ? entry.member_ref
-          : undefined;
-      if (!agentIdentity || !memberRef) {
+      if (typeof entry.member_ref !== 'string' || entry.member_ref.length === 0) {
         throw new Error('Invalid mob spawn response: missing member_ref');
       }
       return {
         mob_id: typeof entry.mob_id === 'string' ? entry.mob_id : this.mobId,
-        agent_identity: agentIdentity,
-        member_ref: memberRef,
+        agent_identity: entry.agent_identity,
+        member_ref: entry.member_ref,
       };
     });
   }
@@ -237,12 +208,15 @@ export class Mob {
   async listMembers(): Promise<MobMember[]> {
     const json = await this.bindings.mob_list_members(this.mobId);
     return (JSON.parse(json) as Array<Record<string, unknown>>).map((member) => {
-      const agentIdentity = String(member.agent_identity ?? member.member_id ?? '');
+      if (typeof member.agent_identity !== 'string' || member.agent_identity.length === 0) {
+        throw new Error('Invalid mob list_members entry: missing agent_identity');
+      }
+      const agentIdentity = member.agent_identity;
       const memberRef =
         typeof member.member_ref === 'string' && member.member_ref.length > 0
           ? member.member_ref
           : '';
-      if (!agentIdentity || !memberRef) {
+      if (!memberRef) {
         throw new Error('Invalid mob list_members entry: missing member_ref');
       }
       return {
@@ -329,7 +303,6 @@ export class Mob {
     }
     const receipt = result.receipt as unknown as Partial<MemberRespawnReceipt> &
       Record<string, unknown>;
-    const legacyIdentity = (receipt as { identity?: unknown }).identity;
     const memberRef =
       typeof receipt.member_ref === 'string' && receipt.member_ref.length > 0
         ? receipt.member_ref
@@ -337,15 +310,13 @@ export class Mob {
     if (!memberRef) {
       throw new Error('Invalid mob respawn response: receipt missing member_ref');
     }
+    if (typeof receipt.agent_identity !== 'string' || receipt.agent_identity.length === 0) {
+      throw new Error('Invalid mob respawn response: receipt missing agent_identity');
+    }
     return {
       status: result.status === 'topology_restore_failed' ? 'topology_restore_failed' : 'completed',
       receipt: {
-        agent_identity:
-          typeof receipt.agent_identity === 'string' && receipt.agent_identity.length > 0
-            ? receipt.agent_identity
-            : typeof legacyIdentity === 'string' && legacyIdentity.length > 0
-              ? legacyIdentity
-            : agentIdentity,
+        agent_identity: receipt.agent_identity,
         member_ref: memberRef,
       },
       failed_peer_ids: Array.isArray(result.failed_peer_ids)
@@ -363,9 +334,11 @@ export class Mob {
   async memberStatus(agentIdentity: string): Promise<MobMemberSnapshot> {
     const json = await this.bindings.mob_member_status(this.mobId, agentIdentity);
     const snapshot = JSON.parse(json) as Partial<MobMemberSnapshot>;
-    let runtime = parseAgentRuntimeId(snapshot.agent_runtime_id);
+    const runtime = parseAgentRuntimeId(snapshot.agent_runtime_id);
     if (!runtime.value) {
-      runtime = { value: `${agentIdentity}:0`, generation: 0 };
+      throw new Error(
+        'Invalid mob_member_status response: missing agent_runtime_id',
+      );
     }
     return {
       status: typeof snapshot.status === 'string' ? snapshot.status : 'unknown',
@@ -411,13 +384,13 @@ export class Mob {
     if (!memberRef) {
       throw new Error('Invalid mob spawn_helper response: missing member_ref');
     }
+    if (typeof result.agent_identity !== 'string' || result.agent_identity.length === 0) {
+      throw new Error('Invalid mob spawn_helper response: missing agent_identity');
+    }
     return {
       output: typeof result.output === 'string' ? result.output : undefined,
       tokens_used: typeof result.tokens_used === 'number' ? result.tokens_used : 0,
-      agent_identity:
-        typeof result.agent_identity === 'string'
-          ? result.agent_identity
-          : (options?.agentIdentity ?? ''),
+      agent_identity: result.agent_identity,
       member_ref: memberRef,
     };
   }
@@ -454,13 +427,13 @@ export class Mob {
     if (!memberRef) {
       throw new Error('Invalid mob fork_helper response: missing member_ref');
     }
+    if (typeof result.agent_identity !== 'string' || result.agent_identity.length === 0) {
+      throw new Error('Invalid mob fork_helper response: missing agent_identity');
+    }
     return {
       output: typeof result.output === 'string' ? result.output : undefined,
       tokens_used: typeof result.tokens_used === 'number' ? result.tokens_used : 0,
-      agent_identity:
-        typeof result.agent_identity === 'string'
-          ? result.agent_identity
-          : (options?.agentIdentity ?? ''),
+      agent_identity: result.agent_identity,
       member_ref: memberRef,
     };
   }

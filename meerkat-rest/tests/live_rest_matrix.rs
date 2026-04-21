@@ -214,7 +214,7 @@ async fn wait_for_input_state(
         let (status, payload) = request_json(
             app,
             Method::GET,
-            format!("/input/{session_id}/{input_id}"),
+            format!("/sessions/{session_id}/inputs/{input_id}"),
             None,
         )
         .await;
@@ -241,7 +241,7 @@ async fn wait_for_input_state_with_budget(
         let (status, payload) = request_json(
             app,
             Method::GET,
-            format!("/input/{session_id}/{input_id}"),
+            format!("/sessions/{session_id}/inputs/{input_id}"),
             None,
         )
         .await;
@@ -307,12 +307,12 @@ async fn e2e_scenario_21_rest_runtime_accept_input_roundtrip() {
     let (status, runtime_state) = request_json(
         &app,
         Method::GET,
-        format!("/runtime/{session_id}/state"),
+        format!("/sessions/{session_id}/runtime-state"),
         None,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    // REST runtime/state lazily attaches an executor, so the initial state
+    // REST session/runtime_state lazily attaches an executor, so the initial state
     // of a deferred session transitions from idle to attached on first query.
     assert!(
         runtime_state["state"] == "idle" || runtime_state["state"] == "attached",
@@ -323,7 +323,7 @@ async fn e2e_scenario_21_rest_runtime_accept_input_roundtrip() {
     let (status, accepted) = request_json(
         &app,
         Method::POST,
-        format!("/runtime/{session_id}/accept"),
+        format!("/sessions/{session_id}/accept-input"),
         Some(durable_prompt_input(
             "Remember the marker REST-RUNTIME-21 and acknowledge briefly.",
         )),
@@ -336,8 +336,13 @@ async fn e2e_scenario_21_rest_runtime_accept_input_roundtrip() {
         .expect("accepted input should have id")
         .to_string();
 
-    let (status, listed) =
-        request_json(&app, Method::GET, format!("/input/{session_id}/list"), None).await;
+    let (status, listed) = request_json(
+        &app,
+        Method::GET,
+        format!("/sessions/{session_id}/inputs"),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         listed["input_ids"].as_array().is_some_and(|ids| ids
@@ -391,7 +396,7 @@ async fn e2e_scenario_22_rest_runtime_reset_and_retire_drain_staged_inputs() {
         let (status, accepted) = request_json(
             &app,
             Method::POST,
-            format!("/runtime/{reset_session_id}/accept"),
+            format!("/sessions/{reset_session_id}/accept-input"),
             Some(durable_peer_progress_input("rest-reset-22")),
         )
         .await;
@@ -401,7 +406,7 @@ async fn e2e_scenario_22_rest_runtime_reset_and_retire_drain_staged_inputs() {
         let (status, reset_payload) = request_json(
             &app,
             Method::POST,
-            format!("/runtime/{reset_session_id}/reset"),
+            format!("/sessions/{reset_session_id}/reset-runtime"),
             None,
         )
         .await;
@@ -421,7 +426,7 @@ async fn e2e_scenario_22_rest_runtime_reset_and_retire_drain_staged_inputs() {
         let (status, runtime_state) = request_json(
             &app,
             Method::GET,
-            format!("/runtime/{reset_session_id}/state"),
+            format!("/sessions/{reset_session_id}/runtime-state"),
             None,
         )
         .await;
@@ -438,7 +443,7 @@ async fn e2e_scenario_22_rest_runtime_reset_and_retire_drain_staged_inputs() {
     let (status, accepted) = request_json(
         &app,
         Method::POST,
-        format!("/runtime/{retire_session_id}/accept"),
+        format!("/sessions/{retire_session_id}/accept-input"),
         Some(durable_prompt_input(
             "Remember rest-retire-22 and apply it before retirement completes.",
         )),
@@ -450,7 +455,7 @@ async fn e2e_scenario_22_rest_runtime_reset_and_retire_drain_staged_inputs() {
     let (status, retire_payload) = request_json(
         &app,
         Method::POST,
-        format!("/runtime/{retire_session_id}/retire"),
+        format!("/sessions/{retire_session_id}/retire-runtime"),
         None,
     )
     .await;
@@ -476,7 +481,7 @@ async fn e2e_scenario_22_rest_runtime_reset_and_retire_drain_staged_inputs() {
     let (status, runtime_state) = request_json(
         &app,
         Method::GET,
-        format!("/runtime/{retire_session_id}/state"),
+        format!("/sessions/{retire_session_id}/runtime-state"),
         None,
     )
     .await;
@@ -486,7 +491,7 @@ async fn e2e_scenario_22_rest_runtime_reset_and_retire_drain_staged_inputs() {
     let (status, rejected) = request_json(
         &app,
         Method::POST,
-        format!("/runtime/{retire_session_id}/accept"),
+        format!("/sessions/{retire_session_id}/accept-input"),
         Some(durable_prompt_input(
             "This should be rejected while retired.",
         )),
@@ -502,7 +507,7 @@ async fn e2e_scenario_22_rest_runtime_reset_and_retire_drain_staged_inputs() {
     let (status, reset_payload) = request_json(
         &app,
         Method::POST,
-        format!("/runtime/{retire_session_id}/reset"),
+        format!("/sessions/{retire_session_id}/reset-runtime"),
         None,
     )
     .await;
@@ -518,7 +523,7 @@ async fn e2e_scenario_22_rest_runtime_reset_and_retire_drain_staged_inputs() {
     let (status, runtime_state) = request_json(
         &app,
         Method::GET,
-        format!("/runtime/{retire_session_id}/state"),
+        format!("/sessions/{retire_session_id}/runtime-state"),
         None,
     )
     .await;
@@ -530,7 +535,7 @@ async fn e2e_scenario_22_rest_runtime_reset_and_retire_drain_staged_inputs() {
     let (status, accepted) = request_json(
         &app,
         Method::POST,
-        format!("/runtime/{retire_session_id}/accept"),
+        format!("/sessions/{retire_session_id}/accept-input"),
         Some(durable_prompt_input(
             "Remember retired-reset-22 and reply briefly when asked.",
         )),

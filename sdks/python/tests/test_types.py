@@ -1082,7 +1082,7 @@ async def test_client_mob_lifecycle_and_send_methods_use_explicit_rpc_methods():
                 "status": "active",
                 "tokens_used": 5,
                 "is_final": False,
-                "agent_runtime_id": "agent-a:1",
+                "agent_runtime_id": {"identity": "agent-a", "generation": 1},
                 "fence_token": 7,
                 "realtime_attachment_status": "binding_ready",
             }
@@ -1105,7 +1105,7 @@ async def test_client_mob_lifecycle_and_send_methods_use_explicit_rpc_methods():
                 "members": [
                     {
                         "agent_identity": "agent-a",
-                        "agent_runtime_id": "agent-a:1",
+                        "agent_runtime_id": {"identity": "agent-a", "generation": 1},
                         "fence_token": 7,
                         "status": "active",
                         "tokens_used": 3,
@@ -1118,7 +1118,7 @@ async def test_client_mob_lifecycle_and_send_methods_use_explicit_rpc_methods():
                 "members": [
                     {
                         "agent_identity": "agent-a",
-                        "agent_runtime_id": "agent-a:1",
+                        "agent_runtime_id": {"identity": "agent-a", "generation": 1},
                         "fence_token": 7,
                         "status": "active",
                         "tokens_used": 3,
@@ -1128,7 +1128,7 @@ async def test_client_mob_lifecycle_and_send_methods_use_explicit_rpc_methods():
             }
         if method == "mob/append_system_context":
             return {"mob_id": "mob-1", "agent_identity": "agent-a", "status": "staged"}
-        if method == "runtime/realtime_attachment_status":
+        if method == "session/realtime_attachment_status":
             return {"status": "binding_ready"}
         return {}
 
@@ -1217,7 +1217,7 @@ async def test_client_mob_lifecycle_and_send_methods_use_explicit_rpc_methods():
         "mob/spawn",
         "mob/retire",
         "mob/member_status",
-        "runtime/realtime_attachment_status",
+        "session/realtime_attachment_status",
         "mob/respawn",
         "mob/wire",
         "mob/unwire",

@@ -76,14 +76,14 @@ rkat-rpc [--realm <id>] [--isolated] [--instance <id>] [--realm-backend <sqlite|
 | `realtime/open_info` | Realtime | Get bootstrap metadata for opening a realtime channel |
 | `realtime/status` | Realtime | Read product-layer realtime channel status for a target |
 | `realtime/capabilities` | Realtime | Read product-layer realtime capabilities for a target |
-| `runtime/state` | Runtime | Read runtime-backed ingress state |
-| `runtime/realtime_attachment_status` | Runtime | Read runtime-backed realtime attachment status for a session |
-| `runtime/realtime_attachment_statuses` | Runtime | Batch read realtime attachment statuses for many sessions |
-| `runtime/accept` | Runtime | Admit external work directly into runtime ingress |
-| `runtime/retire` | Runtime | Retire runtime-backed ingress |
-| `runtime/reset` | Runtime | Reset runtime-backed ingress |
-| `input/state` | Runtime | Read runtime input lifecycle state |
-| `input/list` | Runtime | List runtime input lifecycle records |
+| `session/runtime_state` | Runtime | Read runtime-backed ingress state |
+| `session/realtime_attachment_status` | Runtime | Read runtime-backed realtime attachment status for a session |
+| `session/realtime_attachment_statuses` | Runtime | Batch read realtime attachment statuses for many sessions |
+| `session/accept_input` | Runtime | Admit external work directly into runtime ingress |
+| `session/retire_runtime` | Runtime | Retire runtime-backed ingress |
+| `session/reset_runtime` | Runtime | Reset runtime-backed ingress |
+| `session/input_state` | Runtime | Read runtime input lifecycle state |
+| `session/inputs` | Runtime | List runtime input lifecycle records |
 | `session/stream_open` | Session | Open a standalone session event stream |
 | `session/stream_close` | Session | Close a standalone session event stream |
 | `mob/create` | Mob | Create a mob from a definition (mob feature) |
@@ -165,7 +165,7 @@ rkat-rpc [--realm <id>] [--isolated] [--instance <id>] [--realm-backend <sqlite|
 | `realm/get` | Realm | Get full realm connection set |
 
 <Note>
-`runtime/*` and `input/*` methods are advertised only when the server is running with the runtime-backed ingress/control-plane surface enabled.
+`session/runtime_state`, `session/accept_input`, `session/retire_runtime`, `session/reset_runtime`, `session/input_state`, `session/inputs` are advertised only when the server is running with the runtime-backed ingress/control-plane surface enabled.
 </Note>
 
 <Note>
@@ -173,8 +173,8 @@ Realtime is a delivery mode of the session's LLM, driven by
 `ModelCapabilities.realtime`. To enable realtime audio on a session,
 create the session with a realtime-capable model (for example
 `gpt-realtime-1.5`); transport attach/detach is managed automatically by
-the runtime. Observe status via `runtime/realtime_attachment_status`
-(single) or `runtime/realtime_attachment_statuses` (batch). There is no
+the runtime. Observe status via `session/realtime_attachment_status`
+(single) or `session/realtime_attachment_statuses` (batch). There is no
 caller-initiated attach/detach RPC.
 </Note>
 
@@ -246,8 +246,8 @@ Handshake. Returns server capabilities.
       "capabilities/get", "models/catalog",
       "skills/list", "skills/inspect",
       "realtime/open_info", "realtime/status", "realtime/capabilities",
-      "runtime/state", "runtime/realtime_attachment_status", "runtime/realtime_attachment_statuses", "runtime/accept", "runtime/retire", "runtime/reset",
-      "input/state", "input/list",
+      "session/runtime_state", "session/realtime_attachment_status", "session/realtime_attachment_statuses", "session/accept_input", "session/retire_runtime", "session/reset_runtime",
+      "session/input_state", "session/inputs",
       "session/stream_open", "session/stream_close",
       "mob/create", "mob/list", "mob/status",
       "mob/members", "mob/spawn", "mob/spawn_many",
@@ -848,12 +848,12 @@ To make a session realtime, set its model to `gpt-realtime-1.5` at
 
 The runtime inspects `ModelCapabilities.realtime` for the resolved
 model and brings up the OpenAI Realtime transport automatically. Poll
-`runtime/realtime_attachment_status` to confirm the binding reaches
+`session/realtime_attachment_status` to confirm the binding reaches
 `binding_ready`, then call `realtime/open_info` to obtain a bootstrap
 token for the audio WebSocket on hosts that expose the realtime websocket service. See the [Realtime
 guide](/guides/realtime) for the full flow.
 
-### runtime/realtime_attachment_status
+### session/realtime_attachment_status
 
 Read the runtime-owned realtime attachment status projection for a session.
 
@@ -862,7 +862,7 @@ Read the runtime-owned realtime attachment status projection for a session.
 {
   "jsonrpc": "2.0",
   "id": 22,
-  "method": "runtime/realtime_attachment_status",
+  "method": "session/realtime_attachment_status",
   "params": {
     "session_id": "01936f8a-7b2c-7000-8000-000000000001"
   }
@@ -885,7 +885,7 @@ Status values: `unattached`, `intent_present_unbound`, `binding_not_ready`, `bin
 
 `mob/member_status` responses include the same value under the `realtime_attachment_status` field for sessions bound to mob members.
 
-### runtime/realtime_attachment_statuses
+### session/realtime_attachment_statuses
 
 Batch read of realtime attachment status for multiple sessions in a single round trip. Useful for observing all members of a mob at once.
 
@@ -894,7 +894,7 @@ Batch read of realtime attachment status for multiple sessions in a single round
 {
   "jsonrpc": "2.0",
   "id": 23,
-  "method": "runtime/realtime_attachment_statuses",
+  "method": "session/realtime_attachment_statuses",
   "params": {
     "session_ids": [
       "01936f8a-7b2c-7000-8000-000000000001",

@@ -18,8 +18,8 @@ session-owned.
 - There is **no caller-facing attach/detach RPC**. The runtime attaches and
   detaches the transport automatically as part of session creation and
   `reconfigure_live_topology`.
-- `runtime/realtime_attachment_status` and
-  `runtime/realtime_attachment_statuses` are the canonical observation APIs for
+- `session/realtime_attachment_status` and
+  `session/realtime_attachment_statuses` are the canonical observation APIs for
   attachment state.
 - `realtime/open_info`, `realtime/status`, and `realtime/capabilities` are the
   product-layer bootstrap and inspection APIs.

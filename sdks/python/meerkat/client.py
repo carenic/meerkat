@@ -144,18 +144,29 @@ def _skill_refs_to_wire(refs: list[SkillRef] | None) -> list[dict[str, str]] | N
 
 
 def _parse_agent_runtime_id_wire(raw: Any) -> tuple[str, int | None]:
-    if isinstance(raw, str) and raw:
-        return raw, None
-    if isinstance(raw, dict):
-        identity = raw.get("identity")
-        if not isinstance(identity, str) or not identity:
-            identity = raw.get("agent_identity")
-        generation = raw.get("generation")
-        if isinstance(identity, str) and identity:
-            if isinstance(generation, int):
-                return f"{identity}:{generation}", generation
-            return identity, None
-    return "", None
+    """Parse the canonical ``{identity, generation}`` wire shape.
+
+    The server emits ``AgentRuntimeId`` as an object with ``identity`` and
+    ``generation`` fields; the SDK surfaces it as a ``"identity:generation"``
+    display string plus the raw generation counter. Any other shape is a
+    protocol error — no string legacy form, no ``agent_identity`` alias, no
+    fabrication.
+    """
+    if raw is None:
+        return "", None
+    if not isinstance(raw, dict):
+        raise MeerkatError(
+            "INVALID_RESPONSE",
+            f"Invalid agent_runtime_id wire shape: expected object, got {type(raw).__name__}",
+        )
+    identity = raw.get("identity")
+    generation = raw.get("generation")
+    if not isinstance(identity, str) or not identity or not isinstance(generation, int):
+        raise MeerkatError(
+            "INVALID_RESPONSE",
+            "Invalid agent_runtime_id wire shape: missing identity/generation",
+        )
+    return f"{identity}:{generation}", generation
 
 
 class MeerkatClient:
@@ -1038,34 +1049,6 @@ class MeerkatClient:
     async def mob_status(self, mob_id: str) -> dict[str, Any]:
         return await self._request("mob/status", {"mob_id": mob_id})
 
-    @staticmethod
-    def _legacy_member_identity_key() -> str:
-        return "_".join(("meerkat", "id"))
-
-    async def _request_with_member_identity_compat(
-        self,
-        method: str,
-        params: dict[str, Any],
-    ) -> dict[str, Any]:
-        try:
-            return await self._request(method, params)
-        except MeerkatError as error:
-            legacy_identity_key = self._legacy_member_identity_key()
-            message = str(error)
-            agent_identity = params.get("agent_identity")
-            missing_legacy = "missing field" in message and legacy_identity_key in message
-            unknown_agent_identity = "unknown field `agent_identity`" in message
-            if (
-                not (missing_legacy or unknown_agent_identity)
-                or not isinstance(agent_identity, str)
-                or not agent_identity
-            ):
-                raise
-            legacy_params = dict(params)
-            legacy_params[legacy_identity_key] = agent_identity
-            legacy_params.pop("agent_identity", None)
-            return await self._request(method, legacy_params)
-
     async def list_mob_members(self, mob_id: str) -> list[MobMember]:
         result = await self._request("mob/members", {"mob_id": mob_id})
         members = result.get("members", [])
@@ -1167,7 +1150,7 @@ class MeerkatClient:
         handling_mode: Literal["queue", "steer"] = "queue",
         render_metadata: RenderMetadata | None = None,
     ) -> dict[str, Any]:
-        result = await self._request_with_member_identity_compat(
+        result = await self._request(
             "mob/member_send",
             {
                 "mob_id": mob_id,
@@ -1184,17 +1167,14 @@ class MeerkatClient:
                 "Invalid mob/member_send response: missing member_ref",
             )
         receipt_handling_mode = result.get("handling_mode")
+        resolved_identity = result.get("agent_identity")
+        if not isinstance(resolved_identity, str) or not resolved_identity:
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                "Invalid mob/member_send response: missing agent_identity",
+            )
         return {
-            "agent_identity": (
-                result["agent_identity"]
-                if isinstance(result.get("agent_identity"), str)
-                and result["agent_identity"]
-                else (
-                    result["identity"]
-                    if isinstance(result.get("identity"), str) and result["identity"]
-                    else agent_identity
-                )
-            ),
+            "agent_identity": resolved_identity,
             "member_ref": member_ref,
             "handling_mode": (
                 receipt_handling_mode
@@ -1227,17 +1207,13 @@ class MeerkatClient:
             "context": context,
             "additional_instructions": additional_instructions,
         }
-        result = await self._request_with_member_identity_compat("mob/spawn", params)
-        resolved_identity = (
-            result["agent_identity"]
-            if isinstance(result.get("agent_identity"), str)
-            and result["agent_identity"]
-            else (
-                result["identity"]
-                if isinstance(result.get("identity"), str) and result["identity"]
-                else agent_identity
+        result = await self._request("mob/spawn", params)
+        resolved_identity = result.get("agent_identity")
+        if not isinstance(resolved_identity, str) or not resolved_identity:
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                "Invalid mob/spawn response: missing agent_identity",
             )
-        )
         member_ref = result.get("member_ref")
         if not isinstance(member_ref, str) or not member_ref:
             raise MeerkatError(
@@ -1260,23 +1236,7 @@ class MeerkatClient:
             "mob_id": mob_id,
             "specs": specs,
         }
-        legacy_identity_key = self._legacy_member_identity_key()
-        try:
-            result = await self._request("mob/spawn_many", params)
-        except MeerkatError as error:
-            message = str(error)
-            if "missing field" not in message or legacy_identity_key not in message:
-                raise
-            legacy_specs: list[dict[str, Any]] = []
-            for spec in specs:
-                legacy_spec = dict(spec)
-                if "agent_identity" in legacy_spec:
-                    legacy_spec[legacy_identity_key] = legacy_spec.pop("agent_identity")
-                legacy_specs.append(legacy_spec)
-            result = await self._request(
-                "mob/spawn_many",
-                {"mob_id": mob_id, "specs": legacy_specs},
-            )
+        result = await self._request("mob/spawn_many", params)
         entries = result.get("results", [])
         if not isinstance(entries, list):
             return []
@@ -1329,7 +1289,7 @@ class MeerkatClient:
         return {"events": events if isinstance(events, list) else []}
 
     async def retire_mob_member(self, mob_id: str, agent_identity: str) -> None:
-        await self._request_with_member_identity_compat(
+        await self._request(
             "mob/retire", {"mob_id": mob_id, "agent_identity": agent_identity}
         )
 
@@ -1339,7 +1299,7 @@ class MeerkatClient:
         agent_identity: str,
         initial_message: str | list[dict] | None = None,
     ) -> MobRespawnResult:
-        result = await self._request_with_member_identity_compat(
+        result = await self._request(
             "mob/respawn",
             {
                 "mob_id": mob_id,
@@ -1355,19 +1315,15 @@ class MeerkatClient:
                     "INVALID_RESPONSE",
                     "Invalid mob/respawn response: receipt missing member_ref",
                 )
+            resolved_identity = receipt.get("agent_identity")
+            if not isinstance(resolved_identity, str) or not resolved_identity:
+                raise MeerkatError(
+                    "INVALID_RESPONSE",
+                    "Invalid mob/respawn response: receipt missing agent_identity",
+                )
             result = dict(result)
             result["receipt"] = {
-                "agent_identity": (
-                    receipt["agent_identity"]
-                    if isinstance(receipt.get("agent_identity"), str)
-                    and receipt["agent_identity"]
-                    else (
-                        receipt["identity"]
-                        if isinstance(receipt.get("identity"), str)
-                        and receipt["identity"]
-                        else agent_identity
-                    )
-                ),
+                "agent_identity": resolved_identity,
                 "member_ref": member_ref,
             }
         return {
@@ -1389,7 +1345,7 @@ class MeerkatClient:
         }
 
     async def force_cancel_mob_member(self, mob_id: str, agent_identity: str) -> None:
-        await self._request_with_member_identity_compat(
+        await self._request(
             "mob/force_cancel",
             {"mob_id": mob_id, "agent_identity": agent_identity},
         )
@@ -1409,7 +1365,7 @@ class MeerkatClient:
     async def mob_member_status(
         self, mob_id: str, agent_identity: str
     ) -> MobMemberSnapshot:
-        result = await self._request_with_member_identity_compat(
+        result = await self._request(
             "mob/member_status",
             {"mob_id": mob_id, "agent_identity": agent_identity},
         )
@@ -1595,7 +1551,7 @@ class MeerkatClient:
         backend: str | None = None,
     ) -> MobHelperResult:
         canonical_role_name = role_name if role_name is not None else profile_name
-        result = await self._request_with_member_identity_compat("mob/spawn_helper", {
+        result = await self._request("mob/spawn_helper", {
             "mob_id": mob_id,
             "prompt": prompt,
             "agent_identity": agent_identity,
@@ -1635,7 +1591,7 @@ class MeerkatClient:
         backend: str | None = None,
     ) -> MobHelperResult:
         canonical_role_name = role_name if role_name is not None else profile_name
-        result = await self._request_with_member_identity_compat("mob/fork_helper", {
+        result = await self._request("mob/fork_helper", {
             "mob_id": mob_id,
             "source_member_id": source_member_id,
             "prompt": prompt,
@@ -1815,26 +1771,22 @@ class MeerkatClient:
         source: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        result = await self._request_with_member_identity_compat("mob/append_system_context", {
+        result = await self._request("mob/append_system_context", {
             "mob_id": mob_id,
             "agent_identity": agent_identity,
             "text": text,
             "source": source,
             "idempotency_key": idempotency_key,
         })
+        resolved_identity = result.get("agent_identity")
+        if not isinstance(resolved_identity, str) or not resolved_identity:
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                "Invalid mob/append_system_context response: missing agent_identity",
+            )
         return {
             "mob_id": str(result.get("mob_id", mob_id)),
-            "agent_identity": (
-                str(result["agent_identity"])
-                if isinstance(result.get("agent_identity"), str)
-                and str(result["agent_identity"])
-                else (
-                    str(result["identity"])
-                    if isinstance(result.get("identity"), str)
-                    and str(result["identity"])
-                    else agent_identity
-                )
-            ),
+            "agent_identity": resolved_identity,
             "status": (
                 "duplicate"
                 if result.get("status") == "duplicate"
@@ -1883,7 +1835,7 @@ class MeerkatClient:
         if not self._dispatcher:
             raise MeerkatError("NOT_CONNECTED", "Client not connected")
         if open_method == "mob/stream_open" and "agent_identity" in params:
-            result = await self._request_with_member_identity_compat(open_method, params)
+            result = await self._request(open_method, params)
         else:
             result = await self._request(open_method, params)
         stream_id = str(result.get("stream_id", ""))
@@ -2111,14 +2063,14 @@ class MeerkatClient:
         return await self._request("comms/peers", {"session_id": session_id})
 
     async def runtime_state(self, session_id: str) -> RuntimeStateResult:
-        raw = await self._request("runtime/state", {"session_id": session_id})
+        raw = await self._request("session/runtime_state", {"session_id": session_id})
         return RuntimeStateResult(**raw)
 
     async def runtime_realtime_attachment_status(
         self, session_id: str
     ) -> RuntimeRealtimeAttachmentStatusResult:
         raw = await self._request(
-            "runtime/realtime_attachment_status",
+            "session/realtime_attachment_status",
             {"session_id": session_id},
         )
         return RuntimeRealtimeAttachmentStatusResult(**raw)
@@ -2132,7 +2084,7 @@ class MeerkatClient:
         downcast per their schema types.
         """
         return await self._request(
-            "runtime/realtime_attachment_statuses",
+            "session/realtime_attachment_statuses",
             {"session_ids": session_ids},
         )
 
@@ -2193,7 +2145,7 @@ class MeerkatClient:
         session_id: str,
         input: dict[str, Any],
     ) -> RuntimeAcceptResult:
-        raw = await self._request("runtime/accept", {"session_id": session_id, "input": input})
+        raw = await self._request("session/accept_input", {"session_id": session_id, "input": input})
         state = raw.get("state")
         if isinstance(state, dict):
             raw = dict(raw)
@@ -2201,21 +2153,21 @@ class MeerkatClient:
         return RuntimeAcceptResult(**raw)
 
     async def runtime_retire(self, session_id: str) -> RuntimeRetireResult:
-        raw = await self._request("runtime/retire", {"session_id": session_id})
+        raw = await self._request("session/retire_runtime", {"session_id": session_id})
         return RuntimeRetireResult(**raw)
 
     async def runtime_reset(self, session_id: str) -> RuntimeResetResult:
-        raw = await self._request("runtime/reset", {"session_id": session_id})
+        raw = await self._request("session/reset_runtime", {"session_id": session_id})
         return RuntimeResetResult(**raw)
 
     async def input_state(self, session_id: str, input_id: str) -> WireInputState | None:
-        raw = await self._request("input/state", {"session_id": session_id, "input_id": input_id})
+        raw = await self._request("session/input_state", {"session_id": session_id, "input_id": input_id})
         if raw is None:
             return None
         return self._parse_wire_input_state(raw)
 
     async def input_list(self, session_id: str) -> list[str]:
-        result = await self._request("input/list", {"session_id": session_id})
+        result = await self._request("session/inputs", {"session_id": session_id})
         input_ids = result.get("input_ids", [])
         return [str(input_id) for input_id in input_ids]
 

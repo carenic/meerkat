@@ -146,29 +146,36 @@ interface PlatformTarget {
   binaryName: string;
 }
 
+/**
+ * Parse the canonical `{identity, generation}` wire shape for an
+ * `AgentRuntimeId`. Any other shape is a protocol error — no string
+ * legacy form, no `agent_identity` alias, no fabrication.
+ */
 function parseAgentRuntimeId(raw: unknown): { value: string; generation?: number } {
-  if (typeof raw === "string") {
-    return { value: raw };
+  if (raw == null) {
+    return { value: "" };
   }
-  if (raw && typeof raw === "object") {
-    const record = raw as Record<string, unknown>;
-    const identity =
-      record.identity != null
-        ? String(record.identity)
-        : (record.agent_identity != null ? String(record.agent_identity) : "");
-    const generationRaw = record.generation;
-    const generation =
-      typeof generationRaw === "number" && Number.isFinite(generationRaw)
-        ? generationRaw
-        : undefined;
-    if (identity.length > 0 && generation !== undefined) {
-      return { value: `${identity}:${generation}`, generation };
-    }
-    if (identity.length > 0) {
-      return { value: identity, generation };
-    }
+  if (typeof raw !== "object") {
+    throw new MeerkatError(
+      "INVALID_RESPONSE",
+      `Invalid agent_runtime_id wire shape: expected object, got ${typeof raw}`,
+    );
   }
-  return { value: "" };
+  const record = raw as Record<string, unknown>;
+  const identity = record.identity;
+  const generationRaw = record.generation;
+  if (
+    typeof identity !== "string" ||
+    identity.length === 0 ||
+    typeof generationRaw !== "number" ||
+    !Number.isFinite(generationRaw)
+  ) {
+    throw new MeerkatError(
+      "INVALID_RESPONSE",
+      "Invalid agent_runtime_id wire shape: missing identity/generation",
+    );
+  }
+  return { value: `${identity}:${generationRaw}`, generation: generationRaw };
 }
 
 /** Options for connecting to the rkat-rpc runtime. */
@@ -1816,11 +1823,11 @@ export class MeerkatClient {
   }
 
   async runtimeState(sessionId: string): Promise<RuntimeStateResult> {
-    const result = await this.request("runtime/state", { session_id: sessionId });
+    const result = await this.request("session/runtime_state", { session_id: sessionId });
     if (typeof result.state !== "string" || result.state.length === 0) {
       throw new MeerkatError(
         "INVALID_RESPONSE",
-        "Invalid runtime/state response: missing state",
+        "Invalid session/runtime_state response: missing state",
       );
     }
     return result as unknown as RuntimeStateResult;
@@ -1829,13 +1836,13 @@ export class MeerkatClient {
   async runtimeRealtimeAttachmentStatus(
     sessionId: string,
   ): Promise<RuntimeRealtimeAttachmentStatusResult> {
-    const result = await this.request("runtime/realtime_attachment_status", {
+    const result = await this.request("session/realtime_attachment_status", {
       session_id: sessionId,
     });
     if (typeof result.status !== "string" || result.status.length === 0) {
       throw new MeerkatError(
         "INVALID_RESPONSE",
-        "Invalid runtime/realtime_attachment_status response: missing status",
+        "Invalid session/realtime_attachment_status response: missing status",
       );
     }
     return result as unknown as RuntimeRealtimeAttachmentStatusResult;
@@ -1845,7 +1852,7 @@ export class MeerkatClient {
   async runtimeRealtimeAttachmentStatuses(
     sessionIds: string[],
   ): Promise<Record<string, unknown>> {
-    return await this.request("runtime/realtime_attachment_statuses", {
+    return await this.request("session/realtime_attachment_statuses", {
       session_ids: sessionIds,
     });
   }
@@ -1926,54 +1933,54 @@ export class MeerkatClient {
     sessionId: string,
     input: Record<string, unknown>,
   ): Promise<RuntimeAcceptResult> {
-    const result = await this.request("runtime/accept", { session_id: sessionId, input });
+    const result = await this.request("session/accept_input", { session_id: sessionId, input });
     if (typeof result.outcome_type !== "string" || result.outcome_type.length === 0) {
       throw new MeerkatError(
         "INVALID_RESPONSE",
-        "Invalid runtime/accept response: missing outcome_type",
+        "Invalid session/accept_input response: missing outcome_type",
       );
     }
     return result as unknown as RuntimeAcceptResult;
   }
 
   async runtimeRetire(sessionId: string): Promise<RuntimeRetireResult> {
-    const result = await this.request("runtime/retire", { session_id: sessionId });
+    const result = await this.request("session/retire_runtime", { session_id: sessionId });
     if (typeof result.inputs_abandoned !== "number") {
       throw new MeerkatError(
         "INVALID_RESPONSE",
-        "Invalid runtime/retire response: missing inputs_abandoned",
+        "Invalid session/retire_runtime response: missing inputs_abandoned",
       );
     }
     return result as unknown as RuntimeRetireResult;
   }
 
   async runtimeReset(sessionId: string): Promise<RuntimeResetResult> {
-    const result = await this.request("runtime/reset", { session_id: sessionId });
+    const result = await this.request("session/reset_runtime", { session_id: sessionId });
     if (typeof result.inputs_abandoned !== "number") {
       throw new MeerkatError(
         "INVALID_RESPONSE",
-        "Invalid runtime/reset response: missing inputs_abandoned",
+        "Invalid session/reset_runtime response: missing inputs_abandoned",
       );
     }
     return result as unknown as RuntimeResetResult;
   }
 
   async inputState(sessionId: string, inputId: string): Promise<WireInputState | null> {
-    const result = await this.request("input/state", { session_id: sessionId, input_id: inputId });
+    const result = await this.request("session/input_state", { session_id: sessionId, input_id: inputId });
     if (result === null) {
       return null;
     }
     if (typeof result !== "object" || result === null) {
       throw new MeerkatError(
         "INVALID_RESPONSE",
-        "Invalid input/state response: expected object or null",
+        "Invalid session/input_state response: expected object or null",
       );
     }
     return result as unknown as WireInputState;
   }
 
   async inputList(sessionId: string): Promise<string[]> {
-    const result = (await this.request("input/list", {
+    const result = (await this.request("session/inputs", {
       session_id: sessionId,
     })) as unknown as InputListResult;
     return Array.isArray(result.input_ids)

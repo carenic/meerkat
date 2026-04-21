@@ -168,7 +168,7 @@
   },
   "InputListParams": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Request payload for `input/list`.",
+    "description": "Request payload for `session/inputs`.",
     "properties": {
       "session_id": {
         "type": "string"
@@ -182,7 +182,7 @@
   },
   "InputStateParams": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Request payload for `input/state`.",
+    "description": "Request payload for `session/input_state`.",
     "properties": {
       "input_id": {
         "type": "string"
@@ -1914,7 +1914,7 @@
   },
   "RuntimeAcceptParams": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Request payload for `runtime/accept`.",
+    "description": "Request payload for `session/accept_input`.",
     "properties": {
       "input": true,
       "session_id": {
@@ -1930,7 +1930,7 @@
   },
   "RuntimeRealtimeAttachmentStatusParams": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Request payload for `runtime/realtime_attachment_status`.",
+    "description": "Request payload for `session/realtime_attachment_status`.",
     "properties": {
       "session_id": {
         "type": "string"
@@ -1944,7 +1944,7 @@
   },
   "RuntimeResetParams": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Request payload for `runtime/reset`.",
+    "description": "Request payload for `session/reset_runtime`.",
     "properties": {
       "session_id": {
         "type": "string"
@@ -1958,7 +1958,7 @@
   },
   "RuntimeRetireParams": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Request payload for `runtime/retire`.",
+    "description": "Request payload for `session/retire_runtime`.",
     "properties": {
       "session_id": {
         "type": "string"
@@ -1972,7 +1972,7 @@
   },
   "RuntimeStateParams": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Request payload for `runtime/state`.",
+    "description": "Request payload for `session/runtime_state`.",
     "properties": {
       "session_id": {
         "type": "string"

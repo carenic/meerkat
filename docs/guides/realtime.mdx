@@ -9,7 +9,7 @@ Realtime in Meerkat is **a delivery mode of the session's LLM, not a separate su
 This guide covers the capability-driven model, how to enable realtime on a session, how to observe the attachment status, and the live-topology reconfigure flow for swapping the session's model while a realtime binding is active.
 
 <Note>
-Public API surfaces describe `realtime`, not `voice`. The converged vocabulary is `ModelCapabilities.realtime`, `runtime/realtime_attachment_status`, and the `realtime/*` bootstrap methods (`realtime/open_info`, `realtime/status`, `realtime/capabilities`). Internal Rust symbols still use `live_` in some places (for example `attach_live`, `detach_live`, `reconfigure_live_topology`) — those are runtime-internal implementation details, not a caller-invoked surface.
+Public API surfaces describe `realtime`, not `voice`. The converged vocabulary is `ModelCapabilities.realtime`, `session/realtime_attachment_status`, and the `realtime/*` bootstrap methods (`realtime/open_info`, `realtime/status`, `realtime/capabilities`). Internal Rust symbols still use `live_` in some places (for example `attach_live`, `detach_live`, `reconfigure_live_topology`) — those are runtime-internal implementation details, not a caller-invoked surface.
 </Note>
 
 ## Mental model
@@ -89,7 +89,7 @@ async with MeerkatClient() as client:
 ```
 </CodeGroup>
 
-The runtime resolves the model, sees `ModelCapabilities.realtime == true`, and brings up the realtime transport automatically. Poll `runtime/realtime_attachment_status` (below) to confirm the binding has reached `BindingReady`.
+The runtime resolves the model, sees `ModelCapabilities.realtime == true`, and brings up the realtime transport automatically. Poll `session/realtime_attachment_status` (below) to confirm the binding has reached `BindingReady`.
 
 ### Configuration defaults
 
@@ -103,14 +103,14 @@ When the swap targets a realtime-capable model, the runtime mints a fresh author
 
 ## Observing attachment status
 
-The runtime-owned `RealtimeAttachmentStatus` is surfaced by `runtime/realtime_attachment_status`:
+The runtime-owned `RealtimeAttachmentStatus` is surfaced by `session/realtime_attachment_status`:
 
 <CodeGroup>
 ```json JSON-RPC (single session)
 {
   "jsonrpc": "2.0",
   "id": 2,
-  "method": "runtime/realtime_attachment_status",
+  "method": "session/realtime_attachment_status",
   "params": {"session_id": "01936f8a-7b2c-7000-8000-000000000001"}
 }
 // => { "session_id": "...", "status": "binding_ready" }
@@ -120,14 +120,14 @@ The runtime-owned `RealtimeAttachmentStatus` is surfaced by `runtime/realtime_at
 {
   "jsonrpc": "2.0",
   "id": 3,
-  "method": "runtime/realtime_attachment_statuses",
+  "method": "session/realtime_attachment_statuses",
   "params": {"session_ids": ["01936f8a-...", "01936f8b-..."]}
 }
 // => { "statuses": [{ "session_id": "...", "status": "binding_ready" }, ...] }
 ```
 
 ```bash REST
-curl http://127.0.0.1:8080/runtime/01936f8a-.../realtime_attachment_status
+curl http://127.0.0.1:8080/sessions/01936f8a-.../realtime-attachment-status
 # => {"session_id": "...", "status": "binding_ready"}
 ```
 </CodeGroup>
@@ -175,7 +175,7 @@ Three product-layer RPC methods help callers open and inspect the actual audio t
 These are emitted by `rkat-rpc`'s realtime WebSocket listener. Callers typically:
 
 1. Create or resume a session on a realtime-capable model.
-2. Poll `runtime/realtime_attachment_status` until it reports `binding_ready`.
+2. Poll `session/realtime_attachment_status` until it reports `binding_ready`.
 3. Ensure the host actually exposes the realtime websocket bootstrap service.
 4. Call `realtime/open_info` to obtain a bootstrap token.
 5. Open a WebSocket to the bootstrap URL to exchange audio chunks.
@@ -308,7 +308,7 @@ provider = "openai"
 peer_description = "Realtime host"
 ```
 
-Every member spawned under that profile is initialized on `gpt-realtime-1.5` and its session gets a realtime binding automatically. Use `runtime/realtime_attachment_statuses` with the member session IDs to observe attachment state across the whole mob in one round trip.
+Every member spawned under that profile is initialized on `gpt-realtime-1.5` and its session gets a realtime binding automatically. Use `session/realtime_attachment_statuses` with the member session IDs to observe attachment state across the whole mob in one round trip.
 
 ## Limitations and known gaps
 
@@ -321,7 +321,7 @@ Every member spawned under that profile is initialized on `gpt-realtime-1.5` and
 
 - [Mobs guide](/guides/mobs) — spawning members, profiles, realtime-capable per-member models
 - [Configuration guide](/concepts/configuration) — setting `default_model`
-- [JSON-RPC API](/api/rpc) — `session/create`, `runtime/realtime_attachment_status`, `runtime/realtime_attachment_statuses`, `realtime/*` bootstrap
+- [JSON-RPC API](/api/rpc) — `session/create`, `session/realtime_attachment_status`, `session/realtime_attachment_statuses`, `realtime/*` bootstrap
 - [REST API](/api/rest) — REST routes for session creation and realtime attachment status
 - Internal architecture reference: `.claude/skills/meerkat-architecture/references/realtime-attachment.md`
 - Product design record: `docs/architecture/identity-first-live-voice-proposal.md`

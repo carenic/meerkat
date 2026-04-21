@@ -41,12 +41,12 @@ CANONICAL_APP_RPC_METHODS = {
     "realtime/open_info",
     "realtime/status",
     "realtime/capabilities",
-    "runtime/state",
-    "runtime/accept",
-    "runtime/retire",
-    "runtime/reset",
-    "input/state",
-    "input/list",
+    "session/runtime_state",
+    "session/accept_input",
+    "session/retire_runtime",
+    "session/reset_runtime",
+    "session/input_state",
+    "session/inputs",
     "mob/create",
     "mob/list",
     "mob/status",
@@ -111,12 +111,12 @@ RPC_PUBLIC_WRAPPERS: dict[str, tuple[type, str]] = {
     "realtime/open_info": (MeerkatClient, "realtime_open_info"),
     "realtime/status": (MeerkatClient, "realtime_status"),
     "realtime/capabilities": (MeerkatClient, "realtime_capabilities"),
-    "runtime/state": (MeerkatClient, "runtime_state"),
-    "runtime/accept": (MeerkatClient, "runtime_accept"),
-    "runtime/retire": (MeerkatClient, "runtime_retire"),
-    "runtime/reset": (MeerkatClient, "runtime_reset"),
-    "input/state": (MeerkatClient, "input_state"),
-    "input/list": (MeerkatClient, "input_list"),
+    "session/runtime_state": (MeerkatClient, "runtime_state"),
+    "session/accept_input": (MeerkatClient, "runtime_accept"),
+    "session/retire_runtime": (MeerkatClient, "runtime_retire"),
+    "session/reset_runtime": (MeerkatClient, "runtime_reset"),
+    "session/input_state": (MeerkatClient, "input_state"),
+    "session/inputs": (MeerkatClient, "input_list"),
     "mob/create": (MeerkatClient, "create_mob"),
     "mob/list": (MeerkatClient, "list_mobs"),
     "mob/status": (Mob, "status"),
@@ -334,3 +334,52 @@ async def test_get_mob_profile_not_found_returns_none():
 
     result = await client.get_mob_profile("worker")
     assert result is None
+
+
+def test_sdk_never_uses_deprecated_runtime_or_input_method_strings():
+    """Row 29 regression gate: the public Python SDK must not re-introduce
+    the infrastructure-shaped `runtime/*` or `input/*` method verbs.
+    """
+    import pathlib
+
+    sdk_src = pathlib.Path(__file__).parent.parent / "meerkat"
+    forbidden = [
+        '"runtime/state"',
+        '"runtime/accept"',
+        '"runtime/retire"',
+        '"runtime/reset"',
+        '"runtime/realtime_attachment_status"',
+        '"runtime/realtime_attachment_statuses"',
+        '"input/state"',
+        '"input/list"',
+    ]
+    for path in sdk_src.rglob("*.py"):
+        if "generated" in path.parts:
+            continue
+        text = path.read_text()
+        for needle in forbidden:
+            assert needle not in text, (
+                f"Deprecated method string {needle!r} must not appear in {path}"
+            )
+
+
+def test_parse_agent_runtime_id_wire_rejects_string_form():
+    """Row 31 regression gate: the SDK must not accept legacy string-form
+    `agent_runtime_id`. The canonical wire shape is
+    `{"identity": "...", "generation": N}`; anything else is a protocol
+    error that must surface as a typed `MeerkatError`.
+    """
+    from meerkat.client import MeerkatError, _parse_agent_runtime_id_wire
+
+    with pytest.raises(MeerkatError):
+        _parse_agent_runtime_id_wire("worker:1")
+    with pytest.raises(MeerkatError):
+        _parse_agent_runtime_id_wire({"agent_identity": "worker", "generation": 1})
+    with pytest.raises(MeerkatError):
+        _parse_agent_runtime_id_wire({"identity": "worker"})
+    # Canonical form succeeds; `None` still threads through as absence.
+    assert _parse_agent_runtime_id_wire({"identity": "worker", "generation": 2}) == (
+        "worker:2",
+        2,
+    )
+    assert _parse_agent_runtime_id_wire(None) == ("", None)

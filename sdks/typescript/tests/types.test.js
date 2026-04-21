@@ -1202,7 +1202,7 @@ describe("Mob kickoff wait wrappers", () => {
         members: [
           {
             agent_identity: "lead",
-            agent_runtime_id: "lead:1",
+            agent_runtime_id: { identity: "lead", generation: 1 },
             fence_token: 1,
             status: "active",
             tokens_used: 42,
@@ -1263,7 +1263,7 @@ describe("Mob ready wait wrappers", () => {
         members: [
           {
             agent_identity: "lead",
-            agent_runtime_id: "lead:1",
+            agent_runtime_id: { identity: "lead", generation: 1 },
             fence_token: 1,
             status: "active",
             tokens_used: 42,
