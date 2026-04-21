@@ -1103,12 +1103,17 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                         let initial_baseline_ms = session_context
                             .install_observer_with_baseline(Arc::clone(&bridge_observer));
                         _bridge_observer = Some(bridge_observer);
-                        // Re-seed the DSL freshness to `Clean { baseline }` at
-                        // the sampled watermark. Any concurrent advance visible
-                        // through the bridge arrives as an observer call, which
-                        // routes to `projection_advance_observed` and re-enters
-                        // the DSL under its authority lock — safe.
-                        let _ = product_turn.projection_reset(initial_baseline_ms);
+                        // Seed the DSL freshness frontier to the sampled
+                        // watermark without scrubbing a newer observer tick that
+                        // might land after the install but before this seed call
+                        // runs. `projection_refreshed(baseline)` advances a
+                        // clean frontier to `baseline` in the common case, but
+                        // if a concurrent `context_advanced` already pushed the
+                        // frontier higher via the bridge observer, the
+                        // `not_behind_frontier` guard rejects and preserves the
+                        // owed stale state instead of collapsing it back to
+                        // `Clean`.
+                        let _ = product_turn.projection_refreshed(initial_baseline_ms);
                     } else {
                         _wake_observer = None;
                         _bridge_observer = None;

@@ -27,8 +27,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use meerkat_core::handles::{SessionContextAdvancedObserver, SessionContextHandle};
-use meerkat_runtime::handles::{HandleDslAuthority, RuntimeSessionContextHandle};
+use meerkat_core::handles::{
+    RealtimeProductTurnHandle, RealtimeProjectionFreshness, SessionContextAdvancedObserver,
+    SessionContextHandle,
+};
+use meerkat_runtime::handles::{
+    HandleDslAuthority, RuntimeRealtimeProductTurnHandle, RuntimeSessionContextHandle,
+};
 use meerkat_runtime::meerkat_machine::dsl as mm_dsl;
 
 /// Observer that records every `updated_at_ms` it receives, paired with
@@ -87,6 +92,43 @@ fn new_handle() -> RuntimeSessionContextHandle {
     )
     .expect("RegisterSession input");
     RuntimeSessionContextHandle::new(dsl)
+}
+
+fn new_shared_handles() -> (
+    RuntimeSessionContextHandle,
+    Arc<RuntimeRealtimeProductTurnHandle>,
+) {
+    let dsl = Arc::new(HandleDslAuthority::ephemeral());
+    dsl.apply_signal(mm_dsl::MeerkatMachineSignal::Initialize, "test::initialize")
+        .expect("Initialize signal");
+    dsl.apply_input(
+        mm_dsl::MeerkatMachineInput::RegisterSession {
+            session_id: mm_dsl::SessionId::from("session-context-observer-race".to_string()),
+        },
+        "test::register",
+    )
+    .expect("RegisterSession input");
+    (
+        RuntimeSessionContextHandle::new(Arc::clone(&dsl)),
+        Arc::new(RuntimeRealtimeProductTurnHandle::new(dsl)),
+    )
+}
+
+struct BridgeToProductTurn {
+    product_turn: Arc<dyn RealtimeProductTurnHandle>,
+}
+
+impl SessionContextAdvancedObserver for BridgeToProductTurn {
+    fn on_session_context_advanced(&self, updated_at_ms: u64) {
+        let advanced = self
+            .product_turn
+            .projection_advance_observed(updated_at_ms)
+            .expect("projection_advance_observed must not error");
+        assert!(
+            advanced,
+            "bridge observer must advance product-turn freshness at watermark {updated_at_ms}"
+        );
+    }
 }
 
 /// Baseline sanity: an observer installed at watermark 0 receives every
@@ -189,6 +231,52 @@ fn post_install_transitions_fire_through_installed_observer() {
     }
 
     assert_eq!(observer.count(), 10);
+}
+
+/// Regression for the real product-turn bootstrap race: a
+/// `context_advanced(N+1)` that lands after
+/// `install_observer_with_baseline` but before the socket seeds the
+/// product-turn frontier MUST remain stale. The old
+/// `projection_reset(baseline)` bootstrap collapsed this back to
+/// `Clean` at frontier `N+1`, dropping the owed refresh. The fixed
+/// bootstrap uses `projection_refreshed(baseline)`, whose
+/// `not_behind_frontier` guard rejects when a newer observer tick has
+/// already advanced the frontier.
+#[test]
+fn product_turn_seed_preserves_post_install_advance() {
+    let (session_context, product_turn) = new_shared_handles();
+    let bridge_observer: Arc<dyn SessionContextAdvancedObserver> = Arc::new(BridgeToProductTurn {
+        product_turn: Arc::clone(&product_turn) as Arc<dyn RealtimeProductTurnHandle>,
+    });
+
+    let baseline = session_context.install_observer_with_baseline(Arc::clone(&bridge_observer));
+    assert_eq!(baseline, 0);
+
+    assert!(
+        session_context
+            .context_advanced(1)
+            .expect("post-install advance must not error"),
+        "post-install advance must commit"
+    );
+    assert_eq!(
+        product_turn.projection_freshness(),
+        RealtimeProjectionFreshness::StaleImmediate
+    );
+    assert_eq!(product_turn.projection_frontier_ms(), 1);
+
+    let seeded = product_turn
+        .projection_refreshed(baseline)
+        .expect("projection_refreshed seed must not error");
+    assert!(
+        !seeded,
+        "seed at stale baseline must be guard-rejected when a newer advance already landed"
+    );
+    assert_eq!(
+        product_turn.projection_freshness(),
+        RealtimeProjectionFreshness::StaleImmediate,
+        "seed must preserve the owed refresh when a newer post-install advance already fired"
+    );
+    assert_eq!(product_turn.projection_frontier_ms(), 1);
 }
 
 /// Ordering invariant #3 (concurrent install + advance — THE race
