@@ -2283,15 +2283,12 @@ async fn spawn_uds_listener(
             let (keypair, trusted, inbox_sender) =
                 (keypair.clone(), trusted.clone(), inbox_sender.clone());
             tokio::spawn(async move {
-                let trusted_snapshot = trusted.read().clone();
-                let _ = handle_connection(
-                    stream,
-                    require_peer_auth,
-                    &keypair,
-                    &trusted_snapshot,
-                    &inbox_sender,
-                )
-                .await;
+                // Share the router-owned trust handle directly — no
+                // snapshot clone — so the transport trust gate reads the
+                // same live state the inbox admission gate consults.
+                let _ =
+                    handle_connection(stream, require_peer_auth, &keypair, &trusted, &inbox_sender)
+                        .await;
             });
         }
     });
@@ -2312,15 +2309,12 @@ async fn spawn_tcp_listener(
             let (keypair, trusted, inbox_sender) =
                 (keypair.clone(), trusted.clone(), inbox_sender.clone());
             tokio::spawn(async move {
-                let trusted_snapshot = trusted.read().clone();
-                let _ = handle_connection(
-                    stream,
-                    require_peer_auth,
-                    &keypair,
-                    &trusted_snapshot,
-                    &inbox_sender,
-                )
-                .await;
+                // Share the router-owned trust handle directly — no
+                // snapshot clone — so the transport trust gate reads the
+                // same live state the inbox admission gate consults.
+                let _ =
+                    handle_connection(stream, require_peer_auth, &keypair, &trusted, &inbox_sender)
+                        .await;
             });
         }
     });

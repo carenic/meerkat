@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use parking_lot::RwLock;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::Framed;
 
@@ -30,13 +31,15 @@ use crate::types::{Envelope, InboxItem, MessageKind};
 /// * `stream` - The async read/write stream (e.g., TcpStream or UnixStream)
 /// * `keypair` - Our keypair for signing acks
 /// * `require_peer_auth` - Whether to enforce signature+trusted-peer validation
-/// * `trusted` - The list of trusted peers
+/// * `trusted` - Router-owned trust set. The IO task reads through this
+///   shared handle (no snapshot clone) so admission and the transport-level
+///   trust gate cannot diverge on live mutation.
 /// * `inbox_sender` - Channel to send validated messages to the inbox
 pub async fn handle_connection<S>(
     stream: S,
     require_peer_auth: bool,
     keypair: &Keypair,
-    trusted: &TrustedPeers,
+    trusted: &Arc<RwLock<TrustedPeers>>,
     inbox_sender: &InboxSender,
 ) -> Result<(), IoTaskError>
 where
@@ -67,8 +70,13 @@ where
         return Ok(());
     }
 
-    // Check trust
-    if require_peer_auth && !trusted.is_trusted(&envelope.from) {
+    // Trust gate — single read through the router-owned
+    // `Arc<RwLock<TrustedPeers>>`. The inbox admission gate consults the
+    // same handle, so a snapshot divergence between prefilter and admission
+    // is impossible. We keep this check here (rather than deferring all the
+    // way to admission) so untrusted senders do not receive an ack, which
+    // avoids leaking "I'm live" to unauthenticated scanners.
+    if require_peer_auth && !trusted.read().is_trusted(&envelope.from) {
         tracing::warn!(
             "Dropped message {} from {:?}: sender not trusted",
             envelope.id,
@@ -177,15 +185,15 @@ mod tests {
         Keypair::generate()
     }
 
-    fn make_trusted_peers(pubkey: &PubKey) -> TrustedPeers {
-        TrustedPeers {
+    fn make_trusted_peers(pubkey: &PubKey) -> Arc<RwLock<TrustedPeers>> {
+        Arc::new(RwLock::new(TrustedPeers {
             peers: vec![TrustedPeer {
                 name: "test-peer".to_string(),
                 pubkey: *pubkey,
                 addr: "tcp://127.0.0.1:4200".to_string(),
                 meta: crate::PeerMeta::default(),
             }],
-        }
+        }))
     }
 
     fn make_signed_envelope(from_keypair: &Keypair, to: PubKey, kind: MessageKind) -> Envelope {
@@ -234,7 +242,7 @@ mod tests {
         fn _check_signature<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
             _stream: S,
             _keypair: &Keypair,
-            _trusted: &TrustedPeers,
+            _trusted: &Arc<RwLock<TrustedPeers>>,
             _inbox_sender: &InboxSender,
         ) {
             // The handle_connection function exists with correct signature
@@ -759,5 +767,65 @@ mod tests {
         // No inbox item
         let items = inbox.try_drain();
         assert!(items.is_empty());
+    }
+
+    /// Regression: the IO task must read trust through the shared
+    /// `Arc<RwLock<TrustedPeers>>` handle — not a snapshot — so that a
+    /// peer added to the router *after* the connection is accepted is
+    /// still admitted. This locks in the Wave 3 D Row 20 invariant: one
+    /// trust authority, one read path, no snapshot divergence.
+    #[tokio::test]
+    async fn test_io_task_reads_live_trust_after_listener_spawn() {
+        let sender_keypair = make_keypair();
+        let receiver_keypair = make_keypair();
+
+        // Start with an EMPTY trust set. If the IO task snapshotted at
+        // spawn time, the subsequent add below would not be visible and
+        // the envelope would be silently dropped.
+        let trusted = Arc::new(RwLock::new(TrustedPeers { peers: vec![] }));
+        let (mut inbox, inbox_sender) = Inbox::new();
+
+        let envelope = make_signed_envelope(
+            &sender_keypair,
+            receiver_keypair.public_key(),
+            MessageKind::Message {
+                blocks: None,
+                body: "hello".to_string(),
+                handling_mode: None,
+            },
+        );
+        let envelope_id = envelope.id;
+        let bytes = envelope_to_bytes(&envelope).await;
+
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+
+        // Mutate the trust set AFTER the IO task would normally have
+        // snapshotted, but BEFORE the envelope is delivered. The live
+        // read must observe this mutation.
+        trusted.write().peers.push(crate::TrustedPeer {
+            name: "sender".to_string(),
+            pubkey: sender_keypair.public_key(),
+            addr: "tcp://127.0.0.1:0".to_string(),
+            meta: crate::PeerMeta::default(),
+        });
+
+        tokio::spawn(async move {
+            client_write.write_all(&bytes).await.unwrap();
+            // Read the ack to avoid blocking.
+            let mut buf = vec![0u8; 1024];
+            let _ = client_read.read(&mut buf).await;
+        });
+
+        handle_connection(server, true, &receiver_keypair, &trusted, &inbox_sender)
+            .await
+            .unwrap();
+
+        let items = inbox.try_drain();
+        assert_eq!(items.len(), 1, "envelope should be admitted via live trust");
+        match &items[0] {
+            InboxItem::External { envelope } => assert_eq!(envelope.id, envelope_id),
+            _ => panic!("expected External"),
+        }
     }
 }

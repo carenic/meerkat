@@ -101,8 +101,9 @@ pub(crate) fn project_state(
         registration_phase: super::dsl::RegistrationPhase::Queuing,
         drain_phase: super::dsl::DrainPhase::Inactive,
         drain_mode: None,
-        active_filter: String::new(),
-        staged_filter: String::new(),
+        next_staged_visibility_revision: 0,
+        active_filter: super::dsl::ToolFilter::All,
+        staged_filter: super::dsl::ToolFilter::All,
         active_visibility_revision: 0,
         staged_visibility_revision: 0,
         active_deferred_names: std::collections::BTreeSet::new(),
@@ -169,6 +170,11 @@ pub(crate) fn project_state(
         peer_ingress_owner_kind: super::dsl::PeerIngressOwnerKind::Unattached,
         peer_ingress_comms_runtime_id: None,
         peer_ingress_mob_id: None,
+        supervisor_binding_kind: super::dsl::SupervisorBindingKind::Unbound,
+        supervisor_bound_name: None,
+        supervisor_bound_peer_id: None,
+        supervisor_bound_address: None,
+        supervisor_bound_epoch: None,
     }
 }
 

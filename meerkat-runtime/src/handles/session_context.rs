@@ -66,11 +66,54 @@ impl RuntimeSessionContextHandle {
 
 impl SessionContextHandle for RuntimeSessionContextHandle {
     fn context_advanced(&self, updated_at_ms: u64) -> Result<bool, DslTransitionError> {
-        let effects = match self.dsl.apply_input_with_effects(
+        // Sample the observer slot and collect emissions UNDER the DSL
+        // authority lock, then dispatch the observer callback OUTSIDE
+        // the lock.
+        //
+        // The observer must fire post-lock because
+        // `BridgeProjectionToProductTurn::on_session_context_advanced`
+        // re-enters the same authority via `projection_advance_observed`
+        // and the mutex is non-reentrant.
+        //
+        // The atomicity that closes the race PR #286 tried to close
+        // sits at the sample step, not the dispatch step: sampling the
+        // observer slot inside the same DSL critical section that
+        // committed the transition means a concurrent
+        // `install_observer_with_baseline` (which writes the slot under
+        // the same DSL lock via `with_state_lock`) is strictly ordered
+        // relative to this sample. Either the installer ran before the
+        // sample (the sample returns the new observer — correct, the
+        // transition happened inside the observer's lifetime), or it
+        // ran after the sample (the installer's baseline read reflects
+        // this transition's committed state, so the new observer sees
+        // no fire it is owed). The previous implementation released
+        // the lock before reading the slot, allowing an interleaved
+        // install to see the fire of a transition whose effect its
+        // baseline had already captured.
+        let sampled = self.dsl.apply_input_with_effects_and_sample(
             mm_dsl::MeerkatMachineInput::AdvanceSessionContext { updated_at_ms },
             "SessionContextHandle::context_advanced",
-        ) {
-            Ok(effects) => effects,
+            |effects| {
+                let observer_opt = self
+                    .observer
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .and_then(Weak::upgrade);
+                let emissions: Vec<u64> = effects
+                    .iter()
+                    .filter_map(|effect| match effect {
+                        mm_dsl::MeerkatMachineEffect::SessionContextAdvanced {
+                            updated_at_ms: m,
+                        } => Some(*m),
+                        _ => None,
+                    })
+                    .collect();
+                (observer_opt, emissions)
+            },
+        );
+        let (observer_opt, emissions) = match sampled {
+            Ok(pair) => pair,
             // The monotonic guard surfaces as a typed `GuardRejected` —
             // treat as `Ok(false)` so callers can fire unconditionally
             // without tracking their own watermark. Any other rejection
@@ -79,21 +122,9 @@ impl SessionContextHandle for RuntimeSessionContextHandle {
             Err(err) if err.is_guard_rejected() => return Ok(false),
             Err(err) => return Err(err),
         };
-
-        let observer_opt = self
-            .observer
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .and_then(Weak::upgrade);
         if let Some(observer) = observer_opt {
-            for effect in effects {
-                if let mm_dsl::MeerkatMachineEffect::SessionContextAdvanced {
-                    updated_at_ms: emitted,
-                } = effect
-                {
-                    observer.on_session_context_advanced(emitted);
-                }
+            for emitted in emissions {
+                observer.on_session_context_advanced(emitted);
             }
         }
         Ok(true)

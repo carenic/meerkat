@@ -782,10 +782,11 @@ pub trait SessionContextHandle: Send + Sync {
 /// `SessionContextAdvanced` effect is emitted (W2-E / issue #264).
 ///
 /// The realtime projection consumer implements this to advance its typed
-/// `ProjectionFreshness` state. The observer is invoked under the same
-/// authority lock as the transition that emitted the effect, so the
-/// "mutation → transition → observer" chain is causal, not lexically
-/// adjacent.
+/// `ProjectionFreshness` state. Runtime handles sample the installed
+/// observer under the same authority lock as the transition that emitted
+/// the effect, then dispatch the callback immediately after releasing the
+/// lock so re-entrant observer implementations can safely route back
+/// through the same DSL authority.
 pub trait SessionContextAdvancedObserver: Send + Sync {
     /// Called once per emitted `SessionContextAdvanced { updated_at_ms }`
     /// effect. `updated_at_ms` is the monotonic millisecond watermark of
@@ -997,8 +998,9 @@ pub trait InteractionStreamHandle: Send + Sync {
 ///
 /// Shell-owned projection consumers (the comms runtime's
 /// `interaction_stream_registry`) implement this to drop channel entries
-/// keyed on the terminated correlation id under the same authority lock as
-/// the transition that emitted the effect.
+/// keyed on the terminated correlation id. Runtime handles sample the
+/// observer under the same authority lock as the transition that emitted
+/// the effect, then dispatch after releasing the lock.
 pub trait InteractionStreamCleanupObserver: Send + Sync {
     /// Called once per emitted `InteractionStreamCleanup { corr_id }` effect.
     ///
@@ -1068,9 +1070,10 @@ pub enum RealtimeReconnectPolicy {
 ///
 /// Shell-owned consumers (the realtime-WS dispatch loop) implement this to
 /// wake the socket's `tokio::select!` loop so it can read the new freshness
-/// state and drain if necessary. Called under the same authority lock as
-/// the transition that emitted the effect, so the "advance → state
-/// change → shell wake" chain is causal.
+/// state and drain if necessary. Runtime handles sample the observer under
+/// the same authority lock as the transition that emitted the effect, then
+/// dispatch after releasing the lock so future observers can safely
+/// re-enter the DSL if needed.
 pub trait RealtimeProjectionFreshnessObserver: Send + Sync {
     /// Called once per emitted `RealtimeProjectionFreshnessChanged`
     /// effect. `new_freshness` is the post-transition discriminant;

@@ -489,30 +489,16 @@ impl MeerkatMachine {
                             .tool_visibility_owner,
                     )
                 };
-                let filter_str = serde_json::to_string(&filter).unwrap_or_default();
-                // DSL-first: stage visibility filter before mutation
-                let previous_dsl_state = self
-                    .stage_session_dsl_input(
-                        &session_id,
-                        crate::meerkat_machine::dsl::MeerkatMachineInput::StageVisibilityFilter {
-                            filter: filter_str,
-                            // Use a placeholder revision — the real revision comes from the
-                            // owner after mutation. DSL validates the transition shape, not
-                            // the revision value.
-                            revision: 0,
-                        },
-                        "StageVisibilityFilter",
-                    )
-                    .await
-                    .map_err(|reason| RuntimeDriverError::ValidationFailed { reason })?;
-                let revision = match owner.stage_persistent_filter(filter, witnesses) {
-                    Ok(rev) => rev,
-                    Err(err) => {
-                        self.restore_session_dsl_state(&session_id, previous_dsl_state)
-                            .await;
-                        return Err(RuntimeDriverError::Internal(err.to_string()));
-                    }
-                };
+                // Delegate to the owner — the `MachineToolVisibilityOwner`
+                // trait impl fires the `StageVisibilityFilter` DSL input
+                // internally (dogma round 4, wave 2b #12: DSL owns the
+                // `next_staged_visibility_revision` monotonic). The DSL
+                // input's `update {}` increments and stamps the revision
+                // under the authority lock; the owner reads the minted
+                // value back and projects it onto its own state.
+                let revision = owner
+                    .stage_persistent_filter(filter, witnesses)
+                    .map_err(|err| RuntimeDriverError::Internal(err.to_string()))?;
                 Ok(MeerkatMachineCommandResult::VisibilityRevision(revision))
             }
             MeerkatMachineCommand::RequestDeferredTools {
@@ -549,33 +535,13 @@ impl MeerkatMachine {
                             .tool_visibility_owner,
                     )
                 };
-                // Read current accumulated deferred names, union with new names
-                // (request_deferred_tools extends, DSL replaces — pass the full set)
-                let current_names = owner
-                    .visibility_state()
-                    .map(|s| s.staged_requested_deferred_names)
+                // Delegate to the owner — `request_deferred_tools` fires
+                // the `StageDeferredNames` DSL input (with the extended set)
+                // to mint the revision and then projects onto owner state
+                // (dogma round 4, wave 2b #12).
+                let revision = owner
+                    .request_deferred_tools(names, witnesses)
                     .map_err(|err| RuntimeDriverError::Internal(err.to_string()))?;
-                let accumulated_names: BTreeSet<String> =
-                    current_names.union(&names).cloned().collect();
-                // DSL-first: stage deferred names before mutation
-                let previous_dsl_state = self
-                    .stage_session_dsl_input(
-                        &session_id,
-                        crate::meerkat_machine::dsl::MeerkatMachineInput::StageDeferredNames {
-                            names: accumulated_names,
-                        },
-                        "StageDeferredNames",
-                    )
-                    .await
-                    .map_err(|reason| RuntimeDriverError::ValidationFailed { reason })?;
-                let revision = match owner.request_deferred_tools(names, witnesses) {
-                    Ok(rev) => rev,
-                    Err(err) => {
-                        self.restore_session_dsl_state(&session_id, previous_dsl_state)
-                            .await;
-                        return Err(RuntimeDriverError::Internal(err.to_string()));
-                    }
-                };
                 Ok(MeerkatMachineCommandResult::VisibilityRevision(revision))
             }
             MeerkatMachineCommand::PublishCommittedVisibleSet {
@@ -600,73 +566,47 @@ impl MeerkatMachine {
                     return Err(RuntimeDriverError::Destroyed);
                 }
 
-                // Guard: VisibleSurfacesMatchAppliedStateInvariant —
-                // the committed (active) revision must not lag behind the staged
-                // revision. A lagging active revision means the visible set has
-                // not caught up with staged mutations, violating the TLA+
-                // invariant that visible_surfaces == {s : base_state[s] # None}.
-                if visibility_state.active_revision < visibility_state.staged_revision {
-                    return Err(RuntimeDriverError::ValidationFailed {
-                        reason: format!(
-                            "VisibleSurfacesMatchAppliedStateInvariant violated: \
-                             active_revision ({}) < staged_revision ({})",
-                            visibility_state.active_revision, visibility_state.staged_revision,
-                        ),
-                    });
-                }
-
-                if visibility_state.active_revision == visibility_state.staged_revision
-                    && (visibility_state.active_filter != visibility_state.staged_filter
-                        || visibility_state.active_requested_deferred_names
-                            != visibility_state.staged_requested_deferred_names)
-                {
-                    return Err(RuntimeDriverError::ValidationFailed {
-                        reason: "VisibleSurfacesMatchAppliedStateInvariant violated: equal revisions require equal active and staged visibility state".to_string(),
-                    });
-                }
-
-                if !visibility_state
-                    .active_requested_deferred_names
-                    .is_subset(&visibility_state.staged_requested_deferred_names)
-                {
-                    return Err(RuntimeDriverError::ValidationFailed {
-                        reason: "VisibleSurfacesMatchAppliedStateInvariant violated: active requested deferred names must remain a subset of staged requested deferred names".to_string(),
-                    });
-                }
-
                 let gate = self.session_mutation_gate(&session_id).await;
                 let _gate_guard = match gate {
                     Some(ref g) => Some(g.lock().await),
                     None => None,
                 };
 
-                // DSL-first: stage CommitVisibilityFilter + CommitDeferredNames before mutation
+                // DSL-first: fire the canonical typed `PublishCommittedVisibleSet`
+                // input. The per-phase transitions at `dsl::PublishCommittedVisibleSet*`
+                // own the `VisibleSurfacesMatchAppliedStateInvariant`:
+                //
+                //   * `active_not_behind_staged`
+                //   * `equal_revision_requires_equal_active_and_staged_input`
+                //   * `active_requested_subset_of_staged_requested`
+                //
+                // Guard rejections surface as `RuntimeDriverError::ValidationFailed`
+                // via `stage_session_dsl_input`, so the hand-written shell
+                // pre-checks that previously duplicated these invariants have
+                // been deleted — the DSL guard is the single source of truth.
                 let previous_dsl_state = self
                     .stage_session_dsl_input(
                         &session_id,
-                        crate::meerkat_machine::dsl::MeerkatMachineInput::CommitVisibilityFilter {
-                            filter: serde_json::to_string(&visibility_state.active_filter)
-                                .unwrap_or_default(),
-                            revision: visibility_state.active_revision,
+                        crate::meerkat_machine::dsl::MeerkatMachineInput::PublishCommittedVisibleSet {
+                            active_filter: crate::meerkat_machine::dsl::ToolFilter::from(
+                                &visibility_state.active_filter,
+                            ),
+                            staged_filter: crate::meerkat_machine::dsl::ToolFilter::from(
+                                &visibility_state.staged_filter,
+                            ),
+                            active_requested_deferred_names: visibility_state
+                                .active_requested_deferred_names
+                                .clone(),
+                            staged_requested_deferred_names: visibility_state
+                                .staged_requested_deferred_names
+                                .clone(),
+                            active_visibility_revision: visibility_state.active_revision,
+                            staged_visibility_revision: visibility_state.staged_revision,
                         },
-                        "CommitVisibilityFilter",
+                        "PublishCommittedVisibleSet",
                     )
                     .await
                     .map_err(|reason| RuntimeDriverError::ValidationFailed { reason })?;
-                if let Err(reason) = self
-                    .stage_session_dsl_input(
-                        &session_id,
-                        crate::meerkat_machine::dsl::MeerkatMachineInput::CommitDeferredNames {
-                            names: visibility_state.active_requested_deferred_names.clone(),
-                        },
-                        "CommitDeferredNames",
-                    )
-                    .await
-                {
-                    self.restore_session_dsl_state(&session_id, previous_dsl_state)
-                        .await;
-                    return Err(RuntimeDriverError::ValidationFailed { reason });
-                }
 
                 {
                     let sessions = self.sessions.read().await;

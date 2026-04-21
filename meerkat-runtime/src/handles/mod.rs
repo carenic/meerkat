@@ -140,6 +140,51 @@ impl HandleDslAuthority {
             .map_err(|err| map_kernel_error(err, context))
     }
 
+    /// Apply a DSL input, run `sample` on the emitted effects *while still
+    /// holding the authority mutex*, and return the closure's result.
+    ///
+    /// The closure is the observer-sample seam: it runs inside the same
+    /// critical section that committed the transition, so any observer
+    /// slot the caller reads is totally ordered with respect to a
+    /// concurrent `with_state_lock`-based installer. The caller fires the
+    /// sampled observer AFTER this method returns (i.e., after the
+    /// mutex has been released), which matters because observer
+    /// callbacks typically re-enter the same authority via another
+    /// handle method (e.g. `projection_advance_observed`) and the mutex
+    /// is non-reentrant.
+    ///
+    /// Invariant closed by this method: a handle-local observer slot
+    /// installed under `with_state_lock` sees no fires from transitions
+    /// whose critical sections committed before its install — because
+    /// the fire path samples the slot inside the same DSL-lock that
+    /// committed the transition, and an installer running after the
+    /// sample is ordered strictly after this transition's commit. The
+    /// original post-lock-release observer read in the prior
+    /// implementation allowed an install to interleave between commit
+    /// and observer-read, so a just-installed observer saw a fire whose
+    /// effect the installer's baseline had already captured — the race
+    /// PR #286 attempted to close by construction.
+    ///
+    /// Lock order matches [`Self::apply_input_with_effects`] (DSL
+    /// first); the closure may acquire handle-local locks it already
+    /// nests inside the DSL lock elsewhere (e.g., the `observer:
+    /// RwLock<Option<Weak<...>>>` slot) without deadlock.
+    pub fn apply_input_with_effects_and_sample<S>(
+        &self,
+        input: mm_dsl::MeerkatMachineInput,
+        context: &'static str,
+        sample: impl FnOnce(&[mm_dsl::MeerkatMachineEffect]) -> S,
+    ) -> Result<S, DslTransitionError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let effects = mm_dsl::MeerkatMachineMutator::apply(&mut *guard, input)
+            .map(|transition| transition.effects)
+            .map_err(|err| map_kernel_error(err, context))?;
+        Ok(sample(&effects))
+    }
+
     /// Apply a DSL signal under the shared authority's mutex.
     pub fn apply_signal(
         &self,

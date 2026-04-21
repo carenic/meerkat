@@ -20,7 +20,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use meerkat_core::BlobStore;
 use meerkat_core::lifecycle::core_executor::CoreApplyOutput;
@@ -95,7 +95,10 @@ mod session_management;
 mod traits;
 mod visibility;
 
-pub use comms_drain::{CommsDrainMode, CommsDrainPhase, DrainExitReason, PeerIngressOwner};
+pub use comms_drain::{
+    CommsDrainMode, CommsDrainPhase, DrainExitReason, PeerIngressOwner, SupervisorBinding,
+    SupervisorBindingStageError,
+};
 pub(crate) use comms_drain::{CommsDrainSlot, abort_slot};
 pub(crate) use visibility::MachineToolVisibilityOwner;
 

@@ -79,37 +79,61 @@ impl RuntimeRealtimeProductTurnHandle {
     }
 
     /// Apply an input that may emit `RealtimeProjectionFreshnessChanged`
-    /// effects, dispatching each emission to the installed freshness
-    /// observer under the same authority lock that produced the effect.
+    /// effects, sampling the installed freshness observer under the
+    /// same DSL lock that committed the transition and dispatching the
+    /// observer callback post-lock.
+    ///
+    /// Same race-closing pattern as `session_context.rs`: the sample
+    /// inside the DSL critical section ensures a concurrent
+    /// `install_projection_freshness_observer` is totally ordered vs
+    /// this transition, so a just-installed observer cannot receive a
+    /// fire whose state it already reflects in its install snapshot.
+    /// The dispatch runs post-lock because the wake observer
+    /// (`RealtimeSocketFreshnessWake`) uses `try_send` on an mpsc that
+    /// doesn't re-enter the authority, but keeping dispatch outside
+    /// the lock is uniform with the session-context seam and guards
+    /// against future observers that might.
     fn apply_idempotent_with_freshness_effects(
         &self,
         input: mm_dsl::MeerkatMachineInput,
         context: &'static str,
     ) -> Result<bool, DslTransitionError> {
-        let effects = match self.dsl.apply_input_with_effects(input, context) {
-            Ok(effects) => effects,
+        type FreshnessEmission = (mm_dsl::RealtimeProjectionFreshness, u64);
+        let sampled: Option<(
+            Arc<dyn RealtimeProjectionFreshnessObserver>,
+            Vec<FreshnessEmission>,
+        )> = match self
+            .dsl
+            .apply_input_with_effects_and_sample(input, context, |effects| {
+                let observer_opt = self
+                    .freshness_observer
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .and_then(Weak::upgrade);
+                let observer = observer_opt?;
+                let emissions: Vec<FreshnessEmission> = effects
+                    .iter()
+                    .filter_map(|effect| match effect {
+                        mm_dsl::MeerkatMachineEffect::RealtimeProjectionFreshnessChanged {
+                            new_freshness,
+                            frontier_ms,
+                        } => Some((*new_freshness, *frontier_ms)),
+                        _ => None,
+                    })
+                    .collect();
+                Some((observer, emissions))
+            }) {
+            Ok(sampled) => sampled,
             Err(err) if err.is_guard_rejected() => return Ok(false),
             Err(err) => return Err(err),
         };
-
-        let observer_opt = self
-            .freshness_observer
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .and_then(Weak::upgrade);
-        if let Some(observer) = observer_opt {
-            for effect in effects {
-                if let mm_dsl::MeerkatMachineEffect::RealtimeProjectionFreshnessChanged {
-                    new_freshness,
+        if let Some((observer, emissions)) = sampled {
+            for (new_freshness, frontier_ms) in emissions {
+                observer.on_realtime_projection_freshness_changed(
+                    map_freshness(new_freshness),
                     frontier_ms,
-                } = effect
-                {
-                    observer.on_realtime_projection_freshness_changed(
-                        map_freshness(new_freshness),
-                        frontier_ms,
-                    );
-                }
+                );
             }
         }
         Ok(true)
