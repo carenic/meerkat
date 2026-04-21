@@ -7,7 +7,7 @@
 )]
 
 use meerkat_machine_kernels::generated::flow_frame;
-use meerkat_machine_kernels::{KernelInput, KernelState, KernelValue};
+use meerkat_machine_kernels::test_oracle::{KernelInput, KernelState, KernelValue};
 use std::collections::{BTreeMap, BTreeSet};
 
 // Helper: build a KernelValue::NamedVariant for NodeRunStatus
@@ -168,12 +168,12 @@ fn start_frame_input_dag_a_then_b() -> KernelInput {
 /// node_status[n] == Ready <-> n in ready_queue
 #[test]
 fn test_ready_queue_invariant_holds_across_all_transitions() {
-    let state = flow_frame::initial_state().expect("init");
+    let state = flow_frame::initial_state_raw().expect("init");
     assert_ready_queue_invariant(&state, "initial");
 
     // StartRootFrame with A->B DAG
     let start_input = start_frame_input_dag_a_then_b();
-    let outcome = flow_frame::transition(&state, &start_input).expect("StartRootFrame");
+    let outcome = flow_frame::transition_raw(&state, &start_input).expect("StartRootFrame");
     let state = outcome.next_state;
     assert_ready_queue_invariant(&state, "after StartRootFrame");
 
@@ -190,7 +190,7 @@ fn test_ready_queue_invariant_holds_across_all_transitions() {
         variant: "AdmitNextReadyNode".into(),
         fields: BTreeMap::new(),
     };
-    let outcome = flow_frame::transition(&state, &admit_input).expect("AdmitNextReadyNode");
+    let outcome = flow_frame::transition_raw(&state, &admit_input).expect("AdmitNextReadyNode");
     let state = outcome.next_state;
     assert_ready_queue_invariant(&state, "after AdmitNextReadyNode");
     // A should now be Running, not in queue
@@ -208,7 +208,7 @@ fn test_ready_queue_invariant_holds_across_all_transitions() {
         variant: "CompleteNode".into(),
         fields: BTreeMap::from([("node_id".into(), str_val("node-a"))]),
     };
-    let outcome = flow_frame::transition(&state, &complete_input).expect("CompleteNode");
+    let outcome = flow_frame::transition_raw(&state, &complete_input).expect("CompleteNode");
     let state = outcome.next_state;
     assert_ready_queue_invariant(&state, "after CompleteNode A");
     // B should now be in queue
@@ -224,7 +224,7 @@ fn test_ready_queue_invariant_holds_across_all_transitions() {
         variant: "AdmitNextReadyNode".into(),
         fields: BTreeMap::new(),
     };
-    let outcome = flow_frame::transition(&state, &admit_input).expect("AdmitNextReadyNode B");
+    let outcome = flow_frame::transition_raw(&state, &admit_input).expect("AdmitNextReadyNode B");
     let state = outcome.next_state;
     assert_ready_queue_invariant(&state, "after AdmitNextReadyNode B");
 
@@ -233,7 +233,7 @@ fn test_ready_queue_invariant_holds_across_all_transitions() {
         variant: "CompleteNode".into(),
         fields: BTreeMap::from([("node_id".into(), str_val("node-b"))]),
     };
-    let outcome = flow_frame::transition(&state, &complete_b).expect("CompleteNode B");
+    let outcome = flow_frame::transition_raw(&state, &complete_b).expect("CompleteNode B");
     let state = outcome.next_state;
     assert_ready_queue_invariant(&state, "after CompleteNode B");
 
@@ -242,7 +242,7 @@ fn test_ready_queue_invariant_holds_across_all_transitions() {
         variant: "SealFrame".into(),
         fields: BTreeMap::new(),
     };
-    let outcome = flow_frame::transition(&state, &term_input).expect("SealFrame");
+    let outcome = flow_frame::transition_raw(&state, &term_input).expect("SealFrame");
     let state = outcome.next_state;
     assert_ready_queue_invariant(&state, "after SealFrame");
     assert_eq!(state.phase, "Completed");
@@ -254,7 +254,7 @@ fn test_refresh_ready_frontier_seeds_roots_on_start_frame() {
     let node_a = str_val("node-a");
     let node_b = str_val("node-b");
     let node_c = str_val("node-c");
-    let state = flow_frame::initial_state().expect("init");
+    let state = flow_frame::initial_state_raw().expect("init");
     let start = KernelInput {
         variant: "StartRootFrame".into(),
         fields: BTreeMap::from([
@@ -301,7 +301,7 @@ fn test_refresh_ready_frontier_seeds_roots_on_start_frame() {
             ),
         ]),
     };
-    let outcome = flow_frame::transition(&state, &start).expect("StartRootFrame");
+    let outcome = flow_frame::transition_raw(&state, &start).expect("StartRootFrame");
     let state = outcome.next_state;
     let queue = match state.fields.get("ready_queue").expect("rq") {
         KernelValue::Seq(v) => v.clone(),
@@ -328,9 +328,9 @@ fn test_refresh_ready_frontier_seeds_roots_on_start_frame() {
 
 #[test]
 fn test_admit_step_run_pops_head_and_marks_running() {
-    let state = flow_frame::initial_state().expect("init");
+    let state = flow_frame::initial_state_raw().expect("init");
     let start = start_frame_input_single_root_node();
-    let outcome = flow_frame::transition(&state, &start).expect("StartRootFrame");
+    let outcome = flow_frame::transition_raw(&state, &start).expect("StartRootFrame");
     let state = outcome.next_state;
 
     // Queue: [A], status[A] = Ready
@@ -338,7 +338,7 @@ fn test_admit_step_run_pops_head_and_marks_running() {
         variant: "AdmitNextReadyNode".into(),
         fields: BTreeMap::new(),
     };
-    let outcome = flow_frame::transition(&state, &admit).expect("AdmitNextReadyNode");
+    let outcome = flow_frame::transition_raw(&state, &admit).expect("AdmitNextReadyNode");
     let state = outcome.next_state;
 
     // Queue should be empty, status[A] should be Running
@@ -374,9 +374,9 @@ fn test_admit_skip_when_all_dep_failed() {
     // After A fails, B should be admitted as Skip
     let node_a = str_val("node-a");
     let node_b = str_val("node-b");
-    let state = flow_frame::initial_state().expect("init");
+    let state = flow_frame::initial_state_raw().expect("init");
     let start = start_frame_input_dag_a_then_b();
-    let outcome = flow_frame::transition(&state, &start).expect("StartRootFrame");
+    let outcome = flow_frame::transition_raw(&state, &start).expect("StartRootFrame");
     let state = outcome.next_state;
 
     // Admit A
@@ -384,7 +384,7 @@ fn test_admit_skip_when_all_dep_failed() {
         variant: "AdmitNextReadyNode".into(),
         fields: BTreeMap::new(),
     };
-    let outcome = flow_frame::transition(&state, &admit).expect("admit A");
+    let outcome = flow_frame::transition_raw(&state, &admit).expect("admit A");
     let state = outcome.next_state;
 
     // Fail A
@@ -392,7 +392,7 @@ fn test_admit_skip_when_all_dep_failed() {
         variant: "FailNode".into(),
         fields: BTreeMap::from([("node_id".into(), node_a.clone())]),
     };
-    let outcome = flow_frame::transition(&state, &fail_a).expect("FailNode A");
+    let outcome = flow_frame::transition_raw(&state, &fail_a).expect("FailNode A");
     let state = outcome.next_state;
     // After A fails, B should be in ready_queue (eligible for skip)
     assert_ready_queue_invariant(&state, "after FailNode A");
@@ -410,7 +410,7 @@ fn test_admit_skip_when_all_dep_failed() {
         variant: "AdmitNextReadyNode".into(),
         fields: BTreeMap::new(),
     };
-    let outcome = flow_frame::transition(&state, &admit_b).expect("admit B");
+    let outcome = flow_frame::transition_raw(&state, &admit_b).expect("admit B");
     let state = outcome.next_state;
     let status_b = state.fields.get("node_status").and_then(|m| {
         if let KernelValue::Map(m) = m {
@@ -431,7 +431,7 @@ fn test_admit_skip_when_all_dep_failed() {
 fn test_admit_loop_node_emits_start_loop_node() {
     // Single node "loop-node" with kind=Loop, no deps
     let loop_node = str_val("loop-node");
-    let state = flow_frame::initial_state().expect("init");
+    let state = flow_frame::initial_state_raw().expect("init");
     let start = KernelInput {
         variant: "StartRootFrame".into(),
         fields: BTreeMap::from([
@@ -456,7 +456,7 @@ fn test_admit_loop_node_emits_start_loop_node() {
             ),
         ]),
     };
-    let outcome = flow_frame::transition(&state, &start).expect("StartRootFrame");
+    let outcome = flow_frame::transition_raw(&state, &start).expect("StartRootFrame");
     let state = outcome.next_state;
     assert_ready_queue_invariant(&state, "after StartRootFrame loop");
 
@@ -464,7 +464,7 @@ fn test_admit_loop_node_emits_start_loop_node() {
         variant: "AdmitNextReadyNode".into(),
         fields: BTreeMap::new(),
     };
-    let outcome = flow_frame::transition(&state, &admit).expect("AdmitNextReadyNode loop");
+    let outcome = flow_frame::transition_raw(&state, &admit).expect("AdmitNextReadyNode loop");
 
     // Should emit StartLoopNode (not AdmitStepWork)
     assert!(
@@ -497,7 +497,7 @@ fn test_admit_fail_when_any_mode_all_deps_skipped_or_failed() {
         variant: "Any".into(),
     };
 
-    let state = flow_frame::initial_state().expect("init");
+    let state = flow_frame::initial_state_raw().expect("init");
     let start = KernelInput {
         variant: "StartRootFrame".into(),
         fields: BTreeMap::from([
@@ -544,7 +544,7 @@ fn test_admit_fail_when_any_mode_all_deps_skipped_or_failed() {
             ),
         ]),
     };
-    let outcome = flow_frame::transition(&state, &start).expect("StartRootFrame");
+    let outcome = flow_frame::transition_raw(&state, &start).expect("StartRootFrame");
     let mut state = outcome.next_state;
     assert_ready_queue_invariant(&state, "after StartRootFrame");
 
@@ -554,7 +554,7 @@ fn test_admit_fail_when_any_mode_all_deps_skipped_or_failed() {
             variant: "AdmitNextReadyNode".into(),
             fields: BTreeMap::new(),
         };
-        let outcome = flow_frame::transition(&state, &admit).expect("admit root");
+        let outcome = flow_frame::transition_raw(&state, &admit).expect("admit root");
         state = outcome.next_state;
         assert_ready_queue_invariant(&state, "after admit root");
 
@@ -563,7 +563,7 @@ fn test_admit_fail_when_any_mode_all_deps_skipped_or_failed() {
             variant: "SkipNode".into(),
             fields: BTreeMap::from([("node_id".into(), node.clone())]),
         };
-        let outcome = flow_frame::transition(&state, &skip).expect("skip root");
+        let outcome = flow_frame::transition_raw(&state, &skip).expect("skip root");
         state = outcome.next_state;
         assert_ready_queue_invariant(&state, "after skip root");
     }
@@ -584,7 +584,7 @@ fn test_admit_fail_when_any_mode_all_deps_skipped_or_failed() {
         variant: "AdmitNextReadyNode".into(),
         fields: BTreeMap::new(),
     };
-    let outcome = flow_frame::transition(&state, &admit_c).expect("admit C");
+    let outcome = flow_frame::transition_raw(&state, &admit_c).expect("admit C");
     let state = outcome.next_state;
 
     let status_c = state.fields.get("node_status").and_then(|m| {
@@ -605,9 +605,9 @@ fn test_admit_fail_when_any_mode_all_deps_skipped_or_failed() {
 #[test]
 fn test_ready_frontier_emits_ready_frontier_changed_effect() {
     // StartRootFrame should emit ReadyFrontierChanged when root nodes exist
-    let state = flow_frame::initial_state().expect("init");
+    let state = flow_frame::initial_state_raw().expect("init");
     let start = start_frame_input_single_root_node();
-    let outcome = flow_frame::transition(&state, &start).expect("StartRootFrame");
+    let outcome = flow_frame::transition_raw(&state, &start).expect("StartRootFrame");
     assert!(
         outcome
             .effects

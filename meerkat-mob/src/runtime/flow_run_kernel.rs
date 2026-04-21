@@ -7,11 +7,7 @@ use crate::run::{FlowRunConfig, MobRun, MobRunStatus};
 use crate::store::{MobEventStore, MobRunStore};
 use async_trait::async_trait;
 use indexmap::IndexMap;
-use meerkat_machine_kernels::generated::flow_run;
-use meerkat_machine_kernels::{
-    KernelEffect, KernelInput, KernelState, KernelValue, TransitionOutcome,
-};
-use std::collections::BTreeMap;
+use meerkat_machine_kernels::generated::flow_run::{self, inputs};
 use std::sync::Arc;
 
 mod sealed {
@@ -82,7 +78,7 @@ pub trait FlowRunMutator: sealed::Sealed {
         &self,
         run_id: &RunId,
         step_id: &StepId,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError>;
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError>;
 
     /// Complete a step.
     async fn complete_step(&self, run_id: &RunId, step_id: &StepId) -> Result<bool, MobError>;
@@ -92,7 +88,7 @@ pub trait FlowRunMutator: sealed::Sealed {
         &self,
         run_id: &RunId,
         step_id: &StepId,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError>;
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError>;
 
     /// Record step output.
     async fn record_step_output(&self, run_id: &RunId, step_id: &StepId) -> Result<bool, MobError>;
@@ -102,7 +98,7 @@ pub trait FlowRunMutator: sealed::Sealed {
         &self,
         run_id: &RunId,
         step_id: &StepId,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError>;
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError>;
 
     /// Record that a step's condition passed.
     async fn condition_passed(&self, run_id: &RunId, step_id: &StepId) -> Result<bool, MobError>;
@@ -115,7 +111,7 @@ pub trait FlowRunMutator: sealed::Sealed {
         &self,
         run_id: &RunId,
         step_id: &StepId,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError>;
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError>;
 
     /// Fail a step.
     async fn fail_step(&self, run_id: &RunId, step_id: &StepId) -> Result<bool, MobError>;
@@ -125,7 +121,7 @@ pub trait FlowRunMutator: sealed::Sealed {
         &self,
         run_id: &RunId,
         step_id: &StepId,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError>;
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError>;
 
     /// Skip a step.
     async fn skip_step(&self, run_id: &RunId, step_id: &StepId) -> Result<bool, MobError>;
@@ -135,7 +131,7 @@ pub trait FlowRunMutator: sealed::Sealed {
         &self,
         run_id: &RunId,
         step_id: &StepId,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError>;
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError>;
 
     /// Cancel a step.
     async fn cancel_step(&self, run_id: &RunId, step_id: &StepId) -> Result<bool, MobError>;
@@ -162,7 +158,7 @@ pub trait FlowRunMutator: sealed::Sealed {
         run_id: &RunId,
         step_id: &StepId,
         target_id: &str,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError>;
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError>;
 
     /// Record a target failure.
     async fn record_target_failure(
@@ -178,7 +174,7 @@ pub trait FlowRunMutator: sealed::Sealed {
         run_id: &RunId,
         step_id: &StepId,
         target_id: &str,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError>;
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError>;
 
     /// Record a target canceled.
     async fn record_target_canceled(
@@ -194,7 +190,7 @@ pub trait FlowRunMutator: sealed::Sealed {
         run_id: &RunId,
         step_id: &StepId,
         target_id: &str,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError>;
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError>;
 
     /// Record a terminal failure for a target (no retry possible).
     async fn record_target_terminal_failure(
@@ -239,29 +235,188 @@ pub struct FlowRunKernel {
     terminalization: FlowTerminalizationAuthority,
 }
 
+#[derive(Clone)]
+enum FlowRunCommand {
+    StartRun,
+    DispatchStep {
+        step_id: StepId,
+    },
+    CompleteStep {
+        step_id: StepId,
+    },
+    RecordStepOutput {
+        step_id: StepId,
+    },
+    ConditionPassed {
+        step_id: StepId,
+    },
+    ConditionRejected {
+        step_id: StepId,
+    },
+    FailStep {
+        step_id: StepId,
+    },
+    SkipStep {
+        step_id: StepId,
+    },
+    ProjectFrameStepStatus {
+        step_id: StepId,
+        step_status: flow_run::StepRunStatus,
+        append_failure_ledger: bool,
+    },
+    CancelStep {
+        step_id: StepId,
+    },
+    RegisterTargets {
+        step_id: StepId,
+        target_count: u32,
+    },
+    RecordTargetSuccess {
+        step_id: StepId,
+        target_id: flow_run::MeerkatId,
+    },
+    RecordTargetFailure {
+        step_id: StepId,
+        target_id: flow_run::MeerkatId,
+        retry_key: String,
+    },
+    RecordTargetCanceled {
+        step_id: StepId,
+        target_id: flow_run::MeerkatId,
+    },
+    RecordTargetTerminalFailure {
+        step_id: StepId,
+    },
+    TerminalizeCompleted,
+    TerminalizeFailed,
+    TerminalizeCanceled,
+}
+
+impl FlowRunCommand {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::StartRun => "StartRun",
+            Self::DispatchStep { .. } => "DispatchStep",
+            Self::CompleteStep { .. } => "CompleteStep",
+            Self::RecordStepOutput { .. } => "RecordStepOutput",
+            Self::ConditionPassed { .. } => "ConditionPassed",
+            Self::ConditionRejected { .. } => "ConditionRejected",
+            Self::FailStep { .. } => "FailStep",
+            Self::SkipStep { .. } => "SkipStep",
+            Self::ProjectFrameStepStatus { .. } => "ProjectFrameStepStatus",
+            Self::CancelStep { .. } => "CancelStep",
+            Self::RegisterTargets { .. } => "RegisterTargets",
+            Self::RecordTargetSuccess { .. } => "RecordTargetSuccess",
+            Self::RecordTargetFailure { .. } => "RecordTargetFailure",
+            Self::RecordTargetCanceled { .. } => "RecordTargetCanceled",
+            Self::RecordTargetTerminalFailure { .. } => "RecordTargetTerminalFailure",
+            Self::TerminalizeCompleted => "TerminalizeCompleted",
+            Self::TerminalizeFailed => "TerminalizeFailed",
+            Self::TerminalizeCanceled => "TerminalizeCanceled",
+        }
+    }
+
+    fn into_input(self) -> flow_run::Input {
+        match self {
+            Self::StartRun => flow_run::Input::StartRun(inputs::StartRun {}),
+            Self::DispatchStep { step_id } => flow_run::Input::DispatchStep(inputs::DispatchStep {
+                step_id: step_id.to_string(),
+            }),
+            Self::CompleteStep { step_id } => flow_run::Input::CompleteStep(inputs::CompleteStep {
+                step_id: step_id.to_string(),
+            }),
+            Self::RecordStepOutput { step_id } => {
+                flow_run::Input::RecordStepOutput(inputs::RecordStepOutput {
+                    step_id: step_id.to_string(),
+                })
+            }
+            Self::ConditionPassed { step_id } => {
+                flow_run::Input::ConditionPassed(inputs::ConditionPassed {
+                    step_id: step_id.to_string(),
+                })
+            }
+            Self::ConditionRejected { step_id } => {
+                flow_run::Input::ConditionRejected(inputs::ConditionRejected {
+                    step_id: step_id.to_string(),
+                })
+            }
+            Self::FailStep { step_id } => flow_run::Input::FailStep(inputs::FailStep {
+                step_id: step_id.to_string(),
+            }),
+            Self::SkipStep { step_id } => flow_run::Input::SkipStep(inputs::SkipStep {
+                step_id: step_id.to_string(),
+            }),
+            Self::ProjectFrameStepStatus {
+                step_id,
+                step_status,
+                append_failure_ledger,
+            } => flow_run::Input::ProjectFrameStepStatus(inputs::ProjectFrameStepStatus {
+                step_id: step_id.to_string(),
+                step_status,
+                append_failure_ledger,
+            }),
+            Self::CancelStep { step_id } => flow_run::Input::CancelStep(inputs::CancelStep {
+                step_id: step_id.to_string(),
+            }),
+            Self::RegisterTargets {
+                step_id,
+                target_count,
+            } => flow_run::Input::RegisterTargets(inputs::RegisterTargets {
+                step_id: step_id.to_string(),
+                target_count,
+            }),
+            Self::RecordTargetSuccess { step_id, target_id } => {
+                flow_run::Input::RecordTargetSuccess(inputs::RecordTargetSuccess {
+                    step_id: step_id.to_string(),
+                    target_id,
+                })
+            }
+            Self::RecordTargetFailure {
+                step_id,
+                target_id,
+                retry_key,
+            } => flow_run::Input::RecordTargetFailure(inputs::RecordTargetFailure {
+                step_id: step_id.to_string(),
+                target_id,
+                retry_key,
+            }),
+            Self::RecordTargetCanceled { step_id, target_id } => {
+                flow_run::Input::RecordTargetCanceled(inputs::RecordTargetCanceled {
+                    step_id: step_id.to_string(),
+                    target_id,
+                })
+            }
+            Self::RecordTargetTerminalFailure { step_id } => {
+                flow_run::Input::RecordTargetTerminalFailure(inputs::RecordTargetTerminalFailure {
+                    step_id: step_id.to_string(),
+                })
+            }
+            Self::TerminalizeCompleted => {
+                flow_run::Input::TerminalizeCompleted(inputs::TerminalizeCompleted {})
+            }
+            Self::TerminalizeFailed => {
+                flow_run::Input::TerminalizeFailed(inputs::TerminalizeFailed {})
+            }
+            Self::TerminalizeCanceled => {
+                flow_run::Input::TerminalizeCanceled(inputs::TerminalizeCanceled {})
+            }
+        }
+    }
+}
+
 impl sealed::Sealed for FlowRunKernel {}
 
 /// Read-only helpers and construction. These do not mutate state.
 impl FlowRunKernel {
-    fn step_id_value(step_id: &StepId) -> KernelValue {
-        KernelValue::String(step_id.to_string())
-    }
-
-    fn step_status_value(status: &crate::run::StepRunStatus) -> KernelValue {
-        KernelValue::NamedVariant {
-            enum_name: "StepRunStatus".into(),
-            variant: match status {
-                crate::run::StepRunStatus::Dispatched => "Dispatched".into(),
-                crate::run::StepRunStatus::Completed => "Completed".into(),
-                crate::run::StepRunStatus::Failed => "Failed".into(),
-                crate::run::StepRunStatus::Skipped => "Skipped".into(),
-                crate::run::StepRunStatus::Canceled => "Canceled".into(),
-            },
+    fn step_status_name(status: &crate::run::StepRunStatus) -> flow_run::StepRunStatus {
+        match status {
+            crate::run::StepRunStatus::Dispatched => "Dispatched",
+            crate::run::StepRunStatus::Completed => "Completed",
+            crate::run::StepRunStatus::Failed => "Failed",
+            crate::run::StepRunStatus::Skipped => "Skipped",
+            crate::run::StepRunStatus::Canceled => "Canceled",
         }
-    }
-
-    fn target_id_value(target_id: &str) -> KernelValue {
-        KernelValue::String(target_id.to_string())
+        .to_string()
     }
 
     fn retry_key(step_id: &StepId, target_id: &str) -> String {
@@ -316,18 +471,11 @@ impl FlowRunKernel {
         let effects = self
             .cas_with_retry(
                 run_id,
-                "ProjectFrameStepStatus",
-                BTreeMap::from([
-                    ("step_id".to_string(), Self::step_id_value(step_id)),
-                    (
-                        "step_status".to_string(),
-                        Self::step_status_value(&step_status),
-                    ),
-                    (
-                        "append_failure_ledger".to_string(),
-                        KernelValue::Bool(requested_failure_ledger_append),
-                    ),
-                ]),
+                FlowRunCommand::ProjectFrameStepStatus {
+                    step_id: step_id.clone(),
+                    step_status: Self::step_status_name(&step_status),
+                    append_failure_ledger: requested_failure_ledger_append,
+                },
             )
             .await?
             .ok_or_else(|| {
@@ -350,12 +498,32 @@ impl FlowRunKernel {
         run_id: &RunId,
         step_id: &StepId,
     ) -> Result<bool, MobError> {
-        self.helper_bool(
-            run_id,
-            "StepBranchBlocked",
-            BTreeMap::from([("step_id".to_string(), Self::step_id_value(step_id))]),
-        )
-        .await
+        let run = self.require_run(run_id).await?;
+        let step_key = step_id.to_string();
+        let Some(branch) = run
+            .flow_state
+            .step_branches
+            .get(&step_key)
+            .and_then(|b| b.as_ref())
+        else {
+            return Ok(false);
+        };
+        Ok(run.flow_state.tracked_steps.iter().any(|candidate| {
+            candidate != &step_key
+                && run
+                    .flow_state
+                    .step_branches
+                    .get(candidate)
+                    .and_then(|b| b.as_ref())
+                    == Some(branch)
+                && matches!(
+                    run.flow_state
+                        .step_status
+                        .get(candidate)
+                        .and_then(|s| s.as_deref()),
+                    Some("Completed")
+                )
+        }))
     }
 
     pub async fn step_dependency_ready(
@@ -363,12 +531,38 @@ impl FlowRunKernel {
         run_id: &RunId,
         step_id: &StepId,
     ) -> Result<bool, MobError> {
-        self.helper_bool(
-            run_id,
-            "StepDependencyReady",
-            BTreeMap::from([("step_id".to_string(), Self::step_id_value(step_id))]),
-        )
-        .await
+        let run = self.require_run(run_id).await?;
+        let step_key = step_id.to_string();
+        let deps = run
+            .flow_state
+            .step_dependencies
+            .get(&step_key)
+            .cloned()
+            .unwrap_or_default();
+        if deps.is_empty() {
+            return Ok(true);
+        }
+        let mode = run
+            .flow_state
+            .step_dependency_modes
+            .get(&step_key)
+            .map(String::as_str)
+            .unwrap_or("All");
+        let statuses = &run.flow_state.step_status;
+        Ok(match mode {
+            "Any" => deps.iter().any(|dep| {
+                matches!(
+                    statuses.get(dep).and_then(|s| s.as_deref()),
+                    Some("Completed")
+                )
+            }),
+            _ => deps.iter().all(|dep| {
+                matches!(
+                    statuses.get(dep).and_then(|s| s.as_deref()),
+                    Some("Completed")
+                )
+            }),
+        })
     }
 
     pub async fn step_dependency_should_skip(
@@ -376,32 +570,44 @@ impl FlowRunKernel {
         run_id: &RunId,
         step_id: &StepId,
     ) -> Result<bool, MobError> {
-        self.helper_bool(
-            run_id,
-            "StepDependencyShouldSkip",
-            BTreeMap::from([("step_id".to_string(), Self::step_id_value(step_id))]),
-        )
-        .await
+        let run = self.require_run(run_id).await?;
+        let step_key = step_id.to_string();
+        let deps = run
+            .flow_state
+            .step_dependencies
+            .get(&step_key)
+            .cloned()
+            .unwrap_or_default();
+        if deps.is_empty() {
+            return Ok(false);
+        }
+        let mode = run
+            .flow_state
+            .step_dependency_modes
+            .get(&step_key)
+            .map(String::as_str)
+            .unwrap_or("All");
+        let statuses = &run.flow_state.step_status;
+        Ok(match mode {
+            "Any" => deps.iter().all(|dep| {
+                matches!(
+                    statuses.get(dep).and_then(|s| s.as_deref()),
+                    Some("Skipped")
+                )
+            }),
+            _ => false,
+        })
     }
 
     pub async fn ordered_steps(&self, run_id: &RunId) -> Result<Vec<StepId>, MobError> {
         let run = self.require_run(run_id).await?;
-        let seq = match run.flow_state.fields.get("ordered_steps") {
-            Some(KernelValue::Seq(seq)) => seq,
-            other => {
-                return Err(MobError::Internal(format!(
-                    "flow_run ordered_steps missing or invalid for {run_id}: {other:?}"
-                )));
-            }
-        };
-        seq.iter()
-            .map(|value| match value {
-                KernelValue::String(step_id) => Ok(StepId::from(step_id.clone())),
-                other => Err(MobError::Internal(format!(
-                    "flow_run ordered_steps entry invalid for {run_id}: {other:?}"
-                ))),
-            })
-            .collect()
+        Ok(run
+            .flow_state
+            .ordered_steps
+            .iter()
+            .cloned()
+            .map(StepId::from)
+            .collect())
     }
 
     /// Project canonical terminal step statuses from the frame execution seam and
@@ -472,12 +678,37 @@ impl FlowRunKernel {
         run_id: &RunId,
         step_id: &StepId,
     ) -> Result<bool, MobError> {
-        self.helper_bool(
-            run_id,
-            "CollectionSatisfied",
-            BTreeMap::from([("step_id".to_string(), Self::step_id_value(step_id))]),
-        )
-        .await
+        let run = self.require_run(run_id).await?;
+        let step_key = step_id.to_string();
+        let policy = run
+            .flow_state
+            .step_collection_policies
+            .get(&step_key)
+            .map(String::as_str)
+            .unwrap_or("All");
+        let success = run
+            .flow_state
+            .step_target_success_counts
+            .get(&step_key)
+            .copied()
+            .unwrap_or(0);
+        let count = run
+            .flow_state
+            .step_target_counts
+            .get(&step_key)
+            .copied()
+            .unwrap_or(0);
+        let quorum = run
+            .flow_state
+            .step_quorum_thresholds
+            .get(&step_key)
+            .copied()
+            .unwrap_or(0);
+        Ok(match policy {
+            "Any" => success >= 1,
+            "Quorum" => success >= quorum,
+            _ => success == count,
+        })
     }
 
     pub async fn collection_feasible(
@@ -485,12 +716,44 @@ impl FlowRunKernel {
         run_id: &RunId,
         step_id: &StepId,
     ) -> Result<bool, MobError> {
-        self.helper_bool(
-            run_id,
-            "CollectionFeasible",
-            BTreeMap::from([("step_id".to_string(), Self::step_id_value(step_id))]),
-        )
-        .await
+        let run = self.require_run(run_id).await?;
+        let step_key = step_id.to_string();
+        let policy = run
+            .flow_state
+            .step_collection_policies
+            .get(&step_key)
+            .map(String::as_str)
+            .unwrap_or("All");
+        let success = run
+            .flow_state
+            .step_target_success_counts
+            .get(&step_key)
+            .copied()
+            .unwrap_or(0);
+        let count = run
+            .flow_state
+            .step_target_counts
+            .get(&step_key)
+            .copied()
+            .unwrap_or(0);
+        let terminal_failures = run
+            .flow_state
+            .step_target_terminal_failure_counts
+            .get(&step_key)
+            .copied()
+            .unwrap_or(0);
+        let quorum = run
+            .flow_state
+            .step_quorum_thresholds
+            .get(&step_key)
+            .copied()
+            .unwrap_or(0);
+        let remaining = count.saturating_sub(success + terminal_failures);
+        Ok(match policy {
+            "Any" => success >= 1 || remaining > 0,
+            "Quorum" => success + remaining >= quorum,
+            _ => terminal_failures == 0,
+        })
     }
 
     pub async fn target_retry_allowed(
@@ -499,41 +762,25 @@ impl FlowRunKernel {
         step_id: &StepId,
         target_id: &str,
     ) -> Result<bool, MobError> {
-        self.helper_bool(
-            run_id,
-            "TargetRetryAllowed",
-            BTreeMap::from([(
-                "retry_key".to_string(),
-                KernelValue::String(Self::retry_key(step_id, target_id)),
-            )]),
-        )
-        .await
+        let run = self.require_run(run_id).await?;
+        let key = Self::retry_key(step_id, target_id);
+        let current = run
+            .flow_state
+            .target_retry_counts
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        Ok(current < run.flow_state.max_step_retries)
     }
 
     pub async fn failure_count(&self, run_id: &RunId) -> Result<u32, MobError> {
         let run = self.require_run(run_id).await?;
-        match run.flow_state.fields.get("failure_count") {
-            Some(KernelValue::U64(value)) => u32::try_from(*value).map_err(|_| {
-                MobError::Internal(format!("flow_run failure_count out of range for {run_id}"))
-            }),
-            other => Err(MobError::Internal(format!(
-                "flow_run failure_count missing or invalid for {run_id}: {other:?}"
-            ))),
-        }
+        Ok(run.flow_state.failure_count)
     }
 
     pub async fn consecutive_failure_count(&self, run_id: &RunId) -> Result<u32, MobError> {
         let run = self.require_run(run_id).await?;
-        match run.flow_state.fields.get("consecutive_failure_count") {
-            Some(KernelValue::U64(value)) => u32::try_from(*value).map_err(|_| {
-                MobError::Internal(format!(
-                    "flow_run consecutive_failure_count out of range for {run_id}"
-                ))
-            }),
-            other => Err(MobError::Internal(format!(
-                "flow_run consecutive_failure_count missing or invalid for {run_id}: {other:?}"
-            ))),
-        }
+        Ok(run.flow_state.consecutive_failure_count)
     }
 
     pub async fn step_status(
@@ -542,35 +789,13 @@ impl FlowRunKernel {
         step_id: &StepId,
     ) -> Result<Option<crate::run::StepRunStatus>, MobError> {
         let run = self.require_run(run_id).await?;
-        let map = match run.flow_state.fields.get("step_status") {
-            Some(KernelValue::Map(map)) => map,
-            other => {
-                return Err(MobError::Internal(format!(
-                    "flow_run step_status map missing or invalid for {run_id}: {other:?}"
-                )));
-            }
-        };
-        let value = map
-            .get(&KernelValue::String(step_id.to_string()))
+        run.flow_state
+            .step_status
+            .get(&step_id.to_string())
             .cloned()
-            .unwrap_or(KernelValue::None);
-        match value {
-            KernelValue::None => Ok(None),
-            value => Ok(Some(parse_step_run_status(&value, run_id)?)),
-        }
-    }
-
-    fn evaluate_helper_value(
-        &self,
-        state: &KernelState,
-        helper: &str,
-        fields: BTreeMap<String, KernelValue>,
-    ) -> Result<KernelValue, MobError> {
-        flow_run::kernel()
-            .evaluate_helper(state, helper, &fields)
-            .map_err(|error| {
-                MobError::Internal(format!("flow_run helper {helper} refused: {error}"))
-            })
+            .flatten()
+            .map(|status| parse_step_run_status(&status, run_id))
+            .transpose()
     }
 }
 
@@ -581,12 +806,11 @@ impl FlowRunKernel {
     async fn cas_with_retry(
         &self,
         run_id: &RunId,
-        variant: &str,
-        fields: BTreeMap<String, KernelValue>,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError> {
+        command: FlowRunCommand,
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError> {
         for attempt in 0..5u32 {
             let run = self.require_run(run_id).await?;
-            let outcome = self.transition_outcome(&run.flow_state, variant, fields.clone())?;
+            let outcome = self.transition_outcome(&run.flow_state, command.clone())?;
             let transitioned = self
                 .run_store
                 .cas_flow_state(run_id, &run.flow_state, &outcome.next_state)
@@ -595,19 +819,19 @@ impl FlowRunKernel {
                 return Ok(Some(outcome.effects));
             }
             if attempt < 4 {
-                tracing::debug!(variant, attempt, "CAS contention, retrying");
+                tracing::debug!(attempt, "CAS contention, retrying");
             }
         }
         Err(MobError::Internal(format!(
-            "CAS contention on {variant} after 5 attempts for run {run_id}"
+            "CAS contention after 5 attempts for run {run_id}"
         )))
     }
 
-    fn terminal_variant(target: &TerminalizationTarget) -> &'static str {
+    fn terminal_command(target: &TerminalizationTarget) -> FlowRunCommand {
         match target {
-            TerminalizationTarget::Completed => "TerminalizeCompleted",
-            TerminalizationTarget::Failed { .. } => "TerminalizeFailed",
-            TerminalizationTarget::Canceled => "TerminalizeCanceled",
+            TerminalizationTarget::Completed => FlowRunCommand::TerminalizeCompleted,
+            TerminalizationTarget::Failed { .. } => FlowRunCommand::TerminalizeFailed,
+            TerminalizationTarget::Canceled => FlowRunCommand::TerminalizeCanceled,
         }
     }
 
@@ -617,7 +841,7 @@ impl FlowRunKernel {
         flow_id: FlowId,
         target: TerminalizationTarget,
     ) -> Result<TerminalizationOutcome, MobError> {
-        let variant = Self::terminal_variant(&target);
+        let command = Self::terminal_command(&target);
         let next_status = target.status();
 
         for attempt in 0..5u32 {
@@ -625,7 +849,7 @@ impl FlowRunKernel {
             if run.status.is_terminal() {
                 return Ok(TerminalizationOutcome::Noop);
             }
-            let next_state = self.transition_state(&run.flow_state, variant, BTreeMap::new())?;
+            let next_state = self.transition_state(&run.flow_state, command.clone())?;
             let transitioned = self
                 .run_store
                 .cas_run_snapshot(
@@ -646,22 +870,22 @@ impl FlowRunKernel {
                     .await;
             }
             if attempt < 4 {
-                tracing::debug!(variant, attempt, "terminalize CAS contention, retrying");
+                tracing::debug!(attempt, "terminalize CAS contention, retrying");
             }
         }
         Err(MobError::Internal(format!(
-            "CAS contention on {variant} after 5 attempts for run {run_id}"
+            "CAS contention after 5 attempts for run {run_id}"
         )))
     }
 
     async fn apply_step_input(
         &self,
         run_id: &RunId,
-        variant: &str,
+        command: FlowRunCommand,
         step_id: &StepId,
     ) -> Result<bool, MobError> {
         Ok(self
-            .apply_step_input_with_effects(run_id, variant, step_id)
+            .apply_step_input_with_effects(run_id, command, step_id)
             .await?
             .is_some())
     }
@@ -669,18 +893,11 @@ impl FlowRunKernel {
     async fn apply_step_input_with_effects(
         &self,
         run_id: &RunId,
-        variant: &str,
+        command: FlowRunCommand,
         step_id: &StepId,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError> {
-        self.cas_with_retry(
-            run_id,
-            variant,
-            BTreeMap::from([(
-                "step_id".to_string(),
-                KernelValue::String(step_id.to_string()),
-            )]),
-        )
-        .await
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError> {
+        let _ = step_id;
+        self.cas_with_retry(run_id, command).await
     }
 
     async fn require_run(&self, run_id: &RunId) -> Result<MobRun, MobError> {
@@ -729,44 +946,24 @@ impl FlowRunKernel {
 
     fn transition_outcome(
         &self,
-        state: &KernelState,
-        variant: &str,
-        fields: BTreeMap<String, KernelValue>,
-    ) -> Result<TransitionOutcome, MobError> {
-        flow_run::transition(
-            state,
-            &KernelInput {
-                variant: variant.to_string(),
-                fields,
-            },
-        )
-        .map_err(|error| {
-            MobError::Internal(format!("flow_run {variant} transition refused: {error}"))
+        state: &flow_run::State,
+        command: FlowRunCommand,
+    ) -> Result<flow_run::Outcome, MobError> {
+        let transition_name = command.name();
+        let input = command.into_input();
+        flow_run::transition(state, input, &flow_run::EmptyContext).map_err(|error| {
+            MobError::Internal(format!(
+                "flow_run {transition_name} transition refused: {error:?}"
+            ))
         })
     }
 
     fn transition_state(
         &self,
-        state: &KernelState,
-        variant: &str,
-        fields: BTreeMap<String, KernelValue>,
-    ) -> Result<KernelState, MobError> {
-        Ok(self.transition_outcome(state, variant, fields)?.next_state)
-    }
-
-    async fn helper_bool(
-        &self,
-        run_id: &RunId,
-        helper: &str,
-        fields: BTreeMap<String, KernelValue>,
-    ) -> Result<bool, MobError> {
-        let run = self.require_run(run_id).await?;
-        match self.evaluate_helper_value(&run.flow_state, helper, fields)? {
-            KernelValue::Bool(value) => Ok(value),
-            other => Err(MobError::Internal(format!(
-                "flow_run helper {helper} returned non-bool value: {other:?}"
-            ))),
-        }
+        state: &flow_run::State,
+        command: FlowRunCommand,
+    ) -> Result<flow_run::State, MobError> {
+        Ok(self.transition_outcome(state, command)?.next_state)
     }
 }
 
@@ -797,7 +994,7 @@ impl FlowRunMutator for FlowRunKernel {
         if run.status != MobRunStatus::Pending {
             return Ok(false);
         }
-        let next_state = self.transition_state(&run.flow_state, "StartRun", BTreeMap::new())?;
+        let next_state = self.transition_state(&run.flow_state, FlowRunCommand::StartRun)?;
         self.run_store
             .cas_run_snapshot(
                 run_id,
@@ -812,94 +1009,183 @@ impl FlowRunMutator for FlowRunKernel {
 
     async fn dispatch_step(&self, run_id: &RunId, step_id: &StepId) -> Result<bool, MobError> {
         self.require_run_active(run_id, "dispatch_step").await?;
-        self.apply_step_input(run_id, "DispatchStep", step_id).await
+        self.apply_step_input(
+            run_id,
+            FlowRunCommand::DispatchStep {
+                step_id: step_id.clone(),
+            },
+            step_id,
+        )
+        .await
     }
 
     async fn dispatch_step_effects(
         &self,
         run_id: &RunId,
         step_id: &StepId,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError> {
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError> {
         self.require_run_active(run_id, "dispatch_step_effects")
             .await?;
-        self.apply_step_input_with_effects(run_id, "DispatchStep", step_id)
-            .await
+        self.apply_step_input_with_effects(
+            run_id,
+            FlowRunCommand::DispatchStep {
+                step_id: step_id.clone(),
+            },
+            step_id,
+        )
+        .await
     }
 
     async fn complete_step(&self, run_id: &RunId, step_id: &StepId) -> Result<bool, MobError> {
-        self.apply_step_input(run_id, "CompleteStep", step_id).await
+        self.apply_step_input(
+            run_id,
+            FlowRunCommand::CompleteStep {
+                step_id: step_id.clone(),
+            },
+            step_id,
+        )
+        .await
     }
 
     async fn complete_step_effects(
         &self,
         run_id: &RunId,
         step_id: &StepId,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError> {
-        self.apply_step_input_with_effects(run_id, "CompleteStep", step_id)
-            .await
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError> {
+        self.apply_step_input_with_effects(
+            run_id,
+            FlowRunCommand::CompleteStep {
+                step_id: step_id.clone(),
+            },
+            step_id,
+        )
+        .await
     }
 
     async fn record_step_output(&self, run_id: &RunId, step_id: &StepId) -> Result<bool, MobError> {
-        self.apply_step_input(run_id, "RecordStepOutput", step_id)
-            .await
+        self.apply_step_input(
+            run_id,
+            FlowRunCommand::RecordStepOutput {
+                step_id: step_id.clone(),
+            },
+            step_id,
+        )
+        .await
     }
 
     async fn record_step_output_effects(
         &self,
         run_id: &RunId,
         step_id: &StepId,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError> {
-        self.apply_step_input_with_effects(run_id, "RecordStepOutput", step_id)
-            .await
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError> {
+        self.apply_step_input_with_effects(
+            run_id,
+            FlowRunCommand::RecordStepOutput {
+                step_id: step_id.clone(),
+            },
+            step_id,
+        )
+        .await
     }
 
     async fn condition_passed(&self, run_id: &RunId, step_id: &StepId) -> Result<bool, MobError> {
-        self.apply_step_input(run_id, "ConditionPassed", step_id)
-            .await
+        self.apply_step_input(
+            run_id,
+            FlowRunCommand::ConditionPassed {
+                step_id: step_id.clone(),
+            },
+            step_id,
+        )
+        .await
     }
 
     async fn condition_rejected(&self, run_id: &RunId, step_id: &StepId) -> Result<bool, MobError> {
-        self.apply_step_input(run_id, "ConditionRejected", step_id)
-            .await
+        self.apply_step_input(
+            run_id,
+            FlowRunCommand::ConditionRejected {
+                step_id: step_id.clone(),
+            },
+            step_id,
+        )
+        .await
     }
 
     async fn condition_rejected_effects(
         &self,
         run_id: &RunId,
         step_id: &StepId,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError> {
-        self.apply_step_input_with_effects(run_id, "ConditionRejected", step_id)
-            .await
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError> {
+        self.apply_step_input_with_effects(
+            run_id,
+            FlowRunCommand::ConditionRejected {
+                step_id: step_id.clone(),
+            },
+            step_id,
+        )
+        .await
     }
 
     async fn fail_step(&self, run_id: &RunId, step_id: &StepId) -> Result<bool, MobError> {
-        self.apply_step_input(run_id, "FailStep", step_id).await
+        self.apply_step_input(
+            run_id,
+            FlowRunCommand::FailStep {
+                step_id: step_id.clone(),
+            },
+            step_id,
+        )
+        .await
     }
 
     async fn fail_step_effects(
         &self,
         run_id: &RunId,
         step_id: &StepId,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError> {
-        self.apply_step_input_with_effects(run_id, "FailStep", step_id)
-            .await
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError> {
+        self.apply_step_input_with_effects(
+            run_id,
+            FlowRunCommand::FailStep {
+                step_id: step_id.clone(),
+            },
+            step_id,
+        )
+        .await
     }
 
     async fn skip_step(&self, run_id: &RunId, step_id: &StepId) -> Result<bool, MobError> {
-        self.apply_step_input(run_id, "SkipStep", step_id).await
+        self.apply_step_input(
+            run_id,
+            FlowRunCommand::SkipStep {
+                step_id: step_id.clone(),
+            },
+            step_id,
+        )
+        .await
     }
 
     async fn skip_step_effects(
         &self,
         run_id: &RunId,
         step_id: &StepId,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError> {
-        self.apply_step_input_with_effects(run_id, "SkipStep", step_id)
-            .await
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError> {
+        self.apply_step_input_with_effects(
+            run_id,
+            FlowRunCommand::SkipStep {
+                step_id: step_id.clone(),
+            },
+            step_id,
+        )
+        .await
     }
 
     async fn cancel_step(&self, run_id: &RunId, step_id: &StepId) -> Result<bool, MobError> {
-        self.apply_step_input(run_id, "CancelStep", step_id).await
+        self.apply_step_input(
+            run_id,
+            FlowRunCommand::CancelStep {
+                step_id: step_id.clone(),
+            },
+            step_id,
+        )
+        .await
     }
 
     async fn register_targets(
@@ -911,14 +1197,10 @@ impl FlowRunMutator for FlowRunKernel {
         let run = self.require_run(run_id).await?;
         let next_state = self.transition_state(
             &run.flow_state,
-            "RegisterTargets",
-            BTreeMap::from([
-                ("step_id".to_string(), Self::step_id_value(step_id)),
-                (
-                    "target_count".to_string(),
-                    KernelValue::U64(u64::from(target_count)),
-                ),
-            ]),
+            FlowRunCommand::RegisterTargets {
+                step_id: step_id.clone(),
+                target_count,
+            },
         )?;
         self.run_store
             .cas_flow_state(run_id, &run.flow_state, &next_state)
@@ -943,14 +1225,13 @@ impl FlowRunMutator for FlowRunKernel {
         run_id: &RunId,
         step_id: &StepId,
         target_id: &str,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError> {
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError> {
         self.cas_with_retry(
             run_id,
-            "RecordTargetSuccess",
-            BTreeMap::from([
-                ("step_id".to_string(), Self::step_id_value(step_id)),
-                ("target_id".to_string(), Self::target_id_value(target_id)),
-            ]),
+            FlowRunCommand::RecordTargetSuccess {
+                step_id: step_id.clone(),
+                target_id: target_id.to_string(),
+            },
         )
         .await
     }
@@ -972,16 +1253,15 @@ impl FlowRunMutator for FlowRunKernel {
         run_id: &RunId,
         step_id: &StepId,
         target_id: &str,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError> {
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError> {
         let retry_key = Self::retry_key(step_id, target_id);
         self.cas_with_retry(
             run_id,
-            "RecordTargetFailure",
-            BTreeMap::from([
-                ("step_id".to_string(), Self::step_id_value(step_id)),
-                ("target_id".to_string(), Self::target_id_value(target_id)),
-                ("retry_key".to_string(), KernelValue::String(retry_key)),
-            ]),
+            FlowRunCommand::RecordTargetFailure {
+                step_id: step_id.clone(),
+                target_id: target_id.to_string(),
+                retry_key,
+            },
         )
         .await
     }
@@ -1003,14 +1283,13 @@ impl FlowRunMutator for FlowRunKernel {
         run_id: &RunId,
         step_id: &StepId,
         target_id: &str,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError> {
+    ) -> Result<Option<Vec<flow_run::Effect>>, MobError> {
         self.cas_with_retry(
             run_id,
-            "RecordTargetCanceled",
-            BTreeMap::from([
-                ("step_id".to_string(), Self::step_id_value(step_id)),
-                ("target_id".to_string(), Self::target_id_value(target_id)),
-            ]),
+            FlowRunCommand::RecordTargetCanceled {
+                step_id: step_id.clone(),
+                target_id: target_id.to_string(),
+            },
         )
         .await
     }
@@ -1020,8 +1299,14 @@ impl FlowRunMutator for FlowRunKernel {
         run_id: &RunId,
         step_id: &StepId,
     ) -> Result<bool, MobError> {
-        self.apply_step_input(run_id, "RecordTargetTerminalFailure", step_id)
-            .await
+        self.apply_step_input(
+            run_id,
+            FlowRunCommand::RecordTargetTerminalFailure {
+                step_id: step_id.clone(),
+            },
+            step_id,
+        )
+        .await
     }
 
     async fn cancel_dispatched_steps(&self, run_id: &RunId) -> Result<(), MobError> {
@@ -1078,34 +1363,31 @@ impl FlowRunMutator for FlowRunKernel {
 }
 
 fn parse_step_run_status(
-    value: &KernelValue,
+    value: &str,
     run_id: &RunId,
 ) -> Result<crate::run::StepRunStatus, MobError> {
-    crate::run::StepRunStatus::from_flow_run_kernel_value(value, run_id)
+    crate::run::StepRunStatus::from_flow_run_status(value, run_id)
 }
 
 fn has_step_effect(
-    effects: &[KernelEffect],
+    effects: &[flow_run::Effect],
     variant: &str,
     step_id: &StepId,
 ) -> Result<bool, MobError> {
     let expected = step_id.to_string();
     for effect in effects {
-        if effect.variant != variant {
-            continue;
-        }
-        match effect.fields.get("step_id") {
-            Some(KernelValue::String(candidate)) if candidate == &expected => return Ok(true),
-            Some(other) => {
-                return Err(MobError::Internal(format!(
-                    "flow_run effect `{variant}` carried invalid step_id payload: {other:?}"
-                )));
+        match (variant, effect) {
+            ("AppendFailureLedger", flow_run::Effect::AppendFailureLedger(payload))
+                if payload.step_id == expected =>
+            {
+                return Ok(true);
             }
-            None => {
-                return Err(MobError::Internal(format!(
-                    "flow_run effect `{variant}` missing step_id payload"
-                )));
+            ("EscalateSupervisor", flow_run::Effect::EscalateSupervisor(payload))
+                if payload.step_id == expected =>
+            {
+                return Ok(true);
             }
+            _ => {}
         }
     }
     Ok(false)
@@ -1128,20 +1410,20 @@ mod tests {
     }
 
     impl FlowRunEffectKind {
-        fn parse(effect: &KernelEffect) -> Option<Self> {
-            match effect.variant.as_str() {
-                "AdmitStepWork" => Some(Self::AdmitStepWork),
-                "AppendFailureLedger" => Some(Self::AppendFailureLedger),
-                "EscalateSupervisor" => Some(Self::EscalateSupervisor),
-                "ProjectTargetSuccess" => Some(Self::ProjectTargetSuccess),
-                "ProjectTargetFailure" => Some(Self::ProjectTargetFailure),
-                "ProjectTargetCanceled" => Some(Self::ProjectTargetCanceled),
+        fn parse(effect: &flow_run::Effect) -> Option<Self> {
+            match effect {
+                flow_run::Effect::AdmitStepWork(_) => Some(Self::AdmitStepWork),
+                flow_run::Effect::AppendFailureLedger(_) => Some(Self::AppendFailureLedger),
+                flow_run::Effect::EscalateSupervisor(_) => Some(Self::EscalateSupervisor),
+                flow_run::Effect::ProjectTargetSuccess(_) => Some(Self::ProjectTargetSuccess),
+                flow_run::Effect::ProjectTargetFailure(_) => Some(Self::ProjectTargetFailure),
+                flow_run::Effect::ProjectTargetCanceled(_) => Some(Self::ProjectTargetCanceled),
                 _ => None,
             }
         }
     }
 
-    fn has_effect(effects: &[KernelEffect], expected: FlowRunEffectKind) -> bool {
+    fn has_effect(effects: &[flow_run::Effect], expected: FlowRunEffectKind) -> bool {
         effects
             .iter()
             .filter_map(FlowRunEffectKind::parse)

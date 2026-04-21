@@ -22,6 +22,7 @@ use meerkat_machine_schema::{
     CompositionCoverageManifest, CompositionSchema, MachineCoverageManifest, MachineSchema,
     SchedulerRule, SemanticCoverageEntry, TriggerKind, canonical_composition_coverage_manifests,
     canonical_composition_schemas, canonical_machine_coverage_manifests, canonical_machine_schemas,
+    flow_frame_machine, flow_run_machine, loop_iteration_machine,
 };
 use serde::Serialize;
 
@@ -303,6 +304,18 @@ pub fn machine_codegen_at_root(root: &Path, selection: &Selection) -> Result<()>
         write_generated(
             &generated_kernel_module_path(root, &generated_slug),
             &render_machine_kernel_module(&machine.schema),
+        )?;
+        println!(
+            "generated {}",
+            generated_kernel_module_path(root, &generated_slug).display()
+        );
+    }
+
+    for compat in compat_generated_kernel_schemas() {
+        let generated_slug = generated_kernel_module_slug(&compat.machine);
+        write_generated(
+            &generated_kernel_module_path(root, &generated_slug),
+            &render_machine_kernel_module(&compat),
         )?;
         println!(
             "generated {}",
@@ -2114,9 +2127,18 @@ fn expected_mapping_document(path: &Path, title: &str, generated: &str) -> Resul
 
 fn generated_kernel_export_schemas(registry: &CanonicalRegistry) -> Vec<MachineSchema> {
     let mut schemas = registry.machines.clone();
+    schemas.extend(compat_generated_kernel_schemas());
     schemas.sort_by(|a, b| a.machine.cmp(&b.machine));
     schemas.dedup_by(|a, b| a.machine == b.machine);
     schemas
+}
+
+fn compat_generated_kernel_schemas() -> Vec<MachineSchema> {
+    vec![
+        flow_frame_machine(),
+        flow_run_machine(),
+        loop_iteration_machine(),
+    ]
 }
 
 fn expected_generated_kernel_modules(registry: &CanonicalRegistry) -> BTreeSet<String> {

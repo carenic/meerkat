@@ -208,6 +208,14 @@ pub struct GeneratedMachineKernel {
     schema: MachineSchema,
 }
 
+pub(crate) type RawValue = KernelValue;
+pub(crate) type RawState = KernelState;
+pub(crate) type RawInput = KernelInput;
+pub(crate) type RawSignal = KernelSignal;
+pub(crate) type RawEffect = KernelEffect;
+pub(crate) type RawOutcome = TransitionOutcome;
+pub(crate) type RawRefusal = TransitionRefusal;
+
 impl GeneratedMachineKernel {
     #[must_use]
     pub fn new(schema: MachineSchema) -> Self {
@@ -1041,6 +1049,35 @@ impl GeneratedMachineKernel {
             reason: reason.into(),
         }
     }
+}
+
+pub(crate) fn initial_state_from_schema(schema: MachineSchema) -> Result<RawState, RawRefusal> {
+    GeneratedMachineKernel::new(schema).initial_state()
+}
+
+pub(crate) fn transition_from_schema(
+    schema: MachineSchema,
+    state: &RawState,
+    input: &RawInput,
+) -> Result<RawOutcome, RawRefusal> {
+    GeneratedMachineKernel::new(schema).transition(state, input)
+}
+
+pub(crate) fn transition_signal_from_schema(
+    schema: MachineSchema,
+    state: &RawState,
+    signal: &RawSignal,
+) -> Result<RawOutcome, RawRefusal> {
+    GeneratedMachineKernel::new(schema).transition_signal(state, signal)
+}
+
+pub(crate) fn evaluate_helper_from_schema(
+    schema: MachineSchema,
+    state: &RawState,
+    helper_name: &str,
+    args: &std::collections::BTreeMap<String, RawValue>,
+) -> Result<RawValue, RawRefusal> {
+    GeneratedMachineKernel::new(schema).evaluate_helper(state, helper_name, args)
 }
 
 impl KernelValue {

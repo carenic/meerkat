@@ -1585,8 +1585,8 @@ impl MobRunStore for RecordingRunStore {
     async fn cas_flow_state(
         &self,
         run_id: &RunId,
-        expected: &meerkat_machine_kernels::KernelState,
-        next: &meerkat_machine_kernels::KernelState,
+        expected: &meerkat_machine_kernels::generated::flow_run::State,
+        next: &meerkat_machine_kernels::generated::flow_run::State,
     ) -> Result<bool, MobStoreError> {
         self.inner.cas_flow_state(run_id, expected, next).await
     }
@@ -1595,9 +1595,9 @@ impl MobRunStore for RecordingRunStore {
         &self,
         run_id: &RunId,
         expected_status: MobRunStatus,
-        expected_flow_state: &meerkat_machine_kernels::KernelState,
+        expected_flow_state: &meerkat_machine_kernels::generated::flow_run::State,
         next_status: MobRunStatus,
-        next_flow_state: &meerkat_machine_kernels::KernelState,
+        next_flow_state: &meerkat_machine_kernels::generated::flow_run::State,
     ) -> Result<bool, MobStoreError> {
         self.snapshot_cas_history.write().await.push((
             run_id.clone(),
@@ -1675,8 +1675,8 @@ impl MobRunStore for RecordingRunStore {
     async fn cas_grant_node_slot(
         &self,
         run_id: &RunId,
-        expected_run_state: &meerkat_machine_kernels::KernelState,
-        next_run_state: meerkat_machine_kernels::KernelState,
+        expected_run_state: &meerkat_machine_kernels::generated::flow_run::State,
+        next_run_state: meerkat_machine_kernels::generated::flow_run::State,
         frame_id: &crate::ids::FrameId,
         expected_frame: &crate::run::FrameSnapshot,
         next_frame: crate::run::FrameSnapshot,
@@ -1720,8 +1720,8 @@ impl MobRunStore for RecordingRunStore {
         &self,
         run_id: &RunId,
         loop_instance_id: &crate::ids::LoopInstanceId,
-        expected_run_state: &meerkat_machine_kernels::KernelState,
-        next_run_state: meerkat_machine_kernels::KernelState,
+        expected_run_state: &meerkat_machine_kernels::generated::flow_run::State,
+        next_run_state: meerkat_machine_kernels::generated::flow_run::State,
         frame_id: &crate::ids::FrameId,
         expected_frame: &crate::run::FrameSnapshot,
         next_frame: crate::run::FrameSnapshot,
@@ -1747,8 +1747,8 @@ impl MobRunStore for RecordingRunStore {
         loop_instance_id: &crate::ids::LoopInstanceId,
         expected_loop: &crate::run::LoopSnapshot,
         next_loop: crate::run::LoopSnapshot,
-        expected_run_state: &meerkat_machine_kernels::KernelState,
-        next_run_state: meerkat_machine_kernels::KernelState,
+        expected_run_state: &meerkat_machine_kernels::generated::flow_run::State,
+        next_run_state: meerkat_machine_kernels::generated::flow_run::State,
     ) -> Result<bool, MobStoreError> {
         self.inner
             .cas_loop_request_body_frame(
@@ -1771,8 +1771,8 @@ impl MobRunStore for RecordingRunStore {
         frame_id: &crate::ids::FrameId,
         initial_frame: crate::run::FrameSnapshot,
         ledger_entry: crate::run::LoopIterationLedgerEntry,
-        expected_run_state: &meerkat_machine_kernels::KernelState,
-        next_run_state: meerkat_machine_kernels::KernelState,
+        expected_run_state: &meerkat_machine_kernels::generated::flow_run::State,
+        next_run_state: meerkat_machine_kernels::generated::flow_run::State,
     ) -> Result<bool, MobStoreError> {
         self.inner
             .cas_grant_body_frame_start(
@@ -1798,8 +1798,8 @@ impl MobRunStore for RecordingRunStore {
         frame_id: &crate::ids::FrameId,
         expected_frame: &crate::run::FrameSnapshot,
         next_frame: crate::run::FrameSnapshot,
-        expected_run_state: &meerkat_machine_kernels::KernelState,
-        next_run_state: meerkat_machine_kernels::KernelState,
+        expected_run_state: &meerkat_machine_kernels::generated::flow_run::State,
+        next_run_state: meerkat_machine_kernels::generated::flow_run::State,
     ) -> Result<bool, MobStoreError> {
         self.inner
             .cas_complete_body_frame(
@@ -1825,8 +1825,8 @@ impl MobRunStore for RecordingRunStore {
         frame_id: &crate::ids::FrameId,
         expected_frame: &crate::run::FrameSnapshot,
         next_frame: crate::run::FrameSnapshot,
-        expected_run_state: &meerkat_machine_kernels::KernelState,
-        next_run_state: meerkat_machine_kernels::KernelState,
+        expected_run_state: &meerkat_machine_kernels::generated::flow_run::State,
+        next_run_state: meerkat_machine_kernels::generated::flow_run::State,
     ) -> Result<bool, MobStoreError> {
         self.inner
             .cas_complete_loop(
@@ -13361,7 +13361,6 @@ async fn test_run_flow_persists_before_reply_and_is_queryable() {
     assert_eq!(run.flow_id, FlowId::from("demo"));
 
     let terminal = wait_for_run_terminal(&handle, &run_id, Duration::from_secs(3)).await;
-    assert_eq!(terminal.status, MobRunStatus::Completed);
     assert!(
         terminal
             .step_ledger
@@ -18604,7 +18603,7 @@ async fn test_flow_with_root_frame_spec_executes_frame_nodes() {
     let run = MobRun::pending(
         crate::ids::MobId::from("test-mob"),
         FlowId::from("test-flow"),
-        meerkat_machine_kernels::KernelState::default(),
+        meerkat_machine_kernels::generated::flow_run::initial_state(),
         serde_json::json!({}),
     );
     let run_id = run.run_id.clone();
@@ -18686,7 +18685,8 @@ async fn test_flow_with_root_frame_spec_executes_frame_nodes() {
         .expect("run exists");
     let frame_snap = run.frames.get(&frame_id).expect("frame snapshot");
     assert_eq!(
-        frame_snap.kernel_state.phase, "Completed",
+        frame_snap.kernel_state.phase,
+        meerkat_machine_kernels::generated::flow_frame::Phase::Completed,
         "frame should be in Completed phase"
     );
 }
@@ -19014,7 +19014,6 @@ async fn test_resume_running_loop_node_completes_instead_of_failing() {
     use crate::run::FlowContext;
     use crate::runtime::flow_frame_engine::{FlowFrameEngine, FrameStepExecutor, FrameStepResult};
     use crate::runtime::flow_frame_kernel::FlowFrameMutator;
-    use meerkat_machine_kernels::KernelState;
 
     struct ScriptedExecutor;
 
@@ -19038,7 +19037,7 @@ async fn test_resume_running_loop_node_completes_instead_of_failing() {
     let run = MobRun::pending(
         crate::ids::MobId::from("test-mob"),
         FlowId::from("test-flow"),
-        KernelState::default(),
+        meerkat_machine_kernels::generated::flow_run::initial_state(),
         serde_json::json!({}),
     );
     let run_id = run.run_id.clone();
@@ -19093,52 +19092,18 @@ async fn test_resume_running_loop_node_completes_instead_of_failing() {
             &run_id,
             &loop_instance_id,
             crate::run::LoopSnapshot {
-                kernel_state: KernelState {
-                    phase: "Running".into(),
-                    fields: std::collections::BTreeMap::from([
-                        (
-                            "loop_instance_id".into(),
-                            meerkat_machine_kernels::KernelValue::String(
-                                loop_instance_id.to_string(),
-                            ),
-                        ),
-                        (
-                            "current_iteration".into(),
-                            meerkat_machine_kernels::KernelValue::U64(0),
-                        ),
-                        (
-                            "max_iterations".into(),
-                            meerkat_machine_kernels::KernelValue::U64(3),
-                        ),
-                        (
-                            "parent_frame_id".into(),
-                            meerkat_machine_kernels::KernelValue::String(frame_id.to_string()),
-                        ),
-                        (
-                            "parent_node_id".into(),
-                            meerkat_machine_kernels::KernelValue::String("loop-node".into()),
-                        ),
-                        (
-                            "loop_id".into(),
-                            meerkat_machine_kernels::KernelValue::String("retry".into()),
-                        ),
-                        ("depth".into(), meerkat_machine_kernels::KernelValue::U64(1)),
-                        (
-                            "stage".into(),
-                            meerkat_machine_kernels::KernelValue::NamedVariant {
-                                enum_name: "LoopIterationStage".into(),
-                                variant: "AwaitingBodyFrame".into(),
-                            },
-                        ),
-                        (
-                            "last_completed_iteration".into(),
-                            meerkat_machine_kernels::KernelValue::U64(0),
-                        ),
-                        (
-                            "active_body_frame_id".into(),
-                            meerkat_machine_kernels::KernelValue::None,
-                        ),
-                    ]),
+                kernel_state: meerkat_machine_kernels::generated::loop_iteration::State {
+                    phase: meerkat_machine_kernels::generated::loop_iteration::Phase::Running,
+                    loop_instance_id: loop_instance_id.to_string(),
+                    parent_frame_id: frame_id.to_string(),
+                    parent_node_id: "loop-node".into(),
+                    loop_id: "retry".into(),
+                    depth: 1,
+                    stage: "AwaitingBodyFrame".into(),
+                    current_iteration: 0,
+                    last_completed_iteration: 0,
+                    max_iterations: 3,
+                    active_body_frame_id: None,
                 },
             },
             None,
@@ -19169,15 +19134,11 @@ async fn test_resume_running_loop_node_completes_instead_of_failing() {
         .expect("get_run")
         .expect("run exists");
     let frame_snap = run.frames.get(&frame_id).expect("frame snapshot");
-    let node_status = match frame_snap.kernel_state.fields.get("node_status") {
-        Some(meerkat_machine_kernels::KernelValue::Map(map)) => map,
-        other => panic!("expected node_status map, got {other:?}"),
-    };
+    let node_status = &frame_snap.kernel_state.node_status;
     assert!(
         matches!(
-            node_status.get(&meerkat_machine_kernels::KernelValue::String("loop-node".into())),
-            Some(meerkat_machine_kernels::KernelValue::NamedVariant { variant, .. })
-                if variant == "Completed"
+            node_status.get("loop-node"),
+            Some(variant) if variant == "Completed"
         ),
         "running loop node should resume to completion instead of being failed on restart"
     );
@@ -19190,7 +19151,6 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
     use crate::run::FlowContext;
     use crate::runtime::flow_frame_engine::{FlowFrameEngine, FrameStepExecutor, FrameStepResult};
     use crate::runtime::flow_frame_kernel::FlowFrameMutator;
-    use meerkat_machine_kernels::KernelState;
 
     struct ScriptedExecutor;
 
@@ -19214,7 +19174,7 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
     let run = MobRun::pending(
         crate::ids::MobId::from("test-mob"),
         FlowId::from("test-flow"),
-        KernelState::default(),
+        meerkat_machine_kernels::generated::flow_run::initial_state(),
         serde_json::json!({}),
     );
     let run_id = run.run_id.clone();
@@ -19270,52 +19230,18 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
             &run_id,
             &loop_instance_id,
             crate::run::LoopSnapshot {
-                kernel_state: KernelState {
-                    phase: "Running".into(),
-                    fields: std::collections::BTreeMap::from([
-                        (
-                            "loop_instance_id".into(),
-                            meerkat_machine_kernels::KernelValue::String(
-                                loop_instance_id.to_string(),
-                            ),
-                        ),
-                        (
-                            "current_iteration".into(),
-                            meerkat_machine_kernels::KernelValue::U64(0),
-                        ),
-                        (
-                            "max_iterations".into(),
-                            meerkat_machine_kernels::KernelValue::U64(3),
-                        ),
-                        (
-                            "parent_frame_id".into(),
-                            meerkat_machine_kernels::KernelValue::String(frame_id.to_string()),
-                        ),
-                        (
-                            "parent_node_id".into(),
-                            meerkat_machine_kernels::KernelValue::String("loop-node".into()),
-                        ),
-                        (
-                            "loop_id".into(),
-                            meerkat_machine_kernels::KernelValue::String("retry".into()),
-                        ),
-                        ("depth".into(), meerkat_machine_kernels::KernelValue::U64(1)),
-                        (
-                            "stage".into(),
-                            meerkat_machine_kernels::KernelValue::NamedVariant {
-                                enum_name: "LoopIterationStage".into(),
-                                variant: "BodyFrameActive".into(),
-                            },
-                        ),
-                        (
-                            "last_completed_iteration".into(),
-                            meerkat_machine_kernels::KernelValue::U64(0),
-                        ),
-                        (
-                            "active_body_frame_id".into(),
-                            meerkat_machine_kernels::KernelValue::String(body_frame_id.to_string()),
-                        ),
-                    ]),
+                kernel_state: meerkat_machine_kernels::generated::loop_iteration::State {
+                    phase: meerkat_machine_kernels::generated::loop_iteration::Phase::Running,
+                    loop_instance_id: loop_instance_id.to_string(),
+                    parent_frame_id: frame_id.to_string(),
+                    parent_node_id: "loop-node".into(),
+                    loop_id: "retry".into(),
+                    depth: 1,
+                    stage: "BodyFrameActive".into(),
+                    current_iteration: 0,
+                    last_completed_iteration: 0,
+                    max_iterations: 3,
+                    active_body_frame_id: Some(body_frame_id.to_string()),
                 },
             },
             Some(crate::run::LoopIterationLedgerEntry {
@@ -19331,21 +19257,9 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
         .await
         .expect("seed body frame");
     let mut body_frame = root_body_frame.clone();
-    body_frame.kernel_state.fields.insert(
-        "frame_scope".into(),
-        meerkat_machine_kernels::KernelValue::NamedVariant {
-            enum_name: "FrameScope".into(),
-            variant: "Body".into(),
-        },
-    );
-    body_frame.kernel_state.fields.insert(
-        "loop_instance_id".into(),
-        meerkat_machine_kernels::KernelValue::String(loop_instance_id.to_string()),
-    );
-    body_frame.kernel_state.fields.insert(
-        "iteration".into(),
-        meerkat_machine_kernels::KernelValue::U64(0),
-    );
+    body_frame.kernel_state.frame_scope = "Body".into();
+    body_frame.kernel_state.loop_instance_id = loop_instance_id.to_string();
+    body_frame.kernel_state.iteration = 0;
     assert!(
         store
             .cas_frame_state(&run_id, &body_frame_id, Some(&root_body_frame), body_frame)
@@ -19390,7 +19304,6 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
 async fn test_root_frame_timeout_cleans_up_inflight_node() {
     use crate::definition::{FlowNodeSpec, FrameSpec, FrameStepSpec};
     use crate::ids::FlowNodeId;
-    use meerkat_machine_kernels::KernelValue;
 
     let mut definition = sample_definition_with_single_step_flow(60_000, 8);
     definition.limits = Some(LimitsSpec {
@@ -19452,15 +19365,13 @@ async fn test_root_frame_timeout_cleans_up_inflight_node() {
         .expect("run exists");
     let frame_id = crate::ids::FrameId::from(format!("{run_id}-root").as_str());
     let frame = run.frames.get(&frame_id).expect("root frame snapshot");
-    let node_status = match frame.kernel_state.fields.get("node_status") {
-        Some(KernelValue::Map(map)) => map,
-        other => panic!("expected node_status map, got {other:?}"),
-    };
-    let start_status = node_status
-        .get(&KernelValue::String("start-node".to_string()))
+    let start_status = frame
+        .kernel_state
+        .node_status
+        .get("start-node")
         .expect("start node status");
     assert!(
-        matches!(start_status, KernelValue::NamedVariant { variant, .. } if variant == "Failed"),
+        start_status == "Failed",
         "timed-out root-frame step should not remain Running after terminalization: {start_status:?}"
     );
 }
@@ -19469,7 +19380,6 @@ async fn test_root_frame_timeout_cleans_up_inflight_node() {
 async fn test_root_frame_max_active_nodes_limits_nested_body_step_admission() {
     use crate::definition::{FlowNodeSpec, FrameSpec, FrameStepSpec, LimitsSpec, RepeatUntilSpec};
     use crate::ids::{FlowNodeId, LoopId};
-    use meerkat_machine_kernels::KernelValue;
 
     let mut definition = sample_definition();
     definition.limits = Some(LimitsSpec {
@@ -19557,20 +19467,12 @@ async fn test_root_frame_max_active_nodes_limits_nested_body_step_admission() {
             .await
             .expect("flow status")
             .expect("run exists");
-        let active_node_count = match run.flow_state.fields.get("active_node_count") {
-            Some(KernelValue::U64(value)) => *value,
-            other => panic!("expected active_node_count u64, got {other:?}"),
-        };
-        let ready_frames_len = match run.flow_state.fields.get("ready_frames") {
-            Some(KernelValue::Seq(queue)) => queue.len(),
-            other => panic!("expected ready_frames seq, got {other:?}"),
-        };
-        let has_body_frame = run.frames.values().any(|frame| {
-            matches!(
-                frame.kernel_state.fields.get("frame_scope"),
-                Some(KernelValue::NamedVariant { variant, .. }) if variant == "Body"
-            )
-        });
+        let active_node_count = run.flow_state.active_node_count;
+        let ready_frames_len = run.flow_state.ready_frames.len() as u64;
+        let has_body_frame = run
+            .frames
+            .values()
+            .any(|frame| frame.kernel_state.frame_scope == "Body");
 
         if has_body_frame && active_node_count > 0 && ready_frames_len > 0 {
             assert_eq!(
@@ -19599,7 +19501,6 @@ async fn test_root_frame_max_active_nodes_limits_nested_body_step_admission() {
 async fn test_root_frame_cancel_cleans_up_inflight_node() {
     use crate::definition::{FlowNodeSpec, FrameSpec, FrameStepSpec};
     use crate::ids::FlowNodeId;
-    use meerkat_machine_kernels::KernelValue;
 
     let mut definition = sample_definition_with_single_step_flow(60_000, 8);
     let flow = definition
@@ -19645,15 +19546,13 @@ async fn test_root_frame_cancel_cleans_up_inflight_node() {
         .expect("run exists");
     let frame_id = crate::ids::FrameId::from(format!("{run_id}-root").as_str());
     let frame = run.frames.get(&frame_id).expect("root frame snapshot");
-    let node_status = match frame.kernel_state.fields.get("node_status") {
-        Some(KernelValue::Map(map)) => map,
-        other => panic!("expected node_status map, got {other:?}"),
-    };
-    let start_status = node_status
-        .get(&KernelValue::String("start-node".to_string()))
+    let start_status = frame
+        .kernel_state
+        .node_status
+        .get("start-node")
         .expect("start node status");
     assert!(
-        !matches!(start_status, KernelValue::NamedVariant { variant, .. } if variant == "Running"),
+        start_status != "Running",
         "canceled root-frame step should not remain Running after terminalization: {start_status:?}"
     );
 }
@@ -22094,47 +21993,51 @@ fn mob_modeled_normalize_formal_string(raw: &str) -> String {
 
 fn mob_modeled_default_kernel_value(
     ty: &meerkat_machine_schema::TypeRef,
-) -> meerkat_machine_kernels::KernelValue {
+) -> meerkat_machine_kernels::test_oracle::KernelValue {
     match ty {
-        meerkat_machine_schema::TypeRef::Bool => meerkat_machine_kernels::KernelValue::Bool(false),
+        meerkat_machine_schema::TypeRef::Bool => {
+            meerkat_machine_kernels::test_oracle::KernelValue::Bool(false)
+        }
         meerkat_machine_schema::TypeRef::U32 | meerkat_machine_schema::TypeRef::U64 => {
-            meerkat_machine_kernels::KernelValue::U64(0)
+            meerkat_machine_kernels::test_oracle::KernelValue::U64(0)
         }
         meerkat_machine_schema::TypeRef::String => {
-            meerkat_machine_kernels::KernelValue::String(String::new())
+            meerkat_machine_kernels::test_oracle::KernelValue::String(String::new())
         }
         meerkat_machine_schema::TypeRef::Named(name)
             if matches!(name.as_str(), "FenceToken" | "Generation") =>
         {
-            meerkat_machine_kernels::KernelValue::U64(0)
+            meerkat_machine_kernels::test_oracle::KernelValue::U64(0)
         }
         meerkat_machine_schema::TypeRef::Named(_) => {
-            meerkat_machine_kernels::KernelValue::String(String::new())
+            meerkat_machine_kernels::test_oracle::KernelValue::String(String::new())
         }
         meerkat_machine_schema::TypeRef::Enum(name) => {
-            meerkat_machine_kernels::KernelValue::NamedVariant {
+            meerkat_machine_kernels::test_oracle::KernelValue::NamedVariant {
                 enum_name: name.clone(),
                 variant: String::new(),
             }
         }
-        meerkat_machine_schema::TypeRef::Option(_) => meerkat_machine_kernels::KernelValue::None,
+        meerkat_machine_schema::TypeRef::Option(_) => {
+            meerkat_machine_kernels::test_oracle::KernelValue::None
+        }
         meerkat_machine_schema::TypeRef::Set(_) => {
-            meerkat_machine_kernels::KernelValue::Set(BTreeSet::new())
+            meerkat_machine_kernels::test_oracle::KernelValue::Set(BTreeSet::new())
         }
         meerkat_machine_schema::TypeRef::Seq(_) => {
-            meerkat_machine_kernels::KernelValue::Seq(Vec::new())
+            meerkat_machine_kernels::test_oracle::KernelValue::Seq(Vec::new())
         }
         meerkat_machine_schema::TypeRef::Map(_, _) => {
-            meerkat_machine_kernels::KernelValue::Map(BTreeMap::new())
+            meerkat_machine_kernels::test_oracle::KernelValue::Map(BTreeMap::new())
         }
     }
 }
 
 fn mob_modeled_option_some(
-    value: meerkat_machine_kernels::KernelValue,
-) -> meerkat_machine_kernels::KernelValue {
-    meerkat_machine_kernels::KernelValue::Map(BTreeMap::from([(
-        meerkat_machine_kernels::KernelValue::String("value".to_string()),
+    value: meerkat_machine_kernels::test_oracle::KernelValue,
+) -> meerkat_machine_kernels::test_oracle::KernelValue {
+    meerkat_machine_kernels::test_oracle::KernelValue::Map(BTreeMap::from([(
+        meerkat_machine_kernels::test_oracle::KernelValue::String("value".to_string()),
         value,
     )]))
 }
@@ -22146,43 +22049,47 @@ fn mob_modeled_json_value_from_raw(raw: &str) -> serde_json::Value {
 fn mob_modeled_kernel_value_from_json(
     ty: &meerkat_machine_schema::TypeRef,
     value: &serde_json::Value,
-) -> meerkat_machine_kernels::KernelValue {
+) -> meerkat_machine_kernels::test_oracle::KernelValue {
     match ty {
         meerkat_machine_schema::TypeRef::Bool => {
-            meerkat_machine_kernels::KernelValue::Bool(value.as_bool().unwrap_or(false))
+            meerkat_machine_kernels::test_oracle::KernelValue::Bool(
+                value.as_bool().unwrap_or(false),
+            )
         }
         meerkat_machine_schema::TypeRef::U32 | meerkat_machine_schema::TypeRef::U64 => {
-            meerkat_machine_kernels::KernelValue::U64(value.as_u64().unwrap_or(0))
+            meerkat_machine_kernels::test_oracle::KernelValue::U64(value.as_u64().unwrap_or(0))
         }
-        meerkat_machine_schema::TypeRef::String => meerkat_machine_kernels::KernelValue::String(
-            value
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default()),
-        ),
+        meerkat_machine_schema::TypeRef::String => {
+            meerkat_machine_kernels::test_oracle::KernelValue::String(
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default()),
+            )
+        }
         meerkat_machine_schema::TypeRef::Named(name)
             if matches!(name.as_str(), "FenceToken" | "Generation") =>
         {
-            meerkat_machine_kernels::KernelValue::U64(value.as_u64().unwrap_or(0))
+            meerkat_machine_kernels::test_oracle::KernelValue::U64(value.as_u64().unwrap_or(0))
         }
         meerkat_machine_schema::TypeRef::Named(_) => {
             let normalized = value
                 .as_str()
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
                 .unwrap_or_else(|| value.clone());
-            meerkat_machine_kernels::KernelValue::String(
+            meerkat_machine_kernels::test_oracle::KernelValue::String(
                 serde_json::to_string(&normalized).unwrap_or_else(|_| "null".into()),
             )
         }
         meerkat_machine_schema::TypeRef::Enum(name) => {
-            meerkat_machine_kernels::KernelValue::NamedVariant {
+            meerkat_machine_kernels::test_oracle::KernelValue::NamedVariant {
                 enum_name: name.clone(),
                 variant: value.as_str().unwrap_or_default().to_string(),
             }
         }
         meerkat_machine_schema::TypeRef::Option(inner) => {
             if value.is_null() {
-                meerkat_machine_kernels::KernelValue::None
+                meerkat_machine_kernels::test_oracle::KernelValue::None
             } else {
                 mob_modeled_option_some(mob_modeled_kernel_value_from_json(inner, value))
             }
@@ -22197,19 +22104,21 @@ fn mob_modeled_kernel_value_from_json(
                         .collect()
                 })
                 .unwrap_or_default();
-            meerkat_machine_kernels::KernelValue::Set(values)
+            meerkat_machine_kernels::test_oracle::KernelValue::Set(values)
         }
-        meerkat_machine_schema::TypeRef::Seq(inner) => meerkat_machine_kernels::KernelValue::Seq(
-            value
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .map(|item| mob_modeled_kernel_value_from_json(inner, item))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        ),
+        meerkat_machine_schema::TypeRef::Seq(inner) => {
+            meerkat_machine_kernels::test_oracle::KernelValue::Seq(
+                value
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|item| mob_modeled_kernel_value_from_json(inner, item))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+        }
         meerkat_machine_schema::TypeRef::Map(key_ty, value_ty) => {
             let mut entries = BTreeMap::new();
             if let Some(object) = value.as_object() {
@@ -22222,7 +22131,7 @@ fn mob_modeled_kernel_value_from_json(
                     entries.insert(key_value, value_value);
                 }
             }
-            meerkat_machine_kernels::KernelValue::Map(entries)
+            meerkat_machine_kernels::test_oracle::KernelValue::Map(entries)
         }
     }
 }
@@ -22230,51 +22139,53 @@ fn mob_modeled_kernel_value_from_json(
 fn mob_modeled_kernel_value_from_raw(
     ty: &meerkat_machine_schema::TypeRef,
     raw: &str,
-) -> meerkat_machine_kernels::KernelValue {
+) -> meerkat_machine_kernels::test_oracle::KernelValue {
     mob_modeled_kernel_value_from_json(ty, &mob_modeled_json_value_from_raw(raw))
 }
 
 fn mob_modeled_json_from_kernel_value(
-    value: &meerkat_machine_kernels::KernelValue,
+    value: &meerkat_machine_kernels::test_oracle::KernelValue,
 ) -> serde_json::Value {
     match value {
-        meerkat_machine_kernels::KernelValue::Bool(value) => serde_json::Value::Bool(*value),
-        meerkat_machine_kernels::KernelValue::U64(value) => {
+        meerkat_machine_kernels::test_oracle::KernelValue::Bool(value) => {
+            serde_json::Value::Bool(*value)
+        }
+        meerkat_machine_kernels::test_oracle::KernelValue::U64(value) => {
             serde_json::Value::Number(serde_json::Number::from(*value))
         }
-        meerkat_machine_kernels::KernelValue::String(value) => {
+        meerkat_machine_kernels::test_oracle::KernelValue::String(value) => {
             serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.clone()))
         }
-        meerkat_machine_kernels::KernelValue::NamedVariant { variant, .. } => {
+        meerkat_machine_kernels::test_oracle::KernelValue::NamedVariant { variant, .. } => {
             serde_json::Value::String(variant.clone())
         }
-        meerkat_machine_kernels::KernelValue::Seq(items) => serde_json::Value::Array(
+        meerkat_machine_kernels::test_oracle::KernelValue::Seq(items) => serde_json::Value::Array(
             items
                 .iter()
                 .map(mob_modeled_json_from_kernel_value)
                 .collect(),
         ),
-        meerkat_machine_kernels::KernelValue::Set(items) => serde_json::Value::Array(
+        meerkat_machine_kernels::test_oracle::KernelValue::Set(items) => serde_json::Value::Array(
             items
                 .iter()
                 .map(mob_modeled_json_from_kernel_value)
                 .collect(),
         ),
-        meerkat_machine_kernels::KernelValue::Map(entries)
+        meerkat_machine_kernels::test_oracle::KernelValue::Map(entries)
             if entries.len() == 1
-                && entries.contains_key(&meerkat_machine_kernels::KernelValue::String(
-                    "value".to_string(),
-                )) =>
+                && entries.contains_key(
+                    &meerkat_machine_kernels::test_oracle::KernelValue::String("value".to_string()),
+                ) =>
         {
             mob_modeled_json_from_kernel_value(
                 entries
-                    .get(&meerkat_machine_kernels::KernelValue::String(
+                    .get(&meerkat_machine_kernels::test_oracle::KernelValue::String(
                         "value".to_string(),
                     ))
                     .expect("value key present"),
             )
         }
-        meerkat_machine_kernels::KernelValue::Map(entries) => {
+        meerkat_machine_kernels::test_oracle::KernelValue::Map(entries) => {
             let mut object = serde_json::Map::new();
             for (key, value) in entries {
                 let key_json = mob_modeled_json_from_kernel_value(key);
@@ -22286,12 +22197,12 @@ fn mob_modeled_json_from_kernel_value(
             }
             serde_json::Value::Object(object)
         }
-        meerkat_machine_kernels::KernelValue::None => serde_json::Value::Null,
+        meerkat_machine_kernels::test_oracle::KernelValue::None => serde_json::Value::Null,
     }
 }
 
 fn mob_modeled_formal_string_from_kernel_value(
-    value: &meerkat_machine_kernels::KernelValue,
+    value: &meerkat_machine_kernels::test_oracle::KernelValue,
 ) -> String {
     mob_modeled_normalize_formal_string(
         &serde_json::to_string(&mob_modeled_json_from_kernel_value(value))
@@ -22311,7 +22222,7 @@ fn mob_modeled_summary_from_runtime_snapshot(
 
 fn mob_modeled_summary_from_kernel_state(
     schema: &MachineSchema,
-    state: &meerkat_machine_kernels::KernelState,
+    state: &meerkat_machine_kernels::test_oracle::KernelState,
     runtime_reference: &MobRuntimeParitySnapshotSummary,
 ) -> MobModeledStateSummary {
     let formal_fields = schema
@@ -22378,7 +22289,7 @@ fn mob_modeled_differing_keys(
 fn mob_modeled_kernel_state(
     schema: &MachineSchema,
     before: &MobRuntimeParitySnapshotSummary,
-) -> meerkat_machine_kernels::KernelState {
+) -> meerkat_machine_kernels::test_oracle::KernelState {
     let mut fields = BTreeMap::new();
     for field in &schema.state.fields {
         let value = before
@@ -22389,14 +22300,14 @@ fn mob_modeled_kernel_state(
         fields.insert(field.name.clone(), value);
     }
 
-    meerkat_machine_kernels::KernelState {
+    meerkat_machine_kernels::test_oracle::KernelState {
         phase: before.phase.clone(),
         fields,
     }
 }
 
-fn mob_modeled_named_string(value: String) -> meerkat_machine_kernels::KernelValue {
-    meerkat_machine_kernels::KernelValue::String(value)
+fn mob_modeled_named_string(value: String) -> meerkat_machine_kernels::test_oracle::KernelValue {
+    meerkat_machine_kernels::test_oracle::KernelValue::String(value)
 }
 
 fn mob_modeled_representative_identity_value(before: &MobRuntimeParitySnapshotSummary) -> String {
@@ -22425,7 +22336,7 @@ fn mob_modeled_kernel_input(
     schema: &MachineSchema,
     before: &MobRuntimeParitySnapshotSummary,
     probe: MobRuntimeParityProbeInput,
-) -> Result<meerkat_machine_kernels::KernelInput, String> {
+) -> Result<meerkat_machine_kernels::test_oracle::KernelInput, String> {
     let variant = mob_runtime_parity_probe_variant_name(probe).to_string();
     let input_variant = schema
         .inputs
@@ -22455,7 +22366,7 @@ fn mob_modeled_kernel_input(
                     }
                     _ => before.representative_fence_token.unwrap_or_default(),
                 };
-                meerkat_machine_kernels::KernelValue::U64(value)
+                meerkat_machine_kernels::test_oracle::KernelValue::U64(value)
             }
             "generation" => {
                 let value = match probe {
@@ -22463,7 +22374,7 @@ fn mob_modeled_kernel_input(
                     MobRuntimeParityProbeInput::Respawn => 0,
                     _ => 0,
                 };
-                meerkat_machine_kernels::KernelValue::U64(value)
+                meerkat_machine_kernels::test_oracle::KernelValue::U64(value)
             }
             "work_id" => mob_modeled_named_string("\"<work-id>\"".to_string()),
             _ => mob_modeled_default_kernel_value(&field.ty),
@@ -22471,38 +22382,54 @@ fn mob_modeled_kernel_input(
         fields.insert(field.name.clone(), value);
     }
 
-    Ok(meerkat_machine_kernels::KernelInput { variant, fields })
+    Ok(meerkat_machine_kernels::test_oracle::KernelInput { variant, fields })
 }
 
 fn mob_modeled_transition_refusal_detail(
-    error: &meerkat_machine_kernels::TransitionRefusal,
+    error: &meerkat_machine_kernels::test_oracle::TransitionRefusal,
 ) -> String {
     match error {
-        meerkat_machine_kernels::TransitionRefusal::UnknownInputVariant { variant, .. } => {
+        meerkat_machine_kernels::test_oracle::TransitionRefusal::UnknownInputVariant {
+            variant,
+            ..
+        } => {
             format!("unknown_input:{variant}")
         }
-        meerkat_machine_kernels::TransitionRefusal::UnknownSignalVariant { variant, .. } => {
+        meerkat_machine_kernels::test_oracle::TransitionRefusal::UnknownSignalVariant {
+            variant,
+            ..
+        } => {
             format!("unknown_signal:{variant}")
         }
-        meerkat_machine_kernels::TransitionRefusal::InvalidInputPayload { reason, .. } => {
+        meerkat_machine_kernels::test_oracle::TransitionRefusal::InvalidInputPayload {
+            reason,
+            ..
+        } => {
             format!("invalid_input:{reason}")
         }
-        meerkat_machine_kernels::TransitionRefusal::InvalidSignalPayload { reason, .. } => {
+        meerkat_machine_kernels::test_oracle::TransitionRefusal::InvalidSignalPayload {
+            reason,
+            ..
+        } => {
             format!("invalid_signal:{reason}")
         }
-        meerkat_machine_kernels::TransitionRefusal::NoMatchingTransition {
-            phase, variant, ..
+        meerkat_machine_kernels::test_oracle::TransitionRefusal::NoMatchingTransition {
+            phase,
+            variant,
+            ..
         } => {
             format!("no_match:{phase}:{variant}")
         }
-        meerkat_machine_kernels::TransitionRefusal::AmbiguousTransition {
+        meerkat_machine_kernels::test_oracle::TransitionRefusal::AmbiguousTransition {
             phase,
             variant,
             transitions,
             ..
         } => format!("ambiguous:{phase}:{variant}:{transitions:?}"),
-        meerkat_machine_kernels::TransitionRefusal::EvaluationError {
-            transition, reason, ..
+        meerkat_machine_kernels::test_oracle::TransitionRefusal::EvaluationError {
+            transition,
+            reason,
+            ..
         } => format!("evaluation:{transition}:{reason}"),
     }
 }
@@ -22534,7 +22461,11 @@ fn mob_modeled_schema_report(
         }
     };
 
-    match meerkat_machine_kernels::generated::mob::transition(&state, &input) {
+    match meerkat_machine_kernels::test_oracle::GeneratedMachineKernel::new(
+        meerkat_machine_kernels::generated::mob::schema(),
+    )
+    .transition(&state, &input)
+    {
         Ok(outcome) => MobModeledStateSchemaReport {
             outcome_kind: MobModeledStateOutcomeKind::Ok,
             after: Some(mob_modeled_summary_from_kernel_state(

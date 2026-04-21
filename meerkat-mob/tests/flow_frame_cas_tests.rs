@@ -6,20 +6,18 @@
     clippy::uninlined_format_args
 )]
 
-use meerkat_machine_kernels::generated::flow_run;
-use meerkat_machine_kernels::{KernelInput, KernelState, KernelValue};
+use meerkat_machine_kernels::generated::{flow_frame, flow_run};
 use meerkat_mob::ids::FrameId;
 use meerkat_mob::run::{FrameSnapshot, MobRun};
 use meerkat_mob::store::MobRunStore;
 use meerkat_mob::{FlowFrameMutator, FlowId, InMemoryMobRunStore, MobId};
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 fn build_minimal_mob_run() -> MobRun {
     MobRun::pending(
         MobId::from("test-mob"),
         FlowId::from("test-flow"),
-        KernelState::default(),
+        flow_run::initial_state(),
         serde_json::json!({}),
     )
 }
@@ -34,7 +32,7 @@ async fn test_cas_node_slot_grant_is_atomic() {
 
     let frame_id = FrameId::from("frame-1");
     let initial_frame = FrameSnapshot {
-        kernel_state: KernelState::default(),
+        kernel_state: flow_frame::initial_state(),
     };
 
     // Pre-register the frame in the store (insert initial state)
@@ -63,15 +61,15 @@ async fn test_cas_node_slot_grant_is_atomic() {
     let initial2 = initial_frame.clone();
 
     let next1 = FrameSnapshot {
-        kernel_state: KernelState {
-            phase: "Running".into(),
-            ..Default::default()
+        kernel_state: flow_frame::State {
+            phase: flow_frame::Phase::Running,
+            ..flow_frame::initial_state()
         },
     };
     let next2 = FrameSnapshot {
-        kernel_state: KernelState {
-            phase: "Completed".into(),
-            ..Default::default()
+        kernel_state: flow_frame::State {
+            phase: flow_frame::Phase::Completed,
+            ..flow_frame::initial_state()
         },
     };
 
@@ -117,19 +115,8 @@ fn test_pump_to_exhaustion_after_frame_terminated() {
     );
 
     // ready_frames should be empty after exhaustion
-    let queue = final_state
-        .fields
-        .get("ready_frames")
-        .and_then(|v| {
-            if let KernelValue::Seq(s) = v {
-                Some(s)
-            } else {
-                None
-            }
-        })
-        .expect("ready_frames field");
     assert!(
-        queue.is_empty(),
+        final_state.ready_frames.is_empty(),
         "ready_frames should be empty after exhaustion"
     );
 }
@@ -182,7 +169,10 @@ async fn test_execute_two_node_frame_through_cas_chain() {
         .start_frame(&run_id, &frame_id, &spec)
         .await
         .expect("start_frame");
-    assert_eq!(initial_snapshot.kernel_state.phase, "Running");
+    assert_eq!(
+        initial_snapshot.kernel_state.phase,
+        flow_frame::Phase::Running
+    );
 
     // Step 2: Admit node A
     let effects = kernel
@@ -192,9 +182,11 @@ async fn test_execute_two_node_frame_through_cas_chain() {
     assert!(effects.is_some(), "admit should return effects");
     let effects = effects.unwrap();
     assert!(
-        effects.iter().any(|e| e.variant == "AdmitStepWork"),
+        effects
+            .iter()
+            .any(|e| matches!(e, flow_frame::Effect::AdmitStepWork(_))),
         "AdmitStepWork expected, got: {:?}",
-        effects.iter().map(|e| &e.variant).collect::<Vec<_>>()
+        effects
     );
 
     // Step 3: Complete node A
@@ -233,89 +225,29 @@ async fn test_execute_two_node_frame_through_cas_chain() {
         .expect("run exists");
     let frame_snap = run.frames.get(&frame_id).expect("frame snapshot present");
     assert_eq!(
-        frame_snap.kernel_state.phase, "Completed",
+        frame_snap.kernel_state.phase,
+        flow_frame::Phase::Completed,
         "frame should be in Completed phase after terminalizing"
     );
 }
 
 /// Helper: build a FlowRunMachine in Running state with 3 frames in ready_frames
-fn build_run_state_with_three_ready_frames() -> KernelState {
-    use indexmap::IndexMap;
-    use meerkat_core::types::ContentInput;
-    use meerkat_mob::definition::{
-        CollectionPolicy, DependencyMode, DispatchMode, FlowSpec, FlowStepSpec, LimitsSpec,
-        StepOutputFormat,
-    };
-    use meerkat_mob::ids::{ProfileName, StepId};
-    use meerkat_mob::run::FlowRunConfig;
-
-    let mut steps = IndexMap::new();
-    steps.insert(
-        StepId::from("dummy"),
-        FlowStepSpec {
-            role: ProfileName::from("worker"),
-            message: ContentInput::from("placeholder"),
-            depends_on: Vec::new(),
-            dispatch_mode: DispatchMode::FanOut,
-            collection_policy: CollectionPolicy::All,
-            condition: None,
-            timeout_ms: None,
-            expected_schema_ref: None,
-            branch: None,
-            depends_on_mode: DependencyMode::All,
-            allowed_tools: None,
-            blocked_tools: None,
-            output_format: StepOutputFormat::Json,
-        },
-    );
-
-    let config = FlowRunConfig {
-        flow_id: FlowId::from("test-flow"),
-        flow_spec: FlowSpec {
-            description: None,
-            steps,
-            root: None,
-        },
-        topology: None,
-        supervisor: None,
-        limits: Some(LimitsSpec {
-            max_flow_duration_ms: None,
-            max_step_retries: None,
-            max_orphaned_turns: None,
-            cancel_grace_timeout_ms: None,
-            max_active_nodes: Some(10),
-            max_active_frames: Some(10),
-            max_frame_depth: Some(10),
-        }),
-        orchestrator_role: None,
-    };
-
-    let pending = MobRun::flow_state_for_config(&config).expect("flow_state_for_config");
-
-    // Advance to Running
-    let running = flow_run::transition(
-        &pending,
-        &KernelInput {
-            variant: "StartRun".into(),
-            fields: BTreeMap::new(),
-        },
-    )
-    .expect("StartRun")
-    .next_state;
-
-    // Register 3 ready frames WITHOUT pumping
-    let frames = ["frame-a", "frame-b", "frame-c"];
-    frames.iter().fold(running, |state, fid| {
-        flow_run::transition(
-            &state,
-            &KernelInput {
-                variant: "RegisterReadyFrame".into(),
-                fields: BTreeMap::from([("frame_id".into(), KernelValue::String((*fid).into()))]),
-            },
-        )
-        .expect("RegisterReadyFrame")
-        .next_state
-    })
+fn build_run_state_with_three_ready_frames() -> flow_run::State {
+    flow_run::State {
+        phase: flow_run::Phase::Running,
+        ready_frames: vec!["frame-a".into(), "frame-b".into(), "frame-c".into()],
+        ready_frame_membership: [
+            "frame-a".to_string(),
+            "frame-b".to_string(),
+            "frame-c".to_string(),
+        ]
+        .into_iter()
+        .collect(),
+        max_active_nodes: 10,
+        max_active_frames: 10,
+        max_frame_depth: 10,
+        ..flow_run::initial_state()
+    }
 }
 
 // ─── Regression tests ────────────────────────────────────────────────────────
@@ -329,7 +261,6 @@ fn build_run_state_with_three_ready_frames() -> KernelState {
 #[tokio::test]
 async fn test_transition_frame_cas_exhaustion_returns_err() {
     use indexmap::IndexMap;
-    use meerkat_machine_kernels::KernelState;
     use meerkat_mob::definition::{DependencyMode, FlowNodeSpec, FrameSpec, FrameStepSpec};
     use meerkat_mob::ids::{FlowNodeId, StepId};
     use meerkat_mob::run::FrameSnapshot;
@@ -373,9 +304,9 @@ async fn test_transition_frame_cas_exhaustion_returns_err() {
     // Now: simultaneously make the snapshot stale by writing a different snapshot
     // directly, so every subsequent CAS will lose.
     let stale = FrameSnapshot {
-        kernel_state: KernelState {
-            phase: "Running".into(),
-            fields: Default::default(),
+        kernel_state: flow_frame::State {
+            phase: flow_frame::Phase::Running,
+            ..flow_frame::initial_state()
         },
     };
     store
@@ -443,7 +374,7 @@ async fn test_start_frame_resume_returns_existing_snapshot() {
         .start_frame(&run_id, &frame_id, &spec)
         .await
         .expect("first start_frame");
-    assert_eq!(first.kernel_state.phase, "Running");
+    assert_eq!(first.kernel_state.phase, flow_frame::Phase::Running);
 
     // Second call (simulated resume): must return the EXISTING snapshot, not error.
     let second = kernel
@@ -451,7 +382,8 @@ async fn test_start_frame_resume_returns_existing_snapshot() {
         .await
         .expect("resume start_frame must not error");
     assert_eq!(
-        second.kernel_state.phase, "Running",
+        second.kernel_state.phase,
+        flow_frame::Phase::Running,
         "resume should return the existing Running snapshot"
     );
     assert_eq!(

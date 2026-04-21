@@ -9,7 +9,6 @@ use crate::ids::{FlowNodeId, FrameId, LoopId, LoopInstanceId, RunId, StepId};
 use crate::run::FrameSnapshot;
 use crate::store::MobRunStore;
 use meerkat_machine_kernels::generated::flow_frame;
-use meerkat_machine_kernels::{KernelEffect, KernelInput, KernelValue};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
@@ -60,7 +59,7 @@ pub trait FlowFrameMutator: sealed::Sealed {
         &self,
         run_id: &RunId,
         frame_id: &FrameId,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError>;
+    ) -> Result<Option<Vec<flow_frame::Effect>>, MobError>;
 
     /// Admit the next ready node with up to `max_retries` CAS retries.
     ///
@@ -71,7 +70,7 @@ pub trait FlowFrameMutator: sealed::Sealed {
         run_id: &RunId,
         frame_id: &FrameId,
         max_retries: usize,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError>;
+    ) -> Result<Option<Vec<flow_frame::Effect>>, MobError>;
 
     /// Complete a step node and record its output, with CAS retry.
     async fn complete_step(
@@ -130,10 +129,6 @@ impl FlowFrameKernel {
         Self { run_store }
     }
 
-    fn node_val(node_id: &FlowNodeId) -> KernelValue {
-        KernelValue::String(node_id.to_string())
-    }
-
     /// Read the current `FrameSnapshot` for a frame, returning an error if not found.
     async fn require_frame(
         &self,
@@ -160,13 +155,17 @@ impl FlowFrameKernel {
         &self,
         run_id: &RunId,
         frame_id: &FrameId,
-        input: KernelInput,
+        input: flow_frame::Input,
         max_retries: usize,
-    ) -> Result<Vec<KernelEffect>, MobError> {
+    ) -> Result<Vec<flow_frame::Effect>, MobError> {
         for _ in 0..=max_retries {
             let current = self.require_frame(run_id, frame_id).await?;
-            let outcome = flow_frame::transition(&current.kernel_state, &input)
-                .map_err(|e| MobError::Internal(format!("flow_frame transition failed: {e:?}")))?;
+            let outcome = flow_frame::transition(
+                &current.kernel_state,
+                input.clone(),
+                &flow_frame::EmptyContext,
+            )
+            .map_err(|e| MobError::Internal(format!("flow_frame transition failed: {e:?}")))?;
             let next = FrameSnapshot {
                 kernel_state: outcome.next_state,
             };
@@ -207,11 +206,10 @@ impl FlowFrameMutator for FlowFrameKernel {
             return Ok(existing.clone());
         }
 
-        let initial = flow_frame::initial_state()
-            .map_err(|e| MobError::Internal(format!("flow_frame initial_state failed: {e:?}")))?;
+        let initial = flow_frame::initial_state();
         let ordered = topological_order(spec)?;
         let start_input = build_start_root_frame_input(frame_id, spec, &ordered);
-        let outcome = flow_frame::transition(&initial, &start_input)
+        let outcome = flow_frame::transition(&initial, start_input, &flow_frame::EmptyContext)
             .map_err(|e| MobError::Internal(format!("flow_frame StartRootFrame failed: {e:?}")))?;
         let snapshot = FrameSnapshot {
             kernel_state: outcome.next_state,
@@ -242,11 +240,9 @@ impl FlowFrameMutator for FlowFrameKernel {
         &self,
         run_id: &RunId,
         frame_id: &FrameId,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError> {
-        let input = KernelInput {
-            variant: "AdmitNextReadyNode".into(),
-            fields: BTreeMap::new(),
-        };
+    ) -> Result<Option<Vec<flow_frame::Effect>>, MobError> {
+        let input =
+            flow_frame::Input::AdmitNextReadyNode(flow_frame::inputs::AdmitNextReadyNode {});
         // Map Ok(effects) → Ok(Some(effects)); errors propagate as-is.
         self.transition_frame(run_id, frame_id, input, 5)
             .await
@@ -258,23 +254,19 @@ impl FlowFrameMutator for FlowFrameKernel {
         run_id: &RunId,
         frame_id: &FrameId,
         max_retries: usize,
-    ) -> Result<Option<Vec<KernelEffect>>, MobError> {
+    ) -> Result<Option<Vec<flow_frame::Effect>>, MobError> {
         for _ in 0..=max_retries {
             let snap = self.require_frame(run_id, frame_id).await?;
-            let queue_empty = match snap.kernel_state.fields.get("ready_queue") {
-                Some(KernelValue::Seq(seq)) => seq.is_empty(),
-                _ => true,
-            };
+            let queue_empty = snap.kernel_state.ready_queue.is_empty();
             if queue_empty {
                 return Ok(None); // genuinely nothing to admit
             }
 
-            let admit_input = KernelInput {
-                variant: "AdmitNextReadyNode".into(),
-                fields: BTreeMap::new(),
-            };
-            let outcome = flow_frame::transition(&snap.kernel_state, &admit_input)
-                .map_err(|e| MobError::Internal(format!("AdmitNextReadyNode failed: {e:?}")))?;
+            let admit_input =
+                flow_frame::Input::AdmitNextReadyNode(flow_frame::inputs::AdmitNextReadyNode {});
+            let outcome =
+                flow_frame::transition(&snap.kernel_state, admit_input, &flow_frame::EmptyContext)
+                    .map_err(|e| MobError::Internal(format!("AdmitNextReadyNode failed: {e:?}")))?;
             let next_snap = FrameSnapshot {
                 kernel_state: outcome.next_state,
             };
@@ -318,12 +310,16 @@ impl FlowFrameMutator for FlowFrameKernel {
         } = opts;
         for attempt in 0..=max_retries {
             let snap = self.require_frame(run_id, frame_id).await?;
-            let complete_input = KernelInput {
-                variant: "CompleteNode".into(),
-                fields: BTreeMap::from([("node_id".into(), Self::node_val(node_id))]),
-            };
-            let next_outcome = flow_frame::transition(&snap.kernel_state, &complete_input)
-                .map_err(|e| MobError::Internal(format!("CompleteNode failed: {e:?}")))?;
+            let complete_input =
+                flow_frame::Input::CompleteNode(flow_frame::inputs::CompleteNode {
+                    node_id: node_id.to_string(),
+                });
+            let next_outcome = flow_frame::transition(
+                &snap.kernel_state,
+                complete_input,
+                &flow_frame::EmptyContext,
+            )
+            .map_err(|e| MobError::Internal(format!("CompleteNode failed: {e:?}")))?;
             let next_snap = FrameSnapshot {
                 kernel_state: next_outcome.next_state,
             };
@@ -359,10 +355,9 @@ impl FlowFrameMutator for FlowFrameKernel {
         frame_id: &FrameId,
         node_id: &FlowNodeId,
     ) -> Result<bool, MobError> {
-        let input = KernelInput {
-            variant: "CompleteNode".into(),
-            fields: BTreeMap::from([("node_id".into(), Self::node_val(node_id))]),
-        };
+        let input = flow_frame::Input::CompleteNode(flow_frame::inputs::CompleteNode {
+            node_id: node_id.to_string(),
+        });
         // transition_frame now returns Err on CAS exhaustion rather than Ok(None),
         // so Ok always means the transition fired successfully.
         self.transition_frame(run_id, frame_id, input, 5)
@@ -376,10 +371,9 @@ impl FlowFrameMutator for FlowFrameKernel {
         frame_id: &FrameId,
         node_id: &FlowNodeId,
     ) -> Result<bool, MobError> {
-        let input = KernelInput {
-            variant: "FailNode".into(),
-            fields: BTreeMap::from([("node_id".into(), Self::node_val(node_id))]),
-        };
+        let input = flow_frame::Input::FailNode(flow_frame::inputs::FailNode {
+            node_id: node_id.to_string(),
+        });
         self.transition_frame(run_id, frame_id, input, 5)
             .await
             .map(|_| true)
@@ -391,10 +385,9 @@ impl FlowFrameMutator for FlowFrameKernel {
         frame_id: &FrameId,
         node_id: &FlowNodeId,
     ) -> Result<bool, MobError> {
-        let input = KernelInput {
-            variant: "SkipNode".into(),
-            fields: BTreeMap::from([("node_id".into(), Self::node_val(node_id))]),
-        };
+        let input = flow_frame::Input::SkipNode(flow_frame::inputs::SkipNode {
+            node_id: node_id.to_string(),
+        });
         self.transition_frame(run_id, frame_id, input, 5)
             .await
             .map(|_| true)
@@ -405,10 +398,7 @@ impl FlowFrameMutator for FlowFrameKernel {
         run_id: &RunId,
         frame_id: &FrameId,
     ) -> Result<bool, MobError> {
-        let input = KernelInput {
-            variant: "SealFrame".into(),
-            fields: BTreeMap::new(),
-        };
+        let input = flow_frame::Input::SealFrame(flow_frame::inputs::SealFrame {});
         self.transition_frame(run_id, frame_id, input, 5)
             .await
             .map(|_| true)
@@ -420,10 +410,9 @@ impl FlowFrameMutator for FlowFrameKernel {
         frame_id: &FrameId,
         node_id: &FlowNodeId,
     ) -> Result<bool, MobError> {
-        let input = KernelInput {
-            variant: "CancelNode".into(),
-            fields: BTreeMap::from([("node_id".into(), Self::node_val(node_id))]),
-        };
+        let input = flow_frame::Input::CancelNode(flow_frame::inputs::CancelNode {
+            node_id: node_id.to_string(),
+        });
         self.transition_frame(run_id, frame_id, input, 5)
             .await
             .map(|_| true)
@@ -432,132 +421,123 @@ impl FlowFrameMutator for FlowFrameKernel {
 
 // ─── Helpers (moved from flow_frame_engine.rs) ─────────────────────────────
 
-fn build_frame_start_fields(
+#[allow(clippy::type_complexity)]
+fn build_frame_start_payload(
     frame_id: &FrameId,
     spec: &FrameSpec,
     ordered: &[FlowNodeId],
-) -> BTreeMap<String, KernelValue> {
-    let ordered_kv: Vec<KernelValue> = ordered
-        .iter()
-        .map(|n| KernelValue::String(n.to_string()))
-        .collect();
+) -> (
+    BTreeSet<flow_frame::FlowNodeId>,
+    Vec<flow_frame::FlowNodeId>,
+    BTreeMap<flow_frame::FlowNodeId, flow_frame::FlowNodeKind>,
+    BTreeMap<flow_frame::FlowNodeId, Vec<flow_frame::FlowNodeId>>,
+    BTreeMap<flow_frame::FlowNodeId, flow_frame::DependencyMode>,
+    BTreeMap<flow_frame::FlowNodeId, Option<flow_frame::BranchId>>,
+) {
+    let ordered_kv: Vec<_> = ordered.iter().map(ToString::to_string).collect();
 
-    let tracked: BTreeSet<KernelValue> = ordered
-        .iter()
-        .map(|n| KernelValue::String(n.to_string()))
-        .collect();
+    let tracked: BTreeSet<_> = ordered.iter().map(ToString::to_string).collect();
 
-    let mut node_kind: BTreeMap<KernelValue, KernelValue> = BTreeMap::new();
-    let mut node_deps: BTreeMap<KernelValue, KernelValue> = BTreeMap::new();
-    let mut node_dep_modes: BTreeMap<KernelValue, KernelValue> = BTreeMap::new();
-    let mut node_branches: BTreeMap<KernelValue, KernelValue> = BTreeMap::new();
+    let mut node_kind = BTreeMap::new();
+    let mut node_deps = BTreeMap::new();
+    let mut node_dep_modes = BTreeMap::new();
+    let mut node_branches = BTreeMap::new();
 
     for (node_id, node_spec) in &spec.nodes {
-        let k = KernelValue::String(node_id.to_string());
+        let k = node_id.to_string();
         match node_spec {
             FlowNodeSpec::Step(s) => {
-                node_kind.insert(
-                    k.clone(),
-                    KernelValue::NamedVariant {
-                        enum_name: "FlowNodeKind".into(),
-                        variant: "Step".into(),
-                    },
-                );
+                node_kind.insert(k.clone(), "Step".to_string());
                 node_deps.insert(
                     k.clone(),
-                    KernelValue::Seq(
-                        s.depends_on
-                            .iter()
-                            .map(|d| KernelValue::String(d.to_string()))
-                            .collect(),
-                    ),
+                    s.depends_on.iter().map(ToString::to_string).collect(),
                 );
                 node_dep_modes.insert(k.clone(), dep_mode_kv(&s.depends_on_mode));
-                node_branches.insert(
-                    k.clone(),
-                    s.branch
-                        .as_ref()
-                        .map_or(KernelValue::None, |b| KernelValue::String(b.to_string())),
-                );
+                node_branches.insert(k.clone(), s.branch.as_ref().map(ToString::to_string));
             }
             FlowNodeSpec::RepeatUntil(l) => {
-                node_kind.insert(
-                    k.clone(),
-                    KernelValue::NamedVariant {
-                        enum_name: "FlowNodeKind".into(),
-                        variant: "Loop".into(),
-                    },
-                );
+                node_kind.insert(k.clone(), "Loop".to_string());
                 node_deps.insert(
                     k.clone(),
-                    KernelValue::Seq(
-                        l.depends_on
-                            .iter()
-                            .map(|d| KernelValue::String(d.to_string()))
-                            .collect(),
-                    ),
+                    l.depends_on.iter().map(ToString::to_string).collect(),
                 );
                 node_dep_modes.insert(k.clone(), dep_mode_kv(&l.depends_on_mode));
-                node_branches.insert(k.clone(), KernelValue::None);
+                node_branches.insert(k.clone(), None);
             }
         }
     }
 
-    BTreeMap::from([
-        ("frame_id".into(), KernelValue::String(frame_id.to_string())),
-        ("tracked_nodes".into(), KernelValue::Set(tracked)),
-        ("ordered_nodes".into(), KernelValue::Seq(ordered_kv)),
-        ("node_kind".into(), KernelValue::Map(node_kind)),
-        ("node_dependencies".into(), KernelValue::Map(node_deps)),
-        (
-            "node_dependency_modes".into(),
-            KernelValue::Map(node_dep_modes),
-        ),
-        ("node_branches".into(), KernelValue::Map(node_branches)),
-    ])
+    let _ = frame_id;
+    (
+        tracked,
+        ordered_kv,
+        node_kind,
+        node_deps,
+        node_dep_modes,
+        node_branches,
+    )
 }
 
-/// Build the `StartRootFrame` KernelInput from a `FrameSpec` and its topological order.
+/// Build the typed `StartRootFrame` input from a `FrameSpec` and its topological order.
 pub(crate) fn build_start_root_frame_input(
     frame_id: &FrameId,
     spec: &FrameSpec,
     ordered: &[FlowNodeId],
-) -> KernelInput {
-    KernelInput {
-        variant: "StartRootFrame".into(),
-        fields: build_frame_start_fields(frame_id, spec, ordered),
-    }
+) -> flow_frame::Input {
+    let (
+        tracked_nodes,
+        ordered_nodes,
+        node_kind,
+        node_dependencies,
+        node_dependency_modes,
+        node_branches,
+    ) = build_frame_start_payload(frame_id, spec, ordered);
+    flow_frame::Input::StartRootFrame(flow_frame::inputs::StartRootFrame {
+        frame_id: frame_id.to_string(),
+        tracked_nodes,
+        ordered_nodes,
+        node_kind,
+        node_dependencies,
+        node_dependency_modes,
+        node_branches,
+    })
 }
 
-/// Build the `StartBodyFrame` KernelInput from a `FrameSpec` and its topological order.
+/// Build the typed `StartBodyFrame` input from a `FrameSpec` and its topological order.
 pub(crate) fn build_start_body_frame_input(
     frame_id: &FrameId,
     loop_instance_id: &LoopInstanceId,
     iteration: u64,
     spec: &FrameSpec,
     ordered: &[FlowNodeId],
-) -> KernelInput {
-    let mut fields = build_frame_start_fields(frame_id, spec, ordered);
-    fields.insert(
-        "loop_instance_id".into(),
-        KernelValue::String(loop_instance_id.to_string()),
-    );
-    fields.insert("iteration".into(), KernelValue::U64(iteration));
-    KernelInput {
-        variant: "StartBodyFrame".into(),
-        fields,
-    }
+) -> flow_frame::Input {
+    let (
+        tracked_nodes,
+        ordered_nodes,
+        node_kind,
+        node_dependencies,
+        node_dependency_modes,
+        node_branches,
+    ) = build_frame_start_payload(frame_id, spec, ordered);
+    flow_frame::Input::StartBodyFrame(flow_frame::inputs::StartBodyFrame {
+        frame_id: frame_id.to_string(),
+        loop_instance_id: loop_instance_id.to_string(),
+        iteration: iteration as u32,
+        tracked_nodes,
+        ordered_nodes,
+        node_kind,
+        node_dependencies,
+        node_dependency_modes,
+        node_branches,
+    })
 }
 
-fn dep_mode_kv(mode: &DependencyMode) -> KernelValue {
-    let variant = match mode {
+fn dep_mode_kv(mode: &DependencyMode) -> flow_frame::DependencyMode {
+    match mode {
         DependencyMode::All => "All",
         DependencyMode::Any => "Any",
-    };
-    KernelValue::NamedVariant {
-        enum_name: "DependencyMode".into(),
-        variant: variant.into(),
     }
+    .to_string()
 }
 
 /// Topological sort of a `FrameSpec` (Kahn's algorithm).

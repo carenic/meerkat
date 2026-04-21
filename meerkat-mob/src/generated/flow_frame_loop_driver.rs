@@ -27,21 +27,17 @@ use crate::runtime::loop_iteration_authority::{
     LoopIterationAuthority, LoopUntilEvaluationRequested,
 };
 use meerkat_machine_kernels::generated::{flow_frame, flow_run, loop_iteration};
-use meerkat_machine_kernels::{
-    KernelEffect, KernelInput, KernelState, KernelValue, TransitionOutcome,
-};
-use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
 pub struct PreviewedNodeGrant {
     pub frame_id: FrameId,
-    pub next_run_state: KernelState,
+    pub next_run_state: flow_run::State,
 }
 
 #[derive(Debug, Clone)]
 pub struct PreviewedBodyFrameGrant {
     pub loop_instance_id: LoopInstanceId,
-    pub next_run_state: KernelState,
+    pub next_run_state: flow_run::State,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,16 +50,16 @@ pub enum FlowFrameTerminalPhase {
 #[derive(Debug, Clone)]
 pub enum FlowFrameLoopStorePlan {
     GrantNodeSlot {
-        expected_run_state: KernelState,
-        next_run_state: KernelState,
+        expected_run_state: flow_run::State,
+        next_run_state: flow_run::State,
         frame_id: FrameId,
         expected_frame: FrameSnapshot,
         next_frame: FrameSnapshot,
     },
     StartLoop {
         loop_instance_id: LoopInstanceId,
-        expected_run_state: KernelState,
-        next_run_state: KernelState,
+        expected_run_state: flow_run::State,
+        next_run_state: flow_run::State,
         frame_id: FrameId,
         expected_frame: FrameSnapshot,
         next_frame: FrameSnapshot,
@@ -76,12 +72,12 @@ pub enum FlowFrameLoopStorePlan {
         frame_id: FrameId,
         initial_frame: FrameSnapshot,
         ledger_entry: LoopIterationLedgerEntry,
-        expected_run_state: KernelState,
-        next_run_state: KernelState,
+        expected_run_state: flow_run::State,
+        next_run_state: flow_run::State,
     },
     RunStateOnly {
-        expected_run_state: KernelState,
-        next_run_state: KernelState,
+        expected_run_state: flow_run::State,
+        next_run_state: flow_run::State,
     },
     SealFrame {
         frame_id: FrameId,
@@ -95,15 +91,15 @@ pub enum FlowFrameLoopStorePlan {
         frame_id: FrameId,
         expected_frame: FrameSnapshot,
         next_frame: FrameSnapshot,
-        expected_run_state: KernelState,
-        next_run_state: KernelState,
+        expected_run_state: flow_run::State,
+        next_run_state: flow_run::State,
     },
     LoopRequestBodyFrame {
         loop_instance_id: LoopInstanceId,
         expected_loop: LoopSnapshot,
         next_loop: LoopSnapshot,
-        expected_run_state: KernelState,
-        next_run_state: KernelState,
+        expected_run_state: flow_run::State,
+        next_run_state: flow_run::State,
     },
     CompleteLoop {
         loop_instance_id: LoopInstanceId,
@@ -112,8 +108,8 @@ pub enum FlowFrameLoopStorePlan {
         frame_id: FrameId,
         expected_frame: FrameSnapshot,
         next_frame: FrameSnapshot,
-        expected_run_state: KernelState,
-        next_run_state: KernelState,
+        expected_run_state: flow_run::State,
+        next_run_state: flow_run::State,
     },
 }
 
@@ -155,38 +151,46 @@ impl FlowFrameLoopDecision {
 pub struct FlowFrameLoopDriver;
 
 impl FlowFrameLoopDriver {
-    pub fn preview_node_grant(state: &KernelState) -> Result<Option<PreviewedNodeGrant>, MobError> {
-        let outcome = run_transition_outcome(state, "PumpNodeScheduler", BTreeMap::new());
+    pub fn preview_node_grant(
+        state: &flow_run::State,
+    ) -> Result<Option<PreviewedNodeGrant>, MobError> {
+        let outcome = run_transition_outcome(
+            state,
+            flow_run::Input::PumpNodeScheduler(flow_run::inputs::PumpNodeScheduler {}),
+        );
         match outcome {
-            Ok(outcome) => Ok(effect_frame_id(&outcome.effects, "GrantNodeSlot")?.map(
-                |frame_id| PreviewedNodeGrant {
-                    frame_id,
-                    next_run_state: outcome.next_state,
-                },
-            )),
+            Ok(outcome) => {
+                Ok(
+                    effect_frame_id(&outcome.effects)?.map(|frame_id| PreviewedNodeGrant {
+                        frame_id,
+                        next_run_state: outcome.next_state,
+                    }),
+                )
+            }
             Err(_) => Ok(None),
         }
     }
 
     pub fn preview_body_frame_grant(
-        state: &KernelState,
+        state: &flow_run::State,
     ) -> Result<Option<PreviewedBodyFrameGrant>, MobError> {
-        let outcome = run_transition_outcome(state, "PumpFrameScheduler", BTreeMap::new());
+        let outcome = run_transition_outcome(
+            state,
+            flow_run::Input::PumpFrameScheduler(flow_run::inputs::PumpFrameScheduler {}),
+        );
         match outcome {
-            Ok(outcome) => Ok(
-                effect_loop_id(&outcome.effects, "GrantBodyFrameStart")?.map(|loop_instance_id| {
-                    PreviewedBodyFrameGrant {
-                        loop_instance_id,
-                        next_run_state: outcome.next_state,
-                    }
-                }),
-            ),
+            Ok(outcome) => Ok(effect_loop_id(&outcome.effects)?.map(|loop_instance_id| {
+                PreviewedBodyFrameGrant {
+                    loop_instance_id,
+                    next_run_state: outcome.next_state,
+                }
+            })),
             Err(_) => Ok(None),
         }
     }
 
     pub fn acknowledge_node_grant(
-        expected_run_state: &KernelState,
+        expected_run_state: &flow_run::State,
         grant: &PreviewedNodeGrant,
         current_frame: &FrameSnapshot,
         frame_spec: &FrameSpec,
@@ -196,8 +200,7 @@ impl FlowFrameLoopDriver {
         let frame_id = &grant.frame_id;
         let admit_outcome = frame_transition_outcome(
             &current_frame.kernel_state,
-            "AdmitNextReadyNode",
-            BTreeMap::new(),
+            flow_frame::Input::AdmitNextReadyNode(flow_frame::inputs::AdmitNextReadyNode {}),
         )?;
         let next_frame = FrameSnapshot {
             kernel_state: admit_outcome.next_state.clone(),
@@ -207,22 +210,26 @@ impl FlowFrameLoopDriver {
         if has_effect_variant(&admit_outcome.effects, "NodeExecutionReleased") {
             next_run_state = run_transition_state(
                 &next_run_state,
-                "NodeExecutionReleased",
-                frame_id_fields(frame_id),
+                flow_run::Input::NodeExecutionReleased(flow_run::inputs::NodeExecutionReleased {
+                    frame_id: frame_id.to_string(),
+                }),
             )?;
         }
 
         if frame_ready(&next_frame.kernel_state)
-            && !state_set_contains(&next_run_state, "ready_frame_membership", frame_id)?
+            && !next_run_state
+                .ready_frame_membership
+                .contains(&frame_id.to_string())
         {
             next_run_state = run_transition_state(
                 &next_run_state,
-                "RegisterReadyFrame",
-                frame_id_fields(frame_id),
+                flow_run::Input::RegisterReadyFrame(flow_run::inputs::RegisterReadyFrame {
+                    frame_id: frame_id.to_string(),
+                }),
             )?;
         }
 
-        if let Some(node_id) = effect_node_id(&admit_outcome.effects, "StartLoopNode")? {
+        if let Some(node_id) = effect_node_id(&admit_outcome.effects)? {
             let loop_spec = match frame_spec.nodes.get(&node_id) {
                 Some(FlowNodeSpec::RepeatUntil(spec)) => spec.clone(),
                 _ => {
@@ -249,16 +256,18 @@ impl FlowFrameLoopDriver {
                 body_depth,
             )?;
             if state_is_awaiting_body_frame(&initial_loop.kernel_state)
-                && !state_set_contains(
-                    &next_run_state,
-                    "pending_body_frame_loop_membership",
-                    &loop_instance_id,
-                )?
+                && !next_run_state
+                    .pending_body_frame_loop_membership
+                    .contains(&loop_instance_id.to_string())
             {
                 next_run_state = run_transition_state(
                     &next_run_state,
-                    "RegisterPendingBodyFrame",
-                    loop_register_pending_fields(&loop_instance_id, u64::from(body_depth)),
+                    flow_run::Input::RegisterPendingBodyFrame(
+                        flow_run::inputs::RegisterPendingBodyFrame {
+                            loop_instance_id: loop_instance_id.to_string(),
+                            depth: body_depth,
+                        },
+                    ),
                 )?;
             }
             return Ok(FlowFrameLoopDecision::plan(
@@ -281,7 +290,7 @@ impl FlowFrameLoopDriver {
             expected_frame: current_frame.clone(),
             next_frame,
         });
-        if let Some(node_id) = effect_node_id(&admit_outcome.effects, "AdmitStepWork")? {
+        if let Some(node_id) = effect_admit_step_node_id(&admit_outcome.effects) {
             let step_id = match frame_spec.nodes.get(&node_id) {
                 Some(FlowNodeSpec::Step(step)) => step.step_id.clone(),
                 _ => {
@@ -304,7 +313,7 @@ impl FlowFrameLoopDriver {
     }
 
     pub fn acknowledge_body_frame_start(
-        expected_run_state: &KernelState,
+        expected_run_state: &flow_run::State,
         grant: &PreviewedBodyFrameGrant,
         loop_snapshot: &LoopSnapshot,
         loop_spec: &RepeatUntilSpec,
@@ -320,15 +329,11 @@ impl FlowFrameLoopDriver {
         )?;
         let body_frame_outcome = loop_transition_outcome(
             &loop_snapshot.kernel_state,
-            "BodyFrameStarted",
-            BTreeMap::from([
-                (
-                    "loop_instance_id".into(),
-                    KernelValue::String(grant.loop_instance_id.to_string()),
-                ),
-                ("frame_id".into(), KernelValue::String(frame_id.to_string())),
-                ("iteration".into(), KernelValue::U64(iteration)),
-            ]),
+            loop_iteration::Input::BodyFrameStarted(loop_iteration::inputs::BodyFrameStarted {
+                loop_instance_id: grant.loop_instance_id.to_string(),
+                frame_id: frame_id.to_string(),
+                iteration: iteration as u32,
+            }),
         )?;
         let next_loop = LoopSnapshot {
             kernel_state: body_frame_outcome.next_state,
@@ -340,12 +345,15 @@ impl FlowFrameLoopDriver {
         };
         let mut next_run_state = grant.next_run_state.clone();
         if frame_ready(&initial_frame.kernel_state)
-            && !state_set_contains(&next_run_state, "ready_frame_membership", &frame_id)?
+            && !next_run_state
+                .ready_frame_membership
+                .contains(&frame_id.to_string())
         {
             next_run_state = run_transition_state(
                 &next_run_state,
-                "RegisterReadyFrame",
-                frame_id_fields(&frame_id),
+                flow_run::Input::RegisterReadyFrame(flow_run::inputs::RegisterReadyFrame {
+                    frame_id: frame_id.to_string(),
+                }),
             )?;
         }
         Ok(
@@ -364,13 +372,15 @@ impl FlowFrameLoopDriver {
     }
 
     pub fn register_ready_frame_if_needed(
-        run_state: &KernelState,
+        run_state: &flow_run::State,
         frame_id: &FrameId,
-        frame_state: &KernelState,
+        frame_state: &flow_frame::State,
     ) -> Result<Option<FlowFrameLoopStorePlan>, MobError> {
-        if frame_state.phase != "Running"
+        if frame_state.phase != flow_frame::Phase::Running
             || !frame_ready(frame_state)
-            || state_set_contains(run_state, "ready_frame_membership", frame_id)?
+            || run_state
+                .ready_frame_membership
+                .contains(&frame_id.to_string())
         {
             return Ok(None);
         }
@@ -378,22 +388,24 @@ impl FlowFrameLoopDriver {
             expected_run_state: run_state.clone(),
             next_run_state: run_transition_state(
                 run_state,
-                "RegisterReadyFrame",
-                frame_id_fields(frame_id),
+                flow_run::Input::RegisterReadyFrame(flow_run::inputs::RegisterReadyFrame {
+                    frame_id: frame_id.to_string(),
+                }),
             )?,
         }))
     }
 
     pub fn release_node_execution(
-        run_state: &KernelState,
+        run_state: &flow_run::State,
         frame_id: &FrameId,
     ) -> Result<FlowFrameLoopStorePlan, MobError> {
         Ok(FlowFrameLoopStorePlan::RunStateOnly {
             expected_run_state: run_state.clone(),
             next_run_state: run_transition_state(
                 run_state,
-                "NodeExecutionReleased",
-                frame_id_fields(frame_id),
+                flow_run::Input::NodeExecutionReleased(flow_run::inputs::NodeExecutionReleased {
+                    frame_id: frame_id.to_string(),
+                }),
             )?,
         })
     }
@@ -403,13 +415,15 @@ impl FlowFrameLoopDriver {
         current_frame: &FrameSnapshot,
         frame_spec: &FrameSpec,
     ) -> Result<Option<FlowFrameLoopStorePlan>, MobError> {
-        if current_frame.kernel_state.phase != "Running"
+        if current_frame.kernel_state.phase != flow_frame::Phase::Running
             || !all_nodes_terminal(&current_frame.kernel_state, frame_spec)
         {
             return Ok(None);
         }
-        let outcome =
-            frame_transition_outcome(&current_frame.kernel_state, "SealFrame", BTreeMap::new())?;
+        let outcome = frame_transition_outcome(
+            &current_frame.kernel_state,
+            flow_frame::Input::SealFrame(flow_frame::inputs::SealFrame {}),
+        )?;
         Ok(Some(FlowFrameLoopStorePlan::SealFrame {
             frame_id: frame_id.clone(),
             expected_frame: current_frame.clone(),
@@ -420,13 +434,15 @@ impl FlowFrameLoopDriver {
     }
 
     pub fn advance_body_frame_after_seal(
-        run_state: &KernelState,
+        run_state: &flow_run::State,
         body_frame_id: &FrameId,
         body_frame: &FrameSnapshot,
         loop_snapshot: &LoopSnapshot,
         parent_frame: Option<&FrameSnapshot>,
     ) -> Result<Option<FlowFrameLoopDecision>, MobError> {
-        if !frame_is_body(&body_frame.kernel_state) || body_frame.kernel_state.phase == "Running" {
+        if !frame_is_body(&body_frame.kernel_state)
+            || body_frame.kernel_state.phase == flow_frame::Phase::Running
+        {
             return Ok(None);
         }
         let Some(loop_instance_id) = frame_loop_instance_id(&body_frame.kernel_state) else {
@@ -442,18 +458,35 @@ impl FlowFrameLoopDriver {
             FlowFrameTerminalPhase::Failed => "BodyFrameFailed",
             FlowFrameTerminalPhase::Canceled => "BodyFrameCanceled",
         };
-        let next_run_state =
-            run_transition_state(run_state, "FrameTerminated", frame_id_fields(body_frame_id))?;
+        let next_run_state = run_transition_state(
+            run_state,
+            flow_run::Input::FrameTerminated(flow_run::inputs::FrameTerminated {
+                frame_id: body_frame_id.to_string(),
+            }),
+        )?;
         let loop_outcome = loop_transition_outcome(
             &loop_snapshot.kernel_state,
-            first_variant,
-            BTreeMap::from([
-                (
-                    "loop_instance_id".into(),
-                    KernelValue::String(loop_instance_id.to_string()),
+            match first_variant {
+                "BodyFrameCompleted" => loop_iteration::Input::BodyFrameCompleted(
+                    loop_iteration::inputs::BodyFrameCompleted {
+                        loop_instance_id: loop_instance_id.to_string(),
+                        iteration: iteration as u32,
+                    },
                 ),
-                ("iteration".into(), KernelValue::U64(iteration)),
-            ]),
+                "BodyFrameFailed" => loop_iteration::Input::BodyFrameFailed(
+                    loop_iteration::inputs::BodyFrameFailed {
+                        loop_instance_id: loop_instance_id.to_string(),
+                        iteration: iteration as u32,
+                    },
+                ),
+                "BodyFrameCanceled" => loop_iteration::Input::BodyFrameCanceled(
+                    loop_iteration::inputs::BodyFrameCanceled {
+                        loop_instance_id: loop_instance_id.to_string(),
+                        iteration: iteration as u32,
+                    },
+                ),
+                _ => unreachable!(),
+            },
         )?;
         let next_loop = LoopSnapshot {
             kernel_state: loop_outcome.next_state.clone(),
@@ -464,7 +497,7 @@ impl FlowFrameLoopDriver {
                 let request = loop_outcome
                     .effects
                     .iter()
-                    .find(|effect| effect.variant == "EvaluateUntilCondition")
+                    .find(|effect| matches!(effect, loop_iteration::Effect::EvaluateUntilCondition(_)))
                     .ok_or_else(|| {
                         MobError::Internal(format!(
                             "loop '{loop_instance_id}' did not emit EvaluateUntilCondition after body-frame completion"
@@ -493,10 +526,7 @@ impl FlowFrameLoopDriver {
                         "body-frame '{body_frame_id}' terminalization requires parent frame snapshot"
                     ))
                 })?;
-                let loop_terminal = first_matching_effect(
-                    &loop_outcome.effects,
-                    &["LoopFailed", "LoopCanceled"],
-                )
+                let loop_terminal = first_matching_loop_terminal_effect(&loop_outcome.effects)
                 .ok_or_else(|| {
                     MobError::Internal(format!(
                         "loop '{loop_instance_id}' did not emit a terminal effect after '{first_variant}'"
@@ -524,17 +554,14 @@ impl FlowFrameLoopDriver {
     pub fn pending_until_obligation(
         loop_snapshot: &LoopSnapshot,
     ) -> Result<Option<FlowLoopUntilEvaluationObligation>, MobError> {
-        if loop_snapshot.kernel_state.phase != "Running"
+        if loop_snapshot.kernel_state.phase != loop_iteration::Phase::Running
             || loop_stage(&loop_snapshot.kernel_state)? != "AwaitingUntil"
         {
             return Ok(None);
         }
         Ok(Some(FlowLoopUntilEvaluationObligation {
             loop_instance_id: loop_instance_id_from_state(&loop_snapshot.kernel_state)?,
-            iteration: u32_from_state_field(
-                &loop_snapshot.kernel_state,
-                "last_completed_iteration",
-            )?,
+            iteration: loop_snapshot.kernel_state.last_completed_iteration,
             parent_frame_id: loop_parent_frame_id(&loop_snapshot.kernel_state)?,
             parent_node_id: loop_parent_node_id(&loop_snapshot.kernel_state)?,
             loop_id: loop_id_from_state(&loop_snapshot.kernel_state)?,
@@ -542,7 +569,7 @@ impl FlowFrameLoopDriver {
     }
 
     pub fn resolve_until_feedback(
-        run_state: &KernelState,
+        run_state: &flow_run::State,
         loop_snapshot: &LoopSnapshot,
         parent_frame: &FrameSnapshot,
         obligation: FlowLoopUntilEvaluationObligation,
@@ -558,18 +585,20 @@ impl FlowFrameLoopDriver {
             kernel_state: feedback.next_state.clone(),
         };
 
-        if let Some(depth) = maybe_effect_u64(&feedback.effects, "RequestBodyFrameStart", "depth")?
-        {
+        if let Some(depth) = maybe_effect_request_body_frame_start_depth(&feedback.effects) {
             let mut next_run_state = run_state.clone();
-            if !state_set_contains(
-                run_state,
-                "pending_body_frame_loop_membership",
-                &obligation.loop_instance_id,
-            )? {
+            if !run_state
+                .pending_body_frame_loop_membership
+                .contains(&obligation.loop_instance_id.to_string())
+            {
                 next_run_state = run_transition_state(
                     &next_run_state,
-                    "RegisterPendingBodyFrame",
-                    loop_register_pending_fields(&obligation.loop_instance_id, depth),
+                    flow_run::Input::RegisterPendingBodyFrame(
+                        flow_run::inputs::RegisterPendingBodyFrame {
+                            loop_instance_id: obligation.loop_instance_id.to_string(),
+                            depth,
+                        },
+                    ),
                 )?;
             }
             return Ok(FlowFrameLoopDecision::plan(
@@ -583,15 +612,7 @@ impl FlowFrameLoopDriver {
             ));
         }
 
-        let loop_terminal = first_matching_effect(
-            &feedback.effects,
-            &[
-                "LoopCompleted",
-                "LoopExhausted",
-                "LoopFailed",
-                "LoopCanceled",
-            ],
-        )
+        let loop_terminal = first_matching_loop_terminal_effect(&feedback.effects)
         .ok_or_else(|| {
             MobError::Internal(format!(
                 "until feedback for loop '{}' produced neither RequestBodyFrameStart nor terminal effect",
@@ -612,12 +633,11 @@ impl FlowFrameLoopDriver {
     }
 
     pub fn recover_terminal_loop_projection(
-        run_state: &KernelState,
+        run_state: &flow_run::State,
         loop_snapshot: &LoopSnapshot,
         parent_frame: &FrameSnapshot,
     ) -> Result<Option<FlowFrameLoopDecision>, MobError> {
-        let Some(loop_terminal) = loop_terminal_effect(loop_snapshot.kernel_state.phase.as_str())
-        else {
+        let Some(loop_terminal) = loop_terminal_effect(&loop_snapshot.kernel_state.phase) else {
             return Ok(None);
         };
         let loop_instance_id = loop_instance_id_from_state(&loop_snapshot.kernel_state)?;
@@ -639,10 +659,10 @@ impl FlowFrameLoopDriver {
     }
 
     pub fn recover_pending_body_frame_request(
-        run_state: &KernelState,
+        run_state: &flow_run::State,
         loop_snapshot: &LoopSnapshot,
     ) -> Result<Option<FlowFrameLoopDecision>, MobError> {
-        if loop_snapshot.kernel_state.phase != "Running"
+        if loop_snapshot.kernel_state.phase != loop_iteration::Phase::Running
             || !state_is_awaiting_body_frame(&loop_snapshot.kernel_state)
             || active_body_frame_id(&loop_snapshot.kernel_state).is_some()
         {
@@ -650,19 +670,20 @@ impl FlowFrameLoopDriver {
         }
 
         let loop_instance_id = loop_instance_id_from_state(&loop_snapshot.kernel_state)?;
-        if state_set_contains(
-            run_state,
-            "pending_body_frame_loop_membership",
-            &loop_instance_id,
-        )? {
+        if run_state
+            .pending_body_frame_loop_membership
+            .contains(&loop_instance_id.to_string())
+        {
             return Ok(None);
         }
 
-        let depth = u64_from_state_field(&loop_snapshot.kernel_state, "depth")?;
+        let depth = loop_snapshot.kernel_state.depth;
         let next_run_state = run_transition_state(
             run_state,
-            "RegisterPendingBodyFrame",
-            loop_register_pending_fields(&loop_instance_id, depth),
+            flow_run::Input::RegisterPendingBodyFrame(flow_run::inputs::RegisterPendingBodyFrame {
+                loop_instance_id: loop_instance_id.to_string(),
+                depth,
+            }),
         )?;
         Ok(Some(FlowFrameLoopDecision::plan(
             FlowFrameLoopStorePlan::RunStateOnly {
@@ -679,8 +700,8 @@ impl FlowFrameLoopDriver {
 
 struct CompleteLoopDecisionRequest<'a> {
     loop_terminal: &'a str,
-    expected_run_state: &'a KernelState,
-    next_run_state: KernelState,
+    expected_run_state: &'a flow_run::State,
+    next_run_state: flow_run::State,
     loop_instance_id: &'a LoopInstanceId,
     expected_loop: &'a LoopSnapshot,
     next_loop: LoopSnapshot,
@@ -703,34 +724,39 @@ fn build_complete_loop_decision(
         expected_parent_frame,
         parent_node_id,
     } = request;
-    let parent_input_variant = match loop_terminal {
-        "LoopCompleted" => "CompleteNode",
-        "LoopExhausted" | "LoopFailed" => "FailNode",
-        "LoopCanceled" => "CancelNode",
+    let parent_input = match loop_terminal {
+        "LoopCompleted" => flow_frame::Input::CompleteNode(flow_frame::inputs::CompleteNode {
+            node_id: parent_node_id.to_string(),
+        }),
+        "LoopExhausted" | "LoopFailed" => {
+            flow_frame::Input::FailNode(flow_frame::inputs::FailNode {
+                node_id: parent_node_id.to_string(),
+            })
+        }
+        "LoopCanceled" => flow_frame::Input::CancelNode(flow_frame::inputs::CancelNode {
+            node_id: parent_node_id.to_string(),
+        }),
         other => {
             return Err(MobError::Internal(format!(
                 "unknown loop terminal effect '{other}'"
             )));
         }
     };
-    let parent_outcome = frame_transition_outcome(
-        &expected_parent_frame.kernel_state,
-        parent_input_variant,
-        BTreeMap::from([(
-            "node_id".into(),
-            KernelValue::String(parent_node_id.to_string()),
-        )]),
-    )?;
+    let parent_outcome =
+        frame_transition_outcome(&expected_parent_frame.kernel_state, parent_input)?;
     let next_parent_frame = FrameSnapshot {
         kernel_state: parent_outcome.next_state,
     };
     if frame_ready(&next_parent_frame.kernel_state)
-        && !state_set_contains(&next_run_state, "ready_frame_membership", parent_frame_id)?
+        && !next_run_state
+            .ready_frame_membership
+            .contains(&parent_frame_id.to_string())
     {
         next_run_state = run_transition_state(
             &next_run_state,
-            "RegisterReadyFrame",
-            frame_id_fields(parent_frame_id),
+            flow_run::Input::RegisterReadyFrame(flow_run::inputs::RegisterReadyFrame {
+                frame_id: parent_frame_id.to_string(),
+            }),
         )?;
     }
     Ok(
@@ -757,35 +783,17 @@ fn initial_loop_snapshot(
     parent_node_id: &FlowNodeId,
     depth: u32,
 ) -> Result<LoopSnapshot, MobError> {
-    let initial = loop_iteration::initial_state().map_err(|error| {
-        MobError::Internal(format!("loop_iteration initial_state failed: {error:?}"))
-    })?;
+    let initial = loop_iteration::initial_state();
     let start = loop_transition_outcome(
         &initial,
-        "StartLoop",
-        BTreeMap::from([
-            (
-                "loop_instance_id".into(),
-                KernelValue::String(loop_instance_id.to_string()),
-            ),
-            (
-                "max_iterations".into(),
-                KernelValue::U64(loop_spec.max_iterations as u64),
-            ),
-            (
-                "parent_frame_id".into(),
-                KernelValue::String(parent_frame_id.to_string()),
-            ),
-            (
-                "parent_node_id".into(),
-                KernelValue::String(parent_node_id.to_string()),
-            ),
-            (
-                "loop_id".into(),
-                KernelValue::String(loop_spec.loop_id.to_string()),
-            ),
-            ("depth".into(), KernelValue::U64(u64::from(depth))),
-        ]),
+        loop_iteration::Input::StartLoop(loop_iteration::inputs::StartLoop {
+            loop_instance_id: loop_instance_id.to_string(),
+            max_iterations: loop_spec.max_iterations,
+            parent_frame_id: parent_frame_id.to_string(),
+            parent_node_id: parent_node_id.to_string(),
+            loop_id: loop_spec.loop_id.to_string(),
+            depth,
+        }),
     )?;
     Ok(LoopSnapshot {
         kernel_state: start.next_state,
@@ -798,348 +806,193 @@ fn initial_body_frame_snapshot(
     iteration: u64,
     spec: &FrameSpec,
 ) -> Result<FrameSnapshot, MobError> {
-    let initial = flow_frame::initial_state().map_err(|error| {
-        MobError::Internal(format!("flow_frame initial_state failed: {error:?}"))
-    })?;
+    let initial = flow_frame::initial_state();
     let ordered = topological_order(spec)?;
     let start_input =
         build_start_body_frame_input(frame_id, loop_instance_id, iteration, spec, &ordered);
-    let outcome = flow_frame::transition(&initial, &start_input).map_err(|error| {
-        MobError::Internal(format!("flow_frame StartBodyFrame failed: {error:?}"))
-    })?;
+    let outcome = flow_frame::transition(&initial, start_input, &flow_frame::EmptyContext)
+        .map_err(|error| {
+            MobError::Internal(format!("flow_frame StartBodyFrame failed: {error:?}"))
+        })?;
     Ok(FrameSnapshot {
         kernel_state: outcome.next_state,
     })
 }
 
 fn run_transition_state(
-    state: &KernelState,
-    variant: &str,
-    fields: BTreeMap<String, KernelValue>,
-) -> Result<KernelState, MobError> {
-    Ok(run_transition_outcome(state, variant, fields)?.next_state)
+    state: &flow_run::State,
+    input: flow_run::Input,
+) -> Result<flow_run::State, MobError> {
+    Ok(run_transition_outcome(state, input)?.next_state)
 }
 
 fn run_transition_outcome(
-    state: &KernelState,
-    variant: &str,
-    fields: BTreeMap<String, KernelValue>,
-) -> Result<TransitionOutcome, MobError> {
-    flow_run::transition(
-        state,
-        &KernelInput {
-            variant: variant.to_string(),
-            fields,
-        },
-    )
-    .map_err(|error| MobError::Internal(format!("flow_run {variant} transition refused: {error}")))
+    state: &flow_run::State,
+    input: flow_run::Input,
+) -> Result<flow_run::Outcome, MobError> {
+    flow_run::transition(state, input, &flow_run::EmptyContext)
+        .map_err(|error| MobError::Internal(format!("flow_run transition refused: {error:?}")))
 }
 
 fn frame_transition_outcome(
-    state: &KernelState,
-    variant: &str,
-    fields: BTreeMap<String, KernelValue>,
-) -> Result<TransitionOutcome, MobError> {
-    flow_frame::transition(
-        state,
-        &KernelInput {
-            variant: variant.to_string(),
-            fields,
-        },
-    )
-    .map_err(|error| {
-        MobError::Internal(format!("flow_frame {variant} transition refused: {error}"))
-    })
+    state: &flow_frame::State,
+    input: flow_frame::Input,
+) -> Result<flow_frame::Outcome, MobError> {
+    flow_frame::transition(state, input, &flow_frame::EmptyContext)
+        .map_err(|error| MobError::Internal(format!("flow_frame transition refused: {error:?}")))
 }
 
 fn loop_transition_outcome(
-    state: &KernelState,
-    variant: &str,
-    fields: BTreeMap<String, KernelValue>,
-) -> Result<TransitionOutcome, MobError> {
-    loop_iteration::transition(
-        state,
-        &KernelInput {
-            variant: variant.to_string(),
-            fields,
-        },
-    )
-    .map_err(|error| {
-        MobError::Internal(format!(
-            "loop_iteration {variant} transition refused: {error}"
-        ))
+    state: &loop_iteration::State,
+    input: loop_iteration::Input,
+) -> Result<loop_iteration::Outcome, MobError> {
+    loop_iteration::transition(state, input, &loop_iteration::EmptyContext).map_err(|error| {
+        MobError::Internal(format!("loop_iteration transition refused: {error:?}"))
     })
 }
 
-fn loop_register_pending_fields(
-    loop_instance_id: &LoopInstanceId,
-    depth: u64,
-) -> BTreeMap<String, KernelValue> {
-    BTreeMap::from([
-        (
-            "loop_instance_id".into(),
-            KernelValue::String(loop_instance_id.to_string()),
-        ),
-        ("depth".into(), KernelValue::U64(depth)),
-    ])
-}
-
-fn frame_id_fields(frame_id: &FrameId) -> BTreeMap<String, KernelValue> {
-    BTreeMap::from([("frame_id".into(), KernelValue::String(frame_id.to_string()))])
-}
-
-fn all_nodes_terminal(state: &KernelState, spec: &FrameSpec) -> bool {
-    let Some(KernelValue::Map(status_map)) = state.fields.get("node_status") else {
-        return false;
-    };
+fn all_nodes_terminal(state: &flow_frame::State, spec: &FrameSpec) -> bool {
     let terminal = ["Completed", "Failed", "Skipped", "Canceled"];
-    for node_id in spec.nodes.keys() {
-        let key = KernelValue::String(node_id.to_string());
-        match status_map.get(&key) {
-            Some(KernelValue::NamedVariant { variant, .. })
-                if terminal.contains(&variant.as_str()) => {}
-            _ => return false,
-        }
-    }
-    true
-}
-
-fn frame_ready(state: &KernelState) -> bool {
-    match state.fields.get("ready_queue") {
-        Some(KernelValue::Seq(queue)) => !queue.is_empty(),
-        _ => false,
-    }
-}
-
-fn state_set_contains<T>(state: &KernelState, field: &str, value: &T) -> Result<bool, MobError>
-where
-    T: ToString,
-{
-    let set = match state.fields.get(field) {
-        Some(KernelValue::Set(set)) => set,
-        other => {
-            return Err(MobError::Internal(format!(
-                "kernel state field '{field}' missing or invalid set: {other:?}"
-            )));
-        }
-    };
-    Ok(set.contains(&KernelValue::String(value.to_string())))
-}
-
-fn has_effect_variant(effects: &[KernelEffect], variant: &str) -> bool {
-    effects.iter().any(|effect| effect.variant == variant)
-}
-
-fn first_matching_effect<'a>(effects: &'a [KernelEffect], variants: &[&str]) -> Option<&'a str> {
-    effects
-        .iter()
-        .map(|effect| effect.variant.as_str())
-        .find(|variant| variants.contains(variant))
-}
-
-fn effect_node_id(
-    effects: &[KernelEffect],
-    expected_variant: &str,
-) -> Result<Option<FlowNodeId>, MobError> {
-    effects
-        .iter()
-        .find(|effect| effect.variant == expected_variant)
-        .map(|effect| {
-            string_from_effect_field(effect, "node_id")
-                .map(|value| FlowNodeId::from(value.as_str()))
-        })
-        .transpose()
-}
-
-fn effect_frame_id(
-    effects: &[KernelEffect],
-    expected_variant: &str,
-) -> Result<Option<FrameId>, MobError> {
-    effects
-        .iter()
-        .find(|effect| effect.variant == expected_variant)
-        .map(|effect| {
-            string_from_effect_field(effect, "frame_id").map(|value| FrameId::from(value.as_str()))
-        })
-        .transpose()
-}
-
-fn effect_loop_id(
-    effects: &[KernelEffect],
-    expected_variant: &str,
-) -> Result<Option<LoopInstanceId>, MobError> {
-    effects
-        .iter()
-        .find(|effect| effect.variant == expected_variant)
-        .map(|effect| {
-            string_from_effect_field(effect, "loop_instance_id")
-                .map(|value| LoopInstanceId::from(value.as_str()))
-        })
-        .transpose()
-}
-
-fn maybe_effect_u64(
-    effects: &[KernelEffect],
-    expected_variant: &str,
-    field: &str,
-) -> Result<Option<u64>, MobError> {
-    effects
-        .iter()
-        .find(|effect| effect.variant == expected_variant)
-        .map(|effect| u64_from_effect_field(effect, field))
-        .transpose()
-}
-
-fn string_from_effect_field(effect: &KernelEffect, field: &str) -> Result<String, MobError> {
-    match effect.fields.get(field) {
-        Some(KernelValue::String(value)) => Ok(value.clone()),
-        other => Err(MobError::Internal(format!(
-            "effect '{}' missing String field '{}': {other:?}",
-            effect.variant, field
-        ))),
-    }
-}
-
-fn u64_from_effect_field(effect: &KernelEffect, field: &str) -> Result<u64, MobError> {
-    match effect.fields.get(field) {
-        Some(KernelValue::U64(value)) => Ok(*value),
-        other => Err(MobError::Internal(format!(
-            "effect '{}' missing U64 field '{}': {other:?}",
-            effect.variant, field
-        ))),
-    }
-}
-
-fn string_from_state_field(state: &KernelState, field: &str) -> Result<String, MobError> {
-    match state.fields.get(field) {
-        Some(KernelValue::String(value)) => Ok(value.clone()),
-        other => Err(MobError::Internal(format!(
-            "kernel state missing String field '{field}': {other:?}"
-        ))),
-    }
-}
-
-fn u64_from_state_field(state: &KernelState, field: &str) -> Result<u64, MobError> {
-    match state.fields.get(field) {
-        Some(KernelValue::U64(value)) => Ok(*value),
-        other => Err(MobError::Internal(format!(
-            "kernel state missing U64 field '{field}': {other:?}"
-        ))),
-    }
-}
-
-fn u32_from_state_field(state: &KernelState, field: &str) -> Result<u32, MobError> {
-    let value = u64_from_state_field(state, field)?;
-    u32::try_from(value).map_err(|_| {
-        MobError::Internal(format!(
-            "kernel state field '{field}' value {value} does not fit in u32"
-        ))
+    spec.nodes.keys().all(|node_id| {
+        state
+            .node_status
+            .get(&node_id.to_string())
+            .is_some_and(|status| terminal.contains(&status.as_str()))
     })
 }
 
-fn named_variant_from_state_field<'a>(
-    state: &'a KernelState,
-    field: &str,
-) -> Result<&'a str, MobError> {
-    match state.fields.get(field) {
-        Some(KernelValue::NamedVariant { variant, .. }) => Ok(variant.as_str()),
-        other => Err(MobError::Internal(format!(
-            "kernel state missing enum field '{field}': {other:?}"
-        ))),
-    }
+fn frame_ready(state: &flow_frame::State) -> bool {
+    !state.ready_queue.is_empty()
 }
 
-fn frame_is_body(state: &KernelState) -> bool {
-    matches!(
-        state.fields.get("frame_scope"),
-        Some(KernelValue::NamedVariant { variant, .. }) if variant == "Body"
-    )
+fn has_effect_variant(effects: &[flow_frame::Effect], variant: &str) -> bool {
+    effects.iter().any(|effect| {
+        matches!(
+            (variant, effect),
+            (
+                "NodeExecutionReleased",
+                flow_frame::Effect::NodeExecutionReleased(_)
+            )
+        )
+    })
 }
 
-fn frame_loop_instance_id(state: &KernelState) -> Option<LoopInstanceId> {
-    match state.fields.get("loop_instance_id") {
-        Some(KernelValue::String(loop_instance_id)) if !loop_instance_id.is_empty() => {
-            Some(LoopInstanceId::from(loop_instance_id.as_str()))
+fn effect_admit_step_node_id(effects: &[flow_frame::Effect]) -> Option<FlowNodeId> {
+    effects.iter().find_map(|effect| match effect {
+        flow_frame::Effect::AdmitStepWork(payload) => {
+            Some(FlowNodeId::from(payload.node_id.as_str()))
         }
         _ => None,
-    }
+    })
 }
 
-fn frame_iteration(state: &KernelState) -> Result<u64, MobError> {
-    u64_from_state_field(state, "iteration")
-}
-
-fn loop_current_iteration(state: &KernelState) -> Result<u64, MobError> {
-    u64_from_state_field(state, "current_iteration")
-}
-
-fn loop_instance_id_from_state(state: &KernelState) -> Result<LoopInstanceId, MobError> {
-    Ok(LoopInstanceId::from(string_from_state_field(
-        state,
-        "loop_instance_id",
-    )?))
-}
-
-fn loop_parent_frame_id(state: &KernelState) -> Result<FrameId, MobError> {
-    Ok(FrameId::from(string_from_state_field(
-        state,
-        "parent_frame_id",
-    )?))
-}
-
-fn loop_parent_node_id(state: &KernelState) -> Result<FlowNodeId, MobError> {
-    Ok(FlowNodeId::from(string_from_state_field(
-        state,
-        "parent_node_id",
-    )?))
-}
-
-fn loop_id_from_state(state: &KernelState) -> Result<LoopId, MobError> {
-    Ok(LoopId::from(string_from_state_field(state, "loop_id")?))
-}
-
-fn loop_stage(state: &KernelState) -> Result<&str, MobError> {
-    named_variant_from_state_field(state, "stage")
-}
-
-fn active_body_frame_id(state: &KernelState) -> Option<FrameId> {
-    match state.fields.get("active_body_frame_id") {
-        Some(KernelValue::String(frame_id)) if !frame_id.is_empty() => {
-            Some(FrameId::from(frame_id.as_str()))
+fn effect_node_id(effects: &[flow_frame::Effect]) -> Result<Option<FlowNodeId>, MobError> {
+    Ok(effects.iter().find_map(|effect| match effect {
+        flow_frame::Effect::StartLoopNode(payload) => {
+            Some(FlowNodeId::from(payload.node_id.as_str()))
         }
-        Some(KernelValue::Map(entries)) => entries
-            .get(&KernelValue::String("value".into()))
-            .and_then(|value| match value {
-                KernelValue::String(frame_id) if !frame_id.is_empty() => {
-                    Some(FrameId::from(frame_id.as_str()))
-                }
-                _ => None,
-            }),
         _ => None,
-    }
+    }))
 }
 
-fn state_is_awaiting_body_frame(state: &KernelState) -> bool {
-    matches!(loop_stage(state), Ok("AwaitingBodyFrame"))
+fn effect_frame_id(effects: &[flow_run::Effect]) -> Result<Option<FrameId>, MobError> {
+    Ok(effects.iter().find_map(|effect| match effect {
+        flow_run::Effect::GrantNodeSlot(payload) => Some(FrameId::from(payload.frame_id.as_str())),
+        _ => None,
+    }))
 }
 
-fn loop_terminal_effect(phase: &str) -> Option<&'static str> {
+fn effect_loop_id(effects: &[flow_run::Effect]) -> Result<Option<LoopInstanceId>, MobError> {
+    Ok(effects.iter().find_map(|effect| match effect {
+        flow_run::Effect::GrantBodyFrameStart(payload) => {
+            Some(LoopInstanceId::from(payload.loop_instance_id.as_str()))
+        }
+        _ => None,
+    }))
+}
+
+fn maybe_effect_request_body_frame_start_depth(effects: &[loop_iteration::Effect]) -> Option<u32> {
+    effects.iter().find_map(|effect| match effect {
+        loop_iteration::Effect::RequestBodyFrameStart(payload) => Some(payload.depth),
+        _ => None,
+    })
+}
+
+fn first_matching_loop_terminal_effect(effects: &[loop_iteration::Effect]) -> Option<&'static str> {
+    effects.iter().find_map(|effect| match effect {
+        loop_iteration::Effect::LoopCompleted(_) => Some("LoopCompleted"),
+        loop_iteration::Effect::LoopExhausted(_) => Some("LoopExhausted"),
+        loop_iteration::Effect::LoopFailed(_) => Some("LoopFailed"),
+        loop_iteration::Effect::LoopCanceled(_) => Some("LoopCanceled"),
+        _ => None,
+    })
+}
+
+fn frame_is_body(state: &flow_frame::State) -> bool {
+    state.frame_scope == "Body"
+}
+
+fn frame_loop_instance_id(state: &flow_frame::State) -> Option<LoopInstanceId> {
+    (!state.loop_instance_id.is_empty())
+        .then(|| LoopInstanceId::from(state.loop_instance_id.as_str()))
+}
+
+fn frame_iteration(state: &flow_frame::State) -> Result<u64, MobError> {
+    Ok(u64::from(state.iteration))
+}
+
+fn loop_current_iteration(state: &loop_iteration::State) -> Result<u64, MobError> {
+    Ok(u64::from(state.current_iteration))
+}
+
+fn loop_instance_id_from_state(state: &loop_iteration::State) -> Result<LoopInstanceId, MobError> {
+    Ok(LoopInstanceId::from(state.loop_instance_id.as_str()))
+}
+
+fn loop_parent_frame_id(state: &loop_iteration::State) -> Result<FrameId, MobError> {
+    Ok(FrameId::from(state.parent_frame_id.as_str()))
+}
+
+fn loop_parent_node_id(state: &loop_iteration::State) -> Result<FlowNodeId, MobError> {
+    Ok(FlowNodeId::from(state.parent_node_id.as_str()))
+}
+
+fn loop_id_from_state(state: &loop_iteration::State) -> Result<LoopId, MobError> {
+    Ok(LoopId::from(state.loop_id.as_str()))
+}
+
+fn loop_stage(state: &loop_iteration::State) -> Result<&str, MobError> {
+    Ok(state.stage.as_str())
+}
+
+fn active_body_frame_id(state: &loop_iteration::State) -> Option<FrameId> {
+    state
+        .active_body_frame_id
+        .as_ref()
+        .map(|frame_id| FrameId::from(frame_id.as_str()))
+}
+
+fn state_is_awaiting_body_frame(state: &loop_iteration::State) -> bool {
+    state.stage == "AwaitingBodyFrame"
+}
+
+fn loop_terminal_effect(phase: &loop_iteration::Phase) -> Option<&'static str> {
     match phase {
-        "Completed" => Some("LoopCompleted"),
-        "Exhausted" => Some("LoopExhausted"),
-        "Failed" => Some("LoopFailed"),
-        "Canceled" => Some("LoopCanceled"),
+        loop_iteration::Phase::Completed => Some("LoopCompleted"),
+        loop_iteration::Phase::Exhausted => Some("LoopExhausted"),
+        loop_iteration::Phase::Failed => Some("LoopFailed"),
+        loop_iteration::Phase::Canceled => Some("LoopCanceled"),
         _ => None,
     }
 }
 
-fn terminal_phase(state: &KernelState) -> Result<FlowFrameTerminalPhase, MobError> {
-    match state.phase.as_str() {
-        "Completed" => Ok(FlowFrameTerminalPhase::Completed),
-        "Failed" => Ok(FlowFrameTerminalPhase::Failed),
-        "Canceled" => Ok(FlowFrameTerminalPhase::Canceled),
-        other => Err(MobError::Internal(format!(
-            "frame is not in a terminal phase: '{other}'"
+fn terminal_phase(state: &flow_frame::State) -> Result<FlowFrameTerminalPhase, MobError> {
+    match state.phase {
+        flow_frame::Phase::Completed => Ok(FlowFrameTerminalPhase::Completed),
+        flow_frame::Phase::Failed => Ok(FlowFrameTerminalPhase::Failed),
+        flow_frame::Phase::Canceled => Ok(FlowFrameTerminalPhase::Canceled),
+        ref other => Err(MobError::Internal(format!(
+            "frame is not in a terminal phase: '{other:?}'"
         ))),
     }
 }

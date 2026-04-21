@@ -1,7 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use meerkat_machine_kernels::generated::loop_iteration;
-use meerkat_machine_kernels::{KernelInput, KernelValue};
+use meerkat_machine_kernels::test_oracle::{KernelInput, KernelValue};
 use std::collections::BTreeMap;
 
 fn str_val(s: &str) -> KernelValue {
@@ -56,14 +56,14 @@ fn body_frame_completed_input(loop_instance_id: &str, iteration: u64) -> KernelI
 fn advance_one_iteration(
     loop_instance_id: &str,
     iteration: u64,
-    state: meerkat_machine_kernels::KernelState,
-) -> meerkat_machine_kernels::KernelState {
+    state: meerkat_machine_kernels::test_oracle::KernelState,
+) -> meerkat_machine_kernels::test_oracle::KernelState {
     let started = body_frame_started_input(loop_instance_id, "frame-x", iteration);
-    let state = loop_iteration::transition(&state, &started)
+    let state = loop_iteration::transition_raw(&state, &started)
         .expect("BodyFrameStarted")
         .next_state;
     let completed = body_frame_completed_input(loop_instance_id, iteration);
-    loop_iteration::transition(&state, &completed)
+    loop_iteration::transition_raw(&state, &completed)
         .expect("BodyFrameCompleted")
         .next_state
 }
@@ -71,9 +71,9 @@ fn advance_one_iteration(
 /// REQ-04 (loop side): Loop machine requests body frame start after StartLoop
 #[test]
 fn test_start_loop_emits_request_body_frame_start() {
-    let state = loop_iteration::initial_state().expect("init");
+    let state = loop_iteration::initial_state_raw().expect("init");
     let start = start_loop_input("loop-a", 3);
-    let outcome = loop_iteration::transition(&state, &start).expect("StartLoop");
+    let outcome = loop_iteration::transition_raw(&state, &start).expect("StartLoop");
 
     assert!(
         outcome
@@ -102,21 +102,21 @@ fn test_start_loop_emits_request_body_frame_start() {
 /// REQ-04 (loop side): BodyFrameCompleted advances current_iteration and emits EvaluateUntilCondition
 #[test]
 fn test_loop_iteration_advances_current_iteration() {
-    let state = loop_iteration::initial_state().expect("init");
+    let state = loop_iteration::initial_state_raw().expect("init");
 
     // Start loop
     let outcome =
-        loop_iteration::transition(&state, &start_loop_input("loop-a", 5)).expect("StartLoop");
+        loop_iteration::transition_raw(&state, &start_loop_input("loop-a", 5)).expect("StartLoop");
     let state = outcome.next_state;
 
     // BodyFrameStarted
     let outcome =
-        loop_iteration::transition(&state, &body_frame_started_input("loop-a", "frame-1", 0))
+        loop_iteration::transition_raw(&state, &body_frame_started_input("loop-a", "frame-1", 0))
             .expect("BodyFrameStarted");
     let state = outcome.next_state;
 
     // BodyFrameCompleted → should emit EvaluateUntilCondition and increment iteration
-    let outcome = loop_iteration::transition(&state, &body_frame_completed_input("loop-a", 0))
+    let outcome = loop_iteration::transition_raw(&state, &body_frame_completed_input("loop-a", 0))
         .expect("BodyFrameCompleted");
     let state = outcome.next_state;
 
@@ -144,9 +144,9 @@ fn test_loop_iteration_advances_current_iteration() {
 /// REQ-04: UntilConditionMet → Completed + LoopCompleted
 #[test]
 fn test_until_condition_met_completes_loop() {
-    let state = loop_iteration::initial_state().expect("init");
+    let state = loop_iteration::initial_state_raw().expect("init");
     let outcome =
-        loop_iteration::transition(&state, &start_loop_input("loop-a", 5)).expect("StartLoop");
+        loop_iteration::transition_raw(&state, &start_loop_input("loop-a", 5)).expect("StartLoop");
     let state = advance_one_iteration("loop-a", 0, outcome.next_state);
 
     let met = KernelInput {
@@ -156,7 +156,7 @@ fn test_until_condition_met_completes_loop() {
             ("iteration".into(), u64_val(0)),
         ]),
     };
-    let outcome = loop_iteration::transition(&state, &met).expect("UntilConditionMet");
+    let outcome = loop_iteration::transition_raw(&state, &met).expect("UntilConditionMet");
 
     assert_eq!(outcome.next_state.phase, "Completed");
     assert!(
@@ -173,9 +173,9 @@ fn test_until_condition_met_completes_loop() {
 /// REQ-04 + CHOKE-02: UntilConditionFailed → re-requests body frame for next iteration
 #[test]
 fn test_until_condition_failed_requests_next_body_frame() {
-    let state = loop_iteration::initial_state().expect("init");
+    let state = loop_iteration::initial_state_raw().expect("init");
     let outcome =
-        loop_iteration::transition(&state, &start_loop_input("loop-a", 5)).expect("StartLoop");
+        loop_iteration::transition_raw(&state, &start_loop_input("loop-a", 5)).expect("StartLoop");
     let state = advance_one_iteration("loop-a", 0, outcome.next_state);
 
     let failed = KernelInput {
@@ -185,7 +185,7 @@ fn test_until_condition_failed_requests_next_body_frame() {
             ("iteration".into(), u64_val(0)),
         ]),
     };
-    let outcome = loop_iteration::transition(&state, &failed).expect("UntilConditionFailed");
+    let outcome = loop_iteration::transition_raw(&state, &failed).expect("UntilConditionFailed");
 
     assert_eq!(
         outcome.next_state.phase, "Running",
@@ -208,10 +208,10 @@ fn test_until_condition_failed_requests_next_body_frame() {
 /// REQ-04 + REQ-07: Loop exhausted when max_iterations reached
 #[test]
 fn test_loop_exhausted_when_max_iterations_reached() {
-    let state = loop_iteration::initial_state().expect("init");
+    let state = loop_iteration::initial_state_raw().expect("init");
     // max_iterations = 2
     let outcome =
-        loop_iteration::transition(&state, &start_loop_input("loop-a", 2)).expect("StartLoop");
+        loop_iteration::transition_raw(&state, &start_loop_input("loop-a", 2)).expect("StartLoop");
 
     // Run first iteration, condition fails
     let state = advance_one_iteration("loop-a", 0, outcome.next_state);
@@ -224,7 +224,7 @@ fn test_loop_exhausted_when_max_iterations_reached() {
     };
     // After 1 iteration, current_iteration=1, max=2, so NOT exhausted → re-requests
     let outcome =
-        loop_iteration::transition(&state, &failed).expect("UntilConditionFailed after iter 1");
+        loop_iteration::transition_raw(&state, &failed).expect("UntilConditionFailed after iter 1");
     assert_eq!(
         outcome.next_state.phase, "Running",
         "Should still be Running after first condition failed"
@@ -240,8 +240,8 @@ fn test_loop_exhausted_when_max_iterations_reached() {
             ("iteration".into(), u64_val(1)),
         ]),
     };
-    let outcome =
-        loop_iteration::transition(&state, &failed2).expect("UntilConditionFailed after iter 2");
+    let outcome = loop_iteration::transition_raw(&state, &failed2)
+        .expect("UntilConditionFailed after iter 2");
 
     assert_eq!(
         outcome.next_state.phase, "Exhausted",
@@ -261,10 +261,10 @@ fn test_loop_exhausted_when_max_iterations_reached() {
 /// BodyFrameFailed → Failed + LoopFailed
 #[test]
 fn test_body_frame_failed_transitions_to_failed() {
-    let state = loop_iteration::initial_state().expect("init");
+    let state = loop_iteration::initial_state_raw().expect("init");
     let outcome =
-        loop_iteration::transition(&state, &start_loop_input("loop-b", 3)).expect("StartLoop");
-    let state = loop_iteration::transition(
+        loop_iteration::transition_raw(&state, &start_loop_input("loop-b", 3)).expect("StartLoop");
+    let state = loop_iteration::transition_raw(
         &outcome.next_state,
         &body_frame_started_input("loop-b", "frame-y", 0),
     )
@@ -278,7 +278,7 @@ fn test_body_frame_failed_transitions_to_failed() {
             ("iteration".into(), u64_val(0)),
         ]),
     };
-    let outcome = loop_iteration::transition(&state, &failed).expect("BodyFrameFailed");
+    let outcome = loop_iteration::transition_raw(&state, &failed).expect("BodyFrameFailed");
 
     assert_eq!(outcome.next_state.phase, "Failed");
     assert!(
@@ -295,10 +295,10 @@ fn test_body_frame_failed_transitions_to_failed() {
 /// BodyFrameCanceled → Canceled + LoopCanceled
 #[test]
 fn test_body_frame_canceled_transitions_to_canceled() {
-    let state = loop_iteration::initial_state().expect("init");
+    let state = loop_iteration::initial_state_raw().expect("init");
     let outcome =
-        loop_iteration::transition(&state, &start_loop_input("loop-c", 3)).expect("StartLoop");
-    let state = loop_iteration::transition(
+        loop_iteration::transition_raw(&state, &start_loop_input("loop-c", 3)).expect("StartLoop");
+    let state = loop_iteration::transition_raw(
         &outcome.next_state,
         &body_frame_started_input("loop-c", "frame-z", 0),
     )
@@ -312,7 +312,7 @@ fn test_body_frame_canceled_transitions_to_canceled() {
             ("iteration".into(), u64_val(0)),
         ]),
     };
-    let outcome = loop_iteration::transition(&state, &canceled).expect("BodyFrameCanceled");
+    let outcome = loop_iteration::transition_raw(&state, &canceled).expect("BodyFrameCanceled");
 
     assert_eq!(outcome.next_state.phase, "Canceled");
     assert!(
@@ -329,16 +329,16 @@ fn test_body_frame_canceled_transitions_to_canceled() {
 /// CancelLoop → Canceled + LoopCanceled
 #[test]
 fn test_cancel_loop_transitions_to_canceled() {
-    let state = loop_iteration::initial_state().expect("init");
+    let state = loop_iteration::initial_state_raw().expect("init");
     let outcome =
-        loop_iteration::transition(&state, &start_loop_input("loop-d", 3)).expect("StartLoop");
+        loop_iteration::transition_raw(&state, &start_loop_input("loop-d", 3)).expect("StartLoop");
     let state = outcome.next_state;
 
     let cancel = KernelInput {
         variant: "CancelLoop".into(),
         fields: BTreeMap::from([("loop_instance_id".into(), loop_inst("loop-d"))]),
     };
-    let outcome = loop_iteration::transition(&state, &cancel).expect("CancelLoop");
+    let outcome = loop_iteration::transition_raw(&state, &cancel).expect("CancelLoop");
 
     assert_eq!(outcome.next_state.phase, "Canceled");
     assert!(

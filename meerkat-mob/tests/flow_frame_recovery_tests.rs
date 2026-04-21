@@ -2,19 +2,18 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use indexmap::IndexMap;
-use meerkat_machine_kernels::{KernelState, KernelValue};
+use meerkat_machine_kernels::generated::{flow_frame, flow_run, loop_iteration};
 use meerkat_mob::ids::{FrameId, LoopId, LoopInstanceId, RunId, StepId};
 use meerkat_mob::run::{
     FlowContext, FrameSnapshot, LoopContextHistory, LoopSnapshot, MobRun, MobRunStatus,
 };
 use meerkat_mob::runtime::recovery::{RestoreIncompatible, reconcile_run_state};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn minimal_run_with_schema_v2() -> MobRun {
-    use meerkat_machine_kernels::generated::flow_run;
-    let flow_state = flow_run::initial_state().expect("init");
+    let flow_state = flow_run::initial_state();
     MobRun {
         run_id: RunId::new(),
         mob_id: meerkat_mob::MobId::from("test-mob"),
@@ -37,65 +36,35 @@ fn minimal_run_with_schema_v2() -> MobRun {
 
 /// Build a FrameSnapshot with a specific ready_queue and matching node_status.
 fn frame_snapshot_with_ready_queue(_frame_id: &str, ready_nodes: &[&str]) -> FrameSnapshot {
-    let ready_queue_seq = KernelValue::Seq(
-        ready_nodes
-            .iter()
-            .map(|s| KernelValue::String(s.to_string()))
-            .collect(),
-    );
-    let tracked: BTreeSet<KernelValue> = ready_nodes
+    let mut state = flow_frame::initial_state();
+    state.phase = flow_frame::Phase::Running;
+    state.ready_queue = ready_nodes
         .iter()
-        .map(|s| KernelValue::String(s.to_string()))
+        .map(std::string::ToString::to_string)
         .collect();
-    let node_status: BTreeMap<KernelValue, KernelValue> = ready_nodes
+    state.tracked_nodes = ready_nodes
         .iter()
-        .map(|s| {
-            (
-                KernelValue::String(s.to_string()),
-                KernelValue::NamedVariant {
-                    enum_name: "NodeRunStatus".into(),
-                    variant: "Ready".into(),
-                },
-            )
-        })
+        .map(std::string::ToString::to_string)
         .collect();
-
+    state.node_status = ready_nodes
+        .iter()
+        .map(|s| (s.to_string(), "Ready".to_string()))
+        .collect();
     FrameSnapshot {
-        kernel_state: KernelState {
-            phase: "Running".into(),
-            fields: BTreeMap::from([
-                ("ready_queue".into(), ready_queue_seq),
-                ("tracked_nodes".into(), KernelValue::Set(tracked)),
-                ("node_status".into(), KernelValue::Map(node_status)),
-            ]),
-        },
+        kernel_state: state,
     }
 }
 
 /// Insert a frame_id into the ready_frames Seq and ready_frame_membership Set of flow_state.
-fn insert_frame_to_ready_queue(flow_state: &mut KernelState, frame_id: &str) {
-    if let Some(KernelValue::Seq(seq)) = flow_state.fields.get_mut("ready_frames") {
-        seq.push(KernelValue::String(frame_id.to_string()));
-    }
-    if let Some(KernelValue::Set(set)) = flow_state.fields.get_mut("ready_frame_membership") {
-        set.insert(KernelValue::String(frame_id.to_string()));
-    }
+fn insert_frame_to_ready_queue(flow_state: &mut flow_run::State, frame_id: &str) {
+    flow_state.ready_frames.push(frame_id.to_string());
+    flow_state
+        .ready_frame_membership
+        .insert(frame_id.to_string());
 }
 
-fn get_ready_frames_from_run_state(flow_state: &KernelState) -> Vec<String> {
-    match flow_state.fields.get("ready_frames") {
-        Some(KernelValue::Seq(seq)) => seq
-            .iter()
-            .filter_map(|v| {
-                if let KernelValue::String(s) = v {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            })
-            .collect(),
-        _ => vec![],
-    }
+fn get_ready_frames_from_run_state(flow_state: &flow_run::State) -> Vec<String> {
+    flow_state.ready_frames.clone()
 }
 
 // ─── REQ-10 / CHOKE-04: FlowContext path resolution ─────────────────────────
@@ -232,29 +201,11 @@ fn test_recovery_invalid_frame_invariant() {
 
     // Frame with node-a status=Ready but NOT in ready_queue → invariant violation.
     let bad_frame = FrameSnapshot {
-        kernel_state: KernelState {
-            phase: "Running".into(),
-            fields: BTreeMap::from([
-                (
-                    "ready_queue".into(),
-                    KernelValue::Seq(vec![]), // empty — node-a is NOT here
-                ),
-                (
-                    "tracked_nodes".into(),
-                    KernelValue::Set([KernelValue::String("node-a".into())].into_iter().collect()),
-                ),
-                (
-                    "node_status".into(),
-                    KernelValue::Map(BTreeMap::from([(
-                        KernelValue::String("node-a".into()),
-                        // node-a has Ready status but is NOT in ready_queue → VIOLATION
-                        KernelValue::NamedVariant {
-                            enum_name: "NodeRunStatus".into(),
-                            variant: "Ready".into(),
-                        },
-                    )])),
-                ),
-            ]),
+        kernel_state: flow_frame::State {
+            phase: flow_frame::Phase::Running,
+            tracked_nodes: ["node-a".to_string()].into_iter().collect(),
+            node_status: BTreeMap::from([("node-a".to_string(), "Ready".to_string())]),
+            ..flow_frame::initial_state()
         },
     };
     run.frames.insert(FrameId::from("frame-bad"), bad_frame);
@@ -298,20 +249,8 @@ fn test_pre_v3_pending_run_is_accepted() {
 
 // ─── Recovery: pending_body_frame_loops reconciliation ─────────────────────
 
-fn get_pending_body_frame_loops_from_run_state(flow_state: &KernelState) -> Vec<String> {
-    match flow_state.fields.get("pending_body_frame_loops") {
-        Some(KernelValue::Seq(seq)) => seq
-            .iter()
-            .filter_map(|v| {
-                if let KernelValue::String(s) = v {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            })
-            .collect(),
-        _ => vec![],
-    }
+fn get_pending_body_frame_loops_from_run_state(flow_state: &flow_run::State) -> Vec<String> {
+    flow_state.pending_body_frame_loops.clone()
 }
 
 /// Recovery adds missing pending_body_frame_loops entries for loops in Running
@@ -323,9 +262,10 @@ fn test_recovery_adds_missing_pending_body_frame_loops() {
     // A LoopSnapshot in Running phase with active_body_frame_id = None
     // → should be added to pending_body_frame_loops.
     let loop_snap = LoopSnapshot {
-        kernel_state: KernelState {
-            phase: "Running".into(),
-            fields: BTreeMap::from([("active_body_frame_id".into(), KernelValue::None)]),
+        kernel_state: loop_iteration::State {
+            phase: loop_iteration::Phase::Running,
+            active_body_frame_id: None,
+            ..loop_iteration::initial_state()
         },
     };
     run.loops
@@ -351,30 +291,19 @@ fn test_recovery_drops_stale_pending_body_frame_loops() {
     // A LoopSnapshot in Running phase with active_body_frame_id = Some(frame_id)
     // → should NOT be in pending_body_frame_loops.
     let loop_snap = LoopSnapshot {
-        kernel_state: KernelState {
-            phase: "Running".into(),
-            fields: BTreeMap::from([(
-                "active_body_frame_id".into(),
-                KernelValue::String("body-frame-1".into()),
-            )]),
+        kernel_state: loop_iteration::State {
+            phase: loop_iteration::Phase::Running,
+            active_body_frame_id: Some("body-frame-1".into()),
+            ..loop_iteration::initial_state()
         },
     };
     run.loops
         .insert(LoopInstanceId::from("loop-inst-2"), loop_snap);
 
     // Manually add loop-inst-2 to pending_body_frame_loops as a stale entry.
-    run.flow_state.fields.insert(
-        "pending_body_frame_loops".to_string(),
-        KernelValue::Seq(vec![KernelValue::String("loop-inst-2".into())]),
-    );
-    run.flow_state.fields.insert(
-        "pending_body_frame_loop_membership".to_string(),
-        KernelValue::Set(
-            [KernelValue::String("loop-inst-2".into())]
-                .into_iter()
-                .collect(),
-        ),
-    );
+    run.flow_state.pending_body_frame_loops = vec!["loop-inst-2".into()];
+    run.flow_state.pending_body_frame_loop_membership =
+        ["loop-inst-2".to_string()].into_iter().collect();
 
     reconcile_run_state(&mut run).expect("reconcile");
 

@@ -154,3 +154,16 @@ fn canonical_machine_inventory_matches_docs_and_artifact_bundle() {
         "expected canonical machine inventory to match docs and artifact bundle, got {mismatches:#?}"
     );
 }
+
+#[test]
+fn row22_kernel_public_api_contract_rejects_legacy_exports() {
+    let root = repo_root().expect("repo root");
+    let kernel_lib = root.join("meerkat-machine-kernels/src/lib.rs");
+    let contents = fs::read_to_string(&kernel_lib).expect("read kernel lib");
+
+    assert!(
+        !contents.contains("pub use runtime::{"),
+        "row-22 public API contract should not re-export the legacy runtime surface from {}:\n{contents}",
+        kernel_lib.display()
+    );
+}

@@ -7,15 +7,3 @@ pub mod meerkat;
 pub mod mob;
 pub mod occurrence_lifecycle;
 pub mod schedule_lifecycle;
-
-use crate::runtime::GeneratedMachineKernel;
-
-pub fn all_kernels() -> Vec<GeneratedMachineKernel> {
-    vec![
-        auth::kernel(),
-        meerkat::kernel(),
-        mob::kernel(),
-        occurrence_lifecycle::kernel(),
-        schedule_lifecycle::kernel(),
-    ]
-}

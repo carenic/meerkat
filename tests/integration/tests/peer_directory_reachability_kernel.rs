@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use meerkat_machine_kernels::generated::meerkat;
-use meerkat_machine_kernels::{KernelSignal, KernelValue};
+use meerkat_machine_kernels::test_oracle::{KernelSignal, KernelValue};
 
 fn signal(variant: &str, fields: Vec<(&str, KernelValue)>) -> KernelSignal {
     KernelSignal {
@@ -17,13 +17,13 @@ fn signal(variant: &str, fields: Vec<(&str, KernelValue)>) -> KernelSignal {
 
 #[test]
 fn peer_directory_reachability_kernel_reconcile_signal_removed() {
-    let state = meerkat::initial_state().expect("initial state");
-    let initialized = meerkat::transition_signal(&state, &signal("Initialize", vec![]))
+    let state = meerkat::initial_state_raw().expect("initial state");
+    let initialized = meerkat::transition_signal_raw(&state, &signal("Initialize", vec![]))
         .expect("initialize")
         .next_state;
 
     // ReconcileResolvedDirectory was removed from the schema (unimplemented).
-    let result = meerkat::transition_signal(
+    let result = meerkat::transition_signal_raw(
         &initialized,
         &signal(
             "ReconcileResolvedDirectory",
@@ -42,7 +42,7 @@ fn peer_directory_reachability_kernel_reconcile_signal_removed() {
 
 #[test]
 fn peer_directory_reachability_kernel_fields_removed_from_state() {
-    let state = meerkat::initial_state().expect("initial state");
+    let state = meerkat::initial_state_raw().expect("initial state");
     assert!(
         !state.fields.contains_key("resolved_peer_keys"),
         "resolved_peer_keys field should not exist"

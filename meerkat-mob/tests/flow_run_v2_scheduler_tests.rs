@@ -8,7 +8,7 @@
 use indexmap::IndexMap;
 use meerkat_core::types::ContentInput;
 use meerkat_machine_kernels::generated::flow_run;
-use meerkat_machine_kernels::{KernelInput, KernelState, KernelValue};
+use meerkat_machine_kernels::test_oracle::{KernelInput, KernelValue};
 use meerkat_mob::definition::{
     CollectionPolicy, DependencyMode, DispatchMode, FlowSpec, FlowStepSpec, LimitsSpec,
     StepOutputFormat,
@@ -43,7 +43,7 @@ fn build_running_state_with_limits(
     max_active_nodes: u64,
     max_active_frames: u64,
     max_frame_depth: u64,
-) -> KernelState {
+) -> flow_run::State {
     let mut steps = IndexMap::new();
     steps.insert(
         StepId::from("dummy-step"),
@@ -88,36 +88,118 @@ fn build_running_state_with_limits(
     // flow_state_for_config leaves the machine in Pending state (after CreateRun)
     let state = MobRun::flow_state_for_config(&config).expect("flow_state_for_config");
 
-    // Advance to Running
-    let start = KernelInput {
-        variant: "StartRun".into(),
-        fields: BTreeMap::new(),
-    };
-    flow_run::transition(&state, &start)
-        .expect("StartRun")
-        .next_state
+    apply_input(
+        &state,
+        &KernelInput {
+            variant: "StartRun".into(),
+            fields: BTreeMap::new(),
+        },
+    )
+    .expect("StartRun")
+    .next_state
 }
 
-fn build_running_state() -> KernelState {
+fn build_running_state() -> flow_run::State {
     build_running_state_with_limits(10, 10, 10)
 }
 
 /// Register a frame then pump the node scheduler, returning the next state.
-fn apply_register_and_pump(state: &KernelState, fid: &str) -> KernelState {
+fn apply_register_and_pump(state: &flow_run::State, fid: &str) -> flow_run::State {
     let reg = KernelInput {
         variant: "RegisterReadyFrame".into(),
         fields: BTreeMap::from([("frame_id".into(), frame_id(fid))]),
     };
-    let state = flow_run::transition(state, &reg)
+    let state = apply_input(state, &reg)
         .expect("RegisterReadyFrame")
         .next_state;
     let pump = KernelInput {
         variant: "PumpNodeScheduler".into(),
         fields: BTreeMap::new(),
     };
-    flow_run::transition(&state, &pump)
+    apply_input(&state, &pump)
         .expect("PumpNodeScheduler")
         .next_state
+}
+
+fn active_node_count(state: &flow_run::State) -> KernelValue {
+    KernelValue::U64(u64::from(state.active_node_count))
+}
+
+fn active_frame_count(state: &flow_run::State) -> KernelValue {
+    KernelValue::U64(u64::from(state.active_frame_count))
+}
+
+fn ready_frames_value(state: &flow_run::State) -> KernelValue {
+    KernelValue::Seq(
+        state
+            .ready_frames
+            .iter()
+            .cloned()
+            .map(KernelValue::String)
+            .collect(),
+    )
+}
+
+fn apply_rawish(state: &flow_run::State, input: &KernelInput) -> flow_run::Outcome {
+    apply_input(state, input).expect("typed transition")
+}
+
+fn as_string(value: &KernelValue) -> String {
+    match value {
+        KernelValue::String(s) => s.clone(),
+        other => panic!("expected string kernel value, got {other:?}"),
+    }
+}
+
+fn as_u32(value: &KernelValue) -> u32 {
+    match value {
+        KernelValue::U64(v) => (*v).try_into().expect("u64->u32"),
+        other => panic!("expected u64 kernel value, got {other:?}"),
+    }
+}
+
+fn apply_input(
+    state: &flow_run::State,
+    input: &KernelInput,
+) -> Result<flow_run::Outcome, flow_run::TransitionError> {
+    let typed = match input.variant.as_str() {
+        "StartRun" => flow_run::Input::StartRun(flow_run::inputs::StartRun {}),
+        "RegisterReadyFrame" => {
+            let frame_id = as_string(input.fields.get("frame_id").expect("frame_id"));
+            flow_run::Input::RegisterReadyFrame(flow_run::inputs::RegisterReadyFrame { frame_id })
+        }
+        "PumpNodeScheduler" => {
+            flow_run::Input::PumpNodeScheduler(flow_run::inputs::PumpNodeScheduler {})
+        }
+        "RegisterPendingBodyFrame" => {
+            let loop_instance_id = as_string(
+                input
+                    .fields
+                    .get("loop_instance_id")
+                    .expect("loop_instance_id"),
+            );
+            let depth = as_u32(input.fields.get("depth").expect("depth"));
+            flow_run::Input::RegisterPendingBodyFrame(flow_run::inputs::RegisterPendingBodyFrame {
+                loop_instance_id,
+                depth,
+            })
+        }
+        "PumpFrameScheduler" => {
+            flow_run::Input::PumpFrameScheduler(flow_run::inputs::PumpFrameScheduler {})
+        }
+        "NodeExecutionReleased" => {
+            let frame_id = as_string(input.fields.get("frame_id").expect("frame_id"));
+            flow_run::Input::NodeExecutionReleased(flow_run::inputs::NodeExecutionReleased {
+                frame_id,
+            })
+        }
+        "FrameTerminated" => {
+            let frame_id = as_string(input.fields.get("frame_id").expect("frame_id"));
+            flow_run::Input::FrameTerminated(flow_run::inputs::FrameTerminated { frame_id })
+        }
+        other => panic!("unsupported typed test input {other}"),
+    };
+    flow_run::transition(state, typed, &flow_run::EmptyContext)
 }
 
 /// REQ-04: RegisterReadyFrame + PumpNodeScheduler schedules frames for node-slot grants
@@ -130,11 +212,11 @@ fn test_pump_node_scheduler_increments_active_node_count() {
         variant: "RegisterReadyFrame".into(),
         fields: BTreeMap::from([("frame_id".into(), frame_id("frame-1"))]),
     };
-    let outcome = flow_run::transition(&state, &reg).expect("RegisterReadyFrame");
+    let outcome = apply_rawish(&state, &reg);
     let state = outcome.next_state;
 
     // Before pump: active_node_count should be 0
-    let count = state.fields.get("active_node_count").cloned();
+    let count = Some(active_node_count(&state));
     assert_eq!(
         count,
         Some(u64_val(0)),
@@ -146,10 +228,10 @@ fn test_pump_node_scheduler_increments_active_node_count() {
         variant: "PumpNodeScheduler".into(),
         fields: BTreeMap::new(),
     };
-    let outcome = flow_run::transition(&state, &pump).expect("PumpNodeScheduler");
+    let outcome = apply_rawish(&state, &pump);
 
     // active_node_count should be 1
-    let count = outcome.next_state.fields.get("active_node_count").cloned();
+    let count = Some(active_node_count(&outcome.next_state));
     assert_eq!(
         count,
         Some(u64_val(1)),
@@ -158,24 +240,25 @@ fn test_pump_node_scheduler_increments_active_node_count() {
 
     // GrantNodeSlot should be emitted
     assert!(
-        outcome.effects.iter().any(|e| e.variant == "GrantNodeSlot"),
-        "GrantNodeSlot expected, got: {:?}",
         outcome
             .effects
             .iter()
-            .map(|e| &e.variant)
-            .collect::<Vec<_>>()
+            .any(|e| matches!(e, flow_run::Effect::GrantNodeSlot(_))),
+        "GrantNodeSlot expected, got: {:?}",
+        outcome.effects
     );
 
     // frame_id in GrantNodeSlot effect should match
     let grant = outcome
         .effects
         .iter()
-        .find(|e| e.variant == "GrantNodeSlot")
+        .find_map(|e| match e {
+            flow_run::Effect::GrantNodeSlot(payload) => Some(payload),
+            _ => None,
+        })
         .unwrap();
     assert_eq!(
-        grant.fields.get("frame_id"),
-        Some(&frame_id("frame-1")),
+        grant.frame_id, "frame-1",
         "GrantNodeSlot.frame_id should be 'frame-1'"
     );
 }
@@ -198,19 +281,15 @@ fn test_node_and_frame_release_adjust_counters_independently() {
             ("depth".into(), u64_val(1)),
         ]),
     };
-    let state = flow_run::transition(&state, &reg_loop)
-        .expect("RegisterPendingBodyFrame")
-        .next_state;
+    let state = apply_rawish(&state, &reg_loop).next_state;
     let pump_frame = KernelInput {
         variant: "PumpFrameScheduler".into(),
         fields: BTreeMap::new(),
     };
-    let state = flow_run::transition(&state, &pump_frame)
-        .expect("PumpFrameScheduler")
-        .next_state;
+    let state = apply_rawish(&state, &pump_frame).next_state;
 
     // active_frame_count should be 1 now
-    let active_frames = state.fields.get("active_frame_count").cloned();
+    let active_frames = Some(active_frame_count(&state));
     assert_eq!(
         active_frames,
         Some(u64_val(1)),
@@ -218,7 +297,7 @@ fn test_node_and_frame_release_adjust_counters_independently() {
     );
 
     // active_node_count should be 1 (from the node pump)
-    let active_nodes = state.fields.get("active_node_count").cloned();
+    let active_nodes = Some(active_node_count(&state));
     assert_eq!(
         active_nodes,
         Some(u64_val(1)),
@@ -229,12 +308,10 @@ fn test_node_and_frame_release_adjust_counters_independently() {
         variant: "NodeExecutionReleased".into(),
         fields: BTreeMap::from([("frame_id".into(), frame_id("frame-1"))]),
     };
-    let released_state = flow_run::transition(&state, &release)
-        .expect("NodeExecutionReleased")
-        .next_state;
+    let released_state = apply_rawish(&state, &release).next_state;
 
-    let active_nodes = released_state.fields.get("active_node_count").cloned();
-    let active_frames = released_state.fields.get("active_frame_count").cloned();
+    let active_nodes = Some(active_node_count(&released_state));
+    let active_frames = Some(active_frame_count(&released_state));
 
     assert_eq!(
         active_nodes,
@@ -257,10 +334,10 @@ fn test_node_and_frame_release_adjust_counters_independently() {
             ),
         ]),
     };
-    let outcome = flow_run::transition(&released_state, &term).expect("FrameTerminated");
+    let outcome = apply_rawish(&released_state, &term);
 
-    let active_nodes = outcome.next_state.fields.get("active_node_count").cloned();
-    let active_frames = outcome.next_state.fields.get("active_frame_count").cloned();
+    let active_nodes = Some(active_node_count(&outcome.next_state));
+    let active_frames = Some(active_frame_count(&outcome.next_state));
 
     assert_eq!(
         active_nodes,
@@ -288,12 +365,10 @@ fn test_max_active_frames_enforced() {
             ("depth".into(), u64_val(1)),
         ]),
     };
-    let state = flow_run::transition(&state, &reg_loop1)
-        .expect("RegisterPendingBodyFrame 1")
-        .next_state;
+    let state = apply_rawish(&state, &reg_loop1).next_state;
 
     // active_frame_count should be 0 (pending, not yet granted)
-    let frames = state.fields.get("active_frame_count").cloned();
+    let frames = Some(active_frame_count(&state));
     assert_eq!(
         frames,
         Some(u64_val(0)),
@@ -305,22 +380,18 @@ fn test_max_active_frames_enforced() {
         variant: "PumpFrameScheduler".into(),
         fields: BTreeMap::new(),
     };
-    let outcome = flow_run::transition(&state, &pump).expect("PumpFrameScheduler first");
+    let outcome = apply_rawish(&state, &pump);
     let state = outcome.next_state;
 
     assert!(
         outcome
             .effects
             .iter()
-            .any(|e| e.variant == "GrantBodyFrameStart"),
+            .any(|e| matches!(e, flow_run::Effect::GrantBodyFrameStart(_))),
         "GrantBodyFrameStart expected for first loop frame, got: {:?}",
-        outcome
-            .effects
-            .iter()
-            .map(|e| &e.variant)
-            .collect::<Vec<_>>()
+        outcome.effects
     );
-    let frames = state.fields.get("active_frame_count").cloned();
+    let frames = Some(active_frame_count(&state));
     assert_eq!(
         frames,
         Some(u64_val(1)),
@@ -335,29 +406,23 @@ fn test_max_active_frames_enforced() {
             ("depth".into(), u64_val(1)),
         ]),
     };
-    let state = flow_run::transition(&state, &reg_loop2)
-        .expect("RegisterPendingBodyFrame 2")
-        .next_state;
+    let state = apply_rawish(&state, &reg_loop2).next_state;
 
     // Pump again — should NOT grant because active_frame_count == max_active_frames (1 == 1)
     let pump2 = KernelInput {
         variant: "PumpFrameScheduler".into(),
         fields: BTreeMap::new(),
     };
-    let result = flow_run::transition(&state, &pump2);
+    let result = apply_input(&state, &pump2);
     match result {
         Ok(outcome) => {
             assert!(
                 !outcome
                     .effects
                     .iter()
-                    .any(|e| e.variant == "GrantBodyFrameStart"),
+                    .any(|e| matches!(e, flow_run::Effect::GrantBodyFrameStart(_))),
                 "GrantBodyFrameStart should NOT be emitted when max_active_frames reached, got: {:?}",
-                outcome
-                    .effects
-                    .iter()
-                    .map(|e| &e.variant)
-                    .collect::<Vec<_>>()
+                outcome.effects
             );
         }
         Err(_) => {
@@ -381,11 +446,11 @@ fn test_max_frame_depth_rejected() {
             ("depth".into(), u64_val(3)),
         ]),
     };
-    let result = flow_run::transition(&state, &reg);
+    let result = apply_input(&state, &reg);
     assert!(
         result.is_err(),
         "RegisterPendingBodyFrame with depth > max_frame_depth should be rejected, got: {:?}",
-        result.ok().map(|o| o.transition)
+        result.ok().map(|o| format!("{:?}", o.transition_id))
     );
 }
 
@@ -399,19 +464,15 @@ fn test_pump_node_scheduler_removes_frame_from_queue() {
         variant: "RegisterReadyFrame".into(),
         fields: BTreeMap::from([("frame_id".into(), frame_id("frame-a"))]),
     };
-    let state = flow_run::transition(&state, &reg1)
-        .expect("RegisterReadyFrame a")
-        .next_state;
+    let state = apply_rawish(&state, &reg1).next_state;
     let reg2 = KernelInput {
         variant: "RegisterReadyFrame".into(),
         fields: BTreeMap::from([("frame_id".into(), frame_id("frame-b"))]),
     };
-    let state = flow_run::transition(&state, &reg2)
-        .expect("RegisterReadyFrame b")
-        .next_state;
+    let state = apply_rawish(&state, &reg2).next_state;
 
     // ready_frames should have 2 entries
-    let frames = state.fields.get("ready_frames").cloned().unwrap();
+    let frames = ready_frames_value(&state);
     assert!(
         matches!(&frames, KernelValue::Seq(v) if v.len() == 2),
         "ready_frames should have 2 entries"
@@ -422,19 +483,17 @@ fn test_pump_node_scheduler_removes_frame_from_queue() {
         variant: "PumpNodeScheduler".into(),
         fields: BTreeMap::new(),
     };
-    let state = flow_run::transition(&state, &pump)
-        .expect("PumpNodeScheduler")
-        .next_state;
+    let state = apply_rawish(&state, &pump).next_state;
 
     // ready_frames should now have 1 entry
-    let frames = state.fields.get("ready_frames").cloned().unwrap();
+    let frames = ready_frames_value(&state);
     assert!(
         matches!(&frames, KernelValue::Seq(v) if v.len() == 1),
         "ready_frames should have 1 entry after pump"
     );
 
     // active_node_count should be 1
-    let count = state.fields.get("active_node_count").cloned();
+    let count = Some(active_node_count(&state));
     assert_eq!(count, Some(u64_val(1)));
 }
 
@@ -447,16 +506,14 @@ fn test_register_ready_frame_deduplicates() {
         variant: "RegisterReadyFrame".into(),
         fields: BTreeMap::from([("frame_id".into(), frame_id("frame-dup"))]),
     };
-    let state = flow_run::transition(&state, &reg)
-        .expect("RegisterReadyFrame first")
-        .next_state;
+    let state = apply_rawish(&state, &reg).next_state;
 
     // Second registration of same frame should be rejected (guard: not in membership)
     let reg2 = KernelInput {
         variant: "RegisterReadyFrame".into(),
         fields: BTreeMap::from([("frame_id".into(), frame_id("frame-dup"))]),
     };
-    let result = flow_run::transition(&state, &reg2);
+    let result = apply_input(&state, &reg2);
     assert!(
         result.is_err(),
         "Second RegisterReadyFrame with same frame_id should be rejected"
@@ -474,14 +531,14 @@ fn test_max_active_nodes_enforced() {
         variant: "RegisterReadyFrame".into(),
         fields: BTreeMap::from([("frame_id".into(), frame_id("frame-a"))]),
     };
-    let outcome = flow_run::transition(&state, &reg1).expect("RegisterReadyFrame 1");
+    let outcome = apply_rawish(&state, &reg1);
     let state = outcome.next_state;
 
     let reg2 = KernelInput {
         variant: "RegisterReadyFrame".into(),
         fields: BTreeMap::from([("frame_id".into(), frame_id("frame-b"))]),
     };
-    let outcome = flow_run::transition(&state, &reg2).expect("RegisterReadyFrame 2");
+    let outcome = apply_rawish(&state, &reg2);
     let state = outcome.next_state;
 
     // First pump: should grant slot for frame-a
@@ -489,13 +546,16 @@ fn test_max_active_nodes_enforced() {
         variant: "PumpNodeScheduler".into(),
         fields: BTreeMap::new(),
     };
-    let outcome = flow_run::transition(&state, &pump1).expect("PumpNodeScheduler 1");
+    let outcome = apply_rawish(&state, &pump1);
     let state = outcome.next_state;
     assert!(
-        outcome.effects.iter().any(|e| e.variant == "GrantNodeSlot"),
+        outcome
+            .effects
+            .iter()
+            .any(|e| matches!(e, flow_run::Effect::GrantNodeSlot(_))),
         "First pump should grant a slot"
     );
-    let count = state.fields.get("active_node_count").cloned();
+    let count = Some(active_node_count(&state));
     assert_eq!(count, Some(u64_val(1)), "active_node_count should be 1");
 
     // Second pump: should NOT grant because active_node_count == max_active_nodes
@@ -503,17 +563,16 @@ fn test_max_active_nodes_enforced() {
         variant: "PumpNodeScheduler".into(),
         fields: BTreeMap::new(),
     };
-    let result = flow_run::transition(&state, &pump2);
+    let result = apply_input(&state, &pump2);
     match result {
         Ok(outcome) => {
             assert!(
-                !outcome.effects.iter().any(|e| e.variant == "GrantNodeSlot"),
-                "Second pump should NOT grant when max_active_nodes reached, got: {:?}",
-                outcome
+                !outcome
                     .effects
                     .iter()
-                    .map(|e| &e.variant)
-                    .collect::<Vec<_>>()
+                    .any(|e| matches!(e, flow_run::Effect::GrantNodeSlot(_))),
+                "Second pump should NOT grant when max_active_nodes reached, got: {:?}",
+                outcome.effects
             );
         }
         Err(_) => {

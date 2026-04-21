@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use meerkat_machine_kernels::generated::meerkat;
-use meerkat_machine_kernels::{KernelInput, KernelSignal, KernelValue};
+use meerkat_machine_kernels::test_oracle::{KernelInput, KernelSignal, KernelState, KernelValue};
 
 fn string(value: &str) -> KernelValue {
     KernelValue::String(value.to_string())
@@ -44,20 +44,20 @@ fn signal(variant: &str, fields: Vec<(&str, KernelValue)>) -> KernelSignal {
     }
 }
 
-fn prepared_meerkat_state() -> meerkat_machine_kernels::KernelState {
-    let initialized = meerkat::transition_signal(
-        &meerkat::initial_state().expect("initial state"),
+fn prepared_meerkat_state() -> KernelState {
+    let initialized = meerkat::transition_signal_raw(
+        &meerkat::initial_state_raw().expect("initial state"),
         &signal("Initialize", vec![]),
     )
     .expect("initialize")
     .next_state;
-    let registered = meerkat::transition(
+    let registered = meerkat::transition_raw(
         &initialized,
         &input("RegisterSession", vec![("session_id", string("session-1"))]),
     )
     .expect("register session")
     .next_state;
-    meerkat::transition(
+    meerkat::transition_raw(
         &registered,
         &input(
             "PrepareBindings",
@@ -79,7 +79,7 @@ fn session_tool_visibility_kernel_publishes_committed_set_from_attached() {
     // PublishCommittedVisibleSet from Attached carries the active/staged owner
     // revisions in the input, but the top-level machine no longer stores a
     // separate active visibility mirror.
-    let published = meerkat::transition(
+    let published = meerkat::transition_raw(
         &attached,
         &input(
             "PublishCommittedVisibleSet",
@@ -104,7 +104,7 @@ fn session_tool_visibility_kernel_publishes_committed_set_from_attached() {
 #[test]
 fn session_tool_visibility_kernel_stages_deferred_requests_without_touching_active_state() {
     let attached = prepared_meerkat_state();
-    let requested = meerkat::transition(
+    let requested = meerkat::transition_raw(
         &attached,
         &input(
             "RequestDeferredTools",
