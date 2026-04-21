@@ -261,6 +261,19 @@ pub fn validate(def: &MachineDef) -> Result<(), Error> {
         );
     }
 
+    // Fidelity: schema `from` phase sets must be derivable without the
+    // historical silent `all_phases` fallback. Run `derive_from_phases`
+    // only if the structural validation above is clean — otherwise every
+    // transition on a malformed machine piles on a spurious "cannot
+    // derive from-set" secondary error that drowns the real one.
+    if errors.is_empty() {
+        for t in &def.transitions {
+            if let Err(msg) = crate::gen_schema::derive_from_phases(def, t) {
+                errors.push(Error::new(t.span, msg));
+            }
+        }
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -375,6 +388,32 @@ fn validate_expr(
     }
 }
 
+/// Reject non-literal arithmetic `amount` expressions.
+///
+/// The schema-side `Update::Increment` / `Decrement` / `MapIncrement` /
+/// `MapDecrement` variants encode `amount: u64`, so only compile-time
+/// literal amounts can be faithfully represented in the TLA+ model.
+///
+/// Rather than silently coerce non-literal amounts to `1` (the prior
+/// behavior), we refuse to compile the machine. If you need a computed
+/// amount, either reduce the expression to a literal in the DSL or open
+/// a follow-up to lift `amount` to `Expr` in `meerkat-machine-schema`.
+fn validate_arithmetic_amount(field: &syn::Ident, amount: &ExprDef, errors: &mut Vec<Error>) {
+    if !matches!(amount, ExprDef::U64(_)) {
+        errors.push(Error::new(
+            field.span(),
+            format!(
+                "arithmetic amount for field `{field}` must be a u64 literal; \
+                 non-literal amounts (field refs, bindings, arithmetic) are \
+                 not representable in MachineSchema's `amount: u64` slot — \
+                 lift to `Update::Assign` with an explicit expression, or \
+                 extend `Update::Increment.amount` to `Expr` in meerkat-machine-schema \
+                 and update codegen/kernel accordingly"
+            ),
+        ));
+    }
+}
+
 fn validate_update(
     update: &UpdateDef,
     fields: &HashSet<String>,
@@ -400,6 +439,7 @@ fn validate_update(
                 ));
             }
             validate_expr(amount, fields, bindings, helpers, errors);
+            validate_arithmetic_amount(field, amount, errors);
         }
         UpdateDef::SetInsert { field, value } | UpdateDef::SetRemove { field, value } => {
             if !fields.contains(&field.to_string()) {
@@ -439,6 +479,7 @@ fn validate_update(
             }
             validate_expr(key, fields, bindings, helpers, errors);
             validate_expr(amount, fields, bindings, helpers, errors);
+            validate_arithmetic_amount(field, amount, errors);
         }
         UpdateDef::Conditional {
             condition,

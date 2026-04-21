@@ -516,4 +516,432 @@ mod tests {
         assert_eq!(proj.rules[3].phase, "Idle");
         assert!(proj.rules[3].condition.is_none()); // fallback
     }
+
+    /// Non-literal arithmetic amount must be rejected by `validate`
+    /// rather than silently coerced to `1` in schema codegen.
+    pub const COUNTER_NON_LITERAL_INCREMENT: &str = r#"
+machine CounterBad {
+    version: 1,
+    rust: "test" / "counter_bad",
+
+    state {
+        lifecycle_phase: CounterBadPhase,
+        value: u64,
+    }
+
+    init(Idle) {
+    }
+
+    terminal []
+
+    phase CounterBadPhase {
+        Idle,
+    }
+
+    input CounterBadInput {
+        Bump { amount: u64 },
+    }
+
+    effect CounterBadEffect {
+        Bumped,
+    }
+
+    transition BumpIdle {
+        on input Bump { amount }
+        guard { self.lifecycle_phase == Phase::Idle }
+        update {
+            self.value += amount;
+        }
+        to Idle
+    }
+}
+"#;
+
+    #[test]
+    fn validate_rejects_non_literal_increment_amount() {
+        let tokens: proc_macro2::TokenStream =
+            COUNTER_NON_LITERAL_INCREMENT.parse().expect("tokenize");
+        let def = crate::parse::parse_machine(tokens).expect("parse");
+        let err = crate::validate::validate(&def).expect_err("should reject non-literal amount");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must be a u64 literal"),
+            "expected literal-only error, got: {msg}"
+        );
+    }
+
+    /// Non-literal map-increment amount must likewise be rejected.
+    pub const MAP_NON_LITERAL_INCREMENT: &str = r#"
+machine MapBad {
+    version: 1,
+    rust: "test" / "map_bad",
+
+    state {
+        lifecycle_phase: MapBadPhase,
+        counts: Map<String, u64>,
+        step: u64,
+    }
+
+    init(Idle) {
+        step = 1,
+    }
+
+    terminal []
+
+    phase MapBadPhase {
+        Idle,
+    }
+
+    input MapBadInput {
+        Tick { key: String },
+    }
+
+    effect MapBadEffect {
+        Ticked,
+    }
+
+    transition TickIdle {
+        on input Tick { key }
+        guard { self.lifecycle_phase == Phase::Idle }
+        update {
+            self.counts.increment(key, self.step);
+        }
+        to Idle
+    }
+}
+"#;
+
+    #[test]
+    fn validate_rejects_non_literal_map_increment_amount() {
+        let tokens: proc_macro2::TokenStream = MAP_NON_LITERAL_INCREMENT.parse().expect("tokenize");
+        let def = crate::parse::parse_machine(tokens).expect("parse");
+        let err = crate::validate::validate(&def).expect_err("should reject non-literal amount");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must be a u64 literal"),
+            "expected literal-only error, got: {msg}"
+        );
+    }
+
+    /// Literal arithmetic amount must parse AND validate.
+    pub const COUNTER_LITERAL_INCREMENT: &str = r#"
+machine CounterOk {
+    version: 1,
+    rust: "test" / "counter_ok",
+
+    state {
+        lifecycle_phase: CounterOkPhase,
+        value: u64,
+    }
+
+    init(Idle) {
+    }
+
+    terminal []
+
+    phase CounterOkPhase {
+        Idle,
+    }
+
+    input CounterOkInput {
+        Bump,
+    }
+
+    effect CounterOkEffect {
+        Bumped,
+    }
+
+    transition BumpIdle {
+        on input Bump
+        guard { self.lifecycle_phase == Phase::Idle }
+        update {
+            self.value += 5;
+        }
+        to Idle
+    }
+}
+"#;
+
+    #[test]
+    fn validate_accepts_literal_increment_amount() {
+        let tokens: proc_macro2::TokenStream = COUNTER_LITERAL_INCREMENT.parse().expect("tokenize");
+        let def = crate::parse::parse_machine(tokens).expect("parse");
+        crate::validate::validate(&def).expect("literal amount should validate");
+    }
+
+    /// `self.phase != Phase::X` must derive to `all_phases \ {X}`, not
+    /// silently widen to `all_phases`.
+    pub const NEQ_PHASE_GUARD: &str = r#"
+machine NeqPhase {
+    version: 1,
+    rust: "test" / "neq_phase",
+
+    state {
+        lifecycle_phase: NeqPhasePhase,
+    }
+
+    init(A) {
+    }
+
+    terminal [C]
+
+    phase NeqPhasePhase {
+        A,
+        B,
+        C,
+    }
+
+    input NeqPhaseInput {
+        Ping,
+    }
+
+    effect NeqPhaseEffect {
+        Pinged,
+    }
+
+    transition PingAnywhereButC {
+        on input Ping
+        guard { self.lifecycle_phase != Phase::C }
+        update {}
+        to A
+    }
+}
+"#;
+
+    #[test]
+    fn neq_phase_guard_narrows_from_set() {
+        let tokens: proc_macro2::TokenStream = NEQ_PHASE_GUARD.parse().expect("tokenize");
+        let def = crate::parse::parse_machine(tokens).expect("parse");
+        crate::validate::validate(&def).expect("valid machine");
+        let t = def
+            .transitions
+            .iter()
+            .find(|t| t.name == "PingAnywhereButC")
+            .expect("transition");
+        let from = crate::gen_schema::derive_from_phases(&def, t).expect("phase set should derive");
+        // Expected: {A, B}, i.e. all phases minus C.
+        assert_eq!(from.len(), 2, "expected A and B, got {from:?}");
+        assert!(from.contains(&"A".to_string()));
+        assert!(from.contains(&"B".to_string()));
+        assert!(!from.contains(&"C".to_string()));
+    }
+
+    /// Conjunction of two phase-narrowing guards should intersect, not
+    /// union (the old behavior). `phase == A && phase == B` is
+    /// unsatisfiable and must be flagged.
+    pub const AND_PHASE_GUARD_UNSAT: &str = r#"
+machine AndPhaseUnsat {
+    version: 1,
+    rust: "test" / "and_phase_unsat",
+
+    state {
+        lifecycle_phase: AndPhaseUnsatPhase,
+    }
+
+    init(A) {
+    }
+
+    terminal []
+
+    phase AndPhaseUnsatPhase {
+        A,
+        B,
+    }
+
+    input AndPhaseUnsatInput {
+        Ping,
+    }
+
+    effect AndPhaseUnsatEffect {
+        Pinged,
+    }
+
+    transition Impossible {
+        on input Ping
+        guard "a" { self.lifecycle_phase == Phase::A }
+        guard "b" { self.lifecycle_phase == Phase::B }
+        update {}
+        to A
+    }
+}
+"#;
+
+    #[test]
+    fn and_phase_guard_unsat_is_flagged() {
+        let tokens: proc_macro2::TokenStream = AND_PHASE_GUARD_UNSAT.parse().expect("tokenize");
+        let def = crate::parse::parse_machine(tokens).expect("parse");
+        let err = crate::validate::validate(&def).expect_err("unsat phase conjunction");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("empty phase set"),
+            "expected empty-phase-set error, got: {msg}"
+        );
+    }
+
+    /// A guard that references the phase field in a shape this compiler
+    /// does not analyze must be flagged, not silently widened to all
+    /// phases. Here we use a comparison between the phase field and a
+    /// bound variant from another enum — nonsensical, but the compiler
+    /// should reject it rather than shrug and emit `from = all_phases`.
+    pub const UNANALYZABLE_PHASE_GUARD: &str = r#"
+machine Unanalyzable {
+    version: 1,
+    rust: "test" / "unanalyzable",
+
+    state {
+        lifecycle_phase: UnanalyzablePhase,
+        counter: u64,
+    }
+
+    init(A) {
+    }
+
+    terminal []
+
+    phase UnanalyzablePhase {
+        A,
+        B,
+    }
+
+    input UnanalyzableInput {
+        Ping,
+    }
+
+    effect UnanalyzableEffect {
+        Pinged,
+    }
+
+    transition Weird {
+        on input Ping
+        guard { self.lifecycle_phase == self.lifecycle_phase }
+        update {}
+        to A
+    }
+}
+"#;
+
+    #[test]
+    fn unanalyzable_phase_guard_is_flagged() {
+        let tokens: proc_macro2::TokenStream = UNANALYZABLE_PHASE_GUARD.parse().expect("tokenize");
+        let def = crate::parse::parse_machine(tokens).expect("parse");
+        let err = crate::validate::validate(&def).expect_err("unanalyzable phase guard");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Phase::Variant") || msg.contains("not yet supported"),
+            "expected precise/unsupported-shape error, got: {msg}"
+        );
+    }
+
+    /// Helper-call guard (`helper(self.lifecycle_phase)`) should still
+    /// resolve to the union of phase literals in the helper body.
+    pub const HELPER_PHASE_GUARD: &str = r#"
+machine HelperPhase {
+    version: 1,
+    rust: "test" / "helper_phase",
+
+    state {
+        lifecycle_phase: HelperPhasePhase,
+    }
+
+    init(A) {
+    }
+
+    terminal [D]
+
+    phase HelperPhasePhase {
+        A,
+        B,
+        C,
+        D,
+    }
+
+    input HelperPhaseInput {
+        Ping,
+    }
+
+    effect HelperPhaseEffect {
+        Pinged,
+    }
+
+    helper is_active(p: HelperPhasePhase) -> bool {
+        p == Phase::A || p == Phase::B
+    }
+
+    transition PingActive {
+        on input Ping
+        guard { is_active(self.lifecycle_phase) }
+        update {}
+        to A
+    }
+}
+"#;
+
+    #[test]
+    fn helper_phase_guard_resolves_via_body() {
+        let tokens: proc_macro2::TokenStream = HELPER_PHASE_GUARD.parse().expect("tokenize");
+        let def = crate::parse::parse_machine(tokens).expect("parse");
+        crate::validate::validate(&def).expect("valid machine");
+        let t = def
+            .transitions
+            .iter()
+            .find(|t| t.name == "PingActive")
+            .expect("transition");
+        let from = crate::gen_schema::derive_from_phases(&def, t).expect("phase set should derive");
+        assert_eq!(from.len(), 2, "expected A and B, got {from:?}");
+        assert!(from.contains(&"A".to_string()));
+        assert!(from.contains(&"B".to_string()));
+    }
+
+    /// Non-phase guards alone leave `from` as all phases (legitimate —
+    /// the guard doesn't constrain the phase).
+    pub const NONPHASE_GUARD: &str = r#"
+machine NonPhase {
+    version: 1,
+    rust: "test" / "non_phase",
+
+    state {
+        lifecycle_phase: NonPhasePhase,
+        counter: u64,
+    }
+
+    init(A) {
+    }
+
+    terminal []
+
+    phase NonPhasePhase {
+        A,
+        B,
+    }
+
+    input NonPhaseInput {
+        Ping,
+    }
+
+    effect NonPhaseEffect {
+        Pinged,
+    }
+
+    transition PingIfPositive {
+        on input Ping
+        guard { self.counter > 0 }
+        update {}
+        to A
+    }
+}
+"#;
+
+    #[test]
+    fn nonphase_guard_leaves_from_as_all_phases() {
+        let tokens: proc_macro2::TokenStream = NONPHASE_GUARD.parse().expect("tokenize");
+        let def = crate::parse::parse_machine(tokens).expect("parse");
+        crate::validate::validate(&def).expect("valid machine");
+        let t = def
+            .transitions
+            .iter()
+            .find(|t| t.name == "PingIfPositive")
+            .expect("transition");
+        let from = crate::gen_schema::derive_from_phases(&def, t).expect("phase set should derive");
+        assert_eq!(from, vec!["A".to_string(), "B".to_string()]);
+    }
 }
