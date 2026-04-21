@@ -24,6 +24,8 @@
  * ```
  */
 
+import { Buffer } from "node:buffer";
+
 // ---------------------------------------------------------------------------
 // Shared value types
 // ---------------------------------------------------------------------------
@@ -52,11 +54,7 @@ function encodeAgentRuntimeRefFromDisplay(raw: unknown): string | undefined {
     return "";
   }
   const payload = JSON.stringify({ i: identity, g: generation });
-  // Use btoa in browsers and Buffer in Node — events.ts runs in both.
-  const b64 =
-    typeof Buffer !== "undefined"
-      ? Buffer.from(payload, "utf-8").toString("base64")
-      : btoa(payload);
+  const b64 = Buffer.from(payload, "utf-8").toString("base64");
   return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 

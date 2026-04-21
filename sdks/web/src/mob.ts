@@ -93,10 +93,12 @@ function encodeAgentRuntimeRef(raw: unknown): string {
     throw new Error('Invalid agent_runtime_id wire shape: missing identity/generation');
   }
   const payload = JSON.stringify({ i: identity, g: generation });
-  const b64 =
-    typeof Buffer !== 'undefined'
-      ? Buffer.from(payload, 'utf-8').toString('base64')
-      : btoa(payload);
+  const bytes = new TextEncoder().encode(payload);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  const b64 = btoa(binary);
   return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
