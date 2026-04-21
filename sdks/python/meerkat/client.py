@@ -20,6 +20,7 @@ Example::
 from __future__ import annotations
 
 import asyncio
+import base64
 from dataclasses import asdict, is_dataclass
 import json
 import os
@@ -143,17 +144,24 @@ def _skill_refs_to_wire(refs: list[SkillRef] | None) -> list[dict[str, str]] | N
     ]
 
 
-def _parse_agent_runtime_id_wire(raw: Any) -> tuple[str, int | None]:
-    """Parse the canonical ``{identity, generation}`` wire shape.
+def _encode_agent_runtime_ref(raw: Any) -> str | None:
+    """Encode the wire ``{identity, generation}`` shape as an opaque
+    ``AgentRuntimeRef`` handle.
 
-    The server emits ``AgentRuntimeId`` as an object with ``identity`` and
-    ``generation`` fields; the SDK surfaces it as a ``"identity:generation"``
-    display string plus the raw generation counter. Any other shape is a
-    protocol error — no string legacy form, no ``agent_identity`` alias, no
+    The server emits ``AgentRuntimeId`` as a ``{"identity": ..., "generation": ...}``
+    object. The SDK re-encodes it as a base64url-encoded opaque token
+    (``base64url(json({"i": identity, "g": generation}))``) so public
+    callers cannot parse incarnation internals — they can only compare
+    handles for equality to detect incarnation rotation. This matches the
+    ``WireMemberRef`` pattern from dogma round 1 (PR #295).
+
+    Returns ``None`` when the field is absent (``None``). Any other
+    non-canonical shape surfaces as a typed ``MeerkatError`` at the
+    boundary — no string legacy form, no ``agent_identity`` alias, no
     fabrication.
     """
     if raw is None:
-        return "", None
+        return None
     if not isinstance(raw, dict):
         raise MeerkatError(
             "INVALID_RESPONSE",
@@ -166,7 +174,8 @@ def _parse_agent_runtime_id_wire(raw: Any) -> tuple[str, int | None]:
             "INVALID_RESPONSE",
             "Invalid agent_runtime_id wire shape: missing identity/generation",
         )
-    return f"{identity}:{generation}", generation
+    payload = json.dumps({"i": identity, "g": generation}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).rstrip(b"=").decode("ascii")
 
 
 class MeerkatClient:
@@ -1369,18 +1378,15 @@ class MeerkatClient:
             "mob/member_status",
             {"mob_id": mob_id, "agent_identity": agent_identity},
         )
-        runtime_id, generation = _parse_agent_runtime_id_wire(
-            result.get("agent_runtime_id")
-        )
+        runtime_ref = _encode_agent_runtime_ref(result.get("agent_runtime_id"))
         return {
             "status": str(result.get("status", "unknown")),
-            "agent_runtime_id": runtime_id,
+            "agent_runtime_id": runtime_ref or "",
             "fence_token": (
                 int(result["fence_token"])
                 if isinstance(result.get("fence_token"), int)
                 else 0
             ),
-            **({"generation": generation} if generation is not None else {}),
             **(
                 {"output_preview": str(result["output_preview"])}
                 if result.get("output_preview") is not None
@@ -1439,19 +1445,16 @@ class MeerkatClient:
         for entry in members:
             if not isinstance(entry, dict):
                 continue
-            runtime_id, generation = _parse_agent_runtime_id_wire(
-                entry.get("agent_runtime_id")
-            )
+            runtime_ref = _encode_agent_runtime_ref(entry.get("agent_runtime_id"))
             normalized.append(
                 {
                     "agent_identity": str(entry.get("agent_identity", "")),
-                    "agent_runtime_id": runtime_id,
+                    "agent_runtime_id": runtime_ref or "",
                     "fence_token": (
                         int(entry["fence_token"])
                         if isinstance(entry.get("fence_token"), int)
                         else 0
                     ),
-                    **({"generation": generation} if generation is not None else {}),
                     "status": str(entry.get("status", "unknown")),
                     **(
                         {"output_preview": str(entry["output_preview"])}
@@ -1499,19 +1502,16 @@ class MeerkatClient:
         for entry in members:
             if not isinstance(entry, dict):
                 continue
-            runtime_id, generation = _parse_agent_runtime_id_wire(
-                entry.get("agent_runtime_id")
-            )
+            runtime_ref = _encode_agent_runtime_ref(entry.get("agent_runtime_id"))
             normalized.append(
                 {
                     "agent_identity": str(entry.get("agent_identity", "")),
-                    "agent_runtime_id": runtime_id,
+                    "agent_runtime_id": runtime_ref or "",
                     "fence_token": (
                         int(entry["fence_token"])
                         if isinstance(entry.get("fence_token"), int)
                         else 0
                     ),
-                    **({"generation": generation} if generation is not None else {}),
                     "status": str(entry.get("status", "unknown")),
                     **(
                         {"output_preview": str(entry["output_preview"])}

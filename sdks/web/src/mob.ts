@@ -58,13 +58,23 @@ interface MobWasmBindings {
 }
 
 /**
- * Parse the canonical `{identity, generation}` wire shape for an
- * `AgentRuntimeId`. Any other shape is a protocol error — no string
- * legacy form, no `agent_identity` alias, no fabrication.
+ * Encode the wire `{identity, generation}` shape as an opaque
+ * `AgentRuntimeRef` handle.
+ *
+ * The server emits `AgentRuntimeId` as a `{identity, generation}` object.
+ * The SDK re-encodes it as a base64url-encoded opaque token
+ * (`base64url(json({"i": identity, "g": generation}))`) so public callers
+ * cannot parse incarnation internals — they can only compare handles for
+ * equality to detect incarnation rotation. Matches the `WireMemberRef`
+ * pattern from dogma round 1 (PR #295).
+ *
+ * Returns `''` when the field is absent. Any other non-canonical shape
+ * throws — no string legacy form, no `agent_identity` alias, no
+ * fabrication.
  */
-function parseAgentRuntimeId(raw: unknown): { value: string; generation?: number } {
+function encodeAgentRuntimeRef(raw: unknown): string {
   if (raw == null) {
-    return { value: '' };
+    return '';
   }
   if (typeof raw !== 'object') {
     throw new Error(
@@ -73,16 +83,21 @@ function parseAgentRuntimeId(raw: unknown): { value: string; generation?: number
   }
   const record = raw as Record<string, unknown>;
   const identity = record.identity;
-  const generationRaw = record.generation;
+  const generation = record.generation;
   if (
     typeof identity !== 'string' ||
     identity.length === 0 ||
-    typeof generationRaw !== 'number' ||
-    !Number.isFinite(generationRaw)
+    typeof generation !== 'number' ||
+    !Number.isFinite(generation)
   ) {
     throw new Error('Invalid agent_runtime_id wire shape: missing identity/generation');
   }
-  return { value: `${identity}:${generationRaw}`, generation: generationRaw };
+  const payload = JSON.stringify({ i: identity, g: generation });
+  const b64 =
+    typeof Buffer !== 'undefined'
+      ? Buffer.from(payload, 'utf-8').toString('base64')
+      : btoa(payload);
+  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 /** Capability-bearing handle for one mob member. */
@@ -334,20 +349,19 @@ export class Mob {
   async memberStatus(agentIdentity: string): Promise<MobMemberSnapshot> {
     const json = await this.bindings.mob_member_status(this.mobId, agentIdentity);
     const snapshot = JSON.parse(json) as Partial<MobMemberSnapshot>;
-    const runtime = parseAgentRuntimeId(snapshot.agent_runtime_id);
-    if (!runtime.value) {
+    const agentRuntimeId = encodeAgentRuntimeRef(snapshot.agent_runtime_id);
+    if (!agentRuntimeId) {
       throw new Error(
         'Invalid mob_member_status response: missing agent_runtime_id',
       );
     }
     return {
       status: typeof snapshot.status === 'string' ? snapshot.status : 'unknown',
-      agent_runtime_id: runtime.value,
+      agent_runtime_id: agentRuntimeId,
       fence_token:
         typeof snapshot.fence_token === 'number' && Number.isFinite(snapshot.fence_token)
           ? snapshot.fence_token
           : 0,
-      generation: runtime.generation,
       output_preview:
         typeof snapshot.output_preview === 'string' ? snapshot.output_preview : undefined,
       error: typeof snapshot.error === 'string' ? snapshot.error : undefined,

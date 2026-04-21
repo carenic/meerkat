@@ -363,23 +363,38 @@ def test_sdk_never_uses_deprecated_runtime_or_input_method_strings():
             )
 
 
-def test_parse_agent_runtime_id_wire_rejects_string_form():
-    """Row 31 regression gate: the SDK must not accept legacy string-form
-    `agent_runtime_id`. The canonical wire shape is
-    `{"identity": "...", "generation": N}`; anything else is a protocol
-    error that must surface as a typed `MeerkatError`.
+def test_encode_agent_runtime_ref_is_opaque_and_strict():
+    """Row 31 regression gate: the SDK must emit an opaque
+    ``AgentRuntimeRef`` handle, not a parseable ``"identity:generation"``
+    string. The canonical wire shape is ``{"identity": "...", "generation": N}``;
+    anything else is a protocol error that must surface as a typed
+    ``MeerkatError``.
     """
-    from meerkat.client import MeerkatError, _parse_agent_runtime_id_wire
+    import base64
+    import json as _json
 
+    from meerkat.client import MeerkatError, _encode_agent_runtime_ref
+
+    # Non-canonical shapes are typed errors.
     with pytest.raises(MeerkatError):
-        _parse_agent_runtime_id_wire("worker:1")
+        _encode_agent_runtime_ref("worker:1")
     with pytest.raises(MeerkatError):
-        _parse_agent_runtime_id_wire({"agent_identity": "worker", "generation": 1})
+        _encode_agent_runtime_ref({"agent_identity": "worker", "generation": 1})
     with pytest.raises(MeerkatError):
-        _parse_agent_runtime_id_wire({"identity": "worker"})
-    # Canonical form succeeds; `None` still threads through as absence.
-    assert _parse_agent_runtime_id_wire({"identity": "worker", "generation": 2}) == (
-        "worker:2",
-        2,
-    )
-    assert _parse_agent_runtime_id_wire(None) == ("", None)
+        _encode_agent_runtime_ref({"identity": "worker"})
+
+    # Canonical form yields a deterministic opaque token whose internals
+    # decode to the short ``{i, g}`` key schema — so equality comparison
+    # works across SDKs and callers cannot sniff the display string.
+    token = _encode_agent_runtime_ref({"identity": "worker", "generation": 2})
+    assert isinstance(token, str) and token
+    # Token must NOT carry the parseable display form.
+    assert ":" not in token
+    # Decoding is an SDK-internal detail for testing; callers must not
+    # reach for it.
+    padded = token + "=" * (-len(token) % 4)
+    decoded = _json.loads(base64.urlsafe_b64decode(padded))
+    assert decoded == {"i": "worker", "g": 2}
+
+    # Absence threads through as None.
+    assert _encode_agent_runtime_ref(None) is None

@@ -308,7 +308,7 @@ test(
         },
       ]);
       assert.equal(spawned.length, 2);
-      assert.ok(spawned.every((entry) => entry.agent_runtime_id));
+      assert.ok(spawned.every((entry) => entry.member_ref));
 
       await mob.wire("lead-1", "reviewer-1");
       const appended = await mob.appendSystemContext("reviewer-1", {
@@ -337,7 +337,7 @@ test(
       const members = await mob.listMembers();
       const reviewer = members.find((member) => member.agent_identity === "reviewer-1");
       assert.ok(reviewer);
-      assert.ok(reviewer.agent_runtime_id);
+      assert.ok(reviewer.member_ref);
       const reviewerSnapshot = await mob.memberStatus("reviewer-1");
       assert.ok(reviewerSnapshot.agent_runtime_id);
 
@@ -352,7 +352,7 @@ test(
           runtime_mode: "turn_driven",
         },
       ]);
-      assert.ok(brokenSpawn[0]?.agent_runtime_id);
+      assert.ok(brokenSpawn[0]?.member_ref);
       await assert.rejects(
         () => mob.member("broken-1").send(
           "This turn must fail because the member model is invalid.",
@@ -421,7 +421,7 @@ test(
         },
       ]);
       assert.equal(spawned.length, 3);
-      assert.ok(spawned.every((entry) => entry.agent_runtime_id));
+      assert.ok(spawned.every((entry) => entry.member_ref));
 
       const allSubscription = await mob.subscribeEvents();
       try {
@@ -453,22 +453,30 @@ test(
       );
       assert.ok(!withoutReviewer.some((member) => member.agent_identity === "reviewer-1"));
 
+      const preRespawnSnapshot = await mob.memberStatus("reviewer-1").catch(
+        () => undefined,
+      );
+      const preRespawnRuntimeRef = preRespawnSnapshot?.agent_runtime_id;
       await mob.respawn("reviewer-1", "Return online and say REVIEWER_RESPAWN_48.");
       const withRespawnedReviewer = await waitFor(
         "reviewer respawn",
         () => mob.listMembers(),
         (members) =>
-          members.some(
-            (member) =>
-              member.agent_identity === "reviewer-1"
-              && member.agent_runtime_id
-              && member.agent_runtime_id !== spawned[2].agent_runtime_id,
-        ),
+          members.some((member) => member.agent_identity === "reviewer-1"),
         { timeoutMs: 60000, intervalMs: 200 },
       );
       assert.ok(
         withRespawnedReviewer.some((member) => member.agent_identity === "reviewer-1"),
       );
+      const postRespawnSnapshot = await waitFor(
+        "reviewer respawn incarnation rotated",
+        () => mob.memberStatus("reviewer-1"),
+        (snapshot) =>
+          snapshot.agent_runtime_id.length > 0
+          && snapshot.agent_runtime_id !== preRespawnRuntimeRef,
+        { timeoutMs: 60000, intervalMs: 200 },
+      );
+      assert.ok(postRespawnSnapshot.agent_runtime_id);
 
       await mob.lifecycle("stop");
       const stopped = await mob.status();
