@@ -269,28 +269,22 @@ fn openai_realtime_history_context(seed_messages: &[Message]) -> Option<String> 
     (!sections.is_empty()).then(|| sections.join("\n\n"))
 }
 
-fn normalize_openai_authoritative_system_text(text: &str) -> String {
+fn runtime_system_context_body(text: &str) -> String {
     let trimmed = text.trim();
-    let body = if let Some((_, body)) = trimmed.split_once("\n\n")
-        && trimmed.starts_with("[Runtime System Context]")
-    {
-        body.trim()
-    } else {
-        trimmed
-    };
-
-    if let Some((_, authoritative_tail)) = body.split_once("Authoritative result fields:") {
-        return format!("Authoritative result fields:{}", authoritative_tail.trim());
+    if !trimmed.starts_with("[Runtime System Context]") {
+        return trimmed.to_string();
     }
-
-    body.to_string()
+    trimmed
+        .split_once("\n\n")
+        .map(|(_, body)| body.trim().to_string())
+        .unwrap_or_else(|| trimmed.to_string())
 }
 
 fn authoritative_runtime_system_blocks_from_text(text: &str) -> Vec<String> {
     text.split(meerkat_core::SYSTEM_CONTEXT_SEPARATOR)
         .map(str::trim)
         .filter(|segment| segment.starts_with("[Runtime System Context]"))
-        .map(normalize_openai_authoritative_system_text)
+        .map(runtime_system_context_body)
         .filter(|segment| !segment.is_empty())
         .collect()
 }
@@ -2309,7 +2303,7 @@ mod tests {
     fn instructions_extract_authoritative_runtime_blocks_embedded_in_root_system_prompt() {
         let seed_messages = vec![Message::System(meerkat_core::SystemMessage {
             content: format!(
-                "You are the realtime operator.{}\n[Runtime System Context]\nsource: peer_response_terminal:analyst:req-123\n\nAuthoritative result fields: request_intent=checksum_token, token=birch seventeen. For checksum_token requests, the exact token answer is `birch seventeen`.",
+                "You are the realtime operator.{}\n[Runtime System Context]\nsource: peer_response_terminal:analyst:req-123\n\n[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] Correlated peer response from analyst. Request ID: req-123. Status: completed. Result: {{\"request_intent\":\"checksum_token\",\"token\":\"birch seventeen\"}}.",
                 meerkat_core::SYSTEM_CONTEXT_SEPARATOR
             ),
         })];
@@ -2326,8 +2320,16 @@ mod tests {
             "expected authoritative runtime section to be synthesized: {instructions}"
         );
         assert!(
-            instructions.contains("request_intent=checksum_token, token=birch seventeen"),
-            "expected embedded runtime context to surface exact authoritative token facts: {instructions}"
+            instructions.contains("[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL]"),
+            "expected canonical terminal-peer notice to surface in reconstruction instructions: {instructions}"
+        );
+        assert!(
+            instructions.contains("\"token\":\"birch seventeen\""),
+            "expected structured Result JSON to surface in reconstruction instructions: {instructions}"
+        );
+        assert!(
+            !instructions.contains("Authoritative result fields:"),
+            "runtime must no longer emit the per-fixture 'Authoritative result fields' scaffolding: {instructions}"
         );
     }
 
@@ -2393,7 +2395,7 @@ mod tests {
                 content: "You are the realtime operator.".to_string(),
             }),
             Message::System(meerkat_core::SystemMessage {
-                content: "[Runtime System Context]\nsource: peer_response_terminal:analyst-rt:req-123\n\n[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] Correlated peer response from analyst-rt. Request ID: req-123. Status: completed. Result: {\n  \"request_intent\": \"checksum_token\",\n  \"token\": \"birch seventeen\"\n}. Authoritative result fields: request_intent=checksum_token, token=birch seventeen.".to_string(),
+                content: "[Runtime System Context]\nsource: peer_response_terminal:analyst-rt:req-123\n\n[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] Correlated peer response from analyst-rt. Request ID: req-123. Status: completed. Result: {\n  \"request_intent\": \"checksum_token\",\n  \"token\": \"birch seventeen\"\n}.".to_string(),
             }),
             Message::User(meerkat_core::UserMessage::text("hello")),
             Message::Assistant(meerkat_core::AssistantMessage {

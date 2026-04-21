@@ -38,20 +38,6 @@ fn input_boundary(input: &Input) -> RunApplyBoundary {
         Input::Peer(peer)
             if matches!(
                 peer.convention,
-                Some(crate::input::PeerConvention::ResponseTerminal { .. })
-            ) && peer.handling_mode.is_none() =>
-        {
-            // Runtime-owned default for terminal peer responses:
-            // when surfaces do not explicitly override handling_mode, the
-            // typed ResponseTerminal convention should apply immediately as a
-            // canonical context fact. Routing it through RunStart would strand
-            // the authoritative peer result until a later user turn, which is
-            // exactly the freshness gap the realtime audio smoke exposes.
-            RunApplyBoundary::Immediate
-        }
-        Input::Peer(peer)
-            if matches!(
-                peer.convention,
                 Some(crate::input::PeerConvention::ResponseProgress { .. })
             ) =>
         {
@@ -306,10 +292,9 @@ fn peer_prompt_text(peer: &crate::input::PeerInput) -> String {
             Some(crate::input::PeerConvention::ResponseTerminal { request_id, status }),
             crate::input::InputOrigin::Peer { peer_id, .. },
         ) => format!(
-            "[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] Correlated peer response from {peer_id}. Request ID: {request_id}. Status: {}. Result: {}.{}",
+            "[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] Correlated peer response from {peer_id}. Request ID: {request_id}. Status: {}. Result: {}.",
             response_terminal_status_label(status),
-            format_peer_payload(peer.payload.as_ref()),
-            format_authoritative_peer_result_hint(peer.payload.as_ref())
+            format_peer_payload(peer.payload.as_ref())
         ),
         _ => peer.body.clone(),
     }
@@ -318,48 +303,6 @@ fn peer_prompt_text(peer: &crate::input::PeerInput) -> String {
 fn format_peer_payload(payload: Option<&serde_json::Value>) -> String {
     serde_json::to_string_pretty(payload.unwrap_or(&serde_json::Value::Null))
         .unwrap_or_else(|_| "null".to_string())
-}
-
-fn format_authoritative_peer_result_hint(payload: Option<&serde_json::Value>) -> String {
-    let Some(serde_json::Value::Object(map)) = payload else {
-        return String::new();
-    };
-
-    let request_intent = map
-        .get("request_intent")
-        .and_then(serde_json::Value::as_str);
-    let token = map.get("token").and_then(serde_json::Value::as_str);
-
-    if request_intent.is_none() && token.is_none() {
-        return String::new();
-    }
-
-    // Transitional but machine-owned:
-    // until the machine/DSL branch exposes first-class structured peer-response
-    // fields directly to the model, the runtime-owned prompt projection must
-    // restate the authoritative scalar facts from terminal peer results here.
-    // This keeps the semantic hint on the runtime side rather than asking the
-    // smoke harness or comms helper text to carry the meaning.
-    let mut parts = Vec::new();
-    if let Some(request_intent) = request_intent {
-        parts.push(format!("request_intent={request_intent}"));
-    }
-    if let Some(token) = token {
-        parts.push(format!("token={token}"));
-    }
-
-    let exact_answer_hint = match (request_intent, token) {
-        (Some(request_intent), Some(token)) => format!(
-            " For {request_intent} requests, the exact token answer is `{token}`. If a later user asks what token came from the peer, answer with `{token}` exactly."
-        ),
-        _ => String::new(),
-    };
-
-    format!(
-        " Authoritative result fields: {}. This terminal peer result supersedes any earlier peer-request params for factual recall. Treat these exact values as durable facts for later turns until a newer authoritative terminal peer response supersedes them. Use these exact values, not placeholder words, request subjects, or unrelated remembered codewords.{}",
-        parts.join(", "),
-        exact_answer_hint
-    )
 }
 
 fn response_progress_phase_label(phase: &crate::input::ResponseProgressPhase) -> &'static str {
@@ -1107,7 +1050,56 @@ mod tests {
 
         assert_eq!(
             input_to_prompt(&input),
-            "[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] Correlated peer response from analyst-rt. Request ID: req-123. Status: completed. Result: {\n  \"request_intent\": \"checksum_token\",\n  \"token\": \"birch seventeen\"\n}. Authoritative result fields: request_intent=checksum_token, token=birch seventeen. This terminal peer result supersedes any earlier peer-request params for factual recall. Treat these exact values as durable facts for later turns until a newer authoritative terminal peer response supersedes them. Use these exact values, not placeholder words, request subjects, or unrelated remembered codewords. For checksum_token requests, the exact token answer is `birch seventeen`. If a later user asks what token came from the peer, answer with `birch seventeen` exactly."
+            "[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] Correlated peer response from analyst-rt. Request ID: req-123. Status: completed. Result: {\n  \"request_intent\": \"checksum_token\",\n  \"token\": \"birch seventeen\"\n}."
+        );
+    }
+
+    #[test]
+    fn input_to_prompt_peer_response_terminal_omits_payload_key_extraction() {
+        // Regression: runtime must not reach into the peer response payload
+        // to extract ad-hoc fields (request_intent, token, etc.) and bake
+        // them into prompt text. The canonical projection is the typed
+        // convention + the Result JSON verbatim; any per-fixture semantics
+        // belong to the peer application, not the runtime.
+        let input = Input::Peer(PeerInput {
+            header: InputHeader {
+                id: InputId::new(),
+                timestamp: Utc::now(),
+                source: InputOrigin::Peer {
+                    peer_id: "analyst-rt".into(),
+                    runtime_id: None,
+                },
+                durability: InputDurability::Durable,
+                visibility: InputVisibility::default(),
+                idempotency_key: None,
+                supersession_key: None,
+                correlation_id: None,
+            },
+            convention: Some(crate::input::PeerConvention::ResponseTerminal {
+                request_id: "req-123".into(),
+                status: crate::input::ResponseTerminalStatus::Completed,
+            }),
+            body: "stale helper-local comms prose".into(),
+            payload: Some(serde_json::json!({
+                "request_intent": "checksum_token",
+                "token": "birch seventeen"
+            })),
+            blocks: None,
+            handling_mode: None,
+        });
+
+        let rendered = input_to_prompt(&input);
+        assert!(
+            !rendered.contains("Authoritative result fields:"),
+            "runtime must not emit scenario-specific authoritative-field hints: {rendered}"
+        );
+        assert!(
+            !rendered.contains("the exact token answer is"),
+            "runtime must not coach the model about specific payload values: {rendered}"
+        );
+        assert!(
+            !rendered.contains("request_intent=checksum_token"),
+            "runtime must not re-flatten payload keys into prompt text: {rendered}"
         );
     }
 
@@ -1189,8 +1181,13 @@ mod tests {
     }
 
     #[test]
-    fn peer_response_terminal_without_handling_mode_defaults_to_immediate_boundary()
-    -> Result<(), String> {
+    fn peer_response_terminal_input_boundary_matches_machine_boundary() -> Result<(), String> {
+        // Row 12 unification: `input_boundary` (typed Input view) and
+        // `machine_input_boundary` (ingress handling_mode view) must agree
+        // on ResponseTerminal inputs. Canonical answer is RunStart, since
+        // ResponseTerminal is forbidden from carrying a handling_mode
+        // override and the runtime-loop batch path already stages it as
+        // RunStart.
         let input = Input::Peer(PeerInput {
             header: InputHeader {
                 id: InputId::new(),
@@ -1218,12 +1215,17 @@ mod tests {
             handling_mode: None,
         });
 
+        assert_eq!(input_boundary(&input), RunApplyBoundary::RunStart);
+
         let primitive = inputs_to_primitive(&[(input.id().clone(), input)]);
         let staged = match primitive {
             RunPrimitive::StagedInput(staged) => staged,
             other => return Err(format!("expected staged input, got {other:?}")),
         };
-        assert_eq!(staged.boundary, RunApplyBoundary::Immediate);
+        assert_eq!(staged.boundary, RunApplyBoundary::RunStart);
+        // Terminal peer payload still routes through the context-append
+        // path (not user-visible appends) since `input_to_append` returns
+        // None for the ResponseTerminal convention.
         assert!(staged.appends.is_empty());
         assert_eq!(staged.context_appends.len(), 1);
         Ok(())
