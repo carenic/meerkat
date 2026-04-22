@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+#[allow(unused_imports)]
+use meerkat_core::HttpAuthorizer;
 use meerkat_core::{
-    AuthError, AuthLease, AuthMetadata, AuthProfile, BackendProfile, BindingPolicy, HttpAuthorizer,
-    Provider,
+    AuthError, AuthLease, AuthMetadata, AuthProfile, BackendProfile, BindingPolicy, Provider,
 };
 
 use meerkat_auth_core::resolver::{
@@ -17,9 +18,10 @@ use meerkat_auth_core::resolver::{
     resolve_simple_secret,
 };
 use meerkat_llm_core::LlmClient;
+#[allow(unused_imports)]
+use meerkat_llm_core::provider_runtime::binding::DynamicLease;
 use meerkat_llm_core::provider_runtime::binding::{
-    DynamicLease, NormalizedAuthMethod, NormalizedBackendKind, ResolvedConnection, StaticLease,
-    ValidatedBinding,
+    NormalizedAuthMethod, NormalizedBackendKind, ResolvedConnection, StaticLease, ValidatedBinding,
 };
 use meerkat_llm_core::provider_runtime::errors::{
     ProviderAuthError, ProviderBindingError, ProviderClientError,
@@ -574,6 +576,7 @@ impl ProviderRuntime for AnthropicProviderRuntime {
     }
 }
 
+#[allow(dead_code)]
 fn backend_option_string(binding: &ValidatedBinding, key: &str) -> Option<String> {
     binding
         .backend_profile
@@ -583,6 +586,7 @@ fn backend_option_string(binding: &ValidatedBinding, key: &str) -> Option<String
         .map(ToString::to_string)
 }
 
+#[allow(dead_code)]
 fn bedrock_region(binding: &ValidatedBinding) -> String {
     backend_option_string(binding, "aws_region")
         .or_else(|| backend_option_string(binding, "region"))
