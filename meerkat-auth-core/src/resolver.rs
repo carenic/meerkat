@@ -482,7 +482,7 @@ mod tests {
                 metadata_defaults: meerkat_core::AuthMetadataDefaults {
                     organization_id: Some("org-default".into()),
                     workspace_id: Some("ws-default".into()),
-                    route_hints: AuthRouteHints::Google(Box::new(GoogleRouteHints::default())),
+                    route_hints: AuthRouteHints::Google(Box::default()),
                     provider_metadata: Some(ProviderAuthMetadata::Google(GoogleAuthMetadata {
                         project_id: Some("proj-default".into()),
                         ..Default::default()

@@ -746,7 +746,7 @@ impl ShellState {
             .collect();
         self.dsl_apply(
             mm_dsl::MeerkatMachineInput::RequestWaitAll {
-                operation_ids: dsl_ids.clone(),
+                operation_ids: dsl_ids,
             },
             "RequestWaitAll",
         )?;

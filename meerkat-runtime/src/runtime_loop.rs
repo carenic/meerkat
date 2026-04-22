@@ -235,9 +235,7 @@ fn input_to_append(input: &Input) -> Option<ConversationAppend> {
 }
 
 fn input_to_context_append(input: &Input) -> Option<ConversationContextAppend> {
-    let Some(projection) = peer_projection(input) else {
-        return None;
-    };
+    let projection = peer_projection(input)?;
 
     Some(ConversationContextAppend {
         key: projection.context_key()?,
