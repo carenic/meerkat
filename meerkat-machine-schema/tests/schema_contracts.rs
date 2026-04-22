@@ -920,10 +920,17 @@ fn composition_driver_rejects_duplicate_dispatch_route_names() {
 
 #[test]
 fn composition_with_driver_none_still_validates_as_before() {
+    // Post-Commit-4 the `meerkat_mob_seam` composition itself
+    // declares a `RecomputeMobPeerOverlay` driver — so this test
+    // exercises a constructed driverless variant of the seam to pin
+    // that `driver: None` is still a valid shape. The 3
+    // `schedule_*_bundle` compositions continue to carry `driver:
+    // None` and validate transitively via the
+    // `canonical_composition_registry_is_individually_valid` test.
     let meerkat = meerkat_machine();
     let mob = mob_machine();
-    let composition = meerkat_mob_seam_composition();
-    assert!(composition.driver.is_none());
+    let mut composition = meerkat_mob_seam_composition();
+    composition.driver = None;
 
     assert_eq!(
         composition.validate_against(&[&meerkat, &mob]),

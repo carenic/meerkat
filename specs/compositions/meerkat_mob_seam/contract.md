@@ -19,7 +19,13 @@ _Generated from the Rust composition catalog. Do not edit by hand._
 - `(none)`
 
 ## Driver
-- `(none)`
+- `RecomputeMobPeerOverlay` (`RecomputeMobPeerOverlayDriver` in `meerkat-runtime/src/generated/recompute_mob_peer_overlay_driver.rs`)
+  - watches:
+    - `mob::WiringGraphChanged`
+    - `mob::MemberSessionBindingChanged`
+    - `meerkat::LocalEndpointChanged`
+  - dispatches:
+    - `apply_mob_peer_overlay` → `meerkat::ApplyMobPeerOverlay` (Input)
 
 ## Transaction Plans
 - `(none)`

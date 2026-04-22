@@ -27,6 +27,7 @@ pub mod auth_machine;
 pub mod coalescing;
 pub mod comms_bridge;
 pub mod comms_drain;
+pub mod comms_trust_reconcile;
 pub mod completion;
 pub mod composition_dispatch;
 pub(crate) mod control_plane;
@@ -48,6 +49,7 @@ pub mod peer_handling_mode;
 pub mod policy;
 pub mod policy_table;
 pub mod queue;
+pub mod recompute_mob_peer_overlay;
 pub mod runtime_event;
 pub(crate) mod runtime_loop;
 pub mod runtime_state;
@@ -62,6 +64,7 @@ pub use coalescing::{
     AggregateDescriptor, CoalescingResult, SupersessionScope, apply_coalescing, apply_supersession,
     check_supersession, create_aggregate_input, is_coalescing_eligible,
 };
+pub use comms_trust_reconcile::{CommsTrustReconcileError, CommsTrustReconciler, ReconcileReport};
 pub use completion::{CompletionHandle, CompletionOutcome};
 pub use composition_dispatch::{
     CompositionDispatcher, CompositionDriverTrait, DispatchedInput, DispatcherError, DriverError,
@@ -117,6 +120,7 @@ pub use policy::{
 };
 pub use policy_table::{DEFAULT_POLICY_VERSION, DefaultPolicyTable};
 pub use queue::InputQueue;
+pub use recompute_mob_peer_overlay::{MobPeerOverlayDispatch, RecomputeMobPeerOverlayDriver};
 pub use runtime_event::{
     InputLifecycleEvent, RunLifecycleEvent, RuntimeEvent, RuntimeEventEnvelope,
     RuntimeProjectionEvent, RuntimeStateChangeEvent, RuntimeTopologyEvent,
