@@ -251,7 +251,14 @@ fn peer_block_prefix_text(peer: &crate::input::PeerInput) -> Option<String> {
 
 fn peer_prompt_text(peer: &crate::input::PeerInput) -> String {
     peer_projection_from_peer_input(peer)
-        .map(|projection| projection.prompt_text())
+        .map(|projection| {
+            let prompt = projection.prompt_text();
+            if prompt.is_empty() {
+                peer.body.clone()
+            } else {
+                prompt
+            }
+        })
         .unwrap_or_else(|| peer.body.clone())
 }
 
@@ -985,6 +992,35 @@ mod tests {
             handling_mode: None,
         });
         assert_eq!(input_to_prompt(&input), "peer message");
+    }
+
+    #[test]
+    fn input_to_prompt_peer_message_uses_body_when_projection_text_is_empty() {
+        let input = Input::Peer(PeerInput {
+            header: InputHeader {
+                id: InputId::new(),
+                timestamp: Utc::now(),
+                source: InputOrigin::Peer {
+                    peer_id: "peer-1".into(),
+                    runtime_id: None,
+                },
+                durability: InputDurability::Durable,
+                visibility: InputVisibility::default(),
+                idempotency_key: None,
+                supersession_key: None,
+                correlation_id: None,
+            },
+            convention: Some(crate::input::PeerConvention::Message),
+            body: "[COMMS MESSAGE from peer-1]\nplain body payload".into(),
+            payload: None,
+            blocks: None,
+            handling_mode: None,
+        });
+
+        assert_eq!(
+            input_to_prompt(&input),
+            "[COMMS MESSAGE from peer-1]\nplain body payload"
+        );
     }
 
     #[test]

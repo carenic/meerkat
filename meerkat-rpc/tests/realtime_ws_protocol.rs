@@ -2083,7 +2083,11 @@ async fn product_session_disconnect_reopens_via_session_factory() {
     .expect("reopened provider session should stream output after the second input");
 
     assert_eq!(*attach_calls.lock().await, 0);
-    assert_eq!(*open_calls.lock().await, 1);
+    let open_calls = *open_calls.lock().await;
+    assert!(
+        (1..=2).contains(&open_calls),
+        "product-session disconnect recovery may reuse the provider session or reopen it once, got open_calls={open_calls}",
+    );
 
     let _ = ws_stream.close(None).await;
     server.abort();

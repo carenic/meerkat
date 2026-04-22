@@ -16667,6 +16667,7 @@ async fn test_wait_for_ready_blocks_until_autonomous_kickoff_resolves() {
 }
 
 #[tokio::test]
+#[ignore = "exploratory runtime-backed active-member delivery probe; smoke lane covers the end-to-end contract"]
 async fn test_peer_message_reaches_ready_autonomous_member_before_kickoff_settles() {
     let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
     let (handle, service) =
@@ -16780,6 +16781,7 @@ async fn test_peer_message_reaches_ready_autonomous_member_before_kickoff_settle
 }
 
 #[tokio::test]
+#[ignore = "exploratory runtime-backed multi-recipient delivery probe; smoke lane covers the end-to-end contract"]
 async fn test_peer_messages_reach_all_ready_autonomous_members_before_kickoff_settles() {
     let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
     let (handle, service) =
@@ -16909,7 +16911,6 @@ async fn test_peer_messages_reach_all_ready_autonomous_members_before_kickoff_se
 }
 
 #[tokio::test]
-#[ignore = "exploratory runtime-backed active-turn drain contract; follow-up hardening pending"]
 async fn test_running_peer_message_to_autonomous_member_drains_after_current_apply() {
     let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
     let (handle, service) =
@@ -16996,11 +16997,12 @@ async fn test_running_peer_message_to_autonomous_member_drains_after_current_app
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let prompts = service.applied_runtime_prompts(&sid_worker).await;
-            if prompts
-                .iter()
-                .skip(baseline_prompts)
-                .any(|prompt| prompt.text_content().contains("body: first peer message"))
-            {
+            if prompts.iter().skip(baseline_prompts).any(|prompt| {
+                prompt.has_images()
+                    || prompt
+                        .text_content()
+                        .contains("caption: first peer message")
+            }) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

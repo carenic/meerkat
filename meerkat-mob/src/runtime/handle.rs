@@ -3082,13 +3082,7 @@ impl MobHandle {
                     continue;
                 };
                 let material = self.canonical_member_list_material(id).await;
-                if !Self::ready_wait_is_satisfied(entry, &material, &snapshot.ready_runtime_ids)
-                    || !Self::kickoff_wait_is_satisfied(
-                        entry,
-                        &material,
-                        &snapshot.pending_kickoff_member_ids,
-                    )
-                {
+                if !Self::ready_wait_is_satisfied(entry, &material, &snapshot.ready_runtime_ids) {
                     pending_member_ids.push(id.clone());
                 }
             }
