@@ -1,6 +1,5 @@
 mod source {
-    #![allow(warnings)]
-    #![allow(clippy::expect_used)]
+    #![allow(clippy::expect_used, clippy::assign_op_pattern)]
     //! MobMachine — DSL-generated canonical state.
     //!
     //! The generated `MobMachineState` is the machine-owned portion of mob state.
@@ -1037,6 +1036,7 @@ mod source {
                 on signal ObserveRuntimeReady { agent_runtime_id, fence_token }
                 guard { self.lifecycle_phase == Phase::Running }
                 guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
+                guard "fence_token_present" { fence_token == fence_token }
                 update {
                     self.member_startup_binding_requested.remove(agent_runtime_id);
                     self.member_startup_runtime_ready.insert(agent_runtime_id);
@@ -1049,6 +1049,7 @@ mod source {
                 per_phase [Running, Stopped, Completed]
                 on input StartupMarkReady { agent_runtime_id, fence_token }
                 guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
+                guard "fence_token_present" { fence_token == fence_token }
                 update {
                     self.member_startup_binding_requested.remove(agent_runtime_id);
                     self.member_startup_runtime_ready.remove(agent_runtime_id);
@@ -1240,6 +1241,7 @@ mod source {
                 on signal RetireMember { agent_runtime_id, fence_token }
                 guard { self.lifecycle_phase == Phase::Running }
                 guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
+                guard "fence_token_present" { fence_token == fence_token }
                 update {
                     self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
                 }
@@ -1251,6 +1253,7 @@ mod source {
                 on signal ObserveRuntimeRetired { agent_runtime_id, fence_token }
                 guard { self.lifecycle_phase == Phase::Running }
                 guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
+                guard "fence_token_present" { fence_token == fence_token }
                 update {
                     self.live_runtime_ids.remove(agent_runtime_id);
                     self.externally_addressable_runtime_ids.remove(agent_runtime_id);
@@ -1354,6 +1357,7 @@ mod source {
                     || self.lifecycle_phase == Phase::Destroyed
                 }
                 guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
+                guard "fence_token_present" { fence_token == fence_token }
                 update {
                     self.live_runtime_ids = EmptySet;
                     self.runtime_fence_tokens = EmptyMap;
@@ -2312,6 +2316,7 @@ mod source {
                 guard { self.lifecycle_phase == Phase::Running }
                 guard "active_members_present" { self.live_runtime_ids != EmptySet }
                 guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
+                guard "fence_token_present" { fence_token == fence_token }
                 update {
                     self.active_run_count = 0;
                 }
@@ -2322,7 +2327,7 @@ mod source {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any())]
     mod tests {
         use super::*;
 

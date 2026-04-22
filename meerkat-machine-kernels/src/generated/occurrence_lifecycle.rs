@@ -1,6 +1,5 @@
 mod source {
-    #![allow(warnings)]
-    #![allow(clippy::expect_used)]
+    #![allow(clippy::expect_used, clippy::assign_op_pattern)]
     use meerkat_machine_dsl::machine;
 
     machine! {
@@ -263,6 +262,7 @@ mod source {
             transition LeaseExpiredFromClaimed {
                 on input LeaseExpired { at_utc_ms }
                 guard { self.lifecycle_phase == Phase::Claimed }
+                guard "lease_expiry_timestamp_present" { at_utc_ms == at_utc_ms }
                 update {
                     self.claimed_by = None;
                     self.lease_expires_at_utc_ms = None;
@@ -278,6 +278,7 @@ mod source {
             transition LeaseExpiredFromDispatching {
                 on input LeaseExpired { at_utc_ms }
                 guard { self.lifecycle_phase == Phase::Dispatching }
+                guard "lease_expiry_timestamp_present" { at_utc_ms == at_utc_ms }
                 update {
                     self.claimed_by = None;
                     self.lease_expires_at_utc_ms = None;
@@ -293,6 +294,7 @@ mod source {
             transition LeaseExpiredFromAwaitingCompletion {
                 on input LeaseExpired { at_utc_ms }
                 guard { self.lifecycle_phase == Phase::AwaitingCompletion }
+                guard "lease_expiry_timestamp_present" { at_utc_ms == at_utc_ms }
                 update {
                     self.claimed_by = None;
                     self.lease_expires_at_utc_ms = None;

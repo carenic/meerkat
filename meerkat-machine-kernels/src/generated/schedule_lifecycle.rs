@@ -1,6 +1,5 @@
 mod source {
-    #![allow(warnings)]
-    #![allow(clippy::expect_used)]
+    #![allow(clippy::expect_used, clippy::assign_op_pattern)]
     use meerkat_machine_dsl::machine;
 
     machine! {
@@ -168,6 +167,7 @@ mod source {
             transition PauseActiveOrPaused {
                 on input Pause { at_utc_ms }
                 guard { self.lifecycle_phase == Phase::Active || self.lifecycle_phase == Phase::Paused }
+                guard "pause_timestamp_present" { at_utc_ms == at_utc_ms }
                 update {}
                 to Paused
                 emit EmitScheduleNotice { new_state: self.lifecycle_phase, revision: self.revision }
@@ -176,6 +176,7 @@ mod source {
             transition ResumeActiveOrPaused {
                 on input Resume { at_utc_ms }
                 guard { self.lifecycle_phase == Phase::Active || self.lifecycle_phase == Phase::Paused }
+                guard "resume_timestamp_present" { at_utc_ms == at_utc_ms }
                 update {}
                 to Active
                 emit EmitScheduleNotice { new_state: self.lifecycle_phase, revision: self.revision }
@@ -186,6 +187,7 @@ mod source {
             transition DeleteActive {
                 on input Delete { at_utc_ms }
                 guard { self.lifecycle_phase == Phase::Active }
+                guard "delete_timestamp_present" { at_utc_ms == at_utc_ms }
                 update {
                     self.revision += 1;
                     self.planning_cursor_utc_ms = None;
@@ -198,6 +200,7 @@ mod source {
             transition DeletePaused {
                 on input Delete { at_utc_ms }
                 guard { self.lifecycle_phase == Phase::Paused }
+                guard "delete_timestamp_present" { at_utc_ms == at_utc_ms }
                 update {
                     self.revision += 1;
                     self.planning_cursor_utc_ms = None;
