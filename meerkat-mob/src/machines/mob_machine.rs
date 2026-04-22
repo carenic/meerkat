@@ -31,7 +31,9 @@ impl<T: Clone + Default> OptionValueExt<T> for Option<T> {
 // these newtypes satisfy that while providing From/Into mappings.
 
 /// Bridging type for agent identity. Maps to `crate::ids::AgentIdentity`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct AgentIdentity(pub String);
 
 impl<T: Into<String>> From<T> for AgentIdentity {
@@ -44,12 +46,19 @@ impl<T: Into<String>> From<T> for AgentIdentity {
 ///
 /// The real `AgentRuntimeId` is a struct `{ identity: AgentIdentity, generation: Generation }`.
 /// The DSL uses a single string key `"identity:generation"` for Set/Map operations.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct AgentRuntimeId(pub String);
 
 impl<T: Into<String>> From<T> for AgentRuntimeId {
     fn from(s: T) -> Self {
         Self(s.into())
+    }
+}
+impl AgentRuntimeId {
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -74,7 +83,9 @@ impl From<u64> for Generation {
 }
 
 /// Bridging type for work reference. Maps to `crate::ids::WorkRef`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct WorkId(pub String);
 
 impl<T: Into<String>> From<T> for WorkId {
@@ -84,7 +95,18 @@ impl<T: Into<String>> From<T> for WorkId {
 }
 
 /// Bridging type for flow run identity. Maps to `crate::ids::RunId`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct RunId(pub String);
 
 impl<T: Into<String>> From<T> for RunId {
@@ -94,7 +116,18 @@ impl<T: Into<String>> From<T> for RunId {
 }
 
 /// Bridging type for frame identity. Maps to `crate::ids::FrameId`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct FrameId(pub String);
 
 impl<T: Into<String>> From<T> for FrameId {
@@ -102,9 +135,25 @@ impl<T: Into<String>> From<T> for FrameId {
         Self(s.into())
     }
 }
+impl FrameId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Bridging type for loop instance identity. Maps to `crate::ids::LoopInstanceId`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct LoopInstanceId(pub String);
 
 impl<T: Into<String>> From<T> for LoopInstanceId {
@@ -112,9 +161,25 @@ impl<T: Into<String>> From<T> for LoopInstanceId {
         Self(s.into())
     }
 }
+impl LoopInstanceId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Bridging type for loop definition identity. Maps to `crate::ids::LoopId`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct LoopId(pub String);
 
 impl<T: Into<String>> From<T> for LoopId {
@@ -124,7 +189,18 @@ impl<T: Into<String>> From<T> for LoopId {
 }
 
 /// Bridging type for flow-node identity. Maps to `crate::ids::FlowNodeId`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct FlowNodeId(pub String);
 
 impl<T: Into<String>> From<T> for FlowNodeId {
@@ -134,7 +210,18 @@ impl<T: Into<String>> From<T> for FlowNodeId {
 }
 
 /// Bridging type for branch identity. Maps to `crate::ids::BranchId`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct BranchId(pub String);
 
 impl<T: Into<String>> From<T> for BranchId {
@@ -144,7 +231,18 @@ impl<T: Into<String>> From<T> for BranchId {
 }
 
 /// Bridging type for step identity. Maps to `crate::ids::StepId`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct StepId(pub String);
 
 impl<T: Into<String>> From<T> for StepId {
@@ -152,9 +250,25 @@ impl<T: Into<String>> From<T> for StepId {
         Self(s.into())
     }
 }
+impl StepId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Composite key for run-scoped step state projected into MobMachine.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct RunStepKey(pub String);
 
 impl<T: Into<String>> From<T> for RunStepKey {
@@ -168,7 +282,18 @@ impl<T: Into<String>> From<T> for RunStepKey {
 /// attached to for the current runtime generation. The DSL only needs the
 /// stringified form for Ord/Hash/Clone/Default; the realtime WS observer
 /// materializes it back into the typed core id.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct SessionId(pub String);
 
 impl<T: Into<String>> From<T> for SessionId {
