@@ -1,0 +1,5 @@
+error[E0425]: cannot find function `evaluate_helper` in module `meerkat`
+ --> tests/compile_fail/helper_string_dispatch_absent.rs:5:22
+  |
+5 |     let _ = meerkat::evaluate_helper(
+  |                      ^^^^^^^^^^^^^^^ not found in `meerkat`

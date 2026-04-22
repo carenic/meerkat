@@ -12,7 +12,17 @@ documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+test-oracle = []
+
+[package.metadata.cargo-machete]
+ignored = ["indexmap"]
+
 [dependencies]
+indexmap.workspace = true
+meerkat-core.workspace = true
+meerkat-machine-dsl.workspace = true
 meerkat-machine-schema.workspace = true
 serde.workspace = true
 thiserror.workspace = true

@@ -2520,17 +2520,8 @@ fn count_loop_iterations(run: &MobRun, loop_id: &str) -> usize {
     let loop_instance_ids: BTreeSet<_> = run
         .loops
         .iter()
-        .filter_map(|(instance_id, snapshot)| {
-            match snapshot
-                .kernel_state
-                .fields
-                .get("loop_id")
-                .and_then(|value| value.as_string().ok())
-            {
-                Some(candidate) if candidate == loop_id => Some(instance_id.clone()),
-                _ => None,
-            }
-        })
+        .filter(|(_, snapshot)| snapshot.kernel_state.loop_id == loop_id)
+        .map(|(instance_id, _)| instance_id.clone())
         .collect();
     assert!(
         !loop_instance_ids.is_empty(),
@@ -2546,8 +2537,7 @@ fn completed_count(run: &MobRun, step_id: &str) -> usize {
     run.step_ledger
         .iter()
         .filter(|entry| {
-            entry.step_id == StepId::from(step_id)
-                && entry.status == meerkat_mob::StepRunStatus::Completed
+            entry.step_id == step_id && entry.status == meerkat_mob::StepRunStatus::Completed
         })
         .count()
 }
@@ -2556,8 +2546,7 @@ fn skipped_count(run: &MobRun, step_id: &str) -> usize {
     run.step_ledger
         .iter()
         .filter(|entry| {
-            entry.step_id == StepId::from(step_id)
-                && entry.status == meerkat_mob::StepRunStatus::Skipped
+            entry.step_id == step_id && entry.status == meerkat_mob::StepRunStatus::Skipped
         })
         .count()
 }

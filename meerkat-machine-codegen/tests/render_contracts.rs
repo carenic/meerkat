@@ -2,8 +2,8 @@
 
 use meerkat_machine_codegen::{
     GENERATED_COVERAGE_END, GENERATED_COVERAGE_START, merge_mapping_document,
-    render_composition_mapping_coverage, render_composition_module,
-    render_machine_mapping_coverage, render_machine_module,
+    render_composition_mapping_coverage, render_composition_module, render_generated_kernel_mod,
+    render_machine_kernel_module, render_machine_mapping_coverage, render_machine_module,
 };
 use meerkat_machine_schema::catalog::dsl::{
     dsl_meerkat_machine as meerkat_machine, dsl_mob_machine as mob_machine,
@@ -12,6 +12,7 @@ use meerkat_machine_schema::catalog::{
     canonical_composition_coverage_manifests, canonical_machine_coverage_manifests,
     meerkat_mob_seam_composition,
 };
+use meerkat_machine_schema::{canonical_machine_schemas, flow_run_machine};
 
 #[test]
 fn renders_canonical_meerkat_machine_fixture_with_stable_sections() {
@@ -150,4 +151,130 @@ fn merges_mapping_document_by_appending_and_replacing_generated_block() {
     assert!(!replaced.contains("old block"));
     assert!(replaced.contains("Manual text."));
     assert!(replaced.contains("- `PrepareBindingsInitializing`"));
+}
+
+#[test]
+fn typed_kernel_module_contract_rejects_legacy_kernel_surface() {
+    let rendered = render_machine_kernel_module(&meerkat_machine());
+
+    for forbidden in [
+        "KernelState",
+        "KernelInput",
+        "KernelSignal",
+        "KernelEffect",
+        "KernelValue",
+        "TransitionOutcome",
+        "evaluate_helper(",
+        "GeneratedMachineKernel::new",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "typed kernel module contract should not mention `{forbidden}`:\n{rendered}"
+        );
+    }
+
+    for required in [
+        "pub struct State",
+        "pub enum Phase",
+        "pub enum Input",
+        "pub enum InputKind",
+        "pub enum Signal",
+        "pub enum SignalKind",
+        "pub enum Effect",
+        "pub enum EffectKind",
+        "pub enum TransitionId",
+        "pub enum GuardId",
+        "pub enum HelperId",
+        "pub struct Outcome",
+        "pub enum TransitionError",
+        "pub enum TransitionRefusal",
+        "pub enum KernelError",
+        "pub trait Context",
+        "pub struct EmptyContext",
+        "pub fn initial_state() -> State",
+        "pub fn transition<C: Context>(",
+        "pub fn transition_signal<C: Context>(",
+        "pub mod helpers",
+    ] {
+        assert!(
+            rendered.contains(required),
+            "typed kernel module contract should contain `{required}`:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn typed_compat_kernel_module_contract_rejects_legacy_kernel_surface() {
+    let rendered = render_machine_kernel_module(&flow_run_machine());
+
+    for forbidden in [
+        "KernelState",
+        "KernelInput",
+        "KernelSignal",
+        "KernelEffect",
+        "KernelValue",
+        "TransitionOutcome",
+        "evaluate_helper(",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "typed compat kernel module contract should not mention `{forbidden}`:\n{rendered}"
+        );
+    }
+
+    for required in [
+        "pub struct State",
+        "pub enum Phase",
+        "pub enum Input",
+        "pub enum InputKind",
+        "pub enum Effect",
+        "pub enum EffectKind",
+        "pub enum TransitionId",
+        "pub enum GuardId",
+        "pub enum HelperId",
+        "pub struct Outcome",
+        "pub enum TransitionError",
+        "pub enum TransitionRefusal",
+        "pub enum KernelError",
+        "pub trait Context",
+        "pub struct EmptyContext",
+        "pub fn transition<C: Context>(",
+        "pub mod helpers",
+    ] {
+        assert!(
+            rendered.contains(required),
+            "typed compat kernel module contract should contain `{required}`:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn generated_kernel_inventory_contract_lists_all_typed_machine_modules() {
+    let schemas = canonical_machine_schemas();
+    let rendered = render_generated_kernel_mod(&schemas);
+
+    for slug in [
+        "meerkat",
+        "mob",
+        "schedule_lifecycle",
+        "occurrence_lifecycle",
+        "auth",
+    ] {
+        assert!(
+            rendered.contains(&format!("pub mod {slug};")),
+            "expected generated inventory to include `{slug}`:\n{rendered}"
+        );
+    }
+
+    for hidden_slug in ["flow_run", "flow_frame", "loop_iteration"] {
+        assert!(
+            !rendered.contains(&format!("pub mod {hidden_slug};")),
+            "canonical generated kernel inventory should not export hidden compat module `{hidden_slug}`:\n{rendered}"
+        );
+    }
+
+    assert!(
+        !rendered.contains("GeneratedMachineKernel"),
+        "typed generated inventory should not expose the legacy GeneratedMachineKernel wrapper:\n{rendered}"
+    );
 }

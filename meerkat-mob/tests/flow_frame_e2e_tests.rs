@@ -7,7 +7,6 @@
 
 use async_trait::async_trait;
 use indexmap::IndexMap;
-use meerkat_machine_kernels::KernelState;
 use meerkat_mob::definition::{
     ConditionExpr, DependencyMode, FlowNodeSpec, FrameSpec, FrameStepSpec, RepeatUntilSpec,
 };
@@ -20,7 +19,6 @@ use meerkat_mob::runtime::flow_frame_engine::{
 };
 use meerkat_mob::store::MobRunStore as _;
 use meerkat_mob::{FlowFrameMutator, FlowId, InMemoryMobRunStore, MobId};
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 // ─── Scripted executor ───────────────────────────────────────────────────────
@@ -121,7 +119,7 @@ impl FrameStepExecutor for AnyOrderScriptedStepExecutor {
         let mut remaining = self.remaining.lock().unwrap();
         let Some(index) = remaining
             .iter()
-            .position(|script| script.node_id == node_id.to_string())
+            .position(|script| *node_id == script.node_id)
         else {
             panic!(
                 "no any-order script for node_id={node_id}; remaining={:?}",
@@ -202,7 +200,7 @@ fn build_run() -> (RunId, MobRun) {
     let run = MobRun::pending(
         MobId::from("test-mob"),
         FlowId::from("test-flow"),
-        KernelState::default(),
+        meerkat_mob::generated::flow_run::initial_state(),
         serde_json::json!({}),
     );
     let run_id = run.run_id.clone();
@@ -215,7 +213,7 @@ async fn setup_engine(
     let (run_id, run) = build_run();
     let store = Arc::new(InMemoryMobRunStore::new());
     store.create_run(run).await.expect("create_run");
-    let engine = FlowFrameEngine::new(store.clone(), executor, 0, 0);
+    let engine = FlowFrameEngine::new(store.clone(), executor, None, 0, 0);
     (run_id, store, engine)
 }
 
@@ -969,7 +967,8 @@ async fn test_empty_frame_terminalize() {
         .expect("run present");
     let frame_snap = run.frames.get(&frame_id).expect("frame persisted");
     assert_eq!(
-        frame_snap.kernel_state.phase, "Completed",
+        frame_snap.kernel_state.phase,
+        meerkat_mob::generated::flow_frame::Phase::Completed,
         "empty frame must terminalize to Completed in the store"
     );
 }
@@ -1026,13 +1025,15 @@ async fn test_empty_loop_body_frame_does_not_stall() {
         .expect("run present");
     let root_frame = run.frames.get(&frame_id).expect("root frame");
     assert_eq!(
-        root_frame.kernel_state.phase, "Completed",
+        root_frame.kernel_state.phase,
+        meerkat_mob::generated::flow_frame::Phase::Completed,
         "root frame should complete after empty loop body processing"
     );
     let loop_instance_id = meerkat_mob::ids::LoopInstanceId::from("empty-loop-root::loop-node");
     let loop_snapshot = run.loops.get(&loop_instance_id).expect("loop snapshot");
     assert_eq!(
-        loop_snapshot.kernel_state.phase, "Completed",
+        loop_snapshot.kernel_state.phase,
+        meerkat_mob::generated::loop_iteration::Phase::Completed,
         "empty loop body should still advance the loop lifecycle to Completed"
     );
 }
@@ -1045,7 +1046,7 @@ async fn test_resume_projects_terminal_loop_snapshot_to_parent() {
     let (run_id, run) = build_run();
     let store = Arc::new(InMemoryMobRunStore::new());
     store.create_run(run).await.expect("create_run");
-    let engine = FlowFrameEngine::new(store.clone(), executor, 0, 0);
+    let engine = FlowFrameEngine::new(store.clone(), executor, None, 0, 0);
     let kernel = FlowFrameKernel::new(store.clone());
 
     let frame_id = FrameId::from("resume-root");
@@ -1083,9 +1084,10 @@ async fn test_resume_projects_terminal_loop_snapshot_to_parent() {
         .expect("admit loop node")
         .expect("loop node effects");
     assert!(
-        effects
-            .iter()
-            .any(|effect| effect.variant == "StartLoopNode"),
+        effects.iter().any(|effect| matches!(
+            effect,
+            meerkat_mob::generated::flow_frame::Effect::StartLoopNode(_)
+        )),
         "admitting the loop node should emit StartLoopNode"
     );
 
@@ -1095,52 +1097,19 @@ async fn test_resume_projects_terminal_loop_snapshot_to_parent() {
             &run_id,
             &loop_instance_id,
             LoopSnapshot {
-                kernel_state: KernelState {
-                    phase: "Completed".into(),
-                    fields: BTreeMap::from([
-                        (
-                            "loop_instance_id".into(),
-                            meerkat_machine_kernels::KernelValue::String(
-                                loop_instance_id.to_string(),
-                            ),
-                        ),
-                        (
-                            "current_iteration".into(),
-                            meerkat_machine_kernels::KernelValue::U64(1),
-                        ),
-                        (
-                            "max_iterations".into(),
-                            meerkat_machine_kernels::KernelValue::U64(1),
-                        ),
-                        (
-                            "parent_frame_id".into(),
-                            meerkat_machine_kernels::KernelValue::String(frame_id.to_string()),
-                        ),
-                        (
-                            "parent_node_id".into(),
-                            meerkat_machine_kernels::KernelValue::String(loop_node_id.to_string()),
-                        ),
-                        (
-                            "loop_id".into(),
-                            meerkat_machine_kernels::KernelValue::String(loop_id.to_string()),
-                        ),
-                        ("depth".into(), meerkat_machine_kernels::KernelValue::U64(1)),
-                        (
-                            "stage".into(),
-                            meerkat_machine_kernels::KernelValue::NamedVariant {
-                                enum_name: "LoopIterationStage".into(),
-                                variant: "AwaitingUntil".into(),
-                            },
-                        ),
-                        (
-                            "last_completed_iteration".into(),
-                            meerkat_machine_kernels::KernelValue::U64(0),
-                        ),
-                        (
-                            "active_body_frame_id".into(),
-                            meerkat_machine_kernels::KernelValue::None,
-                        ),
-                    ]),
+                kernel_state: meerkat_mob::generated::loop_iteration::State {
+                    phase: meerkat_mob::generated::loop_iteration::Phase::Completed,
+                    loop_instance_id: loop_instance_id.clone(),
+                    parent_frame_id: frame_id.clone(),
+                    parent_node_id: loop_node_id.clone(),
+                    loop_id: loop_id.clone(),
+                    depth: 1,
+                    stage:
+                        meerkat_mob::generated::loop_iteration::LoopIterationStage::AwaitingUntil,
+                    current_iteration: 1,
+                    last_completed_iteration: 0,
+                    max_iterations: 1,
+                    active_body_frame_id: None,
                 },
             },
             None,
@@ -1166,24 +1135,18 @@ async fn test_resume_projects_terminal_loop_snapshot_to_parent() {
         .expect("run present");
     let root_frame = run.frames.get(&frame_id).expect("root frame");
     assert_eq!(
-        root_frame.kernel_state.phase, "Completed",
+        root_frame.kernel_state.phase,
+        meerkat_mob::generated::flow_frame::Phase::Completed,
         "parent frame should complete after projecting terminal loop snapshot"
     );
-    let node_status = match root_frame.kernel_state.fields.get("node_status") {
-        Some(meerkat_machine_kernels::KernelValue::Map(map)) => map,
-        other => panic!("unexpected node_status map: {other:?}"),
-    };
-    match node_status.get(&meerkat_machine_kernels::KernelValue::String(
-        loop_node_id.to_string(),
-    )) {
-        Some(meerkat_machine_kernels::KernelValue::NamedVariant { variant, .. }) => {
-            assert_eq!(
-                variant, "Completed",
-                "loop node should be completed on resume"
-            );
-        }
-        other => panic!("unexpected loop node status: {other:?}"),
-    }
+    assert_eq!(
+        root_frame
+            .kernel_state
+            .node_status
+            .get(loop_node_id.as_str()),
+        Some(&meerkat_mob::generated::flow_frame::NodeRunStatus::Completed),
+        "loop node should be completed on resume"
+    );
 }
 
 /// Resume must continue a terminal body frame that was already persisted as the active body frame.
@@ -1193,7 +1156,7 @@ async fn test_resume_advances_terminal_body_frame_without_stall() {
     let (run_id, run) = build_run();
     let store = Arc::new(InMemoryMobRunStore::new());
     store.create_run(run).await.expect("create_run");
-    let engine = FlowFrameEngine::new(store.clone(), executor, 0, 0);
+    let engine = FlowFrameEngine::new(store.clone(), executor, None, 0, 0);
     let kernel = FlowFrameKernel::new(store.clone());
 
     let frame_id = FrameId::from("resume-body-root");
@@ -1252,21 +1215,9 @@ async fn test_resume_advances_terminal_body_frame_without_stall() {
         .cloned()
         .expect("body frame snapshot");
     let mut body_frame = rootish_body_frame.clone();
-    body_frame.kernel_state.fields.insert(
-        "frame_scope".into(),
-        meerkat_machine_kernels::KernelValue::NamedVariant {
-            enum_name: "FrameScope".into(),
-            variant: "Body".into(),
-        },
-    );
-    body_frame.kernel_state.fields.insert(
-        "loop_instance_id".into(),
-        meerkat_machine_kernels::KernelValue::String(loop_instance_id.to_string()),
-    );
-    body_frame.kernel_state.fields.insert(
-        "iteration".into(),
-        meerkat_machine_kernels::KernelValue::U64(0),
-    );
+    body_frame.kernel_state.frame_scope = meerkat_mob::generated::flow_frame::FrameScope::Body;
+    body_frame.kernel_state.loop_instance_id = loop_instance_id.clone();
+    body_frame.kernel_state.iteration = 0;
     assert!(
         store
             .cas_frame_state(
@@ -1284,52 +1235,19 @@ async fn test_resume_advances_terminal_body_frame_without_stall() {
             &run_id,
             &loop_instance_id,
             LoopSnapshot {
-                kernel_state: KernelState {
-                    phase: "Running".into(),
-                    fields: BTreeMap::from([
-                        (
-                            "loop_instance_id".into(),
-                            meerkat_machine_kernels::KernelValue::String(
-                                loop_instance_id.to_string(),
-                            ),
-                        ),
-                        (
-                            "current_iteration".into(),
-                            meerkat_machine_kernels::KernelValue::U64(0),
-                        ),
-                        (
-                            "max_iterations".into(),
-                            meerkat_machine_kernels::KernelValue::U64(1),
-                        ),
-                        (
-                            "parent_frame_id".into(),
-                            meerkat_machine_kernels::KernelValue::String(frame_id.to_string()),
-                        ),
-                        (
-                            "parent_node_id".into(),
-                            meerkat_machine_kernels::KernelValue::String(loop_node_id.to_string()),
-                        ),
-                        (
-                            "loop_id".into(),
-                            meerkat_machine_kernels::KernelValue::String(loop_id.to_string()),
-                        ),
-                        ("depth".into(), meerkat_machine_kernels::KernelValue::U64(1)),
-                        (
-                            "stage".into(),
-                            meerkat_machine_kernels::KernelValue::NamedVariant {
-                                enum_name: "LoopIterationStage".into(),
-                                variant: "BodyFrameActive".into(),
-                            },
-                        ),
-                        (
-                            "last_completed_iteration".into(),
-                            meerkat_machine_kernels::KernelValue::U64(0),
-                        ),
-                        (
-                            "active_body_frame_id".into(),
-                            meerkat_machine_kernels::KernelValue::String(body_frame_id.to_string()),
-                        ),
-                    ]),
+                kernel_state: meerkat_mob::generated::loop_iteration::State {
+                    phase: meerkat_mob::generated::loop_iteration::Phase::Running,
+                    loop_instance_id: loop_instance_id.clone(),
+                    parent_frame_id: frame_id.clone(),
+                    parent_node_id: loop_node_id.clone(),
+                    loop_id: loop_id.clone(),
+                    depth: 1,
+                    stage:
+                        meerkat_mob::generated::loop_iteration::LoopIterationStage::BodyFrameActive,
+                    current_iteration: 0,
+                    last_completed_iteration: 0,
+                    max_iterations: 1,
+                    active_body_frame_id: Some(body_frame_id.clone()),
                 },
             },
             None,
@@ -1359,7 +1277,7 @@ async fn test_resume_advances_terminal_body_frame_without_stall() {
             .expect("loop snapshot")
             .kernel_state
             .phase,
-        "Completed",
+        meerkat_mob::generated::loop_iteration::Phase::Completed,
         "completed body frame should advance the loop to Completed on resume"
     );
     assert_eq!(
@@ -1368,7 +1286,7 @@ async fn test_resume_advances_terminal_body_frame_without_stall() {
             .expect("root frame")
             .kernel_state
             .phase,
-        "Completed",
+        meerkat_mob::generated::flow_frame::Phase::Completed,
         "root frame should complete after resuming the terminal body frame"
     );
 }
@@ -1382,12 +1300,11 @@ async fn test_max_frame_depth_enforced_for_nested_loops() {
     let store = Arc::new(InMemoryMobRunStore::new());
     // Use a fresh run for this engine
     let (run_id2, run2) = {
-        use meerkat_machine_kernels::KernelState;
         use meerkat_mob::run::MobRun;
         let run = MobRun::pending(
             meerkat_mob::MobId::from("depth-test"),
             meerkat_mob::FlowId::from("depth-flow"),
-            KernelState::default(),
+            meerkat_mob::generated::flow_run::initial_state(),
             serde_json::json!({}),
         );
         let id = run.run_id.clone();
@@ -1395,7 +1312,7 @@ async fn test_max_frame_depth_enforced_for_nested_loops() {
     };
     store.create_run(run2).await.expect("create_run");
 
-    let engine = FlowFrameEngine::new(store.clone(), executor, 1, 0); // max_frame_depth=1
+    let engine = FlowFrameEngine::new(store.clone(), executor, None, 1, 0); // max_frame_depth=1
 
     // Root frame (depth=0) contains a loop; body (depth=1) also contains a loop.
     // Body-of-body (depth=2) exceeds max_frame_depth=1.
@@ -1470,10 +1387,8 @@ async fn test_max_frame_depth_enforced_for_nested_loops() {
 /// The orphaned Running node should be failed and its dependents skipped.
 #[tokio::test]
 async fn test_resumed_frame_with_running_node_fails_orphan() {
-    use meerkat_machine_kernels::{KernelState, KernelValue};
     use meerkat_mob::run::FrameSnapshot;
     use meerkat_mob::store::MobRunStore as _;
-    use std::collections::BTreeMap;
 
     // Setup engine with a scripted executor that only runs the first step.
     // The second step (node-b) will never be called because node-a will be
@@ -1511,153 +1426,68 @@ async fn test_resumed_frame_with_running_node_fails_orphan() {
     // Inject a pre-existing frame snapshot where node-a is Running (orphaned)
     // and ready_queue is empty — simulating a crash mid-step.
     let orphaned_snapshot = FrameSnapshot {
-        kernel_state: KernelState {
-            phase: "Running".into(),
-            fields: BTreeMap::from([
-                ("frame_id".into(), KernelValue::String(frame_id.to_string())),
+        kernel_state: meerkat_mob::generated::flow_frame::State {
+            phase: meerkat_mob::generated::flow_frame::Phase::Running,
+            frame_id: frame_id.clone(),
+            frame_scope: meerkat_mob::generated::flow_frame::FrameScope::Root,
+            loop_instance_id: meerkat_mob::LoopInstanceId::from(""),
+            iteration: 0,
+            last_admitted_node: meerkat_mob::FlowNodeId::from("node-a"),
+            tracked_nodes: [
+                meerkat_mob::FlowNodeId::from("node-a"),
+                meerkat_mob::FlowNodeId::from("node-b"),
+            ]
+            .into_iter()
+            .collect(),
+            ordered_nodes: vec![
+                meerkat_mob::FlowNodeId::from("node-a"),
+                meerkat_mob::FlowNodeId::from("node-b"),
+            ],
+            node_kind: std::collections::BTreeMap::from([
                 (
-                    "last_admitted_node".into(),
-                    KernelValue::String("node-a".into()),
-                ),
-                ("ready_queue".into(), KernelValue::Seq(vec![])), // empty — was popped
-                (
-                    "tracked_nodes".into(),
-                    KernelValue::Set(
-                        [
-                            KernelValue::String("node-a".into()),
-                            KernelValue::String("node-b".into()),
-                        ]
-                        .into_iter()
-                        .collect(),
-                    ),
-                ),
-                (
-                    "ordered_nodes".into(),
-                    KernelValue::Seq(vec![
-                        KernelValue::String("node-a".into()),
-                        KernelValue::String("node-b".into()),
-                    ]),
+                    meerkat_mob::FlowNodeId::from("node-a"),
+                    meerkat_mob::generated::flow_frame::FlowNodeKind::Step,
                 ),
                 (
-                    "node_kind".into(),
-                    KernelValue::Map(
-                        [
-                            (
-                                KernelValue::String("node-a".into()),
-                                KernelValue::NamedVariant {
-                                    enum_name: "FlowNodeKind".into(),
-                                    variant: "Step".into(),
-                                },
-                            ),
-                            (
-                                KernelValue::String("node-b".into()),
-                                KernelValue::NamedVariant {
-                                    enum_name: "FlowNodeKind".into(),
-                                    variant: "Step".into(),
-                                },
-                            ),
-                        ]
-                        .into_iter()
-                        .collect(),
-                    ),
-                ),
-                (
-                    "node_status".into(),
-                    KernelValue::Map(
-                        [
-                            (
-                                KernelValue::String("node-a".into()),
-                                // ORPHANED: was Running when the process crashed
-                                KernelValue::NamedVariant {
-                                    enum_name: "NodeRunStatus".into(),
-                                    variant: "Running".into(),
-                                },
-                            ),
-                            (
-                                KernelValue::String("node-b".into()),
-                                KernelValue::NamedVariant {
-                                    enum_name: "NodeRunStatus".into(),
-                                    variant: "Pending".into(),
-                                },
-                            ),
-                        ]
-                        .into_iter()
-                        .collect(),
-                    ),
-                ),
-                (
-                    "node_dependencies".into(),
-                    KernelValue::Map(
-                        [
-                            (
-                                KernelValue::String("node-a".into()),
-                                KernelValue::Seq(vec![]),
-                            ),
-                            (
-                                KernelValue::String("node-b".into()),
-                                KernelValue::Seq(vec![KernelValue::String("node-a".into())]),
-                            ),
-                        ]
-                        .into_iter()
-                        .collect(),
-                    ),
-                ),
-                (
-                    "node_dependency_modes".into(),
-                    KernelValue::Map(
-                        [
-                            (
-                                KernelValue::String("node-a".into()),
-                                KernelValue::NamedVariant {
-                                    enum_name: "DependencyMode".into(),
-                                    variant: "All".into(),
-                                },
-                            ),
-                            (
-                                KernelValue::String("node-b".into()),
-                                KernelValue::NamedVariant {
-                                    enum_name: "DependencyMode".into(),
-                                    variant: "All".into(),
-                                },
-                            ),
-                        ]
-                        .into_iter()
-                        .collect(),
-                    ),
-                ),
-                (
-                    "node_branches".into(),
-                    KernelValue::Map(
-                        [
-                            (KernelValue::String("node-a".into()), KernelValue::None),
-                            (KernelValue::String("node-b".into()), KernelValue::None),
-                        ]
-                        .into_iter()
-                        .collect(),
-                    ),
-                ),
-                (
-                    "frame_scope".into(),
-                    KernelValue::NamedVariant {
-                        enum_name: "FrameScope".into(),
-                        variant: "Root".into(),
-                    },
-                ),
-                (
-                    "loop_instance_id".into(),
-                    KernelValue::String(String::new()),
-                ),
-                ("iteration".into(), KernelValue::U64(0)),
-                ("output_recorded".into(), KernelValue::Map(BTreeMap::new())),
-                (
-                    "node_condition_results".into(),
-                    KernelValue::Map(BTreeMap::new()),
-                ),
-                (
-                    "branch_winners".into(),
-                    KernelValue::Set(Default::default()),
+                    meerkat_mob::FlowNodeId::from("node-b"),
+                    meerkat_mob::generated::flow_frame::FlowNodeKind::Step,
                 ),
             ]),
+            node_dependencies: std::collections::BTreeMap::from([
+                (meerkat_mob::FlowNodeId::from("node-a"), vec![]),
+                (
+                    meerkat_mob::FlowNodeId::from("node-b"),
+                    vec![meerkat_mob::FlowNodeId::from("node-a")],
+                ),
+            ]),
+            node_dependency_modes: std::collections::BTreeMap::from([
+                (
+                    meerkat_mob::FlowNodeId::from("node-a"),
+                    meerkat_mob::generated::flow_frame::DependencyMode::All,
+                ),
+                (
+                    meerkat_mob::FlowNodeId::from("node-b"),
+                    meerkat_mob::generated::flow_frame::DependencyMode::All,
+                ),
+            ]),
+            node_branches: std::collections::BTreeMap::from([
+                (meerkat_mob::FlowNodeId::from("node-a"), None),
+                (meerkat_mob::FlowNodeId::from("node-b"), None),
+            ]),
+            branch_winners: Default::default(),
+            node_status: std::collections::BTreeMap::from([
+                (
+                    meerkat_mob::FlowNodeId::from("node-a"),
+                    meerkat_mob::generated::flow_frame::NodeRunStatus::Running,
+                ),
+                (
+                    meerkat_mob::FlowNodeId::from("node-b"),
+                    meerkat_mob::generated::flow_frame::NodeRunStatus::Pending,
+                ),
+            ]),
+            ready_queue: vec![],
+            output_recorded: Default::default(),
+            node_condition_results: Default::default(),
         },
     };
 
@@ -1693,7 +1523,8 @@ async fn test_resumed_frame_with_running_node_fails_orphan() {
     let run = store.get_run(&run_id).await.expect("get_run").expect("run");
     let snap = run.frames.get(&frame_id).expect("frame persisted");
     assert_eq!(
-        snap.kernel_state.phase, "Failed",
+        snap.kernel_state.phase,
+        meerkat_mob::generated::flow_frame::Phase::Failed,
         "frame must be Failed after handling orphaned Running node"
     );
 }
@@ -1767,7 +1598,8 @@ async fn test_completed_loop_persisted_as_completed_not_running() {
         .get(&loop_instance_id)
         .expect("loop snapshot must be persisted");
     assert_eq!(
-        loop_snap.kernel_state.phase, "Completed",
+        loop_snap.kernel_state.phase,
+        meerkat_mob::generated::loop_iteration::Phase::Completed,
         "loop must be persisted as Completed after condition is met"
     );
 
@@ -1775,10 +1607,7 @@ async fn test_completed_loop_persisted_as_completed_not_running() {
     use meerkat_mob::runtime::recovery::reconcile_run_state;
     let mut run_copy = run.clone();
     reconcile_run_state(&mut run_copy).expect("reconcile");
-    let pending_loops = match run_copy.flow_state.fields.get("pending_body_frame_loops") {
-        Some(meerkat_machine_kernels::KernelValue::Seq(s)) => s.len(),
-        _ => 0,
-    };
+    let pending_loops = run_copy.flow_state.pending_body_frame_loops.len();
     assert_eq!(
         pending_loops, 0,
         "completed loop must not appear in pending_body_frame_loops after reconcile"
@@ -1832,7 +1661,7 @@ async fn test_frame_outputs_seeded_from_persisted_state_on_resume() {
 
     // Simulate a resume by creating a new engine (empty executor — no new steps run).
     let resume_executor = Arc::new(ScriptedStepExecutor::new(vec![]));
-    let resume_engine = FlowFrameEngine::new(store.clone(), resume_executor, 0, 0);
+    let resume_engine = FlowFrameEngine::new(store.clone(), resume_executor, None, 0, 0);
 
     // Re-execute the frame (frame is already Completed in the store — it terminalized).
     // The resumed execute_frame should see the Completed phase and return the

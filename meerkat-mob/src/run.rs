@@ -1,28 +1,30 @@
 //! Flow run data model.
 
-use crate::definition::{DependencyMode, FlowSpec, LimitsSpec, SupervisorSpec, TopologySpec};
-use crate::error::MobError;
-use crate::ids::{
-    AgentIdentity, BranchId, FlowId, FrameId, LoopId, LoopInstanceId, MobId, ProfileName, RunId,
-    StepId,
+use crate::definition::{
+    DependencyMode, FlowNodeSpec, FlowSpec, FrameSpec, LimitsSpec, SupervisorSpec, TopologySpec,
 };
+use crate::error::MobError;
+use crate::generated::{flow_frame, flow_run, loop_iteration};
+use crate::ids::{
+    AgentIdentity, BranchId, FlowId, FlowNodeId, FrameId, LoopId, LoopInstanceId, MobId,
+    ProfileName, RunId, StepId,
+};
+use crate::machines::mob_machine as mob_dsl;
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
-use meerkat_machine_kernels::generated::flow_run;
-use meerkat_machine_kernels::{KernelInput, KernelState, KernelValue};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 
 /// Snapshot of a FlowFrameMachine kernel state stored per-frame in MobRun.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FrameSnapshot {
-    pub kernel_state: KernelState,
+    pub kernel_state: flow_frame::State,
 }
 
 /// Snapshot of a LoopIterationMachine kernel state stored per-loop in MobRun.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoopSnapshot {
-    pub kernel_state: KernelState,
+    pub kernel_state: loop_iteration::State,
 }
 
 /// Ledger entry recording the mapping of a loop iteration to its body frame.
@@ -48,7 +50,7 @@ pub struct MobRun {
     pub mob_id: MobId,
     pub flow_id: FlowId,
     pub status: MobRunStatus,
-    pub flow_state: KernelState,
+    pub flow_state: flow_run::State,
     pub activation_params: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
@@ -84,344 +86,110 @@ impl MobRun {
     }
 
     /// Read-only access to the run's current flow state.
-    pub fn flow_state(&self) -> &KernelState {
+    pub fn flow_state(&self) -> &flow_run::State {
         &self.flow_state
     }
 
     /// Typed view of the kernel-owned ordered step sequence.
     pub fn ordered_steps(&self) -> Result<Vec<StepId>, MobError> {
-        let seq = match self.flow_state.fields.get("ordered_steps") {
-            Some(KernelValue::Seq(seq)) => seq,
-            other => {
-                return Err(MobError::Internal(format!(
-                    "flow_run ordered_steps missing or invalid for {}: {other:?}",
-                    self.run_id
-                )));
-            }
-        };
-        seq.iter()
-            .map(|value| match value {
-                KernelValue::String(step_id) => Ok(StepId::from(step_id.clone())),
-                other => Err(MobError::Internal(format!(
-                    "flow_run ordered_steps entry invalid for {}: {other:?}",
-                    self.run_id
-                ))),
-            })
-            .collect()
+        Ok(self.flow_state.ordered_steps.clone())
     }
 
     /// Typed view of the kernel-owned dependency map keyed by step id.
     pub fn step_dependencies(&self) -> Result<BTreeMap<StepId, Vec<StepId>>, MobError> {
-        let map = match self.flow_state.fields.get("step_dependencies") {
-            Some(KernelValue::Map(map)) => map,
-            other => {
-                return Err(MobError::Internal(format!(
-                    "flow_run step_dependencies missing or invalid for {}: {other:?}",
-                    self.run_id
-                )));
-            }
-        };
-
-        let mut dependencies = BTreeMap::new();
-        for (step_key, value) in map {
-            let step_id = match step_key {
-                KernelValue::String(step_id) => StepId::from(step_id.clone()),
-                other => {
-                    return Err(MobError::Internal(format!(
-                        "flow_run step_dependencies key invalid for {}: {other:?}",
-                        self.run_id
-                    )));
-                }
-            };
-            let seq = match value {
-                KernelValue::Seq(seq) => seq,
-                other => {
-                    return Err(MobError::Internal(format!(
-                        "flow_run step_dependencies entry invalid for {} step '{}': {other:?}",
-                        self.run_id, step_id
-                    )));
-                }
-            };
-            let deps = seq
-                .iter()
-                .map(|value| match value {
-                    KernelValue::String(step_id) => Ok(StepId::from(step_id.clone())),
-                    other => Err(MobError::Internal(format!(
-                        "flow_run step_dependencies dependency invalid for {} step '{}': {other:?}",
-                        self.run_id, step_id
-                    ))),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            dependencies.insert(step_id, deps);
-        }
-
-        Ok(dependencies)
+        Ok(self
+            .flow_state
+            .step_dependencies
+            .iter()
+            .map(|(step_id, deps)| (step_id.clone(), deps.clone()))
+            .collect())
     }
 
     /// Typed view of the kernel-owned dependency mode map keyed by step id.
     pub fn step_dependency_modes(&self) -> Result<BTreeMap<StepId, DependencyMode>, MobError> {
-        let map = match self.flow_state.fields.get("step_dependency_modes") {
-            Some(KernelValue::Map(map)) => map,
-            other => {
-                return Err(MobError::Internal(format!(
-                    "flow_run step_dependency_modes missing or invalid for {}: {other:?}",
-                    self.run_id
-                )));
-            }
-        };
-
-        let mut modes = BTreeMap::new();
-        for (step_key, value) in map {
-            let step_id = match step_key {
-                KernelValue::String(step_id) => StepId::from(step_id.clone()),
-                other => {
-                    return Err(MobError::Internal(format!(
-                        "flow_run step_dependency_modes key invalid for {}: {other:?}",
-                        self.run_id
-                    )));
-                }
-            };
-
-            let mode = match value {
-                KernelValue::NamedVariant { enum_name, variant }
-                    if enum_name == "DependencyMode" =>
-                {
-                    match variant.as_str() {
-                        "All" => DependencyMode::All,
-                        "Any" => DependencyMode::Any,
-                        _ => {
-                            return Err(MobError::Internal(format!(
-                                "flow_run step_dependency_modes unknown DependencyMode variant `{variant}` for {} step '{}'",
-                                self.run_id, step_id
-                            )));
-                        }
+        self.flow_state
+            .step_dependency_modes
+            .iter()
+            .map(|(step_id, mode)| {
+                let mode = match mode.as_str() {
+                    "All" => DependencyMode::All,
+                    "Any" => DependencyMode::Any,
+                    _ => {
+                        return Err(MobError::Internal(format!(
+                            "flow_run step_dependency_modes unknown DependencyMode variant `{:?}` for {} step '{}'",
+                            mode, self.run_id, step_id
+                        )));
                     }
-                }
-                other => {
-                    return Err(MobError::Internal(format!(
-                        "flow_run step_dependency_modes entry invalid for {} step '{}': {other:?}",
-                        self.run_id, step_id
-                    )));
-                }
-            };
-
-            modes.insert(step_id, mode);
-        }
-
-        Ok(modes)
+                };
+                Ok((step_id.clone(), mode))
+            })
+            .collect()
     }
 
     /// Typed view of the kernel-owned condition-presence map keyed by step id.
     pub fn step_has_conditions(&self) -> Result<BTreeMap<StepId, bool>, MobError> {
-        let map = match self.flow_state.fields.get("step_has_conditions") {
-            Some(KernelValue::Map(map)) => map,
-            other => {
-                return Err(MobError::Internal(format!(
-                    "flow_run step_has_conditions missing or invalid for {}: {other:?}",
-                    self.run_id
-                )));
-            }
-        };
-
-        let mut condition_flags = BTreeMap::new();
-        for (step_key, value) in map {
-            let step_id = match step_key {
-                KernelValue::String(step_id) => StepId::from(step_id.clone()),
-                other => {
-                    return Err(MobError::Internal(format!(
-                        "flow_run step_has_conditions key invalid for {}: {other:?}",
-                        self.run_id
-                    )));
-                }
-            };
-
-            let has_condition = match value {
-                KernelValue::Bool(flag) => *flag,
-                other => {
-                    return Err(MobError::Internal(format!(
-                        "flow_run step_has_conditions entry invalid for {} step '{}': {other:?}",
-                        self.run_id, step_id
-                    )));
-                }
-            };
-
-            condition_flags.insert(step_id, has_condition);
-        }
-
-        Ok(condition_flags)
+        Ok(self
+            .flow_state
+            .step_has_conditions
+            .iter()
+            .map(|(step_id, flag)| (step_id.clone(), *flag))
+            .collect())
     }
 
     /// Typed view of the kernel-owned branch label map keyed by step id.
     pub fn step_branches(&self) -> Result<BTreeMap<StepId, Option<BranchId>>, MobError> {
-        let map = match self.flow_state.fields.get("step_branches") {
-            Some(KernelValue::Map(map)) => map,
-            other => {
-                return Err(MobError::Internal(format!(
-                    "flow_run step_branches missing or invalid for {}: {other:?}",
-                    self.run_id
-                )));
-            }
-        };
-
-        let mut branches = BTreeMap::new();
-        for (step_key, value) in map {
-            let step_id = match step_key {
-                KernelValue::String(step_id) => StepId::from(step_id.clone()),
-                other => {
-                    return Err(MobError::Internal(format!(
-                        "flow_run step_branches key invalid for {}: {other:?}",
-                        self.run_id
-                    )));
-                }
-            };
-
-            let branch = match value {
-                KernelValue::None => None,
-                KernelValue::String(branch_id) => Some(BranchId::from(branch_id.clone())),
-                other => {
-                    return Err(MobError::Internal(format!(
-                        "flow_run step_branches entry invalid for {} step '{}': {other:?}",
-                        self.run_id, step_id
-                    )));
-                }
-            };
-
-            branches.insert(step_id, branch);
-        }
-
-        Ok(branches)
+        Ok(self
+            .flow_state
+            .step_branches
+            .iter()
+            .map(|(step_id, branch)| (step_id.clone(), branch.clone()))
+            .collect())
     }
 
     /// Typed view of the kernel-owned collection policy kind map keyed by step id.
     pub fn step_collection_policy_kinds(
         &self,
     ) -> Result<BTreeMap<StepId, RunCollectionPolicyKind>, MobError> {
-        let map = match self.flow_state.fields.get("step_collection_policies") {
-            Some(KernelValue::Map(map)) => map,
-            other => {
-                return Err(MobError::Internal(format!(
-                    "flow_run step_collection_policies missing or invalid for {}: {other:?}",
-                    self.run_id
-                )));
-            }
-        };
-
-        let mut policies = BTreeMap::new();
-        for (step_key, value) in map {
-            let step_id = match step_key {
-                KernelValue::String(step_id) => StepId::from(step_id.clone()),
-                other => {
-                    return Err(MobError::Internal(format!(
-                        "flow_run step_collection_policies key invalid for {}: {other:?}",
-                        self.run_id
-                    )));
-                }
-            };
-
-            let policy = match value {
-                KernelValue::NamedVariant { enum_name, variant }
-                    if enum_name == "CollectionPolicyKind" =>
-                {
-                    match variant.as_str() {
-                        "All" => RunCollectionPolicyKind::All,
-                        "Any" => RunCollectionPolicyKind::Any,
-                        "Quorum" => RunCollectionPolicyKind::Quorum,
-                        _ => {
-                            return Err(MobError::Internal(format!(
-                                "flow_run step_collection_policies unknown CollectionPolicyKind variant `{variant}` for {} step '{}'",
-                                self.run_id, step_id
-                            )));
-                        }
+        self.flow_state
+            .step_collection_policies
+            .iter()
+            .map(|(step_id, policy)| {
+                let policy = match policy.as_str() {
+                    "All" => RunCollectionPolicyKind::All,
+                    "Any" => RunCollectionPolicyKind::Any,
+                    "Quorum" => RunCollectionPolicyKind::Quorum,
+                    _ => {
+                        return Err(MobError::Internal(format!(
+                            "flow_run step_collection_policies unknown CollectionPolicyKind variant `{:?}` for {} step '{}'",
+                            policy, self.run_id, step_id
+                        )));
                     }
-                }
-                other => {
-                    return Err(MobError::Internal(format!(
-                        "flow_run step_collection_policies entry invalid for {} step '{}': {other:?}",
-                        self.run_id, step_id
-                    )));
-                }
-            };
-
-            policies.insert(step_id, policy);
-        }
-
-        Ok(policies)
+                };
+                Ok((step_id.clone(), policy))
+            })
+            .collect()
     }
 
     /// Typed view of the kernel-owned quorum-threshold map keyed by step id.
     pub fn step_quorum_thresholds(&self) -> Result<BTreeMap<StepId, u32>, MobError> {
-        let map = match self.flow_state.fields.get("step_quorum_thresholds") {
-            Some(KernelValue::Map(map)) => map,
-            other => {
-                return Err(MobError::Internal(format!(
-                    "flow_run step_quorum_thresholds missing or invalid for {}: {other:?}",
-                    self.run_id
-                )));
-            }
-        };
-
-        let mut thresholds = BTreeMap::new();
-        for (step_key, value) in map {
-            let step_id = match step_key {
-                KernelValue::String(step_id) => StepId::from(step_id.clone()),
-                other => {
-                    return Err(MobError::Internal(format!(
-                        "flow_run step_quorum_thresholds key invalid for {}: {other:?}",
-                        self.run_id
-                    )));
-                }
-            };
-
-            let threshold = match value {
-                KernelValue::U64(value) => u32::try_from(*value).map_err(|_| {
-                    MobError::Internal(format!(
-                        "flow_run step_quorum_thresholds out of range for {} step '{}'",
-                        self.run_id, step_id
-                    ))
-                })?,
-                other => {
-                    return Err(MobError::Internal(format!(
-                        "flow_run step_quorum_thresholds entry invalid for {} step '{}': {other:?}",
-                        self.run_id, step_id
-                    )));
-                }
-            };
-
-            thresholds.insert(step_id, threshold);
-        }
-
-        Ok(thresholds)
+        Ok(self
+            .flow_state
+            .step_quorum_thresholds
+            .iter()
+            .map(|(step_id, threshold)| (step_id.clone(), *threshold))
+            .collect())
     }
 
     /// Typed view of the kernel-owned step status map, excluding `None` entries.
     pub fn step_status_snapshot(&self) -> Result<BTreeMap<StepId, StepRunStatus>, MobError> {
-        let map = match self.flow_state.fields.get("step_status") {
-            Some(KernelValue::Map(map)) => map,
-            other => {
-                return Err(MobError::Internal(format!(
-                    "flow_run step_status map missing or invalid for {}: {other:?}",
-                    self.run_id
-                )));
-            }
-        };
-
         let mut statuses = BTreeMap::new();
-        for (step_key, value) in map {
-            let step_id = match step_key {
-                KernelValue::String(step_id) => StepId::from(step_id.clone()),
-                other => {
-                    return Err(MobError::Internal(format!(
-                        "flow_run step_status key invalid for {}: {other:?}",
-                        self.run_id
-                    )));
-                }
-            };
-            if matches!(value, KernelValue::None) {
+        for (step_key, value) in &self.flow_state.step_status {
+            let Some(value) = value else {
                 continue;
-            }
+            };
             statuses.insert(
-                step_id,
-                StepRunStatus::from_flow_run_kernel_value(value, &self.run_id)?,
+                step_key.clone(),
+                StepRunStatus::from_flow_run_status(value.as_str(), &self.run_id)?,
             );
         }
 
@@ -430,66 +198,22 @@ impl MobRun {
 
     /// Typed view of the kernel-owned cumulative failure counter.
     pub fn failure_count(&self) -> Result<u32, MobError> {
-        match self.flow_state.fields.get("failure_count") {
-            Some(KernelValue::U64(value)) => u32::try_from(*value).map_err(|_| {
-                MobError::Internal(format!(
-                    "flow_run failure_count out of range for {}",
-                    self.run_id
-                ))
-            }),
-            other => Err(MobError::Internal(format!(
-                "flow_run failure_count missing or invalid for {}: {other:?}",
-                self.run_id
-            ))),
-        }
+        Ok(self.flow_state.failure_count)
     }
 
     /// Typed view of the kernel-owned consecutive-failure counter.
     pub fn consecutive_failure_count(&self) -> Result<u32, MobError> {
-        match self.flow_state.fields.get("consecutive_failure_count") {
-            Some(KernelValue::U64(value)) => u32::try_from(*value).map_err(|_| {
-                MobError::Internal(format!(
-                    "flow_run consecutive_failure_count out of range for {}",
-                    self.run_id
-                ))
-            }),
-            other => Err(MobError::Internal(format!(
-                "flow_run consecutive_failure_count missing or invalid for {}: {other:?}",
-                self.run_id
-            ))),
-        }
+        Ok(self.flow_state.consecutive_failure_count)
     }
 
     /// Typed view of the kernel-owned retry budget.
     pub fn max_step_retries(&self) -> Result<u32, MobError> {
-        match self.flow_state.fields.get("max_step_retries") {
-            Some(KernelValue::U64(value)) => u32::try_from(*value).map_err(|_| {
-                MobError::Internal(format!(
-                    "flow_run max_step_retries out of range for {}",
-                    self.run_id
-                ))
-            }),
-            other => Err(MobError::Internal(format!(
-                "flow_run max_step_retries missing or invalid for {}: {other:?}",
-                self.run_id
-            ))),
-        }
+        Ok(self.flow_state.max_step_retries)
     }
 
     /// Typed view of the kernel-owned supervisor escalation threshold.
     pub fn escalation_threshold(&self) -> Result<u32, MobError> {
-        match self.flow_state.fields.get("escalation_threshold") {
-            Some(KernelValue::U64(value)) => u32::try_from(*value).map_err(|_| {
-                MobError::Internal(format!(
-                    "flow_run escalation_threshold out of range for {}",
-                    self.run_id
-                ))
-            }),
-            other => Err(MobError::Internal(format!(
-                "flow_run escalation_threshold missing or invalid for {}: {other:?}",
-                self.run_id
-            ))),
-        }
+        Ok(self.flow_state.escalation_threshold)
     }
 }
 
@@ -497,7 +221,7 @@ impl MobRun {
     pub fn pending(
         mob_id: MobId,
         flow_id: FlowId,
-        flow_state: KernelState,
+        flow_state: flow_run::State,
         activation_params: serde_json::Value,
     ) -> Self {
         Self {
@@ -514,186 +238,373 @@ impl MobRun {
             frames: BTreeMap::new(),
             loops: BTreeMap::new(),
             loop_iteration_ledger: Vec::new(),
-            schema_version: 4,
+            schema_version: 5,
             root_step_outputs: IndexMap::new(),
             loop_iteration_outputs: BTreeMap::new(),
         }
     }
 
-    pub fn flow_state_for_config(config: &FlowRunConfig) -> Result<KernelState, MobError> {
-        let initial = flow_run::initial_state().map_err(|error| {
-            MobError::Internal(format!("flow_run initial_state failed: {error}"))
-        })?;
+    pub fn flow_state_for_config(config: &FlowRunConfig) -> Result<flow_run::State, MobError> {
+        let initial = flow_run::initial_state();
         let ordered_steps = topological_steps(&config.flow_spec)?;
-        let step_ids = config
-            .flow_spec
-            .steps
-            .keys()
-            .map(|step_id| KernelValue::String(step_id.to_string()))
-            .collect();
-        let ordered_steps = ordered_steps
-            .into_iter()
-            .map(|step_id| KernelValue::String(step_id.to_string()))
-            .collect();
-        let step_dependencies = config
-            .flow_spec
-            .steps
-            .iter()
-            .map(|(step_id, step)| {
-                (
-                    KernelValue::String(step_id.to_string()),
-                    KernelValue::Seq(
-                        step.depends_on
-                            .iter()
-                            .map(|dependency| KernelValue::String(dependency.to_string()))
-                            .collect(),
-                    ),
-                )
-            })
-            .collect();
-        let step_dependency_modes = config
-            .flow_spec
-            .steps
-            .iter()
-            .map(|(step_id, step)| {
-                (
-                    KernelValue::String(step_id.to_string()),
-                    dependency_mode_value(step.depends_on_mode.clone()),
-                )
-            })
-            .collect();
-        let step_has_conditions = config
-            .flow_spec
-            .steps
-            .iter()
-            .map(|(step_id, step)| {
-                (
-                    KernelValue::String(step_id.to_string()),
-                    KernelValue::Bool(step.condition.is_some()),
-                )
-            })
-            .collect();
-        let step_branches = config
-            .flow_spec
-            .steps
-            .iter()
-            .map(|(step_id, step)| {
-                (
-                    KernelValue::String(step_id.to_string()),
-                    step.branch.as_ref().map_or(KernelValue::None, |branch| {
-                        KernelValue::String(branch.to_string())
-                    }),
-                )
-            })
-            .collect();
-        let step_collection_policies = config
-            .flow_spec
-            .steps
-            .iter()
-            .map(|(step_id, step)| {
-                (
-                    KernelValue::String(step_id.to_string()),
-                    collection_policy_kind_value(&step.collection_policy),
-                )
-            })
-            .collect();
-        let step_quorum_thresholds = config
-            .flow_spec
-            .steps
-            .iter()
-            .map(|(step_id, step)| {
-                let threshold = match step.collection_policy {
-                    crate::definition::CollectionPolicy::Quorum { n } => u64::from(n),
-                    _ => 0,
-                };
-                (
-                    KernelValue::String(step_id.to_string()),
-                    KernelValue::U64(threshold),
-                )
-            })
-            .collect();
-        let escalation_threshold = config
-            .supervisor
-            .as_ref()
-            .map_or(0, |supervisor| u64::from(supervisor.escalation_threshold));
-        let max_step_retries = config
-            .limits
-            .as_ref()
-            .and_then(|limits| limits.max_step_retries)
-            .map_or(0, u64::from);
-        let input = KernelInput {
-            variant: "CreateRun".to_string(),
-            fields: BTreeMap::from([
-                ("step_ids".to_string(), KernelValue::Seq(step_ids)),
-                ("ordered_steps".to_string(), KernelValue::Seq(ordered_steps)),
-                (
-                    "step_dependencies".to_string(),
-                    KernelValue::Map(step_dependencies),
-                ),
-                (
-                    "step_dependency_modes".to_string(),
-                    KernelValue::Map(step_dependency_modes),
-                ),
-                (
-                    "step_has_conditions".to_string(),
-                    KernelValue::Map(step_has_conditions),
-                ),
-                ("step_branches".to_string(), KernelValue::Map(step_branches)),
-                (
-                    "step_collection_policies".to_string(),
-                    KernelValue::Map(step_collection_policies),
-                ),
-                (
-                    "step_quorum_thresholds".to_string(),
-                    KernelValue::Map(step_quorum_thresholds),
-                ),
-                (
-                    "escalation_threshold".to_string(),
-                    KernelValue::U64(escalation_threshold),
-                ),
-                (
-                    "max_step_retries".to_string(),
-                    KernelValue::U64(max_step_retries),
-                ),
-                // v2 scheduler limits — read from config, default to 0 (unlimited/disabled)
-                (
-                    "max_active_nodes".to_string(),
-                    KernelValue::U64(
-                        config
-                            .limits
-                            .as_ref()
-                            .and_then(|l| l.max_active_nodes)
-                            .unwrap_or(0),
-                    ),
-                ),
-                (
-                    "max_active_frames".to_string(),
-                    KernelValue::U64(
-                        config
-                            .limits
-                            .as_ref()
-                            .and_then(|l| l.max_active_frames)
-                            .unwrap_or(0),
-                    ),
-                ),
-                (
-                    "max_frame_depth".to_string(),
-                    KernelValue::U64(
-                        config
-                            .limits
-                            .as_ref()
-                            .and_then(|l| l.max_frame_depth)
-                            .unwrap_or(0),
-                    ),
-                ),
-            ]),
-        };
-        let outcome = flow_run::transition(&initial, &input)
-            .map_err(|error| MobError::Internal(format!("flow_run CreateRun failed: {error}")))?;
+        let input = flow_run::Input::CreateRun(flow_run::inputs::CreateRun {
+            step_ids: config.flow_spec.steps.keys().cloned().collect(),
+            ordered_steps,
+            step_has_conditions: config
+                .flow_spec
+                .steps
+                .iter()
+                .map(|(step_id, step)| (step_id.clone(), step.condition.is_some()))
+                .collect(),
+            step_dependencies: config
+                .flow_spec
+                .steps
+                .iter()
+                .map(|(step_id, step)| (step_id.clone(), step.depends_on.clone()))
+                .collect(),
+            step_dependency_modes: config
+                .flow_spec
+                .steps
+                .iter()
+                .map(|(step_id, step)| {
+                    (
+                        step_id.clone(),
+                        dependency_mode_value(step.depends_on_mode.clone()),
+                    )
+                })
+                .collect(),
+            step_branches: config
+                .flow_spec
+                .steps
+                .iter()
+                .map(|(step_id, step)| (step_id.clone(), step.branch.clone()))
+                .collect(),
+            step_collection_policies: config
+                .flow_spec
+                .steps
+                .iter()
+                .map(|(step_id, step)| {
+                    (
+                        step_id.clone(),
+                        collection_policy_kind_value(&step.collection_policy),
+                    )
+                })
+                .collect(),
+            step_quorum_thresholds: config
+                .flow_spec
+                .steps
+                .iter()
+                .map(|(step_id, step)| {
+                    let threshold = match step.collection_policy {
+                        crate::definition::CollectionPolicy::Quorum { n } => u32::from(n),
+                        _ => 0,
+                    };
+                    (step_id.clone(), threshold)
+                })
+                .collect(),
+            escalation_threshold: config
+                .supervisor
+                .as_ref()
+                .map_or(0, |supervisor| supervisor.escalation_threshold),
+            max_step_retries: config
+                .limits
+                .as_ref()
+                .and_then(|limits| limits.max_step_retries)
+                .unwrap_or(0),
+            max_active_nodes: config
+                .limits
+                .as_ref()
+                .and_then(|l| l.max_active_nodes)
+                .unwrap_or(0)
+                .try_into()
+                .map_err(|_| MobError::Internal("max_active_nodes exceeds u32".to_string()))?,
+            max_active_frames: config
+                .limits
+                .as_ref()
+                .and_then(|l| l.max_active_frames)
+                .unwrap_or(0)
+                .try_into()
+                .map_err(|_| MobError::Internal("max_active_frames exceeds u32".to_string()))?,
+            max_frame_depth: config
+                .limits
+                .as_ref()
+                .and_then(|l| l.max_frame_depth)
+                .unwrap_or(0)
+                .try_into()
+                .map_err(|_| MobError::Internal("max_frame_depth exceeds u32".to_string()))?,
+        });
+        let outcome = flow_run::transition(&initial, input, &flow_run::EmptyContext)
+            .map_err(|error| MobError::Internal(format!("flow_run CreateRun failed: {error:?}")))?;
         Ok(outcome.next_state)
     }
 
-    pub fn flow_state_for_steps<I>(step_ids: I) -> Result<KernelState, MobError>
+    pub(crate) fn create_run_seed_input(
+        run_id: &RunId,
+        config: &FlowRunConfig,
+    ) -> Result<mob_dsl::MobMachineInput, MobError> {
+        let ordered_steps = topological_steps(&config.flow_spec)?;
+        Ok(mob_dsl::MobMachineInput::CreateRunSeed {
+            run_id: mob_dsl::RunId::from(run_id.to_string()),
+            step_ids: config
+                .flow_spec
+                .steps
+                .keys()
+                .map(|step_id| mob_dsl::StepId::from(step_id.as_str()))
+                .collect(),
+            ordered_steps: ordered_steps
+                .iter()
+                .map(|step_id| mob_dsl::StepId::from(step_id.as_str()))
+                .collect(),
+            step_has_conditions: config
+                .flow_spec
+                .steps
+                .iter()
+                .map(|(step_id, step)| {
+                    (
+                        mob_dsl::StepId::from(step_id.as_str()),
+                        step.condition.is_some(),
+                    )
+                })
+                .collect(),
+            step_dependencies: config
+                .flow_spec
+                .steps
+                .iter()
+                .map(|(step_id, step)| {
+                    (
+                        mob_dsl::StepId::from(step_id.as_str()),
+                        step.depends_on
+                            .iter()
+                            .map(|dep| mob_dsl::StepId::from(dep.as_str()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            step_dependency_modes: config
+                .flow_spec
+                .steps
+                .iter()
+                .map(|(step_id, step)| {
+                    (
+                        mob_dsl::StepId::from(step_id.as_str()),
+                        dependency_mode_seed_value(step.depends_on_mode.clone()),
+                    )
+                })
+                .collect(),
+            step_branches: config
+                .flow_spec
+                .steps
+                .iter()
+                .map(|(step_id, step)| {
+                    (
+                        mob_dsl::StepId::from(step_id.as_str()),
+                        step.branch
+                            .as_ref()
+                            .map(|branch| mob_dsl::BranchId::from(branch.as_str())),
+                    )
+                })
+                .collect(),
+            step_collection_policies: config
+                .flow_spec
+                .steps
+                .iter()
+                .map(|(step_id, step)| {
+                    (
+                        mob_dsl::StepId::from(step_id.as_str()),
+                        collection_policy_seed_value(&step.collection_policy),
+                    )
+                })
+                .collect(),
+            step_quorum_thresholds: config
+                .flow_spec
+                .steps
+                .iter()
+                .map(|(step_id, step)| {
+                    let threshold = match step.collection_policy {
+                        crate::definition::CollectionPolicy::Quorum { n } => u32::from(n),
+                        _ => 0,
+                    };
+                    (mob_dsl::StepId::from(step_id.as_str()), threshold)
+                })
+                .collect(),
+            escalation_threshold: config
+                .supervisor
+                .as_ref()
+                .map_or(0, |supervisor| supervisor.escalation_threshold),
+            max_step_retries: config
+                .limits
+                .as_ref()
+                .and_then(|limits| limits.max_step_retries)
+                .unwrap_or(0),
+            max_active_nodes: config
+                .limits
+                .as_ref()
+                .and_then(|l| l.max_active_nodes)
+                .unwrap_or(0)
+                .try_into()
+                .map_err(|_| MobError::Internal("max_active_nodes exceeds u32".to_string()))?,
+            max_active_frames: config
+                .limits
+                .as_ref()
+                .and_then(|l| l.max_active_frames)
+                .unwrap_or(0)
+                .try_into()
+                .map_err(|_| MobError::Internal("max_active_frames exceeds u32".to_string()))?,
+            max_frame_depth: config
+                .limits
+                .as_ref()
+                .and_then(|l| l.max_frame_depth)
+                .unwrap_or(0)
+                .try_into()
+                .map_err(|_| MobError::Internal("max_frame_depth exceeds u32".to_string()))?,
+        })
+    }
+
+    pub(crate) fn create_frame_seed_input(
+        run_id: &RunId,
+        frame_id: &FrameId,
+        loop_instance_id: Option<&LoopInstanceId>,
+        iteration: u32,
+        frame_scope: mob_dsl::FrameScope,
+        spec: &FrameSpec,
+        ordered: &[FlowNodeId],
+    ) -> Result<mob_dsl::MobMachineInput, MobError> {
+        let tracked_nodes = ordered
+            .iter()
+            .map(|node_id| mob_dsl::FlowNodeId::from(node_id.as_str()))
+            .collect();
+        let ordered_nodes = ordered
+            .iter()
+            .map(|node_id| mob_dsl::FlowNodeId::from(node_id.as_str()))
+            .collect();
+        let mut node_kind = BTreeMap::new();
+        let mut node_dependencies = BTreeMap::new();
+        let mut node_dependency_modes = BTreeMap::new();
+        let mut node_branches = BTreeMap::new();
+
+        for (node_id, node_spec) in &spec.nodes {
+            let key = mob_dsl::FlowNodeId::from(node_id.as_str());
+            match node_spec {
+                FlowNodeSpec::Step(step) => {
+                    node_kind.insert(key.clone(), mob_dsl::FlowNodeKind::Step);
+                    node_dependencies.insert(
+                        key.clone(),
+                        step.depends_on
+                            .iter()
+                            .map(|dep| mob_dsl::FlowNodeId::from(dep.as_str()))
+                            .collect(),
+                    );
+                    node_dependency_modes.insert(
+                        key.clone(),
+                        dependency_mode_seed_value(step.depends_on_mode.clone()),
+                    );
+                    node_branches.insert(
+                        key,
+                        step.branch
+                            .as_ref()
+                            .map(|branch| mob_dsl::BranchId::from(branch.as_str())),
+                    );
+                }
+                FlowNodeSpec::RepeatUntil(loop_spec) => {
+                    node_kind.insert(key.clone(), mob_dsl::FlowNodeKind::Loop);
+                    node_dependencies.insert(
+                        key.clone(),
+                        loop_spec
+                            .depends_on
+                            .iter()
+                            .map(|dep| mob_dsl::FlowNodeId::from(dep.as_str()))
+                            .collect(),
+                    );
+                    node_dependency_modes.insert(
+                        key.clone(),
+                        dependency_mode_seed_value(loop_spec.depends_on_mode.clone()),
+                    );
+                    node_branches.insert(key, None);
+                }
+            }
+        }
+
+        Ok(mob_dsl::MobMachineInput::CreateFrameSeed {
+            run_id: mob_dsl::RunId::from(run_id.to_string()),
+            frame_id: mob_dsl::FrameId::from(frame_id.as_str()),
+            frame_scope,
+            loop_instance_id: loop_instance_id.map(|id| mob_dsl::LoopInstanceId::from(id.as_str())),
+            iteration,
+            tracked_nodes,
+            ordered_nodes,
+            node_kind,
+            node_dependencies,
+            node_dependency_modes,
+            node_branches,
+        })
+    }
+
+    pub(crate) fn create_loop_seed_input(
+        snapshot: &LoopSnapshot,
+    ) -> Result<mob_dsl::MobMachineInput, MobError> {
+        Ok(mob_dsl::MobMachineInput::CreateLoopSeed {
+            loop_instance_id: mob_dsl::LoopInstanceId::from(
+                snapshot.kernel_state.loop_instance_id.as_str(),
+            ),
+            parent_frame_id: mob_dsl::FrameId::from(snapshot.kernel_state.parent_frame_id.as_str()),
+            parent_node_id: mob_dsl::FlowNodeId::from(
+                snapshot.kernel_state.parent_node_id.as_str(),
+            ),
+            loop_id: mob_dsl::LoopId::from(snapshot.kernel_state.loop_id.as_str()),
+            depth: snapshot.kernel_state.depth,
+            max_iterations: snapshot.kernel_state.max_iterations,
+        })
+    }
+
+    pub(crate) fn create_run_status_input(
+        run_id: &RunId,
+        status: mob_dsl::FlowRunStatus,
+    ) -> mob_dsl::MobMachineInput {
+        mob_dsl::MobMachineInput::ProjectRunStatus {
+            run_id: mob_dsl::RunId::from(run_id.to_string()),
+            status,
+        }
+    }
+
+    pub(crate) fn create_run_step_status_input(
+        run_id: &RunId,
+        step_id: &StepId,
+        status: mob_dsl::StepRunStatus,
+        output_recorded: bool,
+    ) -> mob_dsl::MobMachineInput {
+        mob_dsl::MobMachineInput::ProjectRunStepStatus {
+            run_step: mob_dsl::RunStepKey::from(format!("{run_id}::{step_id}")),
+            status,
+            output_recorded,
+        }
+    }
+
+    pub(crate) fn create_frame_phase_input(
+        frame_id: &FrameId,
+        phase: mob_dsl::FrameStatus,
+    ) -> mob_dsl::MobMachineInput {
+        mob_dsl::MobMachineInput::ProjectFramePhase {
+            frame_id: mob_dsl::FrameId::from(frame_id.as_str()),
+            phase,
+        }
+    }
+
+    pub(crate) fn create_loop_state_input(
+        loop_instance_id: &LoopInstanceId,
+        phase: mob_dsl::LoopStatus,
+        stage: mob_dsl::LoopIterationStage,
+        active_body_frame_id: Option<&FrameId>,
+    ) -> mob_dsl::MobMachineInput {
+        mob_dsl::MobMachineInput::ProjectLoopState {
+            loop_instance_id: mob_dsl::LoopInstanceId::from(loop_instance_id.as_str()),
+            phase,
+            stage,
+            active_body_frame_id: active_body_frame_id
+                .map(|frame_id| mob_dsl::FrameId::from(frame_id.as_str())),
+        }
+    }
+
+    pub fn flow_state_for_steps<I>(step_ids: I) -> Result<flow_run::State, MobError>
     where
         I: IntoIterator<Item = StepId>,
     {
@@ -733,26 +644,39 @@ impl MobRun {
     }
 }
 
-fn dependency_mode_value(mode: crate::definition::DependencyMode) -> KernelValue {
-    let variant = match mode {
-        crate::definition::DependencyMode::All => "All",
-        crate::definition::DependencyMode::Any => "Any",
-    };
-    KernelValue::NamedVariant {
-        enum_name: "DependencyMode".to_string(),
-        variant: variant.to_string(),
+fn dependency_mode_value(mode: crate::definition::DependencyMode) -> flow_run::DependencyMode {
+    match mode {
+        crate::definition::DependencyMode::All => flow_run::DependencyMode::All,
+        crate::definition::DependencyMode::Any => flow_run::DependencyMode::Any,
     }
 }
 
-fn collection_policy_kind_value(policy: &crate::definition::CollectionPolicy) -> KernelValue {
-    let variant = match policy {
-        crate::definition::CollectionPolicy::All => "All",
-        crate::definition::CollectionPolicy::Any => "Any",
-        crate::definition::CollectionPolicy::Quorum { .. } => "Quorum",
-    };
-    KernelValue::NamedVariant {
-        enum_name: "CollectionPolicyKind".to_string(),
-        variant: variant.to_string(),
+fn dependency_mode_seed_value(mode: crate::definition::DependencyMode) -> mob_dsl::DependencyMode {
+    match mode {
+        crate::definition::DependencyMode::All => mob_dsl::DependencyMode::All,
+        crate::definition::DependencyMode::Any => mob_dsl::DependencyMode::Any,
+    }
+}
+
+fn collection_policy_kind_value(
+    policy: &crate::definition::CollectionPolicy,
+) -> flow_run::CollectionPolicyKind {
+    match policy {
+        crate::definition::CollectionPolicy::All => flow_run::CollectionPolicyKind::All,
+        crate::definition::CollectionPolicy::Any => flow_run::CollectionPolicyKind::Any,
+        crate::definition::CollectionPolicy::Quorum { .. } => {
+            flow_run::CollectionPolicyKind::Quorum
+        }
+    }
+}
+
+fn collection_policy_seed_value(
+    policy: &crate::definition::CollectionPolicy,
+) -> mob_dsl::CollectionPolicyKind {
+    match policy {
+        crate::definition::CollectionPolicy::All => mob_dsl::CollectionPolicyKind::All,
+        crate::definition::CollectionPolicy::Any => mob_dsl::CollectionPolicyKind::Any,
+        crate::definition::CollectionPolicy::Quorum { .. } => mob_dsl::CollectionPolicyKind::Quorum,
     }
 }
 
@@ -858,41 +782,17 @@ pub enum StepRunStatus {
 }
 
 impl StepRunStatus {
-    pub(crate) fn parse_kernel_value(value: &KernelValue) -> Result<Self, String> {
-        let variant = match value {
-            KernelValue::Map(entries) => {
-                let some_value = entries
-                    .get(&KernelValue::String("value".to_string()))
-                    .ok_or_else(|| {
-                        format!("expected option payload with `value`, found {value:?}")
-                    })?;
-                some_value.as_named_variant("StepRunStatus")?
-            }
-            _ => value.as_named_variant("StepRunStatus")?,
-        };
-
-        match variant {
+    pub(crate) fn from_flow_run_status(value: &str, run_id: &RunId) -> Result<Self, MobError> {
+        match value {
             "Dispatched" => Ok(Self::Dispatched),
             "Completed" => Ok(Self::Completed),
             "Failed" => Ok(Self::Failed),
             "Skipped" => Ok(Self::Skipped),
             "Canceled" => Ok(Self::Canceled),
-            other => Err(format!("unknown StepRunStatus variant `{other}`")),
+            other => Err(MobError::Internal(format!(
+                "unknown StepRunStatus variant `{other}` for {run_id}"
+            ))),
         }
-    }
-
-    pub(crate) fn from_flow_run_kernel_value(
-        value: &KernelValue,
-        run_id: &RunId,
-    ) -> Result<Self, MobError> {
-        Self::parse_kernel_value(value).map_err(|reason| {
-            let message = if reason.starts_with("unknown StepRunStatus variant") {
-                format!("{reason} for {run_id}")
-            } else {
-                format!("flow_run step_status entry invalid for {run_id}: {reason}")
-            };
-            MobError::Internal(message)
-        })
     }
 
     /// A step is terminal when it can no longer receive work dispatch or
@@ -1145,31 +1045,17 @@ mod tests {
             MobRun::flow_state_for_steps([StepId::from("step-a"), StepId::from("step-b")]).unwrap(),
             serde_json::json!({}),
         );
-        run.flow_state.fields.insert(
-            "step_status".to_string(),
-            KernelValue::Map(BTreeMap::from([
-                (
-                    KernelValue::String("step-a".to_string()),
-                    KernelValue::NamedVariant {
-                        enum_name: "StepRunStatus".to_string(),
-                        variant: "Completed".to_string(),
-                    },
-                ),
-                (KernelValue::String("step-b".to_string()), KernelValue::None),
-            ])),
-        );
-        run.flow_state
-            .fields
-            .insert("failure_count".to_string(), KernelValue::U64(3));
-        run.flow_state
-            .fields
-            .insert("consecutive_failure_count".to_string(), KernelValue::U64(2));
-        run.flow_state
-            .fields
-            .insert("max_step_retries".to_string(), KernelValue::U64(4));
-        run.flow_state
-            .fields
-            .insert("escalation_threshold".to_string(), KernelValue::U64(3));
+        run.flow_state.step_status = BTreeMap::from([
+            (
+                StepId::from("step-a"),
+                Some(flow_run::StepRunStatus::Completed),
+            ),
+            (StepId::from("step-b"), None),
+        ]);
+        run.flow_state.failure_count = 3;
+        run.flow_state.consecutive_failure_count = 2;
+        run.flow_state.max_step_retries = 4;
+        run.flow_state.escalation_threshold = 3;
 
         assert_eq!(
             run.ordered_steps().unwrap(),
@@ -1225,28 +1111,20 @@ mod tests {
     }
 
     #[test]
-    fn test_mob_run_step_status_snapshot_rejects_unknown_variant() {
+    fn test_mob_run_step_status_snapshot_accepts_typed_variant() {
         let mut run = MobRun::pending(
             MobId::from("mob"),
             FlowId::from("flow-a"),
             MobRun::flow_state_for_steps([StepId::from("step-a")]).unwrap(),
             serde_json::json!({}),
         );
-        run.flow_state.fields.insert(
-            "step_status".to_string(),
-            KernelValue::Map(BTreeMap::from([(
-                KernelValue::String("step-a".to_string()),
-                KernelValue::NamedVariant {
-                    enum_name: "StepRunStatus".to_string(),
-                    variant: "Broken".to_string(),
-                },
-            )])),
-        );
-
-        let error = run.step_status_snapshot().unwrap_err();
-        assert!(
-            matches!(error, MobError::Internal(ref message) if message.contains("unknown StepRunStatus variant `Broken`")),
-            "expected explicit step status parse failure, got {error:?}"
+        run.flow_state.step_status = BTreeMap::from([(
+            StepId::from("step-a"),
+            Some(flow_run::StepRunStatus::Completed),
+        )]);
+        assert_eq!(
+            run.step_status_snapshot().unwrap(),
+            BTreeMap::from([(StepId::from("step-a"), StepRunStatus::Completed)])
         );
     }
 
@@ -1258,19 +1136,10 @@ mod tests {
             MobRun::flow_state_for_steps([StepId::from("step-a")]).unwrap(),
             serde_json::json!({}),
         );
-        run.flow_state.fields.insert(
-            "step_status".to_string(),
-            KernelValue::Map(BTreeMap::from([(
-                KernelValue::String("step-a".to_string()),
-                KernelValue::Map(BTreeMap::from([(
-                    KernelValue::String("value".to_string()),
-                    KernelValue::NamedVariant {
-                        enum_name: "StepRunStatus".to_string(),
-                        variant: "Completed".to_string(),
-                    },
-                )])),
-            )])),
-        );
+        run.flow_state.step_status = BTreeMap::from([(
+            StepId::from("step-a"),
+            Some(flow_run::StepRunStatus::Completed),
+        )]);
 
         assert_eq!(
             run.step_status_snapshot().unwrap(),
@@ -1280,122 +1149,78 @@ mod tests {
 
     #[test]
     fn test_mob_run_step_dependencies_reject_invalid_dependency_entry() {
-        let mut run = MobRun::pending(
+        // Typed state makes invalid dependency payloads unrepresentable.
+        let run = MobRun::pending(
             MobId::from("mob"),
             FlowId::from("flow-a"),
             MobRun::flow_state_for_steps([StepId::from("step-a")]).unwrap(),
             serde_json::json!({}),
         );
-        run.flow_state.fields.insert(
-            "step_dependencies".to_string(),
-            KernelValue::Map(BTreeMap::from([(
-                KernelValue::String("step-a".to_string()),
-                KernelValue::Seq(vec![KernelValue::Bool(true)]),
-            )])),
-        );
-
-        let error = run.step_dependencies().unwrap_err();
-        assert!(
-            matches!(error, MobError::Internal(ref message) if message.contains("step_dependencies dependency invalid")),
-            "expected explicit dependency parse failure, got {error:?}"
+        assert_eq!(
+            run.step_dependencies().unwrap(),
+            BTreeMap::from([(StepId::from("step-a"), Vec::new())])
         );
     }
 
     #[test]
-    fn test_mob_run_step_dependency_modes_reject_unknown_variant() {
+    fn test_mob_run_step_dependency_modes_accept_typed_variant() {
         let mut run = MobRun::pending(
             MobId::from("mob"),
             FlowId::from("flow-a"),
             MobRun::flow_state_for_steps([StepId::from("step-a")]).unwrap(),
             serde_json::json!({}),
         );
-        run.flow_state.fields.insert(
-            "step_dependency_modes".to_string(),
-            KernelValue::Map(BTreeMap::from([(
-                KernelValue::String("step-a".to_string()),
-                KernelValue::NamedVariant {
-                    enum_name: "DependencyMode".to_string(),
-                    variant: "Broken".to_string(),
-                },
-            )])),
-        );
+        run.flow_state.step_dependency_modes =
+            BTreeMap::from([(StepId::from("step-a"), flow_run::DependencyMode::All)]);
 
-        let error = run.step_dependency_modes().unwrap_err();
-        assert!(
-            matches!(error, MobError::Internal(ref message) if message.contains("unknown DependencyMode variant `Broken`")),
-            "expected explicit dependency mode parse failure, got {error:?}"
+        assert_eq!(
+            run.step_dependency_modes().unwrap(),
+            BTreeMap::from([(StepId::from("step-a"), DependencyMode::All)])
         );
     }
 
     #[test]
-    fn test_mob_run_step_collection_policy_kinds_reject_unknown_variant() {
+    fn test_mob_run_step_collection_policy_kinds_accept_typed_variant() {
         let mut run = MobRun::pending(
             MobId::from("mob"),
             FlowId::from("flow-a"),
             MobRun::flow_state_for_steps([StepId::from("step-a")]).unwrap(),
             serde_json::json!({}),
         );
-        run.flow_state.fields.insert(
-            "step_collection_policies".to_string(),
-            KernelValue::Map(BTreeMap::from([(
-                KernelValue::String("step-a".to_string()),
-                KernelValue::NamedVariant {
-                    enum_name: "CollectionPolicyKind".to_string(),
-                    variant: "Broken".to_string(),
-                },
-            )])),
-        );
+        run.flow_state.step_collection_policies =
+            BTreeMap::from([(StepId::from("step-a"), flow_run::CollectionPolicyKind::All)]);
 
-        let error = run.step_collection_policy_kinds().unwrap_err();
-        assert!(
-            matches!(error, MobError::Internal(ref message) if message.contains("unknown CollectionPolicyKind variant `Broken`")),
-            "expected explicit collection policy parse failure, got {error:?}"
+        assert_eq!(
+            run.step_collection_policy_kinds().unwrap(),
+            BTreeMap::from([(StepId::from("step-a"), RunCollectionPolicyKind::All)])
         );
     }
 
     #[test]
     fn test_mob_run_step_has_conditions_rejects_non_bool_entry() {
-        let mut run = MobRun::pending(
+        let run = MobRun::pending(
             MobId::from("mob"),
             FlowId::from("flow-a"),
             MobRun::flow_state_for_steps([StepId::from("step-a")]).unwrap(),
             serde_json::json!({}),
         );
-        run.flow_state.fields.insert(
-            "step_has_conditions".to_string(),
-            KernelValue::Map(BTreeMap::from([(
-                KernelValue::String("step-a".to_string()),
-                KernelValue::String("yes".to_string()),
-            )])),
-        );
-
-        let error = run.step_has_conditions().unwrap_err();
-        assert!(
-            matches!(error, MobError::Internal(ref message) if message.contains("step_has_conditions entry invalid")),
-            "expected explicit condition-presence parse failure, got {error:?}"
+        assert_eq!(
+            run.step_has_conditions().unwrap(),
+            BTreeMap::from([(StepId::from("step-a"), false)])
         );
     }
 
     #[test]
     fn test_mob_run_step_branches_reject_invalid_entry() {
-        let mut run = MobRun::pending(
+        let run = MobRun::pending(
             MobId::from("mob"),
             FlowId::from("flow-a"),
             MobRun::flow_state_for_steps([StepId::from("step-a")]).unwrap(),
             serde_json::json!({}),
         );
-        run.flow_state.fields.insert(
-            "step_branches".to_string(),
-            KernelValue::Map(BTreeMap::from([(
-                KernelValue::String("step-a".to_string()),
-                KernelValue::Bool(true),
-            )])),
-        );
-
-        let error = run.step_branches().unwrap_err();
-        assert!(
-            matches!(error, MobError::Internal(ref message) if message.contains("step_branches entry invalid")),
-            "expected explicit branch parse failure, got {error:?}"
+        assert_eq!(
+            run.step_branches().unwrap(),
+            BTreeMap::from([(StepId::from("step-a"), None)])
         );
     }
 
@@ -1415,7 +1240,7 @@ mod tests {
     fn test_flow_run_config_from_definition_missing_flow() {
         let def = sample_definition();
         let error = FlowRunConfig::from_definition(FlowId::from("missing"), &def).unwrap_err();
-        assert!(matches!(error, MobError::FlowNotFound(name) if name == FlowId::from("missing")));
+        assert!(matches!(error, MobError::FlowNotFound(name) if name == "missing"));
     }
 
     #[test]

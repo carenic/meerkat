@@ -3073,6 +3073,7 @@ dependencies = [
  "meerkat-machine-dsl",
  "meerkat-machine-kernels",
  "meerkat-machine-schema",
+ "meerkat-mob",
  "trybuild",
 ]
 
@@ -3448,6 +3449,9 @@ dependencies = [
 name = "meerkat-machine-kernels"
 version = "0.6.0"
 dependencies = [
+ "indexmap",
+ "meerkat-core",
+ "meerkat-machine-dsl",
  "meerkat-machine-schema",
  "serde",
  "serde_json",

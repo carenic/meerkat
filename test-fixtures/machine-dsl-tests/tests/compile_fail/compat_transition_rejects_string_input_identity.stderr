@@ -1,0 +1,5 @@
+error[E0432]: unresolved import `meerkat_machine_kernels::generated::flow_run`
+ --> tests/compile_fail/compat_transition_rejects_string_input_identity.rs:1:5
+  |
+1 | use meerkat_machine_kernels::generated::flow_run;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `flow_run` in `generated`

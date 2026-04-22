@@ -80,9 +80,39 @@ macro_rules! string_newtype {
             }
         }
 
+        impl Borrow<String> for $name {
+            fn borrow(&self) -> &String {
+                &self.0
+            }
+        }
+
         impl AsRef<str> for $name {
             fn as_ref(&self) -> &str {
                 &self.0
+            }
+        }
+
+        impl PartialEq<String> for $name {
+            fn eq(&self, other: &String) -> bool {
+                &self.0 == other
+            }
+        }
+
+        impl PartialEq<&String> for $name {
+            fn eq(&self, other: &&String) -> bool {
+                &self.0 == *other
+            }
+        }
+
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.0.as_str() == other
+            }
+        }
+
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.0.as_str() == *other
             }
         }
     };

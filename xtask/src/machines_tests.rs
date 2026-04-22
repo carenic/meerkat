@@ -118,6 +118,22 @@ color="white";
 
 #[cfg(feature = "machine-authority")]
 #[test]
+fn parse_tlc_graph_stats_extracts_generated_distinct_and_depth() {
+    let stats = parse_tlc_graph_stats(
+        r"
+Verifying machine MeerkatMachine
+123 states generated, 45 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 9.
+",
+    );
+
+    assert_eq!(stats.generated_states, Some(123));
+    assert_eq!(stats.distinct_states, Some(45));
+    assert_eq!(stats.depth, Some(9));
+}
+
+#[cfg(feature = "machine-authority")]
+#[test]
 fn hopcroft_refinement_merges_terminally_equivalent_states_without_observation() {
     let dot = r#"
 strict digraph DiskGraph {

@@ -208,15 +208,25 @@ pub struct GeneratedMachineKernel {
     schema: MachineSchema,
 }
 
+#[allow(dead_code)]
+pub(crate) type RawValue = KernelValue;
+#[allow(dead_code)]
+pub(crate) type RawState = KernelState;
+#[allow(dead_code)]
+pub(crate) type RawInput = KernelInput;
+#[allow(dead_code)]
+pub(crate) type RawSignal = KernelSignal;
+#[allow(dead_code)]
+pub(crate) type RawEffect = KernelEffect;
+#[allow(dead_code)]
+pub(crate) type RawOutcome = TransitionOutcome;
+#[allow(dead_code)]
+pub(crate) type RawRefusal = TransitionRefusal;
+
 impl GeneratedMachineKernel {
     #[must_use]
     pub fn new(schema: MachineSchema) -> Self {
         Self { schema }
-    }
-
-    #[must_use]
-    pub fn schema(&self) -> &MachineSchema {
-        &self.schema
     }
 
     pub fn initial_state(&self) -> Result<KernelState, TransitionRefusal> {
@@ -1041,6 +1051,39 @@ impl GeneratedMachineKernel {
             reason: reason.into(),
         }
     }
+}
+
+#[allow(dead_code)]
+pub(crate) fn initial_state_from_schema(schema: MachineSchema) -> Result<RawState, RawRefusal> {
+    GeneratedMachineKernel::new(schema).initial_state()
+}
+
+#[allow(dead_code)]
+pub(crate) fn transition_from_schema(
+    schema: MachineSchema,
+    state: &RawState,
+    input: &RawInput,
+) -> Result<RawOutcome, RawRefusal> {
+    GeneratedMachineKernel::new(schema).transition(state, input)
+}
+
+#[allow(dead_code)]
+pub(crate) fn transition_signal_from_schema(
+    schema: MachineSchema,
+    state: &RawState,
+    signal: &RawSignal,
+) -> Result<RawOutcome, RawRefusal> {
+    GeneratedMachineKernel::new(schema).transition_signal(state, signal)
+}
+
+#[allow(dead_code)]
+pub(crate) fn evaluate_helper_from_schema(
+    schema: MachineSchema,
+    state: &RawState,
+    helper_name: &str,
+    args: &std::collections::BTreeMap<String, RawValue>,
+) -> Result<RawValue, RawRefusal> {
+    GeneratedMachineKernel::new(schema).evaluate_helper(state, helper_name, args)
 }
 
 impl KernelValue {
