@@ -153,6 +153,7 @@ impl LocalTurnExecutionState {
         self.fields.max_extraction_retries > 0
     }
 
+    #[allow(dead_code)]
     pub(crate) fn can_accept(&self, input: &TurnExecutionInput) -> bool {
         self.evaluate(input).is_ok()
     }
