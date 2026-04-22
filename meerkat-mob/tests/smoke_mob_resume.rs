@@ -178,7 +178,7 @@ async fn member_entry(handle: &MobHandle, agent_identity: &str) -> MobMemberList
         .list_members()
         .await
         .into_iter()
-        .find(|entry| entry.agent_identity == AgentIdentity::from(agent_identity))
+        .find(|entry| entry.agent_identity == agent_identity)
         .unwrap_or_else(|| panic!("member {agent_identity} missing from list_members"))
 }
 

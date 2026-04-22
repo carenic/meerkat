@@ -2537,8 +2537,7 @@ fn completed_count(run: &MobRun, step_id: &str) -> usize {
     run.step_ledger
         .iter()
         .filter(|entry| {
-            entry.step_id == StepId::from(step_id)
-                && entry.status == meerkat_mob::StepRunStatus::Completed
+            entry.step_id == step_id && entry.status == meerkat_mob::StepRunStatus::Completed
         })
         .count()
 }
@@ -2547,8 +2546,7 @@ fn skipped_count(run: &MobRun, step_id: &str) -> usize {
     run.step_ledger
         .iter()
         .filter(|entry| {
-            entry.step_id == StepId::from(step_id)
-                && entry.status == meerkat_mob::StepRunStatus::Skipped
+            entry.step_id == step_id && entry.status == meerkat_mob::StepRunStatus::Skipped
         })
         .count()
 }
