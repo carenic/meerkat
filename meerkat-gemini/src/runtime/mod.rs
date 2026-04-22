@@ -7,16 +7,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "oauth"))]
 use meerkat_core::AuthError;
+#[cfg(all(not(target_arch = "wasm32"), feature = "adc"))]
 use meerkat_core::HttpAuthorizer;
 use meerkat_core::{AuthLease, AuthMetadata, AuthProfile, BackendProfile, BindingPolicy, Provider};
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "oauth"))]
 use meerkat_auth_core::resolver::refresh_allowed;
 use meerkat_auth_core::resolver::{
     finalize_auth_metadata, interactive_login_error, resolve_external_authorizer,
     resolve_simple_secret,
 };
 use meerkat_llm_core::LlmClient;
+#[cfg(all(not(target_arch = "wasm32"), feature = "adc"))]
 use meerkat_llm_core::provider_runtime::binding::DynamicLease;
 use meerkat_llm_core::provider_runtime::binding::{
     NormalizedAuthMethod, NormalizedBackendKind, ResolvedConnection, StaticLease, ValidatedBinding,
