@@ -17,12 +17,16 @@ use crate::run::{
 use crate::runtime::MobHandle;
 use crate::runtime::conditions::evaluate_condition;
 use crate::store::MobRunStore;
+#[cfg(target_arch = "wasm32")]
+use crate::tokio::time as tokio_time;
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use indexmap::IndexMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::time as tokio_time;
 
 // ─── FrameStepResult ─────────────────────────────────────────────────────────
 
@@ -713,7 +717,7 @@ impl FlowFrameEngine {
             if !progressed && workers.is_empty() {
                 let run = self.require_run(run_id).await?;
                 if run.flow_state.active_node_count > 0 || run.flow_state.active_frame_count > 0 {
-                    crate::tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    tokio_time::sleep(std::time::Duration::from_millis(10)).await;
                     continue;
                 }
                 return Err(MobError::Internal(format!(
