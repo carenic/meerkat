@@ -28,6 +28,7 @@ pub fn run_protocol_codegen() -> Result<()> {
         meerkat_machine_schema::flow_run_machine(),
         meerkat_machine_schema::loop_iteration_machine(),
         meerkat_machine_schema::ops_barrier_bridge_machine(),
+        meerkat_machine_schema::external_tool_surface_bridge_machine(),
     ]);
     let machine_by_name: std::collections::BTreeMap<&str, &MachineSchema> =
         machines.iter().map(|m| (m.machine.as_str(), m)).collect();
@@ -418,6 +419,13 @@ fn generate_effect_extractor_helpers(
     writeln!(out, "}}")?;
     writeln!(out)?;
 
+    // Only emit `submit_*` (authority.apply) helpers when the binding
+    // declares an authority. Without one, feedback flows through a
+    // stacked `HandleBridge` submitter (see composition validator).
+    if rust.authority_type_path.is_none() {
+        return Ok(());
+    }
+
     for feedback in &protocol.allowed_feedback_inputs {
         let target_machine =
             machine_for_instance(composition, machine_by_name, &feedback.machine_instance)?;
@@ -462,15 +470,12 @@ fn generate_handle_bridge_helpers(
             .context("HandleBridge handle_trait_path missing")?,
     );
 
-    // Rewrite self-references. When the emit path lives inside the
-    // crate that defines `meerkat_core::handles::DslTransitionError`,
-    // rustc sees `meerkat_core::` as an external-crate path and fails.
-    // Detect the in-crate case and use `crate::` instead.
-    let handle_error_path = if rust.module_path.starts_with("meerkat-core/") {
-        "crate::handles::DslTransitionError"
-    } else {
-        "meerkat_core::handles::DslTransitionError"
-    };
+    // Use the unqualified `DslTransitionError` symbol and rely on the
+    // composition's `required_imports` to bring it into scope. This
+    // works for both in-crate (`use crate::handles::DslTransitionError;`)
+    // and cross-crate (`use meerkat_core::handles::DslTransitionError;`)
+    // emit paths, matching what the hand-authored protocol files did.
+    let handle_error_path = "DslTransitionError";
 
     // When HandleBridge is the primary mode AND a bridge source type is
     // declared, emit the `accept_<effect>` helper that wraps the shell-
@@ -499,21 +504,20 @@ fn generate_handle_bridge_helpers(
             })?;
 
         // Dual-mode suffix rule: when HandleBridge is stacked with another
-        // mode that already emits a `submit_*` per feedback variant, append
-        // `_handle` to avoid symbol collision. When HandleBridge is the
-        // primary (and only) mode, the bare `submit_*` name is used.
-        let fn_name = if rust
-            .additional_modes
-            .contains(&ProtocolGenerationMode::HandleBridge)
-            || rust.generation_mode != ProtocolGenerationMode::HandleBridge
-        {
-            // Any mode that isn't HandleBridge as primary → the HandleBridge
-            // block is secondary, add `_handle` to avoid collision.
-            if rust.generation_mode == ProtocolGenerationMode::HandleBridge {
-                format!("submit_{}", to_snake_case(&feedback.input_variant))
-            } else {
-                format!("submit_{}_handle", to_snake_case(&feedback.input_variant))
-            }
+        // mode that *actually* emits an authority-backed `submit_<input>`
+        // (i.e., `ShellBridge` or `EffectExtractor` with
+        // `authority_type_path` set), append `_handle` to avoid symbol
+        // collision. When the stacked mode skips its authority submitter
+        // (EffectExtractor with no authority), the bare `submit_*` name
+        // is used — no collision to avoid.
+        let another_mode_emits_submit = match rust.generation_mode {
+            ProtocolGenerationMode::HandleBridge => false,
+            ProtocolGenerationMode::ShellBridge => true,
+            ProtocolGenerationMode::EffectExtractor => rust.authority_type_path.is_some(),
+            ProtocolGenerationMode::Executor => true,
+        };
+        let fn_name = if another_mode_emits_submit {
+            format!("submit_{}_handle", to_snake_case(&feedback.input_variant))
         } else {
             format!("submit_{}", to_snake_case(&feedback.input_variant))
         };

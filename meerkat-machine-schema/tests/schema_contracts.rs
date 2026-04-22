@@ -1039,6 +1039,7 @@ mod handoff_binding {
             meerkat_machine_schema::flow_run_machine(),
             meerkat_machine_schema::loop_iteration_machine(),
             meerkat_machine_schema::ops_barrier_bridge_machine(),
+            meerkat_machine_schema::external_tool_surface_bridge_machine(),
         ]);
         let machine_refs: Vec<_> = machines.iter().collect();
         for composition in &compositions {

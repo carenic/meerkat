@@ -1594,19 +1594,48 @@ fn validate_generation_mode_binding(
             }
         }
         ProtocolGenerationMode::EffectExtractor => {
-            if rust.authority_type_path.is_none()
-                || rust.mutator_trait_path.is_none()
-                || rust.input_enum_path.is_none()
-                || rust.effect_enum_path.is_none()
-                || rust.transition_type_path.is_none()
-                || rust.error_type_path.is_none()
-            {
+            if rust.effect_enum_path.is_none() {
                 return Err(CompositionSchemaError::InvalidHandoffRustBinding {
                     protocol: protocol.name.clone(),
-                    detail:
-                        "EffectExtractor protocols require authority_type_path, mutator_trait_path, input_enum_path, effect_enum_path, transition_type_path, and error_type_path"
-                            .into(),
+                    detail: "EffectExtractor protocols require effect_enum_path".into(),
                 });
+            }
+            // Authority paths are optional. When present, EffectExtractor
+            // emits `submit_*` helpers that call `authority.apply(...)`
+            // for each feedback input. When absent, only
+            // `extract_obligations` is emitted; feedback flows through a
+            // stacked `HandleBridge` mode. Validator only requires full
+            // authority plumbing when the codegen is actually going to
+            // invoke it — honor partial bindings.
+            let authority_present = rust.authority_type_path.is_some();
+            if authority_present {
+                if rust.mutator_trait_path.is_none()
+                    || rust.input_enum_path.is_none()
+                    || rust.transition_type_path.is_none()
+                    || rust.error_type_path.is_none()
+                {
+                    return Err(CompositionSchemaError::InvalidHandoffRustBinding {
+                        protocol: protocol.name.clone(),
+                        detail:
+                            "EffectExtractor with authority_type_path set also requires mutator_trait_path, input_enum_path, transition_type_path, and error_type_path"
+                                .into(),
+                    });
+                }
+            } else if !protocol.allowed_feedback_inputs.is_empty() {
+                // No authority → feedback must flow through HandleBridge.
+                let has_handle_bridge = rust.generation_mode
+                    == ProtocolGenerationMode::HandleBridge
+                    || rust
+                        .additional_modes
+                        .contains(&ProtocolGenerationMode::HandleBridge);
+                if !has_handle_bridge {
+                    return Err(CompositionSchemaError::InvalidHandoffRustBinding {
+                        protocol: protocol.name.clone(),
+                        detail:
+                            "EffectExtractor without authority_type_path must stack HandleBridge (or declare no feedback inputs)"
+                                .into(),
+                    });
+                }
             }
         }
         ProtocolGenerationMode::ShellBridge => {

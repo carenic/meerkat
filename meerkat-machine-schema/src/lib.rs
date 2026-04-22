@@ -16,7 +16,8 @@ pub use catalog::{
     meerkat_mob_seam_composition,
 };
 pub use compat::{
-    flow_frame_machine, flow_run_machine, loop_iteration_machine, ops_barrier_bridge_machine,
+    external_tool_surface_bridge_machine, flow_frame_machine, flow_run_machine,
+    loop_iteration_machine, ops_barrier_bridge_machine,
 };
 pub use composition::{
     ActorKind, ActorPriority, ActorSchema, ClosurePolicy, CompositionDriverRustBinding,

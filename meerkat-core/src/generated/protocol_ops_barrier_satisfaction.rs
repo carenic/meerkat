@@ -3,7 +3,7 @@
 // Closure policy: AckRequired
 // Liveness: eventual feedback under task-scheduling fairness
 
-use crate::handles::TurnStateHandle;
+use crate::handles::{DslTransitionError, TurnStateHandle};
 use crate::lifecycle::identifiers::WaitRequestId;
 use crate::ops::OperationId;
 use crate::ops_lifecycle::WaitAllSatisfied;
@@ -24,7 +24,7 @@ pub fn accept_wait_all_satisfied(source: WaitAllSatisfied) -> OpsBarrierSatisfac
 pub fn submit_ops_barrier_satisfied(
     handle: &(impl TurnStateHandle + ?Sized),
     obligation: OpsBarrierSatisfactionObligation,
-) -> Result<(), crate::handles::DslTransitionError> {
+) -> Result<(), DslTransitionError> {
     handle.ops_barrier_satisfied(
         obligation
             .operation_ids

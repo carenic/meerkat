@@ -420,7 +420,7 @@ fn default_ci_limits() -> CompositionStateLimits {
 ///
 /// Populated as each handoff protocol's producer side is wired up.
 pub fn compat_composition_schemas() -> Vec<CompositionSchema> {
-    vec![mob_bundle_composition()]
+    vec![mob_bundle_composition(), external_tool_bundle_composition()]
 }
 
 /// Host composition for the `ops_barrier_satisfaction` handoff protocol.
@@ -511,7 +511,7 @@ fn mob_bundle_composition() -> CompositionSchema {
                 // `authority.apply` submitter would point at nothing.
                 generation_mode: ProtocolGenerationMode::HandleBridge,
                 required_imports: vec![
-                    "use crate::handles::TurnStateHandle;".into(),
+                    "use crate::handles::{DslTransitionError, TurnStateHandle};".into(),
                     "use crate::lifecycle::identifiers::WaitRequestId;".into(),
                     "use crate::ops::OperationId;".into(),
                     "use crate::ops_lifecycle::WaitAllSatisfied;".into(),
@@ -554,6 +554,265 @@ fn mob_bundle_composition() -> CompositionSchema {
             ],
         }],
         witnesses: vec![witness("ops_barrier_close_round_trip", &[])],
+        deep_domain_cardinality: 3,
+        deep_domain_overrides: std::collections::BTreeMap::new(),
+        witness_domain_cardinality: 2,
+        ci_limits: Some(default_ci_limits()),
+        closed_world: true,
+    }
+}
+
+/// Host composition for the `surface_completion` and
+/// `surface_snapshot_alignment` handoff protocols.
+///
+/// Both protocols' producer-side effects are emitted by the runtime's
+/// hand-written `ExternalToolSurfaceAuthority`. The compat
+/// `ExternalToolSurfaceBridgeMachine` mirrors each effect's shape and
+/// hosts the `handoff_protocol` annotation that the canonical DSL
+/// macro cannot express.
+///
+/// - `surface_completion` — EffectExtractor (scans `ExternalToolSurfaceEffect`
+///   for `ScheduleSurfaceCompletion` variants) + HandleBridge
+///   (`mark_pending_succeeded` / `mark_pending_failed` on
+///   `ExternalToolSurfaceHandle`). No authority submitter is emitted —
+///   feedback flows through the handle.
+/// - `surface_snapshot_alignment` — EffectExtractor + HandleBridge
+///   (`snapshot_aligned`). Same shape, single field.
+fn external_tool_bundle_composition() -> CompositionSchema {
+    let mut completion_methods = BTreeMap::new();
+    completion_methods.insert("PendingSucceeded".into(), "mark_pending_succeeded".into());
+    completion_methods.insert("PendingFailed".into(), "mark_pending_failed".into());
+    let mut completion_accessors = BTreeMap::new();
+    // Handle takes `String` surface_id; obligation carries typed SurfaceId.
+    completion_accessors.insert("PendingSucceeded.surface_id".into(), ".0".into());
+    completion_accessors.insert("PendingFailed.surface_id".into(), ".0".into());
+    let mut completion_forwarded = BTreeMap::new();
+    // `mark_pending_succeeded(surface_id, pending_task_sequence, staged_intent_sequence)`.
+    completion_forwarded.insert(
+        "PendingSucceeded".into(),
+        vec![
+            "surface_id".into(),
+            "pending_task_sequence".into(),
+            "staged_intent_sequence".into(),
+        ],
+    );
+    // `mark_pending_failed(surface_id, reason)` — `reason` is owner-context.
+    completion_forwarded.insert(
+        "PendingFailed".into(),
+        vec!["surface_id".into(), "reason".into()],
+    );
+
+    let mut snapshot_methods = BTreeMap::new();
+    snapshot_methods.insert("SnapshotAligned".into(), "snapshot_aligned".into());
+    let mut snapshot_forwarded = BTreeMap::new();
+    snapshot_forwarded.insert("SnapshotAligned".into(), vec!["snapshot_epoch".into()]);
+
+    CompositionSchema {
+        name: "external_tool_bundle".into(),
+        machines: vec![MachineInstance {
+            instance_id: "external_tool_surface".into(),
+            machine_name: "ExternalToolSurfaceBridgeMachine".into(),
+            actor: "external_tool_surface_authority".into(),
+        }],
+        actors: vec![
+            machine_actor("external_tool_surface_authority"),
+            owner_actor("surface_host_owner"),
+        ],
+        handoff_protocols: vec![
+            // Protocol 1: surface_completion — dual-mode emission
+            // (EffectExtractor + HandleBridge).
+            EffectHandoffProtocol {
+                name: "surface_completion".into(),
+                producer_instance: "external_tool_surface".into(),
+                effect_variant: "ScheduleSurfaceCompletion".into(),
+                realizing_actor: "surface_host_owner".into(),
+                correlation_fields: vec![
+                    "surface_id".into(),
+                    "pending_task_sequence".into(),
+                ],
+                obligation_fields: vec![
+                    "surface_id".into(),
+                    "operation".into(),
+                    "pending_task_sequence".into(),
+                    "staged_intent_sequence".into(),
+                    "applied_at_turn".into(),
+                ],
+                allowed_feedback_inputs: vec![
+                    FeedbackInputRef {
+                        machine_instance: "external_tool_surface".into(),
+                        input_variant: "PendingSucceeded".into(),
+                        field_bindings: vec![
+                            FeedbackFieldBinding {
+                                input_field: "surface_id".into(),
+                                source: FeedbackFieldSource::ObligationField(
+                                    "surface_id".into(),
+                                ),
+                            },
+                            FeedbackFieldBinding {
+                                input_field: "pending_task_sequence".into(),
+                                source: FeedbackFieldSource::ObligationField(
+                                    "pending_task_sequence".into(),
+                                ),
+                            },
+                            FeedbackFieldBinding {
+                                input_field: "staged_intent_sequence".into(),
+                                source: FeedbackFieldSource::ObligationField(
+                                    "staged_intent_sequence".into(),
+                                ),
+                            },
+                        ],
+                    },
+                    FeedbackInputRef {
+                        machine_instance: "external_tool_surface".into(),
+                        input_variant: "PendingFailed".into(),
+                        field_bindings: vec![
+                            FeedbackFieldBinding {
+                                input_field: "surface_id".into(),
+                                source: FeedbackFieldSource::ObligationField(
+                                    "surface_id".into(),
+                                ),
+                            },
+                            FeedbackFieldBinding {
+                                input_field: "pending_task_sequence".into(),
+                                source: FeedbackFieldSource::ObligationField(
+                                    "pending_task_sequence".into(),
+                                ),
+                            },
+                            FeedbackFieldBinding {
+                                input_field: "reason".into(),
+                                source: FeedbackFieldSource::OwnerContext("reason".into()),
+                            },
+                        ],
+                    },
+                ],
+                closure_policy: ClosurePolicy::AckRequired,
+                liveness_annotation: Some(
+                    "eventual feedback under surface connection liveness".into(),
+                ),
+                rust: ProtocolRustBinding {
+                    module_path: "meerkat-mcp/src/generated/protocol_surface_completion.rs".into(),
+                    generation_mode: ProtocolGenerationMode::EffectExtractor,
+                    required_imports: vec![
+                        "use crate::external_tool_surface_authority::{ExternalToolSurfaceEffect, SurfaceDeltaOperation, SurfaceId, TurnNumber};".into(),
+                        "use meerkat_core::handles::{DslTransitionError, ExternalToolSurfaceHandle};".into(),
+                    ],
+                    // No authority submitters; feedback flows through the
+                    // handle only. EffectExtractor emits `extract_obligations`
+                    // only (no authority.apply submitter).
+                    authority_type_path: None,
+                    mutator_trait_path: None,
+                    input_enum_path: None,
+                    effect_enum_path: Some(
+                        "crate::external_tool_surface_authority::ExternalToolSurfaceEffect".into(),
+                    ),
+                    transition_type_path: None,
+                    error_type_path: None,
+                    executor_trigger_input_variant: None,
+                    bridge_source_type_path: None,
+                    helper_return_shape: ProtocolHelperReturnShape::Obligations,
+                    handle_trait_path: Some(
+                        "meerkat_core::handles::ExternalToolSurfaceHandle".into(),
+                    ),
+                    handle_method_names: completion_methods,
+                    handle_arg_accessors: completion_accessors,
+                    handle_method_forwarded_fields: completion_forwarded,
+                    additional_modes: vec![ProtocolGenerationMode::HandleBridge],
+                },
+            },
+            // Protocol 2: surface_snapshot_alignment — dual-mode.
+            EffectHandoffProtocol {
+                name: "surface_snapshot_alignment".into(),
+                producer_instance: "external_tool_surface".into(),
+                effect_variant: "RefreshVisibleSurfaceSet".into(),
+                realizing_actor: "surface_host_owner".into(),
+                correlation_fields: vec!["snapshot_epoch".into()],
+                obligation_fields: vec!["snapshot_epoch".into()],
+                allowed_feedback_inputs: vec![FeedbackInputRef {
+                    machine_instance: "external_tool_surface".into(),
+                    input_variant: "SnapshotAligned".into(),
+                    field_bindings: vec![FeedbackFieldBinding {
+                        input_field: "snapshot_epoch".into(),
+                        source: FeedbackFieldSource::ObligationField("snapshot_epoch".into()),
+                    }],
+                }],
+                closure_policy: ClosurePolicy::AckRequired,
+                liveness_annotation: Some(
+                    "eventual snapshot acknowledgement under surface host liveness".into(),
+                ),
+                rust: ProtocolRustBinding {
+                    module_path:
+                        "meerkat-mcp/src/generated/protocol_surface_snapshot_alignment.rs".into(),
+                    generation_mode: ProtocolGenerationMode::EffectExtractor,
+                    required_imports: vec![
+                        "use crate::external_tool_surface_authority::ExternalToolSurfaceEffect;".into(),
+                        "use meerkat_core::handles::{DslTransitionError, ExternalToolSurfaceHandle};".into(),
+                    ],
+                    authority_type_path: None,
+                    mutator_trait_path: None,
+                    input_enum_path: None,
+                    effect_enum_path: Some(
+                        "crate::external_tool_surface_authority::ExternalToolSurfaceEffect".into(),
+                    ),
+                    transition_type_path: None,
+                    error_type_path: None,
+                    executor_trigger_input_variant: None,
+                    bridge_source_type_path: None,
+                    helper_return_shape: ProtocolHelperReturnShape::Obligations,
+                    handle_trait_path: Some(
+                        "meerkat_core::handles::ExternalToolSurfaceHandle".into(),
+                    ),
+                    handle_method_names: snapshot_methods,
+                    handle_arg_accessors: BTreeMap::new(),
+                    handle_method_forwarded_fields: snapshot_forwarded,
+                    additional_modes: vec![ProtocolGenerationMode::HandleBridge],
+                },
+            },
+        ],
+        entry_inputs: vec![],
+        routes: vec![],
+        route_target_selectors: vec![],
+        driver: None,
+        transaction_plans: vec![],
+        actor_priorities: vec![],
+        scheduler_rules: vec![],
+        invariants: vec![
+            CompositionInvariant {
+                name: "surface_completion_protocol_covered".into(),
+                kind: CompositionInvariantKind::HandoffProtocolCovered {
+                    producer_instance: "external_tool_surface".into(),
+                    effect_variant: "ScheduleSurfaceCompletion".into(),
+                    protocol_name: "surface_completion".into(),
+                },
+                statement:
+                    "pending-op completion on a tool surface is returned to the authority only through the explicit `surface_completion` protocol"
+                        .into(),
+                references_machines: vec!["external_tool_surface".into()],
+                references_actors: vec![
+                    "external_tool_surface_authority".into(),
+                    "surface_host_owner".into(),
+                ],
+            },
+            CompositionInvariant {
+                name: "surface_snapshot_alignment_protocol_covered".into(),
+                kind: CompositionInvariantKind::HandoffProtocolCovered {
+                    producer_instance: "external_tool_surface".into(),
+                    effect_variant: "RefreshVisibleSurfaceSet".into(),
+                    protocol_name: "surface_snapshot_alignment".into(),
+                },
+                statement:
+                    "visible-set refresh acknowledgement crosses back through the explicit `surface_snapshot_alignment` protocol rather than ad-hoc polling"
+                        .into(),
+                references_machines: vec!["external_tool_surface".into()],
+                references_actors: vec![
+                    "external_tool_surface_authority".into(),
+                    "surface_host_owner".into(),
+                ],
+            },
+        ],
+        witnesses: vec![
+            witness("surface_completion_round_trip", &[]),
+            witness("surface_snapshot_alignment_round_trip", &[]),
+        ],
         deep_domain_cardinality: 3,
         deep_domain_overrides: std::collections::BTreeMap::new(),
         witness_domain_cardinality: 2,
