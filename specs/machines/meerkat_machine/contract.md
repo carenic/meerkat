@@ -37,6 +37,10 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `supervisor_bound_peer_id`: `Option<String>`
 - `supervisor_bound_address`: `Option<String>`
 - `supervisor_bound_epoch`: `Option<u64>`
+- `local_endpoint`: `Option<PeerEndpoint>`
+- `direct_peer_endpoints`: `Set<PeerEndpoint>`
+- `mob_overlay_peer_endpoints`: `Set<PeerEndpoint>`
+- `peer_projection_epoch`: `u64`
 
 ## Inputs
 - `RegisterSession`(session_id: SessionId)
@@ -124,6 +128,11 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `BindSupervisor`(name: String, peer_id: String, address: String, epoch: u64)
 - `AuthorizeSupervisor`(name: String, peer_id: String, address: String, epoch: u64)
 - `RevokeSupervisor`(peer_id: String, epoch: u64)
+- `PublishLocalEndpoint`(endpoint: PeerEndpoint)
+- `ClearLocalEndpoint`
+- `AddDirectPeerEndpoint`(endpoint: PeerEndpoint)
+- `RemoveDirectPeerEndpoint`(endpoint: PeerEndpoint)
+- `ApplyMobPeerOverlay`(epoch: u64, endpoints: Set<PeerEndpoint>)
 
 ## Surface-only Inputs
 - `ContainsSession`
@@ -214,6 +223,9 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RealtimeProjectionFreshnessChanged`(new_freshness: RealtimeProjectionFreshness, frontier_ms: u64)
 - `RealtimeReconnectPolicyChanged`(new_policy: RealtimeReconnectPolicy)
 - `LiveTopologyPhaseChanged`
+- `LocalEndpointChanged`(endpoint: Option<PeerEndpoint>)
+- `PeerProjectionChanged`(peer_projection_epoch: u64)
+- `CommsTrustReconcileRequested`(peer_projection_epoch: u64)
 
 ## Invariants
 - `fence_requires_bound_runtime`
@@ -3560,6 +3572,120 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `peer_id_matches_current`
   - `epoch_matches_current`
 - To: `Stopped`
+
+### `PublishLocalEndpointIdle`
+- From: `Idle`
+- On: `PublishLocalEndpoint`(endpoint)
+- Emits: `LocalEndpointChanged`
+- To: `Idle`
+
+### `PublishLocalEndpointAttached`
+- From: `Attached`
+- On: `PublishLocalEndpoint`(endpoint)
+- Emits: `LocalEndpointChanged`
+- To: `Attached`
+
+### `PublishLocalEndpointRunning`
+- From: `Running`
+- On: `PublishLocalEndpoint`(endpoint)
+- Emits: `LocalEndpointChanged`
+- To: `Running`
+
+### `ClearLocalEndpointIdle`
+- From: `Idle`
+- On: `ClearLocalEndpoint`()
+- Guards:
+  - `local_endpoint_present`
+- Emits: `LocalEndpointChanged`
+- To: `Idle`
+
+### `ClearLocalEndpointAttached`
+- From: `Attached`
+- On: `ClearLocalEndpoint`()
+- Guards:
+  - `local_endpoint_present`
+- Emits: `LocalEndpointChanged`
+- To: `Attached`
+
+### `ClearLocalEndpointRunning`
+- From: `Running`
+- On: `ClearLocalEndpoint`()
+- Guards:
+  - `local_endpoint_present`
+- Emits: `LocalEndpointChanged`
+- To: `Running`
+
+### `AddDirectPeerEndpointIdle`
+- From: `Idle`
+- On: `AddDirectPeerEndpoint`(endpoint)
+- Guards:
+  - `endpoint_not_already_direct`
+- Emits: `PeerProjectionChanged`, `CommsTrustReconcileRequested`
+- To: `Idle`
+
+### `AddDirectPeerEndpointAttached`
+- From: `Attached`
+- On: `AddDirectPeerEndpoint`(endpoint)
+- Guards:
+  - `endpoint_not_already_direct`
+- Emits: `PeerProjectionChanged`, `CommsTrustReconcileRequested`
+- To: `Attached`
+
+### `AddDirectPeerEndpointRunning`
+- From: `Running`
+- On: `AddDirectPeerEndpoint`(endpoint)
+- Guards:
+  - `endpoint_not_already_direct`
+- Emits: `PeerProjectionChanged`, `CommsTrustReconcileRequested`
+- To: `Running`
+
+### `RemoveDirectPeerEndpointIdle`
+- From: `Idle`
+- On: `RemoveDirectPeerEndpoint`(endpoint)
+- Guards:
+  - `endpoint_present_in_direct`
+- Emits: `PeerProjectionChanged`, `CommsTrustReconcileRequested`
+- To: `Idle`
+
+### `RemoveDirectPeerEndpointAttached`
+- From: `Attached`
+- On: `RemoveDirectPeerEndpoint`(endpoint)
+- Guards:
+  - `endpoint_present_in_direct`
+- Emits: `PeerProjectionChanged`, `CommsTrustReconcileRequested`
+- To: `Attached`
+
+### `RemoveDirectPeerEndpointRunning`
+- From: `Running`
+- On: `RemoveDirectPeerEndpoint`(endpoint)
+- Guards:
+  - `endpoint_present_in_direct`
+- Emits: `PeerProjectionChanged`, `CommsTrustReconcileRequested`
+- To: `Running`
+
+### `ApplyMobPeerOverlayIdle`
+- From: `Idle`
+- On: `ApplyMobPeerOverlay`(epoch, endpoints)
+- Guards:
+  - `stale_overlay_epoch`
+- Emits: `PeerProjectionChanged`, `CommsTrustReconcileRequested`
+- To: `Idle`
+
+### `ApplyMobPeerOverlayAttached`
+- From: `Attached`
+- On: `ApplyMobPeerOverlay`(epoch, endpoints)
+- Guards:
+  - `stale_overlay_epoch`
+- Emits: `PeerProjectionChanged`, `CommsTrustReconcileRequested`
+- To: `Attached`
+
+### `ApplyMobPeerOverlayRunning`
+- From: `Running`
+- On: `ApplyMobPeerOverlay`(epoch, endpoints)
+- Guards:
+  - `stale_overlay_epoch`
+- Emits: `PeerProjectionChanged`, `CommsTrustReconcileRequested`
+- To: `Running`
 
 ## Coverage
 ### Code Anchors

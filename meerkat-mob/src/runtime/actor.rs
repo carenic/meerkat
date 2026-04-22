@@ -2244,7 +2244,15 @@ impl MobActor {
                             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                         }
                     }
-                    self.handle_spawn_provisioned_batch(completions).await;
+                    // Box::pin: the `handle_spawn_provisioned_batch`
+                    // future tips past clippy's `large_futures` 16 KiB
+                    // threshold after Track-B R5 added
+                    // `peer_projection_*` state to `MeerkatMachine` —
+                    // the enum size cascades through the actor's
+                    // transitive borrows. Heap-allocating the future
+                    // keeps the polling stack frame small without
+                    // reshaping the handler.
+                    Box::pin(self.handle_spawn_provisioned_batch(completions)).await;
                 }
                 MobCommand::Retire {
                     agent_identity,
