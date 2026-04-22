@@ -558,6 +558,10 @@ impl ProviderRuntime for AnthropicProviderRuntime {
     }
 }
 
+#[cfg(any(
+    all(not(target_arch = "wasm32"), feature = "bedrock"),
+    all(not(target_arch = "wasm32"), feature = "vertex")
+))]
 fn backend_option_string(binding: &ValidatedBinding, key: &str) -> Option<String> {
     binding
         .backend_profile
@@ -567,6 +571,7 @@ fn backend_option_string(binding: &ValidatedBinding, key: &str) -> Option<String
         .map(ToString::to_string)
 }
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "bedrock"))]
 fn bedrock_region(binding: &ValidatedBinding) -> String {
     backend_option_string(binding, "aws_region")
         .or_else(|| backend_option_string(binding, "region"))

@@ -436,6 +436,10 @@ impl ProviderRuntime for GoogleProviderRuntime {
     }
 }
 
+#[cfg(any(
+    all(not(target_arch = "wasm32"), feature = "adc"),
+    all(not(target_arch = "wasm32"), feature = "oauth")
+))]
 fn backend_option_string(binding: &ValidatedBinding, key: &str) -> Option<String> {
     binding
         .backend_profile
