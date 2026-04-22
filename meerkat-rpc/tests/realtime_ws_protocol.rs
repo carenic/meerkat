@@ -1212,7 +1212,7 @@ async fn audio_input_uses_product_session_factory_and_streams_provider_events() 
         RealtimeInputChunk::AudioChunk(RealtimeAudioChunk { data, .. }) if data == "AQID"
     )));
     assert_eq!(*attach_calls.lock().await, 0);
-    assert_eq!(*open_calls.lock().await, 2);
+    assert_eq!(*open_calls.lock().await, 1);
 
     let _ = ws_stream.close(None).await;
     server.abort();
