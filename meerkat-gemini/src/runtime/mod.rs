@@ -7,20 +7,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-#[allow(unused_imports)]
 use meerkat_core::AuthError;
-#[allow(unused_imports)]
 use meerkat_core::HttpAuthorizer;
 use meerkat_core::{AuthLease, AuthMetadata, AuthProfile, BackendProfile, BindingPolicy, Provider};
 
-#[allow(unused_imports)]
 use meerkat_auth_core::resolver::refresh_allowed;
 use meerkat_auth_core::resolver::{
     finalize_auth_metadata, interactive_login_error, resolve_external_authorizer,
     resolve_simple_secret,
 };
 use meerkat_llm_core::LlmClient;
-#[allow(unused_imports)]
 use meerkat_llm_core::provider_runtime::binding::DynamicLease;
 use meerkat_llm_core::provider_runtime::binding::{
     NormalizedAuthMethod, NormalizedBackendKind, ResolvedConnection, StaticLease, ValidatedBinding,
@@ -440,7 +436,6 @@ impl ProviderRuntime for GoogleProviderRuntime {
     }
 }
 
-#[allow(dead_code)]
 fn backend_option_string(binding: &ValidatedBinding, key: &str) -> Option<String> {
     binding
         .backend_profile

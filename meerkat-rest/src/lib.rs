@@ -2710,11 +2710,6 @@ fn config_runtime_err_to_api(err: meerkat_core::ConfigRuntimeError) -> ApiError 
     }
 }
 
-#[allow(dead_code)]
-fn validate_config_for_commit(config: &Config) -> Result<(), ApiError> {
-    validate_config_for_commit_with_roots(config, None, None)
-}
-
 fn validate_config_for_commit_with_roots(
     config: &Config,
     context_root: Option<&std::path::Path>,
@@ -4717,32 +4712,6 @@ mod tests {
         (addr, captured_rx, task)
     }
 
-    #[allow(dead_code)]
-    fn live_test_definition(mob_id: &str) -> meerkat_mob::MobDefinition {
-        let mut profiles = std::collections::BTreeMap::new();
-        profiles.insert(
-            meerkat_mob::ProfileName::from("worker"),
-            meerkat_mob::ProfileBinding::Inline(meerkat_mob::profile::Profile {
-                model: "claude-sonnet-4-5".to_string(),
-                skills: Vec::new(),
-                tools: meerkat_mob::profile::ToolConfig {
-                    comms: true,
-                    ..meerkat_mob::profile::ToolConfig::default()
-                },
-                peer_description: "worker".to_string(),
-                external_addressable: false,
-                backend: None,
-                runtime_mode: meerkat_mob::MobRuntimeMode::TurnDriven,
-                max_inline_peer_notifications: None,
-                output_schema: None,
-                provider_params: None,
-            }),
-        );
-        let mut definition = meerkat_mob::MobDefinition::explicit(meerkat_mob::MobId::from(mob_id));
-        definition.profiles = profiles;
-        definition
-    }
-
     struct MockLlmClient;
 
     struct ErrorLlmClient;
@@ -4773,22 +4742,6 @@ mod tests {
         async fn health_check(&self) -> Result<(), LlmError> {
             Ok(())
         }
-    }
-
-    #[allow(dead_code)]
-    fn install_mock_mob_llm_client(
-        state: &mut AppState,
-        runtime_root: &std::path::Path,
-        mock_client: Arc<dyn LlmClient>,
-    ) {
-        state.mob_state = Arc::new(
-            meerkat_mob_mcp::MobMcpState::new_with_runtime_adapter(
-                state.session_service.clone(),
-                Some(state.runtime_adapter.clone()),
-            )
-            .with_persistent_storage_root(Some(runtime_root.to_path_buf()))
-            .with_default_llm_client(Some(mock_client)),
-        );
     }
 
     #[async_trait]
@@ -6148,7 +6101,8 @@ mod tests {
             },
         ];
 
-        let err = validate_config_for_commit(&config).expect_err("duplicate source uuid");
+        let err = validate_config_for_commit_with_roots(&config, None, None)
+            .expect_err("duplicate source uuid");
         assert!(matches!(&err, ApiError::BadRequest(_)));
         if let ApiError::BadRequest(message) = err {
             assert!(message.contains("Invalid skills source-identity config"));

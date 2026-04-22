@@ -90,19 +90,6 @@ fn apply_patch_preview(config: &Config, patch: Value) -> Result<Config, String> 
 }
 
 #[allow(clippy::result_large_err)]
-#[allow(dead_code)]
-fn validate_config_for_commit(id: Option<RpcId>, config: &Config) -> Result<(), RpcResponse> {
-    config.validate().map_err(|err| {
-        RpcResponse::error(
-            id.clone(),
-            error::INVALID_PARAMS,
-            format!("Invalid config: {err}"),
-        )
-    })?;
-    build_registry_or_invalid_params(id, config, None, None).map(|_| ())
-}
-
-#[allow(clippy::result_large_err)]
 fn validate_config_for_runtime(
     id: Option<RpcId>,
     config: &Config,

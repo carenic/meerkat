@@ -7,11 +7,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-#[allow(unused_imports)]
 use meerkat_core::AuthError;
 use meerkat_core::{AuthLease, AuthMetadata, AuthProfile, BackendProfile, BindingPolicy, Provider};
 
-#[allow(unused_imports)]
 use meerkat_auth_core::resolver::refresh_allowed;
 use meerkat_auth_core::resolver::{
     finalize_auth_metadata, interactive_login_error, resolve_external_authorizer,
