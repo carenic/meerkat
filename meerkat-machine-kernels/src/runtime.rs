@@ -208,12 +208,19 @@ pub struct GeneratedMachineKernel {
     schema: MachineSchema,
 }
 
+#[allow(dead_code)]
 pub(crate) type RawValue = KernelValue;
+#[allow(dead_code)]
 pub(crate) type RawState = KernelState;
+#[allow(dead_code)]
 pub(crate) type RawInput = KernelInput;
+#[allow(dead_code)]
 pub(crate) type RawSignal = KernelSignal;
+#[allow(dead_code)]
 pub(crate) type RawEffect = KernelEffect;
+#[allow(dead_code)]
 pub(crate) type RawOutcome = TransitionOutcome;
+#[allow(dead_code)]
 pub(crate) type RawRefusal = TransitionRefusal;
 
 impl GeneratedMachineKernel {
@@ -1046,10 +1053,12 @@ impl GeneratedMachineKernel {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn initial_state_from_schema(schema: MachineSchema) -> Result<RawState, RawRefusal> {
     GeneratedMachineKernel::new(schema).initial_state()
 }
 
+#[allow(dead_code)]
 pub(crate) fn transition_from_schema(
     schema: MachineSchema,
     state: &RawState,
@@ -1058,6 +1067,7 @@ pub(crate) fn transition_from_schema(
     GeneratedMachineKernel::new(schema).transition(state, input)
 }
 
+#[allow(dead_code)]
 pub(crate) fn transition_signal_from_schema(
     schema: MachineSchema,
     state: &RawState,
@@ -1066,6 +1076,7 @@ pub(crate) fn transition_signal_from_schema(
     GeneratedMachineKernel::new(schema).transition_signal(state, signal)
 }
 
+#[allow(dead_code)]
 pub(crate) fn evaluate_helper_from_schema(
     schema: MachineSchema,
     state: &RawState,

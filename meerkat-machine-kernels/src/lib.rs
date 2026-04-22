@@ -1,4 +1,5 @@
 pub mod generated;
+#[cfg(feature = "test-oracle")]
 mod runtime;
 
 #[cfg(feature = "test-oracle")]

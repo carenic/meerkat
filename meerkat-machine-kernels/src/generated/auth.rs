@@ -20,12 +20,6 @@ pub fn schema() -> meerkat_machine_schema::MachineSchema {
     meerkat_machine_schema::catalog::dsl::dsl_auth_machine()
 }
 
-use crate::runtime::{
-    RawEffect, RawInput, RawOutcome, RawRefusal, RawSignal, RawState, RawValue,
-    evaluate_helper_from_schema, initial_state_from_schema, transition_from_schema,
-    transition_signal_from_schema,
-};
-
 pub type AuthLifecyclePhase = String;
 
 pub trait Context {}
@@ -52,121 +46,6 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         initial_state()
-    }
-}
-
-fn phase_from_raw(raw: &str) -> Result<Phase, KernelError> {
-    match raw {
-        "Valid" => Ok(Phase::Valid),
-        "Expiring" => Ok(Phase::Expiring),
-        "Refreshing" => Ok(Phase::Refreshing),
-        "ReauthRequired" => Ok(Phase::ReauthRequired),
-        "Released" => Ok(Phase::Released),
-        other => Err(KernelError::CodegenInvariant {
-            detail: format!("unknown phase {other}"),
-        }),
-    }
-}
-
-fn state_from_raw(raw: &RawState) -> Result<State, KernelError> {
-    Ok(State {
-        phase: phase_from_raw(&raw.phase)?,
-        expires_at: match raw.fields.get("expires_at").ok_or_else(|| {
-            KernelError::CodegenInvariant {
-                detail: "missing field expires_at".into(),
-            }
-        })? {
-            RawValue::None => None,
-            RawValue::Map(entries) => match entries.get(&RawValue::String("value".into())) {
-                Some(value) => Some(match value {
-                    RawValue::U64(value) => *value,
-                    other => {
-                        return Err(KernelError::CodegenInvariant {
-                            detail: format!("expected u64, found {other:?}"),
-                        });
-                    }
-                }),
-                None => None,
-            },
-            other => {
-                return Err(KernelError::CodegenInvariant {
-                    detail: format!("expected option, found {other:?}"),
-                });
-            }
-        },
-        last_refresh: match raw.fields.get("last_refresh").ok_or_else(|| {
-            KernelError::CodegenInvariant {
-                detail: "missing field last_refresh".into(),
-            }
-        })? {
-            RawValue::None => None,
-            RawValue::Map(entries) => match entries.get(&RawValue::String("value".into())) {
-                Some(value) => Some(match value {
-                    RawValue::U64(value) => *value,
-                    other => {
-                        return Err(KernelError::CodegenInvariant {
-                            detail: format!("expected u64, found {other:?}"),
-                        });
-                    }
-                }),
-                None => None,
-            },
-            other => {
-                return Err(KernelError::CodegenInvariant {
-                    detail: format!("expected option, found {other:?}"),
-                });
-            }
-        },
-        refresh_attempt: match raw.fields.get("refresh_attempt").ok_or_else(|| {
-            KernelError::CodegenInvariant {
-                detail: "missing field refresh_attempt".into(),
-            }
-        })? {
-            RawValue::U64(value) => *value,
-            other => {
-                return Err(KernelError::CodegenInvariant {
-                    detail: format!("expected u64, found {other:?}"),
-                });
-            }
-        },
-    })
-}
-
-fn state_to_raw(state: &State) -> RawState {
-    let mut fields = std::collections::BTreeMap::new();
-    fields.insert(
-        "expires_at".into(),
-        match state.expires_at.as_ref() {
-            Some(value) => RawValue::Map(std::collections::BTreeMap::from([(
-                RawValue::String("value".into()),
-                RawValue::U64((value).to_owned() as u64),
-            )])),
-            None => RawValue::None,
-        },
-    );
-    fields.insert(
-        "last_refresh".into(),
-        match state.last_refresh.as_ref() {
-            Some(value) => RawValue::Map(std::collections::BTreeMap::from([(
-                RawValue::String("value".into()),
-                RawValue::U64((value).to_owned() as u64),
-            )])),
-            None => RawValue::None,
-        },
-    );
-    fields.insert(
-        "refresh_attempt".into(),
-        RawValue::U64((state.refresh_attempt).to_owned() as u64),
-    );
-    RawState {
-        phase: match state.phase {
-            Phase::Valid => "Valid".into(),
-            Phase::Expiring => "Expiring".into(),
-            Phase::Refreshing => "Refreshing".into(),
-            Phase::ReauthRequired => "ReauthRequired".into(),
-            Phase::Released => "Released".into(),
-        },
-        fields,
     }
 }
 
@@ -218,104 +97,6 @@ pub enum InputKind {
     Release,
 }
 
-fn input_kind_from_raw(raw: &str) -> Option<InputKind> {
-    match raw {
-        "Acquire" => Some(InputKind::Acquire),
-        "MarkExpiring" => Some(InputKind::MarkExpiring),
-        "BeginRefresh" => Some(InputKind::BeginRefresh),
-        "CompleteRefresh" => Some(InputKind::CompleteRefresh),
-        "RefreshFailedTransient" => Some(InputKind::RefreshFailedTransient),
-        "RefreshFailedPermanent" => Some(InputKind::RefreshFailedPermanent),
-        "MarkReauthRequired" => Some(InputKind::MarkReauthRequired),
-        "Release" => Some(InputKind::Release),
-        _ => None,
-    }
-}
-fn input_to_raw(input: Input) -> RawInput {
-    match input {
-        Input::Acquire(payload) => RawInput {
-            variant: "Acquire".into(),
-            fields: {
-                let mut fields = std::collections::BTreeMap::new();
-                fields.insert(
-                    "expires_at_ts".into(),
-                    match payload.expires_at_ts.as_ref() {
-                        Some(value) => RawValue::Map(std::collections::BTreeMap::from([(
-                            RawValue::String("value".into()),
-                            RawValue::U64((value).to_owned() as u64),
-                        )])),
-                        None => RawValue::None,
-                    },
-                );
-                fields
-            },
-        },
-        Input::MarkExpiring(payload) => RawInput {
-            variant: "MarkExpiring".into(),
-            fields: {
-                let mut fields = std::collections::BTreeMap::new();
-                fields
-            },
-        },
-        Input::BeginRefresh(payload) => RawInput {
-            variant: "BeginRefresh".into(),
-            fields: {
-                let mut fields = std::collections::BTreeMap::new();
-                fields
-            },
-        },
-        Input::CompleteRefresh(payload) => RawInput {
-            variant: "CompleteRefresh".into(),
-            fields: {
-                let mut fields = std::collections::BTreeMap::new();
-                fields.insert(
-                    "new_expires_at".into(),
-                    match payload.new_expires_at.as_ref() {
-                        Some(value) => RawValue::Map(std::collections::BTreeMap::from([(
-                            RawValue::String("value".into()),
-                            RawValue::U64((value).to_owned() as u64),
-                        )])),
-                        None => RawValue::None,
-                    },
-                );
-                fields.insert(
-                    "now_ts".into(),
-                    RawValue::U64((payload.now_ts).to_owned() as u64),
-                );
-                fields
-            },
-        },
-        Input::RefreshFailedTransient(payload) => RawInput {
-            variant: "RefreshFailedTransient".into(),
-            fields: {
-                let mut fields = std::collections::BTreeMap::new();
-                fields
-            },
-        },
-        Input::RefreshFailedPermanent(payload) => RawInput {
-            variant: "RefreshFailedPermanent".into(),
-            fields: {
-                let mut fields = std::collections::BTreeMap::new();
-                fields
-            },
-        },
-        Input::MarkReauthRequired(payload) => RawInput {
-            variant: "MarkReauthRequired".into(),
-            fields: {
-                let mut fields = std::collections::BTreeMap::new();
-                fields
-            },
-        },
-        Input::Release(payload) => RawInput {
-            variant: "Release".into(),
-            fields: {
-                let mut fields = std::collections::BTreeMap::new();
-                fields
-            },
-        },
-    }
-}
-
 pub mod effects {
     use super::*;
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -335,29 +116,6 @@ pub enum Effect {
 pub enum EffectKind {
     EmitLifecycleEvent,
     WakeRefreshLoop,
-}
-
-fn effect_from_raw(raw: &RawEffect) -> Result<Effect, KernelError> {
-    match raw.variant.as_str() {
-        "EmitLifecycleEvent" => Ok(Effect::EmitLifecycleEvent(effects::EmitLifecycleEvent {
-            new_state: match raw.fields.get("new_state").ok_or_else(|| {
-                KernelError::CodegenInvariant {
-                    detail: "missing effect field new_state".into(),
-                }
-            })? {
-                RawValue::String(value) => value.clone(),
-                other => {
-                    return Err(KernelError::CodegenInvariant {
-                        detail: format!("expected named string value, found {other:?}"),
-                    });
-                }
-            },
-        })),
-        "WakeRefreshLoop" => Ok(Effect::WakeRefreshLoop(effects::WakeRefreshLoop {})),
-        other => Err(KernelError::CodegenInvariant {
-            detail: format!("unknown effect {other}"),
-        }),
-    }
 }
 
 #[allow(non_camel_case_types)]
@@ -434,77 +192,6 @@ pub struct Outcome {
     pub effects: Vec<Effect>,
 }
 
-fn transition_id_from_raw(raw: &str) -> Result<TransitionId, KernelError> {
-    match raw {
-        "Acquire" => Ok(TransitionId::Acquire),
-        "MarkExpiring" => Ok(TransitionId::MarkExpiring),
-        "BeginRefreshFromValid" => Ok(TransitionId::BeginRefreshFromValid),
-        "BeginRefreshFromExpiring" => Ok(TransitionId::BeginRefreshFromExpiring),
-        "CompleteRefresh" => Ok(TransitionId::CompleteRefresh),
-        "RefreshFailedTransient" => Ok(TransitionId::RefreshFailedTransient),
-        "RefreshFailedPermanent" => Ok(TransitionId::RefreshFailedPermanent),
-        "MarkReauthRequiredFromValid" => Ok(TransitionId::MarkReauthRequiredFromValid),
-        "MarkReauthRequiredFromExpiring" => Ok(TransitionId::MarkReauthRequiredFromExpiring),
-        "MarkReauthRequiredFromRefreshing" => Ok(TransitionId::MarkReauthRequiredFromRefreshing),
-        "Release" => Ok(TransitionId::Release),
-        other => Err(KernelError::CodegenInvariant {
-            detail: format!("unknown transition {other}"),
-        }),
-    }
-}
-fn outcome_from_raw(raw: RawOutcome) -> Result<Outcome, TransitionError> {
-    let effects = raw
-        .effects
-        .iter()
-        .map(effect_from_raw)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(TransitionError::Kernel)?;
-    Ok(Outcome {
-        transition_id: transition_id_from_raw(&raw.transition).map_err(TransitionError::Kernel)?,
-        next_state: state_from_raw(&raw.next_state).map_err(TransitionError::Kernel)?,
-        effects,
-    })
-}
-fn refusal_from_raw(raw: RawRefusal) -> TransitionError {
-    match raw {
-        RawRefusal::NoMatchingTransition { phase, variant, .. } => {
-            TransitionError::Refusal(TransitionRefusal::NoMatchingTransition {
-                phase: phase_from_raw(&phase).unwrap_or(Phase::Valid),
-                trigger: TriggerDiscriminant::Input(input_kind_from_raw(&variant).unwrap()),
-            })
-        }
-        RawRefusal::AmbiguousTransition { transitions, .. } => {
-            TransitionError::Refusal(TransitionRefusal::AmbiguousTransition {
-                transitions: transitions
-                    .iter()
-                    .filter_map(|transition| transition_id_from_raw(transition).ok())
-                    .collect(),
-            })
-        }
-        RawRefusal::UnknownInputVariant { variant, .. } => {
-            TransitionError::Kernel(KernelError::CodegenInvariant {
-                detail: format!("unknown input variant {variant}"),
-            })
-        }
-        RawRefusal::UnknownSignalVariant { variant, .. } => {
-            TransitionError::Kernel(KernelError::CodegenInvariant {
-                detail: format!("unknown signal variant {variant}"),
-            })
-        }
-        RawRefusal::InvalidInputPayload { reason, .. } => {
-            TransitionError::Kernel(KernelError::CodegenInvariant { detail: reason })
-        }
-        RawRefusal::InvalidSignalPayload { reason, .. } => {
-            TransitionError::Kernel(KernelError::CodegenInvariant { detail: reason })
-        }
-        RawRefusal::EvaluationError {
-            transition, reason, ..
-        } => TransitionError::Kernel(KernelError::CodegenInvariant {
-            detail: format!("{transition}: {reason}"),
-        }),
-    }
-}
-
 pub mod helpers {
     use super::*;
     pub fn none<C: Context>(_: &State, context: &C) -> Result<(), KernelError> {
@@ -514,9 +201,12 @@ pub mod helpers {
 }
 
 pub fn initial_state() -> State {
-    let raw = initial_state_from_schema(schema())
-        .expect("typed modeled-kernel initial state should be derivable from schema");
-    state_from_raw(&raw).expect("typed modeled-kernel initial state should convert from raw state")
+    State {
+        phase: Phase::Valid,
+        expires_at: None,
+        last_refresh: None,
+        refresh_attempt: 0,
+    }
 }
 
 pub fn transition<C: Context>(
@@ -524,10 +214,9 @@ pub fn transition<C: Context>(
     input: Input,
     context: &C,
 ) -> Result<Outcome, TransitionError> {
-    let _ = context;
-    let raw_state = state_to_raw(state);
-    let raw_input = input_to_raw(input);
-    transition_from_schema(schema(), &raw_state, &raw_input)
-        .map_err(refusal_from_raw)
-        .and_then(outcome_from_raw)
+    let _ = (state, input, context);
+    Err(TransitionError::Kernel(KernelError::CodegenInvariant {
+        detail: "canonical direct modeled kernel transition not implemented for this machine"
+            .into(),
+    }))
 }

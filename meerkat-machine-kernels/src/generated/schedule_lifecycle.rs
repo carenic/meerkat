@@ -20,12 +20,6 @@ pub fn schema() -> meerkat_machine_schema::MachineSchema {
     meerkat_machine_schema::catalog::dsl::dsl_schedule_lifecycle_machine()
 }
 
-use crate::runtime::{
-    RawEffect, RawInput, RawOutcome, RawRefusal, RawSignal, RawState, RawValue,
-    evaluate_helper_from_schema, initial_state_from_schema, transition_from_schema,
-    transition_signal_from_schema,
-};
-
 pub type MisfirePolicy = String;
 pub type MissingTargetPolicy = String;
 pub type OverlapPolicy = String;
@@ -58,196 +52,6 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         initial_state()
-    }
-}
-
-fn phase_from_raw(raw: &str) -> Result<Phase, KernelError> {
-    match raw {
-        "Active" => Ok(Phase::Active),
-        "Paused" => Ok(Phase::Paused),
-        "Deleted" => Ok(Phase::Deleted),
-        other => Err(KernelError::CodegenInvariant {
-            detail: format!("unknown phase {other}"),
-        }),
-    }
-}
-
-fn state_from_raw(raw: &RawState) -> Result<State, KernelError> {
-    Ok(State {
-        phase: phase_from_raw(&raw.phase)?,
-        revision: match raw
-            .fields
-            .get("revision")
-            .ok_or_else(|| KernelError::CodegenInvariant {
-                detail: "missing field revision".into(),
-            })? {
-            RawValue::U64(value) => *value,
-            other => {
-                return Err(KernelError::CodegenInvariant {
-                    detail: format!("expected u64, found {other:?}"),
-                });
-            }
-        },
-        trigger_key: match raw.fields.get("trigger_key").ok_or_else(|| {
-            KernelError::CodegenInvariant {
-                detail: "missing field trigger_key".into(),
-            }
-        })? {
-            RawValue::String(value) => value.clone(),
-            other => {
-                return Err(KernelError::CodegenInvariant {
-                    detail: format!("expected string, found {other:?}"),
-                });
-            }
-        },
-        target_binding_key: match raw.fields.get("target_binding_key").ok_or_else(|| {
-            KernelError::CodegenInvariant {
-                detail: "missing field target_binding_key".into(),
-            }
-        })? {
-            RawValue::String(value) => value.clone(),
-            other => {
-                return Err(KernelError::CodegenInvariant {
-                    detail: format!("expected string, found {other:?}"),
-                });
-            }
-        },
-        misfire_policy: match raw.fields.get("misfire_policy").ok_or_else(|| {
-            KernelError::CodegenInvariant {
-                detail: "missing field misfire_policy".into(),
-            }
-        })? {
-            RawValue::NamedVariant { enum_name, variant } if enum_name == "MisfirePolicy" => {
-                variant.clone()
-            }
-            other => {
-                return Err(KernelError::CodegenInvariant {
-                    detail: format!("expected enum MisfirePolicy, found {other:?}"),
-                });
-            }
-        },
-        overlap_policy: match raw.fields.get("overlap_policy").ok_or_else(|| {
-            KernelError::CodegenInvariant {
-                detail: "missing field overlap_policy".into(),
-            }
-        })? {
-            RawValue::NamedVariant { enum_name, variant } if enum_name == "OverlapPolicy" => {
-                variant.clone()
-            }
-            other => {
-                return Err(KernelError::CodegenInvariant {
-                    detail: format!("expected enum OverlapPolicy, found {other:?}"),
-                });
-            }
-        },
-        missing_target_policy: match raw.fields.get("missing_target_policy").ok_or_else(|| {
-            KernelError::CodegenInvariant {
-                detail: "missing field missing_target_policy".into(),
-            }
-        })? {
-            RawValue::NamedVariant { enum_name, variant } if enum_name == "MissingTargetPolicy" => {
-                variant.clone()
-            }
-            other => {
-                return Err(KernelError::CodegenInvariant {
-                    detail: format!("expected enum MissingTargetPolicy, found {other:?}"),
-                });
-            }
-        },
-        planning_cursor_utc_ms: match raw.fields.get("planning_cursor_utc_ms").ok_or_else(|| {
-            KernelError::CodegenInvariant {
-                detail: "missing field planning_cursor_utc_ms".into(),
-            }
-        })? {
-            RawValue::None => None,
-            RawValue::Map(entries) => match entries.get(&RawValue::String("value".into())) {
-                Some(value) => Some(match value {
-                    RawValue::U64(value) => *value,
-                    other => {
-                        return Err(KernelError::CodegenInvariant {
-                            detail: format!("expected u64, found {other:?}"),
-                        });
-                    }
-                }),
-                None => None,
-            },
-            other => {
-                return Err(KernelError::CodegenInvariant {
-                    detail: format!("expected option, found {other:?}"),
-                });
-            }
-        },
-        next_occurrence_ordinal: match raw.fields.get("next_occurrence_ordinal").ok_or_else(
-            || KernelError::CodegenInvariant {
-                detail: "missing field next_occurrence_ordinal".into(),
-            },
-        )? {
-            RawValue::U64(value) => *value,
-            other => {
-                return Err(KernelError::CodegenInvariant {
-                    detail: format!("expected u64, found {other:?}"),
-                });
-            }
-        },
-    })
-}
-
-fn state_to_raw(state: &State) -> RawState {
-    let mut fields = std::collections::BTreeMap::new();
-    fields.insert(
-        "revision".into(),
-        RawValue::U64((state.revision).to_owned() as u64),
-    );
-    fields.insert(
-        "trigger_key".into(),
-        RawValue::String((state.trigger_key).to_owned()),
-    );
-    fields.insert(
-        "target_binding_key".into(),
-        RawValue::String((state.target_binding_key).to_owned()),
-    );
-    fields.insert(
-        "misfire_policy".into(),
-        RawValue::NamedVariant {
-            enum_name: "MisfirePolicy".into(),
-            variant: (state.misfire_policy).to_owned(),
-        },
-    );
-    fields.insert(
-        "overlap_policy".into(),
-        RawValue::NamedVariant {
-            enum_name: "OverlapPolicy".into(),
-            variant: (state.overlap_policy).to_owned(),
-        },
-    );
-    fields.insert(
-        "missing_target_policy".into(),
-        RawValue::NamedVariant {
-            enum_name: "MissingTargetPolicy".into(),
-            variant: (state.missing_target_policy).to_owned(),
-        },
-    );
-    fields.insert(
-        "planning_cursor_utc_ms".into(),
-        match state.planning_cursor_utc_ms.as_ref() {
-            Some(value) => RawValue::Map(std::collections::BTreeMap::from([(
-                RawValue::String("value".into()),
-                RawValue::U64((value).to_owned() as u64),
-            )])),
-            None => RawValue::None,
-        },
-    );
-    fields.insert(
-        "next_occurrence_ordinal".into(),
-        RawValue::U64((state.next_occurrence_ordinal).to_owned() as u64),
-    );
-    RawState {
-        phase: match state.phase {
-            Phase::Active => "Active".into(),
-            Phase::Paused => "Paused".into(),
-            Phase::Deleted => "Deleted".into(),
-        },
-        fields,
     }
 }
 
@@ -307,142 +111,6 @@ pub enum InputKind {
     Delete,
 }
 
-fn input_kind_from_raw(raw: &str) -> Option<InputKind> {
-    match raw {
-        "Create" => Some(InputKind::Create),
-        "Revise" => Some(InputKind::Revise),
-        "RecordPlanningWindow" => Some(InputKind::RecordPlanningWindow),
-        "Pause" => Some(InputKind::Pause),
-        "Resume" => Some(InputKind::Resume),
-        "Delete" => Some(InputKind::Delete),
-        _ => None,
-    }
-}
-fn input_to_raw(input: Input) -> RawInput {
-    match input {
-        Input::Create(payload) => RawInput {
-            variant: "Create".into(),
-            fields: {
-                let mut fields = std::collections::BTreeMap::new();
-                fields.insert(
-                    "trigger_key".into(),
-                    RawValue::String((payload.trigger_key).to_owned()),
-                );
-                fields.insert(
-                    "target_binding_key".into(),
-                    RawValue::String((payload.target_binding_key).to_owned()),
-                );
-                fields.insert(
-                    "misfire_policy".into(),
-                    RawValue::NamedVariant {
-                        enum_name: "MisfirePolicy".into(),
-                        variant: (payload.misfire_policy).to_owned(),
-                    },
-                );
-                fields.insert(
-                    "overlap_policy".into(),
-                    RawValue::NamedVariant {
-                        enum_name: "OverlapPolicy".into(),
-                        variant: (payload.overlap_policy).to_owned(),
-                    },
-                );
-                fields.insert(
-                    "missing_target_policy".into(),
-                    RawValue::NamedVariant {
-                        enum_name: "MissingTargetPolicy".into(),
-                        variant: (payload.missing_target_policy).to_owned(),
-                    },
-                );
-                fields
-            },
-        },
-        Input::Revise(payload) => RawInput {
-            variant: "Revise".into(),
-            fields: {
-                let mut fields = std::collections::BTreeMap::new();
-                fields.insert(
-                    "trigger_key".into(),
-                    RawValue::String((payload.trigger_key).to_owned()),
-                );
-                fields.insert(
-                    "target_binding_key".into(),
-                    RawValue::String((payload.target_binding_key).to_owned()),
-                );
-                fields.insert(
-                    "misfire_policy".into(),
-                    RawValue::NamedVariant {
-                        enum_name: "MisfirePolicy".into(),
-                        variant: (payload.misfire_policy).to_owned(),
-                    },
-                );
-                fields.insert(
-                    "overlap_policy".into(),
-                    RawValue::NamedVariant {
-                        enum_name: "OverlapPolicy".into(),
-                        variant: (payload.overlap_policy).to_owned(),
-                    },
-                );
-                fields.insert(
-                    "missing_target_policy".into(),
-                    RawValue::NamedVariant {
-                        enum_name: "MissingTargetPolicy".into(),
-                        variant: (payload.missing_target_policy).to_owned(),
-                    },
-                );
-                fields
-            },
-        },
-        Input::RecordPlanningWindow(payload) => RawInput {
-            variant: "RecordPlanningWindow".into(),
-            fields: {
-                let mut fields = std::collections::BTreeMap::new();
-                fields.insert(
-                    "planning_cursor_utc_ms".into(),
-                    RawValue::U64((payload.planning_cursor_utc_ms).to_owned() as u64),
-                );
-                fields.insert(
-                    "next_occurrence_ordinal".into(),
-                    RawValue::U64((payload.next_occurrence_ordinal).to_owned() as u64),
-                );
-                fields
-            },
-        },
-        Input::Pause(payload) => RawInput {
-            variant: "Pause".into(),
-            fields: {
-                let mut fields = std::collections::BTreeMap::new();
-                fields.insert(
-                    "at_utc_ms".into(),
-                    RawValue::U64((payload.at_utc_ms).to_owned() as u64),
-                );
-                fields
-            },
-        },
-        Input::Resume(payload) => RawInput {
-            variant: "Resume".into(),
-            fields: {
-                let mut fields = std::collections::BTreeMap::new();
-                fields.insert(
-                    "at_utc_ms".into(),
-                    RawValue::U64((payload.at_utc_ms).to_owned() as u64),
-                );
-                fields
-            },
-        },
-        Input::Delete(payload) => RawInput {
-            variant: "Delete".into(),
-            fields: {
-                let mut fields = std::collections::BTreeMap::new();
-                fields.insert(
-                    "at_utc_ms".into(),
-                    RawValue::U64((payload.at_utc_ms).to_owned() as u64),
-                );
-                fields
-            },
-        },
-    }
-}
-
 pub mod effects {
     use super::*;
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -474,85 +142,6 @@ pub enum EffectKind {
     PlanningWindowRecorded,
 }
 
-fn effect_from_raw(raw: &RawEffect) -> Result<Effect, KernelError> {
-    match raw.variant.as_str() {
-        "EmitScheduleNotice" => Ok(Effect::EmitScheduleNotice(effects::EmitScheduleNotice {
-            new_state: match raw.fields.get("new_state").ok_or_else(|| {
-                KernelError::CodegenInvariant {
-                    detail: "missing effect field new_state".into(),
-                }
-            })? {
-                RawValue::String(value) => value.clone(),
-                other => {
-                    return Err(KernelError::CodegenInvariant {
-                        detail: format!("expected named string value, found {other:?}"),
-                    });
-                }
-            },
-            revision: match raw.fields.get("revision").ok_or_else(|| {
-                KernelError::CodegenInvariant {
-                    detail: "missing effect field revision".into(),
-                }
-            })? {
-                RawValue::U64(value) => *value,
-                other => {
-                    return Err(KernelError::CodegenInvariant {
-                        detail: format!("expected u64, found {other:?}"),
-                    });
-                }
-            },
-        })),
-        "SupersedePendingOccurrences" => Ok(Effect::SupersedePendingOccurrences(
-            effects::SupersedePendingOccurrences {
-                superseding_revision: match raw.fields.get("superseding_revision").ok_or_else(
-                    || KernelError::CodegenInvariant {
-                        detail: "missing effect field superseding_revision".into(),
-                    },
-                )? {
-                    RawValue::U64(value) => *value,
-                    other => {
-                        return Err(KernelError::CodegenInvariant {
-                            detail: format!("expected u64, found {other:?}"),
-                        });
-                    }
-                },
-            },
-        )),
-        "PlanningWindowRecorded" => Ok(Effect::PlanningWindowRecorded(
-            effects::PlanningWindowRecorded {
-                planning_cursor_utc_ms: match raw.fields.get("planning_cursor_utc_ms").ok_or_else(
-                    || KernelError::CodegenInvariant {
-                        detail: "missing effect field planning_cursor_utc_ms".into(),
-                    },
-                )? {
-                    RawValue::U64(value) => *value,
-                    other => {
-                        return Err(KernelError::CodegenInvariant {
-                            detail: format!("expected u64, found {other:?}"),
-                        });
-                    }
-                },
-                next_occurrence_ordinal: match raw
-                    .fields
-                    .get("next_occurrence_ordinal")
-                    .ok_or_else(|| KernelError::CodegenInvariant {
-                        detail: "missing effect field next_occurrence_ordinal".into(),
-                    })? {
-                    RawValue::U64(value) => *value,
-                    other => {
-                        return Err(KernelError::CodegenInvariant {
-                            detail: format!("expected u64, found {other:?}"),
-                        });
-                    }
-                },
-            },
-        )),
-        other => Err(KernelError::CodegenInvariant {
-            detail: format!("unknown effect {other}"),
-        }),
-    }
-}
-
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TransitionId {
@@ -569,8 +158,7 @@ pub enum TransitionId {
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GuardId {
-    RecordPlanningWindowActive_planning_window_advances_ordinal,
-    RecordPlanningWindowPaused_planning_window_advances_ordinal,
+    None,
 }
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -626,75 +214,6 @@ pub struct Outcome {
     pub effects: Vec<Effect>,
 }
 
-fn transition_id_from_raw(raw: &str) -> Result<TransitionId, KernelError> {
-    match raw {
-        "CreateSchedule" => Ok(TransitionId::CreateSchedule),
-        "ReviseActive" => Ok(TransitionId::ReviseActive),
-        "RevisePaused" => Ok(TransitionId::RevisePaused),
-        "RecordPlanningWindowActive" => Ok(TransitionId::RecordPlanningWindowActive),
-        "RecordPlanningWindowPaused" => Ok(TransitionId::RecordPlanningWindowPaused),
-        "PauseActiveOrPaused" => Ok(TransitionId::PauseActiveOrPaused),
-        "ResumeActiveOrPaused" => Ok(TransitionId::ResumeActiveOrPaused),
-        "DeleteActive" => Ok(TransitionId::DeleteActive),
-        "DeletePaused" => Ok(TransitionId::DeletePaused),
-        other => Err(KernelError::CodegenInvariant {
-            detail: format!("unknown transition {other}"),
-        }),
-    }
-}
-fn outcome_from_raw(raw: RawOutcome) -> Result<Outcome, TransitionError> {
-    let effects = raw
-        .effects
-        .iter()
-        .map(effect_from_raw)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(TransitionError::Kernel)?;
-    Ok(Outcome {
-        transition_id: transition_id_from_raw(&raw.transition).map_err(TransitionError::Kernel)?,
-        next_state: state_from_raw(&raw.next_state).map_err(TransitionError::Kernel)?,
-        effects,
-    })
-}
-fn refusal_from_raw(raw: RawRefusal) -> TransitionError {
-    match raw {
-        RawRefusal::NoMatchingTransition { phase, variant, .. } => {
-            TransitionError::Refusal(TransitionRefusal::NoMatchingTransition {
-                phase: phase_from_raw(&phase).unwrap_or(Phase::Active),
-                trigger: TriggerDiscriminant::Input(input_kind_from_raw(&variant).unwrap()),
-            })
-        }
-        RawRefusal::AmbiguousTransition { transitions, .. } => {
-            TransitionError::Refusal(TransitionRefusal::AmbiguousTransition {
-                transitions: transitions
-                    .iter()
-                    .filter_map(|transition| transition_id_from_raw(transition).ok())
-                    .collect(),
-            })
-        }
-        RawRefusal::UnknownInputVariant { variant, .. } => {
-            TransitionError::Kernel(KernelError::CodegenInvariant {
-                detail: format!("unknown input variant {variant}"),
-            })
-        }
-        RawRefusal::UnknownSignalVariant { variant, .. } => {
-            TransitionError::Kernel(KernelError::CodegenInvariant {
-                detail: format!("unknown signal variant {variant}"),
-            })
-        }
-        RawRefusal::InvalidInputPayload { reason, .. } => {
-            TransitionError::Kernel(KernelError::CodegenInvariant { detail: reason })
-        }
-        RawRefusal::InvalidSignalPayload { reason, .. } => {
-            TransitionError::Kernel(KernelError::CodegenInvariant { detail: reason })
-        }
-        RawRefusal::EvaluationError {
-            transition, reason, ..
-        } => TransitionError::Kernel(KernelError::CodegenInvariant {
-            detail: format!("{transition}: {reason}"),
-        }),
-    }
-}
-
 pub mod helpers {
     use super::*;
     pub fn none<C: Context>(_: &State, context: &C) -> Result<(), KernelError> {
@@ -704,9 +223,17 @@ pub mod helpers {
 }
 
 pub fn initial_state() -> State {
-    let raw = initial_state_from_schema(schema())
-        .expect("typed modeled-kernel initial state should be derivable from schema");
-    state_from_raw(&raw).expect("typed modeled-kernel initial state should convert from raw state")
+    State {
+        phase: Phase::Active,
+        revision: 0,
+        trigger_key: String::new(),
+        target_binding_key: String::new(),
+        misfire_policy: MisfirePolicy::default(),
+        overlap_policy: OverlapPolicy::default(),
+        missing_target_policy: MissingTargetPolicy::default(),
+        planning_cursor_utc_ms: None,
+        next_occurrence_ordinal: 0,
+    }
 }
 
 pub fn transition<C: Context>(
@@ -714,10 +241,9 @@ pub fn transition<C: Context>(
     input: Input,
     context: &C,
 ) -> Result<Outcome, TransitionError> {
-    let _ = context;
-    let raw_state = state_to_raw(state);
-    let raw_input = input_to_raw(input);
-    transition_from_schema(schema(), &raw_state, &raw_input)
-        .map_err(refusal_from_raw)
-        .and_then(outcome_from_raw)
+    let _ = (state, input, context);
+    Err(TransitionError::Kernel(KernelError::CodegenInvariant {
+        detail: "canonical direct modeled kernel transition not implemented for this machine"
+            .into(),
+    }))
 }
