@@ -10,6 +10,7 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::panic,
     clippy::implicit_clone,
     clippy::unnecessary_cast,
     clippy::redundant_clone
@@ -55,8 +56,7 @@ impl From<&str> for DependencyMode {
             "All" => Self::All,
             "Any" => Self::Any,
             other => {
-                debug_assert!(false, "unknown DependencyMode variant: {other}");
-                Self::All
+                panic!("unknown DependencyMode variant: {other}");
             }
         }
     }
@@ -96,8 +96,7 @@ impl From<&str> for FlowNodeKind {
             "Step" => Self::Step,
             "Loop" => Self::Loop,
             other => {
-                debug_assert!(false, "unknown FlowNodeKind variant: {other}");
-                Self::Step
+                panic!("unknown FlowNodeKind variant: {other}");
             }
         }
     }
@@ -137,8 +136,7 @@ impl From<&str> for FrameScope {
             "Root" => Self::Root,
             "Body" => Self::Body,
             other => {
-                debug_assert!(false, "unknown FrameScope variant: {other}");
-                Self::Root
+                panic!("unknown FrameScope variant: {other}");
             }
         }
     }
@@ -193,8 +191,7 @@ impl From<&str> for NodeRunStatus {
             "Skipped" => Self::Skipped,
             "Canceled" => Self::Canceled,
             other => {
-                debug_assert!(false, "unknown NodeRunStatus variant: {other}");
-                Self::Pending
+                panic!("unknown NodeRunStatus variant: {other}");
             }
         }
     }

@@ -10,6 +10,7 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::panic,
     clippy::implicit_clone,
     clippy::unnecessary_cast,
     clippy::redundant_clone
@@ -59,8 +60,7 @@ impl From<&str> for CollectionPolicyKind {
             "Any" => Self::Any,
             "Quorum" => Self::Quorum,
             other => {
-                debug_assert!(false, "unknown CollectionPolicyKind variant: {other}");
-                Self::All
+                panic!("unknown CollectionPolicyKind variant: {other}");
             }
         }
     }
@@ -100,8 +100,7 @@ impl From<&str> for DependencyMode {
             "All" => Self::All,
             "Any" => Self::Any,
             other => {
-                debug_assert!(false, "unknown DependencyMode variant: {other}");
-                Self::All
+                panic!("unknown DependencyMode variant: {other}");
             }
         }
     }
@@ -153,8 +152,7 @@ impl From<&str> for FlowRunStatus {
             "Failed" => Self::Failed,
             "Canceled" => Self::Canceled,
             other => {
-                debug_assert!(false, "unknown FlowRunStatus variant: {other}");
-                Self::Absent
+                panic!("unknown FlowRunStatus variant: {other}");
             }
         }
     }
@@ -203,8 +201,7 @@ impl From<&str> for StepRunStatus {
             "Skipped" => Self::Skipped,
             "Canceled" => Self::Canceled,
             other => {
-                debug_assert!(false, "unknown StepRunStatus variant: {other}");
-                Self::Dispatched
+                panic!("unknown StepRunStatus variant: {other}");
             }
         }
     }

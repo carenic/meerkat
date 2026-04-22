@@ -10,6 +10,7 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::panic,
     clippy::implicit_clone,
     clippy::unnecessary_cast,
     clippy::redundant_clone

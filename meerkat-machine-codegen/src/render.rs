@@ -332,7 +332,7 @@ pub fn render_machine_kernel_module(schema: &MachineSchema) -> String {
     );
     pushln!(
         &mut out,
-        "#![allow(clippy::unwrap_used, clippy::expect_used, clippy::implicit_clone, clippy::unnecessary_cast, clippy::redundant_clone)]"
+        "#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::implicit_clone, clippy::unnecessary_cast, clippy::redundant_clone)]"
     );
     pushln!(&mut out);
     pushln!(
@@ -415,20 +415,11 @@ pub fn render_machine_kernel_module(schema: &MachineSchema) -> String {
                     rust_ident(variant)
                 );
             }
-            let fallback_variant = variants
-                .first()
-                .map(std::string::String::as_str)
-                .unwrap_or("Unknown");
             pushln!(&mut out, "            other => {{");
             pushln!(
                 &mut out,
-                "                debug_assert!(false, \"unknown {} variant: {{other}}\");",
+                "                panic!(\"unknown {} variant: {{other}}\");",
                 enum_name
-            );
-            pushln!(
-                &mut out,
-                "                Self::{}",
-                rust_ident(fallback_variant)
             );
             pushln!(&mut out, "            }},");
             pushln!(&mut out, "        }}");

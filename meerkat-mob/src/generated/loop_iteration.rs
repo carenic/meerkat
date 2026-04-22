@@ -10,6 +10,7 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::panic,
     clippy::implicit_clone,
     clippy::unnecessary_cast,
     clippy::redundant_clone
@@ -58,8 +59,7 @@ impl From<&str> for LoopIterationStage {
             "BodyFrameActive" => Self::BodyFrameActive,
             "AwaitingUntil" => Self::AwaitingUntil,
             other => {
-                debug_assert!(false, "unknown LoopIterationStage variant: {other}");
-                Self::AwaitingBodyFrame
+                panic!("unknown LoopIterationStage variant: {other}");
             }
         }
     }
