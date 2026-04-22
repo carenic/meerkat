@@ -813,6 +813,7 @@ mod handoff_binding {
             handle_trait_path: Some("crate::SomeHandle".into()),
             handle_method_names: methods,
             handle_arg_accessors: BTreeMap::new(),
+            handle_method_forwarded_fields: BTreeMap::new(),
             additional_modes: vec![],
         }
     }
@@ -1016,6 +1017,7 @@ mod handoff_binding {
             handle_trait_path: Some("crate::SomeHandle".into()),
             handle_method_names: methods,
             handle_arg_accessors: BTreeMap::new(),
+            handle_method_forwarded_fields: BTreeMap::new(),
             additional_modes: vec![ProtocolGenerationMode::HandleBridge],
         };
         let composition = composition_with_protocol(handle_bridge_protocol(binding));
@@ -1028,9 +1030,16 @@ mod handoff_binding {
     fn compat_composition_schemas_is_accessible_and_validates_each_returned_entry() {
         // `compat_composition_schemas()` is invoked by the codegen iteration
         // alongside canonical. Every entry it returns must validate against
-        // the canonical machine registry.
+        // the canonical + compat machine registries together, since compat
+        // compositions can reference either catalog.
         let compositions = compat_composition_schemas();
-        let machines = canonical_machine_schemas();
+        let mut machines = canonical_machine_schemas();
+        machines.extend([
+            meerkat_machine_schema::flow_frame_machine(),
+            meerkat_machine_schema::flow_run_machine(),
+            meerkat_machine_schema::loop_iteration_machine(),
+            meerkat_machine_schema::ops_barrier_bridge_machine(),
+        ]);
         let machine_refs: Vec<_> = machines.iter().collect();
         for composition in &compositions {
             composition

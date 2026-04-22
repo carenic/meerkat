@@ -1,8 +1,11 @@
+use std::collections::BTreeMap;
+
 use crate::{
-    ActorKind, ActorSchema, CompositionInvariant, CompositionInvariantKind, CompositionSchema,
-    CompositionStateLimits, CompositionTransactionPlan, CompositionWitness, EntryInput,
-    MachineInstance, Route, RouteBindingSource, RouteDelivery, RouteFieldBinding, RouteTarget,
-    RouteTargetKind,
+    ActorKind, ActorSchema, ClosurePolicy, CompositionInvariant, CompositionInvariantKind,
+    CompositionSchema, CompositionStateLimits, CompositionTransactionPlan, CompositionWitness,
+    EffectHandoffProtocol, EntryInput, FeedbackFieldBinding, FeedbackFieldSource, FeedbackInputRef,
+    MachineInstance, ProtocolGenerationMode, ProtocolHelperReturnShape, ProtocolRustBinding, Route,
+    RouteBindingSource, RouteDelivery, RouteFieldBinding, RouteTarget, RouteTargetKind,
 };
 
 pub fn schedule_bundle_composition() -> CompositionSchema {
@@ -410,14 +413,158 @@ fn default_ci_limits() -> CompositionStateLimits {
 }
 
 /// Compositions declared to host cross-machine handoff protocols whose
-/// producer side is still backed by a compat machine schema (or by a
-/// canonical machine whose DSL is mid-absorption). They sit alongside
+/// producer side is backed either by a compat machine (flow/loop) or by
+/// the canonical `MeerkatMachine` with an absorbed handoff effect that
+/// the runtime authority fills in. They sit alongside
 /// `canonical_composition_schemas()` in the codegen iteration.
 ///
 /// Populated as each handoff protocol's producer side is wired up.
-/// An empty return is a valid intermediate state — the audit tool
-/// treats the emit set as a closed world computed from both the
-/// canonical and compat catalogs together.
 pub fn compat_composition_schemas() -> Vec<CompositionSchema> {
-    Vec::new()
+    vec![mob_bundle_composition()]
+}
+
+/// Host composition for the `ops_barrier_satisfaction` handoff protocol.
+///
+/// The producer is the canonical `MeerkatMachine` which declares
+/// `WaitAllSatisfied { wait_request_id, operation_ids }` as a
+/// local-disposition effect. The realizing owner — the runtime's ops
+/// lifecycle shell — observes the barrier closure and feeds back
+/// through the `OpsBarrierSatisfied { operation_ids }` input; the
+/// `HandleBridge` mode routes the same payload through
+/// `TurnStateHandle::ops_barrier_satisfied` for runtime-backed sessions.
+///
+/// Modes: primary `ShellBridge` (accept + authority.apply submitters),
+/// secondary `HandleBridge` (handle-driven submitter suffixed `_handle`).
+fn mob_bundle_composition() -> CompositionSchema {
+    let mut handle_methods = BTreeMap::new();
+    handle_methods.insert("OpsBarrierSatisfied".into(), "ops_barrier_satisfied".into());
+    // Handle method takes `operation_ids: BTreeSet<String>` — the obligation
+    // field is `Set<OperationId>` which renders as `Vec<OperationId>`. The
+    // accessor rewrites the reference to stringify each operation id.
+    let mut handle_accessors = BTreeMap::new();
+    handle_accessors.insert(
+        "OpsBarrierSatisfied.operation_ids".into(),
+        ".iter().map(ToString::to_string).collect()".into(),
+    );
+    // Handle method takes only `operation_ids`; the obligation carries
+    // a `wait_request_id` correlation token that the turn-state handle
+    // never consumes (the ops-lifecycle owner matches on it internally,
+    // not through the handle).
+    let mut handle_forwarded_fields = BTreeMap::new();
+    handle_forwarded_fields.insert("OpsBarrierSatisfied".into(), vec!["operation_ids".into()]);
+
+    CompositionSchema {
+        name: "mob_bundle".into(),
+        // The producer is the compat `OpsBarrierBridgeMachine` which hosts
+        // the handoff-annotated `WaitAllSatisfied` effect declaration.
+        // Its shape mirrors the runtime-owned effect; the canonical
+        // `MeerkatMachine` also declares `WaitAllSatisfied` (without the
+        // handoff annotation the DSL macro cannot emit) so the runtime
+        // shell still observes the effect through its own reducer.
+        machines: vec![MachineInstance {
+            instance_id: "ops_barrier_bridge".into(),
+            machine_name: "OpsBarrierBridgeMachine".into(),
+            actor: "ops_barrier_bridge_authority".into(),
+        }],
+        actors: vec![
+            machine_actor("ops_barrier_bridge_authority"),
+            owner_actor("ops_lifecycle_owner"),
+        ],
+        handoff_protocols: vec![EffectHandoffProtocol {
+            name: "ops_barrier_satisfaction".into(),
+            producer_instance: "ops_barrier_bridge".into(),
+            effect_variant: "WaitAllSatisfied".into(),
+            realizing_actor: "ops_lifecycle_owner".into(),
+            correlation_fields: vec!["wait_request_id".into()],
+            obligation_fields: vec!["wait_request_id".into(), "operation_ids".into()],
+            allowed_feedback_inputs: vec![FeedbackInputRef {
+                machine_instance: "ops_barrier_bridge".into(),
+                input_variant: "OpsBarrierSatisfied".into(),
+                field_bindings: vec![
+                    FeedbackFieldBinding {
+                        input_field: "wait_request_id".into(),
+                        source: FeedbackFieldSource::ObligationField(
+                            "wait_request_id".into(),
+                        ),
+                    },
+                    FeedbackFieldBinding {
+                        input_field: "operation_ids".into(),
+                        source: FeedbackFieldSource::ObligationField("operation_ids".into()),
+                    },
+                ],
+            }],
+            closure_policy: ClosurePolicy::AckRequired,
+            liveness_annotation: Some(
+                "eventual feedback under task-scheduling fairness".into(),
+            ),
+            rust: ProtocolRustBinding {
+                module_path: "meerkat-core/src/generated/protocol_ops_barrier_satisfaction.rs"
+                    .into(),
+                // Primary mode: HandleBridge. The obligation is built
+                // from the shell-owned `WaitAllSatisfied` struct via the
+                // shared `accept_<effect>` emission; feedback flows
+                // through the `TurnStateHandle::ops_barrier_satisfied`
+                // trait method. The compat `OpsBarrierBridgeMachine`
+                // hosts the handoff annotation purely so the protocol
+                // passes composition validation — it has no runtime
+                // authority of its own, so stacking ShellBridge with an
+                // `authority.apply` submitter would point at nothing.
+                generation_mode: ProtocolGenerationMode::HandleBridge,
+                required_imports: vec![
+                    "use crate::handles::TurnStateHandle;".into(),
+                    "use crate::lifecycle::identifiers::WaitRequestId;".into(),
+                    "use crate::ops::OperationId;".into(),
+                    "use crate::ops_lifecycle::WaitAllSatisfied;".into(),
+                ],
+                authority_type_path: None,
+                mutator_trait_path: None,
+                input_enum_path: None,
+                effect_enum_path: None,
+                transition_type_path: None,
+                error_type_path: None,
+                executor_trigger_input_variant: None,
+                bridge_source_type_path: Some("crate::ops_lifecycle::WaitAllSatisfied".into()),
+                helper_return_shape: ProtocolHelperReturnShape::Obligations,
+                handle_trait_path: Some("meerkat_core::handles::TurnStateHandle".into()),
+                handle_method_names: handle_methods,
+                handle_arg_accessors: handle_accessors,
+                handle_method_forwarded_fields: handle_forwarded_fields,
+                additional_modes: vec![],
+            },
+        }],
+        entry_inputs: vec![],
+        routes: vec![],
+        route_target_selectors: vec![],
+        driver: None,
+        transaction_plans: vec![],
+        actor_priorities: vec![],
+        scheduler_rules: vec![],
+        invariants: vec![CompositionInvariant {
+            name: "ops_barrier_satisfaction_protocol_covered".into(),
+            kind: CompositionInvariantKind::HandoffProtocolCovered {
+                producer_instance: "ops_barrier_bridge".into(),
+                effect_variant: "WaitAllSatisfied".into(),
+                protocol_name: "ops_barrier_satisfaction".into(),
+            },
+            statement: "wait-all barrier satisfaction crosses from the ops lifecycle owner back into turn-state authority only through the explicit `ops_barrier_satisfaction` protocol".into(),
+            references_machines: vec!["ops_barrier_bridge".into()],
+            references_actors: vec![
+                "ops_barrier_bridge_authority".into(),
+                "ops_lifecycle_owner".into(),
+            ],
+        }],
+        witnesses: vec![witness("ops_barrier_close_round_trip", &[])],
+        deep_domain_cardinality: 3,
+        deep_domain_overrides: std::collections::BTreeMap::new(),
+        witness_domain_cardinality: 2,
+        ci_limits: Some(default_ci_limits()),
+        closed_world: true,
+    }
+}
+
+fn owner_actor(name: &str) -> ActorSchema {
+    ActorSchema {
+        name: name.into(),
+        kind: ActorKind::Owner,
+    }
 }

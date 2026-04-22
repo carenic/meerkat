@@ -168,6 +168,15 @@ pub struct ProtocolRustBinding {
     /// `obligation.<field>`. Lets the schema declare a single newtype
     /// unwrap without ceding typed-field correctness.
     pub handle_arg_accessors: BTreeMap<String, String>,
+    /// Per-feedback list of obligation field names (in positional order)
+    /// that get forwarded to the handle method. Keys are
+    /// `FeedbackInputRef::input_variant`. Absent entries fall back to
+    /// "every obligation-sourced field in binding order," which works
+    /// when the handle-method signature mirrors the feedback input. Set
+    /// this when the feedback input carries fields the handle method
+    /// does not accept (e.g., a correlation `wait_request_id` that the
+    /// runtime handle never uses).
+    pub handle_method_forwarded_fields: BTreeMap<String, Vec<String>>,
     /// Additional generation modes stacked onto the primary mode. Each
     /// listed mode emits its own family of helpers into the same output
     /// file, letting a single protocol expose both (for example)

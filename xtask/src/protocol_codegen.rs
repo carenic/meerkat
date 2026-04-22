@@ -27,6 +27,7 @@ pub fn run_protocol_codegen() -> Result<()> {
         meerkat_machine_schema::flow_frame_machine(),
         meerkat_machine_schema::flow_run_machine(),
         meerkat_machine_schema::loop_iteration_machine(),
+        meerkat_machine_schema::ops_barrier_bridge_machine(),
     ]);
     let machine_by_name: std::collections::BTreeMap<&str, &MachineSchema> =
         machines.iter().map(|m| (m.machine.as_str(), m)).collect();
@@ -461,6 +462,29 @@ fn generate_handle_bridge_helpers(
             .context("HandleBridge handle_trait_path missing")?,
     );
 
+    // Rewrite self-references. When the emit path lives inside the
+    // crate that defines `meerkat_core::handles::DslTransitionError`,
+    // rustc sees `meerkat_core::` as an external-crate path and fails.
+    // Detect the in-crate case and use `crate::` instead.
+    let handle_error_path = if rust.module_path.starts_with("meerkat-core/") {
+        "crate::handles::DslTransitionError"
+    } else {
+        "meerkat_core::handles::DslTransitionError"
+    };
+
+    // When HandleBridge is the primary mode AND a bridge source type is
+    // declared, emit the `accept_<effect>` helper that wraps the shell-
+    // owned source struct into the obligation token. This is exactly the
+    // shape ShellBridge would emit; reusing it lets HandleBridge stand
+    // alone for protocols whose consumers speak only through the handle
+    // trait (no authority.apply target).
+    if rust.generation_mode == ProtocolGenerationMode::HandleBridge
+        && let Some(bridge_source_path) = rust.bridge_source_type_path.as_deref()
+    {
+        let bridge_source = short_type(bridge_source_path);
+        emit_accept_helper(out, protocol, obligation_type, bridge_source)?;
+    }
+
     // Stable ordering: feedback entries as declared, which matches the
     // primary-mode output for dual-mode protocols (bit-for-bit parity).
     for feedback in &protocol.allowed_feedback_inputs {
@@ -494,15 +518,27 @@ fn generate_handle_bridge_helpers(
             format!("submit_{}", to_snake_case(&feedback.input_variant))
         };
 
-        // Split bindings into obligation-sourced (emit as
-        // `obligation.<field>[accessor]`) and owner-context (emit as
-        // `<snake_name>: <ty>` parameters + `.into()` if the destination
-        // method signature accepts `String`-typed error reasons).
+        // When `handle_method_forwarded_fields` is declared for this
+        // feedback input, treat it as the authoritative positional
+        // argument list — obligation fields not in the list are dropped
+        // (they are correlation-only and never reach the handle).
+        // Otherwise every obligation-sourced binding is forwarded in
+        // declaration order.
+        let forwarded: Option<&Vec<String>> = rust
+            .handle_method_forwarded_fields
+            .get(&feedback.input_variant);
         let mut owner_params: Vec<String> = Vec::new();
         let mut call_args: Vec<String> = Vec::new();
         for binding in &feedback.field_bindings {
             match &binding.source {
                 FeedbackFieldSource::ObligationField(field) => {
+                    if let Some(allowed) = forwarded
+                        && !allowed
+                            .iter()
+                            .any(|f| to_snake_case(f) == to_snake_case(field))
+                    {
+                        continue;
+                    }
                     let accessor_key =
                         format!("{}.{}", feedback.input_variant, to_snake_case(field));
                     let suffix = rust
@@ -522,7 +558,7 @@ fn generate_handle_bridge_helpers(
 
         writeln!(
             out,
-            "pub fn {fn_name}(handle: &(impl {handle_trait} + ?Sized), obligation: {obligation_type}{}{}) -> Result<(), meerkat_core::handles::DslTransitionError> {{",
+            "pub fn {fn_name}(handle: &(impl {handle_trait} + ?Sized), obligation: {obligation_type}{}{}) -> Result<(), {handle_error_path}> {{",
             if owner_params.is_empty() { "" } else { ", " },
             owner_params.join(", ")
         )?;
@@ -544,21 +580,17 @@ fn generate_handle_bridge_helpers(
     Ok(())
 }
 
-fn generate_shell_bridge_helpers(
+/// Emit the `accept_<effect>` helper that wraps a shell-owned source
+/// struct into the obligation token. Used by `ShellBridge` primary
+/// mode and, when a `bridge_source_type_path` is declared, by
+/// `HandleBridge` primary mode too.
+fn emit_accept_helper(
     out: &mut String,
     protocol: &EffectHandoffProtocol,
-    composition: &CompositionSchema,
-    machine_by_name: &std::collections::BTreeMap<&str, &MachineSchema>,
     obligation_type: &str,
+    bridge_source: &str,
 ) -> Result<()> {
-    let rust = &protocol.rust;
-    let bridge_source = short_type(
-        rust.bridge_source_type_path
-            .as_deref()
-            .context("shell bridge source type missing")?,
-    );
     let accept_name = format!("accept_{}", to_snake_case(&protocol.effect_variant));
-
     writeln!(
         out,
         "pub fn {accept_name}(source: {bridge_source}) -> {obligation_type} {{"
@@ -575,6 +607,23 @@ fn generate_shell_bridge_helpers(
     writeln!(out, "    }}")?;
     writeln!(out, "}}")?;
     writeln!(out)?;
+    Ok(())
+}
+
+fn generate_shell_bridge_helpers(
+    out: &mut String,
+    protocol: &EffectHandoffProtocol,
+    composition: &CompositionSchema,
+    machine_by_name: &std::collections::BTreeMap<&str, &MachineSchema>,
+    obligation_type: &str,
+) -> Result<()> {
+    let rust = &protocol.rust;
+    let bridge_source = short_type(
+        rust.bridge_source_type_path
+            .as_deref()
+            .context("shell bridge source type missing")?,
+    );
+    emit_accept_helper(out, protocol, obligation_type, bridge_source)?;
 
     for feedback in &protocol.allowed_feedback_inputs {
         let target_machine =
