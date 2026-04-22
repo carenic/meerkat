@@ -320,11 +320,45 @@ pub fn render_machine_kernel_module(schema: &MachineSchema) -> String {
     }
     match module_name.as_str() {
         "meerkat" => render_meerkat_modeled_module(),
-        "mob" | "schedule_lifecycle" | "occurrence_lifecycle" | "auth" => {
-            render_canonical_stub_modeled_module(schema)
-        }
+        "mob" => render_include_kernel_source(
+            "/../meerkat-mob/src/machines/mob_machine.rs",
+            "catalog::dsl::dsl_mob_machine",
+        ),
+        "schedule_lifecycle" => render_include_kernel_source(
+            "/../meerkat-schedule/src/machines/schedule_lifecycle.rs",
+            "catalog::dsl::dsl_schedule_lifecycle_machine",
+        ),
+        "occurrence_lifecycle" => render_include_kernel_source(
+            "/../meerkat-schedule/src/machines/occurrence_lifecycle.rs",
+            "catalog::dsl::dsl_occurrence_lifecycle_machine",
+        ),
+        "auth" => render_include_kernel_source(
+            "/../meerkat-runtime/src/auth_machine/dsl.rs",
+            "catalog::dsl::dsl_auth_machine",
+        ),
         _ => render_canonical_stub_modeled_module(schema),
     }
+}
+
+#[cfg(not(test))]
+fn render_include_kernel_source(path: &str, catalog_fn: &str) -> String {
+    let rel = path.trim_start_matches("/../");
+    let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(rel);
+    let source = match std::fs::read_to_string(&source_path) {
+        Ok(source) => source,
+        Err(error) => {
+            return format!(
+                "compile_error!(\"failed to read canonical kernel source {}: {}\");\n",
+                source_path.display(),
+                error
+            );
+        }
+    };
+    format!(
+        "mod source {{\n#![allow(warnings)]\n#![allow(clippy::expect_used)]\n{source}\n}}\npub use source::*;\n\npub fn schema() -> meerkat_machine_schema::MachineSchema {{\n    meerkat_machine_schema::{catalog_fn}()\n}}\n"
+    )
 }
 
 #[cfg(not(test))]
