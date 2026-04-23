@@ -1,6 +1,5 @@
 use crate::ids::{AgentIdentity, Generation, MeerkatId, ProfileName};
 use crate::roster::{MobMemberKickoffSnapshot, Roster, RosterAddEntry, RosterEntry};
-use meerkat_core::comms::TrustedPeerSpec;
 use meerkat_core::types::SessionId;
 use std::collections::BTreeSet;
 
@@ -20,15 +19,6 @@ pub(crate) trait RosterMutator: sealed::Sealed {
     /// [`Roster::sync_retiring_projection`].
     fn sync_retiring_projection(&mut self, retiring_runtime_ids: &BTreeSet<String>);
     fn remove_member(&mut self, agent_identity: &MeerkatId) -> bool;
-    fn wire_members(&mut self, a: &MeerkatId, b: &MeerkatId);
-    fn wire_external_peer(
-        &mut self,
-        local: &MeerkatId,
-        peer_name: &MeerkatId,
-        spec: TrustedPeerSpec,
-    );
-    fn unwire_members(&mut self, a: &MeerkatId, b: &MeerkatId);
-    fn unwire_external_peer(&mut self, local: &MeerkatId, peer_name: &MeerkatId);
     fn set_kickoff(
         &mut self,
         agent_identity: &MeerkatId,
@@ -161,27 +151,6 @@ impl RosterMutator for RosterAuthority {
         } else {
             false
         }
-    }
-
-    fn wire_members(&mut self, a: &MeerkatId, b: &MeerkatId) {
-        self.roster.wire(a, b);
-    }
-
-    fn wire_external_peer(
-        &mut self,
-        local: &MeerkatId,
-        peer_name: &MeerkatId,
-        spec: TrustedPeerSpec,
-    ) {
-        self.roster.wire_external(local, peer_name, spec);
-    }
-
-    fn unwire_members(&mut self, a: &MeerkatId, b: &MeerkatId) {
-        self.roster.unwire(a, b);
-    }
-
-    fn unwire_external_peer(&mut self, local: &MeerkatId, peer_name: &MeerkatId) {
-        self.roster.unwire_external(local, peer_name);
     }
 
     fn set_kickoff(

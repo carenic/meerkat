@@ -6404,17 +6404,6 @@ impl MobActor {
         Ok(())
     }
 
-    /// Internal wire operation (used by handle_wire and auto_wire/role_wiring).
-
-    async fn debug_assert_roster_edge_symmetric(
-        &self,
-        a: &MeerkatId,
-        b: &MeerkatId,
-        context: &'static str,
-    ) {
-        let _ = (a, b, context);
-    }
-
     /// Get the comms runtime for a session, if available.
     async fn provisioner_comms(&self, member_ref: &MemberRef) -> Option<Arc<dyn CoreCommsRuntime>> {
         self.provisioner.comms_runtime(member_ref).await
