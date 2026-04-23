@@ -660,45 +660,6 @@ pub fn provider_key(provider: Provider) -> &'static str {
     provider.as_str()
 }
 
-/// Project a [`Config`] + `provider` tuple into a [`RealmConnectionSet`]
-/// for runtime resolution. This is a pure config projection, not a
-/// policy owner (dogma §1/§20).
-///
-/// Precedence (post plan §6.9/§6.10 + §1.5r cleanup):
-///   1. `Config.realm[_]`: if any realm has a binding whose
-///      backend_profile provider matches the inferred provider, promote
-///      that binding. Preserves "realm-populates-creds" behavior for
-///      surfaces that bootstrap a single-provider realm (notably WASM).
-///   2. `RealmConnectionSet::synthesize_env_default(provider)`: a
-///      synthesized realm with `CredentialSourceSpec::Env { env, fallback }`.
-///      The var names + fallback chain live in meerkat-core (single
-///      canonical owner); the `RKAT_*`-prefix precedence lives in the
-///      resolver's env_lookup arm (`meerkat-client::runtime::resolver`).
-///      This helper does not encode any env-var policy itself.
-fn synthesize_realm_from_config(
-    config: &Config,
-    provider: Provider,
-) -> meerkat_core::RealmConnectionSet {
-    let realm_match = config.realm.iter().find_map(|(realm_id, section)| {
-        let provider_str = provider.as_str();
-        for (binding_id, binding) in &section.binding {
-            if let Some(backend) = section.backend.get(&binding.backend_profile)
-                && backend.provider == provider_str
-            {
-                return Some((realm_id.clone(), binding_id.clone(), section));
-            }
-        }
-        None
-    });
-    if let Some((realm_id, binding_id, section)) = realm_match
-        && let Ok(mut set) = meerkat_core::RealmConnectionSet::from_config(&realm_id, section)
-    {
-        set.default_binding = Some(binding_id);
-        return set;
-    }
-    meerkat_core::RealmConnectionSet::synthesize_env_default(provider)
-}
-
 /// Return `true` when the OpenAI model ID advertises
 /// `ModelCapabilities.realtime == true` in the curated catalog.
 ///
@@ -713,34 +674,6 @@ fn is_openai_realtime_capable(model: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Resolve the API key for `provider` through the canonical
-/// `ProviderRuntimeRegistry` path. Honors the same config→env precedence
-/// as [`synthesize_realm_from_config`]: a realm in `config.realm` that
-/// binds the provider wins, otherwise falls back to
-/// `RealmConnectionSet::synthesize_env_default(provider)` which reads
-/// via `CredentialSourceSpec::Env` through the resolver's env_lookup
-/// seam (respecting `RKAT_*` precedence).
-///
-/// Returns `None` if the realm has no credential material or the
-/// resolver returned a non-inline-secret lease (dynamic authorizer,
-/// OAuth-backed, etc). Dogma §1/§7/§14: single canonical owner for
-/// provider credential acquisition, never a helper-local env read.
-///
-/// Intended for boot-time credential acquisition in sideband surfaces
-/// (e.g. the realtime WS host) that do not yet route through a
-/// per-session `connection_ref`. Session-scoped paths build through
-/// `build_agent`/`AgentFactory` instead.
-pub async fn resolve_provider_api_key(config: &Config, provider: Provider) -> Option<String> {
-    let realm = synthesize_realm_from_config(config, provider);
-    let binding_id = realm.default_binding.clone()?;
-    let env = meerkat_providers::ResolverEnvironment::with_process_env();
-    let registry = crate::default_provider_registry();
-    registry
-        .resolve(&realm, &binding_id, &env)
-        .await
-        .ok()?
-        .resolved_secret()
-}
 
 /// Deferred snapshot provider that captures visible tools from a composed tool dispatcher.
 ///
@@ -1327,14 +1260,6 @@ impl AgentFactory {
             return Ok(Arc::new(meerkat_client::TestClient::default()));
         }
 
-        // Dogma §12 dynamic-policy-follows-dynamic-identity (deferral §2):
-        // if the session carries a `connection_ref`, hot-swap must
-        // re-enter `ProviderRuntimeRegistry::resolve` against that
-        // specific realm + binding — not via
-        // `synthesize_realm_from_config`, which would pick "any realm
-        // that binds this provider" and bleed credentials across
-        // tenants. Env-default is the fallback only when no binding was
-        // persisted on the session.
         let (realm, binding_id): (meerkat_core::RealmConnectionSet, String) =
             match identity.connection_ref.as_ref() {
                 Some(conn_ref) => {
@@ -1348,14 +1273,6 @@ impl AgentFactory {
                         meerkat_core::RealmConnectionSet::from_config(&conn_ref.realm_id, section)
                             .map_err(|e| FactoryError::ClientCreationFailed(e.to_string()))?;
                     (realm, conn_ref.binding_id.clone())
-                }
-                None => {
-                    let realm = synthesize_realm_from_config(config, identity.provider);
-                    let binding_id = realm
-                        .default_binding
-                        .clone()
-                        .unwrap_or_else(|| "default".to_string());
-                    (realm, binding_id)
                 }
             };
 
@@ -1877,21 +1794,6 @@ impl AgentFactory {
                                 })?;
                                 (realm, conn_ref.binding_id.clone())
                             }
-                            None => {
-                                // Env-default fallback (plan §6.4 revised
-                                // 2026-04-18): no connection_ref, no realm
-                                // preconfigured → synthesize a realm with
-                                // `CredentialSourceSpec::Env` and route
-                                // through the same registry. Dogma §5
-                                // compliant: env reads go through the
-                                // resolver's env_lookup, not this caller.
-                                let realm = synthesize_realm_from_config(config, provider);
-                                let binding_id = realm
-                                    .default_binding
-                                    .clone()
-                                    .unwrap_or_else(|| "default".to_string());
-                                (realm, binding_id)
-                            }
                         };
 
                     // Provider-runtime registry needs the OAuth-backed
@@ -1913,23 +1815,10 @@ impl AgentFactory {
                         env = env.with_external_resolver(handle.clone(), resolver.clone());
                     }
                     let provider_registry = crate::default_provider_registry();
-                    let is_env_default = build_config.connection_ref.is_none();
                     let connection = provider_registry
                         .resolve(&realm, &binding_id, &env)
                         .await
-                        .map_err(|e| {
-                            // CLI surfaces prompt the user by parsing the
-                            // error message; keep the env-default text
-                            // stable for that contract.
-                            if is_env_default {
-                                BuildAgentError::ConnectionResolution(format!(
-                                    "API key not set for provider '{}'",
-                                    provider_key(provider)
-                                ))
-                            } else {
-                                BuildAgentError::ConnectionResolution(e.to_string())
-                            }
-                        })?;
+                        .map_err(|e| BuildAgentError::ConnectionResolution(e.to_string()))?;
                     provider = connection.provider;
 
                     // Phase 1.5-rev loop closure — refresh-loop middle:
