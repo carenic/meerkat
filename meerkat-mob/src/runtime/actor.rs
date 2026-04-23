@@ -4834,41 +4834,6 @@ impl MobActor {
             .remove(&ctx.agent_identity);
     }
 
-    /// P1-T06: wire() establishes local or external trust.
-    async fn handle_wire(
-        &self,
-        local: MeerkatId,
-        target: super::handle::PeerTarget,
-    ) -> Result<(), MobError> {
-        self.ensure_pending_spawn_alignment("handle_wire preflight")?;
-        self.ensure_member_not_broken(&local).await?;
-        match target {
-            super::handle::PeerTarget::Local(peer_identity) => {
-                let peer = MeerkatId::from(peer_identity.as_str());
-                if local == peer {
-                    return Err(MobError::WiringError(format!(
-                        "wire requires distinct members (got '{local}')"
-                    )));
-                }
-                {
-                    let roster = self.roster.read().await;
-                    if roster.get(&local).is_none() {
-                        return Err(MobError::MemberNotFound(local.clone()));
-                    }
-                    if roster.get(&peer).is_none() {
-                        return Err(MobError::MemberNotFound(peer.clone()));
-                    }
-                }
-                self.ensure_member_not_broken(&peer).await?;
-                self.do_wire(&local, &peer).await?;
-            }
-            super::handle::PeerTarget::External(spec) => {
-                self.do_wire_external(&local, &spec).await?;
-            }
-        }
-        self.ensure_pending_spawn_alignment("handle_wire completion")
-    }
-
     async fn do_wire_external(
         &self,
         local: &MeerkatId,
@@ -4986,55 +4951,6 @@ impl MobActor {
     }
 
     /// P1-T07: unwire() removes local or external trust.
-    async fn handle_unwire(
-        &self,
-        local: MeerkatId,
-        target: super::handle::PeerTarget,
-    ) -> Result<(), MobError> {
-        self.ensure_pending_spawn_alignment("handle_unwire preflight")?;
-        match target {
-            super::handle::PeerTarget::Local(peer_identity) => {
-                let peer = MeerkatId::from(peer_identity.as_str());
-                if local == peer {
-                    return Err(MobError::WiringError(format!(
-                        "unwire requires distinct peers (got '{local}')"
-                    )));
-                }
-
-                let (peer_exists, looks_external) = {
-                    let roster = self.roster.read().await;
-                    let local_entry = roster
-                        .get(&local)
-                        .ok_or_else(|| MobError::MemberNotFound(local.clone()))?;
-                    let peer_exists = roster.get(&peer).is_some();
-                    let peer_identity = AgentIdentity::from(peer.as_str());
-                    let looks_external = !peer_exists
-                        && (local_entry.wired_to.contains(&peer_identity)
-                            || local_entry.external_peer_specs.contains_key(&peer));
-                    (peer_exists, looks_external)
-                };
-
-                if !peer_exists && !looks_external {
-                    // Peer is not in roster and has no external trace — unwire
-                    // is trivially satisfied (idempotent no-op).
-                    return Ok(());
-                }
-
-                if looks_external {
-                    self.do_unwire_external(&local, &peer, None).await?;
-                } else {
-                    self.do_unwire_local(&local, &peer).await?;
-                }
-            }
-            super::handle::PeerTarget::External(spec) => {
-                let external_name = MeerkatId::from(spec.name.clone());
-                self.do_unwire_external(&local, &external_name, Some(spec))
-                    .await?;
-            }
-        }
-        self.ensure_pending_spawn_alignment("handle_unwire completion")
-    }
-
     async fn do_unwire_local(&self, a: &MeerkatId, b: &MeerkatId) -> Result<(), MobError> {
         let _edge_guard = self.edge_locks.acquire(a.as_str(), b.as_str()).await;
 
