@@ -45,16 +45,16 @@ Every pre-wave-a `.rs` file that contained `#[test]` and no longer exists at HEA
 | `meerkat-rpc/tests/router_realtime_target.rs` | 1 | `488944b7d` |
 | **Total** | **40** | |
 
-### Behaviors covered pre-wave-a (from source of deleted files)
+### Behaviors covered pre-wave-a (source of deleted files)
 
-- **mob_member_lifecycle_authority**: member terminal classification in the face of `restore_failure`, missing active session, unknown sessionless members, retiring members. Pure state-machine reducer unit tests.
-- **mob_wiring_authority**: symmetric local-edge reconciliation, idempotent external wire spec, unwire-when-no-edges is a no-op. Pure reducer unit tests.
-- **track_b_cutover_source_scan**: compile-time/source invariants — mob machine declares topology epoch + Track-B effects, meerkat machine declares peer projection + overlay driver, overlay driver module remains public, dead flow-frame loop driver stays deleted.
-- **composition_dispatch**: composition-driver dispatcher contract — name/descriptor agreement, duplicate rejection, effect→watcher routing, declared-route enforcement, decision-failure surfacing as typed error.
-- **recompute_mob_peer_overlay**: overlay-driver unit tests — wire two members to distinct sessions and route cross-endpoints, respawn rotates session and clears prior overlay, unwire clears mutual overlays, idempotent recompute, release-binding removes member, shadow-mode parity with actor restore.
-- **recompute_mob_peer_overlay_e2e**: full respawn flow installs+rotates trust via driver+reconciler (integration).
-- **comms_trust_reconcile**: first-reconcile registers effective peers, subsequent reconcile adds/removes, stale-epoch accept-as-no-op, add-failure surfaces typed error, empty-set clears trusted peers, serialization/concurrency tests on trust-store mutations.
-- **router_realtime_target**: RPC realtime-open-info rejects mob-member target.
+- **mob_member_lifecycle_authority**: terminal classification for `restore_failure`, missing active session, sessionless-unknown, retiring members. Reducer unit tests.
+- **mob_wiring_authority**: symmetric local-edge reconcile, idempotent external spec, unwire-no-edges is no-op.
+- **track_b_cutover_source_scan**: source-shape invariants on mob-machine effect declarations.
+- **composition_dispatch**: driver dispatcher contract — name/descriptor agreement, duplicate rejection, effect→watcher routing, declared-route enforcement, typed decision-failure.
+- **recompute_mob_peer_overlay**: wire-two-members cross-routing, respawn rotation, unwire clears mutual, idempotent recompute, release-binding removes member, shadow-mode parity with actor restore.
+- **recompute_mob_peer_overlay_e2e**: full respawn flow installs+rotates trust via driver+reconciler.
+- **comms_trust_reconcile**: first-reconcile register, subsequent add/remove, stale-epoch no-op, add-failure typed error, empty clears, concurrency/serialization on trust-store mutations.
+- **router_realtime_target**: RPC realtime rejects mob-member target.
 
 ### Big in-file deletions (not whole-file deletions, but whole test blocks)
 
@@ -88,23 +88,23 @@ Scan for symbols from deleted modules in files that still compile:
 
 No actual broken `use` statements in test files. The codegen references are the real orphan risk: they will silently emit code that cannot compile once the driver is wired. This is consistent with the known broken tree state.
 
-## 4. Behaviors now untested (lost-vs-replaced analysis)
+## 4. Behaviors now untested (lost-vs-replaced)
 
-| Pre-wave-a behavior (test location) | Replacement path | Tested now? |
+| Pre-wave-a behavior | Replacement | Tested now? |
 |---|---|---|
-| Mob Wire / Unwire reducer (mob_wiring_authority) | `MobMachineInput::WireMembers` / `::UnwireMembers` via DSL | **Yes** — `meerkat-mob/tests/member_session_bindings.rs` exercises both variants |
-| Mob member lifecycle terminal classification | Authority collapsed into `MobMachine` DSL guards | **Partial** — DSL guard tests exist; restore-failure-breaks-present-member scenario not found |
-| Composition dispatcher contract (9 tests) | Composition dispatch deleted; drivers now catalog-declared | **No direct replacement** — schema round-trip tests (`catalog_typed_round_trip`) assert declaration, not dispatch |
-| Recompute mob peer overlay (9 unit + 1 e2e) | DSL effect in `MeerkatMachine::peer_projection` | **Partial** — `meerkat-runtime/tests/peer_projection_dsl.rs` (13 tests) covers endpoint publish/clear, direct peer add/remove, overlay apply; does **not** cover respawn rotation, shadow-mode parity, release-binding sweep |
-| Comms trust reconcile (7 tests, incl. concurrency) | Authority now lives in `meerkat_machine::dsl` peer projection | **Partial** — 6 references in `peer_projection_dsl.rs`; concurrency/serialization + add-failure typed error paths are **not covered** |
-| Skills resolver precedence + defaults (11 tests) | Collapsed resolver in `resolver.rs` | **Partial** — 5 tests in `resolver.rs`; precedence, explicit-roots, no-roots-fallback **not covered** |
-| Filesystem skill source (11 tests) | `meerkat-skills/src/source/filesystem.rs` retypedered | **No** — quarantine diagnostics, collection-md fallback, recursive scan, invalid-ratio transitions **not covered** |
-| Skill stdio protocol (10 tests) | `meerkat-skills/src/source/protocol.rs` retypedered | **No** — handshake caching, capability mismatch, unknown-skill-not-found, transport timeout **not covered** |
-| Skill browse/load builtin tools (7 tests) | Live builtins in `meerkat-tools/src/builtin/skills/` | **No** — tool integration tests for root/collection/search/empty-collection listings deleted outright |
-| Router realtime-target rejection | Realtime endpoints deleted | Intentional |
-| Schedule host typed dispatch/admission (3 tests) | `meerkat/src/surface/schedule_host.rs` rewritten | **Partial** — no surface-level tests pinning the rejected-runtime / runtime-terminated mappings |
-| Agent state run-completed / turn-boundary denial (5 tests) | `meerkat-core/src/agent/state.rs` | **Partial** — 33 tests survive; the specific `run_completed_hook_failure_emits_run_failed_without_run_completed` and `turn_boundary_denial_blocks_boundary_side_effects_and_turn_completed` paths are not obviously covered by name |
-| Comms peer request params/body promotion (5 tests) | `meerkat-core/src/comms.rs` | **No** — params/body promotion rules dropped with their test |
+| Mob Wire/Unwire reducer | `MobMachineInput::WireMembers`/`::UnwireMembers` DSL | **Yes** — `meerkat-mob/tests/member_session_bindings.rs` |
+| Mob member terminal classification | DSL guards in `MobMachine` | **Partial** — restore-failure-breaks-present-member not replicated |
+| Composition dispatcher contract (9) | Drivers now catalog-declared | **No direct replacement** — schema round-trip only |
+| Recompute mob peer overlay (9+1) | `MeerkatMachine::peer_projection` DSL | **Partial** — 13 tests cover basic mutations; respawn rotation, shadow-mode parity, release-binding sweep not covered |
+| Comms trust reconcile (7) | `meerkat_machine::dsl` peer projection | **Partial** — 6 DSL refs; concurrency/serialization + add-failure typed error not covered |
+| Skills resolver precedence + defaults (11) | Collapsed `resolver.rs` | **Partial** — 5 tests; precedence, explicit-roots, no-roots-fallback gone |
+| Filesystem skill source (11) | Code still present | **No** — quarantine, collection-md fallback, recursive scan gone |
+| Skill stdio protocol (10) | Code still present | **No** — handshake caching, capability mismatch, timeout gone |
+| Skill browse/load builtin tools (7) | Builtins still live | **No** — tool integration tests deleted |
+| Router realtime-target rejection | Endpoints deleted | Intentional |
+| Schedule host typed dispatch (3) | `surface/schedule_host.rs` rewritten | **No** — surface-level mappings unpinned |
+| Agent run-completed / turn-boundary denial (5) | `agent/state.rs` | **Partial** — 33 tests; named hook-failure and boundary-denial paths not obviously covered |
+| Comms peer-request params/body promotion (5) | `comms.rs` | **No** — promotion rules dropped with test |
 
 ## 5. Classification
 
@@ -118,44 +118,44 @@ No actual broken `use` statements in test files. The codegen references are the 
 
 ### Lost and concerning (behavior exists, no test)
 
-- **Skill source protocol** (stdio handshake caching, capability mismatch, transport timeout) — behaviors still exist in `source/protocol.rs`; 10 tests gone
-- **Skill filesystem source** (recursive scan, quarantine diagnostics, collection-md fallback) — 11 tests gone, code still present
-- **Skill resolver precedence** (defaults, explicit-roots, no-roots fallback) — 6 of 11 tests gone
-- **Skill browse/load tools** (root/collection/search/empty listing) — 7 tests gone; tools still dispatched
-- **Composition dispatcher contract** (effect→watcher routing, duplicate rejection, decision-failure error type) — dispatcher deleted but catalog-declared drivers still need *some* contract; replacement is schema-shape round-trip, not runtime behavior
-- **Schedule host typed dispatch** (rejected-runtime and runtime-terminated mapping) — surface tests gone; behavior still reachable from `meerkat-cli`, `meerkat-rest`, `meerkat-rpc` schedule hosts
-- **Agent `run_completed` lifecycle edge cases** (hook-rewrite, hook-failure emits run-failed, turn-boundary denial blocks side effects)
-- **Comms peer-request params/body promotion** (5-variant precedence rules)
-- **Pack serde round-trip** (4 missing cases)
+- **Skill source protocol** (handshake caching, capability mismatch, timeout) — 10 tests gone, code present
+- **Skill filesystem source** (recursive scan, quarantine, collection-md fallback) — 11 tests gone, code present
+- **Skill resolver precedence** — 6 of 11 tests gone
+- **Skill browse/load tools** (root/collection/search/empty listing) — 7 tests gone, tools still dispatched
+- **Composition dispatcher contract** — runtime dispatch deleted; schema round-trip is not a behavioral substitute for declared-route enforcement
+- **Schedule host typed dispatch** — surface mappings unpinned across CLI/REST/RPC hosts
+- **Agent `run_completed` lifecycle edge cases** — hook-rewrite, hook-failure, turn-boundary denial
+- **Comms peer-request params/body promotion** — 5-variant precedence
+- **Pack serde round-trip** — 4 missing cases
 
 ### Lost and blocker (critical path, no test)
 
-- **Trust reconcile concurrency + error surfacing**: serialized-under-concurrency semantics and "add-failure surfaces typed error and does not update applied view" were explicit regressions fixed in PR #340 per memory. Wave (a) deleted the tests; `peer_projection_dsl.rs` references `trust_reconcile` 6 times but does not pin the concurrency invariant.
-- **Respawn overlay rotation** (`respawn_of_m1_rotates_to_new_session_and_clears_prior_session_overlay`): load-bearing for mob member lifecycle; DSL tests cover simpler endpoint mutation but not the rotation scenario.
-- **Shadow-mode parity with actor restore** (`shadow_mode_parity_matches_actor_restore_wiring_after_respawn`): the specific property that DSL-projected overlay matches shell-restored wiring. With shell authority demolished, parity is the cutover gate.
-- **Release-binding removes member from recompute**: session-lifecycle-triggered overlay cleanup.
-- **Mob member restore-failure terminal classification**: post-restore, a failed member must be classified Broken. Not covered by the new DSL Wire/Unwire tests.
-- **Turn-boundary denial blocks side-effects**: pre-wave-a `turn_boundary_denial_blocks_boundary_side_effects_and_turn_completed` pinned authority around side-effects during deny. Core path; no obvious replacement.
+- **Trust reconcile concurrency + error surfacing**: serialized-under-concurrency and add-failure-typed-error were explicit PR #340 regression fixes. DSL tests reference `trust_reconcile` but do not pin the concurrency invariant.
+- **Respawn overlay rotation**: load-bearing for mob member lifecycle; DSL tests cover simpler endpoint mutation only.
+- **Shadow-mode parity with actor restore**: the parity property between DSL projection and shell-restored wiring — now the cutover gate.
+- **Release-binding removes member from recompute**: session-lifecycle overlay cleanup.
+- **Mob member restore-failure terminal classification**: post-restore failed member must be classified Broken.
+- **Turn-boundary denial blocks side-effects**: authority around side-effects during denial. Core path; no replacement.
 
 ## 6. Minimum test-rebuild list for wave (c)
 
-Wave (c) MUST add tests for the following before it can claim coverage parity:
+Wave (c) MUST add the following before claiming coverage parity:
 
-1. **Peer-projection concurrency**: `concurrent_reconciles_are_serialized_and_stale_short_circuits` — port against the DSL reducer path.
-2. **Peer-projection stale reconcile under serialization**: `stale_reconcile_under_serialization_does_not_leak_trust_store_mutations`.
-3. **Trust reconcile add-failure**: `add_failure_surfaces_typed_error_and_does_not_update_applied_view` — surface test through the peer-projection DSL, not deleted `comms_trust_reconcile`.
-4. **Respawn overlay rotation**: wire M1+M2, respawn M1, assert the prior session overlay is cleared and the new session receives endpoints.
-5. **Release-binding sweep**: release the binding of M1, assert M1 is removed from the peer-overlay projection.
-6. **Shadow-mode parity** (or its successor): after actor restore, DSL-projected overlay equals the expected wired set.
-7. **Mob member restore-failure breaks present member**: terminal-classification for a member whose restore failed.
-8. **Agent run-completed hook-failure emits run-failed, not run-completed**: port from pre-wave-a `state.rs`.
-9. **Turn-boundary denial blocks boundary side-effects**: port.
-10. **Composition-driver runtime contract**: replacement for the 9 `composition_dispatch` tests — minimal surface covering name/descriptor agreement, duplicate rejection, effect→watcher routing, typed decision-failure error. Can live against the catalog-declared driver shape.
-11. **Schedule host typed mapping**: `dispatch_from_admission_keeps_rejected_runtime_meaning_typed` + the two scheduled-completion-future mappings. Hoist to a shared surface test used by CLI/REST/RPC hosts.
-12. **Skill stdio protocol**: handshake-cache-per-source-instance, capability-mismatch typed error, unknown-skill not-found, transport-timeout typed error.
-13. **Skill filesystem**: recursive scan, quarantine diagnostics retention, collection-md fallback, invalid-ratio health transition.
-14. **Skill resolver precedence**: defaults, mixed repos, explicit-roots-context-over-user, no-roots-skips-filesystem-defaults.
-15. **Skill browse/load tool surface**: root listing, collection filter, search, empty collection, load-missing returns not-found — restore `meerkat-tools/tests/` coverage.
-16. **Comms peer-request promotion**: params-only, body-only-promotes-to-params, both-prefers-params, neither-gives-empty-object.
+1. Peer-projection concurrency: `concurrent_reconciles_are_serialized_and_stale_short_circuits` ported to DSL reducer path.
+2. Peer-projection stale reconcile under serialization.
+3. Trust-reconcile add-failure surfaces typed error and does not update applied view.
+4. Respawn overlay rotation: wire M1+M2, respawn M1, prior-session overlay cleared.
+5. Release-binding removes member from overlay projection.
+6. Shadow-mode parity (or successor): DSL projection == actor-restore wiring set.
+7. Mob member restore-failure breaks present member (terminal classification).
+8. Agent run-completed hook-failure emits run-failed.
+9. Turn-boundary denial blocks boundary side-effects.
+10. Composition-driver runtime contract: name/descriptor agreement, duplicate rejection, effect→watcher routing, typed decision-failure error.
+11. Schedule-host typed mapping: dispatch-from-admission + two scheduled-completion-future mappings; hoist to shared surface test for CLI/REST/RPC.
+12. Skill stdio protocol: handshake-cache-per-source, capability-mismatch, unknown-skill, timeout.
+13. Skill filesystem: recursive scan, quarantine diagnostics retention, collection-md fallback, invalid-ratio health transition.
+14. Skill resolver precedence: defaults, mixed repos, explicit-roots precedence, no-roots-skips-filesystem-defaults.
+15. Skill browse/load tool surface: root, collection filter, search, empty, load-missing not-found.
+16. Comms peer-request promotion: params-only, body-promotes, both-prefers-params, neither-empty.
 
-Estimated rebuild: **~40 targeted tests** to restore parity of behaviors still present in the tree. Rebuilding 60+ skills tests lost in B-7 collapse is optional if the typed SkillKey/SkillRef foundation is deemed sufficient — but browse/load/filesystem/protocol are runtime-behavior tests that typed-identity cannot substitute for.
+Estimated rebuild: **~40 targeted tests** to restore parity of behaviors still present. The 60+ skills tests lost in B-7 are optional if typed SkillKey/SkillRef is sufficient — but browse/load/filesystem/protocol are runtime-behavior tests that typed identity cannot substitute for.
