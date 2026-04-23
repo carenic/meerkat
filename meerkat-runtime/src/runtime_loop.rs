@@ -75,27 +75,63 @@ fn input_boundary(input: &Input) -> RunApplyBoundary {
     }
 }
 
-fn input_turn_metadata(
+/// Canonical runtime-side constructor for [`RuntimeTurnMetadata`].
+///
+/// This is the ONLY construction site for `RuntimeTurnMetadata` inside
+/// `meerkat-runtime/src/`. Any other literal/default construction is an
+/// RMAT-governed seam leak; the `turn_metadata_single_construction_site`
+/// integration test greps for that invariant at build time.
+pub(crate) fn for_input(
     input: &Input,
 ) -> Option<meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata> {
+    use meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata;
     match input {
         Input::Prompt(prompt) => prompt.turn_metadata.clone(),
         Input::FlowStep(flow_step) => flow_step.turn_metadata.clone(),
-        Input::ExternalEvent(event) => Some(
-            meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
-                handling_mode: Some(event.handling_mode),
-                render_metadata: event.render_metadata.clone(),
-                ..Default::default()
-            },
-        ),
-        Input::Continuation(continuation) => Some(
-            meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
-                handling_mode: Some(continuation.handling_mode),
-                ..Default::default()
-            },
-        ),
+        Input::ExternalEvent(event) => {
+            let mut meta = RuntimeTurnMetadata::default();
+            meta.handling_mode = Some(event.handling_mode);
+            meta.render_metadata = event.render_metadata.clone();
+            Some(meta)
+        }
+        Input::Continuation(continuation) => {
+            let mut meta = RuntimeTurnMetadata::default();
+            meta.handling_mode = Some(continuation.handling_mode);
+            Some(meta)
+        }
         _ => None,
     }
+}
+
+/// Merge the per-input turn metadata carried by a staged batch into a single
+/// typed carrier. Scalar conflicts (two inputs disagreeing on e.g. `model`)
+/// are refused with a typed error and the batch is treated as if no metadata
+/// could be synthesized safely — the caller falls back to `None` and the
+/// conflict is surfaced through structured tracing.
+pub(crate) fn merge_batch_turn_metadata(
+    inputs: &[(meerkat_core::lifecycle::InputId, Input)],
+) -> Option<meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata> {
+    use meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata;
+    let mut acc: Option<RuntimeTurnMetadata> = None;
+    for (_, input) in inputs {
+        let Some(meta) = for_input(input) else {
+            continue;
+        };
+        match acc.as_mut() {
+            None => acc = Some(meta),
+            Some(existing) => {
+                if let Err(conflict) = existing.merge(meta) {
+                    tracing::error!(
+                        field = conflict.field,
+                        reason = conflict.reason,
+                        "batch turn-metadata merge conflict; dropping batch metadata"
+                    );
+                    return None;
+                }
+            }
+        }
+    }
+    acc.filter(|m| !m.is_empty())
 }
 
 fn resolve_completion_waiters(
