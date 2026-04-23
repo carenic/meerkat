@@ -10,19 +10,68 @@ use crate::{
     WatchedEffect,
 };
 
+// Short-named typed-identity constructors used throughout this module.
+//
+// Every kernel-level identity (`MachineId`, `MachineInstanceId`, `ActorId`, …)
+// is validated via `parse()`. The catalog entries below are compile-time-known
+// slugs — authoring them as `identity::Thing::parse(...).expect(...)` inline
+// would drown the composition definitions in boilerplate, so we route every
+// construction site through these one-line helpers. A panic here is a
+// hand-authored DSL-slug bug, never reachable from wire input.
+use crate::identity::{
+    ActorId, CompositionId, EffectVariantId, FieldId, InputVariantId, MachineId,
+    MachineInstanceId, PhaseId, ProtocolId, RouteId, TransitionId,
+};
+
+fn comp_id(s: &str) -> CompositionId {
+    CompositionId::parse(s).expect("valid composition slug")
+}
+fn mach_id(s: &str) -> MachineId {
+    MachineId::parse(s).expect("valid machine slug")
+}
+fn mi_id(s: &str) -> MachineInstanceId {
+    MachineInstanceId::parse(s).expect("valid machine-instance slug")
+}
+fn act_id(s: &str) -> ActorId {
+    ActorId::parse(s).expect("valid actor slug")
+}
+fn iv_id(s: &str) -> InputVariantId {
+    InputVariantId::parse(s).expect("valid input-variant slug")
+}
+fn ev_id(s: &str) -> EffectVariantId {
+    EffectVariantId::parse(s).expect("valid effect-variant slug")
+}
+fn fld_id(s: &str) -> FieldId {
+    FieldId::parse(s).expect("valid field slug")
+}
+fn route_id(s: &str) -> RouteId {
+    RouteId::parse(s).expect("valid route slug")
+}
+fn protocol_id(s: &str) -> ProtocolId {
+    ProtocolId::parse(s).expect("valid protocol slug")
+}
+#[allow(dead_code)]
+fn phase_id(s: &str) -> PhaseId {
+    PhaseId::parse(s).expect("valid phase slug")
+}
+#[allow(dead_code)]
+fn transition_id(s: &str) -> TransitionId {
+    TransitionId::parse(s).expect("valid transition slug")
+}
+
 pub fn schedule_bundle_composition() -> CompositionSchema {
     CompositionSchema {
-        name: "schedule_bundle".into(),
+        name: comp_id("schedule_bundle"),
         machines: vec![
             MachineInstance {
-                instance_id: "schedule".into(),
-                machine_name: "ScheduleLifecycleMachine".into(),
-                actor: "schedule_authority".into(),
+                instance_id: mi_id("schedule"),
+                machine_name: mach_id("ScheduleLifecycleMachine"),
+                actor: act_id("schedule_authority"),
             },
             MachineInstance {
-                instance_id: "occurrence".into(),
-                machine_name: "OccurrenceLifecycleMachine".into(),
-                actor: "occurrence_authority".into(),
+                instance_id: mi_id("occurrence"),
+                machine_name: mach_id("OccurrenceLifecycleMachine"),
+                actor: act_id("occurrence_authority"),
             },
         ],
         actors: vec![
@@ -62,27 +111,27 @@ pub fn schedule_bundle_composition() -> CompositionSchema {
             CompositionInvariant {
                 name: "schedule_revision_supersede_route_present".into(),
                 kind: CompositionInvariantKind::RoutePresent {
-                    from_machine: "schedule".into(),
-                    effect_variant: "SupersedePendingOccurrences".into(),
-                    to_machine: "occurrence".into(),
+                    from_machine: mi_id("schedule"),
+                    effect_variant: ev_id("SupersedePendingOccurrences"),
+                    to_machine: mi_id("occurrence"),
                     input_variant: "Supersede".into(),
                 },
                 statement: "revision-affecting schedule edits enter occurrence authority through the explicit supersede route".into(),
-                references_machines: vec!["schedule".into(), "occurrence".into()],
-                references_actors: vec!["schedule_authority".into(), "occurrence_authority".into()],
+                references_machines: vec![mi_id("schedule"), mi_id("occurrence")],
+                references_actors: vec![act_id("schedule_authority"), act_id("occurrence_authority")],
             },
             CompositionInvariant {
                 name: "superseded_occurrence_originates_from_schedule_revision".into(),
                 kind: CompositionInvariantKind::ObservedRouteInputOriginatesFromEffect {
-                    route_name: "revision_supersede_enters_occurrence_authority".into(),
-                    to_machine: "occurrence".into(),
+                    route_name: route_id("revision_supersede_enters_occurrence_authority"),
+                    to_machine: mi_id("occurrence"),
                     input_variant: "Supersede".into(),
-                    from_machine: "schedule".into(),
-                    effect_variant: "SupersedePendingOccurrences".into(),
+                    from_machine: mi_id("schedule"),
+                    effect_variant: ev_id("SupersedePendingOccurrences"),
                 },
                 statement: "pending future occurrences are superseded only by the schedule revision route rather than by ad hoc shell mutation".into(),
-                references_machines: vec!["schedule".into(), "occurrence".into()],
-                references_actors: vec!["schedule_authority".into(), "occurrence_authority".into()],
+                references_machines: vec![mi_id("schedule"), mi_id("occurrence")],
+                references_actors: vec![act_id("schedule_authority"), act_id("occurrence_authority")],
             },
         ],
         witnesses: vec![
@@ -102,11 +151,11 @@ pub fn schedule_bundle_composition() -> CompositionSchema {
 
 pub fn schedule_runtime_bundle_composition() -> CompositionSchema {
     CompositionSchema {
-        name: "schedule_runtime_bundle".into(),
+        name: comp_id("schedule_runtime_bundle"),
         machines: vec![MachineInstance {
-            instance_id: "occurrence".into(),
-            machine_name: "OccurrenceLifecycleMachine".into(),
-            actor: "occurrence_authority".into(),
+            instance_id: mi_id("occurrence"),
+            machine_name: mach_id("OccurrenceLifecycleMachine"),
+            actor: act_id("occurrence_authority"),
         }],
         actors: vec![machine_actor("occurrence_authority")],
         handoff_protocols: vec![],
@@ -137,11 +186,11 @@ pub fn schedule_runtime_bundle_composition() -> CompositionSchema {
 
 pub fn schedule_mob_bundle_composition() -> CompositionSchema {
     CompositionSchema {
-        name: "schedule_mob_bundle".into(),
+        name: comp_id("schedule_mob_bundle"),
         machines: vec![MachineInstance {
-            instance_id: "occurrence".into(),
-            machine_name: "OccurrenceLifecycleMachine".into(),
-            actor: "occurrence_authority".into(),
+            instance_id: mi_id("occurrence"),
+            machine_name: mach_id("OccurrenceLifecycleMachine"),
+            actor: act_id("occurrence_authority"),
         }],
         actors: vec![machine_actor("occurrence_authority")],
         handoff_protocols: vec![],
@@ -172,17 +221,17 @@ pub fn schedule_mob_bundle_composition() -> CompositionSchema {
 
 pub fn meerkat_mob_seam_composition() -> CompositionSchema {
     CompositionSchema {
-        name: "meerkat_mob_seam".into(),
+        name: comp_id("meerkat_mob_seam"),
         machines: vec![
             MachineInstance {
-                instance_id: "meerkat".into(),
-                machine_name: "MeerkatMachine".into(),
-                actor: "meerkat_kernel".into(),
+                instance_id: mi_id("meerkat"),
+                machine_name: mach_id("MeerkatMachine"),
+                actor: act_id("meerkat_kernel"),
             },
             MachineInstance {
-                instance_id: "mob".into(),
-                machine_name: "MobMachine".into(),
-                actor: "mob_kernel".into(),
+                instance_id: mi_id("mob"),
+                machine_name: mach_id("MobMachine"),
+                actor: act_id("mob_kernel"),
             },
         ],
         actors: vec![machine_actor("meerkat_kernel"), machine_actor("mob_kernel")],
@@ -190,23 +239,23 @@ pub fn meerkat_mob_seam_composition() -> CompositionSchema {
         entry_inputs: vec![
             EntryInput {
                 name: "spawn_member".into(),
-                machine: "mob".into(),
-                input_variant: "Spawn".into(),
+                machine: mi_id("mob"),
+                input_variant: iv_id("Spawn"),
             },
             EntryInput {
                 name: "submit_work".into(),
-                machine: "mob".into(),
-                input_variant: "SubmitWork".into(),
+                machine: mi_id("mob"),
+                input_variant: iv_id("SubmitWork"),
             },
             EntryInput {
                 name: "retire_member".into(),
-                machine: "mob".into(),
-                input_variant: "Retire".into(),
+                machine: mi_id("mob"),
+                input_variant: iv_id("Retire"),
             },
             EntryInput {
                 name: "destroy_mob".into(),
-                machine: "mob".into(),
-                input_variant: "Destroy".into(),
+                machine: mi_id("mob"),
+                input_variant: iv_id("Destroy"),
             },
         ],
         routes: vec![
@@ -331,7 +380,7 @@ pub fn meerkat_mob_seam_composition() -> CompositionSchema {
 
 fn machine_actor(name: &str) -> ActorSchema {
     ActorSchema {
-        name: name.into(),
+        name: act_id(name),
         kind: ActorKind::Machine,
     }
 }
@@ -346,11 +395,11 @@ fn route(
     bindings: &[RouteFieldBinding],
 ) -> Route {
     Route {
-        name: name.into(),
-        from_machine: from_machine.into(),
-        effect_variant: effect_variant.into(),
+        name: route_id(name),
+        from_machine: mi_id(from_machine),
+        effect_variant: ev_id(effect_variant),
         to: RouteTarget {
-            machine: to_machine.into(),
+            machine: mi_id(to_machine),
             kind: target_kind,
             input_variant: input_variant.into(),
         },
@@ -361,9 +410,9 @@ fn route(
 
 fn bind(to_field: &str, from_field: &str) -> RouteFieldBinding {
     RouteFieldBinding {
-        to_field: to_field.into(),
+        to_field: fld_id(to_field),
         source: RouteBindingSource::Field {
-            from_field: from_field.into(),
+            from_field: fld_id(from_field),
             allow_named_alias: false,
         },
     }
@@ -389,10 +438,7 @@ fn witness(name: &str, expected_routes: &[&str]) -> CompositionWitness {
     CompositionWitness {
         name: name.into(),
         preload_inputs: vec![],
-        expected_routes: expected_routes
-            .iter()
-            .map(|route| (*route).into())
-            .collect(),
+        expected_routes: expected_routes.iter().map(|r| route_id(r)).collect(),
         expected_scheduler_rules: vec![],
         expected_states: vec![],
         expected_transitions: vec![],
@@ -441,59 +487,55 @@ pub fn compat_composition_schemas() -> Vec<CompositionSchema> {
 /// protocol uses in this workspace.
 fn flow_frame_loop_composition() -> CompositionSchema {
     CompositionSchema {
-        name: "flow_frame_loop".into(),
+        name: comp_id("flow_frame_loop"),
         machines: vec![MachineInstance {
-            instance_id: "loop_iteration".into(),
-            machine_name: "LoopIterationMachine".into(),
-            actor: "loop_iteration_authority".into(),
+            instance_id: mi_id("loop_iteration"),
+            machine_name: mach_id("LoopIterationMachine"),
+            actor: act_id("loop_iteration_authority"),
         }],
         actors: vec![
             machine_actor("loop_iteration_authority"),
             owner_actor("loop_runtime_owner"),
         ],
         handoff_protocols: vec![EffectHandoffProtocol {
-            name: "flow_loop_until_evaluation".into(),
-            producer_instance: "loop_iteration".into(),
-            effect_variant: "EvaluateUntilCondition".into(),
-            realizing_actor: "loop_runtime_owner".into(),
-            correlation_fields: vec!["loop_instance_id".into(), "iteration".into()],
+            name: protocol_id("flow_loop_until_evaluation"),
+            producer_instance: mi_id("loop_iteration"),
+            effect_variant: ev_id("EvaluateUntilCondition"),
+            realizing_actor: act_id("loop_runtime_owner"),
+            correlation_fields: vec![fld_id("loop_instance_id"), fld_id("iteration")],
             obligation_fields: vec![
-                "loop_instance_id".into(),
-                "iteration".into(),
-                "parent_frame_id".into(),
-                "parent_node_id".into(),
-                "loop_id".into(),
+                fld_id("loop_instance_id"),
+                fld_id("iteration"),
+                fld_id("parent_frame_id"),
+                fld_id("parent_node_id"),
+                fld_id("loop_id"),
             ],
             allowed_feedback_inputs: vec![
                 FeedbackInputRef {
-                    machine_instance: "loop_iteration".into(),
-                    input_variant: "UntilConditionMet".into(),
+                    machine_instance: mi_id("loop_iteration"),
+                    input_variant: iv_id("UntilConditionMet"),
                     field_bindings: vec![
                         FeedbackFieldBinding {
-                            input_field: "loop_instance_id".into(),
-                            source: FeedbackFieldSource::ObligationField(
-                                "loop_instance_id".into(),
-                            ),
+                            input_field: fld_id("loop_instance_id"),
+                            source: FeedbackFieldSource::ObligationField(fld_id("loop_instance_id")),
                         },
                         FeedbackFieldBinding {
-                            input_field: "iteration".into(),
-                            source: FeedbackFieldSource::ObligationField("iteration".into()),
+                            input_field: fld_id("iteration"),
+                            source: FeedbackFieldSource::ObligationField(fld_id("iteration")),
                         },
                     ],
                 },
                 FeedbackInputRef {
-                    machine_instance: "loop_iteration".into(),
-                    input_variant: "UntilConditionFailed".into(),
+                    machine_instance: mi_id("loop_iteration"),
+                    input_variant: iv_id("UntilConditionFailed"),
                     field_bindings: vec![
                         FeedbackFieldBinding {
-                            input_field: "loop_instance_id".into(),
-                            source: FeedbackFieldSource::ObligationField(
-                                "loop_instance_id".into(),
-                            ),
+                            input_field: fld_id("loop_instance_id"),
+                            source: FeedbackFieldSource::ObligationField(fld_id("loop_instance_id")),
                         },
                         FeedbackFieldBinding {
-                            input_field: "iteration".into(),
-                            source: FeedbackFieldSource::ObligationField("iteration".into()),
+                            input_field: fld_id("iteration"),
+                            source: FeedbackFieldSource::ObligationField(fld_id("iteration")),
                         },
                     ],
                 },
@@ -551,15 +593,15 @@ fn flow_frame_loop_composition() -> CompositionSchema {
         invariants: vec![CompositionInvariant {
             name: "flow_loop_until_evaluation_protocol_covered".into(),
             kind: CompositionInvariantKind::HandoffProtocolCovered {
-                producer_instance: "loop_iteration".into(),
-                effect_variant: "EvaluateUntilCondition".into(),
-                protocol_name: "flow_loop_until_evaluation".into(),
+                producer_instance: mi_id("loop_iteration"),
+                effect_variant: ev_id("EvaluateUntilCondition"),
+                protocol_name: protocol_id("flow_loop_until_evaluation"),
             },
             statement: "loop-iteration authority's UntilCondition evaluation effect is handed off through the explicit `flow_loop_until_evaluation` protocol rather than ad-hoc shell mutation".into(),
-            references_machines: vec!["loop_iteration".into()],
+            references_machines: vec![mi_id("loop_iteration")],
             references_actors: vec![
-                "loop_iteration_authority".into(),
-                "loop_runtime_owner".into(),
+                act_id("loop_iteration_authority"),
+                act_id("loop_runtime_owner"),
             ],
         }],
         witnesses: vec![witness("flow_loop_eval_round_trip", &[])],
@@ -602,7 +644,7 @@ fn mob_bundle_composition() -> CompositionSchema {
     handle_forwarded_fields.insert("OpsBarrierSatisfied".into(), vec!["operation_ids".into()]);
 
     CompositionSchema {
-        name: "mob_bundle".into(),
+        name: comp_id("mob_bundle"),
         // The producer is the compat `OpsBarrierBridgeMachine` which hosts
         // the handoff-annotated `WaitAllSatisfied` effect declaration.
         // Its shape mirrors the runtime-owned effect; the canonical
@@ -610,34 +652,32 @@ fn mob_bundle_composition() -> CompositionSchema {
         // handoff annotation the DSL macro cannot emit) so the runtime
         // shell still observes the effect through its own reducer.
         machines: vec![MachineInstance {
-            instance_id: "ops_barrier_bridge".into(),
-            machine_name: "OpsBarrierBridgeMachine".into(),
-            actor: "ops_barrier_bridge_authority".into(),
+            instance_id: mi_id("ops_barrier_bridge"),
+            machine_name: mach_id("OpsBarrierBridgeMachine"),
+            actor: act_id("ops_barrier_bridge_authority"),
         }],
         actors: vec![
             machine_actor("ops_barrier_bridge_authority"),
             owner_actor("ops_lifecycle_owner"),
         ],
         handoff_protocols: vec![EffectHandoffProtocol {
-            name: "ops_barrier_satisfaction".into(),
-            producer_instance: "ops_barrier_bridge".into(),
-            effect_variant: "WaitAllSatisfied".into(),
-            realizing_actor: "ops_lifecycle_owner".into(),
-            correlation_fields: vec!["wait_request_id".into()],
-            obligation_fields: vec!["wait_request_id".into(), "operation_ids".into()],
+            name: protocol_id("ops_barrier_satisfaction"),
+            producer_instance: mi_id("ops_barrier_bridge"),
+            effect_variant: ev_id("WaitAllSatisfied"),
+            realizing_actor: act_id("ops_lifecycle_owner"),
+            correlation_fields: vec![fld_id("wait_request_id")],
+            obligation_fields: vec![fld_id("wait_request_id"), fld_id("operation_ids")],
             allowed_feedback_inputs: vec![FeedbackInputRef {
-                machine_instance: "ops_barrier_bridge".into(),
-                input_variant: "OpsBarrierSatisfied".into(),
+                machine_instance: mi_id("ops_barrier_bridge"),
+                input_variant: iv_id("OpsBarrierSatisfied"),
                 field_bindings: vec![
                     FeedbackFieldBinding {
-                        input_field: "wait_request_id".into(),
-                        source: FeedbackFieldSource::ObligationField(
-                            "wait_request_id".into(),
-                        ),
+                        input_field: fld_id("wait_request_id"),
+                        source: FeedbackFieldSource::ObligationField(fld_id("wait_request_id")),
                     },
                     FeedbackFieldBinding {
-                        input_field: "operation_ids".into(),
-                        source: FeedbackFieldSource::ObligationField("operation_ids".into()),
+                        input_field: fld_id("operation_ids"),
+                        source: FeedbackFieldSource::ObligationField(fld_id("operation_ids")),
                     },
                 ],
             }],
@@ -691,15 +731,15 @@ fn mob_bundle_composition() -> CompositionSchema {
         invariants: vec![CompositionInvariant {
             name: "ops_barrier_satisfaction_protocol_covered".into(),
             kind: CompositionInvariantKind::HandoffProtocolCovered {
-                producer_instance: "ops_barrier_bridge".into(),
-                effect_variant: "WaitAllSatisfied".into(),
-                protocol_name: "ops_barrier_satisfaction".into(),
+                producer_instance: mi_id("ops_barrier_bridge"),
+                effect_variant: ev_id("WaitAllSatisfied"),
+                protocol_name: protocol_id("ops_barrier_satisfaction"),
             },
             statement: "wait-all barrier satisfaction crosses from the ops lifecycle owner back into turn-state authority only through the explicit `ops_barrier_satisfaction` protocol".into(),
-            references_machines: vec!["ops_barrier_bridge".into()],
+            references_machines: vec![mi_id("ops_barrier_bridge")],
             references_actors: vec![
-                "ops_barrier_bridge_authority".into(),
-                "ops_lifecycle_owner".into(),
+                act_id("ops_barrier_bridge_authority"),
+                act_id("ops_lifecycle_owner"),
             ],
         }],
         witnesses: vec![witness("ops_barrier_close_round_trip", &[])],
@@ -757,11 +797,11 @@ fn external_tool_bundle_composition() -> CompositionSchema {
     snapshot_forwarded.insert("SnapshotAligned".into(), vec!["snapshot_epoch".into()]);
 
     CompositionSchema {
-        name: "external_tool_bundle".into(),
+        name: comp_id("external_tool_bundle"),
         machines: vec![MachineInstance {
-            instance_id: "external_tool_surface".into(),
-            machine_name: "ExternalToolSurfaceBridgeMachine".into(),
-            actor: "external_tool_surface_authority".into(),
+            instance_id: mi_id("external_tool_surface"),
+            machine_name: mach_id("ExternalToolSurfaceBridgeMachine"),
+            actor: act_id("external_tool_surface_authority"),
         }],
         actors: vec![
             machine_actor("external_tool_surface_authority"),
@@ -771,64 +811,54 @@ fn external_tool_bundle_composition() -> CompositionSchema {
             // Protocol 1: surface_completion — dual-mode emission
             // (EffectExtractor + HandleBridge).
             EffectHandoffProtocol {
-                name: "surface_completion".into(),
-                producer_instance: "external_tool_surface".into(),
-                effect_variant: "ScheduleSurfaceCompletion".into(),
-                realizing_actor: "surface_host_owner".into(),
+                name: protocol_id("surface_completion"),
+                producer_instance: mi_id("external_tool_surface"),
+                effect_variant: ev_id("ScheduleSurfaceCompletion"),
+                realizing_actor: act_id("surface_host_owner"),
                 correlation_fields: vec![
-                    "surface_id".into(),
-                    "pending_task_sequence".into(),
+                    fld_id("surface_id"),
+                    fld_id("pending_task_sequence"),
                 ],
                 obligation_fields: vec![
-                    "surface_id".into(),
-                    "operation".into(),
-                    "pending_task_sequence".into(),
-                    "staged_intent_sequence".into(),
-                    "applied_at_turn".into(),
+                    fld_id("surface_id"),
+                    fld_id("operation"),
+                    fld_id("pending_task_sequence"),
+                    fld_id("staged_intent_sequence"),
+                    fld_id("applied_at_turn"),
                 ],
                 allowed_feedback_inputs: vec![
                     FeedbackInputRef {
-                        machine_instance: "external_tool_surface".into(),
-                        input_variant: "PendingSucceeded".into(),
+                        machine_instance: mi_id("external_tool_surface"),
+                        input_variant: iv_id("PendingSucceeded"),
                         field_bindings: vec![
                             FeedbackFieldBinding {
-                                input_field: "surface_id".into(),
-                                source: FeedbackFieldSource::ObligationField(
-                                    "surface_id".into(),
-                                ),
+                                input_field: fld_id("surface_id"),
+                                source: FeedbackFieldSource::ObligationField(fld_id("surface_id")),
                             },
                             FeedbackFieldBinding {
-                                input_field: "pending_task_sequence".into(),
-                                source: FeedbackFieldSource::ObligationField(
-                                    "pending_task_sequence".into(),
-                                ),
+                                input_field: fld_id("pending_task_sequence"),
+                                source: FeedbackFieldSource::ObligationField(fld_id("pending_task_sequence")),
                             },
                             FeedbackFieldBinding {
-                                input_field: "staged_intent_sequence".into(),
-                                source: FeedbackFieldSource::ObligationField(
-                                    "staged_intent_sequence".into(),
-                                ),
+                                input_field: fld_id("staged_intent_sequence"),
+                                source: FeedbackFieldSource::ObligationField(fld_id("staged_intent_sequence")),
                             },
                         ],
                     },
                     FeedbackInputRef {
-                        machine_instance: "external_tool_surface".into(),
-                        input_variant: "PendingFailed".into(),
+                        machine_instance: mi_id("external_tool_surface"),
+                        input_variant: iv_id("PendingFailed"),
                         field_bindings: vec![
                             FeedbackFieldBinding {
-                                input_field: "surface_id".into(),
-                                source: FeedbackFieldSource::ObligationField(
-                                    "surface_id".into(),
-                                ),
+                                input_field: fld_id("surface_id"),
+                                source: FeedbackFieldSource::ObligationField(fld_id("surface_id")),
                             },
                             FeedbackFieldBinding {
-                                input_field: "pending_task_sequence".into(),
-                                source: FeedbackFieldSource::ObligationField(
-                                    "pending_task_sequence".into(),
-                                ),
+                                input_field: fld_id("pending_task_sequence"),
+                                source: FeedbackFieldSource::ObligationField(fld_id("pending_task_sequence")),
                             },
                             FeedbackFieldBinding {
-                                input_field: "reason".into(),
+                                input_field: fld_id("reason"),
                                 source: FeedbackFieldSource::OwnerContext("reason".into()),
                             },
                         ],
@@ -871,18 +901,18 @@ fn external_tool_bundle_composition() -> CompositionSchema {
             },
             // Protocol 2: surface_snapshot_alignment — dual-mode.
             EffectHandoffProtocol {
-                name: "surface_snapshot_alignment".into(),
-                producer_instance: "external_tool_surface".into(),
-                effect_variant: "RefreshVisibleSurfaceSet".into(),
-                realizing_actor: "surface_host_owner".into(),
-                correlation_fields: vec!["snapshot_epoch".into()],
-                obligation_fields: vec!["snapshot_epoch".into()],
+                name: protocol_id("surface_snapshot_alignment"),
+                producer_instance: mi_id("external_tool_surface"),
+                effect_variant: ev_id("RefreshVisibleSurfaceSet"),
+                realizing_actor: act_id("surface_host_owner"),
+                correlation_fields: vec![fld_id("snapshot_epoch")],
+                obligation_fields: vec![fld_id("snapshot_epoch")],
                 allowed_feedback_inputs: vec![FeedbackInputRef {
-                    machine_instance: "external_tool_surface".into(),
-                    input_variant: "SnapshotAligned".into(),
+                    machine_instance: mi_id("external_tool_surface"),
+                    input_variant: iv_id("SnapshotAligned"),
                     field_bindings: vec![FeedbackFieldBinding {
-                        input_field: "snapshot_epoch".into(),
-                        source: FeedbackFieldSource::ObligationField("snapshot_epoch".into()),
+                        input_field: fld_id("snapshot_epoch"),
+                        source: FeedbackFieldSource::ObligationField(fld_id("snapshot_epoch")),
                     }],
                 }],
                 closure_policy: ClosurePolicy::AckRequired,
@@ -930,33 +960,33 @@ fn external_tool_bundle_composition() -> CompositionSchema {
             CompositionInvariant {
                 name: "surface_completion_protocol_covered".into(),
                 kind: CompositionInvariantKind::HandoffProtocolCovered {
-                    producer_instance: "external_tool_surface".into(),
-                    effect_variant: "ScheduleSurfaceCompletion".into(),
-                    protocol_name: "surface_completion".into(),
+                    producer_instance: mi_id("external_tool_surface"),
+                    effect_variant: ev_id("ScheduleSurfaceCompletion"),
+                    protocol_name: protocol_id("surface_completion"),
                 },
                 statement:
                     "pending-op completion on a tool surface is returned to the authority only through the explicit `surface_completion` protocol"
                         .into(),
-                references_machines: vec!["external_tool_surface".into()],
+                references_machines: vec![mi_id("external_tool_surface")],
                 references_actors: vec![
-                    "external_tool_surface_authority".into(),
-                    "surface_host_owner".into(),
+                    act_id("external_tool_surface_authority"),
+                    act_id("surface_host_owner"),
                 ],
             },
             CompositionInvariant {
                 name: "surface_snapshot_alignment_protocol_covered".into(),
                 kind: CompositionInvariantKind::HandoffProtocolCovered {
-                    producer_instance: "external_tool_surface".into(),
-                    effect_variant: "RefreshVisibleSurfaceSet".into(),
-                    protocol_name: "surface_snapshot_alignment".into(),
+                    producer_instance: mi_id("external_tool_surface"),
+                    effect_variant: ev_id("RefreshVisibleSurfaceSet"),
+                    protocol_name: protocol_id("surface_snapshot_alignment"),
                 },
                 statement:
                     "visible-set refresh acknowledgement crosses back through the explicit `surface_snapshot_alignment` protocol rather than ad-hoc polling"
                         .into(),
-                references_machines: vec!["external_tool_surface".into()],
+                references_machines: vec![mi_id("external_tool_surface")],
                 references_actors: vec![
-                    "external_tool_surface_authority".into(),
-                    "surface_host_owner".into(),
+                    act_id("external_tool_surface_authority"),
+                    act_id("surface_host_owner"),
                 ],
             },
         ],
@@ -974,7 +1004,7 @@ fn external_tool_bundle_composition() -> CompositionSchema {
 
 fn owner_actor(name: &str) -> ActorSchema {
     ActorSchema {
-        name: name.into(),
+        name: act_id(name),
         kind: ActorKind::Owner,
     }
 }
