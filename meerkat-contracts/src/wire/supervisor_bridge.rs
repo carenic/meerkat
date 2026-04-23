@@ -209,6 +209,12 @@ pub struct BridgePeerSpec {
     pub name: String,
     pub peer_id: String,
     pub address: String,
+    /// Ed25519 signing public key bytes — required so the receiver can
+    /// verify envelope signatures after trust registration. Serialized
+    /// as a 32-element array; the JSON form is an array of numbers, not
+    /// a base64/hex string, to keep the wire deliberately boring.
+    #[serde(default)]
+    pub pubkey: [u8; 32],
 }
 
 /// Connectivity class observed for the bridged member runtime.
@@ -227,6 +233,7 @@ impl From<meerkat_core::comms::TrustedPeerDescriptor> for BridgePeerSpec {
             name: spec.name.as_str().to_string(),
             peer_id: spec.peer_id.as_str(),
             address: spec.address.to_string(),
+            pubkey: spec.pubkey,
         }
     }
 }
@@ -252,6 +259,7 @@ impl TryFrom<&BridgePeerSpec> for meerkat_core::comms::TrustedPeerDescriptor {
             peer_id,
             name,
             address,
+            pubkey: spec.pubkey,
         })
     }
 }
