@@ -59,6 +59,22 @@ fn transition_id(s: &str) -> TransitionId {
     TransitionId::parse(s).expect("valid transition slug")
 }
 
+/// Typed route-variant constructor that pairs a [`RouteTargetKind`] with
+/// the matching [`InputVariantId`] or [`SignalVariantId`]. Every catalog
+/// author expresses an input/signal target slug through this helper.
+fn rv(kind: RouteTargetKind, slug: &str) -> crate::RouteVariantId {
+    match kind {
+        RouteTargetKind::Input => {
+            crate::RouteVariantId::Input(InputVariantId::parse(slug).expect("valid input-variant slug"))
+        }
+        RouteTargetKind::Signal => {
+            crate::RouteVariantId::Signal(
+                crate::identity::SignalVariantId::parse(slug).expect("valid signal-variant slug"),
+            )
+        }
+    }
+}
+
 pub fn schedule_bundle_composition() -> CompositionSchema {
     CompositionSchema {
         name: comp_id("schedule_bundle"),
@@ -114,7 +130,7 @@ pub fn schedule_bundle_composition() -> CompositionSchema {
                     from_machine: mi_id("schedule"),
                     effect_variant: ev_id("SupersedePendingOccurrences"),
                     to_machine: mi_id("occurrence"),
-                    input_variant: "Supersede".into(),
+                    input_variant: rv(RouteTargetKind::Input, "Supersede"),
                 },
                 statement: "revision-affecting schedule edits enter occurrence authority through the explicit supersede route".into(),
                 references_machines: vec![mi_id("schedule"), mi_id("occurrence")],
@@ -125,7 +141,7 @@ pub fn schedule_bundle_composition() -> CompositionSchema {
                 kind: CompositionInvariantKind::ObservedRouteInputOriginatesFromEffect {
                     route_name: route_id("revision_supersede_enters_occurrence_authority"),
                     to_machine: mi_id("occurrence"),
-                    input_variant: "Supersede".into(),
+                    input_variant: rv(RouteTargetKind::Input, "Supersede"),
                     from_machine: mi_id("schedule"),
                     effect_variant: ev_id("SupersedePendingOccurrences"),
                 },
@@ -398,11 +414,7 @@ fn route(
         name: route_id(name),
         from_machine: mi_id(from_machine),
         effect_variant: ev_id(effect_variant),
-        to: RouteTarget {
-            machine: mi_id(to_machine),
-            kind: target_kind,
-            input_variant: input_variant.into(),
-        },
+        to: RouteTarget::new(mi_id(to_machine), rv(target_kind, input_variant)),
         bindings: bindings.to_vec(),
         delivery: RouteDelivery::Immediate,
     }
