@@ -4,6 +4,7 @@ pub mod catalog;
 /// from the canonical registry.
 pub mod compat;
 mod composition;
+pub mod identity;
 mod machine;
 pub mod types;
 
