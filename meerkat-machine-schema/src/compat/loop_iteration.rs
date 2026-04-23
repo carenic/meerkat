@@ -2,14 +2,13 @@ use indexmap::IndexMap;
 
 use crate::{
     EffectDisposition, EffectDispositionRule, EffectEmit, EnumSchema, Expr, FieldInit, FieldSchema,
-    Guard, InitSchema, InputMatch, MachineSchema, RustBinding, StateSchema, TransitionSchema,
-    TriggerKind, TypeRef, Update, VariantSchema,
+    Guard, InitSchema, MachineSchema, RustBinding, StateSchema, TransitionSchema,
+    TypeRef, Update, VariantSchema, TriggerMatch,
 };
 use crate::identity::{
     EffectVariantId, EnumTypeId, EnumVariantId, FieldId, InputVariantId, MachineId,
     NamedTypeId, PhaseId, ProtocolId, TransitionId,
 };
-use crate::machine::TriggerMatch;
 
 pub fn loop_iteration_machine() -> MachineSchema {
     MachineSchema {

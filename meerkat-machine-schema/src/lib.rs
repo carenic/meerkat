@@ -35,7 +35,7 @@ pub use machine::{
     EffectDisposition, EffectDispositionRule, EffectEmit, EnumSchema, Expr, FieldInit, FieldSchema,
     FieldType, Guard, HelperSchema, InitSchema, InputMatch, InvariantSchema, MachineSchema,
     MachineSchemaError, Quantifier, RustBinding, StateSchema, TransitionSchema, TriggerKind,
-    TypeRef, Update, VariantSchema,
+    TriggerMatch, TypeRef, Update, VariantSchema,
 };
 
 #[cfg(test)]

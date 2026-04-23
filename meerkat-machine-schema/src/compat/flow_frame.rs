@@ -2,8 +2,8 @@ use indexmap::IndexMap;
 
 use crate::{
     EffectDisposition, EffectDispositionRule, EffectEmit, EnumSchema, Expr, FieldInit, FieldSchema,
-    Guard, HelperSchema, InputMatch, InvariantSchema, MachineSchema, Quantifier, RustBinding,
-    StateSchema, TransitionSchema, TriggerKind, TypeRef, Update, VariantSchema,
+    Guard, HelperSchema, InvariantSchema, MachineSchema, Quantifier, RustBinding,
+    StateSchema, TransitionSchema, TypeRef, Update, VariantSchema, TriggerMatch,
 };
 use crate::identity::{
     EffectVariantId, EnumTypeId, EnumVariantId, FieldId, InputVariantId, MachineId,
@@ -1963,4 +1963,3 @@ fn init(field: &str, expr: Expr) -> FieldInit {
 
 // Suppress unused import warning - InitSchema is used via the struct literal in MachineSchema
 use crate::InitSchema;
-use crate::machine::TriggerMatch;
