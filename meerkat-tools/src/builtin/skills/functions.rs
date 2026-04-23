@@ -30,15 +30,6 @@ impl SkillInvokeFunctionTool {
     }
 }
 
-fn canonical_key(id: &SkillId) -> Value {
-    match id.0.split_once('/') {
-        Some((source_uuid, skill_name)) => {
-            json!({"source_uuid": source_uuid, "skill_name": skill_name})
-        }
-        None => json!({"source_uuid": Value::Null, "skill_name": id.0}),
-    }
-}
-
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl BuiltinTool for SkillInvokeFunctionTool {

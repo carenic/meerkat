@@ -180,15 +180,6 @@ impl AgentToolDispatcher for FilteredDispatcher {
             .into()
     }
 
-    async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
-        if !self.allowed_names.contains(call.name) {
-            return Err(ToolError::NotFound {
-                name: call.name.to_string(),
-            });
-        }
-        self.inner.dispatch(call).await
-    }
-
     fn external_tool_surface_snapshot(&self) -> Option<meerkat_core::ExternalToolSurfaceSnapshot> {
         self.inner.external_tool_surface_snapshot()
     }

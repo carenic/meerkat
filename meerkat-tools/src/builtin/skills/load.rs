@@ -80,15 +80,6 @@ impl BuiltinTool for LoadSkillTool {
     }
 }
 
-fn canonical_key(id: &SkillId) -> Value {
-    match id.0.split_once('/') {
-        Some((source_uuid, skill_name)) => {
-            json!({ "source_uuid": source_uuid, "skill_name": skill_name })
-        }
-        None => json!({ "source_uuid": Value::Null, "skill_name": id.0 }),
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::manual_async_fn)]
 mod tests {
