@@ -3332,8 +3332,6 @@ mod tests {
                     event_tx: None,
                     skill_references: None,
                     flow_tool_overlay: None,
-                    additional_instructions: None,
-                    execution_kind: None,
                 },
             )
             .await
@@ -3518,8 +3516,6 @@ mod tests {
                     event_tx: None,
                     skill_references: None,
                     flow_tool_overlay: None,
-                    additional_instructions: None,
-                    execution_kind: None,
                 },
             )
             .await;
@@ -4962,8 +4958,6 @@ mod tests {
                 event_tx: None,
                 skill_references: None,
                 flow_tool_overlay: None,
-                additional_instructions: None,
-                execution_kind: None,
             },
             meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunStart,
             vec![],

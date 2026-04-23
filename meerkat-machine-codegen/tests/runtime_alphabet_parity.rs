@@ -178,13 +178,13 @@ fn every_canonical_input_has_transition_coverage() {
         let surface_only_inputs: BTreeSet<&str> = schema
             .surface_only_inputs
             .iter()
-            .map(String::as_str)
+            .map(|v| v.as_str())
             .collect();
         let covered: BTreeSet<&str> = schema
             .transitions
             .iter()
-            .filter(|transition| transition.on.kind == TriggerKind::Input)
-            .map(|transition| transition.on.variant.as_str())
+            .filter(|transition| transition.on.kind() == TriggerKind::Input)
+            .map(|transition| transition.on.variant_str())
             .collect();
 
         for input in &schema.inputs.variants {
@@ -207,8 +207,8 @@ fn every_canonical_signal_has_transition_coverage() {
         let covered: BTreeSet<&str> = schema
             .transitions
             .iter()
-            .filter(|transition| transition.on.kind == TriggerKind::Signal)
-            .map(|transition| transition.on.variant.as_str())
+            .filter(|transition| transition.on.kind() == TriggerKind::Signal)
+            .map(|transition| transition.on.variant_str())
             .collect();
 
         for signal in &schema.signals.variants {

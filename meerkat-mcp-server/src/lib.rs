@@ -636,11 +636,11 @@ impl MeerkatMcpState {
             Ok(locator) => locator,
             Err(_) => meerkat_core::RealmLocator {
                 state_root: meerkat_core::default_state_root(),
-                realm_id: meerkat_core::generate_realm_id(),
+                realm: meerkat_core::connection::RealmId::parse(meerkat_core::generate_realm_id())
+                    .expect("generate_realm_id emits a valid slug by construction"),
             },
         };
-        let realm_id = meerkat_core::connection::RealmId::parse(locator.realm_id)
-            .expect("generate_realm_id emits a valid slug by construction");
+        let realm_id = locator.realm.clone();
         let realms_root = locator.state_root;
         let config = load_config_async(
             &realm_id,
@@ -4573,33 +4573,6 @@ mod tests {
         .expect("close should succeed");
         let close_payload = unwrap_payload(close);
         assert_eq!(close_payload["closed"], false);
-    }
-
-    #[cfg(feature = "comms")]
-    #[test]
-    fn test_comms_send_input_threads_typed_handling_mode() {
-        use meerkat_core::comms::CommsCommandRequest;
-        use meerkat_core::types::HandlingMode;
-
-        let input: MeerkatCommsSendInput = serde_json::from_value(json!({
-            "session_id": "01234567-89ab-cdef-0123-456789abcdef",
-            "kind": "peer_message",
-            "to": "alice",
-            "body": "hi",
-            "handling_mode": "steer"
-        }))
-        .unwrap();
-        match input.command {
-            CommsCommandRequest::PeerMessage {
-                ref to,
-                handling_mode,
-                ..
-            } => {
-                assert_eq!(to.as_str(), "alice");
-                assert_eq!(handling_mode, Some(HandlingMode::Steer));
-            }
-            other => panic!("expected peer_message, got {other:?}"),
-        }
     }
 
     #[cfg(feature = "comms")]

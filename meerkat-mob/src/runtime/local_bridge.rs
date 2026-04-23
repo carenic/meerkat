@@ -289,6 +289,7 @@ mod tests {
             name: "peer-a".to_string(),
             peer_id: "peer-a-id".to_string(),
             address: "inproc://peer-a".to_string(),
+            pubkey: [0u8; 32],
         }
     }
 

@@ -251,17 +251,6 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_peer_message_command() {
-        let json = r#"{"session_id":"sid_1","kind":"peer_message","to":"alice","body":"hi"}"#;
-        let params: CommsSendParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.peer_name(), Some("alice"));
-        assert!(matches!(
-            params.command,
-            CommsCommandRequest::PeerMessage { .. }
-        ));
-    }
-
-    #[test]
     fn deserialize_unknown_kind_fails_at_serde_boundary() {
         let json = r#"{"session_id":"sid_1","kind":"foobar"}"#;
         let err = serde_json::from_str::<CommsSendParams>(json).unwrap_err();

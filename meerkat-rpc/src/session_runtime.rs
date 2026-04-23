@@ -4750,7 +4750,7 @@ mod tests {
     async fn keep_alive_comms_drain_emits_run_completed_for_terminal_peer_response() {
         use futures::StreamExt;
         use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
-        use meerkat_core::comms::{CommsCommand, PeerName, TrustedPeerSpec};
+        use meerkat_core::comms::{CommsCommand, PeerName, TrustedPeerDescriptor};
         use meerkat_core::interaction::InteractionId;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -4804,15 +4804,23 @@ mod tests {
 
         CoreCommsRuntime::add_trusted_peer(
             &*sender,
-            TrustedPeerSpec::new(operator_name, operator_peer_id, operator_addr)
-                .expect("operator trusted peer spec"),
+            TrustedPeerDescriptor::test_only_unsigned(
+                operator_name,
+                operator_peer_id,
+                operator_addr,
+            )
+            .expect("operator trusted peer spec"),
         )
         .await
         .expect("sender trusts operator");
         CoreCommsRuntime::add_trusted_peer(
             operator_comms.as_ref(),
-            TrustedPeerSpec::new("analyst-drain-test", sender_peer_id, sender_addr)
-                .expect("sender trusted peer spec"),
+            TrustedPeerDescriptor::test_only_unsigned(
+                "analyst-drain-test",
+                sender_peer_id,
+                sender_addr,
+            )
+            .expect("sender trusted peer spec"),
         )
         .await
         .expect("operator trusts sender");
@@ -5240,13 +5248,13 @@ mod tests {
             .await
             .expect("config patch");
 
-        let pending = runtime.pending.read().await;
-        let staged = pending.get(&session_id).expect("pending session");
+        let staged = runtime
+            .staged_sessions
+            .effective_llm_identity(&session_id)
+            .await
+            .expect("pending session");
         assert_eq!(
-            staged
-                .effective_llm_identity
-                .self_hosted_server_id
-                .as_deref(),
+            staged.self_hosted_server_id.as_deref(),
             Some("local"),
             "pending sessions must remain pinned to the server selected at create time"
         );
@@ -5311,14 +5319,17 @@ mod tests {
             self_hosted_server_id: None,
             provider_params: None,
             connection_ref: Some(meerkat_core::ConnectionRef {
-                realm_id: "tenant_a".into(),
-                binding_id: "anthropic_default".into(),
+                realm: meerkat_core::RealmId::parse("tenant_a").expect("valid realm"),
+                binding: meerkat_core::BindingId::parse("anthropic_default")
+                    .expect("valid binding"),
+                profile: None,
             }),
         };
         let overrides = crate::handlers::turn::TurnOverrides {
             connection_ref: Some(meerkat_core::ConnectionRef {
-                realm_id: "tenant_b".into(),
-                binding_id: "anthropic_vip".into(),
+                realm: meerkat_core::RealmId::parse("tenant_b").expect("valid realm"),
+                binding: meerkat_core::BindingId::parse("anthropic_vip").expect("valid binding"),
+                profile: None,
             }),
             ..Default::default()
         };
@@ -5329,18 +5340,12 @@ mod tests {
             .expect("connection_ref override should resolve");
 
         assert_eq!(
-            resolved
-                .connection_ref
-                .as_ref()
-                .map(|c| c.realm_id.as_str()),
+            resolved.connection_ref.as_ref().map(|c| c.realm.as_str()),
             Some("tenant_b"),
             "explicit connection_ref override must win over the session's current binding"
         );
         assert_eq!(
-            resolved
-                .connection_ref
-                .as_ref()
-                .map(|c| c.binding_id.as_str()),
+            resolved.connection_ref.as_ref().map(|c| c.binding.as_str()),
             Some("anthropic_vip"),
         );
     }
@@ -5362,8 +5367,10 @@ mod tests {
             self_hosted_server_id: None,
             provider_params: None,
             connection_ref: Some(meerkat_core::ConnectionRef {
-                realm_id: "tenant_a".into(),
-                binding_id: "anthropic_default".into(),
+                realm: meerkat_core::RealmId::parse("tenant_a").expect("valid realm"),
+                binding: meerkat_core::BindingId::parse("anthropic_default")
+                    .expect("valid binding"),
+                profile: None,
             }),
         };
         let overrides = crate::handlers::turn::TurnOverrides {
@@ -5377,10 +5384,7 @@ mod tests {
             .expect("resolve must succeed");
 
         assert_eq!(
-            resolved
-                .connection_ref
-                .as_ref()
-                .map(|c| c.realm_id.as_str()),
+            resolved.connection_ref.as_ref().map(|c| c.realm.as_str()),
             Some("tenant_a"),
             "absent connection_ref override must inherit the session's current binding, not drop it"
         );

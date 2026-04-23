@@ -4589,15 +4589,41 @@ fn tla_string(value: impl AsRef<str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::render_machine_module;
-    use meerkat_machine_schema::{
-        EffectEmit, EnumSchema, Expr, FieldInit, FieldSchema, InitSchema, InputMatch,
-        MachineSchema, RustBinding, StateSchema, TransitionSchema, TriggerKind, TypeRef, Update,
-        VariantSchema,
+    use meerkat_machine_schema::identity::{
+        EffectVariantId, EnumVariantId, FieldId, InputVariantId, MachineId, PhaseId, TransitionId,
     };
+    use meerkat_machine_schema::{
+        EffectEmit, EnumSchema, Expr, FieldInit, FieldSchema, InitSchema, MachineSchema,
+        RustBinding, StateSchema, TransitionSchema, TriggerMatch, TypeRef, Update, VariantSchema,
+    };
+
+    fn vid(s: &str) -> EnumVariantId {
+        EnumVariantId::parse(s).expect("valid enum variant slug")
+    }
+
+    fn fid(s: &str) -> FieldId {
+        FieldId::parse(s).expect("valid field slug")
+    }
+
+    fn pid(s: &str) -> PhaseId {
+        PhaseId::parse(s).expect("valid phase slug")
+    }
+
+    fn tid(s: &str) -> TransitionId {
+        TransitionId::parse(s).expect("valid transition slug")
+    }
+
+    fn ivid(s: &str) -> InputVariantId {
+        InputVariantId::parse(s).expect("valid input variant slug")
+    }
+
+    fn eid(s: &str) -> EffectVariantId {
+        EffectVariantId::parse(s).expect("valid effect variant slug")
+    }
 
     fn turn_execution_fixture() -> MachineSchema {
         MachineSchema {
-            machine: "TurnExecutionMachine".to_owned(),
+            machine: MachineId::parse("TurnExecutionMachine").expect("valid machine slug"),
             version: 1,
             rust: RustBinding {
                 crate_name: "meerkat-core".to_owned(),
@@ -4608,59 +4634,59 @@ mod tests {
                     name: "TurnExecutionPhase".to_owned(),
                     variants: vec![
                         VariantSchema {
-                            name: "Idle".to_owned(),
+                            name: vid("Idle"),
                             fields: vec![],
                         },
                         VariantSchema {
-                            name: "Running".to_owned(),
+                            name: vid("Running"),
                             fields: vec![],
                         },
                         VariantSchema {
-                            name: "AwaitingBoundary".to_owned(),
+                            name: vid("AwaitingBoundary"),
                             fields: vec![],
                         },
                         VariantSchema {
-                            name: "Cancelled".to_owned(),
+                            name: vid("Cancelled"),
                             fields: vec![],
                         },
                     ],
                 },
                 fields: vec![FieldSchema {
-                    name: "boundary_count".to_owned(),
+                    name: fid("boundary_count"),
                     ty: TypeRef::U64,
                 }],
                 init: InitSchema {
-                    phase: "Idle".to_owned(),
+                    phase: pid("Idle"),
                     fields: vec![FieldInit {
-                        field: "boundary_count".to_owned(),
+                        field: fid("boundary_count"),
                         expr: Expr::U64(0),
                     }],
                 },
-                terminal_phases: vec!["Cancelled".to_owned()],
+                terminal_phases: vec![pid("Cancelled")],
             },
             inputs: EnumSchema {
                 name: "TurnExecutionInput".to_owned(),
                 variants: vec![
                     VariantSchema {
-                        name: "StartConversationRun".to_owned(),
+                        name: vid("StartConversationRun"),
                         fields: vec![FieldSchema {
-                            name: "run_id".to_owned(),
+                            name: fid("run_id"),
                             ty: TypeRef::String,
                         }],
                     },
                     VariantSchema {
-                        name: "PrimitiveAppliedConversationTurn".to_owned(),
+                        name: vid("PrimitiveAppliedConversationTurn"),
                         fields: vec![FieldSchema {
-                            name: "run_id".to_owned(),
+                            name: fid("run_id"),
                             ty: TypeRef::String,
                         }],
                     },
                     VariantSchema {
-                        name: "BoundaryComplete".to_owned(),
+                        name: vid("BoundaryComplete"),
                         fields: vec![],
                     },
                     VariantSchema {
-                        name: "AcknowledgeTerminalFromCancelled".to_owned(),
+                        name: vid("AcknowledgeTerminalFromCancelled"),
                         fields: vec![],
                     },
                 ],
@@ -4673,14 +4699,14 @@ mod tests {
             effects: EnumSchema {
                 name: "TurnExecutionEffect".to_owned(),
                 variants: vec![VariantSchema {
-                    name: "BoundaryApplied".to_owned(),
+                    name: vid("BoundaryApplied"),
                     fields: vec![
                         FieldSchema {
-                            name: "run_id".to_owned(),
+                            name: fid("run_id"),
                             ty: TypeRef::String,
                         },
                         FieldSchema {
-                            name: "boundary_sequence".to_owned(),
+                            name: fid("boundary_sequence"),
                             ty: TypeRef::U64,
                         },
                     ],
@@ -4691,40 +4717,38 @@ mod tests {
             invariants: vec![],
             transitions: vec![
                 TransitionSchema {
-                    name: "StartConversationRun".to_owned(),
-                    from: vec!["Idle".to_owned()],
-                    on: InputMatch {
-                        kind: TriggerKind::Input,
-                        variant: "StartConversationRun".to_owned(),
-                        bindings: vec!["run_id".to_owned()],
+                    name: tid("StartConversationRun"),
+                    from: vec![pid("Idle")],
+                    on: TriggerMatch::Input {
+                        variant: ivid("StartConversationRun"),
+                        bindings: vec![fid("run_id")],
                     },
                     guards: vec![],
                     updates: vec![],
-                    to: "Running".to_owned(),
+                    to: pid("Running"),
                     emit: vec![],
                 },
                 TransitionSchema {
-                    name: "PrimitiveAppliedConversationTurn".to_owned(),
-                    from: vec!["Running".to_owned()],
-                    on: InputMatch {
-                        kind: TriggerKind::Input,
-                        variant: "PrimitiveAppliedConversationTurn".to_owned(),
-                        bindings: vec!["run_id".to_owned()],
+                    name: tid("PrimitiveAppliedConversationTurn"),
+                    from: vec![pid("Running")],
+                    on: TriggerMatch::Input {
+                        variant: ivid("PrimitiveAppliedConversationTurn"),
+                        bindings: vec![fid("run_id")],
                     },
                     guards: vec![],
                     updates: vec![Update::Increment {
-                        field: "boundary_count".to_owned(),
+                        field: fid("boundary_count"),
                         amount: 1,
                     }],
-                    to: "AwaitingBoundary".to_owned(),
+                    to: pid("AwaitingBoundary"),
                     emit: vec![EffectEmit {
-                        variant: "BoundaryApplied".to_owned(),
+                        variant: eid("BoundaryApplied"),
                         fields: [
-                            ("run_id".to_owned(), Expr::Binding("run_id".to_owned())),
+                            (fid("run_id"), Expr::Binding("run_id".to_owned())),
                             (
-                                "boundary_sequence".to_owned(),
+                                fid("boundary_sequence"),
                                 Expr::Add(
-                                    Box::new(Expr::Field("boundary_count".to_owned())),
+                                    Box::new(Expr::Field(fid("boundary_count"))),
                                     Box::new(Expr::U64(1)),
                                 ),
                             ),
@@ -4734,34 +4758,33 @@ mod tests {
                     }],
                 },
                 TransitionSchema {
-                    name: "BoundaryComplete".to_owned(),
-                    from: vec!["AwaitingBoundary".to_owned()],
-                    on: InputMatch {
-                        kind: TriggerKind::Input,
-                        variant: "BoundaryComplete".to_owned(),
+                    name: tid("BoundaryComplete"),
+                    from: vec![pid("AwaitingBoundary")],
+                    on: TriggerMatch::Input {
+                        variant: ivid("BoundaryComplete"),
                         bindings: vec![],
                     },
                     guards: vec![],
                     updates: vec![],
-                    to: "Cancelled".to_owned(),
+                    to: pid("Cancelled"),
                     emit: vec![],
                 },
                 TransitionSchema {
-                    name: "AcknowledgeTerminalFromCancelled".to_owned(),
-                    from: vec!["Cancelled".to_owned()],
-                    on: InputMatch {
-                        kind: TriggerKind::Input,
-                        variant: "AcknowledgeTerminalFromCancelled".to_owned(),
+                    name: tid("AcknowledgeTerminalFromCancelled"),
+                    from: vec![pid("Cancelled")],
+                    on: TriggerMatch::Input {
+                        variant: ivid("AcknowledgeTerminalFromCancelled"),
                         bindings: vec![],
                     },
                     guards: vec![],
                     updates: vec![],
-                    to: "Cancelled".to_owned(),
+                    to: pid("Cancelled"),
                     emit: vec![],
                 },
             ],
             ci_step_limit: None,
             effect_dispositions: vec![],
+            named_types: vec![],
         }
     }
 
