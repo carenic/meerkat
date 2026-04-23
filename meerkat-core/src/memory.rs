@@ -33,6 +33,13 @@ pub struct MemoryResult {
 pub trait MemoryStore: Send + Sync {
     /// Index text content with associated metadata.
     async fn index(&self, content: &str, metadata: MemoryMetadata) -> Result<(), MemoryStoreError>;
+
+    /// Semantic search: return up to `limit` results ordered by relevance.
+    async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryResult>, MemoryStoreError>;
 }
 
 /// Errors from memory store operations.
