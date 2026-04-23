@@ -257,7 +257,7 @@ impl RealmConnectionSet {
     /// - BackendProfile `"default"` with the provider's default
     ///   backend_kind and base_url=None (provider client uses its default).
     /// - AuthProfile `"default"` with `source = Env { env: <ENV_VAR> }`,
-    ///   `auth_method = "api_key"`, storage = Ephemeral.
+    ///   `auth_method = "api_key"`.
     ///
     /// The ENV_VAR name is per-provider:
     /// - Anthropic: `ANTHROPIC_API_KEY`
@@ -548,9 +548,6 @@ mod tests {
             CredentialSourceSpec::Env {
                 env: "OPENAI_API_KEY".into(),
                 fallback: Vec::new(),
-            },
-            CredentialSourceSpec::ManagedStore {
-                profile: "default".into(),
             },
             CredentialSourceSpec::ExternalResolver {
                 handle: "desktop".into(),

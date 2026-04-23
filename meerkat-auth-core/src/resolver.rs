@@ -382,7 +382,7 @@ fn enforce_metadata_requirements(
 mod tests {
     use super::*;
     use meerkat_core::{
-        AuthProfile, AuthRouteHints, BindingPolicy, ConnectionRef, CredentialStorageSpec, Provider,
+        AuthProfile, AuthRouteHints, BindingPolicy, ConnectionRef, Provider,
     };
     use meerkat_llm_core::provider_runtime::binding::{
         NormalizedAuthMethod, NormalizedBackendKind, ValidatedBinding,
@@ -476,7 +476,6 @@ mod tests {
                 source: CredentialSourceSpec::ExternalResolver {
                     handle: "host".into(),
                 },
-                storage: CredentialStorageSpec::default(),
                 constraints: Default::default(),
                 metadata_defaults: meerkat_core::AuthMetadataDefaults {
                     organization_id: Some("org-default".into()),
