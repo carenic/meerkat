@@ -128,6 +128,43 @@ Concerning tests (covering §6 #10-16):
 
 ---
 
+## Section 1.5 — Tripwire tests (TDD scaffolding, pre-wave-c)
+
+Before any wave-c worker starts, a small set of tests lands that explicitly fail today and must pass by the end of wave-c. Each tripwire:
+
+- exists as a committed test file **before any C-* task begins**
+- fails in a specific, diagnosable way today (compile-fails or asserts an invariant the current code violates)
+- has a named wave-c task whose completion is what flips it green
+- catches the class of regression where a task *appears* to complete but the tripwire surfaces the fake
+
+If wave-c ends green on everything else but these are still red, something has been done wrong. If a worker claims a task done and its tripwire is still red, the task isn't done.
+
+**Tripwire list:**
+
+1. **`meerkat-core/tests/fork_at_rotates_session_id.rs`** — asserts `Session::fork_at(...)` returns a distinct `SessionId`. Fails today because `fork_at` at `meerkat-core/src/session.rs:798` preserves SessionId. Flipped green by **C-H1** (F7 closure from state-scope-audit). Catches silent regression if C-H1 forgets the SessionId rotation semantics.
+
+2. **`meerkat-session/tests/persistence_compat.rs` (12 fixtures)** — v0 fixtures 1-12 from `persistence-migration.md` §5 loaded and asserted for lossless typed round-trip. Fixture #4 (Anthropic `thinking: {type:"enabled", budget_tokens:32000}`) is the canary — the case most likely to be silently dropped by the typed retype. Fails today (no v1 migration exists). Flipped green by **C-3** (fixtures 1-11) + **C-6r** (fixture #12, runtime-side snapshot table).
+
+3. **`meerkat-machine-schema/tests/peer_endpoint_structural_equivalence.rs`** — asserts both `PeerEndpoint` copies (runtime DSL at `meerkat-runtime/src/meerkat_machine/dsl.rs:1721` and schema catalog at `meerkat-machine-schema/src/catalog/dsl/meerkat_machine.rs:3037`) carry typed fields (`PeerId`, `PeerAddress`, `PeerName`), not `String`. Fails today (both are `String`). Flipped green by **C-6r**.
+
+4. **`meerkat-cli/tests/connection_ref_single_parser.rs`** — asserts exactly one call site parsing a string into `ConnectionRef` across `meerkat-cli/src/`, scoped by function name (`parse_connection_ref_user_input`), not a byte-pattern match on `split_once(':')` (HTTP-header splits and `TokenKey` parses are separate and must not be flagged). Fails today (multiple ad-hoc sites). Flipped green by **C-12**.
+
+5. **`meerkat-runtime/tests/handles_dispatch_through_dispatcher.rs`** — extension of B-5's grep canary at `meerkat-runtime/tests/composition_dispatch_is_the_path.rs`: asserts every routed-effect-consuming `apply_input` call in `meerkat-runtime/src/handles/**/*.rs` traverses `CompositionDispatcher`. 87 call sites today bypass the dispatcher (per C-6c audit). Flipped green by **C-6c**. This is the tripwire that catches "dispatcher wiring went in but handles weren't touched."
+
+6. **`meerkat-mob/tests/dispatcher_rule_synthetic_injection.rs`** — negative-case test for B-10's `CompositionDispatchIsThePath` rule. Temporarily removes a known `dispatcher.dispatch(...)` call from a test fixture, runs `rmat-audit --rule CompositionDispatchIsThePath`, asserts the rule reports a violation, restores. Proves the rule isn't silently broken — guards against the dispatcher-rule becoming vacuous (false-green). Runs as part of c.1 exit gate.
+
+7. **Blocker-test stubs** (7 files from C-T) — `meerkat-comms/tests/trust_reconcile_concurrency.rs`, `trust_reconcile_add_failure.rs`, `meerkat-mob/tests/respawn_overlay_rotation.rs`, `release_binding_overlay_sweep.rs`, `shadow_mode_parity.rs`, `mob_member_restore_failure_terminal.rs`, `meerkat-runtime/tests/turn_boundary_denial_blocks_effects.rs`. Created as `#[ignore]`-annotated tests that **compile** once the expected API surface exists and **assert** the invariant in test-body form. Fail to compile if the expected API never appears. Un-ignored as each blocker's source-side task lands. Catches "blocker tests bolted on at the end with weak assertions."
+
+8. **`meerkat-machine-schema/tests/named_type_binding_covers_catalog.rs`** — asserts `MachineSchema::validate()` rejects any schema that references a `NamedTypeId` without a matching binding. Fails today for a test fixture with unbound named type. (B-4 landed the validator; tripwire exercises it.) Runs as a cheap backstop that C-6p/C-6c don't accidentally bypass the validator.
+
+9. **`meerkat-session/tests/session_store_append_only_trybuild.rs`** — `trybuild` compile-fail test attempting to call a method on `SessionStore` that would shrink a session's message history. Must compile-fail after **C-H1** lands (type-level append-only). Today it compiles because `save()` allows replacement. This is the compile-time form of F1 closure.
+
+**c.0 — Tripwire scaffolding phase.** Before any C-* task starts, one commit lands all 9 tripwires as failing tests (in the predicted ways). Commit titled `test(wave-c c.0): tripwire scaffolding — TDD backstops for wave-c deliverables`. Each test carries a module-level `//!` doc-comment naming the flipping task (e.g., `//! Flipped green by C-H1`). If any tripwire unexpectedly passes at c.0 commit time, that's a signal the baseline assumption is wrong and the plan needs updating before workers start.
+
+**Ongoing enforcement.** Each wave-c worker's completion checklist includes "confirm the tripwires my task was supposed to flip are now green." This is in addition to the task's own specified catching assertions (Section 5).
+
+---
+
 ## Section 2 — Dependency graph
 
 B-10 (`d5cccf6bc`, commits through `99e155992`) shipped the `CompositionDispatchIsThePath` rule (byte-level banned-helper scan) and `CompositionRouteSemanticCoverage` rule (typed route agreement) in `xtask/src/rmat_audit.rs`. Both rules are live in `rmat-audit --strict`. Wave-c's C-6c must produce code that passes these rules; the rules are active backstops, not aspirational. Citation: commits `d5cccf6bc`, `691e9d682`, `77554ed80`, `99e155992`.
@@ -216,7 +253,9 @@ Base branch stays `dogma/wave-a-demolition`.
 
 ## Section 4 — Phases within wave-c
 
-**c.1 — Enabling wiring.** C-1 core + C-2 contracts + C-6p + C-6c. Unlocks every downstream consumer and makes B-10's live rules enforce on real code. Exit gate: `rmat-audit --strict` green; synthetic-violation test confirms the backstop.
+**c.0 — Tripwire scaffolding.** Section 1.5's 9 tripwires committed as failing tests. Exit gate: all tripwires compile; each fails in the predicted way (no unexpected passes); commit lands with per-test documentation of the flipping task.
+
+**c.1 — Enabling wiring.** C-1 core + C-2 contracts + C-6p + C-6c. Unlocks every downstream consumer and makes B-10's live rules enforce on real code. Exit gate: `rmat-audit --strict` green; tripwire #6 (synthetic injection) confirms the backstop; tripwire #5 flips green as C-6c lands handle-layer wiring.
 
 **c.2 — Consumer rebuilds (parallel).** C-3 session (parallel with C-4 tools/skills, C-5 comms, C-14 providers) once C-1+C-2 done. Exit gate: each of the 5 crates `cargo check` clean in isolation.
 
@@ -286,6 +325,7 @@ Wave (c) is done when all hold:
 - `make verify-version-parity` passes (schema-side only; SDK package version bumps remain wave-d).
 - `make ci` exits zero locally. GitHub `gate` green on the wave-c merge PR.
 - Neither `cargo fmt --check` nor the pre-commit hook chain is skipped on the final merge commit — wave-c ends the `--no-verify` tolerance.
+- **All 9 tripwires from Section 1.5 are green.** If any remain red while other completion criteria claim done, the task whose tripwire is red is not actually done. The tripwires are the tamper-resistant backstop: they were written to fail in diagnosable ways before any worker started, and their names are fixed.
 
 ---
 
