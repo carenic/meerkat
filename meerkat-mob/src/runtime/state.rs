@@ -172,16 +172,6 @@ pub(super) enum MobCommand {
     RetireAll {
         reply_tx: oneshot::Sender<Result<(), MobError>>,
     },
-    Wire {
-        local: MeerkatId,
-        target: super::handle::PeerTarget,
-        reply_tx: oneshot::Sender<Result<(), MobError>>,
-    },
-    Unwire {
-        local: MeerkatId,
-        target: super::handle::PeerTarget,
-        reply_tx: oneshot::Sender<Result<(), MobError>>,
-    },
     /// Unified work-lane ingress: the MobMachine DSL decides work-origin
     /// legality (External vs Internal, addressability, live-runtime, phase),
     /// the shell observes the machine's `RequestRuntimeIngress` effect and

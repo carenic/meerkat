@@ -2057,28 +2057,6 @@ impl MobActor {
                     };
                     let _ = reply_tx.send(result);
                 }
-                MobCommand::Wire {
-                    local,
-                    target,
-                    reply_tx,
-                } => {
-                    let result = match self.require_state(&[MobState::Running]) {
-                        Ok(()) => self.handle_wire(local, target).await,
-                        Err(error) => Err(error),
-                    };
-                    let _ = reply_tx.send(result);
-                }
-                MobCommand::Unwire {
-                    local,
-                    target,
-                    reply_tx,
-                } => {
-                    let result = match self.require_state(&[MobState::Running]) {
-                        Ok(()) => self.handle_unwire(local, target).await,
-                        Err(error) => Err(error),
-                    };
-                    let _ = reply_tx.send(result);
-                }
                 MobCommand::SubmitWork { payload, reply_tx } => {
                     let result = match self.require_state(&[MobState::Running]) {
                         Ok(()) => Box::pin(self.handle_submit_work(payload)).await,
