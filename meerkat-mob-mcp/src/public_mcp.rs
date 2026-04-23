@@ -210,26 +210,6 @@ const fn default_limit() -> usize {
     100
 }
 
-fn conservative_phase_one_capabilities() -> RealtimeCapabilities {
-    RealtimeCapabilities {
-        input_kinds: vec![
-            meerkat_contracts::RealtimeInputKind::Text,
-            meerkat_contracts::RealtimeInputKind::Audio,
-        ],
-        output_kinds: vec![
-            meerkat_contracts::RealtimeOutputKind::Text,
-            meerkat_contracts::RealtimeOutputKind::Audio,
-        ],
-        turning_modes: vec![meerkat_contracts::RealtimeTurningMode::ProviderManaged],
-        interrupt_supported: true,
-        transcript_supported: true,
-        tool_lifecycle_events_supported: false,
-        video_supported: false,
-        audio_input_format: None,
-        audio_output_format: None,
-    }
-}
-
 fn channel_status(
     state: RealtimeChannelState,
     reason: Option<&str>,
@@ -364,134 +344,13 @@ async fn realtime_status_payload(
     })
 }
 
-async fn realtime_capabilities_payload(
-    state: &Arc<MobMcpState>,
-    params: RealtimeCapabilitiesParams,
-) -> Result<RealtimeCapabilitiesResult, McpToolError> {
-    let session_id = resolve_target_session_id(state, &params.target).await?;
-    state
-        .realtime_validate_session_target(&session_id)
-        .await
-        .map_err(|err| McpToolError::invalid_params(err.to_string()))?;
-
-    Ok(RealtimeCapabilitiesResult {
-        capabilities: conservative_phase_one_capabilities(),
-    })
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-async fn proxy_realtime_open_info_over_tcp(
-    addr: &str,
-    request: &RealtimeOpenRequest,
-) -> Result<Value, McpToolError> {
-    let stream = TcpStream::connect(addr).await.map_err(|err| {
-        McpToolError::capability_unavailable(format!(
-            "failed to connect to realtime rpc host at {addr}: {err}"
-        ))
-    })?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half).lines();
-
-    for (id, method, params) in [
-        (1_u64, "initialize", json!({})),
-        (
-            2_u64,
-            "realtime/open_info",
-            serde_json::to_value(request).map_err(|err| {
-                McpToolError::capability_unavailable(format!(
-                    "failed to serialize realtime open request: {err}"
-                ))
-            })?,
-        ),
-    ] {
-        let request_line = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        })
-        .to_string();
-        write_half
-            .write_all(request_line.as_bytes())
-            .await
-            .map_err(|err| {
-                McpToolError::capability_unavailable(format!(
-                    "failed to write `{method}` to realtime rpc host: {err}"
-                ))
-            })?;
-        write_half.write_all(b"\n").await.map_err(|err| {
-            McpToolError::capability_unavailable(format!(
-                "failed to terminate `{method}` request: {err}"
-            ))
-        })?;
-        write_half.flush().await.map_err(|err| {
-            McpToolError::capability_unavailable(format!(
-                "failed to flush `{method}` request: {err}"
-            ))
-        })?;
-
-        loop {
-            let Some(line) = reader.next_line().await.map_err(|err| {
-                McpToolError::capability_unavailable(format!(
-                    "failed to read realtime rpc `{method}` response: {err}"
-                ))
-            })?
-            else {
-                return Err(McpToolError::capability_unavailable(format!(
-                    "realtime rpc host closed before responding to `{method}`"
-                )));
-            };
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let value: Value = serde_json::from_str(trimmed).map_err(|err| {
-                McpToolError::capability_unavailable(format!(
-                    "failed to parse realtime rpc `{method}` response as json: {err}"
-                ))
-            })?;
-            if value.get("id").and_then(Value::as_u64) != Some(id) {
-                continue;
-            }
-            if let Some(error) = value.get("error")
-                && !error.is_null()
-            {
-                return Err(McpToolError::capability_unavailable(format!(
-                    "realtime rpc `{method}` failed: {error}"
-                )));
-            }
-            if method == "realtime/open_info" {
-                return Ok(value.get("result").cloned().unwrap_or(Value::Null));
-            }
-            break;
-        }
-    }
-
-    Err(McpToolError::capability_unavailable(
-        "realtime rpc host did not return realtime/open_info",
-    ))
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn proxy_realtime_open_info_over_tcp(
-    _addr: &str,
-    _request: &RealtimeOpenRequest,
-) -> Result<Value, McpToolError> {
-    Err(McpToolError::capability_unavailable(
-        "public MCP realtime TCP proxy is not available on wasm32 builds",
-    ))
-}
-
 pub fn public_tool_names() -> &'static [&'static str] {
     &[
-        "meerkat_realtime_open_info",
         "meerkat_realtime_status",
-        "meerkat_realtime_capabilities",
         "meerkat_mob_create",
         "meerkat_mob_list",
         "meerkat_mob_status",
         "meerkat_mob_lifecycle",
-        "meerkat_mob_members",
         "meerkat_mob_spawn",
         "meerkat_mob_spawn_many",
         "meerkat_mob_retire",
@@ -506,7 +365,6 @@ pub fn public_tool_names() -> &'static [&'static str] {
         "meerkat_mob_flow_status",
         "meerkat_mob_flow_cancel",
         "meerkat_mob_force_cancel",
-        "meerkat_mob_member_status",
         "meerkat_mob_wait_kickoff",
         "meerkat_mob_profile_create",
         "meerkat_mob_profile_get",
@@ -519,19 +377,9 @@ pub fn public_tool_names() -> &'static [&'static str] {
 pub fn public_tools_list() -> Vec<Value> {
     vec![
         tool(
-            "meerkat_realtime_open_info",
-            "Get bootstrap metadata for opening a realtime channel.",
-            schema_for!(RealtimeOpenRequest),
-        ),
-        tool(
             "meerkat_realtime_status",
             "Get product-layer realtime channel status for a target.",
             schema_for!(RealtimeStatusParams),
-        ),
-        tool(
-            "meerkat_realtime_capabilities",
-            "Get product-layer realtime capabilities for a target.",
-            schema_for!(RealtimeCapabilitiesParams),
         ),
         tool(
             "meerkat_mob_create",
@@ -552,11 +400,6 @@ pub fn public_tools_list() -> Vec<Value> {
             "meerkat_mob_lifecycle",
             "Apply a lifecycle action to a mob.",
             schema_for!(MeerkatMobLifecycleInput),
-        ),
-        tool(
-            "meerkat_mob_members",
-            "List members in a mob roster.",
-            schema_for!(MeerkatMobIdInput),
         ),
         tool(
             "meerkat_mob_spawn",
@@ -626,11 +469,6 @@ pub fn public_tools_list() -> Vec<Value> {
         tool(
             "meerkat_mob_force_cancel",
             "Force-cancel a mob member.",
-            schema_for!(MeerkatMobMemberInput),
-        ),
-        tool(
-            "meerkat_mob_member_status",
-            "Read live status for a mob member.",
             schema_for!(MeerkatMobMemberInput),
         ),
         tool(
@@ -715,32 +553,9 @@ pub async fn handle_public_tools_call(
     arguments: &Value,
 ) -> Result<Value, McpToolError> {
     match name {
-        "meerkat_realtime_open_info" => {
-            let input: RealtimeOpenRequest = parse_args(arguments)?;
-            // W3-H: resolve the channel target to a concrete session id for
-            // both validation and downstream proxying. MobMember targets go
-            // through the canonical binding map; SessionTarget validates
-            // its string form.
-            let _ = resolve_target_session_id(state, &input.target).await?;
-            if let Some(addr) = state.realtime_rpc_tcp_addr() {
-                return proxy_realtime_open_info_over_tcp(&addr, &input).await;
-            }
-            let session_id = resolve_target_session_id(state, &input.target).await?;
-            state
-                .realtime_validate_session_target(&session_id)
-                .await
-                .map_err(|err| McpToolError::invalid_params(err.to_string()))?;
-            Err(McpToolError::capability_unavailable(
-                "realtime/open_info is unavailable until the realtime websocket host ships",
-            ))
-        }
         "meerkat_realtime_status" => {
             let input: RealtimeStatusParams = parse_args(arguments)?;
             Ok(json!(realtime_status_payload(state, input).await?))
-        }
-        "meerkat_realtime_capabilities" => {
-            let input: RealtimeCapabilitiesParams = parse_args(arguments)?;
-            Ok(json!(realtime_capabilities_payload(state, input).await?))
         }
         "meerkat_mob_create" => {
             let input: MobCreateParams = parse_args(arguments)?;
@@ -829,15 +644,6 @@ pub async fn handle_public_tools_call(
                 obj.insert("destroy_report".to_string(), report_value);
             }
             Ok(body)
-        }
-        "meerkat_mob_members" => {
-            let input: MeerkatMobIdInput = parse_args(arguments)?;
-            let mob_id = parse_mob_id(&input.mob_id)?;
-            let members = state
-                .mob_list_members(&mob_id)
-                .await
-                .map_err(|err| McpToolError::invalid_params(err.to_string()))?;
-            Ok(json!({ "mob_id": mob_id, "members": members }))
         }
         "meerkat_mob_spawn" => {
             let input: MeerkatMobSpawnInput = parse_args(arguments)?;
@@ -1078,18 +884,6 @@ pub async fn handle_public_tools_call(
                 .await
                 .map_err(|err| McpToolError::invalid_params(err.to_string()))?;
             Ok(json!({ "cancelled": true }))
-        }
-        "meerkat_mob_member_status" => {
-            let input: MeerkatMobMemberInput = parse_args(arguments)?;
-            let mob_id = parse_mob_id(&input.mob_id)?;
-            let snapshot = state
-                .mob_member_status(
-                    &mob_id,
-                    &meerkat_mob::AgentIdentity::from(input.agent_identity.as_str()),
-                )
-                .await
-                .map_err(|err| McpToolError::invalid_params(err.to_string()))?;
-            Ok(json!(snapshot))
         }
         "meerkat_mob_wait_kickoff" => {
             let input: MeerkatMobWaitKickoffInput = parse_args(arguments)?;
@@ -1466,14 +1260,4 @@ mod tests {
         assert!(!names.contains(&"mob_create".to_string()));
     }
 
-    #[tokio::test]
-    async fn public_tools_include_realtime_bootstrap_controls() {
-        let names: Vec<_> = public_tools_list()
-            .into_iter()
-            .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
-            .collect();
-        assert!(names.contains(&"meerkat_realtime_open_info".to_string()));
-        assert!(names.contains(&"meerkat_realtime_status".to_string()));
-        assert!(names.contains(&"meerkat_realtime_capabilities".to_string()));
-    }
 }
