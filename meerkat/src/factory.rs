@@ -256,7 +256,7 @@ pub struct AgentBuildConfig {
     /// `None` = metadata-only inventory (agent discovers and loads via tools).
     /// `Some(ids)` = pre-load these skills into the system prompt.
     /// `Some(vec![])` is normalized to `None`.
-    pub preload_skills: Option<Vec<meerkat_core::skills::SkillId>>,
+    pub preload_skills: Option<Vec<meerkat_core::skills::SkillKey>>,
     /// Realm identity for cross-surface storage sharing/isolation.
     pub realm_id: Option<String>,
     /// Optional process/agent instance identifier within a realm.
@@ -656,6 +656,29 @@ impl meerkat_core::ModelOperationalDefaultsResolver for RegistryBackedDefaultsRe
 }
 
 /// Return the canonical string key for a provider.
+/// Construct a [`ProviderRuntimeRegistry`] populated with the
+/// feature-gated per-provider runtimes from the per-provider crates.
+/// Private to the factory — callers use the registry `AgentFactory`
+/// owns on itself. Not exposed as a free helper (dogma §65 forbids
+/// a canonical-seam-bypass "populate on demand" path).
+fn build_provider_registry() -> meerkat_llm_core::provider_runtime::ProviderRuntimeRegistry {
+    #[allow(unused_mut)]
+    let mut r = meerkat_llm_core::provider_runtime::ProviderRuntimeRegistry::empty();
+    #[cfg(feature = "anthropic")]
+    {
+        r = r.with_runtime(Arc::new(meerkat_anthropic::AnthropicProviderRuntime));
+    }
+    #[cfg(feature = "openai")]
+    {
+        r = r.with_runtime(Arc::new(meerkat_openai::OpenAiProviderRuntime));
+    }
+    #[cfg(feature = "gemini")]
+    {
+        r = r.with_runtime(Arc::new(meerkat_gemini::GoogleProviderRuntime));
+    }
+    r
+}
+
 pub fn provider_key(provider: Provider) -> &'static str {
     provider.as_str()
 }
@@ -777,6 +800,13 @@ pub struct AgentFactory {
     /// delegate credential resolution to the JS host's OAuth flow.
     pub external_auth_resolvers:
         BTreeMap<String, Arc<dyn meerkat_providers::ExternalAuthResolverHandle>>,
+    /// Provider runtime registry, owned by the factory. Populated with
+    /// the feature-gated per-provider runtimes
+    /// (`AnthropicProviderRuntime`, `OpenAiProviderRuntime`,
+    /// `GoogleProviderRuntime`) at construction so dispatch is
+    /// deterministic and off the canonical-seam-bypass path
+    /// (dogma §65).
+    provider_registry: Arc<meerkat_llm_core::provider_runtime::ProviderRuntimeRegistry>,
 }
 
 impl std::fmt::Debug for AgentFactory {
@@ -827,6 +857,7 @@ impl AgentFactory {
             #[cfg(feature = "skills")]
             skill_source: None,
             custom_store: None,
+            provider_registry: Arc::new(build_provider_registry()),
             mob_tools: None,
             #[cfg(feature = "comms")]
             comms_runtime: None,
@@ -875,6 +906,7 @@ impl AgentFactory {
             #[cfg(not(target_arch = "wasm32"))]
             refresh_coord: None,
             external_auth_resolvers: BTreeMap::new(),
+            provider_registry: Arc::new(build_provider_registry()),
         }
     }
 
@@ -1028,7 +1060,7 @@ impl AgentFactory {
         &self,
         config: &Config,
         build_config: Option<&AgentBuildConfig>,
-    ) -> Vec<String> {
+    ) -> Vec<meerkat_core::skills::CapabilityId> {
         let mut capabilities: BTreeSet<meerkat_contracts::CapabilityId> =
             meerkat_contracts::available_capabilities(config)
                 .into_iter()
@@ -1060,9 +1092,14 @@ impl AgentFactory {
             capabilities.remove(&meerkat_contracts::CapabilityId::Comms);
         }
 
+        // Project the contract-facing `CapabilityId` enum to the typed
+        // core `CapabilityId` slug that `DefaultSkillEngine` expects.
+        // The stringify path is stable by construction — the enum
+        // `Display` impl emits the canonical snake_case slug which
+        // `core::skills::CapabilityId::parse` accepts.
         capabilities
             .into_iter()
-            .map(|cap| cap.to_string())
+            .filter_map(|cap| meerkat_core::skills::CapabilityId::parse(&cap.to_string()).ok())
             .collect()
     }
 
@@ -1262,16 +1299,32 @@ impl AgentFactory {
         let (realm, binding_id): (meerkat_core::RealmConnectionSet, String) =
             match identity.connection_ref.as_ref() {
                 Some(conn_ref) => {
-                    let section = config.realm.get(&conn_ref.realm_id).ok_or_else(|| {
+                    let section = config.realm.get(conn_ref.realm.as_str()).ok_or_else(|| {
                         FactoryError::ClientCreationFailed(format!(
                             "realm '{}' not found in config.realm (hot-swap)",
-                            conn_ref.realm_id
+                            conn_ref.realm
                         ))
                     })?;
                     let realm =
-                        meerkat_core::RealmConnectionSet::from_config(&conn_ref.realm_id, section)
+                        meerkat_core::RealmConnectionSet::from_config(conn_ref.realm.as_str(), section)
                             .map_err(|e| FactoryError::ClientCreationFailed(e.to_string()))?;
-                    (realm, conn_ref.binding_id.clone())
+                    (realm, conn_ref.binding.to_string())
+                }
+                None => {
+                    // Dogma §15/§19 (commit 28e7a51c1): ambient
+                    // provider-credential selection is refused. Callers
+                    // must supply an explicit `connection_ref`;
+                    // synthesizing a realm from env vars or
+                    // first-matching-provider is exactly the silent
+                    // bypass the deletion targeted.
+                    return Err(FactoryError::ClientCreationFailed(
+                        "ambient credential selection refused: \
+                         hot-swap requires an explicit ConnectionRef \
+                         (realm + binding). Env-default realm synthesis \
+                         and first-matching-provider promotion were \
+                         deleted in the wave-c auth-seam cleanup."
+                            .to_string(),
+                    ));
                 }
             };
 
@@ -1289,7 +1342,7 @@ impl AgentFactory {
         for (handle, resolver) in &self.external_auth_resolvers {
             env = env.with_external_resolver(handle.clone(), resolver.clone());
         }
-        let provider_registry = crate::default_provider_registry();
+        let provider_registry = Arc::clone(&self.provider_registry);
         let connection = provider_registry
             .resolve(&realm, &binding_id, &env)
             .await
@@ -1697,26 +1750,39 @@ impl AgentFactory {
                     )
                     .map_err(BuildAgentError::LlmClient)?
                 } else {
-                    // Resolve the target realm: explicit from connection_ref,
-                    // or synthesized from env vars for a default binding.
+                    // Resolve the target realm from the explicit
+                    // `connection_ref`. Ambient env-default synthesis and
+                    // first-matching-provider promotion were deleted in
+                    // commit 28e7a51c1 (dogma §15/§19): callers must
+                    // now supply a realm + binding.
                     let (realm, binding_id): (meerkat_core::RealmConnectionSet, String) =
                         match &build_config.connection_ref {
                             Some(conn_ref) => {
                                 let section =
-                                    config.realm.get(&conn_ref.realm_id).ok_or_else(|| {
+                                    config.realm.get(conn_ref.realm.as_str()).ok_or_else(|| {
                                         BuildAgentError::ConnectionResolution(format!(
                                             "realm '{}' not found in config.realm",
-                                            conn_ref.realm_id
+                                            conn_ref.realm
                                         ))
                                     })?;
                                 let realm = meerkat_core::RealmConnectionSet::from_config(
-                                    &conn_ref.realm_id,
+                                    conn_ref.realm.as_str(),
                                     section,
                                 )
                                 .map_err(|e| {
                                     BuildAgentError::ConnectionResolution(e.to_string())
                                 })?;
-                                (realm, conn_ref.binding_id.clone())
+                                (realm, conn_ref.binding.to_string())
+                            }
+                            None => {
+                                return Err(BuildAgentError::ConnectionResolution(
+                                    "ambient credential selection refused: \
+                                     build_agent requires an explicit ConnectionRef \
+                                     (realm + binding). Env-default realm synthesis \
+                                     and first-matching-provider promotion were \
+                                     deleted in the wave-c auth-seam cleanup."
+                                        .to_string(),
+                                ));
                             }
                         };
 
@@ -1738,7 +1804,7 @@ impl AgentFactory {
                     for (handle, resolver) in &self.external_auth_resolvers {
                         env = env.with_external_resolver(handle.clone(), resolver.clone());
                     }
-                    let provider_registry = crate::default_provider_registry();
+                    let provider_registry = Arc::clone(&self.provider_registry);
                     let connection = provider_registry
                         .resolve(&realm, &binding_id, &env)
                         .await
@@ -1818,8 +1884,35 @@ impl AgentFactory {
             None => LlmClientAdapter::new(llm_client, model.clone()),
         };
         llm_adapter_inner = llm_adapter_inner.with_event_tap(event_tap.clone());
-        if let Some(params) = build_config.provider_params.clone() {
-            llm_adapter_inner = llm_adapter_inner.with_provider_params(Some(params));
+        if let Some(params_value) = build_config.provider_params.as_ref() {
+            // Project the legacy `Option<serde_json::Value>` per-turn
+            // blob into the typed `ProviderTag` the adapter wants.
+            // Per-provider `from_legacy_value` maps well-known shapes;
+            // unknown keys surface as `LegacyProviderParamsError`
+            // (lossless round-trip via `ProviderTag::Unknown { bag }`
+            // is the runtime-boundary responsibility, not this seam).
+            use meerkat_core::lifecycle::run_primitive::{
+                AnthropicProviderTag, GeminiProviderTag, OpenAiProviderTag, ProviderTag,
+            };
+            let typed_tag = match provider {
+                Provider::Anthropic => AnthropicProviderTag::from_legacy_value(params_value)
+                    .map(ProviderTag::Anthropic),
+                Provider::OpenAI => OpenAiProviderTag::from_legacy_value(params_value)
+                    .map(ProviderTag::OpenAi),
+                Provider::Gemini => GeminiProviderTag::from_legacy_value(params_value)
+                    .map(ProviderTag::Gemini),
+                Provider::SelfHosted | Provider::Other => {
+                    // Self-hosted and Other route through OpenAI-compatible
+                    // APIs; use the OpenAI shape for per-turn overrides.
+                    OpenAiProviderTag::from_legacy_value(params_value).map(ProviderTag::OpenAi)
+                }
+            }
+            .map_err(|e| {
+                BuildAgentError::Config(format!(
+                    "invalid provider_params for provider {provider:?}: {e}"
+                ))
+            })?;
+            llm_adapter_inner = llm_adapter_inner.with_provider_params(Some(typed_tag));
         }
         let llm_adapter: Arc<dyn AgentLlmClient> = Arc::new(llm_adapter_inner);
 
@@ -2349,13 +2442,13 @@ impl AgentFactory {
                     let available: std::collections::HashSet<_> = engine
                         .list_skills(&meerkat_core::skills::SkillFilter::default())
                         .await
-                        .map(|descs| descs.into_iter().map(|desc| desc.id).collect())
+                        .map(|descs| descs.into_iter().map(|desc| desc.key).collect())
                         .unwrap_or_default();
                     let mut dropped = Vec::new();
                     ids.retain(|id| {
                         let keep = available.contains(id);
                         if !keep {
-                            dropped.push(id.0.clone());
+                            dropped.push(format!("{}:{}", id.source_uuid, id.skill_name));
                         }
                         keep
                     });
@@ -2400,7 +2493,7 @@ impl AgentFactory {
         let skill_inventory_section: (
             String,
             Vec<String>,
-            Option<Vec<meerkat_core::skills::SkillId>>,
+            Option<Vec<meerkat_core::skills::SkillKey>>,
         ) = (String::new(), Vec::new(), None);
         let (inventory_section, preloaded_skill_sections, active_skill_ids) =
             skill_inventory_section;

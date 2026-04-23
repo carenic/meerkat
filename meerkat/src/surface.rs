@@ -56,7 +56,7 @@ use tokio_with_wasm::alias::sync::mpsc;
 
 #[cfg(feature = "skills")]
 use meerkat_core::skills::{
-    SkillDocument, SkillError, SkillFilter, SkillId, SkillIntrospectionEntry, SkillRuntime,
+    SkillDocument, SkillError, SkillFilter, SkillIntrospectionEntry, SkillKey, SkillRuntime,
 };
 #[cfg(feature = "mcp")]
 use std::collections::HashMap;
@@ -224,11 +224,11 @@ pub async fn list_skills_introspection(
 /// Returns `None` if the skill runtime is not available.
 pub async fn inspect_skill(
     skill_runtime: &Option<Arc<SkillRuntime>>,
-    id: &SkillId,
+    key: &SkillKey,
     source_name: Option<&str>,
 ) -> Option<Result<SkillDocument, SkillError>> {
     let runtime = skill_runtime.as_ref()?;
-    Some(runtime.load_from_source(id, source_name).await)
+    Some(runtime.load_from_source(key, source_name).await)
 }
 
 /// Spawn a task that forwards agent events from a channel to a callback.
