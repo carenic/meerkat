@@ -3761,17 +3761,7 @@ impl MobActor {
         // Feed `Spawn` into the MobMachine DSL so it populates
         // `live_runtime_ids` + `externally_addressable_runtime_ids` and
         // downstream guards (Retire, SubmitWork, …) operate on authoritative
-        // membership state instead of shell-only roster tracking.
-        //
-        // W3-H: populate the new `bridge_session_id` + `replacing` fields
-        // from the current DSL binding state. `replacing` carries the prior
-        // bridge session id if this identity was already bound (respawn
-        // case); the DSL's guard-split between SpawnRunningFresh vs
-        // SpawnRunningReplacing then emits the correct
-        // MemberSessionBindingSet vs MemberSessionBindingRotated effect.
-        // Members without a session-backed binding (e.g. `MemberRef::BackendPeer`)
-        // pass a synthetic empty session id — they are not realtime-WS
-        // targets and their binding map entry is inert.
+        // membership state.
         let dsl_identity = mob_dsl::AgentIdentity::from_domain(&identity);
         let bridge_session_id = match member_ref.bridge_session_id() {
             Some(sid) => mob_dsl::SessionId::from_domain(sid),
@@ -4064,21 +4054,7 @@ impl MobActor {
         // on snapshot construction.
         //
         // The DSL guards reject Retire when the runtime_id is absent from
-        // `live_runtime_ids` or the phase forbids it. That matches the existing
-        // idempotent semantics of handle_retire_inner (already-retired / unknown
-        // => no-op), so a guard rejection is logged but does not fail the retire.
-        //
-        // W3-H: populate `releasing` from the current DSL binding state. For
-        // a terminal retire (user-initiated), `releasing = Some(prior)` drives
-        // the `RetireRunningReleasing` path which clears the binding and emits
-        // `MemberSessionBindingReleased`. For the retire-half of a respawn
-        // (caller sets `preserve_realtime_binding = true`), pass
-        // `releasing = None` even though the binding is present — this drives
-        // the `RetireRunningPreservingBinding` path, which leaves the binding
-        // map alone so the replacement spawn's `SpawnRunningReplacing` can
-        // emit the atomic `MemberSessionBindingRotated` effect. Without this
-        // the respawn path would emit `Released → Set` instead of `Rotated`,
-        // closing MobMember WS channels mid-rotation (s58 root cause).
+        // `live_runtime_ids` or the phase forbids it.
         let dsl_identity = mob_dsl::AgentIdentity::from_domain(agent_identity);
         let releasing = if preserve_realtime_binding {
             None
@@ -4211,12 +4187,6 @@ impl MobActor {
         let replacement_generation = snapshot.generation.next();
 
         // 2. Retire the existing member (archives the session, removes from roster).
-        // W3-H: preserve the realtime binding map entry through the retire so
-        // the replacement spawn's `SpawnRunningReplacing` emits the atomic
-        // `MemberSessionBindingRotated` effect. Without this the binding
-        // would be cleared here, then re-set by the replacement spawn — a
-        // `Released → Set` pair that would break MobMember WS channel
-        // continuity across respawn (s58 root cause).
         if let Err(error) = self.handle_retire_inner(&agent_identity, false, true).await {
             let roster_still_contains_member = {
                 let roster = self.roster.read().await;

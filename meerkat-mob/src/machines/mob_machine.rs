@@ -754,39 +754,7 @@ machine! {
             // updates and illegal status transitions (e.g. Completed→Pending).
             in_progress_task_ids: Set<TaskId>,
             completed_task_ids: Set<TaskId>,
-            // W3-H / dogma #4: canonical identity→bridge-session map for
-            // realtime WS observers. Key absence == Unbound; presence carries
-            // the current bridge session id that identity's realtime channel
-            // should pin to. Respawn updates the value atomically in the same
-            // DSL transition that rebinds the runtime id, emitting a typed
-            // `MemberSessionBindingRotated` effect — the observer handles
-            // rotation as a first-class machine-emitted meaning, not a
-            // shell-side pattern-match over a Cleared+Set debounce window
-            // (dogma #3: one owner of meaning).
-            //
-            // Track-B (R5): this map is the identity-level "member is bound to
-            // *some* session" fact. Realtime WS observers were the first
-            // consumer; the `RecomputeMobPeerOverlay` composition driver is
-            // the second and reads the same map plus `wiring_edges` to
-            // project peer endpoints onto live sessions.
             member_session_bindings: Map<AgentIdentity, SessionId>,
-            // Track-B (R5): monotonically increasing counter that advances
-            // on every Track-B identity-level mutation
-            // (`WireMembers`/`UnwireMembers`/`BindMemberSession`/
-            // `RotateMemberSession`/`ReleaseMemberSession`). The machine
-            // emits `WiringGraphChanged { epoch }` or
-            // `MemberSessionBindingChanged { epoch, ... }` on the same
-            // transition that bumps this counter. Consumers (notably the
-            // `RecomputeMobPeerOverlay` composition driver) use the
-            // epoch to linearize recomputation and reject stale overlays
-            // against newer topology.
-            //
-            // The lifecycle-coupled `Spawn`/`Retire` transitions still
-            // emit the fine-grained `MemberSessionBindingSet`/
-            // `Rotated`/`Released` effects directly and do NOT advance
-            // this counter. Commit 4's driver watches both paths;
-            // Commit 5's cutover consolidates the lifecycle-coupled
-            // updates onto this canonical bump point.
             topology_epoch: u64,
         }
 
@@ -2359,24 +2327,6 @@ machine! {
         // Retire / RetireAll
         // =====================================================================
 
-        // W3-H: Retire splits into three variants to keep caller/state
-        // consistency explicit at the DSL:
-        //   * Releasing — identity has a realtime binding AND caller
-        //     witnesses it with `releasing = Some(prior)`. Binding is
-        //     cleared; MemberSessionBindingReleased is emitted. This is
-        //     a terminal retire (user-initiated).
-        //   * PreservingBinding — identity has a realtime binding but
-        //     caller passes `releasing = None`. This is the retire-half
-        //     of a respawn: the binding map is intentionally left alone
-        //     so the replacement spawn's SpawnRunningReplacing path can
-        //     emit MemberSessionBindingRotated against the same entry.
-        //     No binding-release effect is emitted.
-        //   * NoBinding — identity has no realtime binding and caller
-        //     passes `releasing = None`. No-op on the map.
-        // All three add the Retiring state marker. Guards enforce
-        // caller/state consistency: mismatched caller fails "no
-        // transition matched" rather than silently picking the wrong
-        // branch.
         transition RetireRunningReleasing {
             on input Retire { agent_runtime_id, agent_identity, releasing }
             guard { self.lifecycle_phase == Phase::Running }
