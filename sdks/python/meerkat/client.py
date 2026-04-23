@@ -2068,10 +2068,6 @@ class MeerkatClient:
     async def peers(self, session_id: str) -> dict[str, Any]:
         return await self._request("comms/peers", {"session_id": session_id})
 
-    async def status(self, session_id: str) -> RuntimeStateResult:
-        raw = await self._request("session/status", {"session_id": session_id})
-        return RuntimeStateResult(**raw)
-
     async def runtime_realtime_attachment_status(
         self, session_id: str
     ) -> RuntimeRealtimeAttachmentStatusResult:
@@ -2080,19 +2076,6 @@ class MeerkatClient:
             {"session_id": session_id},
         )
         return RuntimeRealtimeAttachmentStatusResult(**raw)
-
-    async def runtime_realtime_attachment_statuses(
-        self, session_ids: list[str]
-    ) -> dict[str, Any]:
-        """Batch realtime attachment statuses for multiple session IDs.
-
-        Returns a typed-dict-shaped payload with a `statuses` list; callers
-        downcast per their schema types.
-        """
-        return await self._request(
-            "session/realtime_attachment_statuses",
-            {"session_ids": session_ids},
-        )
 
     async def mob_ensure_member(
         self, mob_id: str, spec: dict[str, Any]
@@ -2145,42 +2128,6 @@ class MeerkatClient:
     ) -> RealtimeCapabilitiesResult:
         raw = await self._request("realtime/capabilities", _wire_params(params))
         return RealtimeCapabilitiesResult(**raw)
-
-    async def submit(
-        self,
-        session_id: str,
-        input: dict[str, Any],
-    ) -> RuntimeAcceptResult:
-        raw = await self._request("session/submit", {"session_id": session_id, "input": input})
-        state = raw.get("state")
-        if isinstance(state, dict):
-            raw = dict(raw)
-            raw["state"] = self._parse_wire_input_state(state)
-        return RuntimeAcceptResult(**raw)
-
-    async def retire(self, session_id: str) -> RuntimeRetireResult:
-        raw = await self._request("session/retire", {"session_id": session_id})
-        return RuntimeRetireResult(**raw)
-
-    async def reset(self, session_id: str) -> RuntimeResetResult:
-        raw = await self._request("session/reset", {"session_id": session_id})
-        return RuntimeResetResult(**raw)
-
-    async def submission(
-        self, session_id: str, submission_id: str
-    ) -> WireInputState | None:
-        raw = await self._request(
-            "session/submission",
-            {"session_id": session_id, "input_id": submission_id},
-        )
-        if raw is None:
-            return None
-        return self._parse_wire_input_state(raw)
-
-    async def submissions(self, session_id: str) -> list[str]:
-        result = await self._request("session/submissions", {"session_id": session_id})
-        input_ids = result.get("input_ids", [])
-        return [str(input_id) for input_id in input_ids]
 
     # -- Transport ---------------------------------------------------------
 
