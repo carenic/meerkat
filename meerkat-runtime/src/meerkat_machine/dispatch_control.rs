@@ -185,25 +185,18 @@ impl MeerkatMachine {
                 if matches!(state, RuntimeState::Destroyed | RuntimeState::Stopped) {
                     return Err(RuntimeControlPlaneError::InvalidState { state });
                 }
-                let previous_dsl_state = self
-                    .stage_session_dsl_input(
-                        &session_id,
-                        crate::meerkat_machine::dsl::MeerkatMachineInput::Retire,
-                        "Retire",
-                    )
-                    .await
-                    .map_err(RuntimeControlPlaneError::Internal)?;
+                self.stage_session_dsl_input(
+                    &session_id,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::Retire,
+                    "Retire",
+                )
+                .await
+                .map_err(RuntimeControlPlaneError::Internal)?;
 
                 let mut drv = driver.lock().await;
-                let mut report = match machine_retire(&mut drv).await {
-                    Ok(report) => report,
-                    Err(err) => {
-                        drop(drv);
-                        self.restore_session_dsl_state(&session_id, previous_dsl_state)
-                            .await;
-                        return Err(RuntimeControlPlaneError::Internal(err.to_string()));
-                    }
-                };
+                let mut report = machine_retire(&mut drv)
+                    .await
+                    .map_err(|err| RuntimeControlPlaneError::Internal(err.to_string()))?;
                 drop(drv);
 
                 if report.inputs_pending_drain > 0 {
@@ -243,26 +236,19 @@ impl MeerkatMachine {
                 if matches!(state, RuntimeState::Destroyed | RuntimeState::Running) {
                     return Err(RuntimeControlPlaneError::InvalidState { state });
                 }
-                let previous_dsl_state = self
-                    .stage_session_dsl_input(
-                        &session_id,
-                        crate::meerkat_machine::dsl::MeerkatMachineInput::Recycle,
-                        "Recycle",
-                    )
-                    .await
-                    .map_err(RuntimeControlPlaneError::Internal)?;
+                self.stage_session_dsl_input(
+                    &session_id,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::Recycle,
+                    "Recycle",
+                )
+                .await
+                .map_err(RuntimeControlPlaneError::Internal)?;
 
                 let (transferred, active_after_recycle) = {
                     let mut drv = driver.lock().await;
-                    let transferred = match machine_recycle_preserving_work(&mut drv).await {
-                        Ok(transferred) => transferred,
-                        Err(err) => {
-                            drop(drv);
-                            self.restore_session_dsl_state(&session_id, previous_dsl_state)
-                                .await;
-                            return Err(RuntimeControlPlaneError::Internal(err.to_string()));
-                        }
-                    };
+                    let transferred = machine_recycle_preserving_work(&mut drv)
+                        .await
+                        .map_err(|err| RuntimeControlPlaneError::Internal(err.to_string()))?;
 
                     let active_after_recycle = drv.as_driver().active_input_ids();
                     (transferred, active_after_recycle)
@@ -302,25 +288,18 @@ impl MeerkatMachine {
                 if matches!(state, RuntimeState::Destroyed | RuntimeState::Running) {
                     return Err(RuntimeControlPlaneError::InvalidState { state });
                 }
-                let previous_dsl_state = self
-                    .stage_session_dsl_input(
-                        &session_id,
-                        crate::meerkat_machine::dsl::MeerkatMachineInput::Reset,
-                        "Reset",
-                    )
-                    .await
-                    .map_err(RuntimeControlPlaneError::Internal)?;
+                self.stage_session_dsl_input(
+                    &session_id,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::Reset,
+                    "Reset",
+                )
+                .await
+                .map_err(RuntimeControlPlaneError::Internal)?;
 
                 let mut drv = driver.lock().await;
-                let report = match machine_reset(&mut drv).await {
-                    Ok(report) => report,
-                    Err(err) => {
-                        drop(drv);
-                        self.restore_session_dsl_state(&session_id, previous_dsl_state)
-                            .await;
-                        return Err(RuntimeControlPlaneError::Internal(err.to_string()));
-                    }
-                };
+                let report = machine_reset(&mut drv)
+                    .await
+                    .map_err(|err| RuntimeControlPlaneError::Internal(err.to_string()))?;
                 drop(drv);
 
                 let mut comp = completions.lock().await;
@@ -344,26 +323,21 @@ impl MeerkatMachine {
                 if matches!(state, RuntimeState::Destroyed | RuntimeState::Running) {
                     return Err(RuntimeControlPlaneError::InvalidState { state });
                 }
-                let previous_dsl_state = self
-                    .stage_session_dsl_input(
-                        &session_id,
-                        crate::meerkat_machine::dsl::MeerkatMachineInput::Recover,
-                        "Recover",
-                    )
-                    .await
-                    .map_err(RuntimeControlPlaneError::Internal)?;
+                self.stage_session_dsl_input(
+                    &session_id,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::Recover,
+                    "Recover",
+                )
+                .await
+                .map_err(RuntimeControlPlaneError::Internal)?;
 
                 let (report, active_after_recover) = {
                     let mut drv = driver.lock().await;
-                    let report = match drv.as_driver_mut().recover().await {
-                        Ok(report) => report,
-                        Err(err) => {
-                            drop(drv);
-                            self.restore_session_dsl_state(&session_id, previous_dsl_state)
-                                .await;
-                            return Err(RuntimeControlPlaneError::Internal(err.to_string()));
-                        }
-                    };
+                    let report = drv
+                        .as_driver_mut()
+                        .recover()
+                        .await
+                        .map_err(|err| RuntimeControlPlaneError::Internal(err.to_string()))?;
                     let active_after_recover = drv.as_driver().active_input_ids();
                     (report, active_after_recover)
                 };

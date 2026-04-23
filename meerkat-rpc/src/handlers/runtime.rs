@@ -186,33 +186,6 @@ pub(crate) fn to_wire_accept_result(
 
 // ---- Handlers ----
 
-/// Handle `session/status` — get the runtime state for a session.
-pub async fn handle_status(
-    id: Option<RpcId>,
-    params: Option<&RawValue>,
-    adapter: &dyn SessionServiceRuntimeExt,
-) -> RpcResponse {
-    let params: RuntimeStateParams = match parse_params(params) {
-        Ok(p) => p,
-        Err(resp) => return resp.with_id(id),
-    };
-
-    let session_id = match SessionId::parse(&params.session_id) {
-        Ok(id) => id,
-        Err(_) => {
-            return RpcResponse::error(id, crate::error::INVALID_PARAMS, "Invalid session ID");
-        }
-    };
-
-    match adapter.runtime_state(&session_id).await {
-        Ok(state) => match to_wire_runtime_state(state) {
-            Ok(state) => RpcResponse::success(id, RuntimeStateResult { state }),
-            Err(err) => RpcResponse::error(id, crate::error::INTERNAL_ERROR, err),
-        },
-        Err(e) => RpcResponse::error(id, crate::error::INVALID_PARAMS, e.to_string()),
-    }
-}
-
 /// Handle `session/realtime_attachment_status` — get live attachment status for a session.
 pub async fn handle_runtime_realtime_attachment_status(
     id: Option<RpcId>,
@@ -242,96 +215,7 @@ pub async fn handle_runtime_realtime_attachment_status(
     }
 }
 
-/// Handle `session/realtime_attachment_statuses` — batch variant of
-/// `session/realtime_attachment_status`.
-///
-/// Preserves request order in the response so clients can zip by index.
-/// Per-session failures (bad id, adapter error) are captured in the entry's
-/// `error` field rather than failing the entire RPC — a partial answer is
-/// more useful to a dashboard than a hard error.
-pub async fn handle_runtime_realtime_attachment_statuses(
-    id: Option<RpcId>,
-    params: Option<&RawValue>,
-    adapter: &dyn SessionServiceRuntimeExt,
-) -> RpcResponse {
-    let params: RuntimeRealtimeAttachmentStatusesParams = match parse_params(params) {
-        Ok(p) => p,
-        Err(resp) => return resp.with_id(id),
-    };
 
-    let mut entries = Vec::with_capacity(params.session_ids.len());
-    for raw_session_id in params.session_ids {
-        let session_id = match SessionId::parse(&raw_session_id) {
-            Ok(parsed) => parsed,
-            Err(err) => {
-                entries.push(RuntimeRealtimeAttachmentStatusEntry {
-                    session_id: raw_session_id,
-                    status: None,
-                    error: Some(err.to_string()),
-                });
-                continue;
-            }
-        };
-        match adapter.realtime_attachment_status(&session_id).await {
-            Ok(status) => entries.push(RuntimeRealtimeAttachmentStatusEntry {
-                session_id: raw_session_id,
-                status: Some(to_wire_realtime_attachment_status(status)),
-                error: None,
-            }),
-            Err(err) => entries.push(RuntimeRealtimeAttachmentStatusEntry {
-                session_id: raw_session_id,
-                status: None,
-                error: Some(err.to_string()),
-            }),
-        }
-    }
-
-    RpcResponse::success(id, RuntimeRealtimeAttachmentStatusesResult { entries })
-}
-
-/// Handle `session/submit` — accept an input for a session.
-pub async fn handle_submit(
-    id: Option<RpcId>,
-    params: Option<&RawValue>,
-    adapter: &dyn SessionServiceRuntimeExt,
-) -> RpcResponse {
-    let params: RuntimeAcceptParams = match parse_params(params) {
-        Ok(p) => p,
-        Err(resp) => return resp.with_id(id),
-    };
-
-    let session_id = match SessionId::parse(&params.session_id) {
-        Ok(id) => id,
-        Err(_) => {
-            return RpcResponse::error(id, crate::error::INVALID_PARAMS, "Invalid session ID");
-        }
-    };
-
-    let input = match serde_json::from_value::<meerkat_runtime::Input>(params.input) {
-        Ok(input) => input,
-        Err(err) => {
-            return RpcResponse::error(id, crate::error::INVALID_PARAMS, err.to_string());
-        }
-    };
-
-    match adapter.accept_input(&session_id, input).await {
-        Ok(outcome) => match to_wire_accept_result(outcome) {
-            Ok(result) => RpcResponse::success(id, result),
-            Err(err) => RpcResponse::error(id, crate::error::INTERNAL_ERROR, err),
-        },
-        Err(meerkat_runtime::RuntimeDriverError::NotReady { state }) => {
-            match to_wire_accept_result(meerkat_runtime::AcceptOutcome::Rejected {
-                reason: meerkat_runtime::RejectReason::NotReady {
-                    state: format!("{state}"),
-                },
-            }) {
-                Ok(result) => RpcResponse::success(id, result),
-                Err(err) => RpcResponse::error(id, crate::error::INTERNAL_ERROR, err),
-            }
-        }
-        Err(e) => RpcResponse::error(id, crate::error::INVALID_PARAMS, e.to_string()),
-    }
-}
 
 /// Handle `session/retire` — retire a session's runtime.
 pub async fn handle_retire(
@@ -554,50 +438,6 @@ mod tests {
                 state: RuntimeState::Retired,
             })
         }
-    }
-
-    #[tokio::test]
-    async fn submit_returns_rejected_result_when_runtime_is_retired() {
-        let params_result = to_raw_value(&json!({
-            "session_id": uuid::Uuid::new_v4().to_string(),
-            "input": Input::Prompt(PromptInput::new("hello", None)),
-        }));
-        assert!(params_result.is_ok(), "serialize params should succeed");
-        let Some(params) = params_result.ok() else {
-            return;
-        };
-
-        let response = handle_submit(
-            Some(RpcId::Num(1)),
-            Some(params.as_ref()),
-            &RetiredRejectingAdapter,
-        )
-        .await;
-
-        assert!(
-            response.error.is_none(),
-            "retired accept should not surface as RPC error"
-        );
-        assert!(
-            response.result.is_some(),
-            "result payload should be present"
-        );
-        let Some(result) = response.result else {
-            return;
-        };
-        let value_result: Result<serde_json::Value, _> = serde_json::from_str(result.get());
-        assert!(value_result.is_ok(), "json result parse should succeed");
-        let Some(value) = value_result.ok() else {
-            return;
-        };
-        assert_eq!(value["outcome_type"], "rejected");
-        assert!(
-            value["reason"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("retired"),
-            "rejection reason should mention retired state"
-        );
     }
 
     #[tokio::test]

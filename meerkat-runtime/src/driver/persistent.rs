@@ -352,23 +352,18 @@ impl PersistentRuntimeDriver {
     pub async fn finalize_retire(
         &mut self,
     ) -> Result<crate::traits::RetireReport, RuntimeDriverError> {
-        let checkpoint = self.inner.rollback_snapshot();
         let report = self.inner.finalize_retire();
         let input_states = self.inner.stored_input_states_snapshot();
-        if let Err(err) = self
-            .store
+        self.store
             .atomic_lifecycle_commit(
                 &self.runtime_id,
                 self.runtime_state_for_persistence(),
                 &input_states,
             )
             .await
-        {
-            self.inner.restore_rollback_snapshot(checkpoint);
-            return Err(RuntimeDriverError::Internal(format!(
-                "retire persist failed: {err}"
-            )));
-        }
+            .map_err(|err| {
+                RuntimeDriverError::Internal(format!("retire persist failed: {err}"))
+            })?;
         Ok(report)
     }
 
@@ -385,23 +380,18 @@ impl PersistentRuntimeDriver {
     pub async fn finalize_reset(
         &mut self,
     ) -> Result<crate::traits::ResetReport, RuntimeDriverError> {
-        let checkpoint = self.inner.rollback_snapshot();
         let report = self.inner.reset_cleanup();
         let input_states = self.inner.stored_input_states_snapshot();
-        if let Err(err) = self
-            .store
+        self.store
             .atomic_lifecycle_commit(
                 &self.runtime_id,
                 self.runtime_state_for_persistence(),
                 &input_states,
             )
             .await
-        {
-            self.inner.restore_rollback_snapshot(checkpoint);
-            return Err(RuntimeDriverError::Internal(format!(
-                "reset persist failed: {err}"
-            )));
-        }
+            .map_err(|err| {
+                RuntimeDriverError::Internal(format!("reset persist failed: {err}"))
+            })?;
         Ok(report)
     }
 
@@ -445,23 +435,18 @@ impl PersistentRuntimeDriver {
     }
 
     pub async fn finalize_stop_runtime(&mut self) -> Result<(), RuntimeDriverError> {
-        let checkpoint = self.inner.rollback_snapshot();
         self.inner.stop_runtime_cleanup();
         let input_states = self.inner.stored_input_states_snapshot();
-        if let Err(err) = self
-            .store
+        self.store
             .atomic_lifecycle_commit(
                 &self.runtime_id,
                 self.runtime_state_for_persistence(),
                 &input_states,
             )
             .await
-        {
-            self.inner.restore_rollback_snapshot(checkpoint);
-            return Err(RuntimeDriverError::Internal(format!(
-                "stop persist failed: {err}"
-            )));
-        }
+            .map_err(|err| {
+                RuntimeDriverError::Internal(format!("stop persist failed: {err}"))
+            })?;
         Ok(())
     }
 

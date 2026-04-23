@@ -274,28 +274,10 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
                 "RealtimeCapabilitiesResult",
             ),
             RpcMethodDescriptor::typed(
-                "session/status",
-                "Get a session's current runtime state",
-                "RuntimeStateParams",
-                "RuntimeStateResult",
-            ),
-            RpcMethodDescriptor::typed(
                 "session/realtime_attachment_status",
                 "Get a session's realtime attachment status",
                 "RuntimeRealtimeAttachmentStatusParams",
                 "RuntimeRealtimeAttachmentStatusResult",
-            ),
-            RpcMethodDescriptor::typed(
-                "session/realtime_attachment_statuses",
-                "Batch: realtime attachment statuses for many sessions in one round-trip",
-                "RuntimeRealtimeAttachmentStatusesParams",
-                "RuntimeRealtimeAttachmentStatusesResult",
-            ),
-            RpcMethodDescriptor::typed(
-                "session/submit",
-                "Accept a runtime input for a session",
-                "RuntimeAcceptParams",
-                "RuntimeAcceptResult",
             ),
             RpcMethodDescriptor::typed(
                 "session/retire",

@@ -747,22 +747,6 @@ fn realtime_rpc_args(scope: &RuntimeScope) -> Vec<String> {
     args
 }
 
-fn realtime_target_wire(target: &RealtimeTargetCommands) -> serde_json::Value {
-    match target {
-        RealtimeTargetCommands::Session { session_id } => serde_json::json!({
-            "type": "session_target",
-            "session_id": session_id,
-        }),
-        RealtimeTargetCommands::Member {
-            mob_id,
-            agent_identity,
-        } => serde_json::json!({
-            "type": "mob_member_target",
-            "mob_id": mob_id,
-            "agent_identity": agent_identity,
-        }),
-    }
-}
 
 fn default_realtime_open_request(target: &RealtimeTargetCommands) -> serde_json::Value {
     serde_json::json!({

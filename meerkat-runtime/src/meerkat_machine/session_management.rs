@@ -1,34 +1,6 @@
 use super::*;
 
 impl MeerkatMachine {
-    fn sync_session_dsl_authority_from_driver(
-        dsl_authority: &Arc<std::sync::Mutex<super::dsl::MeerkatMachineAuthority>>,
-        session_id: &SessionId,
-        control_projection: &Arc<StdRwLock<crate::driver::ephemeral::RuntimeControlProjection>>,
-        driver_runtime_id: &LogicalRuntimeId,
-        driver_silent_intents: std::collections::BTreeSet<String>,
-    ) {
-        let control = control_projection
-            .read()
-            .map(|guard| guard.clone())
-            .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
-        let mut authority = dsl_authority
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        authority.state.lifecycle_phase = super::dsl_authority::project_phase(control.phase);
-        authority.state.session_id = Some(super::dsl::SessionId::from_domain(session_id));
-        authority.state.active_runtime_id =
-            Some(super::dsl::AgentRuntimeId::from_domain(driver_runtime_id));
-        authority.state.current_run_id = control
-            .current_run_id
-            .as_ref()
-            .map(super::dsl::RunId::from_domain);
-        authority.state.pre_run_phase = control
-            .pre_run_phase
-            .and_then(super::dsl_authority::pre_run_phase_from_runtime_state);
-        authority.state.silent_intent_overrides = driver_silent_intents;
-    }
-
     pub(super) async fn register_session_inner(&self, session_id: SessionId) {
         {
             let mut sessions = self.sessions.write().await;
@@ -56,18 +28,6 @@ impl MeerkatMachine {
             return;
         }
         let control_projection = entry.control_projection_handle();
-        let driver_runtime_id = entry.runtime_id().clone();
-        let driver_silent_intents = entry
-            .silent_comms_intents()
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>();
-        Self::sync_session_dsl_authority_from_driver(
-            &dsl_authority,
-            &session_id,
-            &control_projection,
-            &driver_runtime_id,
-            driver_silent_intents,
-        );
 
         let (ops_lifecycle, epoch_id, cursor_state) =
             self.recover_or_create_ops_state(&session_id).await;
@@ -226,19 +186,6 @@ impl MeerkatMachine {
                     );
                     return;
                 }
-                let control_projection = recovered_entry.control_projection_handle();
-                let driver_runtime_id = recovered_entry.runtime_id().clone();
-                let driver_silent_intents = recovered_entry
-                    .silent_comms_intents()
-                    .into_iter()
-                    .collect::<std::collections::BTreeSet<_>>();
-                Self::sync_session_dsl_authority_from_driver(
-                    &dsl_authority,
-                    &session_id,
-                    &control_projection,
-                    &driver_runtime_id,
-                    driver_silent_intents,
-                );
 
                 // Recover ops state OUTSIDE the sessions lock to avoid blocking
                 // other adapter operations behind potentially slow disk I/O.

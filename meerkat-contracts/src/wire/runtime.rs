@@ -5,39 +5,11 @@ use serde::{Deserialize, Serialize};
 use crate::wire::session::WireContentBlock;
 use meerkat_core::comms::PeerName;
 
-/// Request payload for `session/status`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct RuntimeStateParams {
-    pub session_id: String,
-}
-
 /// Request payload for `session/realtime_attachment_status`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RuntimeRealtimeAttachmentStatusParams {
     pub session_id: String,
-}
-
-/// Request payload for `session/realtime_attachment_statuses` (batch).
-///
-/// Allows a console rendering N mob members to retrieve live attachment
-/// status for every session in one RPC round-trip instead of fanning out N
-/// individual `session/realtime_attachment_status` calls.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct RuntimeRealtimeAttachmentStatusesParams {
-    /// Sessions to query. Order is preserved in
-    /// [`RuntimeRealtimeAttachmentStatusesResult::entries`].
-    pub session_ids: Vec<String>,
-}
-
-/// Request payload for `session/submit`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct RuntimeAcceptParams {
-    pub session_id: String,
-    pub input: serde_json::Value,
 }
 
 /// Terminal status for dedicated correlated peer-response ingress.
@@ -142,44 +114,11 @@ pub enum WireRealtimeAttachmentStatus {
     ReattachRequired,
 }
 
-/// Response payload for `session/status`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct RuntimeStateResult {
-    pub state: WireRuntimeState,
-}
-
 /// Response payload for `session/realtime_attachment_status`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RuntimeRealtimeAttachmentStatusResult {
     pub status: WireRealtimeAttachmentStatus,
-}
-
-/// One entry in the batched `session/realtime_attachment_statuses` response.
-///
-/// `status` is `None` when the adapter could not resolve a status for
-/// `session_id` (unknown session, not registered, or the adapter returned
-/// an error). `error` carries a short diagnostic string in that case.
-/// Known sessions always produce `status: Some(_)` with `error: None`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct RuntimeRealtimeAttachmentStatusEntry {
-    pub session_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<WireRealtimeAttachmentStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// Response payload for `session/realtime_attachment_statuses` (batch).
-///
-/// Entry order matches the request's `session_ids` order so clients can
-/// zip by index without re-keying.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct RuntimeRealtimeAttachmentStatusesResult {
-    pub entries: Vec<RuntimeRealtimeAttachmentStatusEntry>,
 }
 
 /// Discriminator for `session/submit` responses.

@@ -1073,7 +1073,6 @@ pub(crate) async fn machine_stop_runtime(
         }
     }
 
-    driver.set_control_projection(RuntimeState::Stopped, None, None);
     driver.finalize_stop_runtime().await
 }
 
@@ -1097,7 +1096,6 @@ pub(crate) async fn machine_destroy(
         | RuntimeState::Stopped => {}
     }
 
-    driver.set_control_projection(RuntimeState::Destroyed, None, None);
     driver.destroy().await
 }
 
@@ -1117,9 +1115,6 @@ pub(crate) async fn machine_retire(
         }
     }
 
-    let current_run_id = driver.current_run_id();
-    let pre_run_phase = driver.pre_run_phase();
-    driver.set_control_projection(RuntimeState::Retired, current_run_id, pre_run_phase);
     driver.finalize_retire().await
 }
 
@@ -1142,7 +1137,6 @@ pub(crate) async fn machine_reset(
         }
     }
 
-    driver.set_control_projection(RuntimeState::Idle, None, None);
     driver.finalize_reset().await
 }
 
