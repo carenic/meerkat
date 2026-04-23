@@ -896,10 +896,6 @@ where
     /// to decide whether to emit the `[MCP_PENDING]` system notice.
     pub(crate) mcp_server_lifecycle_handle:
         Option<Arc<dyn crate::handles::McpServerLifecycleHandle>>,
-    /// Binding key for the connection_ref this session resolves through,
-    /// in `"realm_id:binding_id"` form. Populated when the agent was built
-    /// via a connection_ref path; `None` for env-var / legacy flat path.
-    pub(crate) connection_ref_binding_key: Option<String>,
     /// Shared live flag for cancellation at the next turn boundary.
     pub(crate) cancel_after_boundary_requested: Arc<std::sync::atomic::AtomicBool>,
     /// Optional resolver for model-specific operational defaults (e.g., call timeout).

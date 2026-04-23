@@ -685,97 +685,6 @@ where
                     self.session.messages_mut().retain(|message| {
                         !is_synthetic_notice(message, SystemNoticeKind::AuthReauthRequired)
                     });
-                    if let (Some(handle), Some(binding_key)) = (
-                        self.auth_lease_handle.as_deref(),
-                        self.connection_ref_binding_key.as_deref(),
-                    ) {
-                        let snapshot = handle.snapshot(binding_key);
-
-                        // TTL sampler — Phase 1.5-rev refresh-loop leg
-                        // (b): when the lease is still `valid` but the
-                        // resolver's recorded expires_at is within 60s
-                        // of now, drive MarkAuthExpiring so the runner
-                        // (next iteration) sees `expiring` and fires
-                        // begin_refresh. Comparing DSL-recorded TTL
-                        // against SystemTime is shell-mechanics; the
-                        // DSL's transition guard enforces legality.
-                        if snapshot.phase == Some(crate::handles::AuthLeasePhase::Valid)
-                            && let Some(expires_at) = snapshot.expires_at
-                        {
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            // Policy constant is owned by the
-                            // handle-trait module (dogma §9/§20).
-                            // Leases within AUTH_LEASE_TTL_REFRESH_WINDOW_SECS
-                            // of expiry (or already past) trigger
-                            // expiring. Max sentinel (u64::MAX) means
-                            // "no expiry" — api_key/env-var leases
-                            // land here and never expire.
-                            let window = crate::handles::AUTH_LEASE_TTL_REFRESH_WINDOW_SECS;
-                            if expires_at != u64::MAX && expires_at <= now.saturating_add(window) {
-                                let _ = handle.mark_expiring(binding_key);
-                            }
-                        }
-
-                        // Re-read state — may have moved to `expiring`
-                        // via the TTL check above.
-                        let snapshot = handle.snapshot(binding_key);
-                        match snapshot.phase {
-                            // expiring → observable state only. Plan
-                            // §1.5r.9's "call provider resolver refresh
-                            // → complete_refresh or refresh_failed" leg
-                            // is architecturally blocked on mid-session
-                            // client hot-swap (plan §Explicit deferrals),
-                            // so driving into `refreshing` from here
-                            // would create a state the production flow
-                            // has no path out of. Dogma §19 forbids that
-                            // theater. The TTL-expiry signal is still
-                            // useful to external observers (CLI status,
-                            // REST AuthStatus), which is why
-                            // `mark_expiring` fires above; the machine's
-                            // `refreshing` state remains reachable from
-                            // tests and — when the refresh driver lands
-                            // — from a session-scoped driver task.
-                            Some(crate::handles::AuthLeasePhase::Expiring) => {}
-                            // reauth_required → project the DSL state into a
-                            // synthetic session-level system notice, then
-                            // terminate the run. The DSL has already
-                            // decided that this binding cannot proceed;
-                            // the runner only surfaces that decision.
-                            Some(crate::handles::AuthLeasePhase::ReauthRequired) => {
-                                let notice = format!(
-                                    "Connection `{binding_key}` requires re-authentication. \
-                                     Run `rkat auth login` for the provider, then retry."
-                                );
-                                self.session.push(synthetic_notice_message(
-                                    SystemNoticeKind::AuthReauthRequired,
-                                    notice.clone(),
-                                ));
-                                // Typed terminal — the machine decided
-                                // this binding cannot proceed. Surfaces
-                                // can pattern-match on
-                                // AgentError::AuthReauthRequired rather
-                                // than parsing a string prefix out of
-                                // InternalError (dogma §5).
-                                self.pending_fatal_diagnostic =
-                                    Some(AgentError::AuthReauthRequired {
-                                        binding_key: binding_key.to_string(),
-                                        message: notice,
-                                    });
-                                self.apply_turn_input(TurnExecutionInput::FatalFailure {
-                                    run_id: run_id.clone(),
-                                })?;
-                                return self.build_result(turn_count, tool_call_count).await;
-                            }
-                            // valid / refreshing / None: no runner action.
-                            // `refreshing` means another caller is mid-flight;
-                            // we can proceed with the call because the lease
-                            // hasn't been invalidated yet.
-                            _ => {}
-                        }
-                    }
 
                     // 1. Poll external updates BEFORE tool capture so newly
                     //    connected tools are visible in the same LLM call.
@@ -1137,21 +1046,7 @@ where
 
                     let mut effective_max_tokens = self.config.max_tokens_per_turn;
                     let mut effective_temperature = self.config.temperature;
-                    // Merge provider tool defaults with explicit provider_params (RFC 7396).
-                    // tool_defaults are non-persisted, re-derived each build from config + profile.
-                    // explicit provider_params are persisted and override/remove defaults via null.
-                    let mut effective_provider_params = match (
-                        &self.config.provider_tool_defaults,
-                        &self.config.provider_params,
-                    ) {
-                        (Some(defaults), Some(explicit)) => {
-                            let mut merged = defaults.clone();
-                            json_merge_patch(&mut merged, explicit.clone());
-                            Some(merged)
-                        }
-                        (Some(defaults), None) => Some(defaults.clone()),
-                        (None, some_or_none) => some_or_none.clone(),
-                    };
+                    let mut effective_provider_params: Option<Value> = None;
 
                     // Pre-LLM hooks may rewrite request params or deny the turn.
                     let pre_llm_report = self
@@ -3374,83 +3269,6 @@ mod tests {
                 "COMPACT NOW".to_string(),
                 "second".to_string()
             ]
-        );
-    }
-
-    #[tokio::test]
-    async fn calling_llm_with_max_turns_zero_completes_with_zero_turns() {
-        let mut agent = build_agent(Arc::new(StaticLlmClient)).await;
-        agent.config.max_turns = Some(0);
-        agent.state = LoopState::CallingLlm;
-
-        let result = agent.run_loop(None).await.unwrap();
-        assert_eq!(result.turns, 0);
-        assert_eq!(agent.state, LoopState::Completed);
-    }
-
-    #[tokio::test]
-    async fn calling_llm_with_budget_exhausted_completes_with_zero_turns() {
-        let mut agent = build_agent(Arc::new(StaticLlmClient)).await;
-        agent.config.max_turns = Some(10);
-        agent.state = LoopState::CallingLlm;
-        agent.budget = Budget::new(BudgetLimits {
-            max_tokens: Some(0),
-            max_duration: None,
-            max_tool_calls: None,
-        });
-
-        let result = agent.run_loop(None).await.unwrap();
-        assert_eq!(result.turns, 0);
-        assert_eq!(agent.state, LoopState::Completed);
-    }
-
-    #[tokio::test]
-    async fn completed_with_max_turns_zero_returns_immediately() {
-        let mut agent = build_agent(Arc::new(StaticLlmClient)).await;
-        agent.config.max_turns = Some(0);
-        agent.state = LoopState::Completed;
-
-        // With the turn execution authority, Completed + max_turns=0
-        // correctly returns immediately with 0 turns rather than
-        // erroring with InvalidStateTransition.
-        let result = agent.run_loop(None).await.unwrap();
-        assert_eq!(result.turns, 0);
-        assert_eq!(agent.state, LoopState::Completed);
-    }
-
-    #[tokio::test]
-    async fn error_recovery_with_max_turns_zero_completes() {
-        let mut agent = build_agent(Arc::new(StaticLlmClient)).await;
-        agent.config.max_turns = Some(0);
-        agent.state = LoopState::ErrorRecovery;
-
-        let result = agent.run_loop(None).await.unwrap();
-        assert_eq!(result.turns, 0);
-        assert_eq!(agent.state, LoopState::Completed);
-    }
-
-    #[tokio::test]
-    async fn run_with_events_emits_run_completed_for_max_turns_zero() {
-        let mut agent = build_agent(Arc::new(StaticLlmClient)).await;
-        agent.config.max_turns = Some(0);
-
-        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(32);
-        let result = agent
-            .run_with_events("prompt".to_string().into(), tx)
-            .await
-            .unwrap();
-        assert_eq!(result.turns, 0);
-
-        let mut saw_run_completed = false;
-        while let Ok(event) = rx.try_recv() {
-            if let crate::event::AgentEvent::RunCompleted { result, .. } = event {
-                saw_run_completed = true;
-                assert_eq!(result, "");
-            }
-        }
-        assert!(
-            saw_run_completed,
-            "successful early exits should still emit RunCompleted"
         );
     }
 

@@ -563,31 +563,6 @@ impl LocalTurnExecutionState {
             (
                 ApplyingPrimitive | CallingLlm | WaitingForOps | DrainingBoundary | Extracting
                 | ErrorRecovery,
-                TurnLimitReached { run_id },
-            ) => {
-                if !self.guard_run_matches(run_id) {
-                    return Err(Self::invalid(phase, input));
-                }
-                if matches!(phase, WaitingForOps) {
-                    fields.pending_op_refs = None;
-                    fields.barrier_operation_ids = Vec::new();
-                    fields.has_barrier_ops = false;
-                    fields.barrier_satisfied = true;
-                }
-                fields.boundary_count += 1;
-                fields.terminal_outcome = TurnTerminalOutcome::Completed;
-                effects.push(TurnExecutionEffect::BoundaryApplied {
-                    run_id: run_id.clone(),
-                    boundary_sequence: u64::from(fields.boundary_count),
-                });
-                effects.push(TurnExecutionEffect::RunCompleted {
-                    run_id: run_id.clone(),
-                });
-                Completed
-            }
-            (
-                ApplyingPrimitive | CallingLlm | WaitingForOps | DrainingBoundary | Extracting
-                | ErrorRecovery,
                 BudgetExhausted { run_id },
             ) => {
                 if !self.guard_run_matches(run_id) {

@@ -62,7 +62,6 @@ pub struct AgentBuilder {
     pub(super) auth_lease_handle: Option<Arc<dyn crate::handles::AuthLeaseHandle>>,
     pub(super) mcp_server_lifecycle_handle:
         Option<Arc<dyn crate::handles::McpServerLifecycleHandle>>,
-    pub(super) connection_ref_binding_key: Option<String>,
 }
 
 impl AgentBuilder {
@@ -99,7 +98,6 @@ impl AgentBuilder {
             external_tool_surface_handle: None,
             auth_lease_handle: None,
             mcp_server_lifecycle_handle: None,
-            connection_ref_binding_key: None,
         }
     }
 
@@ -338,7 +336,6 @@ impl AgentBuilder {
             external_tool_surface_handle: self.external_tool_surface_handle,
             auth_lease_handle: self.auth_lease_handle,
             mcp_server_lifecycle_handle: self.mcp_server_lifecycle_handle,
-            connection_ref_binding_key: self.connection_ref_binding_key,
             cancel_after_boundary_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_defaults_resolver: self.model_defaults_resolver,
             call_timeout_override: self.call_timeout_override,
@@ -570,15 +567,6 @@ impl AgentBuilder {
         handle: Arc<dyn crate::handles::McpServerLifecycleHandle>,
     ) -> Self {
         self.mcp_server_lifecycle_handle = Some(handle);
-        self
-    }
-
-    /// Identify the `connection_ref` this agent routes LLM calls through.
-    ///
-    /// Format: `"<realm_id>:<binding_id>"`. Used together with
-    /// [`with_auth_lease_handle`] to key lease lifecycle transitions.
-    pub fn with_connection_ref_binding_key(mut self, binding_key: String) -> Self {
-        self.connection_ref_binding_key = Some(binding_key);
         self
     }
 
