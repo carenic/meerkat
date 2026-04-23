@@ -1109,7 +1109,14 @@ impl MethodRouter {
             "skills/list" => handlers::skills::handle_list(id, &self.skill_runtime).await,
             #[cfg(not(feature = "mini-surface"))]
             "skills/inspect" => {
-                handlers::skills::handle_inspect(id, params, &self.skill_runtime).await
+                // Post-wave-a dogma: the shell-side skill inspection path was
+                // retired; callers consult canonical skill registry surfaces.
+                let _ = params;
+                RpcResponse::error(
+                    id,
+                    error::METHOD_NOT_FOUND,
+                    "skills/inspect is no longer served; resolve skills through the typed registry surface".to_string(),
+                )
             }
             "capabilities/get" => {
                 let config = self.config_store.get().await.unwrap_or_default();
@@ -1133,7 +1140,14 @@ impl MethodRouter {
                 handlers::auth::handle_auth_profile_delete(id, params, &self.runtime).await
             }
             "auth/profile/test" => {
-                handlers::auth::handle_auth_profile_test(id, params, &self.runtime).await
+                // Post-wave-a dogma: the auth probe seam was retired; use
+                // `auth/profile/get` + `capabilities/get` to verify profile state.
+                let _ = params;
+                RpcResponse::error(
+                    id,
+                    error::METHOD_NOT_FOUND,
+                    "auth/profile/test is no longer served; use auth/profile/get".to_string(),
+                )
             }
             "auth/login/start" => handlers::auth::handle_auth_login_start(id, params).await,
             "auth/login/complete" => {

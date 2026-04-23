@@ -334,15 +334,12 @@ pub async fn handle_auth_profile_create(
         account_id: None,
         metadata: serde_json::Value::Null,
     };
-    let key = TokenKey::new(
-        connection_ref.realm.to_string(),
-        connection_ref.binding.to_string(),
-    );
+    let key = TokenKey::new(connection_ref.realm.clone(), connection_ref.binding.clone());
     match store.save(&key, &tokens).await {
         Ok(()) => {
             tracing::info!(
                 target: "meerkat::auth::audit",
-                binding_key = %connection_ref,
+                binding_key = ?connection_ref,
                 action = "create_profile",
                 provider = %auth_profile.provider.as_str(),
                 auth_method = %auth_profile.auth_method,
@@ -387,15 +384,12 @@ pub async fn handle_auth_profile_delete(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let key = TokenKey::new(
-        connection_ref.realm.to_string(),
-        connection_ref.binding.to_string(),
-    );
+    let key = TokenKey::new(connection_ref.realm.clone(), connection_ref.binding.clone());
     match store.clear(&key).await {
         Ok(()) => {
             tracing::info!(
                 target: "meerkat::auth::audit",
-                binding_key = %connection_ref,
+                binding_key = ?connection_ref,
                 action = "delete_profile",
                 "binding-scoped auth credentials deleted via RPC"
             );
@@ -488,11 +482,16 @@ pub async fn handle_auth_login_complete(
             }
         };
     let binding_id = parsed.binding_id;
-    let (connection_ref, binding, auth_profile) =
-        match resolve_binding_identity(runtime, &parsed.realm_id, &binding_id).await {
-            Ok(v) => v,
-            Err(r) => return r.with_id(id),
-        };
+    let (connection_ref, binding, auth_profile) = match resolve_binding_identity(
+        runtime,
+        &parsed.realm_id,
+        binding_id.as_deref().unwrap_or(""),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(r) => return r.with_id(id),
+    };
     if parsed.provider != auth_profile.provider.as_str() {
         return RpcResponse::error(
             id,
@@ -554,10 +553,7 @@ pub async fn handle_auth_login_complete(
         account_id: None,
         metadata: serde_json::Value::Null,
     };
-    let key = TokenKey::new(
-        connection_ref.realm.to_string(),
-        connection_ref.binding.to_string(),
-    );
+    let key = TokenKey::new(connection_ref.realm.clone(), connection_ref.binding.clone());
     if let Err(e) = store.save(&key, &tokens).await {
         return RpcResponse::error(
             id,
@@ -567,7 +563,7 @@ pub async fn handle_auth_login_complete(
     }
     tracing::info!(
         target: "meerkat::auth::audit",
-        binding_key = %connection_ref,
+        binding_key = ?connection_ref,
         action = "login_oauth_complete",
         provider = %parsed.provider,
         has_refresh_token = %tokens.refresh_token.is_some(),
@@ -678,11 +674,16 @@ pub async fn handle_auth_login_device_complete(
         );
     }
     let binding_id = parsed.binding_id;
-    let (connection_ref, binding, auth_profile) =
-        match resolve_binding_identity(runtime, &parsed.realm_id, &binding_id).await {
-            Ok(v) => v,
-            Err(r) => return r.with_id(id),
-        };
+    let (connection_ref, binding, auth_profile) = match resolve_binding_identity(
+        runtime,
+        &parsed.realm_id,
+        binding_id.as_deref().unwrap_or(""),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(r) => return r.with_id(id),
+    };
     if parsed.provider != auth_profile.provider.as_str() {
         return RpcResponse::error(
             id,
@@ -743,10 +744,7 @@ pub async fn handle_auth_login_device_complete(
                 account_id: None,
                 metadata: serde_json::Value::Null,
             };
-            let key = TokenKey::new(
-                connection_ref.realm.to_string(),
-                connection_ref.binding.to_string(),
-            );
+            let key = TokenKey::new(connection_ref.realm.clone(), connection_ref.binding.clone());
             if let Err(e) = store.save(&key, &tokens).await {
                 return RpcResponse::error(
                     id,
@@ -756,7 +754,7 @@ pub async fn handle_auth_login_device_complete(
             }
             tracing::info!(
                 target: "meerkat::auth::audit",
-                binding_key = %connection_ref,
+                binding_key = ?connection_ref,
                 action = "login_device_complete",
                 provider = %parsed.provider,
                 has_refresh_token = %tokens.refresh_token.is_some(),
@@ -813,7 +811,16 @@ pub async fn handle_auth_login_provision_api_key(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let key = TokenKey::new(parsed.realm_id.clone(), binding_id.clone());
+    let key = match TokenKey::parse(&parsed.realm_id, binding_id.as_deref().unwrap_or_default()) {
+        Ok(k) => k,
+        Err(err) => {
+            return RpcResponse::error(
+                id,
+                error::INVALID_PARAMS,
+                format!("invalid realm/binding: {err}"),
+            );
+        }
+    };
     // Console endpoints drive `scope = org:create_api_key user:profile`.
     // The runtime wrapper's `provision_api_key` POSTs to
     // API_KEY_CREATE_URL with `Authorization: Bearer <access_token>`
@@ -862,8 +869,8 @@ pub async fn handle_auth_status_get(
     let stored = if let Some(store) = runtime.token_store() {
         store
             .load(&TokenKey::new(
-                connection_ref.realm.to_string(),
-                connection_ref.binding.to_string(),
+                connection_ref.realm.clone(),
+                connection_ref.binding.clone(),
             ))
             .await
             .unwrap_or(None)
@@ -914,15 +921,12 @@ pub async fn handle_auth_logout(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let key = TokenKey::new(
-        connection_ref.realm.to_string(),
-        connection_ref.binding.to_string(),
-    );
+    let key = TokenKey::new(connection_ref.realm.clone(), connection_ref.binding.clone());
     match store.clear(&key).await {
         Ok(()) => {
             tracing::info!(
                 target: "meerkat::auth::audit",
-                binding_key = %connection_ref,
+                binding_key = ?connection_ref,
                 action = "logout",
                 "binding-scoped auth credentials logged out via RPC"
             );

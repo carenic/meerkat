@@ -5,13 +5,13 @@ use serde_json::value::RawValue;
 
 use meerkat_contracts::{
     RuntimeAcceptOutcomeType, RuntimeAcceptResult, RuntimeRealtimeAttachmentStatusParams,
-    RuntimeRealtimeAttachmentStatusResult, WireInputLifecycleState, WireInputPolicy,
-    WireInputState, WireInputStateHistoryEntry, WireRealtimeAttachmentStatus,
+    RuntimeRealtimeAttachmentStatusResult, WireInputLifecycleState, WireInputState,
+    WireInputStateHistoryEntry, WireRealtimeAttachmentStatus, wire::runtime::WireInputPolicy,
 };
 use meerkat_core::SessionId;
 use meerkat_runtime::service_ext::SessionServiceRuntimeExt;
 
-use super::parse_params;
+use super::{RpcResponseExt, parse_params};
 use crate::protocol::{RpcId, RpcResponse};
 
 fn to_wire_realtime_attachment_status(

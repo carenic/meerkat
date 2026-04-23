@@ -211,6 +211,22 @@ impl MobMemberListEntry {
         self.current_bridge_session_id = current_bridge_session_id;
         self
     }
+
+    /// Typed helper for external consumers (mob-mcp, mob-pack verify, rpc
+    /// surface) that legitimately need the binding-era atoms to drive work
+    /// lane calls. Keeps the fields `pub(crate)` + `#[serde(skip)]` so they
+    /// never leak through Serialize/Debug-derived paths.
+    pub fn binding_atoms(&self) -> (AgentRuntimeId, FenceToken) {
+        (self.agent_runtime_id.clone(), self.fence_token)
+    }
+}
+
+impl WorkDeliveryReceipt {
+    /// Typed accessor for the submitting runtime identity. See
+    /// `MobMemberListEntry::binding_atoms` for rationale.
+    pub fn runtime_id(&self) -> &AgentRuntimeId {
+        &self.runtime_id
+    }
 }
 
 /// Live connectivity summary for a member's currently wired peers.

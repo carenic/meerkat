@@ -52,8 +52,18 @@ pub async fn handle_external_event(
             payload,
             blocks,
         } => {
+            let payload_value: serde_json::Value = match serde_json::from_str(payload.get()) {
+                Ok(v) => v,
+                Err(err) => {
+                    return RpcResponse::error(
+                        id,
+                        crate::error::INVALID_PARAMS,
+                        format!("invalid event payload JSON: {err}"),
+                    );
+                }
+            };
             runtime
-                .accept_external_event_via_runtime(&session_id, event_type, payload, blocks)
+                .accept_external_event_via_runtime(&session_id, event_type, payload_value, blocks)
                 .await
         }
         SessionExternalEventEnvelope::PeerResponseTerminal { .. } => {
