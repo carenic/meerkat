@@ -300,6 +300,20 @@ pub(super) struct MobActor {
     pub(super) phase_watch_tx: tokio::sync::watch::Sender<MobState>,
     pub(super) default_external_tools_provider: Option<crate::ExternalToolsProvider>,
     pub(super) realm_profile_store: Option<Arc<dyn crate::store::RealmProfileStore>>,
+    /// Typed composition binding for the `meerkat_mob_seam` composition
+    /// (wave-c C-6p). Every routed effect emitted by the mob DSL travels
+    /// through `CompositionDispatcher::dispatch` via this binding rather
+    /// than through direct peer / provisioner calls. Construction uses
+    /// `CompositionBinding::Standalone` by default (test / ephemeral
+    /// path); production surface assembly swaps in
+    /// `CompositionBinding::Wired(Arc<dyn CompositionDispatcher<...>>)`.
+    pub(super) composition_binding: super::composition::MobCompositionBinding,
+    /// Routed seam-effects queued by sync `apply_dsl_input` /
+    /// `apply_dsl_signal` calls. Drained by `flush_routed_effects` at
+    /// every command-loop boundary and after each command handler; the
+    /// first dispatch failure surfaces as a typed `MobError`, no silent
+    /// drops.
+    pub(super) pending_routed_effects: Vec<super::composition::MobSeamEffect>,
 }
 
 impl MobActor {
@@ -697,6 +711,7 @@ impl MobActor {
     ) -> Result<(), MobError> {
         let transition = mob_dsl::MobMachineMutator::apply(&mut self.dsl_authority, input)
             .map_err(|e| MobError::Internal(format!("DSL authority ({context}): {e}")))?;
+        self.queue_routed_effects_from(&transition.effects);
         if transition.from_phase != transition.to_phase {
             self.dsl_authority.state.lifecycle_phase = transition.to_phase;
             // Publish the projected phase for external observers. This is
@@ -715,9 +730,58 @@ impl MobActor {
             .dsl_authority
             .apply_signal(signal)
             .map_err(|e| MobError::Internal(format!("DSL authority ({context}): {e}")))?;
+        self.queue_routed_effects_from(&transition.effects);
         if transition.from_phase != transition.to_phase {
             self.dsl_authority.state.lifecycle_phase = transition.to_phase;
             let _ = self.phase_watch_tx.send(self.state());
+        }
+        Ok(())
+    }
+
+    /// Wave-c C-6p — harvest routed seam effects from a DSL transition's
+    /// effect list into the actor's pending-dispatch queue.
+    ///
+    /// Non-routed variants (persist-kickoff, emit-lifecycle-notice,
+    /// topology-signal, etc.) stay on the in-process effect-drain path
+    /// reached from the individual command handlers and never enter the
+    /// composition dispatcher. Routed variants flow through
+    /// `flush_routed_effects` at the next async boundary.
+    fn queue_routed_effects_from(&mut self, effects: &[mob_dsl::MobMachineEffect]) {
+        for effect in effects {
+            if let Some(seam_effect) = super::composition::lift_routed_effect(effect) {
+                self.pending_routed_effects.push(seam_effect);
+            }
+        }
+    }
+
+    /// Drain the pending-routed-effect queue, dispatching each payload
+    /// through the typed [`CompositionBinding`]. Returns the first typed
+    /// [`MobError`] a dispatch yields; subsequent effects remain queued
+    /// so the next flush sees them (FIFO).
+    ///
+    /// In [`CompositionBinding::Standalone`] mode (single-machine / test
+    /// construction) this drains the queue without attempting any
+    /// dispatch — the producer has no consumer-side surface to target by
+    /// construction. In [`CompositionBinding::Wired`] mode,
+    /// [`DispatchRefusal::UnwiredConsumer`] surfaces as
+    /// [`MobError::WiringError`] per the wave-c spine's intermediate-state
+    /// contract (C-6p landed, C-6c pending).
+    pub(super) async fn flush_routed_effects(&mut self) -> Result<(), MobError> {
+        use super::composition::dispatch_routed_effect;
+        while let Some(effect) = self.pending_routed_effects.first().cloned() {
+            match dispatch_routed_effect(&self.composition_binding, effect).await {
+                Ok(_outcome) => {
+                    // Drop the head now that dispatch succeeded (or was a
+                    // standalone no-op); keep subsequent queue entries
+                    // intact so a later failure preserves FIFO ordering.
+                    self.pending_routed_effects.remove(0);
+                }
+                Err(error) => {
+                    // Preserve the head + tail on failure so the operator
+                    // can inspect them; caller decides to retry or abort.
+                    return Err(error);
+                }
+            }
         }
         Ok(())
     }
@@ -939,6 +1003,14 @@ impl MobActor {
             Err(_) => return Ok(false),
         };
 
+        // Wave-c C-6p — harvest routed seam effects from this transition
+        // into the pending-dispatch queue. Non-routed kickoff-specific
+        // variants continue to be handled in the per-effect match below;
+        // routed variants (`Request*`) are NOT silently dropped by the
+        // prior `_ => {}` arm — they're lifted through
+        // `lift_routed_effect` and await `flush_routed_effects`.
+        self.queue_routed_effects_from(&transition.effects);
+
         for effect in transition.effects {
             match effect {
                 mob_dsl::MobMachineEffect::PersistKickoffUpdate {
@@ -975,6 +1047,13 @@ impl MobActor {
                         );
                     }
                 }
+                // Routed seam effects (`Request*`) were harvested above
+                // into `pending_routed_effects`; drain happens at the
+                // next async boundary via `flush_routed_effects`.
+                mob_dsl::MobMachineEffect::RequestRuntimeBinding { .. }
+                | mob_dsl::MobMachineEffect::RequestRuntimeIngress { .. }
+                | mob_dsl::MobMachineEffect::RequestRuntimeRetire
+                | mob_dsl::MobMachineEffect::RequestRuntimeDestroy => {}
                 _ => {}
             }
         }
@@ -2632,6 +2711,27 @@ impl MobActor {
                     let _ = reply_tx.send(result);
                     break;
                 }
+            }
+
+            // Wave-c C-6p — drain routed-effect queue at every loop
+            // boundary. `apply_dsl_input` / `apply_dsl_signal` populated
+            // the queue synchronously inside the command handler; this
+            // is the async site where `CompositionDispatcher::dispatch`
+            // runs. A typed dispatch failure — most notably
+            // `DispatchRefusal::UnwiredConsumer` while C-6c (consumer
+            // surface on `MeerkatMachine`) is outstanding — is logged
+            // loud and the actor task terminates rather than silently
+            // dropping the effect. Once the spine lands C-6c, the
+            // dispatcher resolves cleanly and this path becomes
+            // everyday.
+            if let Err(error) = self.flush_routed_effects().await {
+                tracing::error!(
+                    mob_id = %self.definition.id,
+                    error = %error,
+                    queued_remaining = self.pending_routed_effects.len(),
+                    "composition dispatch failed; terminating mob actor task"
+                );
+                return;
             }
         }
     }
@@ -4654,7 +4754,6 @@ impl MobActor {
             .await
             .remove(&ctx.agent_identity);
     }
-
 
     async fn handle_complete(&mut self) -> Result<(), MobError> {
         self.ensure_pending_spawn_alignment("handle_complete preflight")?;

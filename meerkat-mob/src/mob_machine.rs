@@ -41,19 +41,24 @@ pub(crate) enum MobMachineCommand {
         spec: Box<crate::runtime::SpawnMemberSpec>,
         owner_context: Option<crate::runtime::CanonicalOpsOwnerContext>,
     },
-    /// Declarative spawn-if-absent. T4a seam; T5d wires the actor handler.
-    #[allow(dead_code)]
+    /// Declarative spawn-if-absent. Constructed by
+    /// `MobHandle::ensure_member` (runtime/handle.rs:2291) and matched in
+    /// `MobHandle::execute_machine_command` (runtime/handle.rs:864);
+    /// surfaced on the RPC `mob.ensure_member` verb
+    /// (meerkat-rpc/src/handlers/mob.rs:1707).
     EnsureMember {
         spec: Box<crate::runtime::SpawnMemberSpec>,
     },
-    /// Declarative drive-toward-desired roster. T4a seam; T5d wires the actor handler.
-    #[allow(dead_code)]
+    /// Declarative drive-toward-desired roster. Constructed by
+    /// `MobHandle::reconcile` (runtime/handle.rs:2317) and matched at
+    /// runtime/handle.rs:868.
     Reconcile {
         desired: Vec<crate::runtime::SpawnMemberSpec>,
         options: crate::runtime::ReconcileOptions,
     },
-    /// Filtered roster listing. T4a seam; T5d wires the actor handler.
-    #[allow(dead_code)]
+    /// Filtered roster listing. Constructed by
+    /// `MobHandle::list_members_matching` (runtime/handle.rs:2336) and
+    /// matched at runtime/handle.rs:872.
     ListMembersMatching {
         filter: Box<crate::runtime::MemberFilter>,
     },

@@ -69,6 +69,7 @@ pub mod bridge;
 mod bridge_fallback;
 pub mod bridge_protocol;
 mod builder;
+pub mod composition;
 pub mod conditions;
 mod disposal;
 mod edge_locks;

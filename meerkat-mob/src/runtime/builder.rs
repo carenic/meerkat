@@ -1176,7 +1176,6 @@ impl MobBuilder {
                         .await?,
                 );
             }
-
         }
         // Notify orchestrator that the mob resumed.
         if notify_orchestrator_on_resume
@@ -1460,6 +1459,16 @@ impl MobBuilder {
             phase_watch_tx: phase_watch_tx_actor,
             default_external_tools_provider,
             realm_profile_store,
+            // Wave-c C-6p — default to the standalone composition
+            // binding. Production assembly paths (builder configuration
+            // methods that opt into composition dispatch) swap this for
+            // `CompositionBinding::Wired(...)` once the consumer surface
+            // on `MeerkatMachine` is live (C-6c). Standalone is the
+            // correct default for tests / single-machine runs; routed
+            // effects still drain through the queue but have no
+            // consumer to dispatch to by construction.
+            composition_binding: meerkat_runtime::composition::CompositionBinding::Standalone,
+            pending_routed_effects: Vec::new(),
         };
         tokio::spawn(actor.run(command_rx));
 
