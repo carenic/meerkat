@@ -78,15 +78,6 @@ async fn resolve_realm(
     })
 }
 
-fn default_oauth_binding(mode: PersistedAuthMode) -> &'static str {
-    match mode {
-        PersistedAuthMode::ClaudeAiOauth => "anthropic_oauth",
-        PersistedAuthMode::ChatgptOauth => "openai_oauth",
-        PersistedAuthMode::GoogleOauth => "google_oauth",
-        _ => "oauth_profile",
-    }
-}
-
 async fn resolve_binding_identity(
     runtime: &SessionRuntime,
     realm_id: &str,
@@ -459,14 +450,9 @@ struct LoginCompleteParams {
     code: String,
     pkce_verifier: String,
     redirect_uri: String,
-    #[serde(default = "default_realm")]
     realm_id: String,
     #[serde(default)]
     binding_id: Option<String>,
-}
-
-fn default_realm() -> String {
-    "dev".into()
 }
 
 pub async fn handle_auth_login_complete(
@@ -485,9 +471,7 @@ pub async fn handle_auth_login_complete(
                 return RpcResponse::error(id, error::INVALID_PARAMS, msg);
             }
         };
-    let binding_id = parsed
-        .binding_id
-        .unwrap_or_else(|| default_oauth_binding(mode).to_string());
+    let binding_id = parsed.binding_id;
     let (connection_ref, binding, auth_profile) =
         match resolve_binding_identity(runtime, &parsed.realm_id, &binding_id).await {
             Ok(v) => v,
@@ -641,14 +625,9 @@ pub async fn handle_auth_login_device_start(
 struct DeviceCompleteParams {
     provider: String,
     device_code: String,
-    #[serde(default = "default_dev_realm")]
     realm_id: String,
     #[serde(default)]
     binding_id: Option<String>,
-}
-
-fn default_dev_realm() -> String {
-    "dev".into()
 }
 
 /// Plan §1.5r.9 device-flow completion leg. Single-poll semantics — the
@@ -682,9 +661,7 @@ pub async fn handle_auth_login_device_complete(
             ),
         );
     }
-    let binding_id = parsed
-        .binding_id
-        .unwrap_or_else(|| default_oauth_binding(mode).to_string());
+    let binding_id = parsed.binding_id;
     let (connection_ref, binding, auth_profile) =
         match resolve_binding_identity(runtime, &parsed.realm_id, &binding_id).await {
             Ok(v) => v,
@@ -791,10 +768,7 @@ pub async fn handle_auth_login_device_complete(
 struct ProvisionApiKeyParams {
     /// Access token acquired from a prior Console-OAuth flow.
     access_token: String,
-    #[serde(default = "default_dev_realm")]
     realm_id: String,
-    /// Defaults to `anthropic_oauth_to_api_key` so the resolver's
-    /// `OauthToApiKey` path can find the persisted api_key.
     #[serde(default)]
     binding_id: Option<String>,
 }
@@ -818,9 +792,7 @@ pub async fn handle_auth_login_provision_api_key(
         Ok(v) => v,
         Err(r) => return r.with_id(id),
     };
-    let binding_id = parsed
-        .binding_id
-        .unwrap_or_else(|| "anthropic_oauth_to_api_key".to_string());
+    let binding_id = parsed.binding_id;
     let store = match require_token_store(runtime, id.clone()) {
         Ok(s) => s,
         Err(r) => return r,
@@ -843,7 +815,6 @@ pub async fn handle_auth_login_provision_api_key(
                     "realm_id": &parsed.realm_id,
                     "binding_id": &binding_id,
                 },
-                "profile_id": "anthropic_oauth_to_api_key",
                 "provider": "anthropic",
                 "auth_mode": "oauth_to_api_key",
                 "has_api_key": tokens.primary_secret.is_some(),
