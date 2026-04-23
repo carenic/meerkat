@@ -711,6 +711,20 @@ fn parse_postfix_expr(input: ParseStream) -> Result<ExprDef> {
                     key: Box::new(key),
                 };
             }
+            "get_cloned" => {
+                // Map lookup returning `Option<V>` via `.get(&k).cloned()`.
+                // Required when the guard compares a map value against
+                // a typed non-`Copy` variant wrapped in `Some(...)`:
+                // `MapGet` returns `Option<&V>` which does not satisfy
+                // `PartialEq<Option<V>>`. `V: Clone` must hold.
+                let paren;
+                syn::parenthesized!(paren in input);
+                let key = parse_expr(&paren)?;
+                expr = ExprDef::MapGetCloned {
+                    map: Box::new(expr),
+                    key: Box::new(key),
+                };
+            }
             _ => {
                 return Err(syn::Error::new(
                     method.span(),

@@ -184,6 +184,7 @@ pub(crate) fn project_state(
         direct_peer_endpoints: std::collections::BTreeSet::new(),
         mob_overlay_peer_endpoints: std::collections::BTreeSet::new(),
         peer_projection_epoch: 0,
+        mob_overlay_epoch: 0,
     }
 }
 

@@ -284,6 +284,14 @@ pub enum ExprDef {
         map: Box<ExprDef>,
         key: Box<ExprDef>,
     },
+    /// Map lookup returning `Option<V>` via `.get(&k).cloned()`. Required
+    /// when the guard compares a map value against a typed non-`Copy`
+    /// value wrapped in `Some(...)` (e.g. `Option<SessionId>` where
+    /// `SessionId` wraps `String`). `V: Clone` must hold.
+    MapGetCloned {
+        map: Box<ExprDef>,
+        key: Box<ExprDef>,
+    },
     MapKeys(Box<ExprDef>),
 
     // Quantifiers

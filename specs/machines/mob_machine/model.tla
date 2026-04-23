@@ -326,6 +326,7 @@ RotateMemberSessionRunning(agent_identity, old_session_id, new_session_id) ==
     /\ phase = "Running"
     /\ ((agent_identity \in DOMAIN identity_to_runtime) = TRUE)
     /\ ((agent_identity \in DOMAIN member_session_bindings) = TRUE)
+    /\ ((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None") = Some(old_session_id))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ member_session_bindings' = MapSet(member_session_bindings, agent_identity, new_session_id)
@@ -336,6 +337,7 @@ RotateMemberSessionRunning(agent_identity, old_session_id, new_session_id) ==
 ReleaseMemberSessionRunning(agent_identity, session_id) ==
     /\ phase = "Running"
     /\ ((agent_identity \in DOMAIN member_session_bindings) = TRUE)
+    /\ ((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None") = Some(session_id))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ member_session_bindings' = MapRemove(member_session_bindings, agent_identity)

@@ -34,7 +34,12 @@
 //! - Driver errors are typed through [`DriverError`] and surfaced up to
 //!   the caller unchanged — the dispatcher does not swallow failures.
 
-use std::collections::{HashMap, HashSet};
+// `BTreeMap` rather than `HashMap` — iteration order must be
+// deterministic so driver dispatch is reproducible. HashMap's
+// randomised iteration caused non-determinism flags in
+// state-machine frameworks; the BTreeMap choice is intentional
+// (PR #340 review item #7).
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use meerkat_machine_schema::{
@@ -141,7 +146,7 @@ pub struct RegisteredDriver {
     descriptor: CompositionDriver,
     driver: Arc<dyn CompositionDriverTrait>,
     watched_index: HashSet<(String, String)>,
-    dispatch_index: HashMap<String, DriverDispatchRoute>,
+    dispatch_index: BTreeMap<String, DriverDispatchRoute>,
 }
 
 impl RegisteredDriver {
@@ -203,7 +208,7 @@ pub enum DispatcherError {
 /// [`DispatcherError::Driver`].
 #[derive(Debug, Default)]
 pub struct CompositionDispatcher {
-    drivers: HashMap<String, RegisteredDriver>,
+    drivers: BTreeMap<String, RegisteredDriver>,
 }
 
 /// One complete dispatch — the target route plus the input payload.
@@ -264,7 +269,7 @@ impl CompositionDispatcher {
                 watched.effect_variant.clone(),
             ));
         }
-        let mut dispatch_index = HashMap::new();
+        let mut dispatch_index = BTreeMap::new();
         for dispatch in &descriptor.dispatch_routes {
             dispatch_index.insert(dispatch.name.clone(), dispatch.clone());
         }

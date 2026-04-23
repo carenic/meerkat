@@ -151,17 +151,32 @@ machine! {
             // consumes `CommsTrustReconcileRequested` and reads the
             // snapshot to compute the effective set on receipt.
             //
-            // `peer_projection_epoch` advances on every Track-B
-            // peer-projection mutation (direct add/remove + overlay
-            // apply). The overlay-apply transition sets the epoch to
-            // the epoch value the driver supplies; this threads
-            // `MobMachine.topology_epoch` through to the projection
-            // layer so stale overlays can be rejected by the
-            // `stale_overlay_epoch` guard.
+            // Two independent epoch namespaces:
+            //
+            // * `peer_projection_epoch` advances on every Track-B
+            //   peer-projection mutation (direct add/remove + overlay
+            //   apply). Carried in `PeerProjectionChanged` /
+            //   `CommsTrustReconcileRequested` so the comms
+            //   reconciliation handler can linearize trust-store
+            //   reconciles.
+            //
+            // * `mob_overlay_epoch` is the overlay-specific watermark
+            //   the `stale_overlay_epoch` guard reads. The
+            //   `RecomputeMobPeerOverlay` driver supplies the overlay
+            //   epoch; it threads the driver's monotonically
+            //   increasing per-overlay counter (the driver in turn
+            //   threads `MobMachine.topology_epoch` through that
+            //   counter). Keeping this namespace separate from
+            //   `peer_projection_epoch` prevents direct-endpoint
+            //   mutations (which legitimately bump
+            //   `peer_projection_epoch`) from accidentally racing
+            //   ahead of the overlay guard and locking out future
+            //   overlay dispatches.
             local_endpoint: Option<PeerEndpoint>,
             direct_peer_endpoints: Set<PeerEndpoint>,
             mob_overlay_peer_endpoints: Set<PeerEndpoint>,
             peer_projection_epoch: u64,
+            mob_overlay_epoch: u64,
         }
 
         init(Initializing) {
@@ -201,6 +216,7 @@ machine! {
             direct_peer_endpoints = EmptySet,
             mob_overlay_peer_endpoints = EmptySet,
             peer_projection_epoch = 0,
+            mob_overlay_epoch = 0,
         }
 
         terminal [Destroyed]
@@ -2679,15 +2695,26 @@ machine! {
             emit CommsTrustReconcileRequested { peer_projection_epoch: self.peer_projection_epoch }
         }
 
-        // ApplyMobPeerOverlay — stale-epoch guard, wholesale overlay
-        // replacement, `peer_projection_epoch = epoch`.
+        // ApplyMobPeerOverlay — stale-epoch guard on the overlay-
+        // specific `mob_overlay_epoch`, wholesale overlay replacement.
+        // The guard uses `>` (strictly-newer) rather than `>=` so
+        // repeat application of the same epoch is rejected (the
+        // driver's epoch counter already suppresses no-op dispatches;
+        // any re-delivery at the same epoch is a retry-bug on the
+        // transport layer, not a legitimate state change).
+        //
+        // Both epochs bump on a successful apply: `mob_overlay_epoch`
+        // tracks overlay-specific freshness (used by the guard),
+        // `peer_projection_epoch` tracks general effective-set changes
+        // (carried in `CommsTrustReconcileRequested`).
         transition ApplyMobPeerOverlay {
             per_phase [Idle, Attached, Running]
             on input ApplyMobPeerOverlay { epoch, endpoints }
-            guard "stale_overlay_epoch" { epoch >= self.peer_projection_epoch }
+            guard "stale_overlay_epoch" { epoch > self.mob_overlay_epoch }
             update {
                 self.mob_overlay_peer_endpoints = endpoints;
-                self.peer_projection_epoch = epoch;
+                self.mob_overlay_epoch = epoch;
+                self.peer_projection_epoch += 1;
             }
             to Idle
             emit PeerProjectionChanged { peer_projection_epoch: self.peer_projection_epoch }

@@ -351,7 +351,11 @@ fn apply_mob_peer_overlay_replaces_overlay_set_and_bumps_epoch() {
         state.mob_overlay_peer_endpoints.contains(&ep_b),
         "ep_b must be present in overlay",
     );
+    // `peer_projection_epoch` bumps by 1 per overlay apply (general
+    // freshness counter); `mob_overlay_epoch` matches the supplied
+    // driver epoch (overlay-specific watermark).
     assert_eq!(state.peer_projection_epoch, 2);
+    assert_eq!(state.mob_overlay_epoch, 2);
 }
 
 #[test]
@@ -368,20 +372,37 @@ fn apply_mob_peer_overlay_rejects_stale_epoch() {
         "test::overlay_5",
     )
     .expect("overlay accepted");
-    assert_eq!(dsl.snapshot_state().peer_projection_epoch, 5);
+    assert_eq!(dsl.snapshot_state().mob_overlay_epoch, 5);
 
-    let result = dsl.apply_input(
+    // Strictly-less epoch must be rejected.
+    let stale = dsl.apply_input(
         mm_dsl::MeerkatMachineInput::ApplyMobPeerOverlay {
             epoch: 4,
-            endpoints,
+            endpoints: endpoints.clone(),
         },
         "test::overlay_stale",
     );
     assert!(
-        result.is_err(),
+        stale.is_err(),
         "stale overlay epoch (4 < 5) must be rejected by the stale-epoch guard",
     );
-    assert_eq!(dsl.snapshot_state().peer_projection_epoch, 5);
+
+    // Equal epoch is also rejected (strictly-greater guard). The
+    // driver's monotonic counter suppresses no-op dispatches, so any
+    // re-delivery at the same epoch is a retry-bug on the transport
+    // layer and surfaces as an error.
+    let equal = dsl.apply_input(
+        mm_dsl::MeerkatMachineInput::ApplyMobPeerOverlay {
+            epoch: 5,
+            endpoints,
+        },
+        "test::overlay_equal_epoch",
+    );
+    assert!(
+        equal.is_err(),
+        "equal overlay epoch must be rejected by the strictly-greater-epoch guard",
+    );
+    assert_eq!(dsl.snapshot_state().mob_overlay_epoch, 5);
 }
 
 #[test]
@@ -440,6 +461,11 @@ fn apply_mob_peer_overlay_empty_set_clears_overlay_but_preserves_direct() {
 
 #[test]
 fn peer_projection_epoch_advances_monotonically_across_mixed_inputs() {
+    // Post-review-fix: `peer_projection_epoch` and `mob_overlay_epoch`
+    // live in separate namespaces. `peer_projection_epoch` bumps by 1
+    // on every Track-B mutation; `mob_overlay_epoch` bumps only on
+    // successful overlay apply and takes the supplied driver epoch
+    // verbatim.
     let dsl = new_authority();
     let ep_a = endpoint("peer-a", "ed25519:a", "inproc://a");
     let ep_b = endpoint("peer-b", "ed25519:b", "inproc://b");
@@ -452,6 +478,11 @@ fn peer_projection_epoch_advances_monotonically_across_mixed_inputs() {
     )
     .expect("add a");
     assert_eq!(dsl.snapshot_state().peer_projection_epoch, 1);
+    assert_eq!(
+        dsl.snapshot_state().mob_overlay_epoch,
+        0,
+        "direct-endpoint mutation must NOT advance mob_overlay_epoch",
+    );
 
     let mut overlay = std::collections::BTreeSet::new();
     overlay.insert(ep_b);
@@ -463,10 +494,17 @@ fn peer_projection_epoch_advances_monotonically_across_mixed_inputs() {
         "test::overlay",
     )
     .expect("overlay");
-    assert_eq!(dsl.snapshot_state().peer_projection_epoch, 10);
+    assert_eq!(
+        dsl.snapshot_state().peer_projection_epoch,
+        2,
+        "overlay apply bumps peer_projection_epoch by 1",
+    );
+    assert_eq!(
+        dsl.snapshot_state().mob_overlay_epoch,
+        10,
+        "overlay apply takes the supplied driver epoch verbatim",
+    );
 
-    // Add-after-overlay: epoch must advance above the overlay-assigned
-    // 10, not reset to 11 from count.
     dsl.apply_input(
         mm_dsl::MeerkatMachineInput::RemoveDirectPeerEndpoint { endpoint: ep_a },
         "test::remove_a",
@@ -474,8 +512,13 @@ fn peer_projection_epoch_advances_monotonically_across_mixed_inputs() {
     .expect("remove a");
     assert_eq!(
         dsl.snapshot_state().peer_projection_epoch,
-        11,
-        "non-overlay transitions bump by 1; the counter threads through the overlay-assigned value",
+        3,
+        "direct-endpoint mutations bump peer_projection_epoch by 1",
+    );
+    assert_eq!(
+        dsl.snapshot_state().mob_overlay_epoch,
+        10,
+        "direct-endpoint mutations MUST NOT regress the overlay epoch",
     );
 }
 

@@ -2035,10 +2035,17 @@ machine! {
             // `direct_peer_endpoints ∪ mob_overlay_peer_endpoints` by
             // the comms reconciliation handler (Commit 4) on receipt
             // of `CommsTrustReconcileRequested`.
+            //
+            // `peer_projection_epoch` carries general effective-set
+            // change freshness; `mob_overlay_epoch` is the overlay-
+            // specific watermark the `stale_overlay_epoch` guard uses
+            // so direct-endpoint mutations cannot lock out overlay
+            // dispatches.
             local_endpoint: Option<PeerEndpoint>,
             direct_peer_endpoints: Set<PeerEndpoint>,
             mob_overlay_peer_endpoints: Set<PeerEndpoint>,
             peer_projection_epoch: u64,
+            mob_overlay_epoch: u64,
         }
 
         init(Initializing) {
@@ -2150,6 +2157,7 @@ machine! {
             direct_peer_endpoints = EmptySet,
             mob_overlay_peer_endpoints = EmptySet,
             peer_projection_epoch = 0,
+            mob_overlay_epoch = 0,
         }
 
         terminal [Destroyed]
@@ -6351,10 +6359,11 @@ machine! {
         transition ApplyMobPeerOverlay {
             per_phase [Idle, Attached, Running]
             on input ApplyMobPeerOverlay { epoch, endpoints }
-            guard "stale_overlay_epoch" { epoch >= self.peer_projection_epoch }
+            guard "stale_overlay_epoch" { epoch > self.mob_overlay_epoch }
             update {
                 self.mob_overlay_peer_endpoints = endpoints;
-                self.peer_projection_epoch = epoch;
+                self.mob_overlay_epoch = epoch;
+                self.peer_projection_epoch += 1;
             }
             to Idle
             emit PeerProjectionChanged { peer_projection_epoch: self.peer_projection_epoch }

@@ -680,6 +680,72 @@ fn rotate_member_session_rejects_when_no_prior_binding() {
 }
 
 #[test]
+fn rotate_member_session_rejects_wrong_old_session_id_witness() {
+    // PR #340 review item #5: a caller that supplies the wrong
+    // `old_session_id` must be rejected by the
+    // `old_session_id_matches_current` guard.
+    let mut authority = MobMachineAuthority::new();
+    spawn_then_release(&mut authority, "alpha", 1, "spawn-sid");
+    MobMachineMutator::apply(
+        &mut authority,
+        bind_session_input("alpha", "session-actual"),
+    )
+    .expect("initial bind accepted");
+    let epoch_before_rotate = authority.state.topology_epoch;
+
+    // Caller claims the current binding is "session-stale" but the
+    // actual binding is "session-actual" — rotation must be rejected.
+    let result = MobMachineMutator::apply(
+        &mut authority,
+        rotate_session_input("alpha", "session-stale", "session-new"),
+    );
+    assert!(
+        result.is_err(),
+        "RotateMemberSession with a wrong old_session_id must be rejected",
+    );
+    assert_eq!(authority.state.topology_epoch, epoch_before_rotate);
+    assert_eq!(
+        authority
+            .state
+            .member_session_bindings
+            .get(&identity("alpha")),
+        Some(&session_id("session-actual")),
+        "binding must remain untouched after rejected forgery attempt",
+    );
+}
+
+#[test]
+fn release_member_session_rejects_wrong_session_id_witness() {
+    // PR #340 review item #5: `ReleaseMemberSession` also verifies
+    // the caller's session_id witness matches the current binding.
+    let mut authority = MobMachineAuthority::new();
+    spawn_then_release(&mut authority, "alpha", 1, "spawn-sid");
+    MobMachineMutator::apply(
+        &mut authority,
+        bind_session_input("alpha", "session-actual"),
+    )
+    .expect("initial bind accepted");
+    let epoch_before_release = authority.state.topology_epoch;
+
+    let result = MobMachineMutator::apply(
+        &mut authority,
+        release_session_input("alpha", "session-stale"),
+    );
+    assert!(
+        result.is_err(),
+        "ReleaseMemberSession with a wrong session_id must be rejected",
+    );
+    assert_eq!(authority.state.topology_epoch, epoch_before_release);
+    assert!(
+        authority
+            .state
+            .member_session_bindings
+            .contains_key(&identity("alpha")),
+        "binding must remain present after rejected forgery attempt",
+    );
+}
+
+#[test]
 fn release_member_session_removes_binding_and_emits_both_released_and_changed_effects() {
     let mut authority = MobMachineAuthority::new();
     spawn_then_release(&mut authority, "alpha", 1, "spawn-sid");

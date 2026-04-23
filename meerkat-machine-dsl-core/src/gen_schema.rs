@@ -361,6 +361,13 @@ fn gen_schema_expr(expr: &ExprDef) -> TokenStream {
             let key_e = gen_schema_expr(key);
             quote! { Expr::MapGet { map: Box::new(#map_e), key: Box::new(#key_e) } }
         }
+        ExprDef::MapGetCloned { map, key } => {
+            // Same schema-side shape as `MapGet` / `MapGetCopied`. The
+            // `.cloned()` difference is a Rust codegen detail only.
+            let map_e = gen_schema_expr(map);
+            let key_e = gen_schema_expr(key);
+            quote! { Expr::MapGet { map: Box::new(#map_e), key: Box::new(#key_e) } }
+        }
         ExprDef::MapKeys(inner) => {
             let inner_e = gen_schema_expr(inner);
             quote! { Expr::MapKeys(Box::new(#inner_e)) }
@@ -898,6 +905,10 @@ fn references_phase_field(expr: &ExprDef, phase_field_name: &str) -> bool {
             key: value,
         }
         | ExprDef::MapGetCopied {
+            map: collection,
+            key: value,
+        }
+        | ExprDef::MapGetCloned {
             map: collection,
             key: value,
         } => {

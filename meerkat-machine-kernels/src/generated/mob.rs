@@ -1736,6 +1736,11 @@ mod source {
                 guard { self.lifecycle_phase == Phase::Running }
                 guard "identity_has_runtime" { self.identity_to_runtime.contains_key(agent_identity) == true }
                 guard "prior_session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
+                // PR #340 review item #5: verify the caller's witness of
+                // the prior session matches the current binding.
+                guard "old_session_id_matches_current" {
+                    self.member_session_bindings.get_cloned(agent_identity) == Some(old_session_id)
+                }
                 update {
                     self.member_session_bindings.insert(agent_identity, new_session_id);
                     self.topology_epoch += 1;
@@ -1749,6 +1754,11 @@ mod source {
                 on input ReleaseMemberSession { agent_identity, session_id }
                 guard { self.lifecycle_phase == Phase::Running }
                 guard "prior_session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
+                // PR #340 review item #5: verify the caller's witness of
+                // the session being released matches the current binding.
+                guard "session_id_matches_current" {
+                    self.member_session_bindings.get_cloned(agent_identity) == Some(session_id)
+                }
                 update {
                     self.member_session_bindings.remove(agent_identity);
                     self.topology_epoch += 1;

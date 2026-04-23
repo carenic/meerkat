@@ -41,6 +41,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `direct_peer_endpoints`: `Set<PeerEndpoint>`
 - `mob_overlay_peer_endpoints`: `Set<PeerEndpoint>`
 - `peer_projection_epoch`: `u64`
+- `mob_overlay_epoch`: `u64`
 
 ## Inputs
 - `RegisterSession`(session_id: SessionId)

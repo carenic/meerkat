@@ -272,12 +272,18 @@ impl RecomputeMobPeerOverlayDriver {
             });
         }
 
-        // Garbage-collect empty overlays from the cache so the
-        // "previously bound" scan above terminates after the empty
-        // overlay is delivered once.
+        // Garbage-collect cache entries for sessions that are no
+        // longer bound to any member. We MUST keep empty-overlay
+        // entries for still-bound sessions so the next recompute
+        // sees `prior == current` and short-circuits — otherwise
+        // the driver would dispatch an empty overlay on every call
+        // for any session whose neighbors have no endpoints (an
+        // infinite loop). Only bindings leaving the `member_session`
+        // map cause legitimate GC.
+        let bound_sessions: BTreeSet<SessionId> = guard.member_session.values().cloned().collect();
         guard
             .last_overlay_for_session
-            .retain(|_, overlay| !overlay.is_empty());
+            .retain(|session_id, _| bound_sessions.contains(session_id));
 
         dispatches
     }
@@ -466,6 +472,54 @@ mod tests {
             epoch_after_first,
             "driver epoch must not advance when no overlays change",
         );
+    }
+
+    #[test]
+    fn empty_overlay_for_still_bound_session_does_not_loop_forever() {
+        // Regression for PR #340 review item #1: a bound session
+        // whose overlay is legitimately empty (e.g. all neighbors
+        // have released their bindings) must not re-dispatch the
+        // empty overlay on every `recompute_all` call. The GC must
+        // keep empty-overlay cache entries for still-bound sessions
+        // so the next recompute sees `prior == current` and
+        // short-circuits.
+        let driver = RecomputeMobPeerOverlayDriver::new();
+        // M1 is bound with an endpoint but has no wired neighbors —
+        // overlay is empty.
+        driver.observe_binding_change(identity("M1"), None, Some(sid("S1")));
+        driver.observe_local_endpoint(sid("S1"), Some(endpoint("E1")));
+        let first = driver.recompute_all();
+        assert_eq!(
+            first.len(),
+            1,
+            "first recompute emits the empty overlay once"
+        );
+        assert_eq!(
+            first[0].endpoints,
+            BTreeSet::new(),
+            "overlay must be empty (no neighbors)",
+        );
+
+        // Subsequent recomputes with no cache mutations must NOT
+        // emit anything — S1 is still bound, so its empty-overlay
+        // cache entry is preserved by the GC, and the idempotency
+        // check short-circuits.
+        let second = driver.recompute_all();
+        assert!(
+            second.is_empty(),
+            "still-bound session with unchanged empty overlay must not re-dispatch",
+        );
+        let third = driver.recompute_all();
+        assert!(
+            third.is_empty(),
+            "still-bound session with unchanged empty overlay must stay silent",
+        );
+
+        // Sanity: if the session leaves the binding map, GC removes
+        // its cache entry and a future re-bind delivers a fresh
+        // overlay.
+        driver.observe_binding_change(identity("M1"), Some(sid("S1")), None);
+        let _ = driver.recompute_all(); // emits final empty overlay for S1 and GCs.
     }
 
     #[test]

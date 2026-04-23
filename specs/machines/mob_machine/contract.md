@@ -337,6 +337,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `identity_has_runtime`
   - `prior_session_binding_present`
+  - `old_session_id_matches_current`
 - Emits: `MemberSessionBindingRotated`, `MemberSessionBindingChanged`
 - To: `Running`
 
@@ -345,6 +346,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `ReleaseMemberSession`(agent_identity, session_id)
 - Guards:
   - `prior_session_binding_present`
+  - `session_id_matches_current`
 - Emits: `MemberSessionBindingReleased`, `MemberSessionBindingChanged`
 - To: `Running`
 
