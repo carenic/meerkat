@@ -1268,14 +1268,6 @@ impl EphemeralRuntimeDriver {
             .or_else(|| self.queue.dequeue_by_id(input_id))
     }
 
-    /// Look up the persisted input for a given ID (from the ledger).
-    #[allow(dead_code)] // Used by runtime_loop boundary classification via authority
-    pub fn persisted_input(&self, input_id: &InputId) -> Option<&Input> {
-        self.ledger
-            .get(input_id)
-            .and_then(|state| state.persisted_input.as_ref())
-    }
-
     pub fn stage_input(
         &mut self,
         input_id: &InputId,
