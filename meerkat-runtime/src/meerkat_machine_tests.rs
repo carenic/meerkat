@@ -22,7 +22,7 @@ use meerkat_machine_kernels::test_oracle::{
     TransitionRefusal,
 };
 use meerkat_machine_schema::catalog::dsl::dsl_meerkat_machine as schema_meerkat_machine;
-use meerkat_machine_schema::{MachineSchema, TriggerKind, TypeRef};
+use meerkat_machine_schema::{MachineSchema, TypeRef};
 use serde::Serialize;
 use tokio::sync::Notify;
 
@@ -12672,7 +12672,8 @@ fn runtime_modeled_default_kernel_value(ty: &TypeRef) -> KernelValue {
         TypeRef::Named(_) => KernelValue::String(String::new()),
         TypeRef::Enum(name) => KernelValue::NamedVariant {
             enum_name: name.clone(),
-            variant: String::new(),
+            variant: meerkat_machine_schema::identity::EnumVariantId::parse("_")
+                .expect("valid placeholder slug"),
         },
         TypeRef::Option(_) => KernelValue::None,
         TypeRef::Set(_) => KernelValue::Set(BTreeSet::new()),
@@ -12715,7 +12716,13 @@ fn runtime_modeled_kernel_value_from_json(ty: &TypeRef, value: &serde_json::Valu
         }
         TypeRef::Enum(name) => KernelValue::NamedVariant {
             enum_name: name.clone(),
-            variant: value.as_str().unwrap_or_default().to_string(),
+            variant: meerkat_machine_schema::identity::EnumVariantId::parse(
+                value.as_str().unwrap_or("_"),
+            )
+            .unwrap_or_else(|_| {
+                meerkat_machine_schema::identity::EnumVariantId::parse("_")
+                    .expect("valid placeholder slug")
+            }),
         },
         TypeRef::Option(inner) => {
             if value.is_null() {
@@ -12775,7 +12782,9 @@ fn runtime_modeled_json_from_kernel_value(value: &KernelValue) -> serde_json::Va
         KernelValue::String(value) => {
             serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.clone()))
         }
-        KernelValue::NamedVariant { variant, .. } => serde_json::Value::String(variant.clone()),
+        KernelValue::NamedVariant { variant, .. } => {
+            serde_json::Value::String(variant.as_str().to_string())
+        }
         KernelValue::Seq(items) => serde_json::Value::Array(
             items
                 .iter()
@@ -12876,6 +12885,27 @@ fn runtime_modeled_input_id_value() -> KernelValue {
     KernelValue::String("\"<input-id>\"".to_string())
 }
 
+fn modeled_input_variant(slug: &str) -> meerkat_machine_schema::identity::InputVariantId {
+    meerkat_machine_schema::identity::InputVariantId::parse(slug).expect("input variant slug")
+}
+
+fn modeled_field_id(slug: &str) -> meerkat_machine_schema::identity::FieldId {
+    meerkat_machine_schema::identity::FieldId::parse(slug).expect("field slug")
+}
+
+fn modeled_kernel_input(
+    variant: &str,
+    fields: impl IntoIterator<Item = (&'static str, KernelValue)>,
+) -> KernelInput {
+    KernelInput {
+        variant: modeled_input_variant(variant),
+        fields: fields
+            .into_iter()
+            .map(|(name, value)| (modeled_field_id(name), value))
+            .collect(),
+    }
+}
+
 fn runtime_modeled_run_id_value() -> KernelValue {
     KernelValue::String("\"<run-id>\"".to_string())
 }
@@ -12888,7 +12918,7 @@ fn runtime_modeled_kernel_state(
     for field in &schema.state.fields {
         let value = before
             .formal_available_fields
-            .get(&field.name)
+            .get(field.name.as_str())
             .map(|raw| runtime_modeled_kernel_value_from_raw(&field.ty, raw))
             .unwrap_or_else(|| match field.name.as_str() {
                 "active_fence_token" => runtime_modeled_option_some(KernelValue::U64(0)),
@@ -12897,7 +12927,8 @@ fn runtime_modeled_kernel_state(
         fields.insert(field.name.clone(), value);
     }
     KernelState {
-        phase: before.phase.clone(),
+        phase: meerkat_machine_schema::identity::PhaseId::parse(before.phase.as_str())
+            .expect("phase slug"),
         fields,
     }
 }
@@ -12907,10 +12938,12 @@ fn runtime_modeled_kernel_input(
     before: &RuntimeParitySnapshotSummary,
     probe: RuntimeParityProbeInput,
 ) -> Result<KernelInput, String> {
-    let variant = runtime_parity_probe_variant_name(probe).to_string();
+    let variant_name = runtime_parity_probe_variant_name(probe).to_string();
     let input_variant = schema
         .inputs
-        .variant_named(&variant)
+        .variant_named(&variant_name)
+        .map_err(|err| err.to_string())?;
+    let variant = meerkat_machine_schema::identity::InputVariantId::parse(variant_name.as_str())
         .map_err(|err| err.to_string())?;
     let session_value = runtime_modeled_session_value(before);
     let runtime_value = runtime_modeled_runtime_value(before);
@@ -13066,9 +13099,11 @@ fn runtime_modeled_summary_from_kernel_state(
     state: &KernelState,
     runtime_reference: &RuntimeParitySnapshotSummary,
 ) -> Option<RuntimeModeledStateSummary> {
+    let session_id_field =
+        meerkat_machine_schema::identity::FieldId::parse("session_id").expect("session_id slug");
     if state
         .fields
-        .get("session_id")
+        .get(&session_id_field)
         .is_some_and(|value| matches!(value, KernelValue::None))
     {
         return None;
@@ -13081,7 +13116,7 @@ fn runtime_modeled_summary_from_kernel_state(
         .filter(|field| {
             runtime_reference
                 .formal_available_fields
-                .contains_key(&field.name)
+                .contains_key(field.name.as_str())
         })
         .map(|field| {
             let value = state
@@ -13089,12 +13124,12 @@ fn runtime_modeled_summary_from_kernel_state(
                 .get(&field.name)
                 .map(runtime_modeled_formal_string_from_kernel_value)
                 .unwrap_or_else(|| "null".to_string());
-            (field.name.clone(), value)
+            (field.name.as_str().to_string(), value)
         })
         .collect();
 
     Some(RuntimeModeledStateSummary {
-        phase: state.phase.clone(),
+        phase: state.phase.as_str().to_string(),
         formal_fields,
     })
 }
@@ -13182,41 +13217,41 @@ fn runtime_modeled_publish_input(
     active_visibility_revision: u64,
     staged_visibility_revision: u64,
 ) -> KernelInput {
-    KernelInput {
-        variant: "PublishCommittedVisibleSet".to_string(),
-        fields: BTreeMap::from([
+    modeled_kernel_input(
+        "PublishCommittedVisibleSet",
+        [
             (
-                "active_filter".to_string(),
+                "active_filter",
                 KernelValue::String(
                     serde_json::to_string(&meerkat_core::ToolFilter::All)
                         .unwrap_or_else(|_| "\"<tool-filter>\"".into()),
                 ),
             ),
             (
-                "staged_filter".to_string(),
+                "staged_filter",
                 KernelValue::String(
                     serde_json::to_string(&meerkat_core::ToolFilter::All)
                         .unwrap_or_else(|_| "\"<tool-filter>\"".into()),
                 ),
             ),
             (
-                "active_requested_deferred_names".to_string(),
+                "active_requested_deferred_names",
                 runtime_modeled_string_set(&[]),
             ),
             (
-                "staged_requested_deferred_names".to_string(),
+                "staged_requested_deferred_names",
                 runtime_modeled_string_set(&[]),
             ),
             (
-                "active_visibility_revision".to_string(),
+                "active_visibility_revision",
                 KernelValue::U64(active_visibility_revision),
             ),
             (
-                "staged_visibility_revision".to_string(),
+                "staged_visibility_revision",
                 KernelValue::U64(staged_visibility_revision),
             ),
-        ]),
-    }
+        ],
+    )
 }
 
 fn runtime_parity_witnesses() -> BTreeMap<String, meerkat_core::ToolVisibilityWitness> {
@@ -13365,19 +13400,16 @@ async fn modeled_meerkat_accept_with_completion_attached_steer_matches_runtime()
         .await
         .expect("attached steer test should capture an active run snapshot");
     let schema = modeled_meerkat_kernel::schema();
-    let input = KernelInput {
-        variant: "AcceptWithCompletion".to_string(),
-        fields: BTreeMap::from([
-            ("input_id".to_string(), runtime_modeled_input_id_value()),
-            (
-                "request_immediate_processing".to_string(),
-                KernelValue::Bool(true),
-            ),
-            ("interrupt_yielding".to_string(), KernelValue::Bool(false)),
-            ("wake_if_idle".to_string(), KernelValue::Bool(false)),
-            ("run_id".to_string(), runtime_modeled_run_id_value()),
-        ]),
-    };
+    let input = modeled_kernel_input(
+        "AcceptWithCompletion",
+        [
+            ("input_id", runtime_modeled_input_id_value()),
+            ("request_immediate_processing", KernelValue::Bool(true)),
+            ("interrupt_yielding", KernelValue::Bool(false)),
+            ("wake_if_idle", KernelValue::Bool(false)),
+            ("run_id", runtime_modeled_run_id_value()),
+        ],
+    );
     assert_modeled_meerkat_transition_matches_runtime_after(&schema, &before, &input, &after);
     assert_modeled_meerkat_post_admission_signal_matches_runtime(
         &schema,
@@ -13427,19 +13459,16 @@ async fn modeled_meerkat_accept_with_completion_idle_queue_signal_matches_runtim
         .await
         .expect("idle queue test should capture a post-state snapshot");
     let schema = modeled_meerkat_kernel::schema();
-    let input = KernelInput {
-        variant: "AcceptWithCompletion".to_string(),
-        fields: BTreeMap::from([
-            ("input_id".to_string(), runtime_modeled_input_id_value()),
-            (
-                "request_immediate_processing".to_string(),
-                KernelValue::Bool(false),
-            ),
-            ("interrupt_yielding".to_string(), KernelValue::Bool(false)),
-            ("wake_if_idle".to_string(), KernelValue::Bool(false)),
-            ("run_id".to_string(), runtime_modeled_run_id_value()),
-        ]),
-    };
+    let input = modeled_kernel_input(
+        "AcceptWithCompletion",
+        [
+            ("input_id", runtime_modeled_input_id_value()),
+            ("request_immediate_processing", KernelValue::Bool(false)),
+            ("interrupt_yielding", KernelValue::Bool(false)),
+            ("wake_if_idle", KernelValue::Bool(false)),
+            ("run_id", runtime_modeled_run_id_value()),
+        ],
+    );
     assert_modeled_meerkat_transition_matches_runtime_after(&schema, &before, &input, &after);
     assert_modeled_meerkat_post_admission_signal_matches_runtime(
         &schema,
@@ -13636,19 +13665,16 @@ async fn modeled_meerkat_accept_with_completion_running_steer_signal_matches_run
         .await
         .expect("running steer test should capture a post-state snapshot");
     let schema = modeled_meerkat_kernel::schema();
-    let input = KernelInput {
-        variant: "AcceptWithCompletion".to_string(),
-        fields: BTreeMap::from([
-            ("input_id".to_string(), runtime_modeled_input_id_value()),
-            (
-                "request_immediate_processing".to_string(),
-                KernelValue::Bool(true),
-            ),
-            ("interrupt_yielding".to_string(), KernelValue::Bool(false)),
-            ("wake_if_idle".to_string(), KernelValue::Bool(false)),
-            ("run_id".to_string(), runtime_modeled_run_id_value()),
-        ]),
-    };
+    let input = modeled_kernel_input(
+        "AcceptWithCompletion",
+        [
+            ("input_id", runtime_modeled_input_id_value()),
+            ("request_immediate_processing", KernelValue::Bool(true)),
+            ("interrupt_yielding", KernelValue::Bool(false)),
+            ("wake_if_idle", KernelValue::Bool(false)),
+            ("run_id", runtime_modeled_run_id_value()),
+        ],
+    );
     assert_modeled_meerkat_transition_matches_runtime_after(&schema, &before, &input, &after);
     assert_modeled_meerkat_post_admission_signal_matches_runtime(
         &schema,
@@ -13751,19 +13777,16 @@ async fn modeled_meerkat_accept_with_completion_running_interrupt_signal_matches
         .await
         .expect("running interrupt test should capture a post-state snapshot");
     let schema = modeled_meerkat_kernel::schema();
-    let input = KernelInput {
-        variant: "AcceptWithCompletion".to_string(),
-        fields: BTreeMap::from([
-            ("input_id".to_string(), runtime_modeled_input_id_value()),
-            (
-                "request_immediate_processing".to_string(),
-                KernelValue::Bool(false),
-            ),
-            ("interrupt_yielding".to_string(), KernelValue::Bool(true)),
-            ("wake_if_idle".to_string(), KernelValue::Bool(false)),
-            ("run_id".to_string(), runtime_modeled_run_id_value()),
-        ]),
-    };
+    let input = modeled_kernel_input(
+        "AcceptWithCompletion",
+        [
+            ("input_id", runtime_modeled_input_id_value()),
+            ("request_immediate_processing", KernelValue::Bool(false)),
+            ("interrupt_yielding", KernelValue::Bool(true)),
+            ("wake_if_idle", KernelValue::Bool(false)),
+            ("run_id", runtime_modeled_run_id_value()),
+        ],
+    );
     assert_modeled_meerkat_transition_matches_runtime_after(&schema, &before, &input, &after);
     assert_modeled_meerkat_post_admission_signal_matches_runtime(
         &schema,
@@ -14318,6 +14341,9 @@ fn summarize_runtime_parity_command_result(result: &MeerkatMachineCommandResult)
         MeerkatMachineCommandResult::RealtimeAttachmentStatus(status) => {
             format!("realtime_attachment_status:{status:?}")
         }
+        MeerkatMachineCommandResult::RealtimeChannelStatus(status) => {
+            format!("realtime_channel_status:{status:?}")
+        }
         MeerkatMachineCommandResult::Prepared(_) => "prepared".to_string(),
     }
 }
@@ -14461,7 +14487,7 @@ fn runtime_modeled_schema_report(
                     &outcome.next_state,
                     before,
                 ),
-                detail: outcome.transition,
+                detail: outcome.transition.to_string(),
                 result_summary,
             }
         }
@@ -14478,10 +14504,11 @@ fn runtime_modeled_schema_report(
 }
 
 fn runtime_modeled_post_admission_signal_from_effects(effects: &[KernelEffect]) -> String {
+    let signal_field = modeled_field_id("signal");
     effects
         .iter()
-        .find(|effect| effect.variant == "PostAdmissionSignal")
-        .and_then(|effect| effect.fields.get("signal"))
+        .find(|effect| effect.variant.as_str() == "PostAdmissionSignal")
+        .and_then(|effect| effect.fields.get(&signal_field))
         .and_then(|value| match value {
             KernelValue::NamedVariant { variant, .. } => Some(variant.as_str().to_string()),
             _ => None,
@@ -14532,15 +14559,15 @@ fn runtime_modeled_transition_refusal_detail(error: &TransitionRefusal) -> Strin
         TransitionRefusal::InvalidSignalPayload { reason, .. } => {
             format!("invalid_signal:{reason}")
         }
-        TransitionRefusal::NoMatchingTransition { phase, variant, .. } => {
-            format!("no_match:{phase}:{variant}")
+        TransitionRefusal::NoMatchingTransition { phase, trigger, .. } => {
+            format!("no_match:{phase}:{trigger}")
         }
         TransitionRefusal::AmbiguousTransition {
             phase,
-            variant,
+            trigger,
             transitions,
             ..
-        } => format!("ambiguous:{phase}:{variant}:{transitions:?}"),
+        } => format!("ambiguous:{phase}:{trigger}:{transitions:?}"),
         TransitionRefusal::EvaluationError {
             transition, reason, ..
         } => format!("evaluation:{transition}:{reason}"),
@@ -14673,14 +14700,21 @@ fn runtime_parity_schema_transition_summaries_for_phase_input(
         .transitions
         .iter()
         .filter(|transition| {
-            transition.on.kind == TriggerKind::Input
-                && transition.on.variant == input_variant
-                && transition.from.iter().any(|from| from == phase)
+            matches!(
+                &transition.on,
+                meerkat_machine_schema::TriggerMatch::Input { variant, .. }
+                    if variant.as_str() == input_variant
+            ) && transition.from.iter().any(|from| from.as_str() == phase)
         })
         .map(|transition| RuntimeParitySchemaTransitionSummary {
-            transition: transition.name.clone(),
-            to_phase: transition.to.clone(),
-            binding_names: transition.on.bindings.clone(),
+            transition: transition.name.to_string(),
+            to_phase: transition.to.to_string(),
+            binding_names: transition
+                .on
+                .bindings()
+                .iter()
+                .map(|b| b.as_str().to_string())
+                .collect(),
             guard_names: transition
                 .guards
                 .iter()
@@ -14695,7 +14729,7 @@ fn runtime_parity_schema_transition_summaries_for_phase_input(
             effect_variants: transition
                 .emit
                 .iter()
-                .map(|effect| effect.variant.clone())
+                .map(|effect| effect.variant.as_str().to_string())
                 .collect(),
         })
         .collect::<Vec<_>>();
@@ -14759,19 +14793,19 @@ fn runtime_parity_schema_rows_for_pair(
         let left = runtime_parity_schema_transition_summaries_for_phase_input(
             schema,
             left_phase.schema_name(),
-            &input_variant.name,
+            input_variant.name.as_str(),
         );
         let right = runtime_parity_schema_transition_summaries_for_phase_input(
             schema,
             right_phase.schema_name(),
-            &input_variant.name,
+            input_variant.name.as_str(),
         );
         if left.is_empty() && right.is_empty() {
             continue;
         }
 
         rows.push(RuntimeParitySchemaRow {
-            input_variant: input_variant.name.clone(),
+            input_variant: input_variant.name.as_str().to_string(),
             classification: classify_runtime_parity_schema_row(&left, &right),
             left,
             right,
@@ -14920,7 +14954,7 @@ async fn write_runtime_modeled_state_audit_report(path: PathBuf) -> RuntimeModel
     let surface_only_inputs = schema
         .surface_only_inputs
         .iter()
-        .map(String::as_str)
+        .map(|v| v.as_str())
         .collect::<BTreeSet<_>>();
     let mut rows = Vec::new();
 
@@ -14935,10 +14969,11 @@ async fn write_runtime_modeled_state_audit_report(path: PathBuf) -> RuntimeModel
             if surface_only_inputs.contains(input_variant.name.as_str()) {
                 continue;
             }
-            let Some(probe) = runtime_parity_probe_for_input_variant(&input_variant.name) else {
+            let Some(probe) = runtime_parity_probe_for_input_variant(input_variant.name.as_str())
+            else {
                 rows.push(RuntimeModeledStateRowReport {
                     phase: phase.schema_name().to_string(),
-                    input_variant: input_variant.name.clone(),
+                    input_variant: input_variant.name.as_str().to_string(),
                     aligned: false,
                     differing_keys: vec!["unprobed".to_string()],
                     runtime: RuntimeModeledStateRuntimeReport {
@@ -14970,7 +15005,7 @@ async fn write_runtime_modeled_state_audit_report(path: PathBuf) -> RuntimeModel
 
             rows.push(RuntimeModeledStateRowReport {
                 phase: phase.schema_name().to_string(),
-                input_variant: input_variant.name.clone(),
+                input_variant: input_variant.name.as_str().to_string(),
                 aligned,
                 differing_keys,
                 runtime: runtime_report,

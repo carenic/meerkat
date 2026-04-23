@@ -1857,7 +1857,7 @@ mod tests {
         let result = registry.peer_ready(
             &op_id,
             OperationPeerHandle {
-                peer_name: "peer".into(),
+                peer_name: meerkat_core::comms::PeerName::new("peer").unwrap(),
                 trusted_peer: TrustedPeerDescriptor::test_only_unsigned(
                     "peer",
                     "peer-id",
@@ -2273,7 +2273,7 @@ mod tests {
         assert!(snap1.peer_handle.is_none());
 
         let handle = OperationPeerHandle {
-            peer_name: "member-x".into(),
+            peer_name: meerkat_core::comms::PeerName::new("member-x").unwrap(),
             trusted_peer: TrustedPeerDescriptor::test_only_unsigned(
                 "member-x",
                 "peer-id",
@@ -2284,6 +2284,9 @@ mod tests {
         registry.peer_ready(&op_id, handle).unwrap();
 
         let snap2 = registry.snapshot(&op_id).unwrap();
-        assert_eq!(snap2.peer_handle.as_ref().unwrap().peer_name, "member-x");
+        assert_eq!(
+            snap2.peer_handle.as_ref().unwrap().peer_name.as_str(),
+            "member-x"
+        );
     }
 }

@@ -890,7 +890,8 @@ mod tests {
         assert!(standalone.context_provider().is_none());
 
         let consumer = Arc::new(RecordingMeerkatSurface::default());
-        let dispatcher = Arc::new(build_dispatcher(consumer));
+        let dispatcher: Arc<dyn CompositionDispatcher<Effect = SeamEffect>> =
+            Arc::new(build_dispatcher(consumer));
         let wired: CompositionBinding<SeamEffect> =
             CompositionBinding::wired_with(Arc::clone(&dispatcher));
         assert!(!wired.is_standalone());

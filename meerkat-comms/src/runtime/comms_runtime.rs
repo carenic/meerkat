@@ -3305,9 +3305,12 @@ mod tests {
         let runtime = CommsRuntime::new(config).await.unwrap();
 
         let peer_key = Keypair::generate();
-        let trusted_peer =
-            meerkat_core::comms::TrustedPeerDescriptor::test_only_unsigned("ally", peer_key.public_key().to_peer_id(), "inproc://ally")
-                .expect("trusted peer spec should be valid");
+        let trusted_peer = meerkat_core::comms::TrustedPeerDescriptor::test_only_unsigned(
+            "ally",
+            peer_key.public_key().to_peer_id(),
+            "inproc://ally",
+        )
+        .expect("trusted peer spec should be valid");
 
         CoreCommsRuntime::add_trusted_peer(&runtime, trusted_peer.clone())
             .await
@@ -3450,8 +3453,12 @@ mod tests {
             assert_eq!(inbox.dropped_count(), Some(1));
         }
 
-        let trusted_peer = meerkat_core::comms::TrustedPeerDescriptor::test_only_unsigned("sender", peer_id.clone(), "inproc://sender")
-            .expect("trusted peer spec should be valid");
+        let trusted_peer = meerkat_core::comms::TrustedPeerDescriptor::test_only_unsigned(
+            "sender",
+            peer_id.clone(),
+            "inproc://sender",
+        )
+        .expect("trusted peer spec should be valid");
         CoreCommsRuntime::add_trusted_peer(&runtime, trusted_peer)
             .await
             .expect("add_trusted_peer should succeed");
@@ -4032,23 +4039,25 @@ mod tests {
         let sender = CommsRuntime::inproc_only(&sender_name).unwrap();
         let receiver = CommsRuntime::inproc_only(&receiver_name).unwrap();
 
-        let peer_spec = meerkat_core::comms::meerkat_core::comms::TrustedPeerDescriptor::test_only_unsigned(
-            &receiver_name,
-            receiver.public_key().to_peer_id(),
-            format!("inproc://{receiver_name}"),
-        )
-        .expect("valid peer spec");
+        let peer_spec =
+            meerkat_core::comms::meerkat_core::comms::TrustedPeerDescriptor::test_only_unsigned(
+                &receiver_name,
+                receiver.public_key().to_peer_id(),
+                format!("inproc://{receiver_name}"),
+            )
+            .expect("valid peer spec");
 
         CoreCommsRuntime::add_trusted_peer(&sender, peer_spec)
             .await
             .expect("trusted peer add should succeed");
 
-        let reverse_spec = meerkat_core::comms::meerkat_core::comms::TrustedPeerDescriptor::test_only_unsigned(
-            &sender_name,
-            sender.public_key().to_peer_id(),
-            format!("inproc://{sender_name}"),
-        )
-        .expect("valid reverse peer spec");
+        let reverse_spec =
+            meerkat_core::comms::meerkat_core::comms::TrustedPeerDescriptor::test_only_unsigned(
+                &sender_name,
+                sender.public_key().to_peer_id(),
+                format!("inproc://{sender_name}"),
+            )
+            .expect("valid reverse peer spec");
 
         CoreCommsRuntime::add_trusted_peer(&receiver, reverse_spec)
             .await
@@ -4411,8 +4420,12 @@ mod tests {
 
         CoreCommsRuntime::add_trusted_peer(
             &sender,
-            meerkat_core::comms::TrustedPeerDescriptor::test_only_unsigned(&peer_name, peer_key, "tcp://127.0.0.1:9")
-                .expect("valid trusted peer"),
+            meerkat_core::comms::TrustedPeerDescriptor::test_only_unsigned(
+                &peer_name,
+                peer_key,
+                "tcp://127.0.0.1:9",
+            )
+            .expect("valid trusted peer"),
         )
         .await
         .expect("add trusted peer");
@@ -4900,12 +4913,13 @@ mod tests {
         let receiver = CommsRuntime::inproc_only(&receiver_name).unwrap();
 
         // Add receiver as trusted peer of sender
-        let peer_spec = meerkat_core::comms::meerkat_core::comms::TrustedPeerDescriptor::test_only_unsigned(
-            &receiver_name,
-            receiver.public_key().to_peer_id(),
-            format!("inproc://{receiver_name}"),
-        )
-        .expect("valid peer spec");
+        let peer_spec =
+            meerkat_core::comms::meerkat_core::comms::TrustedPeerDescriptor::test_only_unsigned(
+                &receiver_name,
+                receiver.public_key().to_peer_id(),
+                format!("inproc://{receiver_name}"),
+            )
+            .expect("valid peer spec");
 
         CoreCommsRuntime::add_trusted_peer(&sender, peer_spec)
             .await
