@@ -1280,6 +1280,7 @@ impl fmt::Display for MachineSchemaError {
 impl std::error::Error for MachineSchemaError {}
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use crate::{MachineSchemaError, catalog::dsl::dsl_meerkat_machine as meerkat_machine};
 

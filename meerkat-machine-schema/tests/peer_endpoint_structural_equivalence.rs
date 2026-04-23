@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, unused_imports)]
+
 //! Tripwire for wave-c (Section 1.5 #3). Flipped green by **C-6r**
 //! (meerkat-runtime retype — PeerEndpoint twin carries typed newtypes).
 //!
@@ -21,8 +23,6 @@
 //! struct sites, the types are typed; if `: String` appears, they are
 //! not.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -42,9 +42,7 @@ fn workspace_root() -> PathBuf {
                 return p;
             }
         }
-        if !p.pop() {
-            panic!("could not locate workspace root");
-        }
+        assert!(p.pop(), "could not locate workspace root");
     }
 }
 

@@ -1,4 +1,3 @@
-use super::OptionValueExt;
 use meerkat_machine_dsl::machine;
 
 machine! {

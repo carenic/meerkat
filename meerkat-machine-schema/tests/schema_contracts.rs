@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, unused_imports)]
+
 use std::collections::BTreeMap;
 
 use meerkat_machine_schema::catalog::dsl::{

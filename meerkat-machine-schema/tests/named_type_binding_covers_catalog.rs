@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, unused_imports)]
+
 //! Tripwire for wave-c (Section 1.5 #8). Flipped green by **existing
 //! B-4 validator** — this tripwire is a cheap backstop that the
 //! validator is not silently bypassed by C-6p / C-6c refactors.
@@ -15,8 +17,6 @@
 //! expected to PASS at c.0 commit time — it is a regression guard
 //! protecting the B-4 landing from silent degradation during wave-c.
 //! The plan (Section 1.5 #8) calls it out explicitly as a backstop.
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use meerkat_machine_schema::catalog::dsl::dsl_meerkat_machine;
 use meerkat_machine_schema::identity::NamedTypeId;

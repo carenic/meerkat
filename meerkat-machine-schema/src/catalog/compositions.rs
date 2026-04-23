@@ -1,3 +1,11 @@
+// Scoped clippy allows: the helpers below (comp_id, mach_id, act_id, …) use
+// `expect()` on hand-authored DSL slugs that parse at construction time. A
+// failure here is a DSL-slug authoring bug, never reachable from wire input.
+// Inlining `parse(...).expect(...)` at every catalog entry would drown the
+// composition definitions in boilerplate. Scope is the whole file because
+// every composition builder uses these helpers.
+#![allow(clippy::expect_used)]
+
 use std::collections::BTreeMap;
 
 use crate::{

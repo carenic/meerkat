@@ -225,6 +225,7 @@ impl NamedTypeBinding {
     /// the struct by hand.
     pub fn u64(name: &str) -> Self {
         Self {
+            #[allow(clippy::expect_used)]
             name: NamedTypeId::parse(name).expect("valid named-type slug"),
             rust: RustTypeAtom::U64,
         }
@@ -233,6 +234,7 @@ impl NamedTypeBinding {
     /// Construct a binding whose Rust representation is `String`.
     pub fn string(name: &str) -> Self {
         Self {
+            #[allow(clippy::expect_used)]
             name: NamedTypeId::parse(name).expect("valid named-type slug"),
             rust: RustTypeAtom::String,
         }
@@ -242,6 +244,7 @@ impl NamedTypeBinding {
     /// type path.
     pub fn type_path(name: &str, rust_path: impl Into<String>) -> Self {
         Self {
+            #[allow(clippy::expect_used)]
             name: NamedTypeId::parse(name).expect("valid named-type slug"),
             rust: RustTypeAtom::TypePath(rust_path.into()),
         }
