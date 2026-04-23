@@ -214,42 +214,44 @@ impl ProviderTag {
         let namespace = namespace.into();
         let key = key.into();
 
-        if namespace == "anthropic" && key == "thinking" {
-            if let Some(budget) = value
+        if namespace == "anthropic"
+            && key == "thinking"
+            && let Some(budget) = value
                 .get("budget_tokens")
                 .and_then(serde_json::Value::as_u64)
                 .and_then(|v| u32::try_from(v).ok())
-            {
-                return Self::Anthropic(AnthropicProviderTag {
-                    thinking: Some(AnthropicThinkingConfig::Enabled {
-                        budget_tokens: budget,
-                    }),
-                    ..Default::default()
-                });
-            }
+        {
+            return Self::Anthropic(AnthropicProviderTag {
+                thinking: Some(AnthropicThinkingConfig::Enabled {
+                    budget_tokens: budget,
+                }),
+                ..Default::default()
+            });
         }
 
-        if namespace == "openai" && key == "reasoning_effort" {
-            if let Some(effort) = value.as_str().and_then(|s| match s {
+        if namespace == "openai"
+            && key == "reasoning_effort"
+            && let Some(effort) = value.as_str().and_then(|s| match s {
                 "low" => Some(ReasoningEffort::Low),
                 "medium" => Some(ReasoningEffort::Medium),
                 "high" => Some(ReasoningEffort::High),
                 _ => None,
-            }) {
-                return Self::OpenAi(OpenAiProviderTag {
-                    reasoning_effort: Some(effort),
-                    ..Default::default()
-                });
-            }
+            })
+        {
+            return Self::OpenAi(OpenAiProviderTag {
+                reasoning_effort: Some(effort),
+                ..Default::default()
+            });
         }
 
-        if namespace == "gemini" && key == "candidate_count" {
-            if let Some(count) = value.as_u64().and_then(|v| u32::try_from(v).ok()) {
-                return Self::Gemini(GeminiProviderTag {
-                    candidate_count: Some(count),
-                    ..Default::default()
-                });
-            }
+        if namespace == "gemini"
+            && key == "candidate_count"
+            && let Some(count) = value.as_u64().and_then(|v| u32::try_from(v).ok())
+        {
+            return Self::Gemini(GeminiProviderTag {
+                candidate_count: Some(count),
+                ..Default::default()
+            });
         }
 
         Self::Unknown {
@@ -483,7 +485,7 @@ impl AnthropicProviderTag {
             return Err(LegacyProviderParamsError::NotAnObject);
         };
         let mut tag = Self::default();
-        for (k, v) in obj.iter() {
+        for (k, v) in obj {
             match k.as_str() {
                 "thinking" => {
                     if v.get("type").and_then(|t| t.as_str()) == Some("adaptive") {
@@ -600,7 +602,7 @@ impl OpenAiProviderTag {
             return Err(LegacyProviderParamsError::NotAnObject);
         };
         let mut tag = Self::default();
-        for (k, v) in obj.iter() {
+        for (k, v) in obj {
             match k.as_str() {
                 "reasoning_effort" => {
                     let effort = match v.as_str() {
@@ -687,7 +689,7 @@ impl GeminiProviderTag {
             return Err(LegacyProviderParamsError::NotAnObject);
         };
         let mut tag = Self::default();
-        for (k, v) in obj.iter() {
+        for (k, v) in obj {
             match k.as_str() {
                 "thinking" => {
                     let cfg = serde_json::from_value::<GeminiThinkingConfig>(v.clone())
@@ -789,18 +791,13 @@ impl std::fmt::Display for LegacyProviderParamsError {
 impl std::error::Error for LegacyProviderParamsError {}
 
 /// Typed projection of OpenAI's reasoning-effort knob.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
     Low,
+    #[default]
     Medium,
     High,
-}
-
-impl Default for ReasoningEffort {
-    fn default() -> Self {
-        Self::Medium
-    }
 }
 
 /// Typed mode for generalized reasoning emission.
@@ -1153,7 +1150,7 @@ impl RunPrimitive {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 

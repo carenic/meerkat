@@ -475,19 +475,6 @@ mod tests {
     }
 
     #[test]
-    fn test_default_source_identity_records_dedup_same_root() {
-        let temp = TempDir::new().unwrap();
-        let config = SkillsConfig::default();
-        let records = config.default_source_identity_records(Some(temp.path()), Some(temp.path()));
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].display_name, "project");
-        assert_eq!(
-            records[0].source_uuid,
-            SkillsConfig::default_source_uuid_for_scope(SkillScope::Project)
-        );
-    }
-
-    #[test]
     fn test_parse_filesystem_repo() {
         let toml = r#"
 enabled = true

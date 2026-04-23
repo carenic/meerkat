@@ -585,9 +585,6 @@ mod tests {
     use crate::error::{AgentError, ToolError};
     use crate::event::AgentEvent;
     use crate::event_tap::EventTapState;
-    use crate::lifecycle::RunId;
-    use crate::ops::{AsyncOpRef, OperationId};
-    use crate::turn_execution_authority::{ContentShape, TurnExecutionInput};
     use crate::types::{AssistantBlock, StopReason, ToolCallView, ToolDef, UserMessage};
     use async_trait::async_trait;
     use std::sync::atomic::AtomicBool;

@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
 //! B-7 V4: `SourceIdentityRegistry::resolve` refuses Disabled/Retired sources
 //! with a typed `ResolveError::SourceDisabled`, regardless of whether the
 //! disabled source is reached via direct key or through a remap chain.

@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
 //! B-6: typed round-trip + merge-conflict tests for `RuntimeTurnMetadata`.
 //!
 //! Every field round-trips through JSON losslessly and `merge()` refuses

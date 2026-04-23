@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
 //! Wave B (V6): `ConnectionRef` has no string form.
 //!
 //! `ConnectionRef::parse(...)` is gone, and the core type no longer

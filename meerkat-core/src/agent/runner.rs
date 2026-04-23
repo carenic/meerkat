@@ -962,7 +962,7 @@ where
         let snapshot = self
             .turn_state_handle
             .as_deref()
-            .map(|handle| handle.snapshot());
+            .map(crate::handles::TurnStateHandle::snapshot);
         let input = match snapshot.and_then(|s| s.active_run_id) {
             Some(run_id) => TurnExecutionInput::CancelNow { run_id },
             None => TurnExecutionInput::ForceCancelNoRun,

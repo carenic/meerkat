@@ -745,7 +745,6 @@ mod tests {
                 assert_eq!(source, Some(InputSource::Webhook));
                 assert_eq!(handling_mode, Some(HandlingMode::Steer));
             }
-            other => panic!("expected Input, got {other:?}"),
         }
         Ok(())
     }

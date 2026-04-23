@@ -2112,27 +2112,6 @@ fn completion_outcome_status_str(
     }
 }
 
-/// RFC 7396 JSON Merge Patch: null removes, objects recurse, scalars replace.
-///
-/// Local copy because `config_store::merge_patch` is `#[cfg(not(target_arch = "wasm32"))]`.
-fn json_merge_patch(base: &mut serde_json::Value, patch: serde_json::Value) {
-    use serde_json::Value;
-    match (base, patch) {
-        (Value::Object(base_map), Value::Object(patch_map)) => {
-            for (k, v) in patch_map {
-                if v.is_null() {
-                    base_map.remove(&k);
-                } else {
-                    json_merge_patch(base_map.entry(k).or_insert(Value::Null), v);
-                }
-            }
-        }
-        (base_val, patch_val) => {
-            *base_val = patch_val;
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -3631,7 +3610,8 @@ mod tests {
         assert!(
             seen_ids
                 .iter()
-                .any(|id| id.0 == "dc256086-0d2f-4f61-a307-320d4148107f/email-extractor"),
+                .any(|id| id.to_string()
+                    == "dc256086-0d2f-4f61-a307-320d4148107f/email-extractor"),
             "expected canonical skill id to be forwarded to skill engine, saw: {seen_ids:?}"
         );
 

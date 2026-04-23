@@ -22,7 +22,7 @@ pub use identity::{ResolveError, SkillAlias, SourceIdentityRegistry};
 
 /// Canonical source UUID shared by embedded (component-crate `inventory`)
 /// registrations. Embedded skills all live inside this single logical source.
-pub const BUILTIN_SOURCE_UUID: Uuid = Uuid::from_u128(0x0000_0000_0000_4b11_8111_000_00000001);
+pub const BUILTIN_SOURCE_UUID: Uuid = Uuid::from_u128(0x0000_0000_0000_4b11_8111_0000_0000_0001);
 
 /// Canonical source identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
@@ -1233,7 +1233,7 @@ mod tests {
     #[test]
     fn test_skill_ref_structured_only_serde() {
         let key = test_key("email-extractor");
-        let r = SkillRef::Structured(key.clone());
+        let r = SkillRef::Structured(key);
         let json = serde_json::to_value(&r).expect("serialize");
         // The tag must be "structured" and there must be no legacy variant.
         assert_eq!(json["kind"], "structured");
@@ -1294,7 +1294,7 @@ mod tests {
                 "",
             ),
             SkillDescriptor::new(
-                SkillKey::new(b.clone(), SkillName::parse("pdf").expect("slug")),
+                SkillKey::new(b, SkillName::parse("pdf").expect("slug")),
                 "pdf",
                 "",
             ),
