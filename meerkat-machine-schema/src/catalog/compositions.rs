@@ -7,7 +7,7 @@ use crate::{
     EntryInput, FeedbackFieldBinding, FeedbackFieldSource, FeedbackInputRef, MachineInstance,
     ProtocolGenerationMode, ProtocolHelperReturnShape, ProtocolRustBinding, Route,
     RouteBindingSource, RouteDelivery, RouteFieldBinding, RouteTarget, RouteTargetKind,
-    WatchedEffect,
+    RouteVariantId, WatchedEffect,
 };
 
 // Short-named typed-identity constructors used throughout this module.
@@ -19,8 +19,8 @@ use crate::{
 // construction site through these one-line helpers. A panic here is a
 // hand-authored DSL-slug bug, never reachable from wire input.
 use crate::identity::{
-    ActorId, CompositionId, EffectVariantId, FieldId, InputVariantId, MachineId,
-    MachineInstanceId, PhaseId, ProtocolId, RouteId, TransitionId,
+    ActorId, CompositionId, EffectVariantId, FieldId, InputVariantId, MachineId, MachineInstanceId,
+    PhaseId, ProtocolId, RouteId, TransitionId,
 };
 
 fn comp_id(s: &str) -> CompositionId {
@@ -64,14 +64,12 @@ fn transition_id(s: &str) -> TransitionId {
 /// author expresses an input/signal target slug through this helper.
 fn rv(kind: RouteTargetKind, slug: &str) -> crate::RouteVariantId {
     match kind {
-        RouteTargetKind::Input => {
-            crate::RouteVariantId::Input(InputVariantId::parse(slug).expect("valid input-variant slug"))
-        }
-        RouteTargetKind::Signal => {
-            crate::RouteVariantId::Signal(
-                crate::identity::SignalVariantId::parse(slug).expect("valid signal-variant slug"),
-            )
-        }
+        RouteTargetKind::Input => crate::RouteVariantId::Input(
+            InputVariantId::parse(slug).expect("valid input-variant slug"),
+        ),
+        RouteTargetKind::Signal => crate::RouteVariantId::Signal(
+            crate::identity::SignalVariantId::parse(slug).expect("valid signal-variant slug"),
+        ),
     }
 }
 
@@ -357,7 +355,71 @@ pub fn meerkat_mob_seam_composition() -> CompositionSchema {
             ),
         ],
         route_target_selectors: vec![],
-        driver: None,
+        // Wave-c C-6p: the mob→meerkat seam now declares a typed composition
+        // driver. Its sole role is to opt the composition into codegen
+        // emission — `render_composition_driver` gates on `driver: Some(...)`
+        // and generates the `MeerkatMobSeamEffect` enum + `route_to_input`
+        // function that the runtime dispatcher (B-5
+        // `CatalogCompositionDispatcher`) consumes. The four `watched_effects`
+        // and `dispatch_routes` below mirror the four Input-kind `routes`
+        // above (producer=mob, consumer=meerkat); Signal-kind routes are
+        // excluded by `render_composition_driver` and handled by the signal
+        // surface.
+        driver: Some(CompositionDriver {
+            name: "meerkat_mob_seam_driver".into(),
+            rust: CompositionDriverRustBinding {
+                module_path: "meerkat-runtime/src/generated/meerkat_mob_seam.rs".into(),
+                driver_type: "MeerkatMobSeamDriver".into(),
+                store_plan_type: "MeerkatMobSeamStorePlan".into(),
+                work_type: "MeerkatMobSeamWork".into(),
+                decision_type: "MeerkatMobSeamDecision".into(),
+                required_imports: vec![],
+            },
+            watched_effects: vec![
+                WatchedEffect {
+                    producer_instance: mi_id("mob"),
+                    effect_variant: ev_id("RequestRuntimeBinding"),
+                },
+                WatchedEffect {
+                    producer_instance: mi_id("mob"),
+                    effect_variant: ev_id("RequestRuntimeIngress"),
+                },
+                WatchedEffect {
+                    producer_instance: mi_id("mob"),
+                    effect_variant: ev_id("RequestRuntimeRetire"),
+                },
+                WatchedEffect {
+                    producer_instance: mi_id("mob"),
+                    effect_variant: ev_id("RequestRuntimeDestroy"),
+                },
+            ],
+            dispatch_routes: vec![
+                DriverDispatchRoute {
+                    name: route_id("binding_request_reaches_meerkat"),
+                    target_instance: mi_id("meerkat"),
+                    target_kind: RouteTargetKind::Input,
+                    input_variant: RouteVariantId::Input(iv_id("PrepareBindings")),
+                },
+                DriverDispatchRoute {
+                    name: route_id("work_request_reaches_meerkat"),
+                    target_instance: mi_id("meerkat"),
+                    target_kind: RouteTargetKind::Input,
+                    input_variant: RouteVariantId::Input(iv_id("Ingest")),
+                },
+                DriverDispatchRoute {
+                    name: route_id("retire_request_reaches_meerkat"),
+                    target_instance: mi_id("meerkat"),
+                    target_kind: RouteTargetKind::Input,
+                    input_variant: RouteVariantId::Input(iv_id("Retire")),
+                },
+                DriverDispatchRoute {
+                    name: route_id("destroy_request_reaches_meerkat"),
+                    target_instance: mi_id("meerkat"),
+                    target_kind: RouteTargetKind::Input,
+                    input_variant: RouteVariantId::Input(iv_id("Destroy")),
+                },
+            ],
+        }),
         transaction_plans: vec![],
         actor_priorities: vec![],
         scheduler_rules: vec![],
