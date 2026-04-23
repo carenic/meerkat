@@ -482,14 +482,6 @@ fn request_requires_long_running_executor(request: &RpcRequest) -> bool {
     }
 }
 
-fn request_commits_state_on_success(request: &RpcRequest) -> bool {
-    match request.method.as_str() {
-        "turn/start" | "mob/turn_start" => true,
-        "session/create" => session_create_runs_immediately(request.params.as_deref()),
-        _ => false,
-    }
-}
-
 fn session_create_runs_immediately(params: Option<&serde_json::value::RawValue>) -> bool {
     let Some(params) = params else {
         return true;

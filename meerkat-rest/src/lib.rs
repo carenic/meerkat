@@ -1213,14 +1213,6 @@ pub fn router(state: AppState) -> Router {
             get(mob_member_status),
         )
         .route(
-            "/mob/{id}/members/{agent_identity}/realtime/attach",
-            post(mob_realtime_attach),
-        )
-        .route(
-            "/mob/{id}/members/{agent_identity}/realtime/detach",
-            post(mob_realtime_detach),
-        )
-        .route(
             "/mob/{id}/members/{agent_identity}/cancel",
             post(mob_force_cancel),
         )
@@ -2020,32 +2012,6 @@ async fn mob_member_status(
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(json!(snapshot)))
-}
-
-/// POST /mob/{id}/members/{agent_identity}/realtime/attach — unavailable
-/// after Phase 5G/T5h: capability-driven realtime transport is
-/// session-scoped; resolve to `session_id` and drive realtime lifecycle
-/// through the session endpoints instead.
-#[cfg(feature = "mob")]
-async fn mob_realtime_attach(
-    State(_state): State<AppState>,
-    Path((_id, _agent_identity)): Path<(String, String)>,
-) -> Result<Json<Value>, ApiError> {
-    Err(ApiError::BadRequest(
-        "mob realtime attach is unavailable: capability-driven realtime transport is session-scoped".to_string(),
-    ))
-}
-
-/// POST /mob/{id}/members/{agent_identity}/realtime/detach — unavailable
-/// after Phase 5G/T5h. See `mob_realtime_attach` above.
-#[cfg(feature = "mob")]
-async fn mob_realtime_detach(
-    State(_state): State<AppState>,
-    Path((_id, _agent_identity)): Path<(String, String)>,
-) -> Result<Json<Value>, ApiError> {
-    Err(ApiError::BadRequest(
-        "mob realtime detach is unavailable: capability-driven realtime transport is session-scoped".to_string(),
-    ))
 }
 
 /// POST /mob/{id}/members/{agent_identity}/cancel — force-cancel in-flight turn.
