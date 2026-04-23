@@ -96,9 +96,6 @@ pub enum CredentialSourceSpec {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         fallback: Vec<String>,
     },
-    ManagedStore {
-        profile: String,
-    },
     ExternalResolver {
         handle: String,
     },

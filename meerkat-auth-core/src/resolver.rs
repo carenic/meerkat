@@ -105,7 +105,7 @@ pub async fn resolve_simple_secret(
                     .into(),
             ))
         }
-        CredentialSourceSpec::ManagedStore { .. } | CredentialSourceSpec::PlatformDefault => {
+        CredentialSourceSpec::PlatformDefault => {
             Err(ProviderAuthError::Auth(AuthError::InteractiveLoginRequired))
         }
     }
