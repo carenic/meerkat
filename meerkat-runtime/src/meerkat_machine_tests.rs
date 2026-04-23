@@ -345,7 +345,6 @@ async fn meerkat_machine_spine_snapshot_reports_registered_idle_session() {
     assert!(snapshot.binding.ops_registry_present);
     assert_eq!(snapshot.control.phase, RuntimeState::Idle);
     assert!(!snapshot.binding.attachment_live);
-    assert!(!snapshot.binding.detached_wake_present);
     assert_eq!(snapshot.binding.cursor_state.agent_applied_cursor, 0);
     assert_eq!(snapshot.binding.cursor_state.runtime_observed_seq, 0);
     assert_eq!(snapshot.binding.cursor_state.runtime_last_injected_seq, 0);
@@ -4520,8 +4519,6 @@ async fn meerkat_machine_spine_snapshot_tracks_runtime_ops_state() {
     assert!(!snapshot.ops.pending_wait_present);
     assert_eq!(snapshot.ops.pending_wait_request_id, None);
     assert!(snapshot.ops.wait_operation_ids.is_empty());
-    assert_eq!(snapshot.ops.detached_wake_pending, None);
-    assert_eq!(snapshot.ops.detached_wake_signaled, None);
     assert_eq!(snapshot.ops.operations.len(), 1);
 
     let op = &snapshot.ops.operations[0];

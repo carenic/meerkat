@@ -449,7 +449,7 @@ pub(crate) enum MeerkatMachineCommand {
 }
 
 #[derive(Debug)]
-pub(crate) struct MeerkatMachineLegacyRunPrepared {
+pub(crate) struct MeerkatMachineRunPrepared {
     pub input_id: InputId,
     pub run_id: RunId,
     pub primitive: RunPrimitive,
@@ -484,7 +484,7 @@ pub(crate) enum MeerkatMachineCommandResult {
     RealtimeAttachmentStatus(RealtimeAttachmentStatus),
     RealtimeChannelStatus(RealtimeChannelStatus),
     BoundaryReceipt(Option<RunBoundaryReceipt>),
-    Prepared(MeerkatMachineLegacyRunPrepared),
+    Prepared(MeerkatMachineRunPrepared),
 }
 
 #[doc(hidden)]
@@ -541,7 +541,6 @@ pub struct MeerkatBindingSnapshot {
     pub completions_present: bool,
     pub ops_registry_present: bool,
     pub attachment_live: bool,
-    pub detached_wake_present: bool,
     pub epoch_id: RuntimeEpochId,
     pub cursor_state: MeerkatCursorSnapshot,
 }
@@ -611,8 +610,6 @@ pub struct MeerkatOpsSnapshot {
     pub pending_wait_request_id: Option<WaitRequestId>,
     pub wait_operation_ids: Vec<OperationId>,
     pub operations: Vec<OperationLifecycleSnapshot>,
-    pub detached_wake_pending: Option<bool>,
-    pub detached_wake_signaled: Option<bool>,
 }
 
 /// Snapshot of comms-drain lifecycle truth for one session.

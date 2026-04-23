@@ -270,25 +270,11 @@ impl MeerkatMachine {
             completions_present,
             ops_registry_present,
             attachment_live,
-            detached_wake_pending,
-            detached_wake_signaled,
             epoch_id,
             _visibility_state,
         ) = {
             let sessions = self.sessions.read().await;
             let entry = sessions.get(session_id)?;
-            let (detached_wake_pending, detached_wake_signaled) = entry
-                .detached_wake
-                .as_ref()
-                .map(|wake| {
-                    (
-                        wake.pending.load(Ordering::Acquire),
-                        wake.signaled.load(Ordering::Acquire),
-                    )
-                })
-                .map_or((None, None), |(pending, signaled)| {
-                    (Some(pending), Some(signaled))
-                });
             (
                 Arc::clone(&entry.driver),
                 entry.control_snapshot(),
@@ -298,8 +284,6 @@ impl MeerkatMachine {
                 true,
                 true,
                 entry.attachment_is_live(),
-                detached_wake_pending,
-                detached_wake_signaled,
                 entry.epoch_id.clone(),
                 entry.tool_visibility_owner.visibility_state().ok()?,
             )
@@ -354,7 +338,6 @@ impl MeerkatMachine {
             completions_present,
             ops_registry_present,
             attachment_live,
-            detached_wake_present: detached_wake_pending.is_some(),
             epoch_id,
             cursor_state: {
                 let cursor_state = cursor_state.snapshot();
@@ -468,8 +451,6 @@ impl MeerkatMachine {
             pending_wait_request_id: ops_snapshot.pending_wait_request_id,
             wait_operation_ids: ops_snapshot.wait_operation_ids,
             operations: ops_snapshot.operations,
-            detached_wake_pending,
-            detached_wake_signaled,
         };
         let formal_state = {
             let mut available_fields = std::collections::BTreeMap::new();

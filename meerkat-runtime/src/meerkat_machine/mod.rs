@@ -20,7 +20,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
-use std::sync::atomic::Ordering;
 
 use meerkat_core::BlobStore;
 use meerkat_core::lifecycle::core_executor::CoreApplyOutput;
@@ -43,7 +42,7 @@ use crate::meerkat_machine_types::{
     MeerkatCompletionWaiterSnapshot, MeerkatCompletionWaitersSnapshot, MeerkatControlSnapshot,
     MeerkatCursorSnapshot, MeerkatDrainSnapshot, MeerkatDriverKind, MeerkatFormalStateProjection,
     MeerkatInputsSnapshot, MeerkatLedgerSnapshot, MeerkatMachineCommand,
-    MeerkatMachineCommandError, MeerkatMachineCommandResult, MeerkatMachineLegacyRunPrepared,
+    MeerkatMachineCommandError, MeerkatMachineCommandResult, MeerkatMachineRunPrepared,
     MeerkatMachineSpineSnapshot, MeerkatOpsSnapshot, SessionLlmCapabilityDelta,
     SessionLlmCapabilitySurface, SessionLlmCapabilitySurfaceStatus, SessionLlmReconfigureHost,
     SessionLlmReconfigureReport, SessionLlmReconfigureRequest, SessionToolVisibilityDelta,
@@ -146,9 +145,6 @@ struct RuntimeSessionEntry {
     /// Registration phase — explicit type-level distinction between
     /// "registered but inert" and "executor attached."
     phase: RegistrationPhase,
-    /// Detached-wake state for background op completions.
-    /// Shared with the runtime loop which selects on the Notify directly.
-    detached_wake: Option<Arc<crate::detached_wake::DetachedWakeState>>,
     /// DSL authority for coarse lifecycle phase transitions.
     /// Sync field — validates transitions, writes back phase.
     ///
@@ -252,9 +248,6 @@ impl RuntimeSessionEntry {
             // Don't regress to Queuing if another task is mid-attach;
             // Active with dead channels goes back to Queuing for retry.
             self.phase = RegistrationPhase::Queuing;
-            // Clear detached wake state — it will be re-created on
-            // re-registration along with the new runtime loop.
-            self.detached_wake = None;
             return true;
         }
         false

@@ -495,7 +495,7 @@ impl MeerkatMachine {
                         )));
                     }
 
-                    MeerkatMachineLegacyRunPrepared {
+                    MeerkatMachineRunPrepared {
                         input_id,
                         run_id,
                         primitive: crate::runtime_loop::input_to_primitive(
