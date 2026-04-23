@@ -11,7 +11,7 @@ use crate::machines::mob_machine as mob_dsl;
 use crate::tokio;
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
-use meerkat_core::comms::{PeerLifecycleKind, TrustedPeerSpec};
+use meerkat_core::comms::{PeerLifecycleKind, TrustedPeerDescriptor};
 use meerkat_core::time_compat::SystemTime;
 use serde::de::DeserializeOwned;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -39,11 +39,11 @@ enum WiringEndpoint {
     Local {
         entry: Box<RosterEntry>,
         comms: Arc<dyn CoreCommsRuntime>,
-        spec: TrustedPeerSpec,
+        spec: TrustedPeerDescriptor,
         comms_name: String,
     },
     PeerOnly {
-        spec: TrustedPeerSpec,
+        spec: TrustedPeerDescriptor,
         binding: crate::RuntimeBinding,
     },
 }
@@ -208,7 +208,7 @@ pub(super) struct PendingSpawnProgress {
 #[derive(Clone, Debug, Default)]
 pub(super) struct RestoreWiringPlan {
     local_peers: Vec<MeerkatId>,
-    external_peers: Vec<TrustedPeerSpec>,
+    external_peers: Vec<TrustedPeerDescriptor>,
 }
 
 struct RespawnSnapshot {
@@ -331,8 +331,8 @@ impl MobActor {
         peer_id: &str,
         address: &str,
         context: &'static str,
-    ) -> Result<TrustedPeerSpec, MobError> {
-        TrustedPeerSpec::new(
+    ) -> Result<TrustedPeerDescriptor, MobError> {
+        TrustedPeerDescriptor::new(
             address
                 .strip_prefix("inproc://")
                 .map(|value| value.split('?').next().unwrap_or(value).to_string())
@@ -350,7 +350,7 @@ impl MobActor {
     fn peer_only_spec_for_binding(
         binding: &crate::RuntimeBinding,
         context: &'static str,
-    ) -> Result<TrustedPeerSpec, MobError> {
+    ) -> Result<TrustedPeerDescriptor, MobError> {
         match binding {
             crate::RuntimeBinding::External {
                 peer_id, address, ..
@@ -398,7 +398,7 @@ impl MobActor {
 
     async fn bind_peer_only_member_for_binding(
         &self,
-        peer: &TrustedPeerSpec,
+        peer: &TrustedPeerDescriptor,
         binding: &crate::RuntimeBinding,
     ) -> Result<super::bridge_protocol::BridgeBindResponse, MobError> {
         let payload = self.bridge_supervisor_payload().await?;
@@ -408,7 +408,7 @@ impl MobActor {
 
     async fn bind_peer_only_member_for_binding_with_payload(
         &self,
-        peer: &TrustedPeerSpec,
+        peer: &TrustedPeerDescriptor,
         binding: &crate::RuntimeBinding,
         payload: &super::bridge_protocol::BridgeSupervisorPayload,
     ) -> Result<super::bridge_protocol::BridgeBindResponse, MobError> {
@@ -504,9 +504,9 @@ impl MobActor {
 
     async fn ensure_supervisor_authorized(
         &self,
-        peer: &TrustedPeerSpec,
+        peer: &TrustedPeerDescriptor,
         binding: Option<&crate::RuntimeBinding>,
-    ) -> Result<TrustedPeerSpec, MobError> {
+    ) -> Result<TrustedPeerDescriptor, MobError> {
         let payload = self.bridge_supervisor_payload().await?;
         let command = super::bridge_protocol::BridgeCommand::AuthorizeSupervisor(payload);
         let value = self
@@ -544,7 +544,7 @@ impl MobActor {
 
     async fn send_bridge_command_typed<R: DeserializeOwned>(
         &self,
-        peer: &TrustedPeerSpec,
+        peer: &TrustedPeerDescriptor,
         command: &super::bridge_protocol::BridgeCommand,
         timeout: std::time::Duration,
     ) -> Result<R, MobError> {
@@ -610,9 +610,9 @@ impl MobActor {
 
     async fn wire_peer_only_recipient(
         &self,
-        recipient: &TrustedPeerSpec,
+        recipient: &TrustedPeerDescriptor,
         recipient_binding: Option<&crate::RuntimeBinding>,
-        peer_spec: &TrustedPeerSpec,
+        peer_spec: &TrustedPeerDescriptor,
         timeout: std::time::Duration,
     ) -> Result<(), MobError> {
         let recipient = self
@@ -636,9 +636,9 @@ impl MobActor {
 
     async fn unwire_peer_only_recipient(
         &self,
-        recipient: &TrustedPeerSpec,
+        recipient: &TrustedPeerDescriptor,
         recipient_binding: Option<&crate::RuntimeBinding>,
-        peer_spec: &TrustedPeerSpec,
+        peer_spec: &TrustedPeerDescriptor,
         timeout: std::time::Duration,
     ) -> Result<(), MobError> {
         let recipient = self
@@ -5262,7 +5262,7 @@ impl MobActor {
         };
         if !remote_bindings.is_empty() {
             let next_sup_spec: super::bridge_protocol::BridgePeerSpec =
-                meerkat_core::comms::TrustedPeerSpec::new(
+                meerkat_core::comms::TrustedPeerDescriptor::new(
                     format!("{}/__mob_supervisor__", self.definition.id),
                     next.public_peer_id.clone(),
                     format!("inproc://{}/__mob_supervisor__", self.definition.id),
@@ -5278,7 +5278,7 @@ impl MobActor {
             };
             let next_command =
                 super::bridge_protocol::BridgeCommand::AuthorizeSupervisor(next_payload.clone());
-            let mut rotated_peers: Vec<(TrustedPeerSpec, crate::RuntimeBinding)> = Vec::new();
+            let mut rotated_peers: Vec<(TrustedPeerDescriptor, crate::RuntimeBinding)> = Vec::new();
             for binding in remote_bindings {
                 let peer = Self::peer_only_spec_for_binding(&binding, "handle_rotate_supervisor")?;
                 let mut effective_peer = peer.clone();
@@ -6593,7 +6593,7 @@ impl MobActor {
     async fn notify_peer_added(
         &self,
         sender_comms: &Arc<dyn CoreCommsRuntime>,
-        recipient_spec: &TrustedPeerSpec,
+        recipient_spec: &TrustedPeerDescriptor,
         new_peer_id: &MeerkatId,
         new_peer_entry: &RosterEntry,
     ) -> Result<(), MobError> {
@@ -6638,7 +6638,7 @@ impl MobActor {
     async fn notify_peer_event(
         &self,
         intent: &'static str,
-        recipient_spec: &TrustedPeerSpec,
+        recipient_spec: &TrustedPeerDescriptor,
         other_peer_id: &MeerkatId,
         other_peer_entry: &RosterEntry,
         sender_comms: &Arc<dyn CoreCommsRuntime>,
@@ -6754,7 +6754,7 @@ impl MobActor {
     /// Notify a peer that another peer was retired from the mob.
     async fn notify_peer_retired(
         &self,
-        recipient_spec: &TrustedPeerSpec,
+        recipient_spec: &TrustedPeerDescriptor,
         retired_id: &MeerkatId,
         retired_entry: &RosterEntry,
         retiring_comms: &Arc<dyn CoreCommsRuntime>,
@@ -6772,7 +6772,7 @@ impl MobActor {
     /// Notify a peer that another peer was unwired (trust link removed).
     async fn notify_peer_unwired(
         &self,
-        recipient_spec: &TrustedPeerSpec,
+        recipient_spec: &TrustedPeerDescriptor,
         unwired_id: &MeerkatId,
         unwired_entry: &RosterEntry,
         sender_comms: &Arc<dyn CoreCommsRuntime>,

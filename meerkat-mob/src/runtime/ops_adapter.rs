@@ -1,7 +1,7 @@
 #[cfg(feature = "runtime-adapter")]
 use super::*;
 #[cfg(feature = "runtime-adapter")]
-use meerkat_core::comms::TrustedPeerSpec;
+use meerkat_core::comms::TrustedPeerDescriptor;
 #[cfg(feature = "runtime-adapter")]
 use meerkat_core::ops_lifecycle::{
     OperationId, OperationKind, OperationLifecycleSnapshot, OperationPeerHandle,
@@ -439,7 +439,7 @@ impl MobOpsAdapter {
         &self,
         member_ref: &MemberRef,
         peer_name: &str,
-        trusted_peer: TrustedPeerSpec,
+        trusted_peer: TrustedPeerDescriptor,
     ) -> Result<(), MobError> {
         let member_key = Self::require_member_key(member_ref, "mark peer ready for")?;
         let operation_id = self
@@ -590,7 +590,7 @@ impl MobOpsAdapter {
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
-    use meerkat_core::comms::TrustedPeerSpec;
+    use meerkat_core::comms::TrustedPeerDescriptor;
     use meerkat_core::ops_lifecycle::OperationStatus;
 
     #[tokio::test]
@@ -612,7 +612,7 @@ mod tests {
             .mark_member_peer_ready(
                 &member_ref,
                 "mob-a/orchestrator/member-alpha",
-                TrustedPeerSpec::new(
+                TrustedPeerDescriptor::new(
                     "mob-a/orchestrator/member-alpha",
                     "peer-member-alpha",
                     "inproc://member-alpha",

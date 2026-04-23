@@ -11,7 +11,7 @@ use crate::runtime::reconcile::{
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
 use meerkat_core::comms::{
-    PeerDirectoryEntry, PeerReachability, PeerReachabilityReason, TrustedPeerSpec,
+    PeerDirectoryEntry, PeerReachability, PeerReachabilityReason, TrustedPeerDescriptor,
 };
 use meerkat_core::ops::OperationId;
 use meerkat_core::ops_lifecycle::OpsLifecycleRegistry;
@@ -164,7 +164,7 @@ pub struct MobMemberListEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) peer_id: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) external_peer_specs: BTreeMap<AgentIdentity, TrustedPeerSpec>,
+    pub(crate) external_peer_specs: BTreeMap<AgentIdentity, TrustedPeerDescriptor>,
     #[serde(skip)]
     pub(crate) current_session_id: Option<SessionId>,
     #[serde(skip)]
@@ -442,7 +442,7 @@ pub enum PeerTarget {
     /// Another member in the same mob roster.
     Local(AgentIdentity),
     /// A trusted peer that lives outside the local mob roster.
-    External(TrustedPeerSpec),
+    External(TrustedPeerDescriptor),
 }
 
 // DELETE_ME A5 DSL-schema migration: `MeerkatId` is now a type alias

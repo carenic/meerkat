@@ -114,8 +114,9 @@ pub enum RealtimeErrorCode {
     ChannelReconnecting,
     /// W3-H: the mob member this channel was bound to has been retired and
     /// its realtime binding released by the MobMachine
-    /// (`MemberSessionBindingReleased` effect). Signalled only for
-    /// `MobMember` targets; `SessionTarget` channels do not encounter this.
+    /// (`MemberSessionBindingChanged { old: Some, new: None }` effect).
+    /// Signalled only for `MobMember` targets; `SessionTarget` channels
+    /// do not encounter this.
     BindingReleased,
     /// Provider authentication rejected the connection or request. Maps
     /// from `meerkat_client::LlmError::AuthenticationFailed` so the wire
@@ -239,9 +240,10 @@ pub struct ToolCallTimeoutContext {
 ///   canonical anchor, and the server resolves the current bridge session
 ///   on every tick from the MobMachine's `member_session_bindings` map.
 ///   Respawn atomically rotates the bound session via the
-///   `MemberSessionBindingRotated` effect; the channel survives without
-///   any SDK round-trip. A terminal `MemberSessionBindingReleased`
-///   closes the channel with `RealtimeErrorCode::BindingReleased`.
+///   `MemberSessionBindingChanged { old: Some, new: Some }` effect; the
+///   channel survives without any SDK round-trip. A terminal
+///   `MemberSessionBindingChanged { old: Some, new: None }` closes the
+///   channel with `RealtimeErrorCode::BindingReleased`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
