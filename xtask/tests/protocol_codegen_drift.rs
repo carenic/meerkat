@@ -45,6 +45,13 @@ fn rustfmt(source: &str) -> String {
     String::from_utf8(output.stdout).expect("utf8")
 }
 
+/// Normalize line endings so the test is stable for contributors whose
+/// `core.autocrlf = true` git config check out files with `\r\n`.
+/// Rendered output always uses LF; committed files may have either.
+fn normalize(s: &str) -> String {
+    s.replace("\r\n", "\n").trim_end().to_string()
+}
+
 /// For every declared protocol in canonical + compat composition
 /// catalogs, regenerate the source and compare byte-for-byte against
 /// the committed on-disk file.
@@ -101,8 +108,8 @@ fn every_declared_protocol_file_matches_codegen_output() {
             let rendered = rustfmt(&rendered);
 
             assert_eq!(
-                committed.trim_end(),
-                rendered.trim_end(),
+                normalize(&committed),
+                normalize(&rendered),
                 "protocol `{}` ({}) diverged from codegen output.\nIf this is intentional, run `cargo xtask protocol-codegen` and commit the result.",
                 protocol.name,
                 protocol.rust.module_path
@@ -113,5 +120,35 @@ fn every_declared_protocol_file_matches_codegen_output() {
     assert!(
         checked > 0,
         "no protocols declared in canonical + compat catalogs — test is vacuous"
+    );
+}
+
+/// Drift guard for the standalone `terminal_surface_mapping.rs` file.
+/// This file is emitted by the protocol-codegen pass outside the
+/// handoff_protocols loop, so the per-protocol drift test above does
+/// not cover it. Add this separate test so a hand-edit of the file is
+/// caught by the same gate.
+#[test]
+fn terminal_surface_mapping_matches_codegen_output() {
+    use meerkat_machine_schema::{MachineSchema, canonical_machine_schemas};
+
+    let machines: Vec<MachineSchema> = canonical_machine_schemas();
+    let meerkat_machine = machines
+        .iter()
+        .find(|m| m.machine == "MeerkatMachine")
+        .expect("MeerkatMachine must be a canonical schema");
+
+    let rendered = xtask::protocol_codegen::render_terminal_surface_mapping(meerkat_machine)
+        .expect("render terminal_surface_mapping");
+    let rendered = rustfmt(&rendered);
+
+    let committed_path = repo_root().join("meerkat-core/src/generated/terminal_surface_mapping.rs");
+    let committed = std::fs::read_to_string(&committed_path)
+        .unwrap_or_else(|_| panic!("read {}", committed_path.display()));
+
+    assert_eq!(
+        normalize(&committed),
+        normalize(&rendered),
+        "terminal_surface_mapping.rs diverged from codegen output. If this is intentional, run `cargo xtask protocol-codegen` and commit the result."
     );
 }

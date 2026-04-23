@@ -907,6 +907,18 @@ fn ctor_field_list_from_bindings(
     input_payload_module_path: Option<&str>,
 ) -> Result<String> {
     if target_variant.fields.is_empty() {
+        // Tuple-wrapping input enums (kernel-codegen style) require a
+        // payload struct literal even for zero-field variants
+        // (`Input::Foo(payload::Foo {})`). DSL-emitted input enums use
+        // unit variants for zero-field cases (`Input::Foo`). Fail
+        // explicitly rather than emit `Input::Foo` and let rustc
+        // complain with a distant error message.
+        if let Some(module) = input_payload_module_path {
+            bail!(
+                "zero-field feedback input variant `{}` cannot be emitted through input_payload_module_path `{module}` (kernel-style tuple wrapping requires at least one field, or remove the payload module path to emit a unit variant)",
+                target_variant.name
+            );
+        }
         return Ok(target_variant.name.clone());
     }
 
@@ -1038,6 +1050,14 @@ fn is_known_copy_named_type(name: &str) -> bool {
 }
 
 /// Generate a standalone terminal surface mapping module for MeerkatMachine.
+///
+/// Public for the drift test — ensures the codegen-emit path covers this
+/// file alongside the per-protocol helpers, closing the gap the review
+/// flagged in the original drift-test implementation.
+pub fn render_terminal_surface_mapping(machine: &MachineSchema) -> Result<String> {
+    generate_terminal_surface_mapping(machine)
+}
+
 fn generate_terminal_surface_mapping(machine: &MachineSchema) -> Result<String> {
     let mut out = String::new();
 
