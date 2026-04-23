@@ -20,15 +20,15 @@ pub use compat::{
     loop_iteration_machine, ops_barrier_bridge_machine,
 };
 pub use composition::{
-    ActorKind, ActorPriority, ActorSchema, ClosurePolicy, CompositionDriverRustBinding,
-    CompositionInvariant, CompositionInvariantKind, CompositionSchema, CompositionSchemaError,
-    CompositionStateLimits, CompositionTransactionPlan, CompositionWitness,
-    CompositionWitnessField, CompositionWitnessInput, CompositionWitnessState,
-    CompositionWitnessTransition, CompositionWitnessTransitionOrder, EffectHandoffProtocol,
-    EntryInput, FeedbackFieldBinding, FeedbackFieldSource, FeedbackInputRef, MachineInstance,
-    ProtocolGenerationMode, ProtocolHelperReturnShape, ProtocolRustBinding, Route,
+    ActorKind, ActorPriority, ActorSchema, ClosurePolicy, CompositionDriver,
+    CompositionDriverRustBinding, CompositionInvariant, CompositionInvariantKind,
+    CompositionSchema, CompositionSchemaError, CompositionStateLimits, CompositionTransactionPlan,
+    CompositionWitness, CompositionWitnessField, CompositionWitnessInput, CompositionWitnessState,
+    CompositionWitnessTransition, CompositionWitnessTransitionOrder, DriverDispatchRoute,
+    EffectHandoffProtocol, EntryInput, FeedbackFieldBinding, FeedbackFieldSource, FeedbackInputRef,
+    MachineInstance, ProtocolGenerationMode, ProtocolHelperReturnShape, ProtocolRustBinding, Route,
     RouteBindingSource, RouteDelivery, RouteFieldBinding, RouteTarget, RouteTargetKind,
-    RouteTargetSelector, SchedulerRule,
+    RouteTargetSelector, SchedulerRule, WatchedEffect,
 };
 pub use machine::{
     EffectDisposition, EffectDispositionRule, EffectEmit, EnumSchema, Expr, FieldInit, FieldSchema,

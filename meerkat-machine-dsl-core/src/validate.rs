@@ -347,7 +347,9 @@ fn validate_expr(
             validate_expr(map, fields, bindings, helpers, errors);
             validate_expr(key, fields, bindings, helpers, errors);
         }
-        ExprDef::MapGet { map, key } | ExprDef::MapGetCopied { map, key } => {
+        ExprDef::MapGet { map, key }
+        | ExprDef::MapGetCopied { map, key }
+        | ExprDef::MapGetCloned { map, key } => {
             validate_expr(map, fields, bindings, helpers, errors);
             validate_expr(key, fields, bindings, helpers, errors);
         }

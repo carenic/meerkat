@@ -354,12 +354,50 @@ fn gen_schema_expr(expr: &ExprDef) -> TokenStream {
             quote! { Expr::MapGet { map: Box::new(#map_e), key: Box::new(#key_e) } }
         }
         ExprDef::MapGetCopied { map, key } => {
-            // Schema-side, `get_copied` is indistinguishable from `get` — both
-            // are lookups into the same map keyed on the same expression. The
-            // `.copied()` difference is a Rust codegen detail.
+            // `get_copied` returns `Option<V>` in Rust. Lower to a
+            // schema-level `IF contains_key THEN Some(map[key]) ELSE None`
+            // so the TLA+ emission and the Rust kernel eval agree on the
+            // `Option<V>` return type. Plain `MapGet` keeps the raw-value
+            // semantics for helpers that expect `V` directly (e.g.
+            // `step_status: Map<StepId, Option<StepRunStatus>>` where the
+            // map value is already an `Option`).
             let map_e = gen_schema_expr(map);
             let key_e = gen_schema_expr(key);
-            quote! { Expr::MapGet { map: Box::new(#map_e), key: Box::new(#key_e) } }
+            let map_e2 = gen_schema_expr(map);
+            let key_e2 = gen_schema_expr(key);
+            quote! { Expr::IfElse {
+                condition: Box::new(Expr::MapContainsKey {
+                    map: Box::new(#map_e),
+                    key: Box::new(#key_e),
+                }),
+                then_expr: Box::new(Expr::Some(Box::new(Expr::MapGet {
+                    map: Box::new(#map_e2),
+                    key: Box::new(#key_e2),
+                }))),
+                else_expr: Box::new(Expr::None),
+            } }
+        }
+        ExprDef::MapGetCloned { map, key } => {
+            // Same `Option<V>` semantics as `MapGetCopied` — see comment
+            // on the `MapGetCopied` arm above. The `.cloned()` vs
+            // `.copied()` distinction is a Rust codegen detail that the
+            // ExprDef layer preserves; at the schema level both lower to
+            // the same `IfElse(contains_key, Some(MapGet), None)` shape.
+            let map_e = gen_schema_expr(map);
+            let key_e = gen_schema_expr(key);
+            let map_e2 = gen_schema_expr(map);
+            let key_e2 = gen_schema_expr(key);
+            quote! { Expr::IfElse {
+                condition: Box::new(Expr::MapContainsKey {
+                    map: Box::new(#map_e),
+                    key: Box::new(#key_e),
+                }),
+                then_expr: Box::new(Expr::Some(Box::new(Expr::MapGet {
+                    map: Box::new(#map_e2),
+                    key: Box::new(#key_e2),
+                }))),
+                else_expr: Box::new(Expr::None),
+            } }
         }
         ExprDef::MapKeys(inner) => {
             let inner_e = gen_schema_expr(inner);
@@ -898,6 +936,10 @@ fn references_phase_field(expr: &ExprDef, phase_field_name: &str) -> bool {
             key: value,
         }
         | ExprDef::MapGetCopied {
+            map: collection,
+            key: value,
+        }
+        | ExprDef::MapGetCloned {
             map: collection,
             key: value,
         } => {

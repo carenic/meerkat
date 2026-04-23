@@ -115,6 +115,18 @@ fn meerkat_machine_inputs_equal_runtime_manifest_exactly() {
         // `protocol_ops_barrier_satisfaction` handoff helper, not
         // through `MeerkatMachineCommand`.
         "OpsBarrierSatisfied",
+        // Round-5 Track-B (PR #340): peer-projection overlay inputs.
+        // `ApplyMobPeerOverlay` is dispatched by the
+        // `RecomputeMobPeerOverlay` composition driver (see
+        // `meerkat_mob_seam_composition` driver block). The local-
+        // endpoint and direct-peer inputs are staged by the peering
+        // surface shell paths (not through `MeerkatMachineCommand`),
+        // analogous to the peer-ingress ownership inputs above.
+        "ApplyMobPeerOverlay",
+        "PublishLocalEndpoint",
+        "ClearLocalEndpoint",
+        "AddDirectPeerEndpoint",
+        "RemoveDirectPeerEndpoint",
     ];
     let actual: BTreeSet<&str> = variant_names(&schema.inputs.variants)
         .into_iter()

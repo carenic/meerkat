@@ -175,6 +175,16 @@ pub(crate) fn project_state(
         supervisor_bound_peer_id: None,
         supervisor_bound_address: None,
         supervisor_bound_epoch: None,
+        // Track-B (R5): peer-projection state — initialised empty in
+        // the authority projection. The real values flow through the
+        // DSL state machine as `PublishLocalEndpoint` /
+        // `AddDirectPeerEndpoint` / `ApplyMobPeerOverlay` transitions
+        // are applied.
+        local_endpoint: None,
+        direct_peer_endpoints: std::collections::BTreeSet::new(),
+        mob_overlay_peer_endpoints: std::collections::BTreeSet::new(),
+        peer_projection_epoch: 0,
+        mob_overlay_epoch: 0,
     }
 }
 

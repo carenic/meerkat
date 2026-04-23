@@ -1712,6 +1712,52 @@ impl From<crate::HandlingMode> for InputLane {
     }
 }
 
+// Track-B (R5): declarative peer endpoint descriptor for the runtime
+// DSL. Shape mirrors `meerkat_core::comms::TrustedPeerSpec`. The
+// catalog DSL holds an identical type; the two are structurally
+// equivalent so the schema validator sees consistent opaque struct
+// shapes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct PeerEndpoint {
+    pub name: String,
+    pub peer_id: String,
+    pub address: String,
+}
+
+impl PeerEndpoint {
+    pub fn new(
+        name: impl Into<String>,
+        peer_id: impl Into<String>,
+        address: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            peer_id: peer_id.into(),
+            address: address.into(),
+        }
+    }
+}
+
+impl From<meerkat_core::comms::TrustedPeerSpec> for PeerEndpoint {
+    fn from(spec: meerkat_core::comms::TrustedPeerSpec) -> Self {
+        Self {
+            name: spec.name,
+            peer_id: spec.peer_id,
+            address: spec.address,
+        }
+    }
+}
+
+impl From<PeerEndpoint> for meerkat_core::comms::TrustedPeerSpec {
+    fn from(ep: PeerEndpoint) -> Self {
+        Self {
+            name: ep.name,
+            peer_id: ep.peer_id,
+            address: ep.address,
+        }
+    }
+}
+
 // Ensure we keep the exact generated schema DSL body from the catalog source.
 machine! {
     machine MeerkatMachine {
@@ -1979,6 +2025,27 @@ machine! {
             supervisor_bound_peer_id: Option<String>,
             supervisor_bound_address: Option<String>,
             supervisor_bound_epoch: Option<u64>,
+
+            // --- Track-B (R5): peer-projection state ---
+            //
+            // Identity-level wiring from MobMachine is projected onto
+            // endpoint-level peer sets here. See the schema DSL
+            // (`catalog::dsl::meerkat_machine`) for the full rationale;
+            // the `effective` trust set is derived as
+            // `direct_peer_endpoints ∪ mob_overlay_peer_endpoints` by
+            // the comms reconciliation handler (Commit 4) on receipt
+            // of `CommsTrustReconcileRequested`.
+            //
+            // `peer_projection_epoch` carries general effective-set
+            // change freshness; `mob_overlay_epoch` is the overlay-
+            // specific watermark the `stale_overlay_epoch` guard uses
+            // so direct-endpoint mutations cannot lock out overlay
+            // dispatches.
+            local_endpoint: Option<PeerEndpoint>,
+            direct_peer_endpoints: Set<PeerEndpoint>,
+            mob_overlay_peer_endpoints: Set<PeerEndpoint>,
+            peer_projection_epoch: u64,
+            mob_overlay_epoch: u64,
         }
 
         init(Initializing) {
@@ -2085,6 +2152,12 @@ machine! {
             supervisor_bound_peer_id = None,
             supervisor_bound_address = None,
             supervisor_bound_epoch = None,
+            // Track-B (R5): peer-projection state initialised empty.
+            local_endpoint = None,
+            direct_peer_endpoints = EmptySet,
+            mob_overlay_peer_endpoints = EmptySet,
+            peer_projection_epoch = 0,
+            mob_overlay_epoch = 0,
         }
 
         terminal [Destroyed]
@@ -2396,6 +2469,24 @@ machine! {
                 peer_id: String,
                 epoch: u64,
             },
+
+            // Track-B (R5) peer-projection inputs. See catalog DSL for
+            // full rationale. Rejected in `Initializing`, `Retired`,
+            // `Stopped`, `Destroyed`.
+            PublishLocalEndpoint {
+                endpoint: PeerEndpoint,
+            },
+            ClearLocalEndpoint,
+            AddDirectPeerEndpoint {
+                endpoint: PeerEndpoint,
+            },
+            RemoveDirectPeerEndpoint {
+                endpoint: PeerEndpoint,
+            },
+            ApplyMobPeerOverlay {
+                epoch: u64,
+                endpoints: Set<PeerEndpoint>,
+            },
         }
 
         surface_only [
@@ -2541,6 +2632,10 @@ machine! {
                 frontier_ms: u64,
             },
             RealtimeReconnectPolicyChanged { new_policy: Enum<RealtimeReconnectPolicy> },
+            // Track-B (R5) peer-projection effects.
+            LocalEndpointChanged { endpoint: Option<PeerEndpoint> },
+            PeerProjectionChanged { peer_projection_epoch: u64 },
+            CommsTrustReconcileRequested { peer_projection_epoch: u64 },
         }
 
         // =====================================================================
@@ -2607,6 +2702,9 @@ machine! {
         disposition RealtimeProductTurnPhaseChanged => external,
         disposition RealtimeProjectionFreshnessChanged => external,
         disposition RealtimeReconnectPolicyChanged => external,
+        disposition LocalEndpointChanged => external,
+        disposition PeerProjectionChanged => external,
+        disposition CommsTrustReconcileRequested => external,
 
         // =====================================================================
         // Invariants
@@ -6198,6 +6296,78 @@ machine! {
                 self.supervisor_bound_epoch = None;
             }
             to Idle
+        }
+
+        // =====================================================================
+        // Track-B (R5): peer-projection transitions.
+        //
+        // Valid in active session phases (`Idle`, `Attached`,
+        // `Running`). See catalog DSL for the full rationale and
+        // design notes. The `to Idle` clause is filler syntax —
+        // `per_phase` expansion overrides `to_phase` to the current
+        // phase (self-loop); the parser requires `to <Phase>` to be
+        // present.
+        // =====================================================================
+
+        transition PublishLocalEndpoint {
+            per_phase [Idle, Attached, Running]
+            on input PublishLocalEndpoint { endpoint }
+            update {
+                self.local_endpoint = Some(endpoint);
+            }
+            to Idle
+            emit LocalEndpointChanged { endpoint: Some(endpoint) }
+        }
+
+        transition ClearLocalEndpoint {
+            per_phase [Idle, Attached, Running]
+            on input ClearLocalEndpoint
+            guard "local_endpoint_present" { self.local_endpoint != None }
+            update {
+                self.local_endpoint = None;
+            }
+            to Idle
+            emit LocalEndpointChanged { endpoint: None }
+        }
+
+        transition AddDirectPeerEndpoint {
+            per_phase [Idle, Attached, Running]
+            on input AddDirectPeerEndpoint { endpoint }
+            guard "endpoint_not_already_direct" { self.direct_peer_endpoints.contains(endpoint) == false }
+            update {
+                self.direct_peer_endpoints.insert(endpoint);
+                self.peer_projection_epoch += 1;
+            }
+            to Idle
+            emit PeerProjectionChanged { peer_projection_epoch: self.peer_projection_epoch }
+            emit CommsTrustReconcileRequested { peer_projection_epoch: self.peer_projection_epoch }
+        }
+
+        transition RemoveDirectPeerEndpoint {
+            per_phase [Idle, Attached, Running]
+            on input RemoveDirectPeerEndpoint { endpoint }
+            guard "endpoint_present_in_direct" { self.direct_peer_endpoints.contains(endpoint) == true }
+            update {
+                self.direct_peer_endpoints.remove(endpoint);
+                self.peer_projection_epoch += 1;
+            }
+            to Idle
+            emit PeerProjectionChanged { peer_projection_epoch: self.peer_projection_epoch }
+            emit CommsTrustReconcileRequested { peer_projection_epoch: self.peer_projection_epoch }
+        }
+
+        transition ApplyMobPeerOverlay {
+            per_phase [Idle, Attached, Running]
+            on input ApplyMobPeerOverlay { epoch, endpoints }
+            guard "stale_overlay_epoch" { epoch > self.mob_overlay_epoch }
+            update {
+                self.mob_overlay_peer_endpoints = endpoints;
+                self.mob_overlay_epoch = epoch;
+                self.peer_projection_epoch += 1;
+            }
+            to Idle
+            emit PeerProjectionChanged { peer_projection_epoch: self.peer_projection_epoch }
+            emit CommsTrustReconcileRequested { peer_projection_epoch: self.peer_projection_epoch }
         }
     }
 }

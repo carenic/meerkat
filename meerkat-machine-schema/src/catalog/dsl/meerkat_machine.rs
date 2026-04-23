@@ -132,6 +132,51 @@ machine! {
             supervisor_bound_peer_id: Option<String>,
             supervisor_bound_address: Option<String>,
             supervisor_bound_epoch: Option<u64>,
+
+            // --- Track-B (R5): peer-projection state ---
+            //
+            // The identity-level wiring graph owned by `MobMachine` is
+            // projected onto endpoint-level peer sets here. This session
+            // sees its own "local" endpoint (what it publishes as its
+            // address to the comms layer), a set of "direct" peer
+            // endpoints (non-mob peering — e.g. standalone product
+            // sessions wiring to each other), and a "mob overlay" set
+            // computed by the `RecomputeMobPeerOverlay` composition
+            // driver from `wiring_edges` + `member_session_bindings`.
+            //
+            // The effective trust set is the union `direct ∪ overlay`.
+            // It is NOT stored separately here — `effective` is a pure
+            // read-side projection (dogma #11: "derived projections
+            // never authoritative"). The comms reconciliation handler
+            // consumes `CommsTrustReconcileRequested` and reads the
+            // snapshot to compute the effective set on receipt.
+            //
+            // Two independent epoch namespaces:
+            //
+            // * `peer_projection_epoch` advances on every Track-B
+            //   peer-projection mutation (direct add/remove + overlay
+            //   apply). Carried in `PeerProjectionChanged` /
+            //   `CommsTrustReconcileRequested` so the comms
+            //   reconciliation handler can linearize trust-store
+            //   reconciles.
+            //
+            // * `mob_overlay_epoch` is the overlay-specific watermark
+            //   the `stale_overlay_epoch` guard reads. The
+            //   `RecomputeMobPeerOverlay` driver supplies the overlay
+            //   epoch; it threads the driver's monotonically
+            //   increasing per-overlay counter (the driver in turn
+            //   threads `MobMachine.topology_epoch` through that
+            //   counter). Keeping this namespace separate from
+            //   `peer_projection_epoch` prevents direct-endpoint
+            //   mutations (which legitimately bump
+            //   `peer_projection_epoch`) from accidentally racing
+            //   ahead of the overlay guard and locking out future
+            //   overlay dispatches.
+            local_endpoint: Option<PeerEndpoint>,
+            direct_peer_endpoints: Set<PeerEndpoint>,
+            mob_overlay_peer_endpoints: Set<PeerEndpoint>,
+            peer_projection_epoch: u64,
+            mob_overlay_epoch: u64,
         }
 
         init(Initializing) {
@@ -165,6 +210,13 @@ machine! {
             supervisor_bound_peer_id = None,
             supervisor_bound_address = None,
             supervisor_bound_epoch = None,
+
+            // Track-B (R5): peer-projection state — initialised empty.
+            local_endpoint = None,
+            direct_peer_endpoints = EmptySet,
+            mob_overlay_peer_endpoints = EmptySet,
+            peer_projection_epoch = 0,
+            mob_overlay_epoch = 0,
         }
 
         terminal [Destroyed]
@@ -341,6 +393,47 @@ machine! {
                 peer_id: String,
                 epoch: u64,
             },
+
+            // =====================================================================
+            // Track-B (R5): peer-projection inputs.
+            //
+            // Drive the MeerkatMachine's endpoint-level peer sets. The
+            // `RecomputeMobPeerOverlay` composition driver emits
+            // `ApplyMobPeerOverlay` to each bound session based on the
+            // identity-level wiring graph owned by MobMachine; direct
+            // peering surfaces emit `PublishLocalEndpoint` /
+            // `AddDirectPeerEndpoint` / `RemoveDirectPeerEndpoint` when
+            // they establish or tear down non-mob peering.
+            //
+            // - `PublishLocalEndpoint { endpoint }` / `ClearLocalEndpoint`:
+            //   session self-endpoint publication. `Clear` guarded on
+            //   `local_endpoint != None`.
+            // - `AddDirectPeerEndpoint { endpoint }` / `RemoveDirectPeerEndpoint { endpoint }`:
+            //   non-mob peering. Add guarded on not-already-direct;
+            //   Remove guarded on present-in-direct. Both bump
+            //   `peer_projection_epoch` and emit
+            //   `CommsTrustReconcileRequested`.
+            // - `ApplyMobPeerOverlay { epoch, endpoints }`: replaces
+            //   `mob_overlay_peer_endpoints` wholesale and sets
+            //   `peer_projection_epoch = epoch`. Guarded by
+            //   `stale_overlay_epoch` — rejects when
+            //   `epoch < self.peer_projection_epoch` so out-of-order
+            //   overlay applications cannot clobber a newer topology.
+            // =====================================================================
+            PublishLocalEndpoint {
+                endpoint: PeerEndpoint,
+            },
+            ClearLocalEndpoint,
+            AddDirectPeerEndpoint {
+                endpoint: PeerEndpoint,
+            },
+            RemoveDirectPeerEndpoint {
+                endpoint: PeerEndpoint,
+            },
+            ApplyMobPeerOverlay {
+                epoch: u64,
+                endpoints: Set<PeerEndpoint>,
+            },
         }
 
         surface_only [
@@ -466,6 +559,28 @@ machine! {
             RealtimeReconnectPolicyChanged { new_policy: Enum<RealtimeReconnectPolicy> },
             // Live-topology reconfigure effects.
             LiveTopologyPhaseChanged,
+            // --- Track-B (R5): peer-projection effects ---
+            //
+            // `LocalEndpointChanged` fires on publish/clear so the comms
+            // layer can re-advertise the session's self-endpoint.
+            //
+            // `PeerProjectionChanged` is the declarative "the effective
+            // peer set was recomputed" signal. Carries the
+            // post-transition `peer_projection_epoch` so consumers can
+            // linearize observations.
+            //
+            // `CommsTrustReconcileRequested` fires whenever the
+            // effective peer set (direct ∪ overlay) could have
+            // changed. The comms runtime reconciliation handler
+            // (Commit 4) reads the snapshot on receipt, computes the
+            // effective set via `direct_peer_endpoints ∪
+            // mob_overlay_peer_endpoints`, and diffs against its
+            // own "applied trust store" view to compute add/remove
+            // deltas. The DSL emits "reconcile needed at epoch N";
+            // the shell does the mechanical trust-store diff.
+            LocalEndpointChanged { endpoint: Option<PeerEndpoint> },
+            PeerProjectionChanged { peer_projection_epoch: u64 },
+            CommsTrustReconcileRequested { peer_projection_epoch: u64 },
         }
 
         // =====================================================================
@@ -526,6 +641,9 @@ machine! {
         disposition RealtimeProjectionFreshnessChanged => external,
         disposition RealtimeReconnectPolicyChanged => external,
         disposition LiveTopologyPhaseChanged => external,
+        disposition LocalEndpointChanged => external,
+        disposition PeerProjectionChanged => external,
+        disposition CommsTrustReconcileRequested => external,
 
         // =====================================================================
         // Invariants
@@ -2548,6 +2666,103 @@ machine! {
             update {}
             to Running
         }
+
+        // =====================================================================
+        // Track-B (R5): peer-projection transitions.
+        //
+        // Active session phases (`Idle`, `Attached`, `Running`) accept
+        // peer-projection mutations via `per_phase [...]`. Non-active
+        // phases (`Initializing`, `Retired`, `Stopped`, `Destroyed`)
+        // do not — the session is not participating in peer trust
+        // decisions outside the active phases.
+        //
+        // `per_phase` uses the DSL's multi-phase self-loop construct
+        // that expands into one transition per listed phase at macro
+        // expansion. Transitions are "to" the same phase they fired
+        // from.
+        // =====================================================================
+
+        // PublishLocalEndpoint — no effective-peer-set change.
+        //
+        // The `to Idle` is filler syntax: `per_phase` expansion
+        // overrides `to_phase` to each listed phase (self-loop), but
+        // the parser still requires the `to <Phase>` clause.
+        transition PublishLocalEndpoint {
+            per_phase [Idle, Attached, Running]
+            on input PublishLocalEndpoint { endpoint }
+            update {
+                self.local_endpoint = Some(endpoint);
+            }
+            to Idle
+            emit LocalEndpointChanged { endpoint: Some(endpoint) }
+        }
+
+        // ClearLocalEndpoint — guarded on Some(endpoint) being present.
+        transition ClearLocalEndpoint {
+            per_phase [Idle, Attached, Running]
+            on input ClearLocalEndpoint
+            guard "local_endpoint_present" { self.local_endpoint != None }
+            update {
+                self.local_endpoint = None;
+            }
+            to Idle
+            emit LocalEndpointChanged { endpoint: None }
+        }
+
+        // AddDirectPeerEndpoint — direct set update, epoch bump,
+        // reconcile effect.
+        transition AddDirectPeerEndpoint {
+            per_phase [Idle, Attached, Running]
+            on input AddDirectPeerEndpoint { endpoint }
+            guard "endpoint_not_already_direct" { self.direct_peer_endpoints.contains(endpoint) == false }
+            update {
+                self.direct_peer_endpoints.insert(endpoint);
+                self.peer_projection_epoch += 1;
+            }
+            to Idle
+            emit PeerProjectionChanged { peer_projection_epoch: self.peer_projection_epoch }
+            emit CommsTrustReconcileRequested { peer_projection_epoch: self.peer_projection_epoch }
+        }
+
+        // RemoveDirectPeerEndpoint — direct set removal.
+        transition RemoveDirectPeerEndpoint {
+            per_phase [Idle, Attached, Running]
+            on input RemoveDirectPeerEndpoint { endpoint }
+            guard "endpoint_present_in_direct" { self.direct_peer_endpoints.contains(endpoint) == true }
+            update {
+                self.direct_peer_endpoints.remove(endpoint);
+                self.peer_projection_epoch += 1;
+            }
+            to Idle
+            emit PeerProjectionChanged { peer_projection_epoch: self.peer_projection_epoch }
+            emit CommsTrustReconcileRequested { peer_projection_epoch: self.peer_projection_epoch }
+        }
+
+        // ApplyMobPeerOverlay — stale-epoch guard on the overlay-
+        // specific `mob_overlay_epoch`, wholesale overlay replacement.
+        // The guard uses `>` (strictly-newer) rather than `>=` so
+        // repeat application of the same epoch is rejected (the
+        // driver's epoch counter already suppresses no-op dispatches;
+        // any re-delivery at the same epoch is a retry-bug on the
+        // transport layer, not a legitimate state change).
+        //
+        // Both epochs bump on a successful apply: `mob_overlay_epoch`
+        // tracks overlay-specific freshness (used by the guard),
+        // `peer_projection_epoch` tracks general effective-set changes
+        // (carried in `CommsTrustReconcileRequested`).
+        transition ApplyMobPeerOverlay {
+            per_phase [Idle, Attached, Running]
+            on input ApplyMobPeerOverlay { epoch, endpoints }
+            guard "stale_overlay_epoch" { epoch > self.mob_overlay_epoch }
+            update {
+                self.mob_overlay_peer_endpoints = endpoints;
+                self.mob_overlay_epoch = epoch;
+                self.peer_projection_epoch += 1;
+            }
+            to Idle
+            emit PeerProjectionChanged { peer_projection_epoch: self.peer_projection_epoch }
+            emit CommsTrustReconcileRequested { peer_projection_epoch: self.peer_projection_epoch }
+        }
     }
 }
 
@@ -2804,6 +3019,39 @@ pub enum RuntimeNoticeKind {
     Stop,
     Exit,
     Recover,
+}
+
+/// Track-B (R5): declarative peer endpoint descriptor.
+///
+/// Carries the three fields the comms runtime needs to install a
+/// trusted peer: `name` (human-readable), `peer_id` (Ed25519 public
+/// key), `address` (transport URL). Shape mirrors
+/// `meerkat_core::comms::TrustedPeerSpec` but lives here as a
+/// DSL-local type so the schema validator sees a consistent opaque
+/// struct shape (matching `WiringEdge` in `mob_machine`).
+///
+/// Equality is component-wise. `PartialOrd` + `Ord` enable
+/// `BTreeSet<PeerEndpoint>` storage; `Hash` is retained for
+/// `HashSet` use at call sites that prefer it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct PeerEndpoint {
+    pub name: String,
+    pub peer_id: String,
+    pub address: String,
+}
+
+impl PeerEndpoint {
+    pub fn new(
+        name: impl Into<String>,
+        peer_id: impl Into<String>,
+        address: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            peer_id: peer_id.into(),
+            address: address.into(),
+        }
+    }
 }
 
 // =====================================================================
