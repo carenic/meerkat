@@ -26,9 +26,6 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RecordPlanningWindowActive`
   - anchors: `schedule_lifecycle`
   - scenarios: `schedule_pause_resume_delete`
-- `RecordPlanningWindowPaused`
-  - anchors: `schedule_lifecycle`
-  - scenarios: `schedule_pause_resume_delete`
 - `PauseActiveOrPaused`
   - anchors: `schedule_lifecycle`
   - scenarios: `schedule_pause_resume_delete`

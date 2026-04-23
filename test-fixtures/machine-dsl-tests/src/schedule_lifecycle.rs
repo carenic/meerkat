@@ -148,17 +148,11 @@ machine! {
             emit PlanningWindowRecorded { planning_cursor_utc_ms: planning_cursor_utc_ms, next_occurrence_ordinal: next_occurrence_ordinal }
         }
 
-        transition RecordPlanningWindowPaused {
-            on input RecordPlanningWindow { planning_cursor_utc_ms, next_occurrence_ordinal }
-            guard "planning_window_advances_ordinal" { self.lifecycle_phase == Phase::Paused && next_occurrence_ordinal > 0 }
-            update {
-                self.planning_cursor_utc_ms = Some(planning_cursor_utc_ms);
-                self.next_occurrence_ordinal = next_occurrence_ordinal;
-            }
-            to Paused
-            emit EmitScheduleNotice { new_state: self.lifecycle_phase, revision: self.revision }
-            emit PlanningWindowRecorded { planning_cursor_utc_ms: planning_cursor_utc_ms, next_occurrence_ordinal: next_occurrence_ordinal }
-        }
+        // NB: no `RecordPlanningWindowPaused` — planning only advances while
+        // the schedule is Active. Paused schedules MUST reject
+        // `RecordPlanningWindow` as an invalid transition; this closes the
+        // race where a driver tick could race with `Pause` and silently
+        // advance the planning cursor against a paused schedule.
 
         // --- Pause / Resume (from Active or Paused) ---
 
@@ -289,6 +283,32 @@ mod tests {
             ScheduleLifecycleInput::Pause { at_utc_ms: 400 },
         );
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn record_planning_window_rejected_from_paused() {
+        // Catches reintroduction of `RecordPlanningWindowPaused`: a driver/Pause
+        // race must not silently advance the planning cursor on a paused schedule.
+        let mut auth = ScheduleLifecycleMachineAuthority::new();
+        ScheduleLifecycleMachineMutator::apply(
+            &mut auth,
+            ScheduleLifecycleInput::Pause { at_utc_ms: 100 },
+        )
+        .unwrap();
+        assert_eq!(auth.state.phase(), ScheduleLifecycleState::Paused);
+
+        let r = ScheduleLifecycleMachineMutator::apply(
+            &mut auth,
+            ScheduleLifecycleInput::RecordPlanningWindow {
+                planning_cursor_utc_ms: 500,
+                next_occurrence_ordinal: 1,
+            },
+        );
+        assert!(
+            r.is_err(),
+            "RecordPlanningWindow must be rejected while the schedule is Paused",
+        );
+        assert_eq!(auth.state.planning_cursor_utc_ms, None);
     }
 
     #[test]

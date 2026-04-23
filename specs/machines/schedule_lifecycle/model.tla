@@ -90,16 +90,6 @@ RecordPlanningWindowActive(arg_planning_cursor_utc_ms, arg_next_occurrence_ordin
     /\ UNCHANGED << revision, trigger_key, target_binding_key, misfire_policy, overlap_policy, missing_target_policy >>
 
 
-RecordPlanningWindowPaused(arg_planning_cursor_utc_ms, arg_next_occurrence_ordinal) ==
-    /\ phase = "Paused"
-    /\ (arg_next_occurrence_ordinal > 0)
-    /\ phase' = "Paused"
-    /\ model_step_count' = model_step_count + 1
-    /\ planning_cursor_utc_ms' = Some(arg_planning_cursor_utc_ms)
-    /\ next_occurrence_ordinal' = arg_next_occurrence_ordinal
-    /\ UNCHANGED << revision, trigger_key, target_binding_key, misfire_policy, overlap_policy, missing_target_policy >>
-
-
 PauseActiveOrPaused(at_utc_ms) ==
     /\ phase = "Active" \/ phase = "Paused"
     /\ phase' = "Paused"
@@ -137,7 +127,6 @@ Next ==
     \/ \E arg_trigger_key \in StringValues : \E arg_target_binding_key \in StringValues : \E arg_misfire_policy \in MisfirePolicyValues : \E arg_overlap_policy \in OverlapPolicyValues : \E arg_missing_target_policy \in MissingTargetPolicyValues : ReviseActive(arg_trigger_key, arg_target_binding_key, arg_misfire_policy, arg_overlap_policy, arg_missing_target_policy)
     \/ \E arg_trigger_key \in StringValues : \E arg_target_binding_key \in StringValues : \E arg_misfire_policy \in MisfirePolicyValues : \E arg_overlap_policy \in OverlapPolicyValues : \E arg_missing_target_policy \in MissingTargetPolicyValues : RevisePaused(arg_trigger_key, arg_target_binding_key, arg_misfire_policy, arg_overlap_policy, arg_missing_target_policy)
     \/ \E arg_planning_cursor_utc_ms \in 0..2 : \E arg_next_occurrence_ordinal \in 0..2 : RecordPlanningWindowActive(arg_planning_cursor_utc_ms, arg_next_occurrence_ordinal)
-    \/ \E arg_planning_cursor_utc_ms \in 0..2 : \E arg_next_occurrence_ordinal \in 0..2 : RecordPlanningWindowPaused(arg_planning_cursor_utc_ms, arg_next_occurrence_ordinal)
     \/ \E at_utc_ms \in 0..2 : PauseActiveOrPaused(at_utc_ms)
     \/ \E at_utc_ms \in 0..2 : ResumeActiveOrPaused(at_utc_ms)
     \/ \E at_utc_ms \in 0..2 : DeleteActive(at_utc_ms)

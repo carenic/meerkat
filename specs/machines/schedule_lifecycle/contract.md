@@ -63,14 +63,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `EmitScheduleNotice`, `PlanningWindowRecorded`
 - To: `Active`
 
-### `RecordPlanningWindowPaused`
-- From: `Paused`
-- On: `RecordPlanningWindow`(planning_cursor_utc_ms, next_occurrence_ordinal)
-- Guards:
-  - `planning_window_advances_ordinal`
-- Emits: `EmitScheduleNotice`, `PlanningWindowRecorded`
-- To: `Paused`
-
 ### `PauseActiveOrPaused`
 - From: `Active`, `Paused`
 - On: `Pause`(at_utc_ms)
