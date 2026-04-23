@@ -149,6 +149,30 @@ impl SessionAgent for FactoryAgent {
         self.agent.replace_client(client);
     }
 
+    fn hot_swap_llm_identity(
+        &mut self,
+        client: std::sync::Arc<dyn meerkat_core::AgentLlmClient>,
+        identity: meerkat_core::SessionLlmIdentity,
+    ) -> Result<(), meerkat_core::error::AgentError> {
+        // Atomically update the live client and the session's durable
+        // LLM identity so subsequent turns run against the new
+        // model/provider/connection_ref and persisted recovery sees
+        // the swap.
+        self.agent.replace_client(client);
+        if let Some(mut metadata) = self.agent.session().session_metadata() {
+            metadata.apply_llm_identity(&identity);
+            self.agent
+                .session_mut()
+                .set_session_metadata(metadata)
+                .map_err(|e| {
+                    meerkat_core::error::AgentError::ConfigError(format!(
+                        "failed to apply hot-swapped llm identity to session metadata: {e}"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
     fn update_keep_alive(&mut self, keep_alive: bool) {
         if let Some(mut metadata) = self.agent.session().session_metadata() {
             metadata.keep_alive = keep_alive;
@@ -262,7 +286,7 @@ impl SessionAgent for FactoryAgent {
     }
 
     fn execution_snapshot(&self) -> Option<meerkat_core::AgentExecutionSnapshot> {
-        Some(self.agent.execution_snapshot())
+        self.agent.execution_snapshot()
     }
 
     fn tool_scope_snapshot(&self) -> Option<meerkat_core::ToolScopeSnapshot> {

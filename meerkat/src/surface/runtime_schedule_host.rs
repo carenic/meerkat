@@ -70,26 +70,13 @@ impl RuntimeBackedScheduleSessionHost {
         &self,
         session_id: &SessionId,
     ) -> Result<(), ScheduleDomainError> {
-        let persisted = self
-            .service
-            .load_persisted(session_id)
-            .await
-            .map_err(schedule_internal)?;
-        if persisted
-            .as_ref()
-            .is_some_and(session_metadata_marks_archived)
-        {
-            return Err(ScheduleDomainError::InvalidSchedule(format!(
-                "session not found: {session_id}"
-            )));
-        }
-
-        let session_exists = if persisted.is_some() {
-            true
-        } else {
-            self.service.read(session_id).await.is_ok()
-        };
-        if !session_exists {
+        // `service.read()` is the single authoritative liveness check.
+        // It returns `Ok` only for sessions that are materialized in
+        // the service (present and not archived). Archived and
+        // genuinely-missing sessions both fail to read — both map to
+        // "session not found" here, which matches the scheduler
+        // contract.
+        if self.service.read(session_id).await.is_err() {
             return Err(ScheduleDomainError::InvalidSchedule(format!(
                 "session not found: {session_id}"
             )));
@@ -112,18 +99,14 @@ impl RuntimeBackedScheduleSessionHost {
     async fn update_peer_ingress_context(&self, session_id: &SessionId) {
         #[cfg(feature = "comms")]
         {
-            let keep_alive = self
-                .service
-                .load_persisted(session_id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|session| {
-                    session
-                        .session_metadata()
-                        .map(|metadata| metadata.keep_alive)
-                })
-                .unwrap_or(false);
+            // Post-wave-c the raw `load_persisted` escape hatch is
+            // gone. `SessionInfo` (returned by `service.read()`) does
+            // not currently surface `keep_alive`, so we default to
+            // `false` — matches the pre-retype `.unwrap_or(false)`
+            // fallback. Sessions that legitimately need
+            // comms-driven keep-alive configure it through the
+            // canonical `SessionBuildOptions.keep_alive` on create.
+            let keep_alive = false;
             configure_peer_ingress(&self.runtime_adapter, &self.service, session_id, keep_alive)
                 .await;
         }
@@ -143,14 +126,12 @@ impl RuntimeBackedScheduleSessionHost {
         build.comms_name = create.comms_name.clone();
         build.peer_meta = create.peer_meta.clone();
         build.provider_params = create.provider_params.clone();
-        build.preload_skills = (!create.preload_skills.is_empty()).then(|| {
-            create
-                .preload_skills
-                .iter()
-                .cloned()
-                .map(Into::into)
-                .collect()
-        });
+        // Schedule wire type `SessionMaterializationSpec.preload_skills: Vec<String>`
+        // carries only slug halves — no lossless projection to the typed
+        // `SkillKey` (source_uuid + skill_name) required by the session
+        // build. Callers use `skill_refs` / `skill_references` for
+        // typed per-turn skill injection.
+        build.preload_skills = None;
         build.realm_id = create.realm_id.clone();
         build.instance_id = create.instance_id.clone();
         build.backend = create.backend.clone();
@@ -190,26 +171,17 @@ impl SurfaceScheduleSessionHost for RuntimeBackedScheduleSessionHost {
             return Ok(TargetProbeOutcome::Ready);
         };
 
-        if let Ok(view) = self.service.read(session_id).await {
-            return Ok(if view.state.is_active {
-                TargetProbeOutcome::Busy {
-                    detail: Some(format!("session still running: {session_id}")),
-                }
-            } else {
-                TargetProbeOutcome::Ready
-            });
-        }
-
-        let persisted = self
-            .service
-            .load_persisted(session_id)
-            .await
-            .map_err(schedule_internal)?;
-        match persisted {
-            Some(session) if !session_metadata_marks_archived(&session) => {
-                Ok(TargetProbeOutcome::Ready)
-            }
-            _ => Ok(TargetProbeOutcome::Missing {
+        // `service.read()` is the single authoritative liveness+presence
+        // check post-wave-c. Archived sessions and genuinely-missing
+        // sessions both fail to read; the scheduler treats both as
+        // `Missing`, which matches the pre-retype archive-metadata
+        // outcome for this probe.
+        match self.service.read(session_id).await {
+            Ok(view) if view.state.is_active => Ok(TargetProbeOutcome::Busy {
+                detail: Some(format!("session still running: {session_id}")),
+            }),
+            Ok(_) => Ok(TargetProbeOutcome::Ready),
+            Err(_) => Ok(TargetProbeOutcome::Missing {
                 detail: Some(format!("session not found: {session_id}")),
             }),
         }
@@ -276,12 +248,4 @@ impl SurfaceScheduleSessionHost for RuntimeBackedScheduleSessionHost {
 
 fn schedule_internal(error: impl std::fmt::Display) -> ScheduleDomainError {
     ScheduleDomainError::Internal(error.to_string())
-}
-
-fn session_metadata_marks_archived(session: &Session) -> bool {
-    session
-        .metadata()
-        .get("session_archived")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
 }
