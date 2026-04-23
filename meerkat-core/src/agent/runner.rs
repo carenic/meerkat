@@ -418,43 +418,8 @@ where
 
     /// Snapshot the agent's live execution state for diagnostics and mapping.
     pub fn execution_snapshot(&self) -> crate::AgentExecutionSnapshot {
-        if let Some(handle) = self.turn_state_handle.as_deref() {
-            if let Some(snapshot) = runtime_execution_snapshot(handle, self.applied_cursor) {
-                return snapshot;
-            }
-            tracing::warn!(
-                "failed to convert runtime turn-state snapshot; falling back to standalone core snapshot"
-            );
-        }
-
-        crate::AgentExecutionSnapshot {
-            loop_state: self.state.clone(),
-            turn_phase: self.turn_state.phase(),
-            active_run_id: self.turn_state.active_run().cloned(),
-            primitive_kind: self.turn_state.primitive_kind(),
-            admitted_content_shape: self.turn_state.admitted_content_shape().cloned(),
-            vision_enabled: self.turn_state.vision_enabled(),
-            image_tool_results_enabled: self.turn_state.image_tool_results_enabled(),
-            tool_calls_pending: self.turn_state.tool_calls_pending(),
-            pending_operation_ids: self
-                .turn_state
-                .pending_op_ids()
-                .map(|ids| ids.into_iter().cloned().collect()),
-            barrier_operation_ids: self
-                .turn_state
-                .barrier_op_ids()
-                .into_iter()
-                .cloned()
-                .collect(),
-            has_barrier_ops: self.turn_state.has_barrier_ops(),
-            barrier_satisfied: self.turn_state.barrier_satisfied(),
-            boundary_count: self.turn_state.boundary_count(),
-            cancel_after_boundary: self.turn_state.cancel_after_boundary(),
-            terminal_outcome: self.turn_state.terminal_outcome(),
-            extraction_attempts: self.turn_state.extraction_attempts(),
-            max_extraction_retries: self.turn_state.max_extraction_retries(),
-            applied_cursor: self.applied_cursor,
-        }
+        let handle = self.turn_state_handle.as_deref()?;
+        runtime_execution_snapshot(handle, self.applied_cursor)
     }
 
     /// Snapshot the agent's live tool-scope state for diagnostics and mapping.
@@ -865,7 +830,6 @@ where
 
         // Reset state for new run (allows multi-turn on same agent)
         self.state = LoopState::CallingLlm;
-        self.turn_state = super::turn_state::LocalTurnExecutionState::new();
         self.runtime_execution_kind = None;
         self.extraction_result = None;
         self.extraction_last_error = None;
@@ -955,7 +919,6 @@ where
 
         // Reset state for new run (allows multi-turn on same agent)
         self.state = LoopState::CallingLlm;
-        self.turn_state = super::turn_state::LocalTurnExecutionState::new();
         self.runtime_execution_kind = None;
         self.extraction_result = None;
         self.extraction_last_error = None;
@@ -993,21 +956,13 @@ where
     pub fn cancel(&mut self) {
         use crate::turn_execution_authority::TurnExecutionInput;
 
-        // Route through the shared turn-input path so runtime-backed turn
-        // state stays aligned with the standalone local fallback.
-        let input = if let Some(run_id) = self
+        let snapshot = self
             .turn_state_handle
             .as_deref()
-            .and_then(|handle| {
-                self.runtime_execution_kind
-                    .as_ref()
-                    .map(|_| handle.snapshot())
-            })
-            .and_then(|snapshot| snapshot.active_run_id)
-        {
-            TurnExecutionInput::CancelNow { run_id }
-        } else {
-            TurnExecutionInput::ForceCancelNoRun
+            .map(|handle| handle.snapshot());
+        let input = match snapshot.and_then(|s| s.active_run_id) {
+            Some(run_id) => TurnExecutionInput::CancelNow { run_id },
+            None => TurnExecutionInput::ForceCancelNoRun,
         };
         let _ = self.apply_turn_input(input);
     }

@@ -91,25 +91,21 @@ where
     fn turn_active_run_id(&self) -> Option<RunId> {
         self.runtime_turn_authority_snapshot()
             .and_then(|snapshot| snapshot.active_run_id)
-            .or_else(|| self.turn_state.active_run().cloned())
     }
 
     fn turn_phase(&self) -> TurnPhase {
         self.runtime_turn_authority_snapshot()
             .map(|snapshot| snapshot.turn_phase)
-            .unwrap_or_else(|| self.turn_state.phase())
     }
 
     fn turn_cancel_after_boundary(&self) -> bool {
         self.runtime_turn_authority_snapshot()
             .map(|snapshot| snapshot.cancel_after_boundary)
-            .unwrap_or_else(|| self.turn_state.cancel_after_boundary())
     }
 
     fn turn_has_barrier_ops(&self) -> bool {
         self.runtime_turn_authority_snapshot()
             .map(|snapshot| snapshot.has_barrier_ops)
-            .unwrap_or_else(|| self.turn_state.has_barrier_ops())
     }
 
     fn turn_barrier_operation_ids(&self) -> Vec<crate::ops::OperationId> {
@@ -121,37 +117,26 @@ where
                     .filter_map(|id| parse_runtime_operation_id(id))
                     .collect()
             })
-            .unwrap_or_else(|| {
-                self.turn_state
-                    .barrier_op_ids()
-                    .into_iter()
-                    .cloned()
-                    .collect()
-            })
     }
 
     fn turn_pending_ops_registered(&self) -> bool {
         self.runtime_turn_authority_snapshot()
             .map(|snapshot| !snapshot.pending_op_refs.is_empty())
-            .unwrap_or_else(|| self.turn_state.pending_op_refs().is_some())
     }
 
     fn turn_in_extraction_flow(&self) -> bool {
         self.runtime_turn_authority_snapshot()
             .map(|snapshot| snapshot.max_extraction_retries > 0)
-            .unwrap_or_else(|| self.turn_state.in_extraction_flow())
     }
 
     fn turn_terminal_outcome(&self) -> TurnTerminalOutcome {
         self.runtime_turn_authority_snapshot()
             .and_then(|snapshot| snapshot.terminal_outcome)
-            .unwrap_or_else(|| self.turn_state.terminal_outcome())
     }
 
     fn turn_extraction_attempts(&self) -> u32 {
         self.runtime_turn_authority_snapshot()
             .map(|snapshot| u32::try_from(snapshot.extraction_attempts).unwrap_or(u32::MAX))
-            .unwrap_or_else(|| self.turn_state.extraction_attempts())
     }
 
     /// Resolve the effective call timeout for this LLM call.
@@ -394,31 +379,7 @@ where
                 admitted_content_shape,
                 vision_enabled,
                 image_tool_results_enabled,
-            } => match self.turn_state.primitive_kind() {
-                crate::turn_execution_authority::TurnPrimitiveKind::ConversationTurn => handle
-                    .start_conversation_run(
-                        run_id.clone(),
-                        crate::turn_execution_authority::TurnPrimitiveKind::ConversationTurn,
-                        admitted_content_shape.0.clone(),
-                        *vision_enabled,
-                        *image_tool_results_enabled,
-                        if self.config.output_schema.is_some() {
-                            u64::from(self.config.structured_output_retries)
-                        } else {
-                            0
-                        },
-                    )
-                    .and_then(|()| handle.primitive_applied()),
-                crate::turn_execution_authority::TurnPrimitiveKind::ImmediateAppend => handle
-                    .start_immediate_append(run_id.clone(), admitted_content_shape.0.clone())
-                    .and_then(|()| handle.primitive_applied()),
-                crate::turn_execution_authority::TurnPrimitiveKind::ImmediateContextAppend => {
-                    handle
-                        .start_immediate_context(run_id.clone(), admitted_content_shape.0.clone())
-                        .and_then(|()| handle.primitive_applied())
-                }
-                crate::turn_execution_authority::TurnPrimitiveKind::None => return Ok(()),
-            },
+            } => handle.primitive_applied(),
             TurnExecutionInput::LlmReturnedToolCalls { tool_count, .. } => {
                 handle.llm_returned_tool_calls(u64::from(*tool_count))
             }
@@ -485,23 +446,7 @@ where
         &mut self,
         input: TurnExecutionInput,
     ) -> Result<TurnExecutionTransition, AgentError> {
-        let runtime_backed = self.turn_state_handle.is_some()
-            && self.runtime_execution_kind.is_some()
-            && self.turn_state.can_accept(&input);
-        if runtime_backed {
-            self.apply_turn_input_via_runtime_handle(&input)?;
-        }
-        let transition = self.turn_state.apply(input.clone()).map_err(|err| {
-            if runtime_backed {
-                AgentError::InternalError(format!(
-                    "standalone turn-state shadow diverged after runtime accepted {input:?}: {err}"
-                ))
-            } else {
-                err
-            }
-        })?;
-        self.state = transition.next_phase.to_loop_state();
-        Ok(transition)
+        self.apply_turn_input_via_runtime_handle(&input)?;
     }
 
     /// Execute side effects from a transition. Handles CheckCompaction

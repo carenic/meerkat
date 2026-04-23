@@ -944,16 +944,10 @@ machine! {
             Retire { agent_runtime_id: AgentRuntimeId, agent_identity: AgentIdentity, releasing: Option<SessionId> },
             Respawn { agent_runtime_id: AgentRuntimeId },
             RetireAll,
-            Wire,
-            Unwire,
             // Track-B (R5): explicit identity-level wiring and session-binding
             // mutation inputs. These drive `wiring_edges` and
             // `member_session_bindings` directly at DSL authority,
-            // independent of the Spawn/Retire lifecycle. The existing
-            // no-arg `Wire`/`Unwire` and lifecycle-coupled binding
-            // updates on `Spawn`/`Retire` remain in place; the new inputs
-            // are the canonical path for surfaces that mutate topology
-            // without invoking the member lifecycle.
+            // independent of the Spawn/Retire lifecycle.
             //
             // The `edge` field on `WireMembers`/`UnwireMembers` carries a
             // pre-normalized `WiringEdge` (a <= b). Callers construct the
@@ -1661,14 +1655,6 @@ machine! {
         // Running self-loops (inputs)
         // =====================================================================
 
-        transition WireRunning {
-            on input Wire
-            guard { self.lifecycle_phase == Phase::Running }
-            update {}
-            to Running
-            emit NotifyCoordinator
-        }
-
         // =====================================================================
         // Track-B (R5): identity-level wiring mutations.
         //
@@ -2326,18 +2312,6 @@ machine! {
             }
             to Running
             emit EmitRunLifecycleNotice
-        }
-
-        // =====================================================================
-        // Unwire
-        // =====================================================================
-
-        transition UnwireRunning {
-            on input Unwire
-            guard { self.lifecycle_phase == Phase::Running }
-            update {}
-            to Running
-            emit NotifyCoordinator
         }
 
         // =====================================================================

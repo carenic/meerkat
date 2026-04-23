@@ -877,12 +877,8 @@ where
     /// of the canonical `session.build_state().mob_tool_authority_context`.
     pub(crate) mob_authority_handle:
         Option<Arc<std::sync::RwLock<crate::service::MobToolAuthorityContext>>>,
-    /// Runtime-backed turn-state handle, when provided by the session runtime
-    /// bindings. Writes route here first when the mapping is available, with
-    /// `turn_state` retained as the standalone fallback owner.
+    /// Runtime-backed turn-state handle, provided by the session runtime bindings.
     pub(crate) turn_state_handle: Option<Arc<dyn crate::TurnStateHandle>>,
-    /// Standalone local owner for turn-execution state when no runtime handle exists.
-    pub(crate) turn_state: turn_state::LocalTurnExecutionState,
     /// Typed execution intent for the current run, when this turn is owned by
     /// the runtime control plane rather than a direct surface call.
     pub(crate) runtime_execution_kind: Option<crate::lifecycle::RuntimeExecutionKind>,

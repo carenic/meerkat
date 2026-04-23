@@ -334,7 +334,6 @@ impl AgentBuilder {
             completion_enrichment: self.completion_enrichment,
             mob_authority_handle: None,
             turn_state_handle: self.turn_state_handle,
-            turn_state: super::turn_state::LocalTurnExecutionState::new(),
             runtime_execution_kind: None,
             external_tool_surface_handle: self.external_tool_surface_handle,
             auth_lease_handle: self.auth_lease_handle,
