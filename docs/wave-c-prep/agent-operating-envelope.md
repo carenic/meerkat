@@ -1,6 +1,8 @@
-# Agent Operating Envelope — wave-c
+# Agent Operating Envelope — standing (wave-c/d and beyond)
 
-This is the durable set of operating rules every agent spawned into the `wave-c` team works under. Read this BEFORE starting any task. It's designed so the coordinator can point at this file instead of re-writing the envelope in every spawn prompt.
+Durable operating rules for every agent spawned into a Meerkat cleanup wave. Read this before starting any task. The coordinator points at this file instead of re-writing the envelope in every spawn prompt.
+
+**Wave-d note (2026-04-23)**: wave-c is closing and wave-d is opening. The old wave-c carve-out for `--no-verify` (see §5) is **retired** — the tree is expected to compile workspace-wide going forward. See the updated §5.
 
 ## What you should know before touching code
 
@@ -8,7 +10,7 @@ This is the durable set of operating rules every agent spawned into the `wave-c`
 
 - **Minimum context**: skim `CLAUDE.md` at the repo root (5 min). It has the crate ownership table, key traits, design philosophy, and build system.
 - **Architecture depth**: `.claude/skills/meerkat-architecture/SKILL.md` is the Meerkat internal architecture guide — load it if your task touches machine schemas, DSL sources, runtime control plane, mob orchestration, or comms. "DSL" in Meerkat means the declarative machine definitions in `meerkat-machine-schema/src/catalog/dsl/` — those are authoritative sources that drive kernel generation and TLA+ verification. When the plan or task text says "DSL", this is what's meant.
-- **Wave-c plan**: `docs/wave-c-prep/wave-c-plan.md` is the overall plan for wave-c. Section 1 has all 34 (now 35) tasks. Section 1.5 describes the TDD tripwires. Section 4 describes the phases (c.0 → c.1 → c.2 → c.3 → c.4 → c.5).
+- **Wave plan**: the active wave's plan doc is in `docs/wave-<wave>-prep/wave-<wave>-plan.md`. For wave-d that is `docs/wave-d-prep/wave-d-plan.md`. Section 1 lists tasks; Section 4 describes phase gates. For wave-c context see `docs/wave-c-prep/wave-c-plan.md`.
 - **Your task**: the coordinator assigns you a task by number (`#N`). Call `TaskGet taskId: "N"` for authoritative scope — the task description is the contract.
 
 ## The standing envelope — rules you always follow
@@ -23,7 +25,7 @@ Exceptions (narrow, named):
 
 ### 2. No backwards compatibility
 
-Meerkat is pre-1.0. Wave-c deletes freely. If you encounter anything named `Legacy`, `V0`, `Old`, `Deprecated`, `Compat`, `pre_*`, `old_*`: **delete it silently**. No `#[deprecated]` attributes, no migration shims, no "kept for external callers" re-exports, no tombstone comments.
+Meerkat is pre-1.0. Cleanup waves delete freely. If you encounter anything named `Legacy`, `V0`, `Old`, `Deprecated`, `Compat`, `pre_*`, `old_*`: **delete it silently**. No `#[deprecated]` attributes, no migration shims, no "kept for external callers" re-exports, no tombstone comments.
 
 **Narrow exceptions** (allow-listed):
 - `StructuredProviderExtension` opaque bag (for unknown provider-native knobs at the typed boundary).
@@ -55,16 +57,33 @@ The dogma-pure shapes are:
 ### 5. Commit discipline
 
 - `git commit -o <explicit-paths>` ONLY. Never `git add -A`, never `git add .`.
-- Commit message prefix per task: `wave-c C-N: <what>` (or `wave-c C-N follow-up: <what>` for continuations).
-- `--no-verify` is tolerated ONLY while the tree doesn't compile workspace-wide (current baseline). Document in commit message why. `--no-verify` for any OTHER reason is forbidden.
+- Commit message prefix per task: `wave-<letter> <TASK-N>: <what>` (e.g. `wave-d D-i: …`, `wave-d D-i follow-up: …`).
+- **`--no-verify` is forbidden.** Pre-push hooks (fmt, clippy, deterministic gate) run for every commit. If a hook flags something, the fix is the code, not bypassing the hook. The wave-c carve-out for pre-existing baseline-residue is retired as of wave-d open (2026-04-23) — the tree compiles workspace-wide from that point on.
+- If a pre-push hook flags an issue that's genuinely outside your task's scope (someone else's residue blocking your push), surface the specific blocker to the coordinator with `SendMessage` rather than bypassing it. The right response is unblocking the shared tree, not landing around it.
 - Pre-commit `cargo fmt --all` will try to sweep unrelated files: commit only the files you functionally touched. `cargo fmt -p <your-crate>` on just your targets is the right size. If the pre-commit hook wants to reformat wide-sibling files, revert those before commit.
 - Never drop stashes — other agents' in-flight work may be captured there by pre-commit hooks.
 
 ### 6. Worktree discipline
 
 - The coordinator pre-creates a worktree for your task. cd there at session start. Do NOT push commits from a different worktree or to a different branch.
-- If your task has an obvious worktree path `/Users/luka/src/meerkat/.claude/worktrees/wave-c-<task-slug>`, use it. If it doesn't exist, ping the coordinator.
+- If your task has an obvious worktree path `/Users/luka/src/meerkat/.claude/worktrees/wave-<letter>-<task-slug>`, use it. If it doesn't exist, ping the coordinator.
 - Don't reuse a warm worktree from a previous task for a new task — the merge graph gets messy. One task, one branch, one worktree.
+
+### 7. Integration-branch audit discipline
+
+When auditing "did X land?" / "does Y compile on main?" / "is Z still a violation?" questions, verify against the **integration branch** (`dogma/wave-a-demolition`), not your own feature tip. A worktree spawned for task #N is based on `dogma/wave-a-demolition` at spawn time, and siblings landing after that point are not in your ancestry unless you pull.
+
+The recipe:
+```
+git fetch origin
+git log --oneline origin/dogma/wave-a-demolition -5     # current tip
+git merge-base --is-ancestor <commit> origin/dogma/wave-a-demolition
+                                                         # does X land?
+```
+
+If the answer to "does X land?" disagrees with what your working copy shows, your worktree is behind the integration branch — pull or run the check in the `wave-a-demo` worktree, which is the integration-branch checkout.
+
+Do this **before** accusing a prior task of being incomplete or a prior commit of being broken. One stale-checkout cycle burns real coordinator time to untangle.
 
 ## Bulk mechanical work — use codemob + gemini-flash
 
