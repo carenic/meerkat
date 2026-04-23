@@ -1265,7 +1265,10 @@ impl SessionRuntime {
         session_id: &SessionId,
         overrides: Option<&crate::handlers::turn::TurnOverrides>,
     ) -> Result<SessionLlmIdentity, RpcError> {
-        let pending_identity = self.staged_sessions.effective_llm_identity(session_id).await;
+        let pending_identity = self
+            .staged_sessions
+            .effective_llm_identity(session_id)
+            .await;
         if let Some(pending_identity) = pending_identity {
             return match overrides {
                 Some(ov) => {

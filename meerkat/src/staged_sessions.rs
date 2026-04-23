@@ -25,13 +25,12 @@
 //!      (removed)
 //! ```
 
-use indexmap::IndexMap;
 use meerkat_core::types::{ContentInput, SessionId};
 use meerkat_core::{
     AppendSystemContextRequest, AppendSystemContextStatus, Session, SessionLlmIdentity,
     SessionSystemContextState,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use tokio::sync::RwLock;
 
 use crate::AgentBuildConfig;
@@ -103,7 +102,7 @@ pub enum StagedLifecycleError {
 /// mutation, promotion, abandonment) through this object.
 #[derive(Default)]
 pub struct StagedSessionRegistry {
-    slots: RwLock<IndexMap<SessionId, StagedSlot>>,
+    slots: RwLock<HashMap<SessionId, StagedSlot>>,
 }
 
 impl StagedSessionRegistry {
@@ -205,7 +204,7 @@ impl StagedSessionRegistry {
         id: &SessionId,
     ) -> Option<(SessionSystemContextState, SessionSystemContextState)> {
         let mut slots = self.slots.write().await;
-        let slot = slots.swap_remove(id)?;
+        let slot = slots.remove(id)?;
         match slot.phase {
             StagedPhase::Promoting {
                 starting_system_context_state,
@@ -261,7 +260,7 @@ impl StagedSessionRegistry {
 
     /// Drop a slot entirely (archive path).
     pub async fn abandon(&self, id: &SessionId) -> bool {
-        self.slots.write().await.swap_remove(id).is_some()
+        self.slots.write().await.remove(id).is_some()
     }
 
     /// Drop all slots (shutdown path).
