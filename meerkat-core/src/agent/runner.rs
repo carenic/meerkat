@@ -987,7 +987,6 @@ where
             let canonical_ids: Vec<crate::skills::SkillId> = refs
                 .into_iter()
                 .map(|key| {
-                    crate::skills::SkillId(format!("{}/{}", key.source_uuid, key.skill_name))
                 })
                 .collect();
             match engine.resolve_and_render(&canonical_ids).await {
