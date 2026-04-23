@@ -1296,37 +1296,39 @@ impl AgentFactory {
             return Ok(Arc::new(meerkat_client::TestClient::default()));
         }
 
-        let (realm, binding_id): (meerkat_core::RealmConnectionSet, String) =
-            match identity.connection_ref.as_ref() {
-                Some(conn_ref) => {
-                    let section = config.realm.get(conn_ref.realm.as_str()).ok_or_else(|| {
-                        FactoryError::ClientCreationFailed(format!(
-                            "realm '{}' not found in config.realm (hot-swap)",
-                            conn_ref.realm
-                        ))
-                    })?;
-                    let realm =
-                        meerkat_core::RealmConnectionSet::from_config(conn_ref.realm.as_str(), section)
-                            .map_err(|e| FactoryError::ClientCreationFailed(e.to_string()))?;
-                    (realm, conn_ref.binding.to_string())
-                }
-                None => {
-                    // Dogma §15/§19 (commit 28e7a51c1): ambient
-                    // provider-credential selection is refused. Callers
-                    // must supply an explicit `connection_ref`;
-                    // synthesizing a realm from env vars or
-                    // first-matching-provider is exactly the silent
-                    // bypass the deletion targeted.
-                    return Err(FactoryError::ClientCreationFailed(
-                        "ambient credential selection refused: \
+        let (realm, binding_id): (meerkat_core::RealmConnectionSet, String) = match identity
+            .connection_ref
+            .as_ref()
+        {
+            Some(conn_ref) => {
+                let section = config.realm.get(conn_ref.realm.as_str()).ok_or_else(|| {
+                    FactoryError::ClientCreationFailed(format!(
+                        "realm '{}' not found in config.realm (hot-swap)",
+                        conn_ref.realm
+                    ))
+                })?;
+                let realm =
+                    meerkat_core::RealmConnectionSet::from_config(conn_ref.realm.as_str(), section)
+                        .map_err(|e| FactoryError::ClientCreationFailed(e.to_string()))?;
+                (realm, conn_ref.binding.to_string())
+            }
+            None => {
+                // Dogma §15/§19 (commit 28e7a51c1): ambient
+                // provider-credential selection is refused. Callers
+                // must supply an explicit `connection_ref`;
+                // synthesizing a realm from env vars or
+                // first-matching-provider is exactly the silent
+                // bypass the deletion targeted.
+                return Err(FactoryError::ClientCreationFailed(
+                    "ambient credential selection refused: \
                          hot-swap requires an explicit ConnectionRef \
                          (realm + binding). Env-default realm synthesis \
                          and first-matching-provider promotion were \
                          deleted in the wave-c auth-seam cleanup."
-                            .to_string(),
-                    ));
-                }
-            };
+                        .to_string(),
+                ));
+            }
+        };
 
         #[allow(unused_mut)]
         let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
@@ -1897,10 +1899,12 @@ impl AgentFactory {
             let typed_tag = match provider {
                 Provider::Anthropic => AnthropicProviderTag::from_legacy_value(params_value)
                     .map(ProviderTag::Anthropic),
-                Provider::OpenAI => OpenAiProviderTag::from_legacy_value(params_value)
-                    .map(ProviderTag::OpenAi),
-                Provider::Gemini => GeminiProviderTag::from_legacy_value(params_value)
-                    .map(ProviderTag::Gemini),
+                Provider::OpenAI => {
+                    OpenAiProviderTag::from_legacy_value(params_value).map(ProviderTag::OpenAi)
+                }
+                Provider::Gemini => {
+                    GeminiProviderTag::from_legacy_value(params_value).map(ProviderTag::Gemini)
+                }
                 Provider::SelfHosted | Provider::Other => {
                     // Self-hosted and Other route through OpenAI-compatible
                     // APIs; use the OpenAI shape for per-turn overrides.

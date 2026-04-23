@@ -27,10 +27,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use meerkat_machine_schema::catalog::meerkat_mob_seam_composition;
 use meerkat_machine_schema::identity::{
     CompositionId, EffectVariantId, FieldId, InputVariantId, MachineId, MachineInstanceId,
 };
-use meerkat_machine_schema::catalog::meerkat_mob_seam_composition;
 use meerkat_runtime::composition::{
     CatalogCompositionDispatcher, CompositionBinding, CompositionDispatcher, ConsumerSurface,
     DispatchRefusal, EffectPayload, FieldValue, OwnedFieldValue, ProducerEffect, ProducerInstance,
@@ -123,9 +123,7 @@ fn mob_producer() -> ProducerInstance {
     }
 }
 
-fn build_dispatcher(
-    consumer: Arc<RecordingSurface>,
-) -> CatalogCompositionDispatcher<SeamEffect> {
+fn build_dispatcher(consumer: Arc<RecordingSurface>) -> CatalogCompositionDispatcher<SeamEffect> {
     let schema = meerkat_mob_seam_composition();
     let table = RouteTable::from_schema(&schema).expect("seam schema routes are well-formed");
     CatalogCompositionDispatcher::new(schema.name.clone(), table).with_consumer(consumer)

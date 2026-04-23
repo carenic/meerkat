@@ -1167,7 +1167,10 @@ impl MultiBackendProvisioner {
         self
     }
 
-    async fn peer_only_spec(&self, member_ref: &MemberRef) -> Result<TrustedPeerDescriptor, MobError> {
+    async fn peer_only_spec(
+        &self,
+        member_ref: &MemberRef,
+    ) -> Result<TrustedPeerDescriptor, MobError> {
         match member_ref {
             MemberRef::BackendPeer {
                 peer_id,

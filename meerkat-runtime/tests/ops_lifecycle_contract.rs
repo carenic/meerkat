@@ -564,10 +564,7 @@ async fn ops_lifecycle_contract_snapshot_includes_peer_handle() {
 
     let snap2 = registry.snapshot(&op_id).unwrap();
     assert!(snap2.peer_handle.is_some());
-    assert_eq!(
-        snap2.peer_handle.unwrap().peer_name.as_str(),
-        "peer-snap"
-    );
+    assert_eq!(snap2.peer_handle.unwrap().peer_name.as_str(), "peer-snap");
 }
 
 #[tokio::test]

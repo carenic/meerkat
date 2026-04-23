@@ -388,9 +388,7 @@ fn enforce_metadata_requirements(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use meerkat_core::{
-        AuthProfile, AuthRouteHints, BindingPolicy, ConnectionRef, Provider,
-    };
+    use meerkat_core::{AuthProfile, AuthRouteHints, BindingPolicy, ConnectionRef, Provider};
     use meerkat_llm_core::provider_runtime::binding::{
         NormalizedAuthMethod, NormalizedBackendKind, ValidatedBinding,
     };

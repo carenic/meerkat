@@ -22,9 +22,8 @@ use meerkat_machine_schema::identity::{
     MachineId, MachineInstanceId, PhaseId, ProtocolId, RouteId, SignalVariantId, TransitionId,
 };
 use meerkat_machine_schema::{
-    RouteVariantId,
-    CompositionSchema, MachineSchema, TriggerMatch, TypeRef, canonical_composition_schemas,
-    canonical_machine_schemas,
+    CompositionSchema, MachineSchema, RouteVariantId, TriggerMatch, TypeRef,
+    canonical_composition_schemas, canonical_machine_schemas,
 };
 
 #[test]
@@ -171,8 +170,7 @@ fn assert_typed_machine_schema(schema: &MachineSchema) {
         }
     }
     for rule in &schema.effect_dispositions {
-        let rt: EffectVariantId =
-            EffectVariantId::parse(rule.effect_variant.as_str()).unwrap();
+        let rt: EffectVariantId = EffectVariantId::parse(rule.effect_variant.as_str()).unwrap();
         assert_eq!(rt, rule.effect_variant, "EffectVariantId round-trip");
         if let Some(protocol) = rule.handoff_protocol.as_ref() {
             let rt: ProtocolId = ProtocolId::parse(protocol.as_str()).unwrap();
@@ -328,7 +326,10 @@ fn assert_route_variant_id_roundtrip(variant: &RouteVariantId) {
     match variant {
         RouteVariantId::Input(id) => {
             let rt: InputVariantId = InputVariantId::parse(id.as_str()).unwrap();
-            assert_eq!(rt, *id, "InputVariantId round-trip on RouteVariantId::Input");
+            assert_eq!(
+                rt, *id,
+                "InputVariantId round-trip on RouteVariantId::Input"
+            );
         }
         RouteVariantId::Signal(id) => {
             let rt: SignalVariantId = SignalVariantId::parse(id.as_str()).unwrap();

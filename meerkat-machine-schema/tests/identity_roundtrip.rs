@@ -44,7 +44,11 @@ fn every_identity_accepts_a_valid_slug() {
 fn every_identity_accepts_underscore_prefix() {
     macro_rules! check {
         ($ty:ident) => {{
-            assert!($ty::parse("_ok").is_ok(), "{} must allow _-prefix", stringify!($ty));
+            assert!(
+                $ty::parse("_ok").is_ok(),
+                "{} must allow _-prefix",
+                stringify!($ty)
+            );
         }};
     }
     for_each_identity!(check);
@@ -54,30 +58,54 @@ fn every_identity_accepts_underscore_prefix() {
 fn every_identity_rejects_invalid_inputs() {
     macro_rules! check_rejects {
         ($ty:ident) => {{
-            assert!(matches!(
-                $ty::parse("").map_err(|e| e.kind),
-                Err(IdentityErrorKind::Empty)
-            ), "{} must reject empty", stringify!($ty));
-            assert!(matches!(
-                $ty::parse("1bad").map_err(|e| e.kind),
-                Err(IdentityErrorKind::InvalidStartChar('1'))
-            ), "{} must reject digit start", stringify!($ty));
-            assert!(matches!(
-                $ty::parse("bad space").map_err(|e| e.kind),
-                Err(IdentityErrorKind::InvalidChar { ch: ' ', .. })
-            ), "{} must reject spaces", stringify!($ty));
-            assert!(matches!(
-                $ty::parse("bad.dot").map_err(|e| e.kind),
-                Err(IdentityErrorKind::InvalidChar { ch: '.', .. })
-            ), "{} must reject dots", stringify!($ty));
-            assert!(matches!(
-                $ty::parse("bad/slash").map_err(|e| e.kind),
-                Err(IdentityErrorKind::InvalidChar { ch: '/', .. })
-            ), "{} must reject slashes", stringify!($ty));
-            assert!(matches!(
-                $ty::parse("bad\x00nul").map_err(|e| e.kind),
-                Err(IdentityErrorKind::InvalidChar { ch: '\x00', .. })
-            ), "{} must reject control chars", stringify!($ty));
+            assert!(
+                matches!(
+                    $ty::parse("").map_err(|e| e.kind),
+                    Err(IdentityErrorKind::Empty)
+                ),
+                "{} must reject empty",
+                stringify!($ty)
+            );
+            assert!(
+                matches!(
+                    $ty::parse("1bad").map_err(|e| e.kind),
+                    Err(IdentityErrorKind::InvalidStartChar('1'))
+                ),
+                "{} must reject digit start",
+                stringify!($ty)
+            );
+            assert!(
+                matches!(
+                    $ty::parse("bad space").map_err(|e| e.kind),
+                    Err(IdentityErrorKind::InvalidChar { ch: ' ', .. })
+                ),
+                "{} must reject spaces",
+                stringify!($ty)
+            );
+            assert!(
+                matches!(
+                    $ty::parse("bad.dot").map_err(|e| e.kind),
+                    Err(IdentityErrorKind::InvalidChar { ch: '.', .. })
+                ),
+                "{} must reject dots",
+                stringify!($ty)
+            );
+            assert!(
+                matches!(
+                    $ty::parse("bad/slash").map_err(|e| e.kind),
+                    Err(IdentityErrorKind::InvalidChar { ch: '/', .. })
+                ),
+                "{} must reject slashes",
+                stringify!($ty)
+            );
+            assert!(
+                matches!(
+                    $ty::parse("bad\x00nul").map_err(|e| e.kind),
+                    Err(IdentityErrorKind::InvalidChar { ch: '\x00', .. })
+                ),
+                "{} must reject control chars",
+                stringify!($ty)
+            );
         }};
     }
     for_each_identity!(check_rejects);
@@ -95,8 +123,14 @@ fn invalid_char_error_reports_character_and_position() {
         other => panic!("unexpected kind: {other:?}"),
     }
     let rendered = err.to_string();
-    assert!(rendered.contains("' '"), "display should show the char: {rendered}");
-    assert!(rendered.contains("position 2"), "display should show position: {rendered}");
+    assert!(
+        rendered.contains("' '"),
+        "display should show the char: {rendered}"
+    );
+    assert!(
+        rendered.contains("position 2"),
+        "display should show position: {rendered}"
+    );
 }
 
 #[test]

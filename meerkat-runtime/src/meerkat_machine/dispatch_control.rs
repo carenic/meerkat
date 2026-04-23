@@ -506,8 +506,8 @@ fn project_realtime_attachment_status(
 fn project_realtime_reconnect_progress(
     state: &super::dsl::MeerkatMachineState,
 ) -> Option<crate::meerkat_machine_types::ReconnectProgress> {
-    use chrono::{DateTime, Utc};
     use crate::meerkat_machine_types::ReconnectProgress;
+    use chrono::{DateTime, Utc};
 
     let attempt_count_u64 = state.realtime_reconnect_attempt_count;
     let next_retry_at_ms = state.realtime_reconnect_next_retry_at_ms;

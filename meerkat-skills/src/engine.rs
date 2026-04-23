@@ -117,11 +117,8 @@ where
                     });
                 }
 
-                let rendered = renderer::render_injection_with_limit(
-                    key,
-                    &doc.body,
-                    self.max_injection_bytes,
-                );
+                let rendered =
+                    renderer::render_injection_with_limit(key, &doc.body, self.max_injection_bytes);
                 let byte_size = rendered.len();
                 results.push(ResolvedSkill {
                     key: key.clone(),
@@ -144,7 +141,10 @@ where
     ) -> impl Future<Output = Result<Vec<SkillDescriptor>, SkillError>> + Send {
         async move {
             let all_skills = self.source.list(filter).await?;
-            Ok(filter_by_capabilities(all_skills, &self.available_capabilities))
+            Ok(filter_by_capabilities(
+                all_skills,
+                &self.available_capabilities,
+            ))
         }
     }
 
@@ -318,7 +318,11 @@ mod tests {
             .unwrap();
         assert_eq!(result.len(), 1);
         assert!(result[0].rendered_body.contains("task-workflow"));
-        assert!(result[0].rendered_body.contains("Content for task-workflow"));
+        assert!(
+            result[0]
+                .rendered_body
+                .contains("Content for task-workflow")
+        );
         assert_eq!(result[0].name, "Task Workflow");
         assert!(result[0].byte_size > 0);
     }
@@ -341,7 +345,9 @@ mod tests {
         )]);
         let engine = DefaultSkillEngine::new(source, vec![]);
 
-        let result = engine.resolve_and_render(&[test_key("shell-patterns")]).await;
+        let result = engine
+            .resolve_and_render(&[test_key("shell-patterns")])
+            .await;
         assert!(matches!(
             result,
             Err(SkillError::CapabilityUnavailable { .. })

@@ -90,8 +90,9 @@ impl SkillSource for CompositeSkillSource {
         let mut aggregate = SourceHealthSnapshot::default();
         for named in &self.sources {
             let snapshot = named.source.health_snapshot().await?;
-            aggregate.invalid_count =
-                aggregate.invalid_count.saturating_add(snapshot.invalid_count);
+            aggregate.invalid_count = aggregate
+                .invalid_count
+                .saturating_add(snapshot.invalid_count);
             aggregate.total_count = aggregate.total_count.saturating_add(snapshot.total_count);
             aggregate.failure_streak = aggregate.failure_streak.max(snapshot.failure_streak);
             aggregate.handshake_failed |= snapshot.handshake_failed;
@@ -106,8 +107,7 @@ impl SkillSource for CompositeSkillSource {
             };
         }
         if aggregate.total_count > 0 {
-            aggregate.invalid_ratio =
-                aggregate.invalid_count as f32 / aggregate.total_count as f32;
+            aggregate.invalid_ratio = aggregate.invalid_count as f32 / aggregate.total_count as f32;
         }
         Ok(aggregate)
     }

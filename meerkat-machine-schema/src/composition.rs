@@ -1,6 +1,6 @@
 use crate::identity::{
-    ActorId, CompositionId, EffectVariantId, FieldId, InputVariantId, MachineId,
-    MachineInstanceId, PhaseId, ProtocolId, RouteId, SignalVariantId, TransitionId,
+    ActorId, CompositionId, EffectVariantId, FieldId, InputVariantId, MachineId, MachineInstanceId,
+    PhaseId, ProtocolId, RouteId, SignalVariantId, TransitionId,
 };
 use crate::{Expr, MachineSchema, TypeRef, machine::MachineSchemaError};
 use indexmap::IndexSet;
@@ -456,7 +456,11 @@ impl CompositionSchema {
                     actor: machine.actor.as_str().to_owned(),
                 });
             }
-            let Some(actor_schema) = self.actors.iter().find(|a| a.name.as_str() == machine.actor.as_str()) else {
+            let Some(actor_schema) = self
+                .actors
+                .iter()
+                .find(|a| a.name.as_str() == machine.actor.as_str())
+            else {
                 return Err(CompositionSchemaError::UnknownActor {
                     actor: machine.actor.as_str().to_owned(),
                 });
@@ -1377,20 +1381,20 @@ impl CompositionSchema {
                 .variant_named(protocol.effect_variant.as_str())
                 .map_err(CompositionSchemaError::MachineSchema)?;
             for field in &protocol.correlation_fields {
-                effect_variant_schema.field_named(field.as_str()).map_err(|_| {
-                    CompositionSchemaError::UnknownHandoffCorrelationField {
+                effect_variant_schema
+                    .field_named(field.as_str())
+                    .map_err(|_| CompositionSchemaError::UnknownHandoffCorrelationField {
                         protocol: protocol.name.as_str().to_owned(),
                         field: field.as_str().to_owned(),
-                    }
-                })?;
+                    })?;
             }
             for field in &protocol.obligation_fields {
-                effect_variant_schema.field_named(field.as_str()).map_err(|_| {
-                    CompositionSchemaError::UnknownHandoffObligationField {
+                effect_variant_schema
+                    .field_named(field.as_str())
+                    .map_err(|_| CompositionSchemaError::UnknownHandoffObligationField {
                         protocol: protocol.name.as_str().to_owned(),
                         field: field.as_str().to_owned(),
-                    }
-                })?;
+                    })?;
             }
 
             // Feedback inputs must exist on their target machines.
@@ -1537,7 +1541,9 @@ impl CompositionSchema {
             for machine_instance in &self.machines {
                 let machine_schema = schemas
                     .iter()
-                    .find(|schema| schema.machine.as_str() == machine_instance.machine_name.as_str())
+                    .find(|schema| {
+                        schema.machine.as_str() == machine_instance.machine_name.as_str()
+                    })
                     .ok_or_else(|| CompositionSchemaError::UnknownMachineSchema {
                         schema: machine_instance.machine_name.as_str().to_owned(),
                     })?;
@@ -1560,10 +1566,16 @@ impl CompositionSchema {
                                 });
                                 if !route_exists {
                                     return Err(CompositionSchemaError::MissingRoutedEffect {
-                                        from_instance: machine_instance.instance_id.as_str().to_owned(),
+                                        from_instance: machine_instance
+                                            .instance_id
+                                            .as_str()
+                                            .to_owned(),
                                         effect_variant: rule.effect_variant.as_str().to_owned(),
                                         consumer_machine: consumer_machine_name.as_str().to_owned(),
-                                        consumer_instance: consumer_inst.instance_id.as_str().to_owned(),
+                                        consumer_instance: consumer_inst
+                                            .instance_id
+                                            .as_str()
+                                            .to_owned(),
                                     });
                                 }
                             }
@@ -1577,7 +1589,9 @@ impl CompositionSchema {
             for machine_instance in &self.machines {
                 let machine_schema = schemas
                     .iter()
-                    .find(|schema| schema.machine.as_str() == machine_instance.machine_name.as_str())
+                    .find(|schema| {
+                        schema.machine.as_str() == machine_instance.machine_name.as_str()
+                    })
                     .ok_or_else(|| CompositionSchemaError::UnknownMachineSchema {
                         schema: machine_instance.machine_name.as_str().to_owned(),
                     })?;

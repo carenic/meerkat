@@ -593,12 +593,13 @@ fn validate_bind_request(
             "bind member failed: invalid bootstrap token".to_string(),
         ));
     }
-    let supervisor = TrustedPeerDescriptor::try_from(payload.supervisor.clone()).map_err(|error| {
-        (
-            BridgeRejectionCause::InvalidSupervisorSpec,
-            format!("bind member failed: invalid supervisor peer spec: {error}"),
-        )
-    })?;
+    let supervisor =
+        TrustedPeerDescriptor::try_from(payload.supervisor.clone()).map_err(|error| {
+            (
+                BridgeRejectionCause::InvalidSupervisorSpec,
+                format!("bind member failed: invalid supervisor peer spec: {error}"),
+            )
+        })?;
     Ok((supervisor, advertised_address))
 }
 
@@ -1104,7 +1105,8 @@ async fn try_handle_supervisor_bridge_command(
                 .await;
                 return true;
             };
-            let supervisor_spec = match TrustedPeerDescriptor::try_from(payload.supervisor.clone()) {
+            let supervisor_spec = match TrustedPeerDescriptor::try_from(payload.supervisor.clone())
+            {
                 Ok(spec) => spec,
                 Err(error) => {
                     send_bridge_failure(
@@ -2047,8 +2049,8 @@ mod tests {
     fn authorized_state_for(
         payload: &meerkat_contracts::wire::supervisor_bridge::BridgeBindPayload,
     ) -> SupervisorBinding {
-        let spec =
-            TrustedPeerDescriptor::try_from(payload.supervisor.clone()).expect("valid supervisor spec");
+        let spec = TrustedPeerDescriptor::try_from(payload.supervisor.clone())
+            .expect("valid supervisor spec");
         SupervisorBinding::Bound {
             name: spec.name,
             peer_id: spec.peer_id,
@@ -2919,7 +2921,8 @@ mod tests {
             &supervisor.peer_id,
             &BridgeCommand::RevokeSupervisor(payload.clone()),
         );
-        let spec = TrustedPeerDescriptor::try_from(supervisor.clone()).expect("valid supervisor spec");
+        let spec =
+            TrustedPeerDescriptor::try_from(supervisor.clone()).expect("valid supervisor spec");
         adapter
             .stage_supervisor_bind(
                 &session_id,

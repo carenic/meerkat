@@ -4,8 +4,8 @@
 
 use meerkat_core::skills::{
     ResolveError, SkillKey, SkillKeyRemap, SkillName, SourceIdentityLineage,
-    SourceIdentityLineageEvent, SourceIdentityRecord, SourceIdentityRegistry,
-    SourceIdentityStatus, SourceTransportKind, SourceUuid,
+    SourceIdentityLineageEvent, SourceIdentityRecord, SourceIdentityRegistry, SourceIdentityStatus,
+    SourceTransportKind, SourceUuid,
 };
 
 fn source_uuid(raw: &str) -> SourceUuid {
@@ -19,7 +19,11 @@ fn key(source_raw: &str, slug: &str) -> SkillKey {
     }
 }
 
-fn record(source_raw: &str, fingerprint: &str, status: SourceIdentityStatus) -> SourceIdentityRecord {
+fn record(
+    source_raw: &str,
+    fingerprint: &str,
+    status: SourceIdentityStatus,
+) -> SourceIdentityRecord {
     SourceIdentityRecord {
         source_uuid: source_uuid(source_raw),
         display_name: "test".into(),
@@ -44,7 +48,10 @@ fn resolve_rejects_disabled_source_with_typed_error() {
     .expect("registry should build");
 
     let err = registry
-        .resolve(&key("dc256086-0d2f-4f61-a307-320d4148107f", "email-extractor"))
+        .resolve(&key(
+            "dc256086-0d2f-4f61-a307-320d4148107f",
+            "email-extractor",
+        ))
         .expect_err("disabled source must be rejected");
 
     match err {
@@ -70,7 +77,10 @@ fn resolve_rejects_retired_source_with_typed_error() {
     .expect("registry should build");
 
     let err = registry
-        .resolve(&key("dc256086-0d2f-4f61-a307-320d4148107f", "pdf-processing"))
+        .resolve(&key(
+            "dc256086-0d2f-4f61-a307-320d4148107f",
+            "pdf-processing",
+        ))
         .expect_err("retired source must be rejected");
 
     assert!(matches!(
@@ -97,7 +107,10 @@ fn resolve_accepts_active_source() {
     .expect("registry should build");
 
     let resolved = registry
-        .resolve(&key("dc256086-0d2f-4f61-a307-320d4148107f", "email-extractor"))
+        .resolve(&key(
+            "dc256086-0d2f-4f61-a307-320d4148107f",
+            "email-extractor",
+        ))
         .expect("active source must resolve");
     assert_eq!(resolved.source.status, SourceIdentityStatus::Active);
 }
@@ -144,7 +157,10 @@ fn resolve_follows_remap_then_rejects_disabled_target() {
 fn resolve_rejects_unknown_source() {
     let registry = SourceIdentityRegistry::default();
     let err = registry
-        .resolve(&key("dc256086-0d2f-4f61-a307-320d4148107f", "email-extractor"))
+        .resolve(&key(
+            "dc256086-0d2f-4f61-a307-320d4148107f",
+            "email-extractor",
+        ))
         .expect_err("unknown source must be rejected");
     assert!(matches!(err, ResolveError::SourceUnknown(_)));
 }

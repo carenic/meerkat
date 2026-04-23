@@ -48,8 +48,7 @@ impl BuiltinTool for BrowseSkillsTool {
         ToolDef {
             name: "browse_skills".into(),
             description:
-                "List available skills, optionally filtered by search query or source UUID."
-                    .into(),
+                "List available skills, optionally filtered by search query or source UUID.".into(),
             input_schema: crate::schema::schema_for::<BrowseSkillsArgs>(),
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Builtin,
@@ -75,10 +74,7 @@ impl BuiltinTool for BrowseSkillsTool {
             None => None,
         };
 
-        let filter = SkillFilter {
-            query,
-            source_uuid,
-        };
+        let filter = SkillFilter { query, source_uuid };
 
         let skills = self
             .engine

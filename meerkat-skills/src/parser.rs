@@ -197,16 +197,15 @@ When running background jobs...";
     fn test_parse_no_capabilities() {
         let content =
             "---\nname: mcp-setup\ndescription: Configure MCP servers\n---\n\nContent here";
-        let doc = parse_skill_md(test_key("mcp-setup"), SkillScope::Project, content, None)
-            .unwrap();
+        let doc =
+            parse_skill_md(test_key("mcp-setup"), SkillScope::Project, content, None).unwrap();
         assert!(doc.descriptor.capability_requirements.is_empty());
     }
 
     #[test]
     fn test_parse_description_with_colon() {
         let content = "---\nname: test\ndescription: \"Use: this tool carefully\"\n---\n\nBody";
-        let doc =
-            parse_skill_md(test_key("test"), SkillScope::Builtin, content, None).unwrap();
+        let doc = parse_skill_md(test_key("test"), SkillScope::Builtin, content, None).unwrap();
         assert_eq!(doc.descriptor.description, "Use: this tool carefully");
     }
 

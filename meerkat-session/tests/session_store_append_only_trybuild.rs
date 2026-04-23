@@ -66,8 +66,12 @@ async fn append_only_save_guard_rejects_shrink_attempt() {
 
     // First save: 2 messages.
     let mut initial = Session::new();
-    initial.push(Message::User(meerkat_core::types::UserMessage::text("hello")));
-    initial.push(Message::User(meerkat_core::types::UserMessage::text("world")));
+    initial.push(Message::User(meerkat_core::types::UserMessage::text(
+        "hello",
+    )));
+    initial.push(Message::User(meerkat_core::types::UserMessage::text(
+        "world",
+    )));
     store.save(&initial).await.expect("first save must succeed");
 
     // Second save: same id, shorter history (0 messages) — MUST be
@@ -98,7 +102,9 @@ async fn append_only_save_guard_rejects_shrink_attempt() {
     // Extending (not shrinking) continues to succeed — the guard only
     // rejects strict decreases.
     let mut extended = initial.clone();
-    extended.push(Message::User(meerkat_core::types::UserMessage::text("third")));
+    extended.push(Message::User(meerkat_core::types::UserMessage::text(
+        "third",
+    )));
     store.save(&extended).await.expect("extend must succeed");
 }
 

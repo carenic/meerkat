@@ -9,10 +9,10 @@
 //! the inner dispatcher does not know about remains `NotFound`.
 
 use async_trait::async_trait;
+use meerkat_core::AgentToolDispatcher;
 use meerkat_core::error::ToolError;
 use meerkat_core::ops::{ToolAccessPolicy, ToolDispatchOutcome};
 use meerkat_core::types::{ToolCallView, ToolDef, ToolResult};
-use meerkat_core::AgentToolDispatcher;
 use meerkat_tools::dispatcher::FilteredDispatcher;
 use serde_json::json;
 use std::sync::Arc;

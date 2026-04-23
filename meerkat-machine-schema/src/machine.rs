@@ -223,9 +223,7 @@ impl MachineSchema {
             collect_named_type_references_machine(self, &mut referenced);
             for name in &referenced {
                 if !seen_bindings.contains(name.as_str()) {
-                    return Err(MachineSchemaError::MissingNamedTypeBinding {
-                        name: name.clone(),
-                    });
+                    return Err(MachineSchemaError::MissingNamedTypeBinding { name: name.clone() });
                 }
             }
         }
@@ -370,10 +368,7 @@ pub struct VariantSchema {
 }
 
 impl VariantSchema {
-    pub fn field_named(
-        &self,
-        name: impl AsRef<str>,
-    ) -> Result<&FieldSchema, MachineSchemaError> {
+    pub fn field_named(&self, name: impl AsRef<str>) -> Result<&FieldSchema, MachineSchemaError> {
         let name = name.as_ref();
         self.fields
             .iter()

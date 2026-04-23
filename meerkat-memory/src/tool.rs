@@ -91,7 +91,6 @@ impl AgentToolDispatcher for MemorySearchDispatcher {
     fn tools(&self) -> Arc<[Arc<ToolDef>]> {
         Arc::clone(&self.tool_defs)
     }
-
 }
 
 #[cfg(test)]

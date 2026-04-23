@@ -3721,9 +3721,7 @@ fn direct_default_value_expr(
         TypeRef::Bool => "false".to_string(),
         TypeRef::U32 | TypeRef::U64 => "0".to_string(),
         TypeRef::String => "String::new()".to_string(),
-        TypeRef::Named(name) if named_type_lowers_to_u64(schema, name.as_str()) => {
-            "0".to_string()
-        }
+        TypeRef::Named(name) if named_type_lowers_to_u64(schema, name.as_str()) => "0".to_string(),
         TypeRef::Named(name) => format!("{}::from(String::new())", rust_ident(name.as_str())),
         TypeRef::Enum(name) => enum_defaults
             .get(name.as_str())

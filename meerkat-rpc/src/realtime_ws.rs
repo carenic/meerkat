@@ -3118,9 +3118,7 @@ async fn require_product_session_reattach(
 /// close handshake. A timeout expiry is logged at `warn!` but otherwise
 /// treated the same as a clean close — the actor then drops `session`,
 /// running the provider's own drop-path cancellation.
-async fn close_realtime_session_bounded(
-    mut session: Box<dyn meerkat_client::RealtimeSession>,
-) {
+async fn close_realtime_session_bounded(mut session: Box<dyn meerkat_client::RealtimeSession>) {
     match tokio::time::timeout(REALTIME_PROVIDER_CLOSE_TIMEOUT, session.close()).await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {

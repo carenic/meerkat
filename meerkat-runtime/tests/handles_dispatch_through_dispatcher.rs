@@ -125,8 +125,7 @@ fn every_apply_input_in_handles_traverses_dispatcher() {
             }
             // Skip comments and obvious doc-lines.
             let trimmed = line.trim_start();
-            if trimmed.starts_with("//") || trimmed.starts_with("///")
-                || trimmed.starts_with("//!")
+            if trimmed.starts_with("//") || trimmed.starts_with("///") || trimmed.starts_with("//!")
             {
                 continue;
             }
@@ -135,8 +134,8 @@ fn every_apply_input_in_handles_traverses_dispatcher() {
             let fn_end = find_fn_end(&lines, fn_start);
             let fn_body = lines[fn_start..=fn_end].join("\n");
 
-            let in_scope = fn_body.contains("dispatcher")
-                || fn_body.contains("CompositionDispatcher");
+            let in_scope =
+                fn_body.contains("dispatcher") || fn_body.contains("CompositionDispatcher");
             if !in_scope {
                 violations.push(format!(
                     "{}:{} — `apply_input(` call site not reached via \

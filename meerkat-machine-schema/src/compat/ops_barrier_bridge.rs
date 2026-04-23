@@ -15,13 +15,13 @@
 //! intentionally excluded from the canonical catalog and TLC state
 //! space; it exists only for the protocol-codegen producer lookup.
 
+use crate::identity::{
+    EffectVariantId, EnumTypeId, EnumVariantId, FieldId, InputVariantId, MachineId, NamedTypeId,
+    PhaseId, ProtocolId, TransitionId,
+};
 use crate::{
     EffectDisposition, EffectDispositionRule, EnumSchema, FieldSchema, InitSchema, MachineSchema,
     NamedTypeBinding, RustBinding, StateSchema, TypeRef, VariantSchema,
-};
-use crate::identity::{
-    EffectVariantId, EnumTypeId, EnumVariantId, FieldId, InputVariantId, MachineId,
-    NamedTypeId, PhaseId, ProtocolId, TransitionId,
 };
 
 /// Minimal compat machine that hosts the `ops_barrier_satisfaction`
@@ -43,7 +43,7 @@ pub fn ops_barrier_bridge_machine() -> MachineSchema {
             },
             fields: vec![],
             init: InitSchema {
-            phase: PhaseId::parse("Idle").expect("valid phase slug"),
+                phase: PhaseId::parse("Idle").expect("valid phase slug"),
                 fields: vec![],
             },
             terminal_phases: vec![],
@@ -54,12 +54,16 @@ pub fn ops_barrier_bridge_machine() -> MachineSchema {
                 name: EnumVariantId::parse("OpsBarrierSatisfied").expect("valid variant slug"),
                 fields: vec![
                     FieldSchema {
-                name: FieldId::parse("wait_request_id").expect("valid field slug"),
-                        ty: TypeRef::Named(NamedTypeId::parse("WaitRequestId").expect("valid named-type slug")),
+                        name: FieldId::parse("wait_request_id").expect("valid field slug"),
+                        ty: TypeRef::Named(
+                            NamedTypeId::parse("WaitRequestId").expect("valid named-type slug"),
+                        ),
                     },
                     FieldSchema {
-                name: FieldId::parse("operation_ids").expect("valid field slug"),
-                        ty: TypeRef::Seq(Box::new(TypeRef::Named(NamedTypeId::parse("OperationId").expect("valid named-type slug")))),
+                        name: FieldId::parse("operation_ids").expect("valid field slug"),
+                        ty: TypeRef::Seq(Box::new(TypeRef::Named(
+                            NamedTypeId::parse("OperationId").expect("valid named-type slug"),
+                        ))),
                     },
                 ],
             }],
@@ -74,26 +78,35 @@ pub fn ops_barrier_bridge_machine() -> MachineSchema {
                 name: EnumVariantId::parse("WaitAllSatisfied").expect("valid variant slug"),
                 fields: vec![
                     FieldSchema {
-                name: FieldId::parse("wait_request_id").expect("valid field slug"),
-                        ty: TypeRef::Named(NamedTypeId::parse("WaitRequestId").expect("valid named-type slug")),
+                        name: FieldId::parse("wait_request_id").expect("valid field slug"),
+                        ty: TypeRef::Named(
+                            NamedTypeId::parse("WaitRequestId").expect("valid named-type slug"),
+                        ),
                     },
                     FieldSchema {
-                name: FieldId::parse("operation_ids").expect("valid field slug"),
-                        ty: TypeRef::Seq(Box::new(TypeRef::Named(NamedTypeId::parse("OperationId").expect("valid named-type slug")))),
+                        name: FieldId::parse("operation_ids").expect("valid field slug"),
+                        ty: TypeRef::Seq(Box::new(TypeRef::Named(
+                            NamedTypeId::parse("OperationId").expect("valid named-type slug"),
+                        ))),
                     },
                 ],
             }],
         },
         transitions: vec![],
-        surface_only_inputs: vec![InputVariantId::parse("OpsBarrierSatisfied").expect("valid input-variant slug")],
+        surface_only_inputs: vec![
+            InputVariantId::parse("OpsBarrierSatisfied").expect("valid input-variant slug"),
+        ],
         helpers: vec![],
         derived: vec![],
         invariants: vec![],
         ci_step_limit: None,
         effect_dispositions: vec![EffectDispositionRule {
-            effect_variant: EffectVariantId::parse("WaitAllSatisfied").expect("valid effect-variant slug"),
+            effect_variant: EffectVariantId::parse("WaitAllSatisfied")
+                .expect("valid effect-variant slug"),
             disposition: EffectDisposition::External,
-            handoff_protocol: Some(ProtocolId::parse("ops_barrier_satisfaction").expect("valid protocol slug")),
+            handoff_protocol: Some(
+                ProtocolId::parse("ops_barrier_satisfaction").expect("valid protocol slug"),
+            ),
         }],
         named_types: vec![
             NamedTypeBinding::string("WaitRequestId"),

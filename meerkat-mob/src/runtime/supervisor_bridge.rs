@@ -3,7 +3,9 @@ use crate::store::SupervisorAuthorityRecord;
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
 use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
-use meerkat_core::comms::{CommsCommand, InputStreamMode, PeerName, SendReceipt, TrustedPeerDescriptor};
+use meerkat_core::comms::{
+    CommsCommand, InputStreamMode, PeerName, SendReceipt, TrustedPeerDescriptor,
+};
 use meerkat_core::interaction::{
     InteractionContent, PeerInputCandidate, TerminalityClass, classify_response_terminality,
 };

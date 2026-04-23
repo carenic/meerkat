@@ -79,8 +79,7 @@ impl BuiltinTool for SkillListResourcesTool {
         ToolDef {
             name: "skill_list_resources".into(),
             description:
-                "List resources exposed by a skill identified by (source_uuid, skill_name)."
-                    .into(),
+                "List resources exposed by a skill identified by (source_uuid, skill_name).".into(),
             input_schema: crate::schema::schema_for::<SkillListResourcesArgs>(),
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Builtin,
@@ -141,9 +140,10 @@ impl BuiltinTool for SkillReadResourceTool {
 
     async fn call(&self, args: Value) -> Result<ToolOutput, BuiltinToolError> {
         let raw_key = parse_key(&args)?;
-        let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
-            BuiltinToolError::InvalidArgs("missing 'path' parameter".into())
-        })?;
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| BuiltinToolError::InvalidArgs("missing 'path' parameter".into()))?;
         // Apply source-identity lineage remaps before dispatch.
         let key = self
             .engine

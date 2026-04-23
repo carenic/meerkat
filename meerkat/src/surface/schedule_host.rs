@@ -528,5 +528,4 @@ mod tests {
         occurrence.attempt_count = 1;
         occurrence
     }
-
 }

@@ -230,10 +230,8 @@ impl CapabilityId {
         }
 
         Err(SkillError::Parse(
-            format!(
-                "invalid capability_id '{value}': expected lowercase slug [a-z0-9_-], no '--'"
-            )
-            .into(),
+            format!("invalid capability_id '{value}': expected lowercase slug [a-z0-9_-], no '--'")
+                .into(),
         ))
     }
 
@@ -864,7 +862,11 @@ where
         function_name: &str,
         arguments: serde_json::Value,
     ) -> impl Future<Output = Result<serde_json::Value, SkillError>> + Send {
-        async move { (**self).invoke_function(key, function_name, arguments).await }
+        async move {
+            (**self)
+                .invoke_function(key, function_name, arguments)
+                .await
+        }
     }
 
     fn list_all_with_provenance(
@@ -880,11 +882,7 @@ where
         source_name: Option<&str>,
     ) -> impl Future<Output = Result<SkillDocument, SkillError>> + Send {
         let source_name = source_name.map(ToString::to_string);
-        async move {
-            (**self)
-                .load_from_source(key, source_name.as_deref())
-                .await
-        }
+        async move { (**self).load_from_source(key, source_name.as_deref()).await }
     }
 }
 
@@ -1077,9 +1075,11 @@ impl SkillRuntime {
             invoke_function_fn: Arc::new(
                 move |key: SkillKey, function_name: String, arguments: serde_json::Value| {
                     let engine = Arc::clone(&invoke_function_engine);
-                    Box::pin(
-                        async move { engine.invoke_function(&key, &function_name, arguments).await },
-                    )
+                    Box::pin(async move {
+                        engine
+                            .invoke_function(&key, &function_name, arguments)
+                            .await
+                    })
                 },
             ),
             list_all_with_provenance_fn: Arc::new(move |filter: SkillFilter| {
@@ -1088,9 +1088,7 @@ impl SkillRuntime {
             }),
             load_from_source_fn: Arc::new(move |key: SkillKey, source_name: Option<String>| {
                 let engine = Arc::clone(&load_from_source_engine);
-                Box::pin(
-                    async move { engine.load_from_source(&key, source_name.as_deref()).await },
-                )
+                Box::pin(async move { engine.load_from_source(&key, source_name.as_deref()).await })
             }),
             canonical_skill_key_fn: Arc::new(move |key: SkillKey| {
                 let engine = Arc::clone(&canonical_engine);

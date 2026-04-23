@@ -35,7 +35,9 @@ pub async fn resolve_repositories_with_roots(
     for repo in &config.repositories {
         match &repo.transport {
             SkillRepoTransport::Filesystem { path } => {
-                let resolution_root = context_root.or(cache_root).unwrap_or_else(|| Path::new("."));
+                let resolution_root = context_root
+                    .or(cache_root)
+                    .unwrap_or_else(|| Path::new("."));
                 let full_path = if Path::new(path).is_relative() {
                     resolution_root.join(path)
                 } else {

@@ -169,10 +169,7 @@ async fn load_returns_body_and_key_fields_for_known_skill() {
     let json = output.into_json().unwrap();
 
     assert_eq!(json["skill_name"].as_str().unwrap(), "alpha");
-    assert_eq!(
-        json["source_uuid"].as_str().unwrap(),
-        primary.to_string()
-    );
+    assert_eq!(json["source_uuid"].as_str().unwrap(), primary.to_string());
     let body = json["body"].as_str().unwrap();
     assert!(
         body.contains("body-alpha"),
@@ -199,9 +196,7 @@ async fn load_missing_skill_surfaces_execution_failure() {
 
     match &err {
         meerkat_tools::BuiltinToolError::ExecutionFailed(_) => {}
-        other => panic!(
-            "load of unknown skill must return ExecutionFailed; got {other:?}"
-        ),
+        other => panic!("load of unknown skill must return ExecutionFailed; got {other:?}"),
     }
 }
 

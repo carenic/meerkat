@@ -5489,8 +5489,10 @@ impl MobActor {
             .apply_dsl_input(mob_dsl::MobMachineInput::Stop, "stop_reset")
             .is_err();
         if stop_rejected
-            && let Err(error) = self
-                .apply_dsl_signal(mob_dsl::MobMachineSignal::FinishCleanup, "finish_cleanup_reset")
+            && let Err(error) = self.apply_dsl_signal(
+                mob_dsl::MobMachineSignal::FinishCleanup,
+                "finish_cleanup_reset",
+            )
         {
             tracing::debug!(
                 error = %error,

@@ -192,7 +192,10 @@ async fn all_four_catalog_routes_dispatch_to_meerkat_consumer() {
         .await
         .expect("binding route dispatches");
     assert_eq!(outcome.applied_input.as_str(), "PrepareBindings");
-    assert_eq!(outcome.route.route_id.as_str(), "binding_request_reaches_meerkat");
+    assert_eq!(
+        outcome.route.route_id.as_str(),
+        "binding_request_reaches_meerkat"
+    );
     assert_eq!(outcome.consumer.as_str(), "meerkat");
 
     // Route 2: RequestRuntimeIngress → Ingest
@@ -211,7 +214,10 @@ async fn all_four_catalog_routes_dispatch_to_meerkat_consumer() {
         .await
         .expect("ingress route dispatches");
     assert_eq!(outcome.applied_input.as_str(), "Ingest");
-    assert_eq!(outcome.route.route_id.as_str(), "work_request_reaches_meerkat");
+    assert_eq!(
+        outcome.route.route_id.as_str(),
+        "work_request_reaches_meerkat"
+    );
 
     // Route 3: RequestRuntimeRetire → Retire
     let outcome = dispatcher

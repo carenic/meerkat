@@ -829,5 +829,4 @@ mod tests {
 
         assert_eq!(agent.applied_cursor, 0);
     }
-
 }

@@ -158,7 +158,6 @@ impl RuntimeBackedScheduleSessionHost {
             labels: Some(create.labels.clone()),
         }
     }
-
 }
 
 #[async_trait]

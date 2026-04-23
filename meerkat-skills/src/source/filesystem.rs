@@ -121,10 +121,6 @@ impl SkillSource for FilesystemSkillSource {
     }
 
     async fn health_snapshot(&self) -> Result<SourceHealthSnapshot, SkillError> {
-        Ok(self
-            .health
-            .read()
-            .map(|s| s.clone())
-            .unwrap_or_default())
+        Ok(self.health.read().map(|s| s.clone()).unwrap_or_default())
     }
 }

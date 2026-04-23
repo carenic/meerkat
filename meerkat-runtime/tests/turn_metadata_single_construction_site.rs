@@ -45,10 +45,7 @@ fn runtime_turn_metadata_has_single_construction_site() {
     walk(&root, &mut files);
     assert!(!files.is_empty(), "no .rs files found under {root:?}");
 
-    let needles = [
-        "RuntimeTurnMetadata::default()",
-        "RuntimeTurnMetadata {",
-    ];
+    let needles = ["RuntimeTurnMetadata::default()", "RuntimeTurnMetadata {"];
 
     let mut offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     for file in &files {
@@ -106,9 +103,7 @@ fn runtime_turn_metadata_has_single_construction_site() {
     if !offenders.is_empty() {
         let rendered = offenders
             .into_iter()
-            .map(|(path, lineno, line)| {
-                format!("  {}:{}  {}", path.display(), lineno, line.trim())
-            })
+            .map(|(path, lineno, line)| format!("  {}:{}  {}", path.display(), lineno, line.trim()))
             .collect::<Vec<_>>()
             .join("\n");
         panic!(

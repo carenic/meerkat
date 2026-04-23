@@ -26,7 +26,9 @@ use crate::provider::Provider;
 pub enum IdentityError {
     #[error("identity slug is empty")]
     Empty,
-    #[error("identity slug contains invalid character {0:?}; must be ASCII alphanumeric or one of '-', '_', '.'")]
+    #[error(
+        "identity slug contains invalid character {0:?}; must be ASCII alphanumeric or one of '-', '_', '.'"
+    )]
     InvalidChar(char),
 }
 
@@ -84,7 +86,10 @@ macro_rules! slug_newtype {
 }
 
 slug_newtype!(RealmId, "Opaque slug identifying a realm.");
-slug_newtype!(BindingId, "Opaque slug identifying a binding inside a realm.");
+slug_newtype!(
+    BindingId,
+    "Opaque slug identifying a binding inside a realm."
+);
 slug_newtype!(
     ProfileId,
     "Opaque slug identifying an auth profile override on a connection."

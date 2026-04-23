@@ -1885,7 +1885,12 @@ mod tests {
             &op_id,
             OperationPeerHandle {
                 peer_name: "peer".into(),
-                trusted_peer: TrustedPeerDescriptor::test_only_unsigned("peer", "peer-id", "inproc://peer").unwrap(),
+                trusted_peer: TrustedPeerDescriptor::test_only_unsigned(
+                    "peer",
+                    "peer-id",
+                    "inproc://peer",
+                )
+                .unwrap(),
             },
         );
         assert!(matches!(result, Err(OpsLifecycleError::PeerNotExpected(_))));
@@ -2329,7 +2334,12 @@ mod tests {
 
         let handle = OperationPeerHandle {
             peer_name: "member-x".into(),
-            trusted_peer: TrustedPeerDescriptor::test_only_unsigned("member-x", "peer-id", "inproc://x").unwrap(),
+            trusted_peer: TrustedPeerDescriptor::test_only_unsigned(
+                "member-x",
+                "peer-id",
+                "inproc://x",
+            )
+            .unwrap(),
         };
         registry.peer_ready(&op_id, handle).unwrap();
 

@@ -168,7 +168,10 @@ impl meerkat_core::checkpoint::SessionCheckpointer for StoreCheckpointer {
             return;
         }
         let mut persisted = session.clone();
-        if let Err(e) = persisted.externalize_media(self.blob_store.as_ref(), 0).await {
+        if let Err(e) = persisted
+            .externalize_media(self.blob_store.as_ref(), 0)
+            .await
+        {
             tracing::warn!("Host-mode checkpoint blob externalization failed: {e}");
             return;
         }

@@ -1,13 +1,13 @@
 use indexmap::IndexMap;
 
+use crate::identity::{
+    EffectVariantId, EnumTypeId, EnumVariantId, FieldId, InputVariantId, MachineId, NamedTypeId,
+    PhaseId, ProtocolId, TransitionId,
+};
 use crate::{
     EffectDisposition, EffectDispositionRule, EffectEmit, EnumSchema, Expr, FieldInit, FieldSchema,
     Guard, HelperSchema, InvariantSchema, MachineSchema, NamedTypeBinding, Quantifier, RustBinding,
-    StateSchema, TransitionSchema, TypeRef, Update, VariantSchema, TriggerMatch,
-};
-use crate::identity::{
-    EffectVariantId, EnumTypeId, EnumVariantId, FieldId, InputVariantId, MachineId,
-    NamedTypeId, PhaseId, ProtocolId, TransitionId,
+    StateSchema, TransitionSchema, TriggerMatch, TypeRef, Update, VariantSchema,
 };
 
 // ---------------------------------------------------------------------------
@@ -22,7 +22,9 @@ fn dep_is_terminal_expr(dep_binding: &str) -> Expr {
     Expr::Or(vec![
         Expr::Eq(
             Box::new(Expr::MapGet {
-                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                map: Box::new(Expr::Field(
+                    FieldId::parse("node_status").expect("valid field slug"),
+                )),
                 key: Box::new(Expr::Binding(dep_binding.into())),
             }),
             Box::new(Expr::NamedVariant {
@@ -32,7 +34,9 @@ fn dep_is_terminal_expr(dep_binding: &str) -> Expr {
         ),
         Expr::Eq(
             Box::new(Expr::MapGet {
-                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                map: Box::new(Expr::Field(
+                    FieldId::parse("node_status").expect("valid field slug"),
+                )),
                 key: Box::new(Expr::Binding(dep_binding.into())),
             }),
             Box::new(Expr::NamedVariant {
@@ -42,7 +46,9 @@ fn dep_is_terminal_expr(dep_binding: &str) -> Expr {
         ),
         Expr::Eq(
             Box::new(Expr::MapGet {
-                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                map: Box::new(Expr::Field(
+                    FieldId::parse("node_status").expect("valid field slug"),
+                )),
                 key: Box::new(Expr::Binding(dep_binding.into())),
             }),
             Box::new(Expr::NamedVariant {
@@ -52,7 +58,9 @@ fn dep_is_terminal_expr(dep_binding: &str) -> Expr {
         ),
         Expr::Eq(
             Box::new(Expr::MapGet {
-                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                map: Box::new(Expr::Field(
+                    FieldId::parse("node_status").expect("valid field slug"),
+                )),
                 key: Box::new(Expr::Binding(dep_binding.into())),
             }),
             Box::new(Expr::NamedVariant {
@@ -65,7 +73,9 @@ fn dep_is_terminal_expr(dep_binding: &str) -> Expr {
 
 fn dependency_ids_expr(node_id_expr: Expr) -> Expr {
     Expr::SeqElements(Box::new(Expr::MapGet {
-        map: Box::new(Expr::Field(FieldId::parse("node_dependencies").expect("valid field slug"))),
+        map: Box::new(Expr::Field(
+            FieldId::parse("node_dependencies").expect("valid field slug"),
+        )),
         key: Box::new(node_id_expr),
     }))
 }
@@ -101,12 +111,16 @@ fn refresh_ready_frontier_updates() -> Vec<Update> {
                     // Node must be Pending
                     Expr::Eq(
                         Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                            map: Box::new(Expr::Field(
+                                FieldId::parse("node_status").expect("valid field slug"),
+                            )),
                             key: Box::new(Expr::Binding("rf_node".into())),
                         }),
                         Box::new(Expr::NamedVariant {
-                            enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                            variant: EnumVariantId::parse("Pending").expect("valid enum-variant slug"),
+                            enum_name: EnumTypeId::parse("NodeRunStatus")
+                                .expect("valid enum-type slug"),
+                            variant: EnumVariantId::parse("Pending")
+                                .expect("valid enum-variant slug"),
                         }),
                     ),
                     // Dep conditions are satisfied for admission eligibility
@@ -119,7 +133,8 @@ fn refresh_ready_frontier_updates() -> Vec<Update> {
                     field: FieldId::parse("node_status").expect("valid field slug"),
                     key: Expr::Binding("rf_node".into()),
                     value: Expr::NamedVariant {
-                        enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
+                        enum_name: EnumTypeId::parse("NodeRunStatus")
+                            .expect("valid enum-type slug"),
                         variant: EnumVariantId::parse("Ready").expect("valid enum-variant slug"),
                     },
                 }],
@@ -139,17 +154,23 @@ fn refresh_ready_frontier_updates() -> Vec<Update> {
                     // Node must be Ready (was just promoted in Step 1, or was already Ready)
                     Expr::Eq(
                         Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                            map: Box::new(Expr::Field(
+                                FieldId::parse("node_status").expect("valid field slug"),
+                            )),
                             key: Box::new(Expr::Binding("rf_node".into())),
                         }),
                         Box::new(Expr::NamedVariant {
-                            enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                            variant: EnumVariantId::parse("Ready").expect("valid enum-variant slug"),
+                            enum_name: EnumTypeId::parse("NodeRunStatus")
+                                .expect("valid enum-type slug"),
+                            variant: EnumVariantId::parse("Ready")
+                                .expect("valid enum-variant slug"),
                         }),
                     ),
                     // Node must NOT already be in ready_queue
                     Expr::Not(Box::new(Expr::Contains {
-                        collection: Box::new(Expr::SeqElements(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug"))))),
+                        collection: Box::new(Expr::SeqElements(Box::new(Expr::Field(
+                            FieldId::parse("ready_queue").expect("valid field slug"),
+                        )))),
                         value: Box::new(Expr::Binding("rf_node".into())),
                     })),
                 ]),
@@ -165,17 +186,29 @@ fn refresh_ready_frontier_updates() -> Vec<Update> {
 
 /// Emit a ReadyFrontierChanged effect referencing the frame_id in state.
 fn emit_ready_frontier_changed() -> EffectEmit {
-    EffectEmit { variant: EffectVariantId::parse("ReadyFrontierChanged").expect("valid effect-variant slug"),
-        fields: IndexMap::from([(FieldId::parse("frame_id").expect("valid field slug"), Expr::Field(FieldId::parse("frame_id").expect("valid field slug")))]),
+    EffectEmit {
+        variant: EffectVariantId::parse("ReadyFrontierChanged").expect("valid effect-variant slug"),
+        fields: IndexMap::from([(
+            FieldId::parse("frame_id").expect("valid field slug"),
+            Expr::Field(FieldId::parse("frame_id").expect("valid field slug")),
+        )]),
     }
 }
 
 /// Emit a NodeExecutionReleased effect for a given node_id binding.
 fn emit_node_execution_released(node_id_expr: Expr) -> EffectEmit {
-    EffectEmit { variant: EffectVariantId::parse("NodeExecutionReleased").expect("valid effect-variant slug"),
+    EffectEmit {
+        variant: EffectVariantId::parse("NodeExecutionReleased")
+            .expect("valid effect-variant slug"),
         fields: IndexMap::from([
-            (FieldId::parse("frame_id").expect("valid field slug"), Expr::Field(FieldId::parse("frame_id").expect("valid field slug"))),
-            (FieldId::parse("node_id").expect("valid field slug"), node_id_expr),
+            (
+                FieldId::parse("frame_id").expect("valid field slug"),
+                Expr::Field(FieldId::parse("frame_id").expect("valid field slug")),
+            ),
+            (
+                FieldId::parse("node_id").expect("valid field slug"),
+                node_id_expr,
+            ),
         ]),
     }
 }
@@ -183,7 +216,10 @@ fn emit_node_execution_released(node_id_expr: Expr) -> EffectEmit {
 fn emit_root_frame_terminal(effect_variant: &str) -> EffectEmit {
     EffectEmit {
         variant: EffectVariantId::parse(effect_variant).expect("valid effect-variant slug"),
-        fields: IndexMap::from([(FieldId::parse("frame_id").expect("valid field slug"), Expr::Field(FieldId::parse("frame_id").expect("valid field slug")))]),
+        fields: IndexMap::from([(
+            FieldId::parse("frame_id").expect("valid field slug"),
+            Expr::Field(FieldId::parse("frame_id").expect("valid field slug")),
+        )]),
     }
 }
 
@@ -191,10 +227,18 @@ fn emit_body_frame_terminal(effect_variant: &str) -> EffectEmit {
     EffectEmit {
         variant: EffectVariantId::parse(effect_variant).expect("valid effect-variant slug"),
         fields: IndexMap::from([
-            (FieldId::parse("frame_id").expect("valid field slug"), Expr::Field(FieldId::parse("frame_id").expect("valid field slug"))),
-            (FieldId::parse("loop_instance_id").expect("valid field slug"), Expr::Field(FieldId::parse("loop_instance_id").expect("valid field slug")),
+            (
+                FieldId::parse("frame_id").expect("valid field slug"),
+                Expr::Field(FieldId::parse("frame_id").expect("valid field slug")),
             ),
-            (FieldId::parse("iteration").expect("valid field slug"), Expr::Field(FieldId::parse("iteration").expect("valid field slug"))),
+            (
+                FieldId::parse("loop_instance_id").expect("valid field slug"),
+                Expr::Field(FieldId::parse("loop_instance_id").expect("valid field slug")),
+            ),
+            (
+                FieldId::parse("iteration").expect("valid field slug"),
+                Expr::Field(FieldId::parse("iteration").expect("valid field slug")),
+            ),
         ]),
     }
 }
@@ -203,10 +247,14 @@ fn any_node_with_status_expr(status_variant: &str) -> Expr {
     Expr::Quantified {
         quantifier: Quantifier::Any,
         binding: "status_node".into(),
-        over: Box::new(Expr::Field(FieldId::parse("tracked_nodes").expect("valid field slug"))),
+        over: Box::new(Expr::Field(
+            FieldId::parse("tracked_nodes").expect("valid field slug"),
+        )),
         body: Box::new(Expr::Eq(
             Box::new(Expr::MapGet {
-                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                map: Box::new(Expr::Field(
+                    FieldId::parse("node_status").expect("valid field slug"),
+                )),
                 key: Box::new(Expr::Binding("status_node".into())),
             }),
             Box::new(Expr::NamedVariant {
@@ -219,7 +267,9 @@ fn any_node_with_status_expr(status_variant: &str) -> Expr {
 
 fn frame_scope_expr(scope_variant: &str) -> Expr {
     Expr::Eq(
-        Box::new(Expr::Field(FieldId::parse("frame_scope").expect("valid field slug"))),
+        Box::new(Expr::Field(
+            FieldId::parse("frame_scope").expect("valid field slug"),
+        )),
         Box::new(Expr::NamedVariant {
             enum_name: EnumTypeId::parse("FrameScope").expect("valid enum-type slug"),
             variant: EnumVariantId::parse(scope_variant).expect("valid enum-variant slug"),
@@ -327,7 +377,9 @@ fn guard_queue_non_empty() -> Guard {
     Guard {
         name: "ready_queue_non_empty".into(),
         expr: Expr::Gt(
-            Box::new(Expr::Len(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug"))))),
+            Box::new(Expr::Len(Box::new(Expr::Field(
+                FieldId::parse("ready_queue").expect("valid field slug"),
+            )))),
             Box::new(Expr::U64(0)),
         ),
     }
@@ -339,8 +391,12 @@ fn guard_head_is_step() -> Guard {
         name: "head_is_step".into(),
         expr: Expr::Eq(
             Box::new(Expr::MapGet {
-                map: Box::new(Expr::Field(FieldId::parse("node_kind").expect("valid field slug"))),
-                key: Box::new(Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug"))))),
+                map: Box::new(Expr::Field(
+                    FieldId::parse("node_kind").expect("valid field slug"),
+                )),
+                key: Box::new(Expr::Head(Box::new(Expr::Field(
+                    FieldId::parse("ready_queue").expect("valid field slug"),
+                )))),
             }),
             Box::new(Expr::NamedVariant {
                 enum_name: EnumTypeId::parse("FlowNodeKind").expect("valid enum-type slug"),
@@ -356,8 +412,12 @@ fn guard_head_is_loop() -> Guard {
         name: "head_is_loop".into(),
         expr: Expr::Eq(
             Box::new(Expr::MapGet {
-                map: Box::new(Expr::Field(FieldId::parse("node_kind").expect("valid field slug"))),
-                key: Box::new(Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug"))))),
+                map: Box::new(Expr::Field(
+                    FieldId::parse("node_kind").expect("valid field slug"),
+                )),
+                key: Box::new(Expr::Head(Box::new(Expr::Field(
+                    FieldId::parse("ready_queue").expect("valid field slug"),
+                )))),
             }),
             Box::new(Expr::NamedVariant {
                 enum_name: EnumTypeId::parse("FlowNodeKind").expect("valid enum-type slug"),
@@ -377,10 +437,16 @@ fn guard_head_can_run() -> Guard {
             // For nodes without a branch (None), Contains(branch_winners, None) is always false because
             // branch_winners only contains BranchId strings — so this AND arm is a no-op for branchless nodes.
             Expr::Not(Box::new(Expr::Contains {
-                collection: Box::new(Expr::Field(FieldId::parse("branch_winners").expect("valid field slug"))),
+                collection: Box::new(Expr::Field(
+                    FieldId::parse("branch_winners").expect("valid field slug"),
+                )),
                 value: Box::new(Expr::MapGet {
-                    map: Box::new(Expr::Field(FieldId::parse("node_branches").expect("valid field slug"))),
-                    key: Box::new(Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug"))))),
+                    map: Box::new(Expr::Field(
+                        FieldId::parse("node_branches").expect("valid field slug"),
+                    )),
+                    key: Box::new(Expr::Head(Box::new(Expr::Field(
+                        FieldId::parse("ready_queue").expect("valid field slug"),
+                    )))),
                 }),
             })),
             // Dep satisfaction: any of the three eligibility cases.
@@ -388,8 +454,12 @@ fn guard_head_can_run() -> Guard {
                 // No deps at all
                 Expr::Eq(
                     Box::new(Expr::Len(Box::new(Expr::MapGet {
-                        map: Box::new(Expr::Field(FieldId::parse("node_dependencies").expect("valid field slug"))),
-                        key: Box::new(Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug"))))),
+                        map: Box::new(Expr::Field(
+                            FieldId::parse("node_dependencies").expect("valid field slug"),
+                        )),
+                        key: Box::new(Expr::Head(Box::new(Expr::Field(
+                            FieldId::parse("ready_queue").expect("valid field slug"),
+                        )))),
                     }))),
                     Box::new(Expr::U64(0)),
                 ),
@@ -397,34 +467,48 @@ fn guard_head_can_run() -> Guard {
                 Expr::And(vec![
                     Expr::Eq(
                         Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field(FieldId::parse("node_dependency_modes").expect("valid field slug"))),
-                            key: Box::new(Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug"))))),
+                            map: Box::new(Expr::Field(
+                                FieldId::parse("node_dependency_modes").expect("valid field slug"),
+                            )),
+                            key: Box::new(Expr::Head(Box::new(Expr::Field(
+                                FieldId::parse("ready_queue").expect("valid field slug"),
+                            )))),
                         }),
                         Box::new(Expr::NamedVariant {
-                            enum_name: EnumTypeId::parse("DependencyMode").expect("valid enum-type slug"),
+                            enum_name: EnumTypeId::parse("DependencyMode")
+                                .expect("valid enum-type slug"),
                             variant: EnumVariantId::parse("All").expect("valid enum-variant slug"),
                         }),
                     ),
                     Expr::Call {
                         helper: "AllDepsCompleted".into(),
-                        args: vec![Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug"))))],
+                        args: vec![Expr::Head(Box::new(Expr::Field(
+                            FieldId::parse("ready_queue").expect("valid field slug"),
+                        )))],
                     },
                 ]),
                 // Any-mode AND any dep Completed
                 Expr::And(vec![
                     Expr::Eq(
                         Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field(FieldId::parse("node_dependency_modes").expect("valid field slug"))),
-                            key: Box::new(Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug"))))),
+                            map: Box::new(Expr::Field(
+                                FieldId::parse("node_dependency_modes").expect("valid field slug"),
+                            )),
+                            key: Box::new(Expr::Head(Box::new(Expr::Field(
+                                FieldId::parse("ready_queue").expect("valid field slug"),
+                            )))),
                         }),
                         Box::new(Expr::NamedVariant {
-                            enum_name: EnumTypeId::parse("DependencyMode").expect("valid enum-type slug"),
+                            enum_name: EnumTypeId::parse("DependencyMode")
+                                .expect("valid enum-type slug"),
                             variant: EnumVariantId::parse("Any").expect("valid enum-variant slug"),
                         }),
                     ),
                     Expr::Call {
                         helper: "AnyDepCompleted".into(),
-                        args: vec![Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug"))))],
+                        args: vec![Expr::Head(Box::new(Expr::Field(
+                            FieldId::parse("ready_queue").expect("valid field slug"),
+                        )))],
                     },
                 ]),
             ]),
@@ -445,11 +529,16 @@ fn guard_head_should_skip() -> Guard {
             Expr::And(vec![
                 Expr::Eq(
                     Box::new(Expr::MapGet {
-                        map: Box::new(Expr::Field(FieldId::parse("node_dependency_modes").expect("valid field slug"))),
-                        key: Box::new(Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug"))))),
+                        map: Box::new(Expr::Field(
+                            FieldId::parse("node_dependency_modes").expect("valid field slug"),
+                        )),
+                        key: Box::new(Expr::Head(Box::new(Expr::Field(
+                            FieldId::parse("ready_queue").expect("valid field slug"),
+                        )))),
                     }),
                     Box::new(Expr::NamedVariant {
-                        enum_name: EnumTypeId::parse("DependencyMode").expect("valid enum-type slug"),
+                        enum_name: EnumTypeId::parse("DependencyMode")
+                            .expect("valid enum-type slug"),
                         variant: EnumVariantId::parse("All").expect("valid enum-variant slug"),
                     }),
                 ),
@@ -457,36 +546,50 @@ fn guard_head_should_skip() -> Guard {
                 Expr::Quantified {
                     quantifier: Quantifier::Any,
                     binding: "dep_id".into(),
-                    over: Box::new(dependency_ids_expr(Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug")))))),
+                    over: Box::new(dependency_ids_expr(Expr::Head(Box::new(Expr::Field(
+                        FieldId::parse("ready_queue").expect("valid field slug"),
+                    ))))),
                     body: Box::new(Expr::Or(vec![
                         Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_status").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("dep_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Failed").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("NodeRunStatus")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Failed")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                         Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_status").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("dep_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Skipped").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("NodeRunStatus")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Skipped")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                         Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_status").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("dep_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Canceled").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("NodeRunStatus")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Canceled")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                     ])),
@@ -497,10 +600,16 @@ fn guard_head_should_skip() -> Guard {
             // BranchId strings, so Contains(branch_winners, None) is always false — branchless
             // nodes are unaffected.
             Expr::Contains {
-                collection: Box::new(Expr::Field(FieldId::parse("branch_winners").expect("valid field slug"))),
+                collection: Box::new(Expr::Field(
+                    FieldId::parse("branch_winners").expect("valid field slug"),
+                )),
                 value: Box::new(Expr::MapGet {
-                    map: Box::new(Expr::Field(FieldId::parse("node_branches").expect("valid field slug"))),
-                    key: Box::new(Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug"))))),
+                    map: Box::new(Expr::Field(
+                        FieldId::parse("node_branches").expect("valid field slug"),
+                    )),
+                    key: Box::new(Expr::Head(Box::new(Expr::Field(
+                        FieldId::parse("ready_queue").expect("valid field slug"),
+                    )))),
                 }),
             },
         ]),
@@ -515,8 +624,12 @@ fn guard_head_should_fail() -> Guard {
         expr: Expr::And(vec![
             Expr::Eq(
                 Box::new(Expr::MapGet {
-                    map: Box::new(Expr::Field(FieldId::parse("node_dependency_modes").expect("valid field slug"))),
-                    key: Box::new(Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug"))))),
+                    map: Box::new(Expr::Field(
+                        FieldId::parse("node_dependency_modes").expect("valid field slug"),
+                    )),
+                    key: Box::new(Expr::Head(Box::new(Expr::Field(
+                        FieldId::parse("ready_queue").expect("valid field slug"),
+                    )))),
                 }),
                 Box::new(Expr::NamedVariant {
                     enum_name: EnumTypeId::parse("DependencyMode").expect("valid enum-type slug"),
@@ -527,13 +640,17 @@ fn guard_head_should_fail() -> Guard {
             Expr::Quantified {
                 quantifier: Quantifier::All,
                 binding: "dep_id".into(),
-                over: Box::new(dependency_ids_expr(Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug")))))),
+                over: Box::new(dependency_ids_expr(Expr::Head(Box::new(Expr::Field(
+                    FieldId::parse("ready_queue").expect("valid field slug"),
+                ))))),
                 body: Box::new(dep_is_terminal_expr("dep_id")),
             },
             // No dep is Completed (otherwise would have been admitted as run)
             Expr::Not(Box::new(Expr::Call {
                 helper: "AnyDepCompleted".into(),
-                args: vec![Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug"))))],
+                args: vec![Expr::Head(Box::new(Expr::Field(
+                    FieldId::parse("ready_queue").expect("valid field slug"),
+                )))],
             })),
         ]),
     }
@@ -547,12 +664,16 @@ fn admit_run_updates(status_variant: &str) -> Vec<Update> {
         // Store the head node ID so effects can reference it after the pop
         Update::Assign {
             field: FieldId::parse("last_admitted_node").expect("valid field slug"),
-            expr: Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug")))),
+            expr: Expr::Head(Box::new(Expr::Field(
+                FieldId::parse("ready_queue").expect("valid field slug"),
+            ))),
         },
         // Set status to Running
         Update::MapInsert {
             field: FieldId::parse("node_status").expect("valid field slug"),
-            key: Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug")))),
+            key: Expr::Head(Box::new(Expr::Field(
+                FieldId::parse("ready_queue").expect("valid field slug"),
+            ))),
             value: Expr::NamedVariant {
                 enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
                 variant: EnumVariantId::parse(status_variant).expect("valid enum-variant slug"),
@@ -572,12 +693,16 @@ fn admit_terminal_updates(status_variant: &str) -> Vec<Update> {
         // Store the head node ID so effects can reference it after the pop
         Update::Assign {
             field: FieldId::parse("last_admitted_node").expect("valid field slug"),
-            expr: Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug")))),
+            expr: Expr::Head(Box::new(Expr::Field(
+                FieldId::parse("ready_queue").expect("valid field slug"),
+            ))),
         },
         // Set terminal status
         Update::MapInsert {
             field: FieldId::parse("node_status").expect("valid field slug"),
-            key: Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug")))),
+            key: Expr::Head(Box::new(Expr::Field(
+                FieldId::parse("ready_queue").expect("valid field slug"),
+            ))),
             value: Expr::NamedVariant {
                 enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
                 variant: EnumVariantId::parse(status_variant).expect("valid enum-variant slug"),
@@ -614,78 +739,124 @@ pub fn flow_frame_machine() -> MachineSchema {
             },
             fields: vec![
                 // Frame identity (stored so effects can reference it without bindings)
-                field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
-                field("frame_scope", TypeRef::Enum(EnumTypeId::parse("FrameScope").expect("valid enum-type slug"))),
-                field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
+                field(
+                    "frame_id",
+                    TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug")),
+                ),
+                field(
+                    "frame_scope",
+                    TypeRef::Enum(EnumTypeId::parse("FrameScope").expect("valid enum-type slug")),
+                ),
+                field(
+                    "loop_instance_id",
+                    TypeRef::Named(
+                        NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"),
+                    ),
+                ),
                 field("iteration", TypeRef::U32),
                 // Transient scratch: the node ID admitted in the most recent
                 // AdmitNextReadyNode transition. Set BEFORE SeqPopFront so that
                 // effects emitted in the same transition can reference it via
                 // Expr::Field("last_admitted_node"). Stale between transitions —
                 // do not read this field outside of an AdmitNextReadyNode context.
-                field("last_admitted_node", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
+                field(
+                    "last_admitted_node",
+                    TypeRef::Named(
+                        NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                    ),
+                ),
                 // Node graph
                 field(
                     "tracked_nodes",
-                    TypeRef::Set(Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug")))),
+                    TypeRef::Set(Box::new(TypeRef::Named(
+                        NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                    ))),
                 ),
                 field(
                     "ordered_nodes",
-                    TypeRef::Seq(Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug")))),
+                    TypeRef::Seq(Box::new(TypeRef::Named(
+                        NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                    ))),
                 ),
                 field(
                     "node_kind",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
-                        Box::new(TypeRef::Enum(EnumTypeId::parse("FlowNodeKind").expect("valid enum-type slug"))),
+                        Box::new(TypeRef::Named(
+                            NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                        )),
+                        Box::new(TypeRef::Enum(
+                            EnumTypeId::parse("FlowNodeKind").expect("valid enum-type slug"),
+                        )),
                     ),
                 ),
                 // Dependency graph
                 field(
                     "node_dependencies",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
-                        Box::new(TypeRef::Seq(Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))))),
+                        Box::new(TypeRef::Named(
+                            NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                        )),
+                        Box::new(TypeRef::Seq(Box::new(TypeRef::Named(
+                            NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                        )))),
                     ),
                 ),
                 field(
                     "node_dependency_modes",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
-                        Box::new(TypeRef::Enum(EnumTypeId::parse("DependencyMode").expect("valid enum-type slug"))),
+                        Box::new(TypeRef::Named(
+                            NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                        )),
+                        Box::new(TypeRef::Enum(
+                            EnumTypeId::parse("DependencyMode").expect("valid enum-type slug"),
+                        )),
                     ),
                 ),
                 field(
                     "node_branches",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
-                        Box::new(TypeRef::Option(Box::new(TypeRef::Named(NamedTypeId::parse("BranchId").expect("valid named-type slug"))))),
+                        Box::new(TypeRef::Named(
+                            NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                        )),
+                        Box::new(TypeRef::Option(Box::new(TypeRef::Named(
+                            NamedTypeId::parse("BranchId").expect("valid named-type slug"),
+                        )))),
                     ),
                 ),
                 // Branch winner tracking: once a node in a branch group completes,
                 // its BranchId is added here to suppress all sibling branch nodes.
                 field(
                     "branch_winners",
-                    TypeRef::Set(Box::new(TypeRef::Named(NamedTypeId::parse("BranchId").expect("valid named-type slug")))),
+                    TypeRef::Set(Box::new(TypeRef::Named(
+                        NamedTypeId::parse("BranchId").expect("valid named-type slug"),
+                    ))),
                 ),
                 // Status
                 field(
                     "node_status",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
-                        Box::new(TypeRef::Enum(EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"))),
+                        Box::new(TypeRef::Named(
+                            NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                        )),
+                        Box::new(TypeRef::Enum(
+                            EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
+                        )),
                     ),
                 ),
                 // Scheduler
                 field(
                     "ready_queue",
-                    TypeRef::Seq(Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug")))),
+                    TypeRef::Seq(Box::new(TypeRef::Named(
+                        NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                    ))),
                 ),
                 // Output tracking
                 field(
                     "output_recorded",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
+                        Box::new(TypeRef::Named(
+                            NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                        )),
                         Box::new(TypeRef::Bool),
                     ),
                 ),
@@ -693,19 +864,22 @@ pub fn flow_frame_machine() -> MachineSchema {
                 field(
                     "node_condition_results",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
+                        Box::new(TypeRef::Named(
+                            NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                        )),
                         Box::new(TypeRef::Option(Box::new(TypeRef::Bool))),
                     ),
                 ),
             ],
             init: InitSchema {
-            phase: PhaseId::parse("Absent").expect("valid phase slug"),
+                phase: PhaseId::parse("Absent").expect("valid phase slug"),
                 fields: vec![
                     init("frame_id", Expr::String(String::new())),
                     init(
                         "frame_scope",
                         Expr::NamedVariant {
-                            enum_name: EnumTypeId::parse("FrameScope").expect("valid enum-type slug"),
+                            enum_name: EnumTypeId::parse("FrameScope")
+                                .expect("valid enum-type slug"),
                             variant: EnumVariantId::parse("Root").expect("valid enum-variant slug"),
                         },
                     ),
@@ -725,117 +899,216 @@ pub fn flow_frame_machine() -> MachineSchema {
                     init("node_condition_results", Expr::EmptyMap),
                 ],
             },
-            terminal_phases: vec![PhaseId::parse("Completed").expect("valid phase slug"), PhaseId::parse("Failed").expect("valid phase slug"), PhaseId::parse("Canceled").expect("valid phase slug")],
+            terminal_phases: vec![
+                PhaseId::parse("Completed").expect("valid phase slug"),
+                PhaseId::parse("Failed").expect("valid phase slug"),
+                PhaseId::parse("Canceled").expect("valid phase slug"),
+            ],
         },
         inputs: EnumSchema {
             name: "FlowFrameInput".into(),
             variants: vec![
                 VariantSchema {
-                name: EnumVariantId::parse("StartRootFrame").expect("valid variant slug"),
+                    name: EnumVariantId::parse("StartRootFrame").expect("valid variant slug"),
                     fields: vec![
-                        field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
+                        field(
+                            "frame_id",
+                            TypeRef::Named(
+                                NamedTypeId::parse("FrameId").expect("valid named-type slug"),
+                            ),
+                        ),
                         field(
                             "tracked_nodes",
-                            TypeRef::Set(Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug")))),
+                            TypeRef::Set(Box::new(TypeRef::Named(
+                                NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                            ))),
                         ),
                         field(
                             "ordered_nodes",
-                            TypeRef::Seq(Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug")))),
+                            TypeRef::Seq(Box::new(TypeRef::Named(
+                                NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                            ))),
                         ),
                         field(
                             "node_kind",
                             TypeRef::Map(
-                                Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
-                                Box::new(TypeRef::Enum(EnumTypeId::parse("FlowNodeKind").expect("valid enum-type slug"))),
+                                Box::new(TypeRef::Named(
+                                    NamedTypeId::parse("FlowNodeId")
+                                        .expect("valid named-type slug"),
+                                )),
+                                Box::new(TypeRef::Enum(
+                                    EnumTypeId::parse("FlowNodeKind")
+                                        .expect("valid enum-type slug"),
+                                )),
                             ),
                         ),
                         field(
                             "node_dependencies",
                             TypeRef::Map(
-                                Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
-                                Box::new(TypeRef::Seq(Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))))),
+                                Box::new(TypeRef::Named(
+                                    NamedTypeId::parse("FlowNodeId")
+                                        .expect("valid named-type slug"),
+                                )),
+                                Box::new(TypeRef::Seq(Box::new(TypeRef::Named(
+                                    NamedTypeId::parse("FlowNodeId")
+                                        .expect("valid named-type slug"),
+                                )))),
                             ),
                         ),
                         field(
                             "node_dependency_modes",
                             TypeRef::Map(
-                                Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
-                                Box::new(TypeRef::Enum(EnumTypeId::parse("DependencyMode").expect("valid enum-type slug"))),
+                                Box::new(TypeRef::Named(
+                                    NamedTypeId::parse("FlowNodeId")
+                                        .expect("valid named-type slug"),
+                                )),
+                                Box::new(TypeRef::Enum(
+                                    EnumTypeId::parse("DependencyMode")
+                                        .expect("valid enum-type slug"),
+                                )),
                             ),
                         ),
                         field(
                             "node_branches",
                             TypeRef::Map(
-                                Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
-                                Box::new(TypeRef::Option(Box::new(TypeRef::Named(NamedTypeId::parse("BranchId").expect("valid named-type slug"))))),
+                                Box::new(TypeRef::Named(
+                                    NamedTypeId::parse("FlowNodeId")
+                                        .expect("valid named-type slug"),
+                                )),
+                                Box::new(TypeRef::Option(Box::new(TypeRef::Named(
+                                    NamedTypeId::parse("BranchId").expect("valid named-type slug"),
+                                )))),
                             ),
                         ),
                     ],
                 },
                 VariantSchema {
-                name: EnumVariantId::parse("StartBodyFrame").expect("valid variant slug"),
+                    name: EnumVariantId::parse("StartBodyFrame").expect("valid variant slug"),
                     fields: vec![
-                        field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
-                        field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
+                        field(
+                            "frame_id",
+                            TypeRef::Named(
+                                NamedTypeId::parse("FrameId").expect("valid named-type slug"),
+                            ),
+                        ),
+                        field(
+                            "loop_instance_id",
+                            TypeRef::Named(
+                                NamedTypeId::parse("LoopInstanceId")
+                                    .expect("valid named-type slug"),
+                            ),
+                        ),
                         field("iteration", TypeRef::U32),
                         field(
                             "tracked_nodes",
-                            TypeRef::Set(Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug")))),
+                            TypeRef::Set(Box::new(TypeRef::Named(
+                                NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                            ))),
                         ),
                         field(
                             "ordered_nodes",
-                            TypeRef::Seq(Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug")))),
+                            TypeRef::Seq(Box::new(TypeRef::Named(
+                                NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                            ))),
                         ),
                         field(
                             "node_kind",
                             TypeRef::Map(
-                                Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
-                                Box::new(TypeRef::Enum(EnumTypeId::parse("FlowNodeKind").expect("valid enum-type slug"))),
+                                Box::new(TypeRef::Named(
+                                    NamedTypeId::parse("FlowNodeId")
+                                        .expect("valid named-type slug"),
+                                )),
+                                Box::new(TypeRef::Enum(
+                                    EnumTypeId::parse("FlowNodeKind")
+                                        .expect("valid enum-type slug"),
+                                )),
                             ),
                         ),
                         field(
                             "node_dependencies",
                             TypeRef::Map(
-                                Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
-                                Box::new(TypeRef::Seq(Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))))),
+                                Box::new(TypeRef::Named(
+                                    NamedTypeId::parse("FlowNodeId")
+                                        .expect("valid named-type slug"),
+                                )),
+                                Box::new(TypeRef::Seq(Box::new(TypeRef::Named(
+                                    NamedTypeId::parse("FlowNodeId")
+                                        .expect("valid named-type slug"),
+                                )))),
                             ),
                         ),
                         field(
                             "node_dependency_modes",
                             TypeRef::Map(
-                                Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
-                                Box::new(TypeRef::Enum(EnumTypeId::parse("DependencyMode").expect("valid enum-type slug"))),
+                                Box::new(TypeRef::Named(
+                                    NamedTypeId::parse("FlowNodeId")
+                                        .expect("valid named-type slug"),
+                                )),
+                                Box::new(TypeRef::Enum(
+                                    EnumTypeId::parse("DependencyMode")
+                                        .expect("valid enum-type slug"),
+                                )),
                             ),
                         ),
                         field(
                             "node_branches",
                             TypeRef::Map(
-                                Box::new(TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
-                                Box::new(TypeRef::Option(Box::new(TypeRef::Named(NamedTypeId::parse("BranchId").expect("valid named-type slug"))))),
+                                Box::new(TypeRef::Named(
+                                    NamedTypeId::parse("FlowNodeId")
+                                        .expect("valid named-type slug"),
+                                )),
+                                Box::new(TypeRef::Option(Box::new(TypeRef::Named(
+                                    NamedTypeId::parse("BranchId").expect("valid named-type slug"),
+                                )))),
                             ),
                         ),
                     ],
                 },
                 variant("AdmitNextReadyNode"),
                 VariantSchema {
-                name: EnumVariantId::parse("CompleteNode").expect("valid variant slug"),
-                    fields: vec![field("node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug")))],
+                    name: EnumVariantId::parse("CompleteNode").expect("valid variant slug"),
+                    fields: vec![field(
+                        "node_id",
+                        TypeRef::Named(
+                            NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                        ),
+                    )],
                 },
                 VariantSchema {
-                name: EnumVariantId::parse("RecordNodeOutput").expect("valid variant slug"),
-                    fields: vec![field("node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug")))],
+                    name: EnumVariantId::parse("RecordNodeOutput").expect("valid variant slug"),
+                    fields: vec![field(
+                        "node_id",
+                        TypeRef::Named(
+                            NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                        ),
+                    )],
                 },
                 VariantSchema {
-                name: EnumVariantId::parse("FailNode").expect("valid variant slug"),
-                    fields: vec![field("node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug")))],
+                    name: EnumVariantId::parse("FailNode").expect("valid variant slug"),
+                    fields: vec![field(
+                        "node_id",
+                        TypeRef::Named(
+                            NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                        ),
+                    )],
                 },
                 VariantSchema {
-                name: EnumVariantId::parse("SkipNode").expect("valid variant slug"),
-                    fields: vec![field("node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug")))],
+                    name: EnumVariantId::parse("SkipNode").expect("valid variant slug"),
+                    fields: vec![field(
+                        "node_id",
+                        TypeRef::Named(
+                            NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                        ),
+                    )],
                 },
                 VariantSchema {
-                name: EnumVariantId::parse("CancelNode").expect("valid variant slug"),
-                    fields: vec![field("node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug")))],
+                    name: EnumVariantId::parse("CancelNode").expect("valid variant slug"),
+                    fields: vec![field(
+                        "node_id",
+                        TypeRef::Named(
+                            NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                        ),
+                    )],
                 },
                 variant("SealFrame"),
             ],
@@ -849,70 +1122,164 @@ pub fn flow_frame_machine() -> MachineSchema {
             name: "FlowFrameEffect".into(),
             variants: vec![
                 VariantSchema {
-                name: EnumVariantId::parse("ReadyFrontierChanged").expect("valid variant slug"),
-                    fields: vec![field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug")))],
+                    name: EnumVariantId::parse("ReadyFrontierChanged").expect("valid variant slug"),
+                    fields: vec![field(
+                        "frame_id",
+                        TypeRef::Named(
+                            NamedTypeId::parse("FrameId").expect("valid named-type slug"),
+                        ),
+                    )],
                 },
                 VariantSchema {
-                name: EnumVariantId::parse("AdmitStepWork").expect("valid variant slug"),
+                    name: EnumVariantId::parse("AdmitStepWork").expect("valid variant slug"),
                     fields: vec![
-                        field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
-                        field("node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
+                        field(
+                            "frame_id",
+                            TypeRef::Named(
+                                NamedTypeId::parse("FrameId").expect("valid named-type slug"),
+                            ),
+                        ),
+                        field(
+                            "node_id",
+                            TypeRef::Named(
+                                NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                            ),
+                        ),
                     ],
                 },
                 VariantSchema {
-                name: EnumVariantId::parse("StartLoopNode").expect("valid variant slug"),
+                    name: EnumVariantId::parse("StartLoopNode").expect("valid variant slug"),
                     fields: vec![
-                        field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
-                        field("node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
+                        field(
+                            "frame_id",
+                            TypeRef::Named(
+                                NamedTypeId::parse("FrameId").expect("valid named-type slug"),
+                            ),
+                        ),
+                        field(
+                            "node_id",
+                            TypeRef::Named(
+                                NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                            ),
+                        ),
                     ],
                 },
                 VariantSchema {
-                name: EnumVariantId::parse("PersistStepOutput").expect("valid variant slug"),
+                    name: EnumVariantId::parse("PersistStepOutput").expect("valid variant slug"),
                     fields: vec![
-                        field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
-                        field("node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
+                        field(
+                            "frame_id",
+                            TypeRef::Named(
+                                NamedTypeId::parse("FrameId").expect("valid named-type slug"),
+                            ),
+                        ),
+                        field(
+                            "node_id",
+                            TypeRef::Named(
+                                NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                            ),
+                        ),
                     ],
                 },
                 VariantSchema {
-                name: EnumVariantId::parse("NodeExecutionReleased").expect("valid variant slug"),
+                    name: EnumVariantId::parse("NodeExecutionReleased")
+                        .expect("valid variant slug"),
                     fields: vec![
-                        field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
-                        field("node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
+                        field(
+                            "frame_id",
+                            TypeRef::Named(
+                                NamedTypeId::parse("FrameId").expect("valid named-type slug"),
+                            ),
+                        ),
+                        field(
+                            "node_id",
+                            TypeRef::Named(
+                                NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                            ),
+                        ),
                     ],
                 },
                 VariantSchema {
-                name: EnumVariantId::parse("RootFrameCompleted").expect("valid variant slug"),
-                    fields: vec![field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug")))],
+                    name: EnumVariantId::parse("RootFrameCompleted").expect("valid variant slug"),
+                    fields: vec![field(
+                        "frame_id",
+                        TypeRef::Named(
+                            NamedTypeId::parse("FrameId").expect("valid named-type slug"),
+                        ),
+                    )],
                 },
                 VariantSchema {
-                name: EnumVariantId::parse("RootFrameFailed").expect("valid variant slug"),
-                    fields: vec![field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug")))],
+                    name: EnumVariantId::parse("RootFrameFailed").expect("valid variant slug"),
+                    fields: vec![field(
+                        "frame_id",
+                        TypeRef::Named(
+                            NamedTypeId::parse("FrameId").expect("valid named-type slug"),
+                        ),
+                    )],
                 },
                 VariantSchema {
-                name: EnumVariantId::parse("RootFrameCanceled").expect("valid variant slug"),
-                    fields: vec![field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug")))],
+                    name: EnumVariantId::parse("RootFrameCanceled").expect("valid variant slug"),
+                    fields: vec![field(
+                        "frame_id",
+                        TypeRef::Named(
+                            NamedTypeId::parse("FrameId").expect("valid named-type slug"),
+                        ),
+                    )],
                 },
                 VariantSchema {
-                name: EnumVariantId::parse("BodyFrameCompleted").expect("valid variant slug"),
+                    name: EnumVariantId::parse("BodyFrameCompleted").expect("valid variant slug"),
                     fields: vec![
-                        field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
-                        field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
+                        field(
+                            "frame_id",
+                            TypeRef::Named(
+                                NamedTypeId::parse("FrameId").expect("valid named-type slug"),
+                            ),
+                        ),
+                        field(
+                            "loop_instance_id",
+                            TypeRef::Named(
+                                NamedTypeId::parse("LoopInstanceId")
+                                    .expect("valid named-type slug"),
+                            ),
+                        ),
                         field("iteration", TypeRef::U32),
                     ],
                 },
                 VariantSchema {
-                name: EnumVariantId::parse("BodyFrameFailed").expect("valid variant slug"),
+                    name: EnumVariantId::parse("BodyFrameFailed").expect("valid variant slug"),
                     fields: vec![
-                        field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
-                        field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
+                        field(
+                            "frame_id",
+                            TypeRef::Named(
+                                NamedTypeId::parse("FrameId").expect("valid named-type slug"),
+                            ),
+                        ),
+                        field(
+                            "loop_instance_id",
+                            TypeRef::Named(
+                                NamedTypeId::parse("LoopInstanceId")
+                                    .expect("valid named-type slug"),
+                            ),
+                        ),
                         field("iteration", TypeRef::U32),
                     ],
                 },
                 VariantSchema {
-                name: EnumVariantId::parse("BodyFrameCanceled").expect("valid variant slug"),
+                    name: EnumVariantId::parse("BodyFrameCanceled").expect("valid variant slug"),
                     fields: vec![
-                        field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
-                        field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
+                        field(
+                            "frame_id",
+                            TypeRef::Named(
+                                NamedTypeId::parse("FrameId").expect("valid named-type slug"),
+                            ),
+                        ),
+                        field(
+                            "loop_instance_id",
+                            TypeRef::Named(
+                                NamedTypeId::parse("LoopInstanceId")
+                                    .expect("valid named-type slug"),
+                            ),
+                        ),
                         field("iteration", TypeRef::U32),
                     ],
                 },
@@ -926,13 +1293,20 @@ pub fn flow_frame_machine() -> MachineSchema {
             // being promoted while A is merely Ready (not yet started).
             HelperSchema {
                 name: "NodeAdmissionEligible".into(),
-                params: vec![field("node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug")))],
+                params: vec![field(
+                    "node_id",
+                    TypeRef::Named(
+                        NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                    ),
+                )],
                 returns: TypeRef::Bool,
                 body: Expr::IfElse {
                     // No deps → immediately eligible
                     condition: Box::new(Expr::Eq(
                         Box::new(Expr::Len(Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field(FieldId::parse("node_dependencies").expect("valid field slug"))),
+                            map: Box::new(Expr::Field(
+                                FieldId::parse("node_dependencies").expect("valid field slug"),
+                            )),
                             key: Box::new(Expr::Binding("node_id".into())),
                         }))),
                         Box::new(Expr::U64(0)),
@@ -943,12 +1317,17 @@ pub fn flow_frame_machine() -> MachineSchema {
                         // (Completed, Failed, Skipped, or Canceled — NOT Ready or Running)
                         condition: Box::new(Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_dependency_modes").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_dependency_modes")
+                                        .expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("node_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("DependencyMode").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("All").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("DependencyMode")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("All")
+                                    .expect("valid enum-variant slug"),
                             }),
                         )),
                         then_expr: Box::new(Expr::Quantified {
@@ -963,15 +1342,22 @@ pub fn flow_frame_machine() -> MachineSchema {
                             Expr::Quantified {
                                 quantifier: Quantifier::Any,
                                 binding: "dep_id".into(),
-                                over: Box::new(dependency_ids_expr(Expr::Binding("node_id".into()))),
+                                over: Box::new(dependency_ids_expr(Expr::Binding(
+                                    "node_id".into(),
+                                ))),
                                 body: Box::new(Expr::Eq(
                                     Box::new(Expr::MapGet {
-                                        map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                                        map: Box::new(Expr::Field(
+                                            FieldId::parse("node_status")
+                                                .expect("valid field slug"),
+                                        )),
                                         key: Box::new(Expr::Binding("dep_id".into())),
                                     }),
                                     Box::new(Expr::NamedVariant {
-                                        enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                        variant: EnumVariantId::parse("Completed").expect("valid enum-variant slug"),
+                                        enum_name: EnumTypeId::parse("NodeRunStatus")
+                                            .expect("valid enum-type slug"),
+                                        variant: EnumVariantId::parse("Completed")
+                                            .expect("valid enum-variant slug"),
                                     }),
                                 )),
                             },
@@ -979,7 +1365,9 @@ pub fn flow_frame_machine() -> MachineSchema {
                             Expr::Quantified {
                                 quantifier: Quantifier::All,
                                 binding: "dep_id".into(),
-                                over: Box::new(dependency_ids_expr(Expr::Binding("node_id".into()))),
+                                over: Box::new(dependency_ids_expr(Expr::Binding(
+                                    "node_id".into(),
+                                ))),
                                 body: Box::new(dep_is_terminal_expr("dep_id")),
                             },
                         ])),
@@ -989,7 +1377,12 @@ pub fn flow_frame_machine() -> MachineSchema {
             // AllDepsCompleted(node_id): true if ALL deps are Completed
             HelperSchema {
                 name: "AllDepsCompleted".into(),
-                params: vec![field("node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug")))],
+                params: vec![field(
+                    "node_id",
+                    TypeRef::Named(
+                        NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                    ),
+                )],
                 returns: TypeRef::Bool,
                 body: Expr::Quantified {
                     quantifier: Quantifier::All,
@@ -997,12 +1390,16 @@ pub fn flow_frame_machine() -> MachineSchema {
                     over: Box::new(dependency_ids_expr(Expr::Binding("node_id".into()))),
                     body: Box::new(Expr::Eq(
                         Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                            map: Box::new(Expr::Field(
+                                FieldId::parse("node_status").expect("valid field slug"),
+                            )),
                             key: Box::new(Expr::Binding("dep_id".into())),
                         }),
                         Box::new(Expr::NamedVariant {
-                            enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                            variant: EnumVariantId::parse("Completed").expect("valid enum-variant slug"),
+                            enum_name: EnumTypeId::parse("NodeRunStatus")
+                                .expect("valid enum-type slug"),
+                            variant: EnumVariantId::parse("Completed")
+                                .expect("valid enum-variant slug"),
                         }),
                     )),
                 },
@@ -1010,7 +1407,12 @@ pub fn flow_frame_machine() -> MachineSchema {
             // AnyDepCompleted(node_id): true if ANY dep is Completed
             HelperSchema {
                 name: "AnyDepCompleted".into(),
-                params: vec![field("node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug")))],
+                params: vec![field(
+                    "node_id",
+                    TypeRef::Named(
+                        NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"),
+                    ),
+                )],
                 returns: TypeRef::Bool,
                 body: Expr::Quantified {
                     quantifier: Quantifier::Any,
@@ -1018,12 +1420,16 @@ pub fn flow_frame_machine() -> MachineSchema {
                     over: Box::new(dependency_ids_expr(Expr::Binding("node_id".into()))),
                     body: Box::new(Expr::Eq(
                         Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                            map: Box::new(Expr::Field(
+                                FieldId::parse("node_status").expect("valid field slug"),
+                            )),
                             key: Box::new(Expr::Binding("dep_id".into())),
                         }),
                         Box::new(Expr::NamedVariant {
-                            enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                            variant: EnumVariantId::parse("Completed").expect("valid enum-variant slug"),
+                            enum_name: EnumTypeId::parse("NodeRunStatus")
+                                .expect("valid enum-type slug"),
+                            variant: EnumVariantId::parse("Completed")
+                                .expect("valid enum-variant slug"),
                         }),
                     )),
                 },
@@ -1036,46 +1442,64 @@ pub fn flow_frame_machine() -> MachineSchema {
                 body: Expr::Quantified {
                     quantifier: Quantifier::All,
                     binding: "t_node".into(),
-                    over: Box::new(Expr::Field(FieldId::parse("tracked_nodes").expect("valid field slug"))),
+                    over: Box::new(Expr::Field(
+                        FieldId::parse("tracked_nodes").expect("valid field slug"),
+                    )),
                     body: Box::new(Expr::Or(vec![
                         Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_status").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("t_node".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Completed").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("NodeRunStatus")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Completed")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                         Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_status").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("t_node".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Failed").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("NodeRunStatus")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Failed")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                         Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_status").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("t_node".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Skipped").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("NodeRunStatus")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Skipped")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                         Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_status").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("t_node".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Canceled").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("NodeRunStatus")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Canceled")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                     ])),
@@ -1090,15 +1514,21 @@ pub fn flow_frame_machine() -> MachineSchema {
                 Expr::Quantified {
                     quantifier: Quantifier::All,
                     binding: "q_node".into(),
-                    over: Box::new(Expr::SeqElements(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug"))))),
+                    over: Box::new(Expr::SeqElements(Box::new(Expr::Field(
+                        FieldId::parse("ready_queue").expect("valid field slug"),
+                    )))),
                     body: Box::new(Expr::Eq(
                         Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                            map: Box::new(Expr::Field(
+                                FieldId::parse("node_status").expect("valid field slug"),
+                            )),
                             key: Box::new(Expr::Binding("q_node".into())),
                         }),
                         Box::new(Expr::NamedVariant {
-                            enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                            variant: EnumVariantId::parse("Ready").expect("valid enum-variant slug"),
+                            enum_name: EnumTypeId::parse("NodeRunStatus")
+                                .expect("valid enum-type slug"),
+                            variant: EnumVariantId::parse("Ready")
+                                .expect("valid enum-variant slug"),
                         }),
                     )),
                 },
@@ -1106,20 +1536,28 @@ pub fn flow_frame_machine() -> MachineSchema {
                 Expr::Quantified {
                     quantifier: Quantifier::All,
                     binding: "t_node".into(),
-                    over: Box::new(Expr::Field(FieldId::parse("tracked_nodes").expect("valid field slug"))),
+                    over: Box::new(Expr::Field(
+                        FieldId::parse("tracked_nodes").expect("valid field slug"),
+                    )),
                     body: Box::new(Expr::Or(vec![
                         Expr::Neq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_status").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("t_node".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Ready").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("NodeRunStatus")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Ready")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                         Expr::Contains {
-                            collection: Box::new(Expr::SeqElements(Box::new(Expr::Field(FieldId::parse("ready_queue").expect("valid field slug"))))),
+                            collection: Box::new(Expr::SeqElements(Box::new(Expr::Field(
+                                FieldId::parse("ready_queue").expect("valid field slug"),
+                            )))),
                             value: Box::new(Expr::Binding("t_node".into())),
                         },
                     ])),
@@ -1135,7 +1573,10 @@ pub fn flow_frame_machine() -> MachineSchema {
             TransitionSchema {
                 name: TransitionId::parse("StartRootFrame").expect("valid transition slug"),
                 from: vec![PhaseId::parse("Absent").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("StartRootFrame").expect("valid input-variant slug"), bindings: vec![
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("StartRootFrame")
+                        .expect("valid input-variant slug"),
+                    bindings: vec![
                         FieldId::parse("frame_id").expect("valid field slug"),
                         FieldId::parse("tracked_nodes").expect("valid field slug"),
                         FieldId::parse("ordered_nodes").expect("valid field slug"),
@@ -1143,7 +1584,8 @@ pub fn flow_frame_machine() -> MachineSchema {
                         FieldId::parse("node_dependencies").expect("valid field slug"),
                         FieldId::parse("node_dependency_modes").expect("valid field slug"),
                         FieldId::parse("node_branches").expect("valid field slug"),
-                    ] },
+                    ],
+                },
                 guards: vec![],
                 updates: start_root_frame_updates(),
                 to: PhaseId::parse("Running").expect("valid phase slug"),
@@ -1152,7 +1594,10 @@ pub fn flow_frame_machine() -> MachineSchema {
             TransitionSchema {
                 name: TransitionId::parse("StartBodyFrame").expect("valid transition slug"),
                 from: vec![PhaseId::parse("Absent").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("StartBodyFrame").expect("valid input-variant slug"), bindings: vec![
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("StartBodyFrame")
+                        .expect("valid input-variant slug"),
+                    bindings: vec![
                         FieldId::parse("frame_id").expect("valid field slug"),
                         FieldId::parse("loop_instance_id").expect("valid field slug"),
                         FieldId::parse("iteration").expect("valid field slug"),
@@ -1162,7 +1607,8 @@ pub fn flow_frame_machine() -> MachineSchema {
                         FieldId::parse("node_dependencies").expect("valid field slug"),
                         FieldId::parse("node_dependency_modes").expect("valid field slug"),
                         FieldId::parse("node_branches").expect("valid field slug"),
-                    ] },
+                    ],
+                },
                 guards: vec![],
                 updates: start_body_frame_updates(),
                 to: PhaseId::parse("Running").expect("valid phase slug"),
@@ -1173,9 +1619,14 @@ pub fn flow_frame_machine() -> MachineSchema {
             // Head of ready_queue is a Step node whose deps allow running.
             // ----------------------------------------------------------------
             TransitionSchema {
-                name: TransitionId::parse("AdmitNextReadyNode_StepRun").expect("valid transition slug"),
+                name: TransitionId::parse("AdmitNextReadyNode_StepRun")
+                    .expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("AdmitNextReadyNode").expect("valid input-variant slug"), bindings: vec![] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("AdmitNextReadyNode")
+                        .expect("valid input-variant slug"),
+                    bindings: vec![],
+                },
                 guards: vec![
                     guard_queue_non_empty(),
                     guard_head_is_step(),
@@ -1184,10 +1635,20 @@ pub fn flow_frame_machine() -> MachineSchema {
                 updates: admit_run_updates("Running"),
                 to: PhaseId::parse("Running").expect("valid phase slug"),
                 emit: vec![
-                    EffectEmit { variant: EffectVariantId::parse("AdmitStepWork").expect("valid effect-variant slug"),
+                    EffectEmit {
+                        variant: EffectVariantId::parse("AdmitStepWork")
+                            .expect("valid effect-variant slug"),
                         fields: IndexMap::from([
-                            (FieldId::parse("frame_id").expect("valid field slug"), Expr::Field(FieldId::parse("frame_id").expect("valid field slug"))),
-                            (FieldId::parse("node_id").expect("valid field slug"), Expr::Field(FieldId::parse("last_admitted_node").expect("valid field slug"))),
+                            (
+                                FieldId::parse("frame_id").expect("valid field slug"),
+                                Expr::Field(FieldId::parse("frame_id").expect("valid field slug")),
+                            ),
+                            (
+                                FieldId::parse("node_id").expect("valid field slug"),
+                                Expr::Field(
+                                    FieldId::parse("last_admitted_node").expect("valid field slug"),
+                                ),
+                            ),
                         ]),
                     },
                     emit_ready_frontier_changed(),
@@ -1198,9 +1659,14 @@ pub fn flow_frame_machine() -> MachineSchema {
             // Head of ready_queue is a Loop node whose deps allow running.
             // ----------------------------------------------------------------
             TransitionSchema {
-                name: TransitionId::parse("AdmitNextReadyNode_LoopRun").expect("valid transition slug"),
+                name: TransitionId::parse("AdmitNextReadyNode_LoopRun")
+                    .expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("AdmitNextReadyNode").expect("valid input-variant slug"), bindings: vec![] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("AdmitNextReadyNode")
+                        .expect("valid input-variant slug"),
+                    bindings: vec![],
+                },
                 guards: vec![
                     guard_queue_non_empty(),
                     guard_head_is_loop(),
@@ -1209,13 +1675,25 @@ pub fn flow_frame_machine() -> MachineSchema {
                 updates: admit_run_updates("Running"),
                 to: PhaseId::parse("Running").expect("valid phase slug"),
                 emit: vec![
-                    EffectEmit { variant: EffectVariantId::parse("StartLoopNode").expect("valid effect-variant slug"),
+                    EffectEmit {
+                        variant: EffectVariantId::parse("StartLoopNode")
+                            .expect("valid effect-variant slug"),
                         fields: IndexMap::from([
-                            (FieldId::parse("frame_id").expect("valid field slug"), Expr::Field(FieldId::parse("frame_id").expect("valid field slug"))),
-                            (FieldId::parse("node_id").expect("valid field slug"), Expr::Field(FieldId::parse("last_admitted_node").expect("valid field slug"))),
+                            (
+                                FieldId::parse("frame_id").expect("valid field slug"),
+                                Expr::Field(FieldId::parse("frame_id").expect("valid field slug")),
+                            ),
+                            (
+                                FieldId::parse("node_id").expect("valid field slug"),
+                                Expr::Field(
+                                    FieldId::parse("last_admitted_node").expect("valid field slug"),
+                                ),
+                            ),
                         ]),
                     },
-                    emit_node_execution_released(Expr::Field(FieldId::parse("last_admitted_node").expect("valid field slug"))),
+                    emit_node_execution_released(Expr::Field(
+                        FieldId::parse("last_admitted_node").expect("valid field slug"),
+                    )),
                     emit_ready_frontier_changed(),
                 ],
             },
@@ -1224,14 +1702,21 @@ pub fn flow_frame_machine() -> MachineSchema {
             // Head of ready_queue should be skipped (All-mode with failed dep).
             // ----------------------------------------------------------------
             TransitionSchema {
-                name: TransitionId::parse("AdmitNextReadyNode_Skip").expect("valid transition slug"),
+                name: TransitionId::parse("AdmitNextReadyNode_Skip")
+                    .expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("AdmitNextReadyNode").expect("valid input-variant slug"), bindings: vec![] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("AdmitNextReadyNode")
+                        .expect("valid input-variant slug"),
+                    bindings: vec![],
+                },
                 guards: vec![guard_queue_non_empty(), guard_head_should_skip()],
                 updates: admit_terminal_updates("Skipped"),
                 to: PhaseId::parse("Running").expect("valid phase slug"),
                 emit: vec![
-                    emit_node_execution_released(Expr::Field(FieldId::parse("last_admitted_node").expect("valid field slug"))),
+                    emit_node_execution_released(Expr::Field(
+                        FieldId::parse("last_admitted_node").expect("valid field slug"),
+                    )),
                     emit_ready_frontier_changed(),
                 ],
             },
@@ -1240,14 +1725,21 @@ pub fn flow_frame_machine() -> MachineSchema {
             // Head of ready_queue should fail (Any-mode, all deps terminal, none Completed).
             // ----------------------------------------------------------------
             TransitionSchema {
-                name: TransitionId::parse("AdmitNextReadyNode_Fail").expect("valid transition slug"),
+                name: TransitionId::parse("AdmitNextReadyNode_Fail")
+                    .expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("AdmitNextReadyNode").expect("valid input-variant slug"), bindings: vec![] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("AdmitNextReadyNode")
+                        .expect("valid input-variant slug"),
+                    bindings: vec![],
+                },
                 guards: vec![guard_queue_non_empty(), guard_head_should_fail()],
                 updates: admit_terminal_updates("Failed"),
                 to: PhaseId::parse("Running").expect("valid phase slug"),
                 emit: vec![
-                    emit_node_execution_released(Expr::Field(FieldId::parse("last_admitted_node").expect("valid field slug"))),
+                    emit_node_execution_released(Expr::Field(
+                        FieldId::parse("last_admitted_node").expect("valid field slug"),
+                    )),
                     emit_ready_frontier_changed(),
                 ],
             },
@@ -1257,18 +1749,26 @@ pub fn flow_frame_machine() -> MachineSchema {
             TransitionSchema {
                 name: TransitionId::parse("CompleteNode_Step").expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("CompleteNode").expect("valid input-variant slug"), bindings: vec![FieldId::parse("node_id").expect("valid field slug")] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("CompleteNode")
+                        .expect("valid input-variant slug"),
+                    bindings: vec![FieldId::parse("node_id").expect("valid field slug")],
+                },
                 guards: vec![
                     Guard {
                         name: "node_is_running".into(),
                         expr: Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_status").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("node_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Running").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("NodeRunStatus")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Running")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                     },
@@ -1276,12 +1776,16 @@ pub fn flow_frame_machine() -> MachineSchema {
                         name: "node_is_step".into(),
                         expr: Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_kind").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_kind").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("node_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("FlowNodeKind").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Step").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("FlowNodeKind")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Step")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                     },
@@ -1292,8 +1796,10 @@ pub fn flow_frame_machine() -> MachineSchema {
                             field: FieldId::parse("node_status").expect("valid field slug"),
                             key: Expr::Binding("node_id".into()),
                             value: Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Completed").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("NodeRunStatus")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Completed")
+                                    .expect("valid enum-variant slug"),
                             },
                         },
                         // If this node belongs to a branch group, record it as the branch winner
@@ -1301,7 +1807,9 @@ pub fn flow_frame_machine() -> MachineSchema {
                         Update::Conditional {
                             condition: Expr::Neq(
                                 Box::new(Expr::MapGet {
-                                    map: Box::new(Expr::Field(FieldId::parse("node_branches").expect("valid field slug"))),
+                                    map: Box::new(Expr::Field(
+                                        FieldId::parse("node_branches").expect("valid field slug"),
+                                    )),
                                     key: Box::new(Expr::Binding("node_id".into())),
                                 }),
                                 Box::new(Expr::None),
@@ -1309,7 +1817,9 @@ pub fn flow_frame_machine() -> MachineSchema {
                             then_updates: vec![Update::SetInsert {
                                 field: FieldId::parse("branch_winners").expect("valid field slug"),
                                 value: Expr::MapGet {
-                                    map: Box::new(Expr::Field(FieldId::parse("node_branches").expect("valid field slug"))),
+                                    map: Box::new(Expr::Field(
+                                        FieldId::parse("node_branches").expect("valid field slug"),
+                                    )),
                                     key: Box::new(Expr::Binding("node_id".into())),
                                 },
                             }],
@@ -1332,18 +1842,26 @@ pub fn flow_frame_machine() -> MachineSchema {
             TransitionSchema {
                 name: TransitionId::parse("CompleteNode_Loop").expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("CompleteNode").expect("valid input-variant slug"), bindings: vec![FieldId::parse("node_id").expect("valid field slug")] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("CompleteNode")
+                        .expect("valid input-variant slug"),
+                    bindings: vec![FieldId::parse("node_id").expect("valid field slug")],
+                },
                 guards: vec![
                     Guard {
                         name: "node_is_running".into(),
                         expr: Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_status").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("node_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Running").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("NodeRunStatus")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Running")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                     },
@@ -1351,12 +1869,16 @@ pub fn flow_frame_machine() -> MachineSchema {
                         name: "node_is_loop".into(),
                         expr: Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_kind").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_kind").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("node_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("FlowNodeKind").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Loop").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("FlowNodeKind")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Loop")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                     },
@@ -1367,14 +1889,18 @@ pub fn flow_frame_machine() -> MachineSchema {
                             field: FieldId::parse("node_status").expect("valid field slug"),
                             key: Expr::Binding("node_id".into()),
                             value: Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Completed").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("NodeRunStatus")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Completed")
+                                    .expect("valid enum-variant slug"),
                             },
                         },
                         Update::Conditional {
                             condition: Expr::Neq(
                                 Box::new(Expr::MapGet {
-                                    map: Box::new(Expr::Field(FieldId::parse("node_branches").expect("valid field slug"))),
+                                    map: Box::new(Expr::Field(
+                                        FieldId::parse("node_branches").expect("valid field slug"),
+                                    )),
                                     key: Box::new(Expr::Binding("node_id".into())),
                                 }),
                                 Box::new(Expr::None),
@@ -1382,7 +1908,9 @@ pub fn flow_frame_machine() -> MachineSchema {
                             then_updates: vec![Update::SetInsert {
                                 field: FieldId::parse("branch_winners").expect("valid field slug"),
                                 value: Expr::MapGet {
-                                    map: Box::new(Expr::Field(FieldId::parse("node_branches").expect("valid field slug"))),
+                                    map: Box::new(Expr::Field(
+                                        FieldId::parse("node_branches").expect("valid field slug"),
+                                    )),
                                     key: Box::new(Expr::Binding("node_id".into())),
                                 },
                             }],
@@ -1401,7 +1929,11 @@ pub fn flow_frame_machine() -> MachineSchema {
             TransitionSchema {
                 name: TransitionId::parse("RecordNodeOutput").expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("RecordNodeOutput").expect("valid input-variant slug"), bindings: vec![FieldId::parse("node_id").expect("valid field slug")] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("RecordNodeOutput")
+                        .expect("valid input-variant slug"),
+                    bindings: vec![FieldId::parse("node_id").expect("valid field slug")],
+                },
                 guards: vec![],
                 updates: vec![Update::MapInsert {
                     field: FieldId::parse("output_recorded").expect("valid field slug"),
@@ -1409,10 +1941,18 @@ pub fn flow_frame_machine() -> MachineSchema {
                     value: Expr::Bool(true),
                 }],
                 to: PhaseId::parse("Running").expect("valid phase slug"),
-                emit: vec![EffectEmit { variant: EffectVariantId::parse("PersistStepOutput").expect("valid effect-variant slug"),
+                emit: vec![EffectEmit {
+                    variant: EffectVariantId::parse("PersistStepOutput")
+                        .expect("valid effect-variant slug"),
                     fields: IndexMap::from([
-                        (FieldId::parse("frame_id").expect("valid field slug"), Expr::Field(FieldId::parse("frame_id").expect("valid field slug"))),
-                        (FieldId::parse("node_id").expect("valid field slug"), Expr::Binding("node_id".into())),
+                        (
+                            FieldId::parse("frame_id").expect("valid field slug"),
+                            Expr::Field(FieldId::parse("frame_id").expect("valid field slug")),
+                        ),
+                        (
+                            FieldId::parse("node_id").expect("valid field slug"),
+                            Expr::Binding("node_id".into()),
+                        ),
                     ]),
                 }],
             },
@@ -1422,18 +1962,25 @@ pub fn flow_frame_machine() -> MachineSchema {
             TransitionSchema {
                 name: TransitionId::parse("FailNode_Step").expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("FailNode").expect("valid input-variant slug"), bindings: vec![FieldId::parse("node_id").expect("valid field slug")] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("FailNode").expect("valid input-variant slug"),
+                    bindings: vec![FieldId::parse("node_id").expect("valid field slug")],
+                },
                 guards: vec![
                     Guard {
                         name: "node_is_running".into(),
                         expr: Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_status").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("node_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Running").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("NodeRunStatus")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Running")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                     },
@@ -1441,12 +1988,16 @@ pub fn flow_frame_machine() -> MachineSchema {
                         name: "node_is_step".into(),
                         expr: Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_kind").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_kind").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("node_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("FlowNodeKind").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Step").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("FlowNodeKind")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Step")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                     },
@@ -1456,8 +2007,10 @@ pub fn flow_frame_machine() -> MachineSchema {
                         field: FieldId::parse("node_status").expect("valid field slug"),
                         key: Expr::Binding("node_id".into()),
                         value: Expr::NamedVariant {
-                            enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                            variant: EnumVariantId::parse("Failed").expect("valid enum-variant slug"),
+                            enum_name: EnumTypeId::parse("NodeRunStatus")
+                                .expect("valid enum-type slug"),
+                            variant: EnumVariantId::parse("Failed")
+                                .expect("valid enum-variant slug"),
                         },
                     }];
                     updates.extend(refresh_ready_frontier_updates());
@@ -1476,18 +2029,25 @@ pub fn flow_frame_machine() -> MachineSchema {
             TransitionSchema {
                 name: TransitionId::parse("FailNode_Loop").expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("FailNode").expect("valid input-variant slug"), bindings: vec![FieldId::parse("node_id").expect("valid field slug")] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("FailNode").expect("valid input-variant slug"),
+                    bindings: vec![FieldId::parse("node_id").expect("valid field slug")],
+                },
                 guards: vec![
                     Guard {
                         name: "node_is_running".into(),
                         expr: Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_status").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("node_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Running").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("NodeRunStatus")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Running")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                     },
@@ -1495,12 +2055,16 @@ pub fn flow_frame_machine() -> MachineSchema {
                         name: "node_is_loop".into(),
                         expr: Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_kind").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_kind").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("node_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("FlowNodeKind").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Loop").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("FlowNodeKind")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Loop")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                     },
@@ -1510,8 +2074,10 @@ pub fn flow_frame_machine() -> MachineSchema {
                         field: FieldId::parse("node_status").expect("valid field slug"),
                         key: Expr::Binding("node_id".into()),
                         value: Expr::NamedVariant {
-                            enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                            variant: EnumVariantId::parse("Failed").expect("valid enum-variant slug"),
+                            enum_name: EnumTypeId::parse("NodeRunStatus")
+                                .expect("valid enum-type slug"),
+                            variant: EnumVariantId::parse("Failed")
+                                .expect("valid enum-variant slug"),
                         },
                     }];
                     updates.extend(refresh_ready_frontier_updates());
@@ -1526,18 +2092,25 @@ pub fn flow_frame_machine() -> MachineSchema {
             TransitionSchema {
                 name: TransitionId::parse("SkipNode_Step").expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("SkipNode").expect("valid input-variant slug"), bindings: vec![FieldId::parse("node_id").expect("valid field slug")] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("SkipNode").expect("valid input-variant slug"),
+                    bindings: vec![FieldId::parse("node_id").expect("valid field slug")],
+                },
                 guards: vec![
                     Guard {
                         name: "node_is_running".into(),
                         expr: Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_status").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("node_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Running").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("NodeRunStatus")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Running")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                     },
@@ -1545,12 +2118,16 @@ pub fn flow_frame_machine() -> MachineSchema {
                         name: "node_is_step".into(),
                         expr: Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_kind").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_kind").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("node_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("FlowNodeKind").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Step").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("FlowNodeKind")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Step")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                     },
@@ -1560,8 +2137,10 @@ pub fn flow_frame_machine() -> MachineSchema {
                         field: FieldId::parse("node_status").expect("valid field slug"),
                         key: Expr::Binding("node_id".into()),
                         value: Expr::NamedVariant {
-                            enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                            variant: EnumVariantId::parse("Skipped").expect("valid enum-variant slug"),
+                            enum_name: EnumTypeId::parse("NodeRunStatus")
+                                .expect("valid enum-type slug"),
+                            variant: EnumVariantId::parse("Skipped")
+                                .expect("valid enum-variant slug"),
                         },
                     }];
                     updates.extend(refresh_ready_frontier_updates());
@@ -1580,18 +2159,25 @@ pub fn flow_frame_machine() -> MachineSchema {
             TransitionSchema {
                 name: TransitionId::parse("SkipNode_Loop").expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("SkipNode").expect("valid input-variant slug"), bindings: vec![FieldId::parse("node_id").expect("valid field slug")] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("SkipNode").expect("valid input-variant slug"),
+                    bindings: vec![FieldId::parse("node_id").expect("valid field slug")],
+                },
                 guards: vec![
                     Guard {
                         name: "node_is_running".into(),
                         expr: Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_status").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("node_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Running").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("NodeRunStatus")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Running")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                     },
@@ -1599,12 +2185,16 @@ pub fn flow_frame_machine() -> MachineSchema {
                         name: "node_is_loop".into(),
                         expr: Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_kind").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_kind").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("node_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("FlowNodeKind").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Loop").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("FlowNodeKind")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Loop")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                     },
@@ -1614,8 +2204,10 @@ pub fn flow_frame_machine() -> MachineSchema {
                         field: FieldId::parse("node_status").expect("valid field slug"),
                         key: Expr::Binding("node_id".into()),
                         value: Expr::NamedVariant {
-                            enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                            variant: EnumVariantId::parse("Skipped").expect("valid enum-variant slug"),
+                            enum_name: EnumTypeId::parse("NodeRunStatus")
+                                .expect("valid enum-type slug"),
+                            variant: EnumVariantId::parse("Skipped")
+                                .expect("valid enum-variant slug"),
                         },
                     }];
                     updates.extend(refresh_ready_frontier_updates());
@@ -1630,18 +2222,25 @@ pub fn flow_frame_machine() -> MachineSchema {
             TransitionSchema {
                 name: TransitionId::parse("CancelNode_Step").expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("CancelNode").expect("valid input-variant slug"), bindings: vec![FieldId::parse("node_id").expect("valid field slug")] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("CancelNode").expect("valid input-variant slug"),
+                    bindings: vec![FieldId::parse("node_id").expect("valid field slug")],
+                },
                 guards: vec![
                     Guard {
                         name: "node_is_running".into(),
                         expr: Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_status").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("node_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Running").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("NodeRunStatus")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Running")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                     },
@@ -1649,12 +2248,16 @@ pub fn flow_frame_machine() -> MachineSchema {
                         name: "node_is_step".into(),
                         expr: Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_kind").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_kind").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("node_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("FlowNodeKind").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Step").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("FlowNodeKind")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Step")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                     },
@@ -1664,8 +2267,10 @@ pub fn flow_frame_machine() -> MachineSchema {
                         field: FieldId::parse("node_status").expect("valid field slug"),
                         key: Expr::Binding("node_id".into()),
                         value: Expr::NamedVariant {
-                            enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                            variant: EnumVariantId::parse("Canceled").expect("valid enum-variant slug"),
+                            enum_name: EnumTypeId::parse("NodeRunStatus")
+                                .expect("valid enum-type slug"),
+                            variant: EnumVariantId::parse("Canceled")
+                                .expect("valid enum-variant slug"),
                         },
                     }];
                     updates.extend(refresh_ready_frontier_updates());
@@ -1684,18 +2289,25 @@ pub fn flow_frame_machine() -> MachineSchema {
             TransitionSchema {
                 name: TransitionId::parse("CancelNode_Loop").expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("CancelNode").expect("valid input-variant slug"), bindings: vec![FieldId::parse("node_id").expect("valid field slug")] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("CancelNode").expect("valid input-variant slug"),
+                    bindings: vec![FieldId::parse("node_id").expect("valid field slug")],
+                },
                 guards: vec![
                     Guard {
                         name: "node_is_running".into(),
                         expr: Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_status").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_status").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("node_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Running").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("NodeRunStatus")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Running")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                     },
@@ -1703,12 +2315,16 @@ pub fn flow_frame_machine() -> MachineSchema {
                         name: "node_is_loop".into(),
                         expr: Expr::Eq(
                             Box::new(Expr::MapGet {
-                                map: Box::new(Expr::Field(FieldId::parse("node_kind").expect("valid field slug"))),
+                                map: Box::new(Expr::Field(
+                                    FieldId::parse("node_kind").expect("valid field slug"),
+                                )),
                                 key: Box::new(Expr::Binding("node_id".into())),
                             }),
                             Box::new(Expr::NamedVariant {
-                                enum_name: EnumTypeId::parse("FlowNodeKind").expect("valid enum-type slug"),
-                                variant: EnumVariantId::parse("Loop").expect("valid enum-variant slug"),
+                                enum_name: EnumTypeId::parse("FlowNodeKind")
+                                    .expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("Loop")
+                                    .expect("valid enum-variant slug"),
                             }),
                         ),
                     },
@@ -1718,8 +2334,10 @@ pub fn flow_frame_machine() -> MachineSchema {
                         field: FieldId::parse("node_status").expect("valid field slug"),
                         key: Expr::Binding("node_id".into()),
                         value: Expr::NamedVariant {
-                            enum_name: EnumTypeId::parse("NodeRunStatus").expect("valid enum-type slug"),
-                            variant: EnumVariantId::parse("Canceled").expect("valid enum-variant slug"),
+                            enum_name: EnumTypeId::parse("NodeRunStatus")
+                                .expect("valid enum-type slug"),
+                            variant: EnumVariantId::parse("Canceled")
+                                .expect("valid enum-variant slug"),
                         },
                     }];
                     updates.extend(refresh_ready_frontier_updates());
@@ -1735,7 +2353,10 @@ pub fn flow_frame_machine() -> MachineSchema {
             TransitionSchema {
                 name: TransitionId::parse("SealRootFrameCanceled").expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("SealFrame").expect("valid input-variant slug"), bindings: vec![] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("SealFrame").expect("valid input-variant slug"),
+                    bindings: vec![],
+                },
                 guards: vec![
                     Guard {
                         name: "all_nodes_terminal".into(),
@@ -1760,7 +2381,10 @@ pub fn flow_frame_machine() -> MachineSchema {
             TransitionSchema {
                 name: TransitionId::parse("SealRootFrameFailed").expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("SealFrame").expect("valid input-variant slug"), bindings: vec![] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("SealFrame").expect("valid input-variant slug"),
+                    bindings: vec![],
+                },
                 guards: vec![
                     Guard {
                         name: "all_nodes_terminal".into(),
@@ -1789,7 +2413,10 @@ pub fn flow_frame_machine() -> MachineSchema {
             TransitionSchema {
                 name: TransitionId::parse("SealRootFrameCompleted").expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("SealFrame").expect("valid input-variant slug"), bindings: vec![] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("SealFrame").expect("valid input-variant slug"),
+                    bindings: vec![],
+                },
                 guards: vec![
                     Guard {
                         name: "all_nodes_terminal".into(),
@@ -1818,7 +2445,10 @@ pub fn flow_frame_machine() -> MachineSchema {
             TransitionSchema {
                 name: TransitionId::parse("SealBodyFrameCanceled").expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("SealFrame").expect("valid input-variant slug"), bindings: vec![] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("SealFrame").expect("valid input-variant slug"),
+                    bindings: vec![],
+                },
                 guards: vec![
                     Guard {
                         name: "all_nodes_terminal".into(),
@@ -1843,7 +2473,10 @@ pub fn flow_frame_machine() -> MachineSchema {
             TransitionSchema {
                 name: TransitionId::parse("SealBodyFrameFailed").expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("SealFrame").expect("valid input-variant slug"), bindings: vec![] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("SealFrame").expect("valid input-variant slug"),
+                    bindings: vec![],
+                },
                 guards: vec![
                     Guard {
                         name: "all_nodes_terminal".into(),
@@ -1872,7 +2505,10 @@ pub fn flow_frame_machine() -> MachineSchema {
             TransitionSchema {
                 name: TransitionId::parse("SealBodyFrameCompleted").expect("valid transition slug"),
                 from: vec![PhaseId::parse("Running").expect("valid phase slug")],
-                on: TriggerMatch::Input { variant: InputVariantId::parse("SealFrame").expect("valid input-variant slug"), bindings: vec![] },
+                on: TriggerMatch::Input {
+                    variant: InputVariantId::parse("SealFrame").expect("valid input-variant slug"),
+                    bindings: vec![],
+                },
                 guards: vec![
                     Guard {
                         name: "all_nodes_terminal".into(),
@@ -1939,7 +2575,8 @@ fn routed_disposition(name: &str, consumer_machines: &[&str]) -> EffectDispositi
         effect_variant: EffectVariantId::parse(name).expect("valid effect-variant slug"),
         disposition: EffectDisposition::Routed {
             consumer_machines: consumer_machines
-                .iter().map(|item| MachineId::parse(*item).expect("valid machine slug"))
+                .iter()
+                .map(|item| MachineId::parse(*item).expect("valid machine slug"))
                 .collect(),
         },
         handoff_protocol: None,

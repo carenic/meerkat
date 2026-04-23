@@ -49,8 +49,14 @@ fn route_target_variant<'a>(
     target: &RouteTarget,
 ) -> Option<&'a VariantSchema> {
     match target.kind {
-        RouteTargetKind::Input => machine.inputs.variant_named(target.input_variant.as_str()).ok(),
-        RouteTargetKind::Signal => machine.signals.variant_named(target.input_variant.as_str()).ok(),
+        RouteTargetKind::Input => machine
+            .inputs
+            .variant_named(target.input_variant.as_str())
+            .ok(),
+        RouteTargetKind::Signal => machine
+            .signals
+            .variant_named(target.input_variant.as_str())
+            .ok(),
     }
 }
 
@@ -819,10 +825,7 @@ pub fn composition_witness_cfg_name(name: &str) -> String {
     format!("witness-{}.cfg", tla_ident(name))
 }
 
-fn composition_witness_route_property_name(
-    witness: &str,
-    route_name: impl AsRef<str>,
-) -> String {
+fn composition_witness_route_property_name(witness: &str, route_name: impl AsRef<str>) -> String {
     format!(
         "WitnessRouteObserved_{}_{}",
         tla_ident(witness),
@@ -4086,7 +4089,10 @@ impl<'a> CompositionTlaCompiler<'a> {
         let field_env = self.machine_field_env(instance_id);
 
         let mut clauses = vec![
-            format!("packet.variant = {}", tla_string(transition.on.variant_str())),
+            format!(
+                "packet.variant = {}",
+                tla_string(transition.on.variant_str())
+            ),
             from_guard,
         ];
         clauses.extend(
@@ -5394,7 +5400,12 @@ impl<'a> MachineTlaCompiler<'a> {
                 .state
                 .fields
                 .iter()
-                .map(|field| (field.name.as_str().to_owned(), field.name.as_str().to_owned()))
+                .map(|field| {
+                    (
+                        field.name.as_str().to_owned(),
+                        field.name.as_str().to_owned(),
+                    )
+                })
                 .collect::<BTreeMap<String, _>>()
         });
         let binding_types = helper
@@ -5470,7 +5481,12 @@ impl<'a> MachineTlaCompiler<'a> {
             .state
             .fields
             .iter()
-            .map(|field| (field.name.as_str().to_owned(), field.name.as_str().to_owned()))
+            .map(|field| {
+                (
+                    field.name.as_str().to_owned(),
+                    field.name.as_str().to_owned(),
+                )
+            })
             .collect::<BTreeMap<String, _>>();
 
         for guard in &transition.guards {
@@ -6771,12 +6787,8 @@ fn default_state_init_expr(ty: &TypeRef) -> String {
         TypeRef::Bool => "FALSE".into(),
         TypeRef::U32 | TypeRef::U64 => "0".into(),
         TypeRef::String => tla_string(""),
-        TypeRef::Named(name) => {
-            tla_string(format!("{}_default", tla_ident(name).to_lowercase()))
-        }
-        TypeRef::Enum(name) => {
-            tla_string(format!("{}_default", tla_ident(name).to_lowercase()))
-        }
+        TypeRef::Named(name) => tla_string(format!("{}_default", tla_ident(name).to_lowercase())),
+        TypeRef::Enum(name) => tla_string(format!("{}_default", tla_ident(name).to_lowercase())),
         TypeRef::Option(_) => "None".into(),
         TypeRef::Set(_) => "{}".into(),
         TypeRef::Seq(_) => "<<>>".into(),

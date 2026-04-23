@@ -50,8 +50,7 @@ fn workspace_root() -> PathBuf {
 
 fn read_peer_endpoint_block(root: &Path, relative: &str) -> String {
     let path = root.join(relative);
-    fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()))
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()))
 }
 
 fn assert_typed_peer_endpoint(label: &str, body: &str) {

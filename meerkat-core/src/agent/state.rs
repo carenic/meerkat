@@ -125,7 +125,9 @@ where
     }
 
     fn turn_cancel_after_boundary(&self) -> Result<bool, AgentError> {
-        Ok(self.runtime_turn_authority_snapshot()?.cancel_after_boundary)
+        Ok(self
+            .runtime_turn_authority_snapshot()?
+            .cancel_after_boundary)
     }
 
     fn turn_has_barrier_ops(&self) -> Result<bool, AgentError> {
@@ -142,11 +144,17 @@ where
     }
 
     fn turn_pending_ops_registered(&self) -> Result<bool, AgentError> {
-        Ok(!self.runtime_turn_authority_snapshot()?.pending_op_refs.is_empty())
+        Ok(!self
+            .runtime_turn_authority_snapshot()?
+            .pending_op_refs
+            .is_empty())
     }
 
     fn turn_in_extraction_flow(&self) -> Result<bool, AgentError> {
-        Ok(self.runtime_turn_authority_snapshot()?.max_extraction_retries > 0)
+        Ok(self
+            .runtime_turn_authority_snapshot()?
+            .max_extraction_retries
+            > 0)
     }
 
     fn turn_terminal_outcome(&self) -> Result<TurnTerminalOutcome, AgentError> {
@@ -581,7 +589,8 @@ where
             return Ok(());
         }
 
-        if self.turn_active_run_id()?.as_ref() != Some(run_id) || self.turn_cancel_after_boundary()?
+        if self.turn_active_run_id()?.as_ref() != Some(run_id)
+            || self.turn_cancel_after_boundary()?
         {
             return Ok(());
         }

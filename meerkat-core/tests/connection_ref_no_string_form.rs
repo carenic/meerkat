@@ -7,8 +7,8 @@
 //! an anti-regression gate: attempts to reintroduce the parser or the
 //! display will fail this test's serde and construction contracts.
 
-use meerkat_core::connection::{BindingId, ProfileId, RealmId};
 use meerkat_core::ConnectionRef;
+use meerkat_core::connection::{BindingId, ProfileId, RealmId};
 
 #[test]
 fn connection_ref_constructs_from_typed_ids_only() {

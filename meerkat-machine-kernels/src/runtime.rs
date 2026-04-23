@@ -292,30 +292,29 @@ impl GeneratedMachineKernel {
         fields: &BTreeMap<FieldId, KernelValue>,
     ) -> Result<TransitionOutcome, TransitionRefusal> {
         let trigger_variant = match trigger {
-            RouteVariantId::Input(variant) => {
-                self.schema.inputs.variant_named(variant.as_str()).map_err(|_| {
-                    TransitionRefusal::UnknownInputVariant {
-                        machine: self.schema.machine.clone(),
-                        variant: variant.clone(),
-                    }
-                })?
-            }
-            RouteVariantId::Signal(variant) => {
-                self.schema.signals.variant_named(variant.as_str()).map_err(|_| {
-                    TransitionRefusal::UnknownSignalVariant {
-                        machine: self.schema.machine.clone(),
-                        variant: variant.clone(),
-                    }
-                })?
-            }
+            RouteVariantId::Input(variant) => self
+                .schema
+                .inputs
+                .variant_named(variant.as_str())
+                .map_err(|_| TransitionRefusal::UnknownInputVariant {
+                    machine: self.schema.machine.clone(),
+                    variant: variant.clone(),
+                })?,
+            RouteVariantId::Signal(variant) => self
+                .schema
+                .signals
+                .variant_named(variant.as_str())
+                .map_err(|_| TransitionRefusal::UnknownSignalVariant {
+                    machine: self.schema.machine.clone(),
+                    variant: variant.clone(),
+                })?,
         };
 
         for field in &trigger_variant.fields {
             let Some(value) = fields.get(&field.name) else {
-                return Err(self.payload_refusal(
-                    trigger,
-                    format!("missing field `{}`", field.name),
-                ));
+                return Err(
+                    self.payload_refusal(trigger, format!("missing field `{}`", field.name))
+                );
             };
             if !value_matches_type(value, &field.ty) {
                 return Err(self.payload_refusal(
@@ -532,10 +531,7 @@ impl GeneratedMachineKernel {
                     .as_u64()
                     .map_err(|reason| self.eval_error(transition_name, reason))?;
                 let next = value.checked_sub(*amount).ok_or_else(|| {
-                    self.eval_error(
-                        transition_name,
-                        format!("underflow decrementing `{field}`"),
-                    )
+                    self.eval_error(transition_name, format!("underflow decrementing `{field}`"))
                 })?;
                 state.fields.insert(field.clone(), KernelValue::U64(next));
             }
@@ -1202,7 +1198,8 @@ fn default_value_for_type(ty: &TypeRef) -> KernelValue {
         TypeRef::String => KernelValue::String(String::new()),
         TypeRef::Named(name) if named_type_is_u64(name.as_str()) => KernelValue::U64(0),
         TypeRef::Named(_) => KernelValue::String(String::new()),
-        TypeRef::Enum(name) => {
+        TypeRef::Enum(name) =>
+        {
             #[allow(clippy::expect_used)]
             KernelValue::NamedVariant {
                 enum_name: name.clone(),
@@ -1223,9 +1220,7 @@ fn value_matches_type(value: &KernelValue, ty: &TypeRef) -> bool {
         (KernelValue::String(_), TypeRef::String) => true,
         (KernelValue::U64(_), TypeRef::Named(name)) if named_type_is_u64(name.as_str()) => true,
         (KernelValue::String(_), TypeRef::Named(name)) if !named_type_is_u64(name.as_str()) => true,
-        (KernelValue::NamedVariant { enum_name, .. }, TypeRef::Enum(name))
-            if enum_name == name =>
-        {
+        (KernelValue::NamedVariant { enum_name, .. }, TypeRef::Enum(name)) if enum_name == name => {
             true
         }
         (KernelValue::None, TypeRef::Option(_)) => true,
@@ -1464,7 +1459,10 @@ mod tests {
                 .any(|effect| effect.variant == effect_id("SubmitMemberWork"))
         );
         assert_eq!(
-            submitted.next_state.fields.get(&field_id("active_run_count")),
+            submitted
+                .next_state
+                .fields
+                .get(&field_id("active_run_count")),
             Some(&KernelValue::U64(0))
         );
     }

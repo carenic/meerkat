@@ -6,9 +6,9 @@ mod source {
     //! It covers lifecycle phase, roster membership, run tracking, spawn tracking,
     //! and coordinator binding. Shell infrastructure (channels, stores, services,
     //! handles, etc.) is NOT modeled here.
-    
+
     use meerkat_machine_dsl::machine;
-    
+
     /// Extension trait providing `.get()` on `Option<T>` to support the
     /// `option_value` schema pattern emitted by the `machine!` DSL
     /// (`Expr::MapGet { map: Field(...), key: String("value") }`). The DSL's
@@ -23,7 +23,7 @@ mod source {
             self.clone().unwrap_or_default()
         }
     }
-    
+
     // ---------------------------------------------------------------------------
     // Bridging newtypes
     // ---------------------------------------------------------------------------
@@ -31,19 +31,19 @@ mod source {
     // These types bridge between the DSL's flat representation and the real mob
     // domain types in `crate::ids`. The DSL needs Ord+Hash+Clone for Set/Map;
     // these newtypes satisfy that while providing From/Into mappings.
-    
+
     /// Bridging type for agent identity. Maps to `crate::ids::AgentIdentity`.
     #[derive(
         Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
     )]
     pub struct AgentIdentity(pub String);
-    
+
     impl<T: Into<String>> From<T> for AgentIdentity {
         fn from(s: T) -> Self {
             Self(s.into())
         }
     }
-    
+
     /// Bridging type for agent runtime ID. Maps to `crate::ids::AgentRuntimeId`.
     ///
     /// The real `AgentRuntimeId` is a struct `{ identity: AgentIdentity, generation: Generation }`.
@@ -52,7 +52,7 @@ mod source {
         Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
     )]
     pub struct AgentRuntimeId(pub String);
-    
+
     impl<T: Into<String>> From<T> for AgentRuntimeId {
         fn from(s: T) -> Self {
             Self(s.into())
@@ -63,39 +63,39 @@ mod source {
             &self.0
         }
     }
-    
+
     /// Bridging type for fence token. Maps to `crate::ids::FenceToken`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct FenceToken(pub u64);
-    
+
     impl From<u64> for FenceToken {
         fn from(v: u64) -> Self {
             Self(v)
         }
     }
-    
+
     /// Bridging type for generation counter. Maps to `crate::ids::Generation`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct Generation(pub u64);
-    
+
     impl From<u64> for Generation {
         fn from(v: u64) -> Self {
             Self(v)
         }
     }
-    
+
     /// Bridging type for work reference. Maps to `crate::ids::WorkRef`.
     #[derive(
         Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
     )]
     pub struct WorkId(pub String);
-    
+
     impl<T: Into<String>> From<T> for WorkId {
         fn from(s: T) -> Self {
             Self(s.into())
         }
     }
-    
+
     /// Bridging type for flow run identity. Maps to `crate::ids::RunId`.
     #[derive(
         Debug,
@@ -110,13 +110,13 @@ mod source {
         serde::Deserialize,
     )]
     pub struct RunId(pub String);
-    
+
     impl<T: Into<String>> From<T> for RunId {
         fn from(s: T) -> Self {
             Self(s.into())
         }
     }
-    
+
     /// Bridging type for frame identity. Maps to `crate::ids::FrameId`.
     #[derive(
         Debug,
@@ -131,7 +131,7 @@ mod source {
         serde::Deserialize,
     )]
     pub struct FrameId(pub String);
-    
+
     impl<T: Into<String>> From<T> for FrameId {
         fn from(s: T) -> Self {
             Self(s.into())
@@ -142,7 +142,7 @@ mod source {
             &self.0
         }
     }
-    
+
     /// Bridging type for loop instance identity. Maps to `crate::ids::LoopInstanceId`.
     #[derive(
         Debug,
@@ -157,7 +157,7 @@ mod source {
         serde::Deserialize,
     )]
     pub struct LoopInstanceId(pub String);
-    
+
     impl<T: Into<String>> From<T> for LoopInstanceId {
         fn from(s: T) -> Self {
             Self(s.into())
@@ -168,7 +168,7 @@ mod source {
             &self.0
         }
     }
-    
+
     /// Bridging type for loop definition identity. Maps to `crate::ids::LoopId`.
     #[derive(
         Debug,
@@ -183,13 +183,13 @@ mod source {
         serde::Deserialize,
     )]
     pub struct LoopId(pub String);
-    
+
     impl<T: Into<String>> From<T> for LoopId {
         fn from(s: T) -> Self {
             Self(s.into())
         }
     }
-    
+
     /// Bridging type for flow-node identity. Maps to `crate::ids::FlowNodeId`.
     #[derive(
         Debug,
@@ -204,13 +204,13 @@ mod source {
         serde::Deserialize,
     )]
     pub struct FlowNodeId(pub String);
-    
+
     impl<T: Into<String>> From<T> for FlowNodeId {
         fn from(s: T) -> Self {
             Self(s.into())
         }
     }
-    
+
     /// Bridging type for branch identity. Maps to `crate::ids::BranchId`.
     #[derive(
         Debug,
@@ -225,13 +225,13 @@ mod source {
         serde::Deserialize,
     )]
     pub struct BranchId(pub String);
-    
+
     impl<T: Into<String>> From<T> for BranchId {
         fn from(s: T) -> Self {
             Self(s.into())
         }
     }
-    
+
     /// Bridging type for step identity. Maps to `crate::ids::StepId`.
     #[derive(
         Debug,
@@ -246,7 +246,7 @@ mod source {
         serde::Deserialize,
     )]
     pub struct StepId(pub String);
-    
+
     impl<T: Into<String>> From<T> for StepId {
         fn from(s: T) -> Self {
             Self(s.into())
@@ -257,7 +257,7 @@ mod source {
             &self.0
         }
     }
-    
+
     /// Composite key for run-scoped step state projected into MobMachine.
     #[derive(
         Debug,
@@ -272,13 +272,13 @@ mod source {
         serde::Deserialize,
     )]
     pub struct RunStepKey(pub String);
-    
+
     impl<T: Into<String>> From<T> for RunStepKey {
         fn from(s: T) -> Self {
             Self(s.into())
         }
     }
-    
+
     /// Bridging type for bridge session id. Maps to
     /// `meerkat_core::session::SessionId` — the bridge session a mob member is
     /// attached to for the current runtime generation. The DSL only needs the
@@ -297,20 +297,20 @@ mod source {
         serde::Deserialize,
     )]
     pub struct SessionId(pub String);
-    
+
     impl<T: Into<String>> From<T> for SessionId {
         fn from(s: T) -> Self {
             Self(s.into())
         }
     }
-    
+
     impl SessionId {
         /// Project a real `meerkat_core::types::SessionId` into the DSL bridging type.
         pub fn from_domain(id: &meerkat_core::types::SessionId) -> Self {
             Self(id.to_string())
         }
     }
-    
+
     /// Per-identity realtime binding state. Lives in MobMachine as the canonical
     /// join between identity continuity (MobMachine-owned) and the realtime
     /// attachment's concrete session target (MeerkatMachine-owned).
@@ -327,56 +327,56 @@ mod source {
             session_id: SessionId,
         },
     }
-    
+
     // ---------------------------------------------------------------------------
     // Projection helpers: domain types → bridging types
     // ---------------------------------------------------------------------------
-    
+
     impl AgentRuntimeId {
         /// Project a real `AgentRuntimeId` into the DSL bridging type.
         pub fn from_domain(rid: &crate::ids::AgentRuntimeId) -> Self {
             Self(rid.to_string()) // "identity:generation"
         }
     }
-    
+
     impl AgentIdentity {
         /// Project a real `AgentIdentity` into the DSL bridging type.
         pub fn from_domain(id: &crate::ids::AgentIdentity) -> Self {
             Self(id.to_string())
         }
     }
-    
+
     impl FenceToken {
         /// Project a real `FenceToken` into the DSL bridging type.
         pub fn from_domain(ft: crate::ids::FenceToken) -> Self {
             Self(ft.get())
         }
     }
-    
+
     impl Generation {
         /// Project a real `Generation` into the DSL bridging type.
         pub fn from_domain(generation: crate::ids::Generation) -> Self {
             Self(generation.get())
         }
     }
-    
+
     impl WorkId {
         /// Project a real `WorkRef` into the DSL bridging type.
         pub fn from_work_ref(wr: &crate::ids::WorkRef) -> Self {
             Self(wr.to_string())
         }
     }
-    
+
     /// Bridging type for task identifier. Maps to a shell-side task reference.
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct TaskId(pub String);
-    
+
     impl<T: Into<String>> From<T> for TaskId {
         fn from(s: T) -> Self {
             Self(s.into())
         }
     }
-    
+
     /// Kickoff lifecycle phase for a member's initial autonomous turn.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum KickoffPhase {
@@ -387,7 +387,7 @@ mod source {
         Failed,
         Cancelled,
     }
-    
+
     /// Task lifecycle status. DSL guards enumerate these directly
     /// (`TaskStatus::Pending`, `TaskStatus::InProgress`,
     /// `TaskStatus::Completed`, `TaskStatus::Cancelled`). `Completed` and
@@ -401,7 +401,7 @@ mod source {
         Completed,
         Cancelled,
     }
-    
+
     /// Dependency satisfaction mode for a step or frame node.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
     pub enum DependencyMode {
@@ -409,7 +409,7 @@ mod source {
         All,
         Any,
     }
-    
+
     /// Collection policy for a step's fan-out execution.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
     pub enum CollectionPolicyKind {
@@ -418,7 +418,7 @@ mod source {
         Any,
         Quorum,
     }
-    
+
     /// Canonical flow-run lifecycle state once run-local semantics are absorbed.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
     pub enum FlowRunStatus {
@@ -430,7 +430,7 @@ mod source {
         Failed,
         Canceled,
     }
-    
+
     /// Canonical frame lifecycle state once frame-local semantics are absorbed.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
     pub enum FrameStatus {
@@ -440,7 +440,7 @@ mod source {
         Failed,
         Canceled,
     }
-    
+
     /// Canonical loop lifecycle state once loop-local semantics are absorbed.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
     pub enum LoopStatus {
@@ -451,7 +451,7 @@ mod source {
         Failed,
         Canceled,
     }
-    
+
     /// Canonical step execution status once run-local semantics are absorbed.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
     pub enum StepRunStatus {
@@ -462,7 +462,7 @@ mod source {
         Skipped,
         Canceled,
     }
-    
+
     /// Root-vs-body frame scope for a frame snapshot.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
     pub enum FrameScope {
@@ -470,7 +470,7 @@ mod source {
         Root,
         Body,
     }
-    
+
     /// Flow node kind inside a frame DAG.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
     pub enum FlowNodeKind {
@@ -478,7 +478,7 @@ mod source {
         Step,
         Loop,
     }
-    
+
     /// Per-node execution status within a frame.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
     pub enum NodeRunStatus {
@@ -491,7 +491,7 @@ mod source {
         Skipped,
         Canceled,
     }
-    
+
     /// Loop-body/evaluate lifecycle stage for an active repeat-until node.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
     pub enum LoopIterationStage {
@@ -500,7 +500,7 @@ mod source {
         BodyFrameActive,
         AwaitingUntilEvaluation,
     }
-    
+
     /// Opaque task payload carried through the DSL. The full domain type is
     /// richer than what the DSL models; only `tasks.contains(id)` is observed in
     /// guards. Field projection lives in shell code consuming the DSL state.
@@ -512,7 +512,7 @@ mod source {
         pub owner: Option<AgentIdentity>,
         pub blocked_by: Vec<TaskId>,
     }
-    
+
     /// Per-runtime lifecycle marker tracking whether a member is actively serving
     /// work or draining toward retirement. Opaque to DSL guards — observed only
     /// at the shell layer for work-routing decisions.
@@ -522,7 +522,7 @@ mod source {
         Active,
         Retiring,
     }
-    
+
     /// Typed work-origin classification for
     /// [`MobMachineInput::SubmitWork`] / [`MobMachineEffect::RequestRuntimeIngress`].
     /// Closed mirror of [`crate::ids::WorkOrigin`] — the DSL uses this enum as
@@ -538,7 +538,7 @@ mod source {
         Internal,
         Ingest,
     }
-    
+
     impl From<crate::ids::WorkOrigin> for WorkOrigin {
         fn from(origin: crate::ids::WorkOrigin) -> Self {
             match origin {
@@ -547,23 +547,25 @@ mod source {
             }
         }
     }
-    
+
     /// Fallible reverse mapping: the `Ingest` variant has no counterpart in the
     /// shell-side [`crate::ids::WorkOrigin`] (which only classifies mob-submitted
     /// work lanes); callers on the mob-domain side assert it away and surface a
     /// domain error if the DSL ever produces it back across the seam.
     impl TryFrom<WorkOrigin> for crate::ids::WorkOrigin {
         type Error = &'static str;
-    
+
         fn try_from(origin: WorkOrigin) -> Result<Self, Self::Error> {
             match origin {
                 WorkOrigin::External => Ok(Self::External),
                 WorkOrigin::Internal => Ok(Self::Internal),
-                WorkOrigin::Ingest => Err("WorkOrigin::Ingest has no meerkat-mob domain counterpart"),
+                WorkOrigin::Ingest => {
+                    Err("WorkOrigin::Ingest has no meerkat-mob domain counterpart")
+                }
             }
         }
     }
-    
+
     /// Typed member lifecycle notice kind. Replaces the former literal-string
     /// `kind` field on [`MobMachineEffect::EmitMemberLifecycleNotice`] — closed
     /// set of observed member-lifecycle transitions the orchestrator emits.
@@ -578,7 +580,7 @@ mod source {
         Completed,
         Destroyed,
     }
-    
+
     impl MemberLifecycleKind {
         /// Stable discriminant for logging / wire surfaces.
         pub const fn as_str(self) -> &'static str {
@@ -593,13 +595,13 @@ mod source {
             }
         }
     }
-    
+
     impl std::fmt::Display for MemberLifecycleKind {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str(self.as_str())
         }
     }
-    
+
     /// Typed kickoff-notice intent. Replaces the former literal-string `intent`
     /// field on [`MobMachineEffect::EmitKickoffLifecycleNotice`] — closed mirror
     /// of [`KickoffPhase`] with an additional `Started` intent variant for the
@@ -614,7 +616,7 @@ mod source {
         Failed,
         Cancelled,
     }
-    
+
     impl KickoffIntent {
         /// Stable discriminant for logging / wire surfaces.
         pub const fn as_str(self) -> &'static str {
@@ -628,13 +630,13 @@ mod source {
             }
         }
     }
-    
+
     impl std::fmt::Display for KickoffIntent {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str(self.as_str())
         }
     }
-    
+
     /// Undirected wiring edge between two identities. Callers MUST normalize
     /// to `(smaller, larger)` before constructing so that edge equality is
     /// independent of insertion order.
@@ -643,7 +645,7 @@ mod source {
         pub a: AgentIdentity,
         pub b: AgentIdentity,
     }
-    
+
     impl WiringEdge {
         /// Constructs an edge, normalizing so `a <= b`.
         pub fn new(lhs: AgentIdentity, rhs: AgentIdentity) -> Self {
@@ -654,16 +656,16 @@ mod source {
             }
         }
     }
-    
+
     // ---------------------------------------------------------------------------
     // Machine definition
     // ---------------------------------------------------------------------------
-    
+
     machine! {
         machine MobMachine {
             version: 1,
             rust: "meerkat-mob" / "machines::mob_machine",
-    
+
             state {
                 lifecycle_phase: MobPhase,
                 live_runtime_ids: Set<AgentRuntimeId>,
@@ -759,7 +761,7 @@ mod source {
                 member_session_bindings: Map<AgentIdentity, SessionId>,
                 topology_epoch: u64,
             }
-    
+
             init(Running) {
                 live_runtime_ids = EmptySet,
                 externally_addressable_runtime_ids = EmptySet,
@@ -840,16 +842,16 @@ mod source {
                 member_session_bindings = EmptyMap,
                 topology_epoch = 0,
             }
-    
+
             terminal [Destroyed]
-    
+
             phase MobPhase {
                 Running,
                 Stopped,
                 Completed,
                 Destroyed,
             }
-    
+
             input MobMachineInput {
                 RunFlow,
                 CreateRunSeed {
@@ -965,7 +967,7 @@ mod source {
                 KickoffCancelRequested { member_id: String },
                 KickoffClear { member_id: String },
             }
-    
+
             surface_only [
                 FlowStatus,
                 TaskList,
@@ -981,7 +983,7 @@ mod source {
                 ReplayAllEvents,
                 GetMember
             ]
-    
+
             signal MobMachineSignal {
                 ObserveRuntimeReady { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken },
                 RetireMember { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken },
@@ -1012,7 +1014,7 @@ mod source {
                 PeerInputAdmitted,
                 CreateRun,
             }
-    
+
             effect MobMachineEffect {
                 RequestRuntimeBinding { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation },
                 RequestRuntimeIngress { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, work_id: WorkId, origin: Enum<WorkOrigin> },
@@ -1050,7 +1052,7 @@ mod source {
                 WiringGraphChanged { epoch: u64 },
                 MemberSessionBindingChanged { epoch: u64, agent_identity: AgentIdentity, old_session_id: Option<SessionId>, new_session_id: Option<SessionId> },
             }
-    
+
             disposition RequestRuntimeBinding => routed [MeerkatMachine],
             disposition RequestRuntimeIngress => routed [MeerkatMachine],
             disposition RequestRuntimeRetire => routed [MeerkatMachine],
@@ -1072,11 +1074,11 @@ mod source {
             disposition EmitKickoffLifecycleNotice => external,
             disposition WiringGraphChanged => external,
             disposition MemberSessionBindingChanged => external,
-    
+
             // =====================================================================
             // Invariants
             // =====================================================================
-    
+
             // W3-H / dogma #4: "no zombie realtime binding" — every identity that
             // has a bound session must also appear in `identity_to_runtime` (i.e.
             // must be an identity MobMachine has spawned). Ensures the binding map
@@ -1086,11 +1088,11 @@ mod source {
             invariant bindings_require_known_identity {
                 for_all(id in self.member_session_bindings.keys(), self.identity_to_runtime.contains_key(id))
             }
-    
+
             // =====================================================================
             // Direct transitions
             // =====================================================================
-    
+
             // W3-H: Spawn splits into two guarded variants — Fresh (no prior
             // realtime binding for the identity) and Replacing (identity already
             // has a `BoundToSession`, i.e. this Spawn is the second half of a
@@ -1134,7 +1136,7 @@ mod source {
                 emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation }
                 emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Spawned }
             }
-    
+
             transition SpawnRunningReplacing {
                 on input Spawn { agent_identity, agent_runtime_id, fence_token, generation, external_addressable, bridge_session_id, replacing }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1159,7 +1161,7 @@ mod source {
                 emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation }
                 emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Spawned }
             }
-    
+
             transition ObserveRuntimeReady {
                 on signal ObserveRuntimeReady { agent_runtime_id, fence_token }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1172,7 +1174,7 @@ mod source {
                 }
                 to Running
             }
-    
+
             transition StartupMarkReady {
                 per_phase [Running, Stopped, Completed]
                 on input StartupMarkReady { agent_runtime_id, fence_token }
@@ -1185,7 +1187,7 @@ mod source {
                 }
                 to Running
             }
-    
+
             transition KickoffMarkPending {
                 per_phase [Running, Stopped, Completed]
                 on input KickoffMarkPending { member_id }
@@ -1210,7 +1212,7 @@ mod source {
                 emit PersistKickoffUpdate { member_id: member_id, phase: KickoffPhase::Pending }
                 emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::Pending }
             }
-    
+
             transition KickoffMarkStarting {
                 per_phase [Running, Stopped, Completed]
                 on input KickoffMarkStarting { member_id }
@@ -1228,7 +1230,7 @@ mod source {
                 emit PersistKickoffUpdate { member_id: member_id, phase: KickoffPhase::Starting }
                 emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::Starting }
             }
-    
+
             transition KickoffResolveStarted {
                 per_phase [Running, Stopped, Completed]
                 on input KickoffResolveStarted { member_id }
@@ -1246,7 +1248,7 @@ mod source {
                 emit PersistKickoffUpdate { member_id: member_id, phase: KickoffPhase::Started }
                 emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::Started }
             }
-    
+
             transition KickoffResolveCallbackPending {
                 per_phase [Running, Stopped, Completed]
                 on input KickoffResolveCallbackPending { member_id }
@@ -1264,7 +1266,7 @@ mod source {
                 emit PersistKickoffUpdate { member_id: member_id, phase: KickoffPhase::CallbackPending }
                 emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::CallbackPending }
             }
-    
+
             transition KickoffResolveFailedFromStarting {
                 per_phase [Running, Stopped, Completed]
                 on input KickoffResolveFailed { member_id, error }
@@ -1286,7 +1288,7 @@ mod source {
                 emit PersistKickoffFailureUpdate { member_id: member_id, phase: KickoffPhase::Failed, error: error }
                 emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::Failed }
             }
-    
+
             transition KickoffResolveCancelled {
                 per_phase [Running, Stopped, Completed]
                 on input KickoffResolveCancelled { member_id }
@@ -1304,7 +1306,7 @@ mod source {
                 emit PersistKickoffUpdate { member_id: member_id, phase: KickoffPhase::Cancelled }
                 emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::Cancelled }
             }
-    
+
             transition KickoffCancelRequested {
                 per_phase [Running, Stopped, Completed]
                 on input KickoffCancelRequested { member_id }
@@ -1326,7 +1328,7 @@ mod source {
                 emit PersistKickoffUpdate { member_id: member_id, phase: KickoffPhase::Cancelled }
                 emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::Cancelled }
             }
-    
+
             transition KickoffClear {
                 per_phase [Running, Stopped, Completed]
                 on input KickoffClear { member_id }
@@ -1341,7 +1343,7 @@ mod source {
                 }
                 to Running
             }
-    
+
             transition SubmitWorkRunningExternal {
                 on input SubmitWork { agent_runtime_id, fence_token, work_id, origin }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1353,7 +1355,7 @@ mod source {
                 to Running
                 emit RequestRuntimeIngress { agent_runtime_id: agent_runtime_id, fence_token: fence_token, work_id: work_id, origin: origin }
             }
-    
+
             transition SubmitWorkRunningInternal {
                 on input SubmitWork { agent_runtime_id, fence_token, work_id, origin }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1364,7 +1366,7 @@ mod source {
                 to Running
                 emit RequestRuntimeIngress { agent_runtime_id: agent_runtime_id, fence_token: fence_token, work_id: work_id, origin: origin }
             }
-    
+
             transition RetireMember {
                 on signal RetireMember { agent_runtime_id, fence_token }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1376,7 +1378,7 @@ mod source {
                 to Running
                 emit RequestRuntimeRetire
             }
-    
+
             transition ObserveRuntimeRetired {
                 on signal ObserveRuntimeRetired { agent_runtime_id, fence_token }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1395,7 +1397,7 @@ mod source {
                 to Stopped
                 emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Retired }
             }
-    
+
             transition ResetMember {
                 on signal ResetMember { agent_identity, agent_runtime_id, fence_token, generation, external_addressable }
                 guard {
@@ -1421,7 +1423,7 @@ mod source {
                 emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation }
                 emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Reset }
             }
-    
+
             transition RespawnMember {
                 on signal RespawnMember { agent_identity, agent_runtime_id, fence_token, generation, external_addressable }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1444,7 +1446,7 @@ mod source {
                 emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation }
                 emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Respawned }
             }
-    
+
             transition MarkCompleted {
                 on signal MarkCompleted
                 guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped }
@@ -1453,7 +1455,7 @@ mod source {
                 to Completed
                 emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Completed }
             }
-    
+
             transition DestroyMob {
                 on signal DestroyMob
                 guard {
@@ -1475,7 +1477,7 @@ mod source {
                 to Destroyed
                 emit RequestRuntimeDestroy
             }
-    
+
             transition ObserveRuntimeDestroyed {
                 on signal ObserveRuntimeDestroyed { agent_runtime_id, fence_token }
                 guard {
@@ -1497,11 +1499,11 @@ mod source {
                 to Destroyed
                 emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Destroyed }
             }
-    
+
             // =====================================================================
             // Absorbed transitions: per-phase self-loops
             // =====================================================================
-    
+
             transition RecordOperatorActionProvenanceRunning {
                 on input RecordOperatorActionProvenance
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1526,7 +1528,7 @@ mod source {
                 update {}
                 to Destroyed
             }
-    
+
             transition SetSpawnPolicyRunning {
                 on input SetSpawnPolicy
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1551,11 +1553,11 @@ mod source {
                 update {}
                 to Destroyed
             }
-    
+
             // =====================================================================
             // Phase-changing transitions
             // =====================================================================
-    
+
             transition StopRunning {
                 on input Stop
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1567,7 +1569,7 @@ mod source {
                 to Stopped
                 emit EmitRunLifecycleNotice
             }
-    
+
             transition ResumeStopped {
                 on input Resume
                 guard { self.lifecycle_phase == Phase::Stopped }
@@ -1577,7 +1579,7 @@ mod source {
                 to Running
                 emit EmitRunLifecycleNotice
             }
-    
+
             transition CompleteRunning {
                 on input Complete
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1587,7 +1589,7 @@ mod source {
                 to Completed
                 emit EmitRunLifecycleNotice
             }
-    
+
             transition ResetToRunning {
                 on input Reset
                 guard {
@@ -1603,11 +1605,11 @@ mod source {
                 to Running
                 emit EmitRunLifecycleNotice
             }
-    
+
             // =====================================================================
             // Running self-loops (inputs)
             // =====================================================================
-    
+
             // =====================================================================
             // Track-B (R5): identity-level wiring mutations.
             //
@@ -1616,7 +1618,7 @@ mod source {
             // effect lets the `RecomputeMobPeerOverlay` composition driver
             // linearize peer-overlay recomputation against graph changes.
             // =====================================================================
-    
+
             transition WireMembersRunning {
                 on input WireMembers { edge }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1628,7 +1630,7 @@ mod source {
                 to Running
                 emit WiringGraphChanged { epoch: self.topology_epoch }
             }
-    
+
             transition UnwireMembersRunning {
                 on input UnwireMembers { edge }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1640,7 +1642,7 @@ mod source {
                 to Running
                 emit WiringGraphChanged { epoch: self.topology_epoch }
             }
-    
+
             // =====================================================================
             // Track-B (R5): identity-level session-binding mutations.
             //
@@ -1651,7 +1653,7 @@ mod source {
             // so the composition driver can recompute overlay endpoints
             // keyed on the updated session.
             // =====================================================================
-    
+
             transition BindMemberSessionRunning {
                 on input BindMemberSession { agent_identity, session_id }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1664,7 +1666,7 @@ mod source {
                 to Running
                 emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: None, new_session_id: Some(session_id) }
             }
-    
+
             transition RotateMemberSessionRunning {
                 on input RotateMemberSession { agent_identity, old_session_id, new_session_id }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1682,7 +1684,7 @@ mod source {
                 to Running
                 emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(old_session_id), new_session_id: Some(new_session_id) }
             }
-    
+
             transition ReleaseMemberSessionRunning {
                 on input ReleaseMemberSession { agent_identity, session_id }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1699,7 +1701,7 @@ mod source {
                 to Running
                 emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(session_id), new_session_id: None }
             }
-    
+
             // TaskCreate: real mutator. Rejects duplicate task ids.
             transition TaskCreateRunning {
                 on input TaskCreate { task_id, task_payload }
@@ -1711,7 +1713,7 @@ mod source {
                 to Running
                 emit EmitTaskNotice
             }
-    
+
             // TaskUpdate: status transition authority.
             //
             // Split into one transition per target status. Each enforces:
@@ -1734,7 +1736,7 @@ mod source {
                 to Running
                 emit EmitTaskNotice
             }
-    
+
             transition TaskUpdateRunningInProgress {
                 on input TaskUpdate { task_id, new_status }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1747,7 +1749,7 @@ mod source {
                 to Running
                 emit EmitTaskNotice
             }
-    
+
             transition TaskUpdateRunningCompleted {
                 on input TaskUpdate { task_id, new_status }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1760,7 +1762,7 @@ mod source {
                 to Running
                 emit EmitTaskNotice
             }
-    
+
             transition TaskUpdateRunningCancelled {
                 on input TaskUpdate { task_id, new_status }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1773,7 +1775,7 @@ mod source {
                 to Running
                 emit EmitTaskNotice
             }
-    
+
             transition ForceCancelRunning {
                 on input ForceCancel
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1783,11 +1785,11 @@ mod source {
                 to Running
                 emit FlowTerminalized
             }
-    
+
             // =====================================================================
             // Subscribe commands
             // =====================================================================
-    
+
             transition SubscribeAgentEventsRunning {
                 on input SubscribeAgentEvents
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1816,7 +1818,7 @@ mod source {
                 update {}
                 to Destroyed
             }
-    
+
             transition SubscribeAllAgentEventsRunning {
                 on input SubscribeAllAgentEvents
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1841,7 +1843,7 @@ mod source {
                 update {}
                 to Destroyed
             }
-    
+
             transition SubscribeMobEventsRunning {
                 on input SubscribeMobEvents
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1866,11 +1868,11 @@ mod source {
                 update {}
                 to Destroyed
             }
-    
+
             // =====================================================================
             // Shutdown: from any non-Destroyed state
             // =====================================================================
-    
+
             transition ShutdownRunning {
                 on input Shutdown
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1881,7 +1883,7 @@ mod source {
                 to Stopped
                 emit EmitRunLifecycleNotice
             }
-    
+
             transition ShutdownStopped {
                 on input Shutdown
                 guard { self.lifecycle_phase == Phase::Stopped }
@@ -1892,7 +1894,7 @@ mod source {
                 to Stopped
                 emit EmitRunLifecycleNotice
             }
-    
+
             transition ShutdownCompleted {
                 on input Shutdown
                 guard { self.lifecycle_phase == Phase::Completed }
@@ -1903,11 +1905,11 @@ mod source {
                 to Completed
                 emit EmitRunLifecycleNotice
             }
-    
+
             // =====================================================================
             // Signal-driven Running self-loops
             // =====================================================================
-    
+
             transition CancelFlowRunning {
                 on input CancelFlow
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1917,7 +1919,7 @@ mod source {
                 to Running
                 emit FlowTerminalized
             }
-    
+
             transition InitializeOrchestratorRunning {
                 on signal InitializeOrchestrator
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1927,7 +1929,7 @@ mod source {
                 to Running
                 emit NotifyCoordinator
             }
-    
+
             transition BindCoordinatorRunning {
                 on signal BindCoordinator
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1937,7 +1939,7 @@ mod source {
                 to Running
                 emit NotifyCoordinator
             }
-    
+
             transition UnbindCoordinatorRunning {
                 on signal UnbindCoordinator
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1947,7 +1949,7 @@ mod source {
                 to Running
                 emit NotifyCoordinator
             }
-    
+
             transition StageSpawnRunning {
                 on signal StageSpawn
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1957,7 +1959,7 @@ mod source {
                 to Running
                 emit ExposePendingSpawn
             }
-    
+
             transition StopOrchestratorRunning {
                 on signal StopOrchestrator
                 guard { self.lifecycle_phase == Phase::Running }
@@ -1979,7 +1981,7 @@ mod source {
                 to Completed
                 emit NotifyCoordinator
             }
-    
+
             transition ResumeOrchestratorRunning {
                 on signal ResumeOrchestrator
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2001,7 +2003,7 @@ mod source {
                 to Completed
                 emit NotifyCoordinator
             }
-    
+
             transition DestroyOrchestratorRunning {
                 on signal DestroyOrchestrator
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2023,7 +2025,7 @@ mod source {
                 to Completed
                 emit NotifyCoordinator
             }
-    
+
             transition ForceCancelMemberRunning {
                 on signal ForceCancelMember
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2031,7 +2033,7 @@ mod source {
                 to Running
                 emit EmitMemberTerminalNotice
             }
-    
+
             transition MemberPeerExposedRunning {
                 on signal MemberPeerExposed
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2039,7 +2041,7 @@ mod source {
                 to Running
                 emit AdmitPeerInput
             }
-    
+
             transition MemberTerminalizedRunning {
                 on signal MemberTerminalized
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2047,7 +2049,7 @@ mod source {
                 to Running
                 emit EmitMemberTerminalNotice
             }
-    
+
             transition OperationPeerTrustedRunning {
                 on signal OperationPeerTrusted
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2055,7 +2057,7 @@ mod source {
                 to Running
                 emit AdmitPeerInput
             }
-    
+
             transition PeerInputAdmittedRunning {
                 on signal PeerInputAdmitted
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2063,11 +2065,11 @@ mod source {
                 to Running
                 emit AdmitPeerInput
             }
-    
+
             // =====================================================================
             // BeginCleanup / FinishCleanup
             // =====================================================================
-    
+
             transition BeginCleanupStopped {
                 on signal BeginCleanup
                 guard { self.lifecycle_phase == Phase::Stopped }
@@ -2075,7 +2077,7 @@ mod source {
                 to Stopped
                 emit EmitRunLifecycleNotice
             }
-    
+
             transition BeginCleanupCompleted {
                 on signal BeginCleanup
                 guard { self.lifecycle_phase == Phase::Completed }
@@ -2083,7 +2085,7 @@ mod source {
                 to Stopped
                 emit EmitRunLifecycleNotice
             }
-    
+
             transition FinishCleanupStopped {
                 on signal FinishCleanup
                 guard { self.lifecycle_phase == Phase::Stopped }
@@ -2091,7 +2093,7 @@ mod source {
                 to Stopped
                 emit EmitRunLifecycleNotice
             }
-    
+
             transition FinishCleanupCompleted {
                 on signal FinishCleanup
                 guard { self.lifecycle_phase == Phase::Completed }
@@ -2099,11 +2101,11 @@ mod source {
                 to Stopped
                 emit EmitRunLifecycleNotice
             }
-    
+
             // =====================================================================
             // RunFlow / StartFlow / CreateRun / StartRun
             // =====================================================================
-    
+
             transition RunFlowRunning {
                 on input RunFlow
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2114,7 +2116,7 @@ mod source {
                 to Running
                 emit EmitFlowRunNotice
             }
-    
+
             transition CreateRunSeedRunning {
                 on input CreateRunSeed { run_id, step_ids, ordered_steps, step_has_conditions, step_dependencies, step_dependency_modes, step_branches, step_collection_policies, step_quorum_thresholds, escalation_threshold, max_step_retries, max_active_nodes, max_active_frames, max_frame_depth }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2148,7 +2150,7 @@ mod source {
                 to Running
                 emit EmitRunLifecycleNotice
             }
-    
+
             transition CreateFrameSeedRunning {
                 on input CreateFrameSeed { run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2172,7 +2174,7 @@ mod source {
                 to Running
                 emit EmitRunLifecycleNotice
             }
-    
+
             transition CreateLoopSeedRunning {
                 on input CreateLoopSeed { loop_instance_id, parent_frame_id, parent_node_id, loop_id, depth, max_iterations }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2189,7 +2191,7 @@ mod source {
                 to Running
                 emit EmitRunLifecycleNotice
             }
-    
+
             transition ProjectRunStatusRunning {
                 on input ProjectRunStatus { run_id, status }
                 guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
@@ -2199,7 +2201,7 @@ mod source {
                 to Running
                 emit EmitRunLifecycleNotice
             }
-    
+
             transition ProjectRunStepStatusRunning {
                 on input ProjectRunStepStatus { run_step, status, output_recorded }
                 guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
@@ -2210,7 +2212,7 @@ mod source {
                 to Running
                 emit EmitRunLifecycleNotice
             }
-    
+
             transition ProjectFramePhaseRunning {
                 on input ProjectFramePhase { frame_id, phase }
                 guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
@@ -2220,7 +2222,7 @@ mod source {
                 to Running
                 emit EmitRunLifecycleNotice
             }
-    
+
             transition ProjectLoopStateRunning {
                 on input ProjectLoopState { loop_instance_id, phase, stage, active_body_frame_id }
                 guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
@@ -2232,7 +2234,7 @@ mod source {
                 to Running
                 emit EmitRunLifecycleNotice
             }
-    
+
             transition StartFlowRunning {
                 on signal StartFlow
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2243,7 +2245,7 @@ mod source {
                 to Running
                 emit EmitFlowRunNotice
             }
-    
+
             transition CreateRunRunning {
                 on signal CreateRun
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2253,7 +2255,7 @@ mod source {
                 to Running
                 emit EmitRunLifecycleNotice
             }
-    
+
             transition StartRunRunning {
                 on signal StartRun
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2263,7 +2265,7 @@ mod source {
                 to Running
                 emit EmitRunLifecycleNotice
             }
-    
+
             // =====================================================================
             // CompleteFlow / FinishRun
             // =====================================================================
@@ -2284,7 +2286,7 @@ mod source {
             // (no-op update, same target phase) rather than as an error the
             // caller must paper over — dogma requires that convergence
             // semantics live in the machine authority.
-    
+
             transition CompleteFlowRunning {
                 on signal CompleteFlow
                 guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Completed }
@@ -2295,7 +2297,7 @@ mod source {
                 to Running
                 emit FlowTerminalized
             }
-    
+
             transition CompleteFlowRunningZero {
                 on signal CompleteFlow
                 guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Completed }
@@ -2304,7 +2306,7 @@ mod source {
                 to Running
                 emit NotifyCoordinator
             }
-    
+
             transition FinishRunRunning {
                 on signal FinishRun
                 guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped }
@@ -2315,7 +2317,7 @@ mod source {
                 to Running
                 emit EmitRunLifecycleNotice
             }
-    
+
             transition FinishRunRunningZero {
                 on signal FinishRun
                 guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped }
@@ -2324,11 +2326,11 @@ mod source {
                 to Running
                 emit NotifyCoordinator
             }
-    
+
             // =====================================================================
             // Retire / RetireAll
             // =====================================================================
-    
+
             transition RetireRunningReleasing {
                 on input Retire { agent_runtime_id, agent_identity, releasing }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2343,7 +2345,7 @@ mod source {
                 to Running
                 emit RequestRuntimeRetire
             }
-    
+
             transition RetireRunningPreservingBinding {
                 on input Retire { agent_runtime_id, agent_identity, releasing }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2357,7 +2359,7 @@ mod source {
                 to Running
                 emit RequestRuntimeRetire
             }
-    
+
             transition RetireRunningNoBinding {
                 on input Retire { agent_runtime_id, agent_identity, releasing }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2371,7 +2373,7 @@ mod source {
                 to Running
                 emit RequestRuntimeRetire
             }
-    
+
             transition RetireStoppedReleasing {
                 on input Retire { agent_runtime_id, agent_identity, releasing }
                 guard { self.lifecycle_phase == Phase::Stopped }
@@ -2386,7 +2388,7 @@ mod source {
                 to Stopped
                 emit RequestRuntimeRetire
             }
-    
+
             transition RetireStoppedPreservingBinding {
                 on input Retire { agent_runtime_id, agent_identity, releasing }
                 guard { self.lifecycle_phase == Phase::Stopped }
@@ -2400,7 +2402,7 @@ mod source {
                 to Stopped
                 emit RequestRuntimeRetire
             }
-    
+
             transition RetireStoppedNoBinding {
                 on input Retire { agent_runtime_id, agent_identity, releasing }
                 guard { self.lifecycle_phase == Phase::Stopped }
@@ -2414,7 +2416,7 @@ mod source {
                 to Stopped
                 emit RequestRuntimeRetire
             }
-    
+
             transition RetireAllRunning {
                 on input RetireAll
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2425,7 +2427,7 @@ mod source {
                 to Running
                 emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Retiring }
             }
-    
+
             transition RetireAllStopped {
                 on input RetireAll
                 guard { self.lifecycle_phase == Phase::Stopped }
@@ -2436,11 +2438,11 @@ mod source {
                 to Stopped
                 emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Retiring }
             }
-    
+
             // =====================================================================
             // CompleteSpawn
             // =====================================================================
-    
+
             transition CompleteSpawnRunning {
                 on signal CompleteSpawn
                 guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped }
@@ -2451,11 +2453,11 @@ mod source {
                 to Running
                 emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Spawned }
             }
-    
+
             // =====================================================================
             // Destroy (input)
             // =====================================================================
-    
+
             transition DestroyFromAny {
                 on input Destroy
                 guard {
@@ -2472,11 +2474,11 @@ mod source {
                 }
                 to Destroyed
             }
-    
+
             // =====================================================================
             // Respawn (input, Running self-loop)
             // =====================================================================
-    
+
             transition RespawnRunning {
                 on input Respawn { agent_runtime_id }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2486,11 +2488,11 @@ mod source {
                 to Running
                 emit ExposePendingSpawn
             }
-    
+
             // =====================================================================
             // CancelAllWork
             // =====================================================================
-    
+
             transition CancelAllWorkRunning {
                 on input CancelAllWork { agent_runtime_id, fence_token }
                 guard { self.lifecycle_phase == Phase::Running }
@@ -2503,14 +2505,14 @@ mod source {
                 to Running
                 emit FlowTerminalized
             }
-    
+
         }
     }
-    
+
     #[cfg(test)]
     mod tests {
         use super::*;
-    
+
         #[test]
         fn create_run_seed_populates_canonical_run_maps() {
             let mut authority = MobMachineAuthority::new();
@@ -2540,7 +2542,7 @@ mod source {
                 },
             )
             .expect("CreateRunSeed should be accepted");
-    
+
             assert_eq!(transition.to_phase, MobPhase::Running);
             assert_eq!(
                 authority.state.run_status.get(&run_id),
@@ -2564,14 +2566,14 @@ mod source {
                 Some(&Vec::new())
             );
         }
-    
+
         #[test]
         fn create_frame_seed_populates_canonical_frame_maps() {
             let mut authority = MobMachineAuthority::new();
             let run_id = RunId::from("run-1");
             let frame_id = FrameId::from("frame-root");
             let node_id = FlowNodeId::from("node-a");
-    
+
             let transition = MobMachineMutator::apply(
                 &mut authority,
                 MobMachineInput::CreateFrameSeed {
@@ -2593,7 +2595,7 @@ mod source {
                 },
             )
             .expect("CreateFrameSeed should be accepted");
-    
+
             assert_eq!(transition.to_phase, MobPhase::Running);
             assert_eq!(
                 authority.state.frame_scope.get(&frame_id),
@@ -2613,7 +2615,7 @@ mod source {
                 Some(&FlowNodeKind::Step)
             );
         }
-    
+
         #[test]
         fn create_loop_seed_populates_canonical_loop_maps() {
             let mut authority = MobMachineAuthority::new();
@@ -2621,7 +2623,7 @@ mod source {
             let frame_id = FrameId::from("frame-root");
             let node_id = FlowNodeId::from("loop-node");
             let loop_id = LoopId::from("repeat");
-    
+
             let transition = MobMachineMutator::apply(
                 &mut authority,
                 MobMachineInput::CreateLoopSeed {
@@ -2634,7 +2636,7 @@ mod source {
                 },
             )
             .expect("CreateLoopSeed should be accepted");
-    
+
             assert_eq!(transition.to_phase, MobPhase::Running);
             assert_eq!(
                 authority.state.loop_parent_frame.get(&loop_instance_id),

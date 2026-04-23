@@ -35,12 +35,11 @@ fn validate_rejects_schema_with_unbound_named_type() {
     // binding in `named_types`. Append a new field referencing a
     // sentinel unbound type whose name is unique enough to not collide
     // with any real binding.
-    let unbound = NamedTypeId::parse("tripwire_unbound_type_zzz")
-        .expect("slug is a valid NamedTypeId");
-    let renamed = meerkat_machine_schema::identity::FieldId::parse(
-        "tripwire_field_with_unbound_type",
-    )
-    .expect("slug is a valid FieldId");
+    let unbound =
+        NamedTypeId::parse("tripwire_unbound_type_zzz").expect("slug is a valid NamedTypeId");
+    let renamed =
+        meerkat_machine_schema::identity::FieldId::parse("tripwire_field_with_unbound_type")
+            .expect("slug is a valid FieldId");
 
     schema.state.fields.push(FieldSchema {
         name: renamed,

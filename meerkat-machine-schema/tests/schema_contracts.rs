@@ -5,15 +5,15 @@ use meerkat_machine_schema::catalog::dsl::{
     dsl_occurrence_lifecycle_machine as occurrence_lifecycle_machine,
     dsl_schedule_lifecycle_machine as schedule_lifecycle_machine,
 };
+use meerkat_machine_schema::identity::{
+    ActorId, CompositionId, EffectVariantId, EnumTypeId, EnumVariantId, FieldId, InputVariantId,
+    MachineId, MachineInstanceId, NamedTypeId, PhaseId, ProtocolId, RouteId, TransitionId,
+};
 use meerkat_machine_schema::{
     CompositionDriver, CompositionDriverRustBinding, CompositionSchemaError, DriverDispatchRoute,
     RouteTargetKind, RouteVariantId, WatchedEffect, canonical_composition_coverage_manifests,
     canonical_composition_schemas, canonical_machine_coverage_manifests, canonical_machine_schemas,
     meerkat_mob_seam_composition,
-};
-use meerkat_machine_schema::identity::{
-    ActorId, CompositionId, EffectVariantId, EnumTypeId, EnumVariantId, FieldId, InputVariantId,
-    MachineId, MachineInstanceId, NamedTypeId, PhaseId, ProtocolId, RouteId, TransitionId,
 };
 
 #[test]
@@ -161,11 +161,15 @@ fn schedule_and_occurrence_machines_stay_in_canonical_coverage_manifests() {
         occurrence_lifecycle_machine().machine,
     ] {
         assert!(
-            machine_names.iter().any(|machine| machine.as_str() == name.as_str()),
+            machine_names
+                .iter()
+                .any(|machine| machine.as_str() == name.as_str()),
             "{name} should remain canonical"
         );
         assert!(
-            coverage_names.iter().any(|machine| machine.as_str() == name.as_str()),
+            coverage_names
+                .iter()
+                .any(|machine| machine.as_str() == name.as_str()),
             "{name} should retain coverage metadata"
         );
     }
@@ -785,13 +789,16 @@ fn noop_driver_on_meerkat_mob_seam() -> CompositionDriver {
         rust: sample_driver_rust_binding(),
         watched_effects: vec![WatchedEffect {
             producer_instance: MachineInstanceId::parse("mob").expect("valid producer_instance"),
-            effect_variant: EffectVariantId::parse("RequestRuntimeBinding").expect("valid effect_variant"),
+            effect_variant: EffectVariantId::parse("RequestRuntimeBinding")
+                .expect("valid effect_variant"),
         }],
         dispatch_routes: vec![DriverDispatchRoute {
             name: RouteId::parse("noop_dispatch").expect("valid route slug"),
             target_instance: MachineInstanceId::parse("meerkat").expect("valid MachineInstanceId"),
             target_kind: RouteTargetKind::Input,
-            input_variant: RouteVariantId::Input(InputVariantId::parse("PrepareBindings").expect("valid input-variant slug")),
+            input_variant: RouteVariantId::Input(
+                InputVariantId::parse("PrepareBindings").expect("valid input-variant slug"),
+            ),
         }],
     }
 }
@@ -816,7 +823,8 @@ fn composition_driver_rejects_watched_effect_on_unknown_producer_instance() {
     let mob = mob_machine();
     let mut composition = meerkat_mob_seam_composition();
     let mut driver = noop_driver_on_meerkat_mob_seam();
-    driver.watched_effects[0].producer_instance = MachineInstanceId::parse("ghost_machine").expect("valid MachineInstanceId");
+    driver.watched_effects[0].producer_instance =
+        MachineInstanceId::parse("ghost_machine").expect("valid MachineInstanceId");
     composition.driver = Some(driver);
 
     let result = composition.validate_against(&[&meerkat, &mob]);
@@ -835,7 +843,8 @@ fn composition_driver_rejects_watched_variant_missing_on_producer_effects() {
     let mob = mob_machine();
     let mut composition = meerkat_mob_seam_composition();
     let mut driver = noop_driver_on_meerkat_mob_seam();
-    driver.watched_effects[0].effect_variant = EffectVariantId::parse("NoSuchEffect").expect("valid EffectVariantId");
+    driver.watched_effects[0].effect_variant =
+        EffectVariantId::parse("NoSuchEffect").expect("valid EffectVariantId");
     composition.driver = Some(driver);
 
     let result = composition.validate_against(&[&meerkat, &mob]);
@@ -854,7 +863,8 @@ fn composition_driver_rejects_dispatch_route_to_unknown_target_instance() {
     let mob = mob_machine();
     let mut composition = meerkat_mob_seam_composition();
     let mut driver = noop_driver_on_meerkat_mob_seam();
-    driver.dispatch_routes[0].target_instance = MachineInstanceId::parse("ghost_target").expect("valid MachineInstanceId");
+    driver.dispatch_routes[0].target_instance =
+        MachineInstanceId::parse("ghost_target").expect("valid MachineInstanceId");
     composition.driver = Some(driver);
 
     let result = composition.validate_against(&[&meerkat, &mob]);
@@ -873,7 +883,9 @@ fn composition_driver_rejects_dispatch_route_input_variant_missing_on_target() {
     let mob = mob_machine();
     let mut composition = meerkat_mob_seam_composition();
     let mut driver = noop_driver_on_meerkat_mob_seam();
-    driver.dispatch_routes[0].input_variant = RouteVariantId::Input(InputVariantId::parse("NoSuchInput").expect("valid input-variant slug"));
+    driver.dispatch_routes[0].input_variant = RouteVariantId::Input(
+        InputVariantId::parse("NoSuchInput").expect("valid input-variant slug"),
+    );
     composition.driver = Some(driver);
 
     let result = composition.validate_against(&[&meerkat, &mob]);
@@ -986,15 +998,15 @@ fn every_canonical_input_variant_has_transition_coverage() {
 mod handoff_binding {
     use std::collections::BTreeMap;
 
+    use meerkat_machine_schema::identity::{
+        ActorId, CompositionId, EffectVariantId, FieldId, InputVariantId, MachineId,
+        MachineInstanceId, ProtocolId,
+    };
     use meerkat_machine_schema::{
         ActorKind, ActorSchema, ClosurePolicy, CompositionSchema, CompositionSchemaError,
         CompositionStateLimits, EffectHandoffProtocol, FeedbackFieldBinding, FeedbackFieldSource,
         FeedbackInputRef, MachineInstance, ProtocolGenerationMode, ProtocolHelperReturnShape,
         ProtocolRustBinding, canonical_machine_schemas, compat_composition_schemas,
-    };
-    use meerkat_machine_schema::identity::{
-        ActorId, CompositionId, EffectVariantId, FieldId, InputVariantId, MachineId,
-        MachineInstanceId, ProtocolId,
     };
 
     fn ok_handle_binding() -> ProtocolRustBinding {
@@ -1031,10 +1043,12 @@ mod handoff_binding {
                 actor: ActorId::parse("meerkat_authority").expect("valid actor"),
             }],
             actors: vec![
-                ActorSchema { name: ActorId::parse("meerkat_authority").expect("valid actor slug"),
+                ActorSchema {
+                    name: ActorId::parse("meerkat_authority").expect("valid actor slug"),
                     kind: ActorKind::Machine,
                 },
-                ActorSchema { name: ActorId::parse("surface_owner").expect("valid actor slug"),
+                ActorSchema {
+                    name: ActorId::parse("surface_owner").expect("valid actor slug"),
                     kind: ActorKind::Owner,
                 },
             ],
@@ -1068,13 +1082,16 @@ mod handoff_binding {
     fn handle_bridge_protocol(rust: ProtocolRustBinding) -> EffectHandoffProtocol {
         EffectHandoffProtocol {
             name: ProtocolId::parse("test_handoff").expect("valid protocol slug"),
-            producer_instance: MachineInstanceId::parse("meerkat").expect("valid producer_instance"),
-            effect_variant: EffectVariantId::parse("RefreshVisibleSurfaceSet").expect("valid effect_variant"),
+            producer_instance: MachineInstanceId::parse("meerkat")
+                .expect("valid producer_instance"),
+            effect_variant: EffectVariantId::parse("RefreshVisibleSurfaceSet")
+                .expect("valid effect_variant"),
             realizing_actor: ActorId::parse("surface_owner").expect("valid realizing_actor"),
             correlation_fields: vec![],
             obligation_fields: vec![],
             allowed_feedback_inputs: vec![FeedbackInputRef {
-                machine_instance: MachineInstanceId::parse("meerkat").expect("valid machine_instance"),
+                machine_instance: MachineInstanceId::parse("meerkat")
+                    .expect("valid machine_instance"),
                 input_variant: InputVariantId::parse("Ack").expect("valid input_variant"),
                 field_bindings: vec![FeedbackFieldBinding {
                     input_field: FieldId::parse("epoch").expect("valid input_field"),
@@ -1272,33 +1289,49 @@ mod handoff_binding {
         };
 
         let composition = CompositionSchema {
-            name: CompositionId::parse("test_effect_extractor_without_authority").expect("valid composition slug"),
+            name: CompositionId::parse("test_effect_extractor_without_authority")
+                .expect("valid composition slug"),
             machines: vec![MachineInstance {
-                instance_id: MachineInstanceId::parse("external_tool_surface").expect("valid instance_id"),
-                machine_name: MachineId::parse("ExternalToolSurfaceBridgeMachine").expect("valid machine_name"),
+                instance_id: MachineInstanceId::parse("external_tool_surface")
+                    .expect("valid instance_id"),
+                machine_name: MachineId::parse("ExternalToolSurfaceBridgeMachine")
+                    .expect("valid machine_name"),
                 actor: ActorId::parse("external_tool_surface_authority").expect("valid actor"),
             }],
             actors: vec![
-                ActorSchema { name: ActorId::parse("external_tool_surface_authority").expect("valid actor slug"),
+                ActorSchema {
+                    name: ActorId::parse("external_tool_surface_authority")
+                        .expect("valid actor slug"),
                     kind: ActorKind::Machine,
                 },
-                ActorSchema { name: ActorId::parse("owner").expect("valid actor slug"),
+                ActorSchema {
+                    name: ActorId::parse("owner").expect("valid actor slug"),
                     kind: ActorKind::Owner,
                 },
             ],
             handoff_protocols: vec![EffectHandoffProtocol {
                 name: ProtocolId::parse("no_authority_no_handle").expect("valid protocol slug"),
-                producer_instance: MachineInstanceId::parse("external_tool_surface").expect("valid producer_instance"),
-                effect_variant: EffectVariantId::parse("RefreshVisibleSurfaceSet").expect("valid effect_variant"),
+                producer_instance: MachineInstanceId::parse("external_tool_surface")
+                    .expect("valid producer_instance"),
+                effect_variant: EffectVariantId::parse("RefreshVisibleSurfaceSet")
+                    .expect("valid effect_variant"),
                 realizing_actor: ActorId::parse("owner").expect("valid realizing_actor"),
-                correlation_fields: vec![FieldId::parse("snapshot_epoch").expect("valid field slug")],
-                obligation_fields: vec![FieldId::parse("snapshot_epoch").expect("valid field slug")],
+                correlation_fields: vec![
+                    FieldId::parse("snapshot_epoch").expect("valid field slug"),
+                ],
+                obligation_fields: vec![
+                    FieldId::parse("snapshot_epoch").expect("valid field slug"),
+                ],
                 allowed_feedback_inputs: vec![FeedbackInputRef {
-                    machine_instance: MachineInstanceId::parse("external_tool_surface").expect("valid machine_instance"),
-                    input_variant: InputVariantId::parse("SnapshotAligned").expect("valid input_variant"),
+                    machine_instance: MachineInstanceId::parse("external_tool_surface")
+                        .expect("valid machine_instance"),
+                    input_variant: InputVariantId::parse("SnapshotAligned")
+                        .expect("valid input_variant"),
                     field_bindings: vec![FeedbackFieldBinding {
                         input_field: FieldId::parse("snapshot_epoch").expect("valid input_field"),
-                        source: FeedbackFieldSource::ObligationField(FieldId::parse("snapshot_epoch").expect("valid field slug")),
+                        source: FeedbackFieldSource::ObligationField(
+                            FieldId::parse("snapshot_epoch").expect("valid field slug"),
+                        ),
                     }],
                 }],
                 closure_policy: ClosurePolicy::AckRequired,

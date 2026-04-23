@@ -880,14 +880,6 @@ mod tests {
         assert_eq!(parsed.wired_to.len(), 1);
     }
 
-
-
-
-
-
-
-
-
     #[test]
     fn test_serde_roundtrip_with_state_field() {
         let entry = RosterEntry {
@@ -1097,7 +1089,6 @@ mod tests {
         let found: Vec<_> = roster.find_all_by_label("tier", "1").collect();
         assert_eq!(found.len(), 2);
     }
-
 
     #[test]
     fn test_roster_entry_roundtrip_json() {

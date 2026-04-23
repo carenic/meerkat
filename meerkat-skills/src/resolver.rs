@@ -13,9 +13,7 @@ use meerkat_core::skills::{SkillError, SkillKey, SkillName, SourceUuid};
 /// It is intentionally narrow: exactly one `/`, both halves typed.
 pub fn parse_skill_key_pair(raw: &str) -> Result<SkillKey, SkillError> {
     let (source_part, skill_part) = raw.split_once('/').ok_or_else(|| {
-        SkillError::Parse(
-            format!("expected '<source_uuid>/<skill_name>', got '{raw}'").into(),
-        )
+        SkillError::Parse(format!("expected '<source_uuid>/<skill_name>', got '{raw}'").into())
     })?;
     if skill_part.contains('/') {
         return Err(SkillError::Parse(

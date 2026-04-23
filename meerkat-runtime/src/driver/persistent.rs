@@ -361,9 +361,7 @@ impl PersistentRuntimeDriver {
                 &input_states,
             )
             .await
-            .map_err(|err| {
-                RuntimeDriverError::Internal(format!("retire persist failed: {err}"))
-            })?;
+            .map_err(|err| RuntimeDriverError::Internal(format!("retire persist failed: {err}")))?;
         Ok(report)
     }
 
@@ -389,9 +387,7 @@ impl PersistentRuntimeDriver {
                 &input_states,
             )
             .await
-            .map_err(|err| {
-                RuntimeDriverError::Internal(format!("reset persist failed: {err}"))
-            })?;
+            .map_err(|err| RuntimeDriverError::Internal(format!("reset persist failed: {err}")))?;
         Ok(report)
     }
 
@@ -444,9 +440,7 @@ impl PersistentRuntimeDriver {
                 &input_states,
             )
             .await
-            .map_err(|err| {
-                RuntimeDriverError::Internal(format!("stop persist failed: {err}"))
-            })?;
+            .map_err(|err| RuntimeDriverError::Internal(format!("stop persist failed: {err}")))?;
         Ok(())
     }
 

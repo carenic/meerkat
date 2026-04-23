@@ -119,11 +119,10 @@ async fn relative_filesystem_path_resolves_against_context_root() {
         ..Default::default()
     };
 
-    let composite =
-        resolve_repositories_with_roots(&cfg, Some(tmp.path()), None, None)
-            .await
-            .unwrap()
-            .expect("resolver returns Some(composite) when enabled");
+    let composite = resolve_repositories_with_roots(&cfg, Some(tmp.path()), None, None)
+        .await
+        .unwrap()
+        .expect("resolver returns Some(composite) when enabled");
 
     let listed = composite.list(&SkillFilter::default()).await.unwrap();
     let names: Vec<String> = listed
@@ -156,15 +155,11 @@ async fn context_root_takes_precedence_over_cache_root_for_relative_paths() {
         ..Default::default()
     };
 
-    let composite = resolve_repositories_with_roots(
-        &cfg,
-        Some(ctx_tmp.path()),
-        None,
-        Some(cache_tmp.path()),
-    )
-    .await
-    .unwrap()
-    .expect("resolver returns Some(composite)");
+    let composite =
+        resolve_repositories_with_roots(&cfg, Some(ctx_tmp.path()), None, Some(cache_tmp.path()))
+            .await
+            .unwrap()
+            .expect("resolver returns Some(composite)");
 
     let listed = composite.list(&SkillFilter::default()).await.unwrap();
     let names: Vec<String> = listed
@@ -193,11 +188,10 @@ async fn cache_root_is_fallback_when_no_context_root() {
         ..Default::default()
     };
 
-    let composite =
-        resolve_repositories_with_roots(&cfg, None, None, Some(cache_tmp.path()))
-            .await
-            .unwrap()
-            .expect("resolver returns Some");
+    let composite = resolve_repositories_with_roots(&cfg, None, None, Some(cache_tmp.path()))
+        .await
+        .unwrap()
+        .expect("resolver returns Some");
 
     let listed = composite.list(&SkillFilter::default()).await.unwrap();
     let names: Vec<String> = listed

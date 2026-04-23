@@ -169,9 +169,7 @@ pub struct DispatchOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DispatchRefusal {
     /// The producer is not registered for this dispatcher's composition.
-    #[error(
-        "dispatcher composition {expected} does not match producer composition {actual}"
-    )]
+    #[error("dispatcher composition {expected} does not match producer composition {actual}")]
     CompositionMismatch {
         expected: CompositionId,
         actual: CompositionId,
@@ -187,9 +185,7 @@ pub enum DispatchRefusal {
     },
     /// A route-binding references a producer field that the effect body did
     /// not supply (via [`ProducerEffect::field`]).
-    #[error(
-        "route {route} requires producer field {field} on variant {variant}, not provided"
-    )]
+    #[error("route {route} requires producer field {field} on variant {variant}, not provided")]
     MissingProducerField {
         route: RouteId,
         variant: EffectVariantId,
@@ -522,7 +518,8 @@ impl<E: ProducerEffect> CatalogCompositionDispatcher<E> {
     /// wave-b prove registration happens exactly once per instance in the
     /// composition schema.)
     pub fn with_consumer(mut self, surface: Arc<dyn ConsumerSurface>) -> Self {
-        self.consumers.insert(surface.instance_id().clone(), surface);
+        self.consumers
+            .insert(surface.instance_id().clone(), surface);
         self
     }
 }
@@ -562,13 +559,13 @@ impl<E: ProducerEffect> CompositionDispatcher for CatalogCompositionDispatcher<E
         let mut projected: Vec<(FieldId, OwnedFieldValue)> =
             Vec::with_capacity(descriptor.bindings.len());
         for (from_field, to_field) in &descriptor.bindings {
-            let value = body.field(from_field).ok_or_else(|| {
-                DispatchRefusal::MissingProducerField {
-                    route: descriptor.route_id.clone(),
-                    variant: variant.clone(),
-                    field: from_field.clone(),
-                }
-            })?;
+            let value =
+                body.field(from_field)
+                    .ok_or_else(|| DispatchRefusal::MissingProducerField {
+                        route: descriptor.route_id.clone(),
+                        variant: variant.clone(),
+                        field: from_field.clone(),
+                    })?;
             projected.push((to_field.clone(), value.to_owned_value()));
         }
 
@@ -711,14 +708,24 @@ mod tests {
 
         assert_eq!(outcome.consumer.as_str(), "meerkat");
         assert_eq!(outcome.applied_input.as_str(), "PrepareBindings");
-        assert_eq!(outcome.route.route_id.as_str(), "binding_request_reaches_meerkat");
+        assert_eq!(
+            outcome.route.route_id.as_str(),
+            "binding_request_reaches_meerkat"
+        );
 
         let log = consumer.log.lock().await;
-        assert_eq!(log.len(), 1, "dispatcher must call the consumer exactly once");
+        assert_eq!(
+            log.len(),
+            1,
+            "dispatcher must call the consumer exactly once"
+        );
         let (variant, fields) = &log[0];
         assert_eq!(variant.as_str(), "PrepareBindings");
         let field_names: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(field_names, vec!["agent_runtime_id", "fence_token", "generation"]);
+        assert_eq!(
+            field_names,
+            vec!["agent_runtime_id", "fence_token", "generation"]
+        );
         match &fields[0].1 {
             OwnedFieldValue::Str(s) => assert_eq!(s, "rt-1"),
             other => panic!("expected Str, got {other:?}"),

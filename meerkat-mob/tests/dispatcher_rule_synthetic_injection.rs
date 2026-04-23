@@ -40,7 +40,5 @@ fn rule_reports_violation_when_dispatch_call_is_removed() {
     //
     // The invariant is the symmetric proof: rule green on baseline,
     // red after excision.
-    unreachable!(
-        "rmat-audit negative-case tripwire: un-ignore at c.1 exit gate"
-    );
+    unreachable!("rmat-audit negative-case tripwire: un-ignore at c.1 exit gate");
 }

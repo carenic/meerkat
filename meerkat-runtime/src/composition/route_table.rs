@@ -63,13 +63,8 @@ pub enum RouteTableError {
     /// builder surfaces it as a typed error rather than panicking so
     /// callers handling hand-assembled schemas see a deterministic
     /// failure instead of a crash.
-    #[error(
-        "input-kind route {route} in composition has a signal-typed variant id `{variant}`"
-    )]
-    InputRouteCarriesSignalVariant {
-        route: RouteId,
-        variant: String,
-    },
+    #[error("input-kind route {route} in composition has a signal-typed variant id `{variant}`")]
+    InputRouteCarriesSignalVariant { route: RouteId, variant: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -247,7 +242,10 @@ mod tests {
         let variant = EffectVariantId::parse("RequestRuntimeBinding").unwrap();
         let descriptor = table.resolve(&mob, &variant).expect("known route");
 
-        assert_eq!(descriptor.route_id.as_str(), "binding_request_reaches_meerkat");
+        assert_eq!(
+            descriptor.route_id.as_str(),
+            "binding_request_reaches_meerkat"
+        );
         assert_eq!(descriptor.instance_id.as_str(), "meerkat");
         assert_eq!(descriptor.input_variant.as_str(), "PrepareBindings");
         let field_pairs: Vec<(&str, &str)> = descriptor

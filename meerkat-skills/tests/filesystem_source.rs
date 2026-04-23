@@ -15,9 +15,7 @@
 //! audit context.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use meerkat_core::skills::{
-    SkillFilter, SkillKey, SkillName, SkillScope, SkillSource, SourceUuid,
-};
+use meerkat_core::skills::{SkillFilter, SkillKey, SkillName, SkillScope, SkillSource, SourceUuid};
 use meerkat_skills::FilesystemSkillSource;
 use std::fs;
 use std::path::Path;

@@ -55,11 +55,8 @@ fn sample_occurrence(attempt_count: u32) -> Occurrence {
         planning_horizon_occurrences: None,
     });
 
-    let mut occ = Occurrence::planned_from_schedule(
-        &schedule,
-        OccurrenceOrdinal(0),
-        chrono::Utc::now(),
-    );
+    let mut occ =
+        Occurrence::planned_from_schedule(&schedule, OccurrenceOrdinal(0), chrono::Utc::now());
     occ.attempt_count = attempt_count;
     occ
 }
@@ -140,8 +137,7 @@ async fn immediate_delivery_failure_carries_typed_failure_class_and_detail() {
 #[tokio::test]
 async fn immediate_completed_dispatch_maps_to_accepted_stage_and_completes() {
     let occ = sample_occurrence(1);
-    let dispatch =
-        immediate_completed_dispatch(&occ, Some("corr-immediate".to_string()));
+    let dispatch = immediate_completed_dispatch(&occ, Some("corr-immediate".to_string()));
 
     assert_eq!(
         dispatch.receipt.stage,

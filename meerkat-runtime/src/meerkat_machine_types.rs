@@ -104,9 +104,7 @@ impl RealtimeAttachmentStatus {
             Self::Unattached => RealtimeChannelState::Closed,
             Self::IntentPresentUnbound | Self::BindingNotReady => RealtimeChannelState::Opening,
             Self::BindingReady => RealtimeChannelState::Ready,
-            Self::ReplacementPending | Self::ReattachRequired => {
-                RealtimeChannelState::Reconnecting
-            }
+            Self::ReplacementPending | Self::ReattachRequired => RealtimeChannelState::Reconnecting,
         }
     }
 
@@ -120,10 +118,7 @@ impl RealtimeAttachmentStatus {
     /// defaults (`attempt_count = 1` for the two reconnecting states,
     /// `0` elsewhere) — identical to the pre-C-9c projection output,
     /// just routed through a single canonical site.
-    pub fn to_channel_status(
-        self,
-        reconnect: Option<&ReconnectProgress>,
-    ) -> RealtimeChannelStatus {
+    pub fn to_channel_status(self, reconnect: Option<&ReconnectProgress>) -> RealtimeChannelStatus {
         let state = self.channel_state();
         let reason = self.default_reason().map(str::to_string);
         let (attempt_count, next_retry_at, deadline_at) = match (state, reconnect) {

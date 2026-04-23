@@ -37,7 +37,10 @@ fn descriptor_for(name: &str, pubkey: &meerkat_comms::identity::PubKey) -> Trust
     }
 }
 
-fn make_signed_envelope(sender: &Keypair, receiver_pubkey: meerkat_comms::identity::PubKey) -> Envelope {
+fn make_signed_envelope(
+    sender: &Keypair,
+    receiver_pubkey: meerkat_comms::identity::PubKey,
+) -> Envelope {
     let mut envelope = Envelope {
         id: Uuid::new_v4(),
         from: sender.public_key(),
@@ -59,8 +62,7 @@ fn make_signed_envelope(sender: &Keypair, receiver_pubkey: meerkat_comms::identi
 #[tokio::test]
 async fn trusted_sender_is_admitted_through_classified_path() {
     let receiver_name = format!("recv-{}", Uuid::new_v4().simple());
-    let receiver =
-        CommsRuntime::inproc_only(&receiver_name).expect("receiver runtime");
+    let receiver = CommsRuntime::inproc_only(&receiver_name).expect("receiver runtime");
     let sender = Keypair::generate();
 
     // Register the sender as trusted on the receiver.
@@ -73,10 +75,11 @@ async fn trusted_sender_is_admitted_through_classified_path() {
 
     let trusted_peers = receiver.router().shared_trusted_peers();
     let envelope = make_signed_envelope(&sender, receiver.public_key());
-    let outcome = receiver
-        .router()
-        .inbox_sender()
-        .send_connection_ingress(envelope, true, &trusted_peers);
+    let outcome =
+        receiver
+            .router()
+            .inbox_sender()
+            .send_connection_ingress(envelope, true, &trusted_peers);
     assert_eq!(outcome, AdmissionOutcome::Admitted);
 }
 
@@ -97,8 +100,7 @@ async fn trusted_sender_is_admitted_through_classified_path() {
 #[tokio::test]
 async fn revoked_sender_is_rejected_at_admission() {
     let receiver_name = format!("recv-{}", Uuid::new_v4().simple());
-    let receiver =
-        CommsRuntime::inproc_only(&receiver_name).expect("receiver runtime");
+    let receiver = CommsRuntime::inproc_only(&receiver_name).expect("receiver runtime");
     let sender = Keypair::generate();
 
     // Seed trust, then revoke — this is the post-revoke state the
@@ -119,10 +121,11 @@ async fn revoked_sender_is_rejected_at_admission() {
 
     let trusted_peers = receiver.router().shared_trusted_peers();
     let envelope = make_signed_envelope(&sender, receiver.public_key());
-    let outcome = receiver
-        .router()
-        .inbox_sender()
-        .send_connection_ingress(envelope, true, &trusted_peers);
+    let outcome =
+        receiver
+            .router()
+            .inbox_sender()
+            .send_connection_ingress(envelope, true, &trusted_peers);
     assert_eq!(
         outcome,
         AdmissionOutcome::Dropped {
@@ -145,9 +148,8 @@ async fn revoked_sender_is_rejected_at_admission() {
 #[tokio::test]
 async fn concurrent_revokes_and_admissions_never_admit_untrusted() {
     let receiver_name = format!("recv-{}", Uuid::new_v4().simple());
-    let receiver = std::sync::Arc::new(
-        CommsRuntime::inproc_only(&receiver_name).expect("receiver runtime"),
-    );
+    let receiver =
+        std::sync::Arc::new(CommsRuntime::inproc_only(&receiver_name).expect("receiver runtime"));
     let sender = std::sync::Arc::new(Keypair::generate());
 
     meerkat_core::agent::CommsRuntime::add_trusted_peer(
@@ -170,10 +172,11 @@ async fn concurrent_revokes_and_admissions_never_admit_untrusted() {
             let mut dropped_other = 0usize;
             for _ in 0..total {
                 let envelope = make_signed_envelope(&sender, receiver_pk);
-                let outcome = receiver
-                    .router()
-                    .inbox_sender()
-                    .send_connection_ingress(envelope, true, &trusted_peers);
+                let outcome = receiver.router().inbox_sender().send_connection_ingress(
+                    envelope,
+                    true,
+                    &trusted_peers,
+                );
                 match outcome {
                     AdmissionOutcome::Admitted => admitted += 1,
                     AdmissionOutcome::Dropped {
@@ -211,8 +214,7 @@ async fn concurrent_revokes_and_admissions_never_admit_untrusted() {
         })
     };
 
-    let (admitted, dropped_untrusted, dropped_other) =
-        admit_handle.await.expect("admit task");
+    let (admitted, dropped_untrusted, dropped_other) = admit_handle.await.expect("admit task");
     revoke_handle.await.expect("revoke task");
 
     assert_eq!(
@@ -240,8 +242,7 @@ async fn concurrent_revokes_and_admissions_never_admit_untrusted() {
 #[tokio::test]
 async fn classify_at_t0_revoke_at_t1_admit_at_t2_sees_revoked_state() {
     let receiver_name = format!("recv-{}", Uuid::new_v4().simple());
-    let receiver =
-        CommsRuntime::inproc_only(&receiver_name).expect("receiver runtime");
+    let receiver = CommsRuntime::inproc_only(&receiver_name).expect("receiver runtime");
     let sender = Keypair::generate();
 
     // Seed trust — classification at T0 will see the sender as trusted.
@@ -259,14 +260,14 @@ async fn classify_at_t0_revoke_at_t1_admit_at_t2_sees_revoked_state() {
     // classify → (revoke trust) → admit. Post-fix, the admission step
     // re-reads the trust set and drops. Pre-fix, it would admit using
     // the stale classification-time bool.
-    let outcome = receiver.router().inbox_sender().classified_admit_with_pause_for_test(
-        InboxItem::External { envelope },
-        || {
+    let outcome = receiver
+        .router()
+        .inbox_sender()
+        .classified_admit_with_pause_for_test(InboxItem::External { envelope }, || {
             // This runs between classify and admit. Revoke trust so the
             // admission stage observes a state the classifier did not.
             shared_peers.write().remove(&revoke_pubkey);
-        },
-    );
+        });
 
     assert_eq!(
         outcome,
@@ -285,8 +286,7 @@ async fn classify_at_t0_revoke_at_t1_admit_at_t2_sees_revoked_state() {
 #[tokio::test]
 async fn auth_exempt_bridge_request_admits_without_trust_edge() {
     let receiver_name = format!("recv-{}", Uuid::new_v4().simple());
-    let receiver =
-        CommsRuntime::inproc_only(&receiver_name).expect("receiver runtime");
+    let receiver = CommsRuntime::inproc_only(&receiver_name).expect("receiver runtime");
     let sender = Keypair::generate();
     // No trust edge seeded — sender is not trusted.
 
@@ -304,10 +304,11 @@ async fn auth_exempt_bridge_request_admits_without_trust_edge() {
     };
     envelope.sign(&sender);
 
-    let outcome = receiver
-        .router()
-        .inbox_sender()
-        .send_connection_ingress(envelope, true, &trusted_peers);
+    let outcome =
+        receiver
+            .router()
+            .inbox_sender()
+            .send_connection_ingress(envelope, true, &trusted_peers);
     assert_eq!(
         outcome,
         AdmissionOutcome::Admitted,

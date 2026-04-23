@@ -311,10 +311,7 @@ fn retire_with_some_releasing_but_wrong_value_is_rejected() {
     );
     let changed = find_binding_changed(&transition);
     assert!(
-        matches!(
-            changed,
-            Some((_, _, Some(_), None))
-        ),
+        matches!(changed, Some((_, _, Some(_), None))),
         "Releasing path must emit MemberSessionBindingChanged (Some -> None)",
     );
 }
