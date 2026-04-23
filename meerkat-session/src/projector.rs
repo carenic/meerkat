@@ -98,6 +98,10 @@ impl SessionProjector {
         file.write_all(lines.as_bytes())
             .await
             .map_err(ProjectionError::Io)?;
+        // Tokio file writes complete on background blocking tasks; flush before
+        // dropping so immediate replay readers observe the finished contents.
+        file.flush().await.map_err(ProjectionError::Io)?;
+        drop(file);
 
         // Write summary.txt if we have assistant text
         if let Some(text) = last_assistant_text {
