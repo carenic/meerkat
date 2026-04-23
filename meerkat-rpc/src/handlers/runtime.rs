@@ -1,10 +1,5 @@
 //! v9 runtime RPC handlers — session/status, session/submit, and
 //! session/realtime_attachment_status.
-//!
-//! Wave B removed the retired runtime verbs `session/retire`,
-//! `session/reset`, `session/submission`, `session/submissions`, and the
-//! per-session realtime attachment status batch. Their handlers are gone;
-//! callers must migrate to the lifecycle-driven equivalents.
 
 use serde_json::value::RawValue;
 
@@ -198,14 +193,6 @@ pub async fn handle_runtime_realtime_attachment_status(
         Err(e) => RpcResponse::error(id, crate::error::INVALID_PARAMS, e.to_string()),
     }
 }
-
-
-
-// Wave B removed the `session/retire`, `session/reset`,
-// `session/submission`, and `session/submissions` handlers. The
-// underlying wire types are gone from `meerkat-contracts/src/wire/runtime.rs`
-// so new handlers cannot regrow this surface. Router registration of these
-// methods is wave-c's job to delete.
 
 #[cfg(test)]
 mod tests {

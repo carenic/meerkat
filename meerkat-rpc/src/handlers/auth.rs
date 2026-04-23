@@ -99,10 +99,26 @@ async fn resolve_binding_identity(
             format!("Unknown binding {realm_id}:{binding_id}: {e}"),
         )
     })?;
+    let realm_typed = meerkat_core::connection::RealmId::parse(resolved_realm_id).map_err(|e| {
+        RpcResponse::error(
+            None,
+            error::INVALID_PARAMS,
+            format!("Invalid realm id {realm_id}: {e}"),
+        )
+    })?;
+    let binding_typed =
+        meerkat_core::connection::BindingId::parse(binding.id.clone()).map_err(|e| {
+            RpcResponse::error(
+                None,
+                error::INVALID_PARAMS,
+                format!("Invalid binding id {}: {e}", binding.id),
+            )
+        })?;
     Ok((
         ConnectionRef {
-            realm_id: resolved_realm_id,
-            binding_id: binding.id.clone(),
+            realm: realm_typed,
+            binding: binding_typed,
+            profile: None,
         },
         binding.clone(),
         auth_profile.clone(),
@@ -319,8 +335,8 @@ pub async fn handle_auth_profile_create(
         metadata: serde_json::Value::Null,
     };
     let key = TokenKey::new(
-        connection_ref.realm_id.clone(),
-        connection_ref.binding_id.clone(),
+        connection_ref.realm.to_string(),
+        connection_ref.binding.to_string(),
     );
     match store.save(&key, &tokens).await {
         Ok(()) => {
@@ -335,8 +351,8 @@ pub async fn handle_auth_profile_create(
             RpcResponse::success(
                 id,
                 serde_json::json!({
-                    "realm_id": &connection_ref.realm_id,
-                    "binding_id": &connection_ref.binding_id,
+                    "realm_id": connection_ref.realm.as_str(),
+                    "binding_id": connection_ref.binding.as_str(),
                     "connection_ref": &connection_ref,
                     "profile_id": &binding.auth_profile,
                     "provider": auth_profile.provider.as_str(),
@@ -372,8 +388,8 @@ pub async fn handle_auth_profile_delete(
         Err(r) => return r,
     };
     let key = TokenKey::new(
-        connection_ref.realm_id.clone(),
-        connection_ref.binding_id.clone(),
+        connection_ref.realm.to_string(),
+        connection_ref.binding.to_string(),
     );
     match store.clear(&key).await {
         Ok(()) => {
@@ -386,8 +402,8 @@ pub async fn handle_auth_profile_delete(
             RpcResponse::success(
                 id,
                 serde_json::json!({
-                    "realm_id": &connection_ref.realm_id,
-                    "binding_id": &connection_ref.binding_id,
+                    "realm_id": connection_ref.realm.as_str(),
+                    "binding_id": connection_ref.binding.as_str(),
                     "connection_ref": &connection_ref,
                     "profile_id": &binding.auth_profile,
                     "cleared": true,
@@ -539,8 +555,8 @@ pub async fn handle_auth_login_complete(
         metadata: serde_json::Value::Null,
     };
     let key = TokenKey::new(
-        connection_ref.realm_id.clone(),
-        connection_ref.binding_id.clone(),
+        connection_ref.realm.to_string(),
+        connection_ref.binding.to_string(),
     );
     if let Err(e) = store.save(&key, &tokens).await {
         return RpcResponse::error(
@@ -560,8 +576,8 @@ pub async fn handle_auth_login_complete(
     RpcResponse::success(
         id,
         serde_json::json!({
-            "realm_id": &connection_ref.realm_id,
-            "binding_id": &connection_ref.binding_id,
+            "realm_id": connection_ref.realm.as_str(),
+            "binding_id": connection_ref.binding.as_str(),
             "connection_ref": &connection_ref,
             "profile_id": &binding.auth_profile,
             "provider": parsed.provider,
@@ -728,8 +744,8 @@ pub async fn handle_auth_login_device_complete(
                 metadata: serde_json::Value::Null,
             };
             let key = TokenKey::new(
-                connection_ref.realm_id.clone(),
-                connection_ref.binding_id.clone(),
+                connection_ref.realm.to_string(),
+                connection_ref.binding.to_string(),
             );
             if let Err(e) = store.save(&key, &tokens).await {
                 return RpcResponse::error(
@@ -750,8 +766,8 @@ pub async fn handle_auth_login_device_complete(
                 id,
                 serde_json::json!({
                     "state": "ready",
-                    "realm_id": &connection_ref.realm_id,
-                    "binding_id": &connection_ref.binding_id,
+                    "realm_id": connection_ref.realm.as_str(),
+                    "binding_id": connection_ref.binding.as_str(),
                     "connection_ref": &connection_ref,
                     "profile_id": &binding.auth_profile,
                     "provider": parsed.provider,
@@ -846,8 +862,8 @@ pub async fn handle_auth_status_get(
     let stored = if let Some(store) = runtime.token_store() {
         store
             .load(&TokenKey::new(
-                connection_ref.realm_id.clone(),
-                connection_ref.binding_id.clone(),
+                connection_ref.realm.to_string(),
+                connection_ref.binding.to_string(),
             ))
             .await
             .unwrap_or(None)
@@ -865,8 +881,8 @@ pub async fn handle_auth_status_get(
     RpcResponse::success(
         id,
         serde_json::json!({
-            "realm_id": &connection_ref.realm_id,
-            "binding_id": &connection_ref.binding_id,
+            "realm_id": connection_ref.realm.as_str(),
+            "binding_id": connection_ref.binding.as_str(),
             "connection_ref": &connection_ref,
             "profile_id": &binding.auth_profile,
             "provider": auth_profile.provider.as_str(),
@@ -899,8 +915,8 @@ pub async fn handle_auth_logout(
         Err(r) => return r,
     };
     let key = TokenKey::new(
-        connection_ref.realm_id.clone(),
-        connection_ref.binding_id.clone(),
+        connection_ref.realm.to_string(),
+        connection_ref.binding.to_string(),
     );
     match store.clear(&key).await {
         Ok(()) => {
@@ -913,8 +929,8 @@ pub async fn handle_auth_logout(
             RpcResponse::success(
                 id,
                 serde_json::json!({
-                    "realm_id": &connection_ref.realm_id,
-                    "binding_id": &connection_ref.binding_id,
+                    "realm_id": connection_ref.realm.as_str(),
+                    "binding_id": connection_ref.binding.as_str(),
                     "connection_ref": &connection_ref,
                     "profile_id": &binding.auth_profile,
                     "cleared": true,

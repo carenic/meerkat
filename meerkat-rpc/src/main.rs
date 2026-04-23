@@ -253,8 +253,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli_user_root.clone().or(default_user_root.clone()),
     );
     runtime.set_skill_identity_registry(identity_registry);
+    let realm_id_typed = meerkat_core::connection::RealmId::parse(locator.realm_id.clone())
+        .map_err(|e| {
+            std::io::Error::other(format!(
+                "invalid realm id '{}': {e}",
+                locator.realm_id
+            ))
+        })?;
     runtime.set_realm_context(
-        Some(locator.realm_id.clone()),
+        Some(realm_id_typed),
         cli.instance.clone(),
         Some(manifest.backend.as_str().to_string()),
     );

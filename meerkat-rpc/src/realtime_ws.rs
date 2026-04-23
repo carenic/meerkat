@@ -656,7 +656,7 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                 return;
             };
 
-            let observed_realm_id = state.runtime.realm_id().map(str::to_string);
+            let observed_realm_id = state.runtime.realm_id().map(ToString::to_string);
             match state
                 .host
                 .accept_open_frame_with_realm(&open_frame, observed_realm_id.as_deref())

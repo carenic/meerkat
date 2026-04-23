@@ -103,7 +103,7 @@ pub async fn handle_realtime_open_info(
     params: Option<&RawValue>,
     adapter: &dyn SessionServiceRuntimeExt,
     realtime_ws_host: Option<&crate::realtime_ws::RealtimeWsHost>,
-    realm_id: Option<&str>,
+    realm_id: Option<&meerkat_core::connection::RealmId>,
     #[cfg(feature = "mob")] mob_state: &std::sync::Arc<meerkat_mob_mcp::MobMcpState>,
 ) -> RpcResponse {
     let params: RealtimeOpenRequest = match parse_params(params) {
@@ -151,7 +151,7 @@ pub async fn handle_realtime_open_info(
     };
 
     let open_info = realtime_ws_host
-        .issue_open_info(params, capabilities, realm_id.map(str::to_string))
+        .issue_open_info(params, capabilities, realm_id.map(ToString::to_string))
         .await;
     RpcResponse::success(id, open_info)
 }
