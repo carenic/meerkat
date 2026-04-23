@@ -951,6 +951,7 @@ mod tests {
             peer_id: PeerId::new(),
             name: PeerName::new("peer-a").expect("valid peer name"),
             address: PeerAddress::new(PeerTransport::Inproc, "peer-a"),
+            pubkey: [0u8; 32],
         };
         let result = <NoopCommsRuntime as CommsRuntime>::add_trusted_peer(&runtime, peer).await;
         assert!(matches!(result, Err(SendError::Unsupported(_))));

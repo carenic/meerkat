@@ -205,11 +205,12 @@ impl From<PeerName> for String {
 /// traverse the core seam.
 ///
 /// Replaces the old stringly trusted-peer spec `{ name, peer_id, address }`
-/// with typed atoms: `PeerId` (routing key), `PeerName` (display slug),
-/// `PeerAddress` (transport + endpoint). Richer fields like
-/// wire-public-key, trust-store metadata, or reachability stay in
-/// `meerkat-comms::trust::TrustedPeer` — this descriptor is only the
-/// subset the core loop needs for routing.
+/// with typed atoms: `PeerId` (runtime routing key), `PeerName` (display
+/// slug), `PeerAddress` (transport + endpoint), and a 32-byte signing
+/// public key that lets the receiver verify envelope signatures. Richer
+/// trust-store metadata (reachability snapshots, discovery labels) stays
+/// in `meerkat-comms::trust::TrustedPeer` — this descriptor is the
+/// minimal typed subset the core seam needs to route and admit a peer.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedPeerDescriptor {
@@ -221,6 +222,10 @@ pub struct TrustedPeerDescriptor {
     /// Typed transport atom + endpoint. Transport cannot be invented by
     /// string concatenation at a call site.
     pub address: PeerAddress,
+    /// Ed25519 signing public key (32 bytes). The receiver needs this to
+    /// verify envelope signatures; the router derives `PeerId` from it
+    /// via UUIDv5 so `peer_id` and `pubkey` are consistent.
+    pub pubkey: [u8; 32],
 }
 
 /// One-way peer lifecycle notification kind.

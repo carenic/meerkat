@@ -21,13 +21,33 @@ use uuid::Uuid;
 
 use crate::identity::Keypair;
 use crate::inbox::InboxSender;
-use crate::inproc::InprocSendError;
+use crate::inproc::{InprocRegistry, InprocSendError};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::transport::codec::{EnvelopeFrame, TransportCodec};
-use crate::transport::TransportError;
+use crate::transport::{PeerAddr, TransportError};
 use crate::trust::{TrustedPeer, TrustedPeers};
 use crate::types::{Envelope, MessageKind};
 use meerkat_core::comms::PeerId;
+
+/// Namespace for deriving a stable [`PeerId`] from a signing pubkey.
+///
+/// Mirrors [`crate::runtime::comms_runtime::peer_id_from_pubkey`] so the
+/// router and runtime agree on the UUIDv5 derivation used to round-trip
+/// between `PubKey` and `PeerId`.
+const PEER_ID_UUID_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x6d65_6572_6b61_7450_6565_7249_6430_0001);
+
+/// Derive the canonical [`PeerId`] for a signing [`crate::identity::PubKey`].
+///
+/// Callers that hold only a [`PeerId`] and need to route through the trust
+/// store use this together with [`TrustedPeers::find_by_peer_id`] (which
+/// performs the linear match under the store read lock).
+pub(crate) fn peer_id_from_pubkey(pubkey: &crate::identity::PubKey) -> PeerId {
+    PeerId::from_uuid(uuid::Uuid::new_v5(
+        &PEER_ID_UUID_NAMESPACE,
+        pubkey.as_bytes(),
+    ))
+}
 
 pub const DEFAULT_ACK_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_MAX_MESSAGE_BYTES: u32 = crate::transport::MAX_PAYLOAD_SIZE;
@@ -50,8 +70,11 @@ impl Default for CommsConfig {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SendError {
+    /// The destination [`PeerId`] does not resolve to any trusted-peer
+    /// entry. Carries the typed [`PeerId`] so callers can distinguish it
+    /// from a display-name mismatch.
     #[error("Peer not found: {0}")]
-    PeerNotFound(String),
+    PeerNotFound(PeerId),
     #[error("Peer offline (no ack received)")]
     PeerOffline,
     #[error("Transport error: {0}")]
@@ -65,20 +88,12 @@ pub enum SendError {
     /// as "peer unreachable".
     #[error("Peer dropped envelope at admission: {reason:?}")]
     AdmissionDropped { reason: crate::inbox::DropReason },
-    /// Routing by [`PeerId`] landed in Wave-B V5 as a typed signature but
-    /// transport dispatch is reinstated in Wave-C. Until then, callers that
-    /// reach the router-level send path receive this typed error rather
-    /// than `PeerOffline` so the "not yet wired" condition is observable
-    /// at the call site instead of silently masquerading as a live peer
-    /// being unreachable.
-    #[error("router send path is awaiting Wave-C transport dispatcher")]
-    DispatcherPending,
 }
 
 #[inline]
-fn map_inproc_send_error(err: InprocSendError) -> SendError {
+fn map_inproc_send_error(err: InprocSendError, dest: PeerId) -> SendError {
     match err {
-        InprocSendError::PeerNotFound(peer) => SendError::PeerNotFound(peer),
+        InprocSendError::PeerNotFound(_) => SendError::PeerNotFound(dest),
         InprocSendError::InboxClosed | InprocSendError::InboxFull => SendError::PeerOffline,
         // Preserve the typed ingress-drop reason all the way through to
         // REST/RPC/MCP payloads. Do NOT collapse into `PeerOffline` — the
@@ -255,20 +270,144 @@ impl Router {
     ///
     /// Wave-B V5: `PeerName` is display metadata; it is not safe as a routing
     /// key (duplicate names are legal). Callers that hold only a name must
-    /// resolve it to a `PeerId` via [`TrustStore::resolve_name`] at the
-    /// boundary and handle the typed
+    /// resolve it to a `PeerId` via [`crate::trust::TrustStore::resolve_name`]
+    /// at the boundary and handle the typed
     /// [`TrustResolveError::Ambiguous`](crate::trust::TrustResolveError::Ambiguous)
     /// case explicitly — the router will not guess.
-    ///
-    /// Transport dispatch (inproc / uds / tcp fan-out, signing, ack waiting)
-    /// is reinstated in Wave-C. In Wave-B the signature exists and is the
-    /// sole entry point, but calls return [`SendError::DispatcherPending`]
-    /// until Wave-C lands — this way the presence of the dead code path is
-    /// visible at runtime rather than masquerading as a reachable peer.
     pub async fn send(&self, dest: PeerId, kind: MessageKind) -> Result<Uuid, SendError> {
-        // The `dest`/`kind` values are the typed inputs Wave-C will consume.
-        let _ = (dest, kind);
-        Err(SendError::DispatcherPending)
+        self.send_with_id(dest, Uuid::new_v4(), kind).await
+    }
+
+    /// Canonical send with a caller-supplied envelope id.
+    ///
+    /// Used by the correlated request/response path, which reserves a
+    /// stream key before the envelope goes out so replies can correlate
+    /// via `in_reply_to` without an extra local id map.
+    pub async fn send_with_id(
+        &self,
+        dest: PeerId,
+        envelope_id: Uuid,
+        kind: MessageKind,
+    ) -> Result<Uuid, SendError> {
+        let inproc_namespace = self.inproc_namespace.as_deref().unwrap_or("");
+        let peer = {
+            let peers = self.trusted_peers.read();
+            peers.find_by_peer_id(&dest).cloned()
+        }
+        .or_else(|| {
+            if self.require_peer_auth {
+                None
+            } else {
+                // Auth-disabled fallback: scan the inproc registry for an
+                // entry whose derived PeerId matches. Display names remain
+                // the inproc lookup key, but the routing match is PeerId.
+                InprocRegistry::global()
+                    .peers_in_namespace(inproc_namespace)
+                    .into_iter()
+                    .find(|p| peer_id_from_pubkey(&p.pubkey) == dest)
+                    .map(|p| TrustedPeer {
+                        name: p.name.clone(),
+                        pubkey: p.pubkey,
+                        addr: format!("inproc://{}", p.name),
+                        meta: p.meta,
+                    })
+            }
+        })
+        .ok_or(SendError::PeerNotFound(dest))?;
+        let addr = PeerAddr::parse(&peer.addr)?;
+        let mut envelope = Envelope {
+            id: envelope_id,
+            from: self.keypair.public_key(),
+            to: peer.pubkey,
+            kind,
+            sig: crate::identity::Signature::new([0u8; 64]),
+        };
+        if self.require_peer_auth {
+            envelope.sign(&self.keypair);
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let wait_for_ack = should_wait_for_ack(&envelope.kind);
+            match addr {
+                #[cfg(unix)]
+                PeerAddr::Uds(path) => {
+                    let mut stream = UnixStream::connect(&path).await?;
+                    self.send_on_stream(&mut stream, envelope, wait_for_ack)
+                        .await
+                }
+                #[cfg(not(unix))]
+                PeerAddr::Uds(_path) => Err(std::io::Error::new(
+                    ErrorKind::Unsupported,
+                    "unix domain sockets are not supported on this platform",
+                )
+                .into()),
+                PeerAddr::Tcp(addr_str) => {
+                    let mut stream = TcpStream::connect(&addr_str).await?;
+                    self.send_on_stream(&mut stream, envelope, wait_for_ack)
+                        .await
+                }
+                PeerAddr::Inproc(_) => {
+                    let registry = InprocRegistry::global();
+                    // Inproc delivery is constrained by the resolved peer's
+                    // pubkey: the trust store already pinned it to `dest`,
+                    // so the registry lookup must agree or we refuse the
+                    // send rather than fall through to a name collision.
+                    match registry.send_with_signature_in_namespace_with_id(
+                        inproc_namespace,
+                        &self.keypair,
+                        &peer.name,
+                        envelope.id,
+                        envelope.kind.clone(),
+                        self.require_peer_auth,
+                    ) {
+                        Ok(uuid) => Ok(uuid),
+                        Err(InprocSendError::PeerNotFound(_)) => registry
+                            .send_cross_namespace_with_id(
+                                &self.keypair,
+                                &peer.name,
+                                &peer.pubkey,
+                                envelope.id,
+                                envelope.kind,
+                                self.require_peer_auth,
+                            )
+                            .map_err(|err| map_inproc_send_error(err, dest)),
+                        Err(other) => Err(map_inproc_send_error(other, dest)),
+                    }
+                }
+            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            match addr {
+                PeerAddr::Tcp(_) => Err(SendError::Transport(TransportError::InvalidAddress(
+                    "TCP transport is not available on wasm32".to_string(),
+                ))),
+                PeerAddr::Inproc(_) => {
+                    let registry = InprocRegistry::global();
+                    match registry.send_with_signature_in_namespace(
+                        inproc_namespace,
+                        &self.keypair,
+                        &peer.name,
+                        envelope.kind.clone(),
+                        self.require_peer_auth,
+                    ) {
+                        Ok(uuid) => Ok(uuid),
+                        Err(InprocSendError::PeerNotFound(_)) => registry
+                            .send_cross_namespace(
+                                &self.keypair,
+                                &peer.name,
+                                &peer.pubkey,
+                                envelope.kind,
+                                self.require_peer_auth,
+                            )
+                            .map_err(|err| map_inproc_send_error(err, dest)),
+                        Err(other) => Err(map_inproc_send_error(other, dest)),
+                    }
+                }
+            }
+        }
     }
 }
 
