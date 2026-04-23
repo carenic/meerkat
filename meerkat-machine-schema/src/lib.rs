@@ -19,7 +19,8 @@ pub use catalog::{
 };
 pub use compat::{
     external_tool_surface_bridge_machine, flow_frame_machine, flow_run_machine,
-    loop_iteration_machine, ops_barrier_bridge_machine, supervisor_trust_bridge_machine,
+    loop_iteration_machine, mob_destroy_session_ingress_bridge_machine,
+    ops_barrier_bridge_machine, supervisor_trust_bridge_machine,
 };
 pub use composition::{
     ActorKind, ActorPriority, ActorSchema, ClosurePolicy, CompositionDriver,

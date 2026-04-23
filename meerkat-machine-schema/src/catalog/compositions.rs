@@ -547,6 +547,7 @@ pub fn compat_composition_schemas() -> Vec<CompositionSchema> {
         external_tool_bundle_composition(),
         flow_frame_loop_composition(),
         supervisor_trust_bundle_composition(),
+        mob_destroy_session_ingress_bundle_composition(),
     ]
 }
 
@@ -1347,6 +1348,172 @@ fn supervisor_trust_bundle_composition() -> CompositionSchema {
             witness("supervisor_trust_publish_round_trip", &[]),
             witness("supervisor_trust_revoke_round_trip", &[]),
         ],
+        deep_domain_cardinality: 2,
+        deep_domain_overrides: std::collections::BTreeMap::new(),
+        witness_domain_cardinality: 2,
+        ci_limits: Some(default_ci_limits()),
+        closed_world: true,
+    }
+}
+
+/// Host composition for the `mob_destroying_session_ingress` handoff
+/// obligation — C-F3 step-lock formalisation for the mob-destroy →
+/// session-ingress-detach seam.
+///
+/// State-scope-audit row F3 flagged that `MeerkatMachine` carries a
+/// `peer_ingress_mob_id: Option<MobId>` with no structural
+/// "mob-exists" invariant (`meerkat-machine-schema/src/catalog/dsl/
+/// meerkat_machine.rs:112`). When a mob is destroyed, every session
+/// whose peer-ingress ownership was `MobOwned` by that mob must
+/// receive `DetachIngress` first — otherwise the session is left
+/// holding a dangling `peer_ingress_mob_id` on a now-retired mob. The
+/// canonical `meerkat_mob_seam` route `destroy_request_reaches_meerkat`
+/// (`RequestRuntimeDestroy` → `Destroy` input) carries no such
+/// ordering guarantee; the shell (`meerkat-mob::runtime::actor::
+/// handle_destroy`) retires each member before the `Destroy` input
+/// lands, but that ordering is convention, not contract.
+///
+/// C-F3 closes that seam with a generated obligation pair. The
+/// `mob_destroying_session_ingress` protocol declares:
+///
+/// * producer: compat `MobDestroySessionIngressBridgeMachine` effect
+///   `RequestSessionIngressDetachForMobDestroy { mob_id,
+///   agent_runtime_id }`, emitted from the mob's destroy path before
+///   any `RequestRuntimeDestroy` is routed;
+/// * realising actor: `mob_destroy_session_ingress_owner`, which calls
+///   `DetachIngress` on the target session's `MeerkatMachine`;
+/// * feedback: `SessionIngressDetachedForMobDestroy { mob_id,
+///   agent_runtime_id }` on success, or
+///   `SessionIngressDetachFailedForMobDestroy { mob_id,
+///   agent_runtime_id, reason }` on failure (the mob's destroy report
+///   surfaces the typed reason and holds off the `RequestRuntimeDestroy`).
+///
+/// `closure_policy` is `AckRequired`. Correlation on `mob_id +
+/// agent_runtime_id` — the same tuple the runtime shell needs to
+/// route the detach to the correct session's DSL authority.
+///
+/// The `xtask seam-inventory` destroy-obligation-pairing check
+/// (`## Destroy-obligation Pairing`) asserts that every canonical
+/// routed effect whose name contains "Destroy" has a paired handoff
+/// protocol that threads the ingress-detach ack before destroy, and
+/// this composition is the declarative witness that pair exists for
+/// the `meerkat_mob_seam` route.
+///
+/// Mode: ShellBridge. The mob runtime's `handle_destroy` path is the
+/// effect producer today; when the canonical DSL macro grows
+/// `handoff_protocol` syntax the bridge can retire and the effect
+/// emission can move to `MobMachine::DestroyMob`.
+fn mob_destroy_session_ingress_bundle_composition() -> CompositionSchema {
+    CompositionSchema {
+        name: comp_id("mob_destroy_session_ingress_bundle"),
+        machines: vec![MachineInstance {
+            instance_id: mi_id("mob_destroy_session_ingress_bridge"),
+            machine_name: mach_id("MobDestroySessionIngressBridgeMachine"),
+            actor: act_id("mob_destroy_session_ingress_bridge_authority"),
+        }],
+        actors: vec![
+            machine_actor("mob_destroy_session_ingress_bridge_authority"),
+            owner_actor("mob_destroy_session_ingress_owner"),
+        ],
+        handoff_protocols: vec![EffectHandoffProtocol {
+            name: protocol_id("mob_destroying_session_ingress"),
+            producer_instance: mi_id("mob_destroy_session_ingress_bridge"),
+            effect_variant: ev_id("RequestSessionIngressDetachForMobDestroy"),
+            realizing_actor: act_id("mob_destroy_session_ingress_owner"),
+            correlation_fields: vec![fld_id("mob_id"), fld_id("agent_runtime_id")],
+            obligation_fields: vec![fld_id("mob_id"), fld_id("agent_runtime_id")],
+            allowed_feedback_inputs: vec![
+                FeedbackInputRef {
+                    machine_instance: mi_id("mob_destroy_session_ingress_bridge"),
+                    input_variant: iv_id("SessionIngressDetachedForMobDestroy"),
+                    field_bindings: vec![
+                        FeedbackFieldBinding {
+                            input_field: fld_id("mob_id"),
+                            source: FeedbackFieldSource::ObligationField(fld_id("mob_id")),
+                        },
+                        FeedbackFieldBinding {
+                            input_field: fld_id("agent_runtime_id"),
+                            source: FeedbackFieldSource::ObligationField(fld_id(
+                                "agent_runtime_id",
+                            )),
+                        },
+                    ],
+                },
+                FeedbackInputRef {
+                    machine_instance: mi_id("mob_destroy_session_ingress_bridge"),
+                    input_variant: iv_id("SessionIngressDetachFailedForMobDestroy"),
+                    field_bindings: vec![
+                        FeedbackFieldBinding {
+                            input_field: fld_id("mob_id"),
+                            source: FeedbackFieldSource::ObligationField(fld_id("mob_id")),
+                        },
+                        FeedbackFieldBinding {
+                            input_field: fld_id("agent_runtime_id"),
+                            source: FeedbackFieldSource::ObligationField(fld_id(
+                                "agent_runtime_id",
+                            )),
+                        },
+                        FeedbackFieldBinding {
+                            input_field: fld_id("reason"),
+                            source: FeedbackFieldSource::OwnerContext("reason".into()),
+                        },
+                    ],
+                },
+            ],
+            closure_policy: ClosurePolicy::AckRequired,
+            liveness_annotation: Some(
+                "eventual feedback: the mob destroy path awaits each session's DetachIngress ack before requesting runtime destroy"
+                    .into(),
+            ),
+            rust: ProtocolRustBinding {
+                module_path:
+                    "meerkat-mob/src/generated/protocol_mob_destroying_session_ingress.rs"
+                        .into(),
+                generation_mode: ProtocolGenerationMode::ShellBridge,
+                required_imports: vec![
+                    "use crate::runtime::actor::MobDestroySessionIngressBridgeEffect;".into(),
+                ],
+                authority_type_path: None,
+                mutator_trait_path: None,
+                input_enum_path: None,
+                effect_enum_path: Some(
+                    "crate::runtime::actor::MobDestroySessionIngressBridgeEffect".into(),
+                ),
+                transition_type_path: None,
+                error_type_path: None,
+                executor_trigger_input_variant: None,
+                bridge_source_type_path: None,
+                helper_return_shape: ProtocolHelperReturnShape::Obligations,
+                handle_trait_path: None,
+                handle_method_names: BTreeMap::new(),
+                handle_arg_accessors: BTreeMap::new(),
+                handle_method_forwarded_fields: BTreeMap::new(),
+                input_payload_module_path: None,
+                additional_modes: vec![],
+            },
+        }],
+        entry_inputs: vec![],
+        routes: vec![],
+        route_target_selectors: vec![],
+        driver: None,
+        transaction_plans: vec![],
+        actor_priorities: vec![],
+        scheduler_rules: vec![],
+        invariants: vec![CompositionInvariant {
+            name: "mob_destroying_session_ingress_protocol_covered".into(),
+            kind: CompositionInvariantKind::HandoffProtocolCovered {
+                producer_instance: mi_id("mob_destroy_session_ingress_bridge"),
+                effect_variant: ev_id("RequestSessionIngressDetachForMobDestroy"),
+                protocol_name: protocol_id("mob_destroying_session_ingress"),
+            },
+            statement: "mob destroying its runtime crosses from the mob authority back into meerkat acknowledgement only through the explicit `mob_destroying_session_ingress` protocol: DetachIngress is fired against the target session and acknowledged before RequestRuntimeDestroy is routed".into(),
+            references_machines: vec![mi_id("mob_destroy_session_ingress_bridge")],
+            references_actors: vec![
+                act_id("mob_destroy_session_ingress_bridge_authority"),
+                act_id("mob_destroy_session_ingress_owner"),
+            ],
+        }],
+        witnesses: vec![witness("mob_destroying_session_ingress_round_trip", &[])],
         deep_domain_cardinality: 2,
         deep_domain_overrides: std::collections::BTreeMap::new(),
         witness_domain_cardinality: 2,

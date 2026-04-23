@@ -1069,6 +1069,103 @@ fn print_summary(
         protocol_rows.len()
     );
     println!();
+    // C-F3 — destroy-obligation pairing audit. State-scope audit row
+    // F3 flagged that `MeerkatMachine` carries a
+    // `peer_ingress_mob_id: Option<MobId>` whose "mob-exists"
+    // invariant is convention-driven: when a mob destroys its
+    // runtime, every session whose peer-ingress ownership was
+    // `MobOwned` by that mob must receive `DetachIngress` first,
+    // otherwise the `peer_ingress_mob_id` on that session dangles.
+    //
+    // This section walks every canonical routed effect whose variant
+    // name contains the substring "Destroy" and asserts a paired
+    // handoff obligation exists whose feedback inputs include at
+    // least one variant that mentions "IngressDetached" or "Detach".
+    // Unpaired destroy routes are emitted as debt so the
+    // `mob-destroy → session-detach` ordering cannot regress
+    // silently.
+    let mut destroy_routes: Vec<(String, String, String, String, bool)> = Vec::new();
+    for composition in &all_compositions {
+        for route in &composition.routes {
+            // Filter to destroy *requests* that flow from a producer to a
+            // consumer that will be torn down. Reply signals like
+            // `RuntimeDestroyed` (consumer → producer, "destroy observed")
+            // are not request-side effects and do not need a paired
+            // detach obligation: the destroy is already done by the time
+            // they fire.
+            let variant = route.effect_variant.as_str();
+            if !(variant.contains("Destroy") && variant.starts_with("Request")) {
+                continue;
+            }
+            let producer_instance = route.from_machine.as_str().to_string();
+            let producer_machine = composition
+                .machines
+                .iter()
+                .find(|m| m.instance_id == route.from_machine)
+                .map(|m| m.machine_name.as_str().to_string())
+                .unwrap_or_default();
+            let effect = route.effect_variant.as_str().to_string();
+            let composition_name = composition.name.as_str().to_string();
+            // Paired iff some protocol (across all compositions) has a
+            // feedback input whose variant name is "*IngressDetach*"
+            // or "*Detach*" AND the protocol's allowed feedback inputs
+            // route into the same consumer as this destroy route.
+            let consumer_instance = &route.to.machine;
+            let paired = all_compositions.iter().any(|other| {
+                other.handoff_protocols.iter().any(|protocol| {
+                    protocol.allowed_feedback_inputs.iter().any(|fb| {
+                        let variant = fb.input_variant.as_str();
+                        (variant.contains("IngressDetached") || variant.contains("Detach"))
+                            && (fb.machine_instance == *consumer_instance
+                                || other.machines.iter().any(|m| {
+                                    m.instance_id == fb.machine_instance
+                                        && other
+                                            .machines
+                                            .iter()
+                                            .any(|cm| cm.machine_name.as_str() == producer_machine)
+                                })
+                                || protocol.name.as_str().contains("session_ingress"))
+                    })
+                })
+            });
+            destroy_routes.push((
+                producer_machine.clone(),
+                effect,
+                composition_name,
+                producer_instance,
+                paired,
+            ));
+        }
+    }
+    destroy_routes.sort();
+    println!("## Destroy-obligation Pairing (C-F3)");
+    if destroy_routes.is_empty() {
+        println!("  (no canonical routed *Destroy* effects declared)");
+    } else {
+        println!(
+            "  {:24} {:32} {:32} {:32} paired",
+            "producer_machine", "effect_variant", "composition", "producer_instance"
+        );
+        for (producer, effect, composition_name, instance, paired) in &destroy_routes {
+            println!(
+                "  {:24} {:32} {:32} {:32} {}",
+                producer,
+                effect,
+                composition_name,
+                instance,
+                if *paired { "yes" } else { "NO" }
+            );
+        }
+    }
+    let unpaired_destroy_debt: Vec<&(String, String, String, String, bool)> = destroy_routes
+        .iter()
+        .filter(|(_, _, _, _, paired)| !paired)
+        .collect();
+    println!(
+        "  unpaired destroy routes (debt):            {}",
+        unpaired_destroy_debt.len()
+    );
+    println!();
     println!("## Public Surface Contracts");
     for entry in public_surface_contracts {
         println!(
@@ -1098,5 +1195,9 @@ fn print_summary(
     println!(
         "  unresolved routed-effect debt:             {}",
         unresolved_routed_debt.len()
+    );
+    println!(
+        "  unpaired destroy-obligation debt (C-F3):   {}",
+        unpaired_destroy_debt.len()
     );
 }
