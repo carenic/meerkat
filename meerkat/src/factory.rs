@@ -1437,58 +1437,6 @@ impl AgentFactory {
         }
     }
 
-    /// Anthropic's current web search tool type identifier.
-    const ANTHROPIC_WEB_SEARCH_TOOL_TYPE: &'static str = "web_search_20250305";
-
-    /// Resolve provider-native tool defaults for a model.
-    ///
-    /// Returns `None` when the model's profile does not support web search,
-    /// the config has the feature disabled, or the provider is self-hosted/other.
-    fn resolve_provider_tool_defaults(
-        registry: &meerkat_core::ModelRegistry,
-        provider: Provider,
-        model: &str,
-        config: &Config,
-        suppress_ambient_provider_search: bool,
-    ) -> Option<serde_json::Value> {
-        if suppress_ambient_provider_search {
-            return None;
-        }
-        let profile = registry.profile_for(model)?;
-        if !profile.supports_web_search {
-            return None;
-        }
-        let mut tools = serde_json::Map::new();
-        match provider {
-            Provider::Anthropic if config.provider_tools.anthropic.web_search => {
-                tools.insert(
-                    "web_search".into(),
-                    serde_json::json!({
-                        "type": Self::ANTHROPIC_WEB_SEARCH_TOOL_TYPE,
-                        "name": "web_search"
-                    }),
-                );
-            }
-            Provider::OpenAI if config.provider_tools.openai.web_search => {
-                tools.insert(
-                    "web_search".into(),
-                    serde_json::json!({"type": "web_search"}),
-                );
-            }
-            Provider::Gemini if config.provider_tools.gemini.google_search => {
-                tools.insert("google_search".into(), serde_json::json!({}));
-            }
-            // Self-hosted: capability flag is plumbed but tool shape emission
-            // is not wired yet (needs per-transport knowledge).
-            _ => {}
-        }
-        if tools.is_empty() {
-            None
-        } else {
-            Some(serde_json::Value::Object(tools))
-        }
-    }
-
     /// Wrap a session store in the shared adapter.
     pub async fn build_store_adapter<S: SessionStore + 'static>(
         &self,
@@ -1724,30 +1672,7 @@ impl AgentFactory {
             None
         };
 
-        // 2b. Resolve provider-native tool defaults (web search, etc.)
-        let provider_tool_defaults = Self::resolve_provider_tool_defaults(
-            &registry,
-            provider,
-            &build_config.model,
-            config,
-            explicit_meerkat_tool_policy,
-        );
-
-        // 3. Create LLM client. Precedence:
-        //    1. llm_client_override (test/embedded path)
-        //    2. connection_ref → ProviderRuntimeRegistry
-        //    3. env-var fallback → synthesized default realm →
-        //       same ProviderRuntimeRegistry path
-        //    4. SelfHosted → build_self_hosted_client_from_registry
-        //       (SelfHosted backends don't fit the standard
-        //        backend_kind taxonomy yet; tracked for post-0.6.0)
-        //
-        // The model-inferred `provider` from step 2 stays authoritative for
-        // SessionMetadata except when connection_ref resolves through the
-        // registry — that returns a different provider (which is the whole
-        // point of the binding indirection). Env-var synthesized realms use
-        // the same provider as the model-inferred one.
-        let mut provider = provider;
+        // 3. Create LLM client.
         let llm_client: Arc<dyn LlmClient> = match build_config.llm_client_override.as_ref() {
             Some(client) => Arc::clone(client),
             None if std::env::var("RKAT_TEST_CLIENT").ok().as_deref() == Some("1") => {
@@ -1819,7 +1744,6 @@ impl AgentFactory {
                         .resolve(&realm, &binding_id, &env)
                         .await
                         .map_err(|e| BuildAgentError::ConnectionResolution(e.to_string()))?;
-                    provider = connection.provider;
 
                     // Phase 1.5-rev loop closure — refresh-loop middle:
                     // The DSL tracks per-binding auth lifecycle state.
@@ -2630,10 +2554,6 @@ impl AgentFactory {
         if let Some(params) = build_config.provider_params.clone() {
             builder = builder.provider_params(params);
         }
-        if let Some(defaults) = provider_tool_defaults {
-            builder = builder.provider_tool_defaults(defaults);
-        }
-
         if let Some(system_prompt) = system_prompt {
             builder = builder.system_prompt(system_prompt);
         }
