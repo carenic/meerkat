@@ -82,67 +82,88 @@ where
     T: AgentToolDispatcher + ?Sized + 'static,
     S: AgentSessionStore + ?Sized + 'static,
 {
-    fn runtime_turn_authority_snapshot(&self) -> Option<crate::TurnStateSnapshot> {
-        let handle = self.turn_state_handle.as_deref()?;
-        self.runtime_execution_kind?;
-        Some(handle.snapshot())
+    /// Snapshot the runtime-backed turn-state authority.
+    ///
+    /// Pre-wave-a, a missing `turn_state_handle` fell through to a
+    /// standalone in-process `self.turn_state` authority. Wave-a deleted
+    /// the standalone authority entirely; the runtime-backed handle is now
+    /// the only turn-state source. For live runs the facade wires the
+    /// handle via `AgentBuilder::with_turn_state_handle` (see
+    /// `meerkat/src/factory.rs` where it plugs `SessionRuntimeBindings`).
+    ///
+    /// Returns a typed `AgentError::InternalError` when callers on the
+    /// live-run path query turn state without an attached handle —
+    /// preserves the pre-retype intent (a real secondary authority, never
+    /// a silent default) as a fail-loud error rather than an
+    /// `unwrap_or_default` silent-drop.
+    fn runtime_turn_authority_snapshot(&self) -> Result<crate::TurnStateSnapshot, AgentError> {
+        let handle = self.turn_state_handle.as_deref().ok_or_else(|| {
+            AgentError::InternalError(
+                "runtime turn-state handle missing: agent was built without \
+                 with_turn_state_handle but is being queried on a live-run code path \
+                 — the standalone fallback was deleted in wave-a; runtime-backed \
+                 wiring is required"
+                    .to_string(),
+            )
+        })?;
+        if self.runtime_execution_kind.is_none() {
+            return Err(AgentError::InternalError(
+                "runtime_execution_kind not set: turn-state handle is attached but \
+                 the runtime build mode did not classify the execution kind"
+                    .to_string(),
+            ));
+        }
+        Ok(handle.snapshot())
     }
 
-    fn turn_active_run_id(&self) -> Option<RunId> {
-        self.runtime_turn_authority_snapshot()
-            .and_then(|snapshot| snapshot.active_run_id)
+    fn turn_active_run_id(&self) -> Result<Option<RunId>, AgentError> {
+        Ok(self.runtime_turn_authority_snapshot()?.active_run_id)
     }
 
-    fn turn_phase(&self) -> TurnPhase {
-        // No runtime-backed turn state ⇒ the agent is standalone/ephemeral
-        // and has not yet advanced past `Ready`.
-        self.runtime_turn_authority_snapshot()
-            .map(|snapshot| snapshot.turn_phase)
-            .unwrap_or(TurnPhase::Ready)
+    fn turn_phase(&self) -> Result<TurnPhase, AgentError> {
+        Ok(self.runtime_turn_authority_snapshot()?.turn_phase)
     }
 
-    fn turn_cancel_after_boundary(&self) -> bool {
-        self.runtime_turn_authority_snapshot()
-            .is_some_and(|snapshot| snapshot.cancel_after_boundary)
+    fn turn_cancel_after_boundary(&self) -> Result<bool, AgentError> {
+        Ok(self.runtime_turn_authority_snapshot()?.cancel_after_boundary)
     }
 
-    fn turn_has_barrier_ops(&self) -> bool {
-        self.runtime_turn_authority_snapshot()
-            .is_some_and(|snapshot| snapshot.has_barrier_ops)
+    fn turn_has_barrier_ops(&self) -> Result<bool, AgentError> {
+        Ok(self.runtime_turn_authority_snapshot()?.has_barrier_ops)
     }
 
-    fn turn_barrier_operation_ids(&self) -> Vec<crate::ops::OperationId> {
-        self.runtime_turn_authority_snapshot()
-            .map(|snapshot| {
-                snapshot
-                    .barrier_operation_ids
-                    .iter()
-                    .filter_map(|id| parse_runtime_operation_id(id))
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn turn_barrier_operation_ids(&self) -> Result<Vec<crate::ops::OperationId>, AgentError> {
+        let snapshot = self.runtime_turn_authority_snapshot()?;
+        Ok(snapshot
+            .barrier_operation_ids
+            .iter()
+            .filter_map(|id| parse_runtime_operation_id(id))
+            .collect())
     }
 
-    fn turn_pending_ops_registered(&self) -> bool {
-        self.runtime_turn_authority_snapshot()
-            .is_some_and(|snapshot| !snapshot.pending_op_refs.is_empty())
+    fn turn_pending_ops_registered(&self) -> Result<bool, AgentError> {
+        Ok(!self.runtime_turn_authority_snapshot()?.pending_op_refs.is_empty())
     }
 
-    fn turn_in_extraction_flow(&self) -> bool {
-        self.runtime_turn_authority_snapshot()
-            .is_some_and(|snapshot| snapshot.max_extraction_retries > 0)
+    fn turn_in_extraction_flow(&self) -> Result<bool, AgentError> {
+        Ok(self.runtime_turn_authority_snapshot()?.max_extraction_retries > 0)
     }
 
-    fn turn_terminal_outcome(&self) -> TurnTerminalOutcome {
-        self.runtime_turn_authority_snapshot()
-            .and_then(|snapshot| snapshot.terminal_outcome)
-            .unwrap_or(TurnTerminalOutcome::None)
+    fn turn_terminal_outcome(&self) -> Result<TurnTerminalOutcome, AgentError> {
+        // `terminal_outcome` on the snapshot is `Option<TurnTerminalOutcome>`;
+        // `None` there is a meaningful phase ("not yet terminal"), distinct
+        // from "handle absent" which surfaces above as an error. Project
+        // the in-handle `None` to `TurnTerminalOutcome::None` per the
+        // DSL contract (see `TurnStateSnapshot::terminal_outcome` doc).
+        Ok(self
+            .runtime_turn_authority_snapshot()?
+            .terminal_outcome
+            .unwrap_or(TurnTerminalOutcome::None))
     }
 
-    fn turn_extraction_attempts(&self) -> u32 {
-        self.runtime_turn_authority_snapshot()
-            .map(|snapshot| u32::try_from(snapshot.extraction_attempts).unwrap_or(u32::MAX))
-            .unwrap_or(0)
+    fn turn_extraction_attempts(&self) -> Result<u32, AgentError> {
+        let snapshot = self.runtime_turn_authority_snapshot()?;
+        Ok(u32::try_from(snapshot.extraction_attempts).unwrap_or(u32::MAX))
     }
 
     /// Resolve the effective call timeout for this LLM call.
@@ -425,7 +446,7 @@ where
             }
             TurnExecutionInput::CancellationObserved { .. } => handle.cancellation_observed(),
             TurnExecutionInput::AcknowledgeTerminal { .. } => {
-                handle.acknowledge_terminal(self.turn_terminal_outcome())
+                handle.acknowledge_terminal(self.turn_terminal_outcome()?)
             }
             TurnExecutionInput::TurnLimitReached { .. } => handle.turn_limit_reached(),
             TurnExecutionInput::BudgetExhausted { .. } => handle.budget_exhausted(),
@@ -452,9 +473,9 @@ where
         &mut self,
         input: TurnExecutionInput,
     ) -> Result<TurnExecutionTransition, AgentError> {
-        let prev_phase = self.turn_phase();
+        let prev_phase = self.turn_phase()?;
         self.apply_turn_input_via_runtime_handle(&input)?;
-        let next_phase = self.turn_phase();
+        let next_phase = self.turn_phase()?;
 
         // Effects are derived from phase transitions only. The runtime
         // authority owns all other side-effect decisions; core just
@@ -560,11 +581,12 @@ where
             return Ok(());
         }
 
-        if self.turn_active_run_id().as_ref() != Some(run_id) || self.turn_cancel_after_boundary() {
+        if self.turn_active_run_id()?.as_ref() != Some(run_id) || self.turn_cancel_after_boundary()?
+        {
             return Ok(());
         }
 
-        match self.turn_phase() {
+        match self.turn_phase()? {
             TurnPhase::ApplyingPrimitive
             | TurnPhase::CallingLlm
             | TurnPhase::WaitingForOps
@@ -1140,7 +1162,7 @@ where
                     }
 
                     // In extraction mode, override tools/temperature/params
-                    let in_extraction = self.turn_in_extraction_flow();
+                    let in_extraction = self.turn_in_extraction_flow()?;
                     if in_extraction {
                         // Force temperature 0.0 for deterministic output
                         effective_temperature = Some(0.0_f32);
@@ -1644,7 +1666,7 @@ where
                             has_barrier_ops,
                         })?;
 
-                        if self.turn_has_barrier_ops() {
+                        if self.turn_has_barrier_ops()? {
                             // Stay in WaitingForOps — the outer match arm will
                             // await completion of barrier ops via wait-set.
                             continue;
@@ -1661,7 +1683,7 @@ where
                         })?;
                         self.execute_turn_effects(&t, turn_count, &event_tx).await;
                         turn_count += 1;
-                    } else if self.turn_in_extraction_flow() {
+                    } else if self.turn_in_extraction_flow()? {
                         // Extraction turn response — validate against schema
                         self.session.push(Message::BlockAssistant(assistant_msg));
 
@@ -1746,7 +1768,7 @@ where
                                 },
                             )?;
 
-                            if !self.turn_phase().is_terminal() {
+                            if !self.turn_phase()?.is_terminal() {
                                 // Authority decided to retry — push retry prompt
                                 let retry_prompt = format!(
                                     "The previous output was invalid: {error}. \
@@ -1765,7 +1787,7 @@ where
                                 tracing::warn!("Failed to save session: {}", e);
                             }
                             return Err(AgentError::StructuredOutputValidationFailed {
-                                attempts: self.turn_extraction_attempts(),
+                                attempts: self.turn_extraction_attempts()?,
                                 reason: error,
                                 last_output: self.session.last_assistant_text().unwrap_or_default(),
                             });
@@ -1806,7 +1828,7 @@ where
 
                         // Check if we need to perform extraction turn for structured output
                         if let Some(output_schema) = self.config.output_schema.as_ref()
-                            && !self.turn_in_extraction_flow()
+                            && !self.turn_in_extraction_flow()?
                         {
                             // Enter extraction mode via authority
                             self.extraction_result = None;
@@ -1869,12 +1891,12 @@ where
                     // Await completion of all pending barrier operations via
                     // the machine-owned turn-local wait-set. Only barrier ops
                     // block the turn; detached ops run independently.
-                    if !self.turn_pending_ops_registered() {
+                    if !self.turn_pending_ops_registered()? {
                         return Err(AgentError::InternalError(
                             "WaitingForOps entered without registered pending_op_refs".to_string(),
                         ));
                     }
-                    let barrier_ids = self.turn_barrier_operation_ids();
+                    let barrier_ids = self.turn_barrier_operation_ids()?;
                     if !barrier_ids.is_empty() {
                         let wait_result = if let Some(ref registry) = self.ops_lifecycle {
                             registry
@@ -1944,7 +1966,7 @@ where
     async fn build_result(&mut self, turns: u32, tool_calls: u32) -> Result<RunResult, AgentError> {
         use crate::generated::terminal_surface_mapping::{SurfaceResultClass, classify_terminal};
 
-        let outcome = self.turn_terminal_outcome();
+        let outcome = self.turn_terminal_outcome()?;
         let classification = classify_terminal(&outcome);
 
         match classification {
