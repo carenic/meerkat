@@ -169,9 +169,17 @@ impl ProviderRuntimeRegistry {
         let (binding, backend, auth) = realm
             .lookup_binding(binding_id)
             .map_err(|e| ProviderAuthError::SourceResolutionFailed(e.to_string()))?;
+        // Wave-c C-6r: `ConnectionRef` is typed — realm + binding land via
+        // `RealmId::parse` / `BindingId::parse` at this construction seam.
+        // The string slugs come from a validated `RealmConnectionSet` so
+        // `expect` is the correct shape: a parse failure here is a bug in
+        // the realm config loader, not a runtime condition.
         let connection_ref = meerkat_core::ConnectionRef {
-            realm_id: realm.realm_id.clone(),
-            binding_id: binding.id.clone(),
+            realm: meerkat_core::connection::RealmId::parse(&realm.realm_id)
+                .expect("realm_id from RealmConnectionSet is a valid RealmId slug"),
+            binding: meerkat_core::connection::BindingId::parse(&binding.id)
+                .expect("binding.id from RealmConnectionSet is a valid BindingId slug"),
+            profile: None,
         };
         let runtime = self
             .runtimes

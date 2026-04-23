@@ -252,9 +252,19 @@ pub async fn resolve_external_authorizer(
     materialize_external_auth_lease(
         binding,
         envelope,
+        // Wave-c C-6r: `ConnectionRef` is typed (no `Display` impl, per
+        // the connection.rs comment "wave-b deleted `parse` and
+        // `Display` so that no code path accidentally ferries the
+        // opaque join through the runtime"). The external-resolver
+        // lease key renders the typed realm + binding (+ optional
+        // profile) slugs explicitly; this keeps the lease-key shape
+        // stable for downstream authorizers without reintroducing a
+        // colon-join `Display`.
         format!(
-            "external:{}:{}",
-            binding.connection_ref, binding.auth_profile.id
+            "external:{}:{}:{}",
+            binding.connection_ref.realm.as_str(),
+            binding.connection_ref.binding.as_str(),
+            binding.auth_profile.id
         ),
     )
 }
