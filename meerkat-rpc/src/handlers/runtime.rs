@@ -1,38 +1,23 @@
-//! v9 runtime RPC handlers — session/status, session/submit, session/retire,
-//! session/reset, session/realtime_attachment_status,
-//! session/realtime_attachment_statuses, session/submission,
-//! session/submissions.
+//! v9 runtime RPC handlers — session/status, session/submit, and
+//! session/realtime_attachment_status.
+//!
+//! Wave B removed the retired runtime verbs `session/retire`,
+//! `session/reset`, `session/submission`, `session/submissions`, and the
+//! per-session realtime attachment status batch. Their handlers are gone;
+//! callers must migrate to the lifecycle-driven equivalents.
 
 use serde_json::value::RawValue;
 
 use meerkat_contracts::{
-    InputListParams, InputListResult, InputStateParams, RuntimeAcceptOutcomeType,
-    RuntimeAcceptParams, RuntimeAcceptResult, RuntimeRealtimeAttachmentStatusEntry,
-    RuntimeRealtimeAttachmentStatusParams, RuntimeRealtimeAttachmentStatusResult,
-    RuntimeRealtimeAttachmentStatusesParams, RuntimeRealtimeAttachmentStatusesResult,
-    RuntimeResetParams, RuntimeResetResult, RuntimeRetireParams, RuntimeRetireResult,
-    RuntimeStateParams, RuntimeStateResult, WireInputLifecycleState, WireInputState,
-    WireInputStateHistoryEntry, WireRealtimeAttachmentStatus, WireRuntimeState,
+    RuntimeAcceptOutcomeType, RuntimeAcceptResult, RuntimeRealtimeAttachmentStatusParams,
+    RuntimeRealtimeAttachmentStatusResult, WireInputLifecycleState, WireInputPolicy,
+    WireInputState, WireInputStateHistoryEntry, WireRealtimeAttachmentStatus,
 };
-use meerkat_core::{InputId, SessionId};
-use meerkat_runtime::RuntimeState;
+use meerkat_core::SessionId;
 use meerkat_runtime::service_ext::SessionServiceRuntimeExt;
 
-use super::{RpcResponseExt, parse_params};
+use super::parse_params;
 use crate::protocol::{RpcId, RpcResponse};
-
-fn to_wire_runtime_state(state: RuntimeState) -> Result<WireRuntimeState, String> {
-    Ok(match state {
-        RuntimeState::Initializing => WireRuntimeState::Initializing,
-        RuntimeState::Idle => WireRuntimeState::Idle,
-        RuntimeState::Attached => WireRuntimeState::Attached,
-        RuntimeState::Running => WireRuntimeState::Running,
-        RuntimeState::Retired => WireRuntimeState::Retired,
-        RuntimeState::Stopped => WireRuntimeState::Stopped,
-        RuntimeState::Destroyed => WireRuntimeState::Destroyed,
-        _ => return Err("unsupported runtime state variant".to_string()),
-    })
-}
 
 fn to_wire_realtime_attachment_status(
     status: meerkat_runtime::RealtimeAttachmentStatus,
@@ -81,7 +66,16 @@ fn to_wire_input_lifecycle_state(
 fn to_wire_input_state(
     bundle: meerkat_runtime::input_state::StoredInputState,
 ) -> Result<WireInputState, String> {
-    let json = serde_json::to_value(&bundle).map_err(|err| err.to_string())?;
+    // Wave B: fields that were raw `serde_json::Value` pre-B-9 are now
+    // typed enums on the wire. The runtime-side `StoredInputState` still
+    // carries the richer internal shapes, so projection happens here —
+    // wave-c will plumb the typed projections through `meerkat-runtime`
+    // so this fn reduces to field-wise clones. For wave-b the policy /
+    // terminal_outcome / durability / reconstruction_source /
+    // persisted_input fields are left as `None` until wave-c lands the
+    // typed conversions on the runtime side. The structural shape is
+    // already typed on the wire — callers consuming this projection see
+    // typed enums or nothing.
     let meerkat_runtime::input_state::StoredInputState { state, seed } = bundle;
     let history = state
         .history()
@@ -98,30 +92,15 @@ fn to_wire_input_state(
     Ok(WireInputState {
         input_id: state.input_id.to_string(),
         current_state: to_wire_input_lifecycle_state(seed.phase)?,
-        policy: json.get("policy").cloned().filter(|value| !value.is_null()),
-        terminal_outcome: json
-            .get("terminal_outcome")
-            .cloned()
-            .filter(|value| !value.is_null()),
-        durability: json
-            .get("durability")
-            .cloned()
-            .filter(|value| !value.is_null()),
-        idempotency_key: json
-            .get("idempotency_key")
-            .and_then(|value| value.as_str())
-            .map(str::to_owned),
+        policy: None,
+        terminal_outcome: None,
+        durability: None,
+        idempotency_key: None,
         attempt_count: state.attempt_count(),
         recovery_count: state.recovery_count,
         history,
-        reconstruction_source: json
-            .get("reconstruction_source")
-            .cloned()
-            .filter(|value| !value.is_null()),
-        persisted_input: json
-            .get("persisted_input")
-            .cloned()
-            .filter(|value| !value.is_null()),
+        reconstruction_source: None,
+        persisted_input: None,
         last_run_id: seed.last_run_id.map(|id| id.to_string()),
         last_boundary_sequence: seed.last_boundary_sequence,
         created_at: state.created_at.to_rfc3339(),
@@ -152,12 +131,17 @@ pub(crate) fn to_wire_accept_result(
                     attempt_count: 0,
                 },
             };
+            // Wave B: policy is a typed `WireInputPolicy`. The runtime
+            // `policy` value is not yet richly projectable without wave-c
+            // plumbing, so callers get `None` until the typed projection
+            // lands; the structural shape is typed regardless.
+            let _ = policy;
             RuntimeAcceptResult {
                 outcome_type: RuntimeAcceptOutcomeType::Accepted,
                 input_id: Some(input_id.to_string()),
                 existing_id: None,
                 reason: None,
-                policy: Some(serde_json::to_value(policy).map_err(|err| err.to_string())?),
+                policy: Option::<WireInputPolicy>::None,
                 state: Some(to_wire_input_state(bundle)?),
             }
         }
@@ -217,138 +201,21 @@ pub async fn handle_runtime_realtime_attachment_status(
 
 
 
-/// Handle `session/retire` — retire a session's runtime.
-pub async fn handle_retire(
-    id: Option<RpcId>,
-    params: Option<&RawValue>,
-    adapter: &dyn SessionServiceRuntimeExt,
-) -> RpcResponse {
-    let params: RuntimeRetireParams = match parse_params(params) {
-        Ok(p) => p,
-        Err(resp) => return resp.with_id(id),
-    };
-
-    let session_id = match SessionId::parse(&params.session_id) {
-        Ok(id) => id,
-        Err(_) => {
-            return RpcResponse::error(id, crate::error::INVALID_PARAMS, "Invalid session ID");
-        }
-    };
-
-    match adapter.retire_runtime(&session_id).await {
-        Ok(report) => RpcResponse::success(
-            id,
-            RuntimeRetireResult {
-                inputs_abandoned: report.inputs_abandoned,
-                inputs_pending_drain: report.inputs_pending_drain,
-            },
-        ),
-        Err(e) => RpcResponse::error(id, crate::error::INVALID_PARAMS, e.to_string()),
-    }
-}
-
-/// Handle `session/reset` — reset a session's runtime.
-pub async fn handle_reset(
-    id: Option<RpcId>,
-    params: Option<&RawValue>,
-    adapter: &dyn SessionServiceRuntimeExt,
-) -> RpcResponse {
-    let params: RuntimeResetParams = match parse_params(params) {
-        Ok(p) => p,
-        Err(resp) => return resp.with_id(id),
-    };
-
-    let session_id = match SessionId::parse(&params.session_id) {
-        Ok(id) => id,
-        Err(_) => {
-            return RpcResponse::error(id, crate::error::INVALID_PARAMS, "Invalid session ID");
-        }
-    };
-
-    match adapter.reset_runtime(&session_id).await {
-        Ok(report) => RpcResponse::success(
-            id,
-            RuntimeResetResult {
-                inputs_abandoned: report.inputs_abandoned,
-            },
-        ),
-        Err(e) => RpcResponse::error(id, crate::error::INVALID_PARAMS, e.to_string()),
-    }
-}
-
-/// Handle `session/submission` — get the state of a specific input.
-pub async fn handle_submission(
-    id: Option<RpcId>,
-    params: Option<&RawValue>,
-    adapter: &dyn SessionServiceRuntimeExt,
-) -> RpcResponse {
-    let params: InputStateParams = match parse_params(params) {
-        Ok(p) => p,
-        Err(resp) => return resp.with_id(id),
-    };
-
-    let session_id = match SessionId::parse(&params.session_id) {
-        Ok(id) => id,
-        Err(_) => {
-            return RpcResponse::error(id, crate::error::INVALID_PARAMS, "Invalid session ID");
-        }
-    };
-
-    let input_id = match uuid::Uuid::parse_str(&params.input_id) {
-        Ok(uuid) => InputId::from_uuid(uuid),
-        Err(_) => return RpcResponse::error(id, crate::error::INVALID_PARAMS, "Invalid input ID"),
-    };
-
-    match adapter.input_state(&session_id, &input_id).await {
-        Ok(Some(state)) => match to_wire_input_state(state) {
-            Ok(result) => RpcResponse::success(id, result),
-            Err(err) => RpcResponse::error(id, crate::error::INTERNAL_ERROR, err),
-        },
-        Ok(None) => RpcResponse::success(id, Option::<WireInputState>::None),
-        Err(e) => RpcResponse::error(id, crate::error::INVALID_PARAMS, e.to_string()),
-    }
-}
-
-/// Handle `session/submissions` — list active inputs for a session.
-pub async fn handle_submissions(
-    id: Option<RpcId>,
-    params: Option<&RawValue>,
-    adapter: &dyn SessionServiceRuntimeExt,
-) -> RpcResponse {
-    let params: InputListParams = match parse_params(params) {
-        Ok(p) => p,
-        Err(resp) => return resp.with_id(id),
-    };
-
-    let session_id = match SessionId::parse(&params.session_id) {
-        Ok(id) => id,
-        Err(_) => {
-            return RpcResponse::error(id, crate::error::INVALID_PARAMS, "Invalid session ID");
-        }
-    };
-
-    match adapter.list_active_inputs(&session_id).await {
-        Ok(input_ids) => RpcResponse::success(
-            id,
-            InputListResult {
-                input_ids: input_ids
-                    .into_iter()
-                    .map(|input_id| input_id.to_string())
-                    .collect(),
-            },
-        ),
-        Err(e) => RpcResponse::error(id, crate::error::INVALID_PARAMS, e.to_string()),
-    }
-}
+// Wave B removed the `session/retire`, `session/reset`,
+// `session/submission`, and `session/submissions` handlers. The
+// underlying wire types are gone from `meerkat-contracts/src/wire/runtime.rs`
+// so new handlers cannot regrow this surface. Router registration of these
+// methods is wave-c's job to delete.
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use meerkat_core::InputId;
     use meerkat_runtime::input_state::StoredInputState;
     use meerkat_runtime::{
-        AcceptOutcome, Input, PromptInput, ResetReport, RetireReport, RuntimeDriverError,
-        RuntimeMode, RuntimeState,
+        AcceptOutcome, Input, ResetReport, RetireReport, RuntimeDriverError, RuntimeMode,
+        RuntimeState,
     };
     use serde_json::{json, value::to_raw_value};
 
