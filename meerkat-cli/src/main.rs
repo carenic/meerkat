@@ -722,7 +722,7 @@ fn resolve_rkat_rpc_binary() -> anyhow::Result<PathBuf> {
 fn realtime_rpc_args(scope: &RuntimeScope) -> Vec<String> {
     let mut args = vec![
         "--realm".to_string(),
-        scope.locator.realm_id.clone(),
+        scope.locator.realm.as_str().to_owned(),
         "--state-root".to_string(),
         scope.locator.state_root.display().to_string(),
         "--realtime-ws".to_string(),
@@ -746,7 +746,6 @@ fn realtime_rpc_args(scope: &RuntimeScope) -> Vec<String> {
     }
     args
 }
-
 
 fn default_realtime_open_request(target: &RealtimeTargetCommands) -> serde_json::Value {
     serde_json::json!({
@@ -2609,7 +2608,8 @@ fn resolve_runtime_scope(cli: &Cli) -> anyhow::Result<RuntimeScope> {
 async fn resolve_config_store(
     scope: &RuntimeScope,
 ) -> anyhow::Result<(Arc<dyn ConfigStore>, PathBuf)> {
-    let paths = meerkat_store::realm_paths_in(&scope.locator.state_root, &scope.locator.realm_id);
+    let paths =
+        meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str());
     if let Some(parent) = paths.config_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -2891,7 +2891,8 @@ async fn handle_auth_command(command: AuthCommands, scope: &RuntimeScope) -> any
                     .map_err(|e| anyhow::anyhow!("Cannot open TokenStore: {e}"))?
                     .open()
                     .map_err(|e| anyhow::anyhow!("Cannot open TokenStore: {e}"))?;
-                let key = TokenKey::new(&realm, &profile_id);
+                let key = TokenKey::parse(&realm, &profile_id)
+                    .map_err(|e| anyhow::anyhow!("invalid token-key realm/profile: {e}"))?;
                 match store
                     .load(&key)
                     .await
@@ -2984,7 +2985,8 @@ async fn handle_auth_command(command: AuthCommands, scope: &RuntimeScope) -> any
                     .map_err(|e| anyhow::anyhow!("Cannot open TokenStore: {e}"))?
                     .open()
                     .map_err(|e| anyhow::anyhow!("Cannot open TokenStore: {e}"))?;
-                let key = TokenKey::new(&realm, &profile_id);
+                let key = TokenKey::parse(&realm, &profile_id)
+                    .map_err(|e| anyhow::anyhow!("invalid token-key realm/profile: {e}"))?;
                 let present = store
                     .load(&key)
                     .await
@@ -2994,7 +2996,7 @@ async fn handle_auth_command(command: AuthCommands, scope: &RuntimeScope) -> any
                         .clear(&key)
                         .await
                         .map_err(|e| anyhow::anyhow!("TokenStore clear failed: {e}"))?;
-                    println!("deleted: {}:{}", key.realm_id, key.binding_id);
+                    println!("deleted: {}:{}", key.realm.as_str(), key.binding.as_str());
                 } else {
                     println!(
                         "nothing to delete: no persisted credential for '{realm}:{profile_id}'"
@@ -3193,7 +3195,8 @@ async fn refresh_auth_profile(
     let coord: StdArc<dyn RefreshCoordinator> = StdArc::new(InMemoryCoordinator::default());
 
     // Pre-state for the reported diff.
-    let key = TokenKey::new(realm, profile_id);
+    let key = TokenKey::parse(&realm, &profile_id)
+        .map_err(|e| anyhow::anyhow!("invalid token-key realm/profile: {e}"))?;
     let before = store
         .load(&key)
         .await
@@ -3523,7 +3526,9 @@ async fn noninteractive_login(
     };
 
     let store = TokenStoreBackend::default_auto()?.open()?;
-    let key = TokenKey::new("dev", format!("default_{provider_lc}"));
+    let binding_id_str = format!("default_{provider_lc}");
+    let key = TokenKey::parse("dev", &binding_id_str)
+        .map_err(|e| anyhow::anyhow!("invalid token-key realm/binding: {e}"))?;
     let auth_mode = if method == "static_bearer" {
         PersistedAuthMode::StaticBearer
     } else {
@@ -3618,24 +3623,26 @@ async fn interactive_login(
         auth_cyan(&redirect_url),
     ));
 
-    let (endpoints, client_secret, auth_mode, key) = match provider {
+    // Wave-c C-12 / C-1 follow-up: TokenKey now takes typed atoms.
+    // `provider.binding_id()` returns `&'static str`; build the key
+    // outside the match so the fallible parse flows cleanly via `?`.
+    let key = TokenKey::parse("dev", provider.binding_id())
+        .map_err(|e| anyhow::anyhow!("invalid token-key for provider login: {e}"))?;
+    let (endpoints, client_secret, auth_mode) = match provider {
         LoginProvider::Anthropic => (
             a_oauth::claude_ai_endpoints(&redirect_url),
             None,
             PersistedAuthMode::ClaudeAiOauth,
-            TokenKey::new("dev", provider.binding_id()),
         ),
         LoginProvider::OpenAi => (
             o_oauth::chatgpt_endpoints(&redirect_url),
             None,
             PersistedAuthMode::ChatgptOauth,
-            TokenKey::new("dev", provider.binding_id()),
         ),
         LoginProvider::Google => (
             g_oauth::code_assist_endpoints(&redirect_url),
             Some(g_oauth::CODE_ASSIST_CLIENT_SECRET),
             PersistedAuthMode::GoogleOauth,
-            TokenKey::new("dev", provider.binding_id()),
         ),
     };
 
@@ -3758,8 +3765,8 @@ async fn interactive_login(
     eprintln!(
         "  {} {}:{}",
         auth_bold("Profile:"),
-        key.realm_id,
-        key.binding_id,
+        key.realm.as_str(),
+        key.binding.as_str(),
     );
     eprintln!("  {} {}", auth_bold("Storage:"), storage_location);
     if let Some(expiry) = expires_at {
@@ -3822,9 +3829,20 @@ async fn interactive_logout(profile_id: &str, _scope: &RuntimeScope) -> anyhow::
         .map_err(|e| anyhow::anyhow!("Cannot open TokenStore: {e}"))?
         .open()
         .map_err(|e| anyhow::anyhow!("Cannot open TokenStore: {e}"))?;
+    // Wave-c C-12: TokenKey now takes typed atoms; parse the raw
+    // `profile_id` form at this logout boundary. This is the
+    // non-ConnectionRef carve-out `split_once(':')` site explicitly
+    // documented in `cli_parse.rs` — TokenKey shares the same flat
+    // `realm:binding` grammar but has no profile component.
     let keys = match profile_id.split_once(':') {
-        Some((realm, binding)) => vec![TokenKey::new(realm, binding)],
-        None => vec![TokenKey::new("dev", profile_id)],
+        Some((realm, binding)) => vec![
+            TokenKey::parse(realm, binding)
+                .map_err(|e| anyhow::anyhow!("invalid token-key `{profile_id}`: {e}"))?,
+        ],
+        None => vec![
+            TokenKey::parse("dev", profile_id)
+                .map_err(|e| anyhow::anyhow!("invalid token-key `dev:{profile_id}`: {e}"))?,
+        ],
     };
     let mut cleared = 0;
     for key in keys {
@@ -3840,16 +3858,16 @@ async fn interactive_logout(profile_id: &str, _scope: &RuntimeScope) -> anyhow::
             eprintln!(
                 "{} Cleared {}:{}",
                 auth_green("✓"),
-                key.realm_id,
-                key.binding_id,
+                key.realm.as_str(),
+                key.binding.as_str(),
             );
             cleared += 1;
         } else {
             eprintln!(
                 "{} No stored credentials for {}:{}",
                 auth_dim("·"),
-                key.realm_id,
-                key.binding_id,
+                key.realm.as_str(),
+                key.binding.as_str(),
             );
         }
     }
@@ -3875,7 +3893,7 @@ async fn handle_doctor(scope: &RuntimeScope) -> anyhow::Result<()> {
     let mut ok = true;
     let (config, _) = load_config(scope).await?;
     let config_path =
-        meerkat_store::realm_paths_in(&scope.locator.state_root, &scope.locator.realm_id)
+        meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
             .config_path;
     if config_path.exists() {
         println!("ok\tconfig\t{}", config_path.display());
@@ -4019,7 +4037,7 @@ async fn handle_realm_command(command: RealmCommands, scope: &RuntimeScope) -> a
 
     match command {
         RealmCommands::Current => {
-            println!("{}", scope.locator.realm_id);
+            println!("{}", scope.locator.realm.as_str());
             Ok(())
         }
         RealmCommands::List => {
@@ -4038,7 +4056,7 @@ async fn handle_realm_command(command: RealmCommands, scope: &RuntimeScope) -> a
             for entry in manifests {
                 let leases = meerkat_store::inspect_realm_leases_in(
                     &scope.locator.state_root,
-                    &entry.manifest.realm_id,
+                    entry.manifest.realm.as_str(),
                     true,
                 )
                 .await
@@ -4046,7 +4064,7 @@ async fn handle_realm_command(command: RealmCommands, scope: &RuntimeScope) -> a
                 let origin = entry.manifest.origin.as_str();
                 println!(
                     "{:<28} {:<8} {:<14} {:<8} {:<12}",
-                    entry.manifest.realm_id,
+                    entry.manifest.realm,
                     entry.manifest.backend.as_str(),
                     origin,
                     leases.active.len(),
@@ -4055,7 +4073,7 @@ async fn handle_realm_command(command: RealmCommands, scope: &RuntimeScope) -> a
                 if entry.manifest.origin == meerkat_store::RealmOrigin::LegacyUnknown {
                     println!(
                         "  note: realm '{}' is legacy/unknown origin and is skipped by --isolated-only prune.",
-                        entry.manifest.realm_id
+                        entry.manifest.realm
                     );
                 }
             }
@@ -4079,7 +4097,7 @@ async fn handle_realm_command(command: RealmCommands, scope: &RuntimeScope) -> a
                 meerkat_store::inspect_realm_leases_in(&scope.locator.state_root, &realm_id, true)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to inspect leases: {e}"))?;
-            println!("realm_id: {}", manifest.realm_id);
+            println!("realm_id: {}", manifest.realm);
             println!("backend: {}", manifest.backend.as_str());
             println!("origin: {}", manifest.origin.as_str());
             println!("created_at: {}", manifest.created_at);
@@ -4105,7 +4123,7 @@ async fn handle_realm_command(command: RealmCommands, scope: &RuntimeScope) -> a
             .map_err(|e| anyhow::anyhow!("Failed to create realm: {e}"))?;
             println!(
                 "Created realm '{}' backend={} origin={}",
-                manifest.realm_id,
+                manifest.realm,
                 manifest.backend.as_str(),
                 manifest.origin.as_str()
             );
@@ -4258,7 +4276,7 @@ async fn prune_realms_inner(
         }
 
         let lease_status =
-            meerkat_store::inspect_realm_leases_in(state_root, &manifest.realm_id, true)
+            meerkat_store::inspect_realm_leases_in(state_root, manifest.realm.as_str(), true)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to inspect realm leases: {e}"))?;
         if !lease_status.active.is_empty() && !force {
@@ -4266,11 +4284,11 @@ async fn prune_realms_inner(
             continue;
         }
 
-        let paths = meerkat_store::realm_paths_in(state_root, &manifest.realm_id);
+        let paths = meerkat_store::realm_paths_in(state_root, manifest.realm.as_str());
         if let Err(err) = remove_realm_root_with_retries(&paths, force).await {
             outcome
                 .leftovers
-                .push(format!("{} ({})", manifest.realm_id, err));
+                .push(format!("{} ({})", manifest.realm, err));
             continue;
         }
         outcome.removed += 1;
@@ -4285,7 +4303,7 @@ async fn create_persistence_bundle(
 ) -> anyhow::Result<(meerkat_store::RealmManifest, PersistenceBundle)> {
     meerkat::open_realm_persistence_in(
         &scope.locator.state_root,
-        &scope.locator.realm_id,
+        scope.locator.realm.as_str(),
         scope.backend_hint(),
         Some(scope.origin_hint),
     )
@@ -4301,7 +4319,8 @@ async fn create_persistence_bundle(
 }
 
 fn realm_store_path(manifest: &meerkat_store::RealmManifest, scope: &RuntimeScope) -> PathBuf {
-    let paths = meerkat_store::realm_paths_in(&scope.locator.state_root, &scope.locator.realm_id);
+    let paths =
+        meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str());
     match manifest.backend {
         #[cfg(feature = "jsonl-store")]
         RealmBackend::Jsonl => paths.sessions_jsonl_dir,
@@ -4929,7 +4948,7 @@ fn session_err_to_anyhow(e: meerkat_core::service::SessionError) -> anyhow::Erro
 }
 
 fn resolve_scoped_session_id(input: &str, scope: &RuntimeScope) -> anyhow::Result<SessionId> {
-    SessionLocator::resolve_for_realm(input, &scope.locator.realm_id).map_err(|err| match err {
+    SessionLocator::resolve_for_realm(input, scope.locator.realm.as_str()).map_err(|err| match err {
         SessionLocatorError::RealmMismatch { provided, active } => anyhow::anyhow!(
             "Session belongs to realm '{provided}', but active realm is '{active}'. Use --realm {provided} or switch to the matching realm before running session commands."
         ),
@@ -5196,8 +5215,11 @@ async fn run_agent(
         let mut factory = AgentFactory::new(realm_store_path(&manifest, scope))
             .session_store(session_store)
             .runtime_root(
-                meerkat_store::realm_paths_in(&scope.locator.state_root, &scope.locator.realm_id)
-                    .root,
+                meerkat_store::realm_paths_in(
+                    &scope.locator.state_root,
+                    scope.locator.realm.as_str(),
+                )
+                .root,
             )
             .project_root(project_root)
             .builtins(enable_builtins)
@@ -5312,7 +5334,7 @@ async fn run_agent(
             schedule_tools: None,
             mob_tool_authority_context: None,
             preload_skills,
-            realm_id: Some(scope.locator.realm_id.clone()),
+            realm_id: Some(scope.locator.realm.as_str().to_owned()),
             instance_id: scope.instance_id.clone(),
             backend: Some(manifest.backend.as_str().to_string()),
             config_generation: None,
@@ -5450,7 +5472,7 @@ async fn run_agent(
                 Some(handle) => completion_outcome_to_cli_runtime_turn_result(
                     handle.wait().await,
                     &session_id,
-                    &scope.locator.realm_id,
+                    scope.locator.realm.as_str(),
                     true,
                 ),
                 None => {
@@ -5513,7 +5535,7 @@ async fn run_agent(
                     let json = serde_json::json!({
                         "text": result.text,
                         "session_id": result.session_id.to_string(),
-                        "session_ref": format_session_ref(&scope.locator.realm_id, &result.session_id),
+                        "session_ref": format_session_ref(scope.locator.realm.as_str(), &result.session_id),
                         "turns": result.turns,
                         "tool_calls": result.tool_calls,
                         "usage": {
@@ -5759,8 +5781,11 @@ async fn resume_session_with_llm_override(
         let mut factory = AgentFactory::new(store_path)
             .session_store(store.clone())
             .runtime_root(
-                meerkat_store::realm_paths_in(&scope.locator.state_root, &scope.locator.realm_id)
-                    .root,
+                meerkat_store::realm_paths_in(
+                    &scope.locator.state_root,
+                    scope.locator.realm.as_str(),
+                )
+                .root,
             )
             .project_root(project_root)
             .builtins(tooling.builtins.resolve(config.tools.builtins_enabled))
@@ -5884,7 +5909,7 @@ async fn resume_session_with_llm_override(
             realm_id: stored_metadata
                 .as_ref()
                 .and_then(|m| m.realm_id.clone())
-                .or_else(|| Some(scope.locator.realm_id.clone())),
+                .or_else(|| Some(scope.locator.realm.as_str().to_owned())),
             instance_id: stored_metadata
                 .as_ref()
                 .and_then(|m| m.instance_id.clone())
@@ -5994,7 +6019,7 @@ async fn resume_session_with_llm_override(
                 Some(handle) => completion_outcome_to_cli_runtime_turn_result(
                     handle.wait().await,
                     &session_id,
-                    &scope.locator.realm_id,
+                    scope.locator.realm.as_str(),
                     false,
                 ),
                 None => {
@@ -6044,7 +6069,7 @@ async fn resume_session_with_llm_override(
                 eprintln!(
                     "\n[Session: {} | Ref: {} | Turns: {} | Tokens: {} in / {} out]",
                     result.session_id,
-                    format_session_ref(&scope.locator.realm_id, &result.session_id),
+                    format_session_ref(scope.locator.realm.as_str(), &result.session_id),
                     result.turns,
                     result.usage.input_tokens,
                     result.usage.output_tokens
@@ -6114,7 +6139,8 @@ fn get_or_create_cli_persistent_surface_from_bundle(
     let mut factory = AgentFactory::new(store_path)
         .session_store(store.clone())
         .runtime_root(
-            meerkat_store::realm_paths_in(&scope.locator.state_root, &scope.locator.realm_id).root,
+            meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
+                .root,
         )
         .project_root(project_root)
         .builtins(config.tools.builtins_enabled)
@@ -6153,7 +6179,7 @@ fn get_or_create_cli_persistent_surface_from_bundle(
         Some(spawn_schedule_host(
             schedule_service,
             shared_adapter,
-            format!("rkat:{}", scope.locator.realm_id),
+            format!("rkat:{}", scope.locator.realm.as_str()),
         ))
     } else {
         None
@@ -6573,7 +6599,7 @@ fn mob_persistent_service_key(scope: &RuntimeScope) -> String {
     format!(
         "{}::{}",
         scope.locator.state_root.display(),
-        scope.locator.realm_id
+        scope.locator.realm.as_str()
     )
 }
 
@@ -6874,7 +6900,7 @@ async fn list_sessions(
                 println!(
                     "{:<40} {:<72} {:<12} {:<20} {:<20} {}",
                     meta.session_id,
-                    format_session_ref(&scope.locator.realm_id, &meta.session_id),
+                    format_session_ref(scope.locator.realm.as_str(), &meta.session_id),
                     meta.message_count,
                     created,
                     updated,
@@ -6884,7 +6910,7 @@ async fn list_sessions(
                 println!(
                     "{:<40} {:<72} {:<12} {:<20} {:<20}",
                     meta.session_id,
-                    format_session_ref(&scope.locator.realm_id, &meta.session_id),
+                    format_session_ref(scope.locator.realm.as_str(), &meta.session_id),
                     meta.message_count,
                     created,
                     updated
@@ -6920,7 +6946,7 @@ async fn show_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
         println!("Session: {session_id}");
         println!(
             "Session Ref: {}",
-            format_session_ref(&scope.locator.realm_id, &session_id)
+            format_session_ref(scope.locator.realm.as_str(), &session_id)
         );
         println!("Messages: {}", session.messages().len());
         println!("Version: {}", session.version());
@@ -7067,7 +7093,7 @@ async fn delete_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
         println!("Deleted session: {session_id}");
         println!(
             "Session Ref: {}",
-            format_session_ref(&scope.locator.realm_id, &session_id)
+            format_session_ref(scope.locator.realm.as_str(), &session_id)
         );
         Ok(())
     }
@@ -7092,7 +7118,7 @@ async fn interrupt_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()>
                 println!("Interrupted session: {session_id}");
                 println!(
                     "Session Ref: {}",
-                    format_session_ref(&scope.locator.realm_id, &session_id)
+                    format_session_ref(scope.locator.realm.as_str(), &session_id)
                 );
                 Ok(())
             }
@@ -7144,14 +7170,14 @@ async fn find_session_matches(
             .map_err(|e| anyhow::anyhow!("Failed to list realms in '{}': {e}", root.display()))?;
         for entry in manifests {
             if let Some(target_realm) = locator.realm_id.as_deref()
-                && entry.manifest.realm_id != target_realm
+                && entry.manifest.realm != target_realm
             {
                 continue;
             }
 
             let store = meerkat_store::open_realm_session_store_in(
                 root,
-                &entry.manifest.realm_id,
+                entry.manifest.realm.as_str(),
                 Some(entry.manifest.backend),
                 None,
             )
@@ -7159,7 +7185,7 @@ async fn find_session_matches(
             .map_err(|e| {
                 anyhow::anyhow!(
                     "Failed to open realm '{}' in '{}': {e}",
-                    entry.manifest.realm_id,
+                    entry.manifest.realm,
                     root.display()
                 )
             })?
@@ -7171,7 +7197,7 @@ async fn find_session_matches(
                 .map_err(|e| {
                     anyhow::anyhow!(
                         "Failed to list sessions in realm '{}' ({}): {e}",
-                        entry.manifest.realm_id,
+                        entry.manifest.realm,
                         root.display()
                     )
                 })?
@@ -7180,7 +7206,7 @@ async fn find_session_matches(
             if found {
                 matches.push(SessionLocateMatch {
                     state_root: root.clone(),
-                    realm_id: entry.manifest.realm_id,
+                    realm_id: entry.manifest.realm,
                     session_id: locator.session_id.clone(),
                 });
             }
@@ -7520,13 +7546,15 @@ struct PersistedMob {
 
 #[cfg(feature = "mob")]
 fn mob_registry_path(scope: &RuntimeScope) -> PathBuf {
-    let paths = meerkat_store::realm_paths_in(&scope.locator.state_root, &scope.locator.realm_id);
+    let paths =
+        meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str());
     paths.root.join("mob_registry.json")
 }
 
 #[cfg(feature = "mob")]
 fn mob_registry_lock_path(scope: &RuntimeScope) -> PathBuf {
-    let paths = meerkat_store::realm_paths_in(&scope.locator.state_root, &scope.locator.realm_id);
+    let paths =
+        meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str());
     paths.root.join("mob_registry.lock")
 }
 
@@ -8956,7 +8984,7 @@ fn parse_trust_policy(raw: &str) -> Option<TrustPolicy> {
 #[cfg(feature = "mob")]
 fn read_config_trust_policy(scope: &RuntimeScope) -> anyhow::Result<Option<TrustPolicy>> {
     let config_path =
-        meerkat_store::realm_paths_in(&scope.locator.state_root, &scope.locator.realm_id)
+        meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
             .config_path;
     if !config_path.exists() {
         return Ok(None);
@@ -8990,7 +9018,7 @@ fn load_deploy_config_with_pack_defaults(
     }
 
     let config_path =
-        meerkat_store::realm_paths_in(&scope.locator.state_root, &scope.locator.realm_id)
+        meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
             .config_path;
     if config_path.exists() {
         let file_bytes = std::fs::read(&config_path).map_err(|err| {
@@ -9089,13 +9117,14 @@ where
 {
     let (manifest, persistence) = create_persistence_bundle(scope).await?;
     let session_store = persistence.session_store();
-    let paths = meerkat_store::realm_paths_in(&scope.locator.state_root, &scope.locator.realm_id);
+    let paths =
+        meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str());
     let base_store: Arc<dyn ConfigStore> =
         Arc::new(FileConfigStore::new(paths.config_path.clone()));
     let tagged = meerkat_core::TaggedConfigStore::new(
         base_store,
         meerkat_core::ConfigStoreMetadata {
-            realm_id: Some(scope.locator.realm_id.clone()),
+            realm_id: Some(scope.locator.realm.as_str().to_owned()),
             instance_id: scope.instance_id.clone(),
             backend: Some(manifest.backend.as_str().to_string()),
             resolved_paths: Some(meerkat_core::ConfigResolvedPaths {
@@ -9168,7 +9197,7 @@ where
     // The mob_id is known from the definition before the handle is created.
     let deployed_mob_id = archive.definition.id.to_string();
     runtime.set_realm_context(
-        Some(scope.locator.realm_id.clone()),
+        Some(scope.locator.realm.as_str().to_owned()),
         scope
             .instance_id
             .clone()
@@ -11419,7 +11448,7 @@ mod tests {
         let mut scope = test_scope_with_context(temp.path().to_path_buf());
         scope.user_config_root = Some(temp.path().to_path_buf());
         let config_path =
-            meerkat_store::realm_paths_in(&scope.locator.state_root, &scope.locator.realm_id)
+            meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
                 .config_path;
         std::fs::create_dir_all(config_path.parent().expect("config parent"))
             .expect("mkdir config");
@@ -11458,7 +11487,7 @@ mob_enabled = true
         let mut scope = test_scope_with_context(temp.path().to_path_buf());
         scope.user_config_root = Some(temp.path().to_path_buf());
         let config_path =
-            meerkat_store::realm_paths_in(&scope.locator.state_root, &scope.locator.realm_id)
+            meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
                 .config_path;
         std::fs::create_dir_all(config_path.parent().expect("config parent"))
             .expect("mkdir config");
@@ -12217,7 +12246,7 @@ capabilities = ["definitely_missing_capability"]
         let mut scope = test_scope_with_context(temp.path().to_path_buf());
         scope.user_config_root = Some(temp.path().to_path_buf());
         let config_path =
-            meerkat_store::realm_paths_in(&scope.locator.state_root, &scope.locator.realm_id)
+            meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
                 .config_path;
         std::fs::create_dir_all(config_path.parent().expect("config parent"))
             .expect("mkdir config");
