@@ -1,6 +1,6 @@
 use crate::identity::{
     ActorId, CompositionId, EffectVariantId, FieldId, InputVariantId, MachineId,
-    MachineInstanceId, PhaseId, ProtocolId, RouteId, TransitionId,
+    MachineInstanceId, PhaseId, ProtocolId, RouteId, SignalVariantId, TransitionId,
 };
 use crate::{Expr, MachineSchema, TypeRef, machine::MachineSchemaError};
 use indexmap::IndexSet;
@@ -279,14 +279,10 @@ pub struct DriverDispatchRoute {
     /// Target machine instance id within the composition.
     pub target_instance: MachineInstanceId,
     /// Whether the dispatch lands on an input or a signal.
+    /// Structural kind tag; mirrors the arm of `input_variant`.
     pub target_kind: RouteTargetKind,
-    /// Variant name on the target's input/signal enum.
-    ///
-    /// Semantically an `InputVariantId` when `target_kind == Input` and a
-    /// `SignalVariantId` when `target_kind == Signal`. Kept as `String` until
-    /// the `RouteVariantId` sum is introduced in B-4 (same polymorphism issue
-    /// as `TriggerMatch.variant`).
-    pub input_variant: String,
+    /// Typed slug for the dispatched variant, sum-tagged by input/signal.
+    pub input_variant: RouteVariantId,
 }
 
 /// Declares how a routed effect selects its concrete target machine instance.
@@ -826,7 +822,7 @@ impl CompositionSchema {
                             from_machine: from_machine.as_str().to_owned(),
                             effect_variant: effect_variant.as_str().to_owned(),
                             to_machine: to_machine.as_str().to_owned(),
-                            input_variant: input_variant.clone(),
+                            input_variant: input_variant.as_str().to_owned(),
                         });
                     }
                 }
@@ -848,7 +844,7 @@ impl CompositionSchema {
                             from_machine: from_machine.as_str().to_owned(),
                             effect_variant: effect_variant.as_str().to_owned(),
                             to_machine: to_machine.as_str().to_owned(),
-                            input_variant: input_variant.clone(),
+                            input_variant: input_variant.as_str().to_owned(),
                         });
                     }
                 }
@@ -873,7 +869,7 @@ impl CompositionSchema {
                             from_machine: from_machine.as_str().to_owned(),
                             effect_variant: effect_variant.as_str().to_owned(),
                             to_machine: to_machine.as_str().to_owned(),
-                            input_variant: input_variant.clone(),
+                            input_variant: input_variant.as_str().to_owned(),
                         });
                     }
                 }
@@ -920,7 +916,7 @@ impl CompositionSchema {
                                 from_machine: from_machine.as_str().to_owned(),
                                 effect_variant: effect_variant.as_str().to_owned(),
                                 to_machine: target.machine.as_str().to_owned(),
-                                input_variant: target.input_variant.clone(),
+                                input_variant: target.input_variant.as_str().to_owned(),
                             });
                         }
                     }
@@ -1017,7 +1013,7 @@ impl CompositionSchema {
                     if !to_inputs.contains(route.to.input_variant.as_str()) {
                         return Err(CompositionSchemaError::UnknownRouteInput {
                             machine: route.to.machine.as_str().to_owned(),
-                            input: route.to.input_variant.clone(),
+                            input: route.to.input_variant.as_str().to_owned(),
                         });
                     }
                     to_schema
@@ -1033,7 +1029,7 @@ impl CompositionSchema {
                     if !to_signals.contains(route.to.input_variant.as_str()) {
                         return Err(CompositionSchemaError::UnknownRouteSignal {
                             machine: route.to.machine.as_str().to_owned(),
-                            signal: route.to.input_variant.clone(),
+                            signal: route.to.input_variant.as_str().to_owned(),
                         });
                     }
                     to_schema
@@ -1196,7 +1192,7 @@ impl CompositionSchema {
                             driver: driver.name.clone(),
                             instance: dispatch.target_instance.as_str().to_owned(),
                             target_kind: dispatch.target_kind,
-                            variant: dispatch.input_variant.clone(),
+                            variant: dispatch.input_variant.as_str().to_owned(),
                         },
                     );
                 }
@@ -1637,19 +1633,65 @@ pub struct Route {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteTarget {
     pub machine: MachineInstanceId,
+    /// Structural kind tag; kept alongside `input_variant` for callers
+    /// that dispatch on kind without unwrapping the typed slug. The
+    /// invariant `self.kind == self.input_variant.kind()` is enforced by
+    /// the `RouteTarget::new` constructor and asserted in validate().
     pub kind: RouteTargetKind,
-    /// Input or signal variant name depending on `kind`.
-    ///
-    /// Semantically an `InputVariantId` when `kind == Input` and a
-    /// `SignalVariantId` when `kind == Signal`. Kept as `String` pending the
-    /// `RouteVariantId` sum scheduled for B-4.
-    pub input_variant: String,
+    /// Typed slug for the target variant, sum-tagged by input/signal.
+    pub input_variant: RouteVariantId,
+}
+
+impl RouteTarget {
+    /// Construct a `RouteTarget` whose `kind` tag is in sync with the
+    /// wrapped [`RouteVariantId`] arm.
+    pub fn new(machine: MachineInstanceId, input_variant: RouteVariantId) -> Self {
+        let kind = input_variant.kind();
+        Self {
+            machine,
+            kind,
+            input_variant,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteTargetKind {
     Input,
     Signal,
+}
+
+/// Typed sum for the polymorphic `input_variant` slug on [`RouteTarget`],
+/// [`DriverDispatchRoute`], and the `input_variant` fields of every
+/// [`CompositionInvariantKind`] variant that references one.
+///
+/// The slug is semantically an [`InputVariantId`] when the target is an
+/// input and a [`SignalVariantId`] when the target is a signal. Carrying
+/// the typed discriminator alongside the slug eliminates the last
+/// stringly-typed identity on the composition surface (parallel to the
+/// [`crate::machine::TriggerMatch`] sum on the machine surface).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteVariantId {
+    Input(InputVariantId),
+    Signal(SignalVariantId),
+}
+
+impl RouteVariantId {
+    /// Borrow the slug regardless of the input/signal arm.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Input(id) => id.as_str(),
+            Self::Signal(id) => id.as_str(),
+        }
+    }
+
+    /// Report the structural kind of the wrapped identity.
+    pub fn kind(&self) -> RouteTargetKind {
+        match self {
+            Self::Input(_) => RouteTargetKind::Input,
+            Self::Signal(_) => RouteTargetKind::Signal,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1706,19 +1748,18 @@ pub enum CompositionInvariantKind {
         from_machine: MachineInstanceId,
         effect_variant: EffectVariantId,
         to_machine: MachineInstanceId,
-        /// Polymorphic input/signal variant name — see RouteTarget doc.
-        input_variant: String,
+        input_variant: RouteVariantId,
     },
     ObservedInputOriginatesFromEffect {
         to_machine: MachineInstanceId,
-        input_variant: String,
+        input_variant: RouteVariantId,
         from_machine: MachineInstanceId,
         effect_variant: EffectVariantId,
     },
     ObservedRouteInputOriginatesFromEffect {
         route_name: RouteId,
         to_machine: MachineInstanceId,
-        input_variant: String,
+        input_variant: RouteVariantId,
         from_machine: MachineInstanceId,
         effect_variant: EffectVariantId,
     },

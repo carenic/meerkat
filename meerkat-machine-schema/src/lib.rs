@@ -29,7 +29,7 @@ pub use composition::{
     EffectHandoffProtocol, EntryInput, FeedbackFieldBinding, FeedbackFieldSource, FeedbackInputRef,
     MachineInstance, ProtocolGenerationMode, ProtocolHelperReturnShape, ProtocolRustBinding, Route,
     RouteBindingSource, RouteDelivery, RouteFieldBinding, RouteTarget, RouteTargetKind,
-    RouteTargetSelector, SchedulerRule, WatchedEffect,
+    RouteTargetSelector, RouteVariantId, SchedulerRule, WatchedEffect,
 };
 pub use machine::{
     EffectDisposition, EffectDispositionRule, EffectEmit, EnumSchema, Expr, FieldInit, FieldSchema,
