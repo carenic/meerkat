@@ -1,6 +1,5 @@
 use crate::ids::{AgentIdentity, Generation, MeerkatId, ProfileName};
 use crate::roster::{MobMemberKickoffSnapshot, Roster, RosterAddEntry, RosterEntry};
-use meerkat_core::types::SessionId;
 
 mod sealed {
     pub trait Sealed {}
@@ -68,51 +67,13 @@ impl RosterAuthority {
         self.roster.list_all()
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn list_retiring(&self) -> impl Iterator<Item = &RosterEntry> {
-        self.roster.list_retiring()
-    }
-
     pub(crate) fn by_profile(&self, profile: &ProfileName) -> impl Iterator<Item = &RosterEntry> {
         self.roster.by_profile(profile)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn find_by_label(&self, key: &str, value: &str) -> Option<&RosterEntry> {
-        self.roster.find_by_label(key, value)
-    }
-
     /// Get a specific roster entry.
-    #[allow(dead_code)]
     pub(crate) fn entry(&self, agent_identity: &MeerkatId) -> Option<RosterEntry> {
         self.roster.get(agent_identity).cloned()
-    }
-
-    /// List all members currently `Active`.
-    #[allow(dead_code)]
-    pub(crate) fn active_members(&self) -> Vec<RosterEntry> {
-        self.roster.list().cloned().collect()
-    }
-
-    /// List the members that have been marked `Retiring`.
-    #[allow(dead_code)]
-    pub(crate) fn retiring_members(&self) -> Vec<RosterEntry> {
-        self.roster.list_retiring().cloned().collect()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn debug_assert_wiring_projection_consistent(&self) {
-        self.roster.debug_assert_wiring_projection_consistent();
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn set_bridge_session_id(
-        &mut self,
-        agent_identity: &MeerkatId,
-        bridge_session_id: SessionId,
-    ) -> bool {
-        self.roster
-            .set_bridge_session_id(agent_identity, bridge_session_id)
     }
 
     pub(crate) fn replace_backend_peer_binding_by_peer_id(

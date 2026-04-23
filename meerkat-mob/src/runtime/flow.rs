@@ -2144,7 +2144,6 @@ enum DependencyDecision {
 }
 
 /// Outcome of canonical step execution via `execute_step_with_all_guards`.
-#[allow(dead_code)]
 pub(crate) enum StepGuardOutcome {
     Completed(Value),
     Skipped {

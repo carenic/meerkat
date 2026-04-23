@@ -506,7 +506,6 @@ pub struct MobHandle {
         Arc<tokio::sync::Mutex<BTreeMap<RunId, mpsc::Sender<meerkat_core::ScopedAgentEvent>>>>,
     pub(super) session_service: Arc<dyn MobSessionService>,
     #[cfg(feature = "runtime-adapter")]
-    #[allow(dead_code)]
     pub(super) runtime_adapter: Option<Arc<meerkat_runtime::MeerkatMachine>>,
     pub(super) restore_diagnostics: Arc<RwLock<HashMap<MeerkatId, RestoreFailureDiagnostic>>>,
     /// Read-only receiver for the actor's terminal-phase projection. The

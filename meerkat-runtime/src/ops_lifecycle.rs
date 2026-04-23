@@ -967,7 +967,6 @@ pub struct RuntimeOpsLifecycleRegistry {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct RuntimeOpsDiagnosticSnapshot {
     pub operation_count: usize,
     pub active_count: usize,
@@ -1153,10 +1152,6 @@ impl RuntimeOpsLifecycleRegistry {
     }
 
     /// Capture a stable diagnostic snapshot of the canonical ops lifecycle state.
-    ///
-    /// This is an internal refactor aid for the MeerkatMachine build-out. It is
-    /// intentionally additive and does not change lifecycle semantics.
-    #[allow(dead_code)]
     pub(crate) fn diagnostic_snapshot(&self) -> RuntimeOpsDiagnosticSnapshot {
         let state = self
             .state
