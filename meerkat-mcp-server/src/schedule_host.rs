@@ -43,8 +43,7 @@ use meerkat_runtime::{
 use tokio::time::sleep;
 
 use crate::{
-    MeerkatMcpState, canonical_skill_keys, compose_external_tool_dispatchers, preload_skill_ids,
-    runtime_ingress,
+    MeerkatMcpState, canonical_skill_keys, compose_external_tool_dispatchers, runtime_ingress,
 };
 
 #[derive(Clone)]
@@ -52,7 +51,7 @@ struct McpScheduleContext {
     service: Arc<meerkat::PersistentSessionService<meerkat::FactoryAgentBuilder>>,
     runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
     config_runtime: Arc<meerkat_core::ConfigRuntime>,
-    realm_id: String,
+    realm_id: meerkat_core::connection::RealmId,
     instance_id: Option<String>,
     backend: String,
     mcp_adapters: runtime_ingress::SharedMcpAdapters,
@@ -210,11 +209,16 @@ impl McpScheduleContext {
             override_mob: meerkat_core::ToolCategoryOverride::Inherit,
             schedule_tools: None,
             mob_tool_authority_context: None,
-            preload_skills: preload_skill_ids(Some(create.preload_skills.clone())),
+            // Schedule wire type `preload_skills: Vec<String>` carries
+            // only the slug half — no lossless projection to the typed
+            // `SkillKey` (source_uuid + skill_name) required by the
+            // session build. Callers use `skill_refs` / `skill_references`
+            // for typed per-turn skill injection.
+            preload_skills: None,
             realm_id: create
                 .realm_id
                 .clone()
-                .or_else(|| Some(self.realm_id.clone())),
+                .or_else(|| Some(self.realm_id.to_string())),
             instance_id: create
                 .instance_id
                 .clone()

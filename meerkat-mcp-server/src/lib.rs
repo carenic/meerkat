@@ -287,7 +287,7 @@ fn map_config_runtime_error(err: ConfigRuntimeError) -> ToolCallError {
 }
 
 async fn load_config_async(
-    realm_id: &str,
+    realm_id: &meerkat_core::connection::RealmId,
     realms_root: &std::path::Path,
     backend_hint: Option<meerkat_store::RealmBackend>,
     origin_hint: Option<meerkat_store::RealmOrigin>,
@@ -333,11 +333,11 @@ fn validate_public_peer_meta(peer_meta: Option<&meerkat_core::PeerMeta>) -> Resu
 
 fn tagged_realm_config_store(
     realms_root: &std::path::Path,
-    realm_id: &str,
+    realm_id: &meerkat_core::connection::RealmId,
     backend: meerkat_store::RealmBackend,
     instance_id: Option<&str>,
 ) -> Arc<dyn ConfigStore> {
-    let paths = meerkat_store::realm_paths_in(realms_root, realm_id);
+    let paths = meerkat_store::realm_paths_in(realms_root, realm_id.as_str());
     let base: Arc<dyn ConfigStore> = Arc::new(FileConfigStore::new(paths.config_path.clone()));
     let tagged = meerkat_core::TaggedConfigStore::new(
         base,
@@ -358,16 +358,20 @@ fn tagged_realm_config_store(
 }
 
 async fn realm_config_store(
-    realm_id: &str,
+    realm_id: &meerkat_core::connection::RealmId,
     realms_root: &std::path::Path,
     backend_hint: Option<meerkat_store::RealmBackend>,
     origin_hint: Option<meerkat_store::RealmOrigin>,
     instance_id: Option<&str>,
 ) -> Result<Arc<dyn ConfigStore>, String> {
-    let manifest =
-        meerkat_store::ensure_realm_manifest_in(realms_root, realm_id, backend_hint, origin_hint)
-            .await
-            .map_err(|e| e.to_string())?;
+    let manifest = meerkat_store::ensure_realm_manifest_in(
+        realms_root,
+        realm_id.as_str(),
+        backend_hint,
+        origin_hint,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(tagged_realm_config_store(
         realms_root,
         realm_id,
@@ -378,10 +382,10 @@ async fn realm_config_store(
 
 fn realm_store_path(
     realms_root: &std::path::Path,
-    realm_id: &str,
+    realm_id: &meerkat_core::connection::RealmId,
     backend: meerkat_store::RealmBackend,
 ) -> PathBuf {
-    let paths = meerkat_store::realm_paths_in(realms_root, realm_id);
+    let paths = meerkat_store::realm_paths_in(realms_root, realm_id.as_str());
     match backend {
         meerkat_store::RealmBackend::Jsonl => paths.sessions_jsonl_dir,
         meerkat_store::RealmBackend::Sqlite => paths.root,
@@ -396,7 +400,7 @@ fn realm_store_path(
 pub struct MeerkatMcpState {
     service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
     schedule_service: ScheduleService,
-    realm_id: String,
+    realm_id: meerkat_core::connection::RealmId,
     backend: String,
     instance_id: Option<String>,
     expose_paths: bool,
@@ -488,7 +492,11 @@ impl MeerkatMcpState {
         default_llm_client: Option<Arc<dyn meerkat::LlmClient>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let locator = bootstrap.realm.resolve_locator()?;
-        let realm_id = locator.realm_id;
+        // Parse the locator's stringly realm_id into the typed `RealmId`
+        // at the mcp-server boundary. Downstream state carries the typed
+        // form; `&str` is only produced at `meerkat_store::*_in`
+        // call sites via `RealmId::as_str`.
+        let realm_id = meerkat_core::connection::RealmId::parse(locator.realm_id)?;
         let realms_root = locator.state_root;
         let backend_hint = bootstrap
             .realm
@@ -504,9 +512,13 @@ impl MeerkatMcpState {
             bootstrap.realm.instance_id.as_deref(),
         )
         .await;
-        let (manifest, persistence) =
-            meerkat::open_realm_persistence_in(&realms_root, &realm_id, backend_hint, origin_hint)
-                .await?;
+        let (manifest, persistence) = meerkat::open_realm_persistence_in(
+            &realms_root,
+            realm_id.as_str(),
+            backend_hint,
+            origin_hint,
+        )
+        .await?;
         let store_path = persistence
             .store_path()
             .map(std::path::Path::to_path_buf)
@@ -515,7 +527,7 @@ impl MeerkatMcpState {
         let session_store = persistence.session_store();
         let blob_store = persistence.blob_store();
         let schedule_service = ScheduleService::new(persistence.schedule_store());
-        let realm_paths = meerkat_store::realm_paths_in(&realms_root, &realm_id);
+        let realm_paths = meerkat_store::realm_paths_in(&realms_root, realm_id.as_str());
         let conventions_context_root = bootstrap.context.context_root.clone();
         let project_root = conventions_context_root
             .clone()
@@ -532,7 +544,7 @@ impl MeerkatMcpState {
         ));
         let _lease = meerkat_store::start_realm_lease_in(
             &realms_root,
-            &realm_id,
+            realm_id.as_str(),
             bootstrap.realm.instance_id.as_deref(),
             "rkat-mcp",
         )
@@ -628,7 +640,8 @@ impl MeerkatMcpState {
                 realm_id: meerkat_core::generate_realm_id(),
             },
         };
-        let realm_id = locator.realm_id;
+        let realm_id = meerkat_core::connection::RealmId::parse(locator.realm_id)
+            .expect("generate_realm_id emits a valid slug by construction");
         let realms_root = locator.state_root;
         let config = load_config_async(
             &realm_id,
@@ -640,7 +653,7 @@ impl MeerkatMcpState {
         .await;
         let store_path =
             realm_store_path(&realms_root, &realm_id, meerkat_store::RealmBackend::Sqlite);
-        let realm_paths = meerkat_store::realm_paths_in(&realms_root, &realm_id);
+        let realm_paths = meerkat_store::realm_paths_in(&realms_root, realm_id.as_str());
         let project_root = realm_paths.root.clone();
         let config_store = tagged_realm_config_store(
             &realms_root,
@@ -710,7 +723,7 @@ impl MeerkatMcpState {
         state
     }
 
-    pub fn realm_id(&self) -> &str {
+    pub fn realm_id(&self) -> &meerkat_core::connection::RealmId {
         &self.realm_id
     }
 
@@ -2587,7 +2600,7 @@ async fn handle_meerkat_run(
         schedule_tools: None,
         mob_tool_authority_context: None,
         preload_skills,
-        realm_id: Some(state.realm_id.clone()),
+        realm_id: Some(state.realm_id.to_string()),
         instance_id: state.instance_id.clone(),
         backend: Some(state.backend.clone()),
         config_generation: current_generation,
@@ -2876,7 +2889,7 @@ async fn handle_meerkat_resume(
         realm_id: stored_metadata
             .as_ref()
             .and_then(|m| m.realm_id.clone())
-            .or_else(|| Some(state.realm_id.clone())),
+            .or_else(|| Some(state.realm_id.to_string())),
         instance_id: stored_metadata
             .as_ref()
             .and_then(|m| m.instance_id.clone())
