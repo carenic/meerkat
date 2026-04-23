@@ -3926,6 +3926,31 @@ impl MobActor {
             .write()
             .await
             .remove(agent_identity);
+
+        // Populate the Roster projection AFTER DSL `Spawn` authoritatively
+        // applies. The pre-DSL roster insert was deleted in Wave-A commit
+        // `e77ce8797` (running before `MobMachineInput::Spawn` committed, so
+        // rejected admissions could leave shell state stale); the
+        // correctly-ordered replacement was never wired until now. Without
+        // this insert, `start_autonomous_member` below reads an empty roster
+        // and fails with `"autonomous member '{id}' missing roster entry for
+        // startup readiness"` (#30 D-spawn-readiness-lookup).
+        {
+            let mut roster = self.roster.write().await;
+            roster.add_member(crate::roster::RosterAddEntry {
+                agent_identity: identity.clone(),
+                generation,
+                fence_token,
+                agent_runtime_id: agent_runtime_id.clone(),
+                role: profile_name.clone(),
+                runtime_mode,
+                member_ref: Self::sanitized_member_ref(&member_ref),
+                peer_id: None,
+                labels: labels.clone(),
+                effective_profile_override: effective_profile_override.clone(),
+            });
+        }
+
         if runtime_mode == crate::MobRuntimeMode::AutonomousHost {
             let _ = self
                 .apply_kickoff_input(
