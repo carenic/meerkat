@@ -375,42 +375,6 @@ pub use meerkat_llm_core::provider_runtime::{
     ProviderRuntime, ProviderRuntimeRegistry, ResolverEnvironment,
 };
 
-/// Construct a [`meerkat_llm_core::provider_runtime::ProviderRuntimeRegistry`] populated with the
-/// feature-gated provider runtimes from the per-provider crates.
-///
-/// Replaces `meerkat_llm_core::ProviderRuntimeRegistry::default_registry()`,
-/// which is empty post-B2-split because `meerkat-llm-core` cannot reach the
-/// per-provider crates (cycle).
-pub fn default_provider_registry() -> meerkat_llm_core::provider_runtime::ProviderRuntimeRegistry {
-    #[allow(unused_mut)]
-    let mut r = meerkat_llm_core::provider_runtime::ProviderRuntimeRegistry::empty();
-    // Per-provider runtimes compile on wasm32: the resolver arms the
-    // browser path exercises (`CredentialSourceSpec::InlineSecret` from
-    // `populate_realm_from_api_keys`, `ExternalResolver` from the WASM
-    // host's JS-registered auth callback) are target-neutral. OAuth /
-    // IAM / filesystem arms inside `meerkat-auth-core::resolver` and
-    // inside each provider's `resolve_binding` stay behind
-    // `#[cfg(not(target_arch = "wasm32"))]`. Registering the runtimes
-    // on all targets is what lets `build_agent` resolve provider
-    // credentials in the browser (closes the smoke-lane Cluster C
-    // "API key not set for provider 'anthropic'" failure for s47/s48).
-    #[cfg(feature = "anthropic")]
-    {
-        r = r.with_runtime(std::sync::Arc::new(
-            meerkat_anthropic::AnthropicProviderRuntime,
-        ));
-    }
-    #[cfg(feature = "openai")]
-    {
-        r = r.with_runtime(std::sync::Arc::new(meerkat_openai::OpenAiProviderRuntime));
-    }
-    #[cfg(feature = "gemini")]
-    {
-        r = r.with_runtime(std::sync::Arc::new(meerkat_gemini::GoogleProviderRuntime));
-    }
-    r
-}
-
 /// Prelude module for convenient imports
 pub mod prelude {
     pub use super::{

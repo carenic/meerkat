@@ -411,54 +411,6 @@ pub async fn handle_auth_profile_delete(
     }
 }
 
-#[derive(serde::Deserialize)]
-struct TestParams {
-    realm_id: String,
-    binding_id: String,
-}
-
-pub async fn handle_auth_profile_test(
-    id: Option<RpcId>,
-    params: Option<&RawValue>,
-    runtime: &SessionRuntime,
-) -> RpcResponse {
-    let parsed: TestParams = match parse_params(params) {
-        Ok(v) => v,
-        Err(r) => return r.with_id(id),
-    };
-    let realm = match resolve_realm(runtime, &parsed.realm_id).await {
-        Ok(r) => r,
-        Err(r) => return r.with_id(id),
-    };
-    let registry = meerkat_providers::ProviderRuntimeRegistry::default();
-    let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
-    if let Some(store) = runtime.token_store() {
-        env = env.with_token_store(store);
-    }
-    match registry.resolve(&realm, &parsed.binding_id, &env).await {
-        Ok(conn) => RpcResponse::success(
-            id,
-            serde_json::json!({
-                "state": "valid",
-                "connection_ref": {
-                    "realm_id": &parsed.realm_id,
-                    "binding_id": &parsed.binding_id,
-                },
-                "binding_id": &parsed.binding_id,
-                "provider": conn.provider.as_str(),
-                "backend_profile_id": &conn.backend_profile.id,
-                "has_credential": conn.resolved_secret().is_some()
-                    || conn.resolved_authorizer().is_some(),
-            }),
-        ),
-        Err(e) => RpcResponse::error(
-            id,
-            error::INVALID_REQUEST,
-            format!("Binding resolution failed: {e}"),
-        ),
-    }
-}
-
 // --- OAuth login ------------------------------------------------------
 
 #[derive(serde::Deserialize)]

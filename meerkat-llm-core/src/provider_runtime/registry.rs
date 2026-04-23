@@ -145,14 +145,6 @@ impl ProviderRuntimeRegistry {
         }
     }
 
-    /// Default registry — now delegates to the facade. llm-core cannot
-    /// reach per-provider crates (cycle), so `default_registry()` returns
-    /// an empty registry. Callers should use `meerkat::default_provider_registry()`
-    /// from the facade crate, which registers each provider's runtime.
-    pub fn default_registry() -> Self {
-        Self::empty()
-    }
-
     /// Install a custom runtime, replacing any previously registered
     /// runtime for that provider.
     pub fn with_runtime(mut self, runtime: Arc<dyn ProviderRuntime>) -> Self {
@@ -204,12 +196,6 @@ impl ProviderRuntimeRegistry {
                     "runtime-not-registered",
                 ))?;
         runtime.build_client(connection)
-    }
-}
-
-impl Default for ProviderRuntimeRegistry {
-    fn default() -> Self {
-        Self::default_registry()
     }
 }
 
