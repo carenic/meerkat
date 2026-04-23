@@ -317,6 +317,19 @@ impl TrustedPeers {
     pub fn get_by_name(&self, name: &str) -> Option<&TrustedPeer> {
         self.peers.iter().find(|p| p.name == name)
     }
+
+    /// Canonical routing lookup: find the trusted peer whose derived
+    /// [`PeerId`] matches `peer_id`.
+    ///
+    /// `PeerId` is deterministic over the signing pubkey (UUIDv5; see
+    /// [`crate::router::peer_id_from_pubkey`]), so the match is stable and
+    /// unambiguous even when multiple entries share a [`crate::peer_meta::PeerMeta`]
+    /// display name.
+    pub fn find_by_peer_id(&self, peer_id: &PeerId) -> Option<&TrustedPeer> {
+        self.peers
+            .iter()
+            .find(|p| crate::router::peer_id_from_pubkey(&p.pubkey) == *peer_id)
+    }
 }
 
 #[cfg(test)]
