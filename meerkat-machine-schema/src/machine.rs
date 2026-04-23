@@ -1,6 +1,6 @@
 use crate::identity::{
-    EffectVariantId, EnumTypeId, EnumVariantId, FieldId, InputVariantId, MachineId, NamedTypeId,
-    PhaseId, ProtocolId, SignalVariantId, TransitionId,
+    EffectVariantId, EnumTypeId, EnumVariantId, FieldId, InputVariantId, MachineId,
+    NamedTypeBinding, NamedTypeId, PhaseId, ProtocolId, SignalVariantId, TransitionId,
 };
 use indexmap::{IndexMap, IndexSet};
 use std::fmt;
@@ -20,11 +20,26 @@ pub struct MachineSchema {
     pub invariants: Vec<InvariantSchema>,
     pub transitions: Vec<TransitionSchema>,
     pub effect_dispositions: Vec<EffectDispositionRule>,
+    /// Authoritative Rust-type mapping for every `TypeRef::Named(NamedTypeId)`
+    /// referenced in this schema. The codegen consults this table rather
+    /// than matching on the type's name; a `NamedTypeId` referenced
+    /// without a matching binding is a schema-construction error.
+    pub named_types: Vec<NamedTypeBinding>,
     /// Override the CI step_limit for individual machine TLC verification.
     /// Machines with many state fields (e.g. a rich MobMachine flow/work region)
     /// may need a lower limit to keep CI verification tractable. `None` uses the
     /// codegen default (6 for CI, 8 for deep).
     pub ci_step_limit: Option<u32>,
+}
+
+impl MachineSchema {
+    /// Look up the authoritative Rust binding for a named type referenced
+    /// by this schema. Returns `None` if the type is unbound.
+    pub fn named_type_binding(&self, name: &NamedTypeId) -> Option<&NamedTypeBinding> {
+        self.named_types
+            .iter()
+            .find(|binding| binding.name == *name)
+    }
 }
 
 impl MachineSchema {
@@ -186,6 +201,31 @@ impl MachineSchema {
                         &helper_names,
                         &bindings,
                     )?;
+                }
+            }
+        }
+
+        // Validate named-type bindings: every `TypeRef::Named(id)` referenced
+        // anywhere in the schema must have a matching binding in `named_types`,
+        // and bindings must be unique by name. This is the authoritative
+        // single source of truth for how the codegen lowers named types —
+        // there is no name-based fallback.
+        let mut seen_bindings: IndexSet<&str> = IndexSet::new();
+        for binding in &self.named_types {
+            if !seen_bindings.insert(binding.name.as_str()) {
+                return Err(MachineSchemaError::DuplicateNamedTypeBinding {
+                    name: binding.name.as_str().to_owned(),
+                });
+            }
+        }
+        {
+            let mut referenced: IndexSet<String> = IndexSet::new();
+            collect_named_type_references_machine(self, &mut referenced);
+            for name in &referenced {
+                if !seen_bindings.contains(name.as_str()) {
+                    return Err(MachineSchemaError::MissingNamedTypeBinding {
+                        name: name.clone(),
+                    });
                 }
             }
         }
@@ -1085,6 +1125,48 @@ impl Expr {
     }
 }
 
+/// Recursively collect every `NamedTypeId` slug referenced by a type tree.
+fn collect_named_type_references_type(ty: &TypeRef, out: &mut IndexSet<String>) {
+    match ty {
+        TypeRef::Bool | TypeRef::U32 | TypeRef::U64 | TypeRef::String | TypeRef::Enum(_) => {}
+        TypeRef::Named(id) => {
+            out.insert(id.as_str().to_owned());
+        }
+        TypeRef::Option(inner) | TypeRef::Set(inner) | TypeRef::Seq(inner) => {
+            collect_named_type_references_type(inner, out);
+        }
+        TypeRef::Map(key, value) => {
+            collect_named_type_references_type(key, out);
+            collect_named_type_references_type(value, out);
+        }
+    }
+}
+
+/// Collect every named-type reference anywhere in a `MachineSchema`'s typed
+/// surface: state fields, variant fields (inputs/signals/effects),
+/// helpers + derived parameters and returns.
+pub(crate) fn collect_named_type_references_machine(
+    schema: &MachineSchema,
+    out: &mut IndexSet<String>,
+) {
+    for field in &schema.state.fields {
+        collect_named_type_references_type(&field.ty, out);
+    }
+    for enum_schema in [&schema.inputs, &schema.signals, &schema.effects] {
+        for variant in &enum_schema.variants {
+            for field in &variant.fields {
+                collect_named_type_references_type(&field.ty, out);
+            }
+        }
+    }
+    for helper in schema.helpers.iter().chain(schema.derived.iter()) {
+        for param in &helper.params {
+            collect_named_type_references_type(&param.ty, out);
+        }
+        collect_named_type_references_type(&helper.returns, out);
+    }
+}
+
 fn unique_names<'a>(
     names: impl IntoIterator<Item = &'a str>,
     kind: &'static str,
@@ -1123,6 +1205,8 @@ pub enum MachineSchemaError {
     MissingEffectDisposition { variant: String },
     HandoffProtocolOnRoutedEffect { variant: String },
     SurfaceOnlyInputHasTransition { variant: String, transition: String },
+    DuplicateNamedTypeBinding { name: String },
+    MissingNamedTypeBinding { name: String },
 }
 
 impl fmt::Display for MachineSchemaError {
@@ -1175,6 +1259,15 @@ impl fmt::Display for MachineSchemaError {
                 write!(
                     f,
                     "surface-only input `{variant}` must not have transition `{transition}`"
+                )
+            }
+            Self::DuplicateNamedTypeBinding { name } => {
+                write!(f, "duplicate named-type binding for `{name}`")
+            }
+            Self::MissingNamedTypeBinding { name } => {
+                write!(
+                    f,
+                    "named type `{name}` is referenced by this schema but has no NamedTypeBinding entry in `named_types`"
                 )
             }
         }
