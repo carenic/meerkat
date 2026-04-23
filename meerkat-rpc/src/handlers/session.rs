@@ -305,9 +305,7 @@ pub async fn handle_create(
     build_config.additional_instructions = params.additional_instructions;
     build_config.app_context = params.app_context;
     build_config.shell_env = params.shell_env;
-    build_config.preload_skills = params
-        .preload_skills
-        .map(|ids| ids.into_iter().map(meerkat_core::skills::SkillId).collect());
+    build_config.preload_skills = params.preload_skills;
 
     // Wire callback tools backed by the live registered_tools list.
     // Tools added later via tools/register are picked up dynamically at each

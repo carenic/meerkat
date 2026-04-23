@@ -618,7 +618,7 @@ pub struct SessionRuntime {
     max_sessions: usize,
     /// Override LLM client for all sessions (primarily for testing).
     default_llm_client: Arc<StdRwLock<Option<Arc<dyn LlmClient>>>>,
-    realm_id: Option<String>,
+    realm_id: Option<meerkat_core::connection::RealmId>,
     instance_id: Option<String>,
     backend: Option<String>,
     config_runtime: Arc<StdRwLock<Option<Arc<meerkat_core::ConfigRuntime>>>>,
@@ -832,7 +832,7 @@ impl SessionRuntime {
     /// Attach realm context defaults used for session metadata.
     pub fn set_realm_context(
         &mut self,
-        realm_id: Option<String>,
+        realm_id: Option<meerkat_core::connection::RealmId>,
         instance_id: Option<String>,
         backend: Option<String>,
     ) {
@@ -881,8 +881,8 @@ impl SessionRuntime {
     }
 
     /// Active realm id for this runtime, if configured.
-    pub fn realm_id(&self) -> Option<&str> {
-        self.realm_id.as_deref()
+    pub fn realm_id(&self) -> Option<&meerkat_core::connection::RealmId> {
+        self.realm_id.as_ref()
     }
 
     /// Attach config runtime for generation stamping.
@@ -1029,7 +1029,7 @@ impl SessionRuntime {
                 external_tools: self.recovery_external_tools(),
                 runtime_build_mode: Some(meerkat_core::RuntimeBuildMode::SessionOwned(bindings)),
                 require_runtime_build_mode: true,
-                realm_id: self.realm_id.clone(),
+                realm_id: self.realm_id.as_ref().map(ToString::to_string),
                 instance_id: self.instance_id.clone(),
                 backend: self.backend.clone(),
                 config_generation: current_generation,
@@ -2354,7 +2354,9 @@ impl SessionRuntime {
             };
 
             let mut build = build_config.to_session_build_options();
-            build.realm_id = build.realm_id.or_else(|| self.realm_id.clone());
+            build.realm_id = build
+                .realm_id
+                .or_else(|| self.realm_id.as_ref().map(ToString::to_string));
             build.instance_id = build.instance_id.or_else(|| self.instance_id.clone());
             build.backend = build.backend.or_else(|| self.backend.clone());
             build.config_generation = build.config_generation.or(runtime_generation);
@@ -2810,7 +2812,9 @@ impl SessionRuntime {
             };
 
             let mut build = build_config.to_session_build_options();
-            build.realm_id = build.realm_id.or_else(|| self.realm_id.clone());
+            build.realm_id = build
+                .realm_id
+                .or_else(|| self.realm_id.as_ref().map(ToString::to_string));
             build.instance_id = build.instance_id.or_else(|| self.instance_id.clone());
             build.backend = build.backend.or_else(|| self.backend.clone());
             build.config_generation = build.config_generation.or(runtime_generation);
