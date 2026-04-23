@@ -11,7 +11,7 @@ use meerkat_machine_schema::catalog::dsl::{
 };
 use meerkat_machine_schema::catalog::{
     canonical_composition_coverage_manifests, canonical_machine_coverage_manifests,
-    meerkat_mob_seam_composition,
+    meerkat_mob_seam_composition, schedule_runtime_bundle_composition,
 };
 use meerkat_machine_schema::{
     CompositionDriver, CompositionDriverRustBinding, DriverDispatchRoute, RouteTargetKind,
@@ -319,7 +319,11 @@ fn sample_driver() -> CompositionDriver {
 
 #[test]
 fn render_composition_driver_returns_none_for_driverless_composition() {
-    let composition = meerkat_mob_seam_composition();
+    // `meerkat_mob_seam_composition` now carries the
+    // `RecomputeMobPeerOverlay` driver (Track-B R5 Commit 4). Use a
+    // still-driverless composition to pin the "no driver emitted"
+    // contract.
+    let composition = schedule_runtime_bundle_composition();
     assert!(composition.driver.is_none());
     assert!(
         render_composition_driver(&composition).is_none(),

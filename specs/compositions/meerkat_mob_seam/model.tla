@@ -9845,7 +9845,7 @@ mob_RotateMemberSessionRunning(arg_agent_identity, arg_old_session_id, arg_new_s
        /\ mob_phase = "Running"
        /\ ((packet.payload.agent_identity \in DOMAIN mob_identity_to_runtime) = TRUE)
        /\ ((packet.payload.agent_identity \in DOMAIN mob_member_session_bindings) = TRUE)
-       /\ ((IF packet.payload.agent_identity \in DOMAIN mob_member_session_bindings THEN mob_member_session_bindings[packet.payload.agent_identity] ELSE "None") = Some(packet.payload.old_session_id))
+       /\ ((IF (packet.payload.agent_identity \in DOMAIN mob_member_session_bindings) THEN Some((IF packet.payload.agent_identity \in DOMAIN mob_member_session_bindings THEN mob_member_session_bindings[packet.payload.agent_identity] ELSE "None")) ELSE None) = Some(packet.payload.old_session_id))
        /\ mob_phase' = "Running"
        /\ mob_member_session_bindings' = MapSet(mob_member_session_bindings, packet.payload.agent_identity, packet.payload.new_session_id)
        /\ mob_topology_epoch' = (mob_topology_epoch) + 1
@@ -9868,7 +9868,7 @@ mob_ReleaseMemberSessionRunning(arg_agent_identity, arg_session_id) ==
        /\ ~HigherPriorityReady("mob_kernel")
        /\ mob_phase = "Running"
        /\ ((packet.payload.agent_identity \in DOMAIN mob_member_session_bindings) = TRUE)
-       /\ ((IF packet.payload.agent_identity \in DOMAIN mob_member_session_bindings THEN mob_member_session_bindings[packet.payload.agent_identity] ELSE "None") = Some(packet.payload.session_id))
+       /\ ((IF (packet.payload.agent_identity \in DOMAIN mob_member_session_bindings) THEN Some((IF packet.payload.agent_identity \in DOMAIN mob_member_session_bindings THEN mob_member_session_bindings[packet.payload.agent_identity] ELSE "None")) ELSE None) = Some(packet.payload.session_id))
        /\ mob_phase' = "Running"
        /\ mob_member_session_bindings' = MapRemove(mob_member_session_bindings, packet.payload.agent_identity)
        /\ mob_topology_epoch' = (mob_topology_epoch) + 1
@@ -11545,8 +11545,8 @@ EntryPacketAdmissible_mob(packet) ==
     \/ /\ (packet.variant = "WireMembers") /\ (mob_phase = "Running") /\ (((packet.payload.edge \in mob_wiring_edges) = FALSE))
     \/ /\ (packet.variant = "UnwireMembers") /\ (mob_phase = "Running") /\ (((packet.payload.edge \in mob_wiring_edges) = TRUE))
     \/ /\ (packet.variant = "BindMemberSession") /\ (mob_phase = "Running") /\ (((packet.payload.agent_identity \in DOMAIN mob_identity_to_runtime) = TRUE)) /\ (((packet.payload.agent_identity \in DOMAIN mob_member_session_bindings) = FALSE))
-    \/ /\ (packet.variant = "RotateMemberSession") /\ (mob_phase = "Running") /\ (((packet.payload.agent_identity \in DOMAIN mob_identity_to_runtime) = TRUE)) /\ (((packet.payload.agent_identity \in DOMAIN mob_member_session_bindings) = TRUE)) /\ (((IF packet.payload.agent_identity \in DOMAIN mob_member_session_bindings THEN mob_member_session_bindings[packet.payload.agent_identity] ELSE "None") = Some(packet.payload.old_session_id)))
-    \/ /\ (packet.variant = "ReleaseMemberSession") /\ (mob_phase = "Running") /\ (((packet.payload.agent_identity \in DOMAIN mob_member_session_bindings) = TRUE)) /\ (((IF packet.payload.agent_identity \in DOMAIN mob_member_session_bindings THEN mob_member_session_bindings[packet.payload.agent_identity] ELSE "None") = Some(packet.payload.session_id)))
+    \/ /\ (packet.variant = "RotateMemberSession") /\ (mob_phase = "Running") /\ (((packet.payload.agent_identity \in DOMAIN mob_identity_to_runtime) = TRUE)) /\ (((packet.payload.agent_identity \in DOMAIN mob_member_session_bindings) = TRUE)) /\ (((IF (packet.payload.agent_identity \in DOMAIN mob_member_session_bindings) THEN Some((IF packet.payload.agent_identity \in DOMAIN mob_member_session_bindings THEN mob_member_session_bindings[packet.payload.agent_identity] ELSE "None")) ELSE None) = Some(packet.payload.old_session_id)))
+    \/ /\ (packet.variant = "ReleaseMemberSession") /\ (mob_phase = "Running") /\ (((packet.payload.agent_identity \in DOMAIN mob_member_session_bindings) = TRUE)) /\ (((IF (packet.payload.agent_identity \in DOMAIN mob_member_session_bindings) THEN Some((IF packet.payload.agent_identity \in DOMAIN mob_member_session_bindings THEN mob_member_session_bindings[packet.payload.agent_identity] ELSE "None")) ELSE None) = Some(packet.payload.session_id)))
     \/ /\ (packet.variant = "TaskCreate") /\ (mob_phase = "Running") /\ (((packet.payload.task_id \in DOMAIN mob_tasks) = FALSE))
     \/ /\ (packet.variant = "TaskUpdate") /\ (mob_phase = "Running") /\ ((packet.payload.new_status = "Pending")) /\ (((packet.payload.task_id \in DOMAIN mob_tasks) = TRUE)) /\ (((packet.payload.task_id \in mob_completed_task_ids) = FALSE))
     \/ /\ (packet.variant = "TaskUpdate") /\ (mob_phase = "Running") /\ ((packet.payload.new_status = "InProgress")) /\ (((packet.payload.task_id \in DOMAIN mob_tasks) = TRUE)) /\ (((packet.payload.task_id \in mob_completed_task_ids) = FALSE))

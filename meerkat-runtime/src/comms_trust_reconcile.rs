@@ -39,7 +39,11 @@ use meerkat_core::comms::{SendError, TrustedPeerSpec};
 // closing the TOCTOU class where a stale reconcile's mutations
 // could orphan peers in the trust store while its commit was
 // skipped (PR #340 re-review item).
-use tokio::sync::Mutex;
+//
+// Use `crate::tokio::sync::Mutex` (the crate-level re-export) so the
+// WASM target picks up `tokio_with_wasm::alias::sync::Mutex` instead
+// of the plain `tokio` crate, which is not wasm32-compatible.
+use crate::tokio::sync::Mutex;
 
 use crate::meerkat_machine::dsl::PeerEndpoint;
 
