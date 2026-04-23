@@ -1839,17 +1839,6 @@ export class MeerkatClient {
     return this.request("comms/peers", { session_id: sessionId });
   }
 
-  async status(sessionId: string): Promise<RuntimeStateResult> {
-    const result = await this.request("session/status", { session_id: sessionId });
-    if (typeof result.state !== "string" || result.state.length === 0) {
-      throw new MeerkatError(
-        "INVALID_RESPONSE",
-        "Invalid session/status response: missing state",
-      );
-    }
-    return result as unknown as RuntimeStateResult;
-  }
-
   async runtimeRealtimeAttachmentStatus(
     sessionId: string,
   ): Promise<RuntimeRealtimeAttachmentStatusResult> {
@@ -1944,68 +1933,6 @@ export class MeerkatClient {
       );
     }
     return result as unknown as RealtimeCapabilitiesResult;
-  }
-
-  async submit(
-    sessionId: string,
-    input: Record<string, unknown>,
-  ): Promise<RuntimeAcceptResult> {
-    const result = await this.request("session/submit", { session_id: sessionId, input });
-    if (typeof result.outcome_type !== "string" || result.outcome_type.length === 0) {
-      throw new MeerkatError(
-        "INVALID_RESPONSE",
-        "Invalid session/submit response: missing outcome_type",
-      );
-    }
-    return result as unknown as RuntimeAcceptResult;
-  }
-
-  async retire(sessionId: string): Promise<RuntimeRetireResult> {
-    const result = await this.request("session/retire", { session_id: sessionId });
-    if (typeof result.inputs_abandoned !== "number") {
-      throw new MeerkatError(
-        "INVALID_RESPONSE",
-        "Invalid session/retire response: missing inputs_abandoned",
-      );
-    }
-    return result as unknown as RuntimeRetireResult;
-  }
-
-  async reset(sessionId: string): Promise<RuntimeResetResult> {
-    const result = await this.request("session/reset", { session_id: sessionId });
-    if (typeof result.inputs_abandoned !== "number") {
-      throw new MeerkatError(
-        "INVALID_RESPONSE",
-        "Invalid session/reset response: missing inputs_abandoned",
-      );
-    }
-    return result as unknown as RuntimeResetResult;
-  }
-
-  async submission(sessionId: string, submissionId: string): Promise<WireInputState | null> {
-    const result = await this.request("session/submission", {
-      session_id: sessionId,
-      input_id: submissionId,
-    });
-    if (result === null) {
-      return null;
-    }
-    if (typeof result !== "object" || result === null) {
-      throw new MeerkatError(
-        "INVALID_RESPONSE",
-        "Invalid session/submission response: expected object or null",
-      );
-    }
-    return result as unknown as WireInputState;
-  }
-
-  async submissions(sessionId: string): Promise<string[]> {
-    const result = (await this.request("session/submissions", {
-      session_id: sessionId,
-    })) as unknown as InputListResult;
-    return Array.isArray(result.input_ids)
-      ? result.input_ids.map((inputId) => String(inputId))
-      : [];
   }
 
   // -- Auth + realm (Phase 4d) --------------------------------------------
