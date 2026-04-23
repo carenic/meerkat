@@ -557,14 +557,6 @@ machine! {
         // Running self-loops (inputs)
         // =====================================================================
 
-        transition WireRunning {
-            on input Wire
-            guard { self.lifecycle_phase == Phase::Running }
-            update {}
-            to Running
-            emit NotifyCoordinator
-        }
-
         // TaskCreate: real mutator. Rejects duplicate task ids via the
         // unknown-task guard's inverse (task id not already present).
         transition TaskCreateRunning {
@@ -1013,18 +1005,6 @@ machine! {
             }
             to Running
             emit EmitRunLifecycleNotice
-        }
-
-        // =====================================================================
-        // Unwire
-        // =====================================================================
-
-        transition UnwireRunning {
-            on input Unwire
-            guard { self.lifecycle_phase == Phase::Running }
-            update {}
-            to Running
-            emit NotifyCoordinator
         }
 
         // =====================================================================
