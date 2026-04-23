@@ -1168,58 +1168,6 @@ fn session_metadata_marks_archived(session: &Session) -> bool {
         .unwrap_or(false)
 }
 
-async fn ensure_runtime_session_registered(
-    state: &AppState,
-    session_id: &SessionId,
-) -> Result<(), Response> {
-    let adapter = get_runtime_adapter(state);
-
-    let persisted = state
-        .session_service
-        .load_persisted(session_id)
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": error.to_string()})),
-            )
-                .into_response()
-        })?;
-    if persisted
-        .as_ref()
-        .is_some_and(session_metadata_marks_archived)
-    {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("Session not found: {session_id}")})),
-        )
-            .into_response());
-    }
-
-    let session_exists = if persisted.is_some() {
-        true
-    } else {
-        state.session_service.read(session_id).await.is_ok()
-    };
-
-    if !session_exists {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("Session not found: {session_id}")})),
-        )
-            .into_response());
-    }
-
-    let executor = Box::new(RestSessionRuntimeExecutor::new(
-        state.runtime_executor_context(),
-        session_id.clone(),
-    ));
-    adapter
-        .ensure_session_with_executor(session_id.clone(), executor)
-        .await;
-    Ok(())
-}
-
 fn realtime_channel_status(
     state: RealtimeChannelState,
     reason: Option<&str>,
@@ -1277,7 +1225,6 @@ async fn realtime_status(
     // the MobMcpState resolver. SessionTarget parses directly; MobMember
     // reads the canonical binding map on the MobMachine.
     let sid = resolve_realtime_target_session_rest(&state, &body.target).await?;
-    ensure_runtime_session_registered(&state, &sid).await?;
     let adapter = get_runtime_adapter(&state);
     let live_status = adapter
         .realtime_attachment_status(&sid)
@@ -1465,13 +1412,6 @@ async fn mob_spawn_helper(
         .mob_spawn_helper(&mob_id, identity, req.prompt, options)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let identity_str = result.agent_identity.to_string();
-    Ok(Json(json!({
-        "output": result.output,
-        "tokens_used": result.tokens_used,
-        "agent_identity": result.agent_identity.as_str(),
-        "member_ref": meerkat_contracts::WireMemberRef::encode(mob_id.as_str(), &identity_str),
-    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1558,13 +1498,6 @@ async fn mob_fork_helper(
         )
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let identity_str = result.agent_identity.to_string();
-    Ok(Json(json!({
-        "output": result.output,
-        "tokens_used": result.tokens_used,
-        "agent_identity": result.agent_identity.as_str(),
-        "member_ref": meerkat_contracts::WireMemberRef::encode(mob_id.as_str(), &identity_str),
-    })))
 }
 
 /// GET /mob/{id}/members/{agent_identity}/status — member execution snapshot.
@@ -1912,7 +1845,6 @@ async fn post_external_event(
 
     let session_id =
         resolve_session_id_for_state(&id, &state).map_err(IntoResponse::into_response)?;
-    ensure_runtime_session_registered(&state, &session_id).await?;
 
     let input = match event {
         meerkat_contracts::SessionExternalEventEnvelope::GenericJson {
@@ -1929,38 +1861,6 @@ async fn post_external_event(
     }
     .map_err(IntoResponse::into_response)?;
 
-    match state
-        .runtime_adapter
-        .accept_input_without_wake(&session_id, input)
-        .await
-    {
-        Ok(
-            meerkat_runtime::AcceptOutcome::Accepted { .. }
-            | meerkat_runtime::AcceptOutcome::Deduplicated { .. },
-        ) => Ok((StatusCode::ACCEPTED, Json(json!({"queued": true})))),
-        Ok(meerkat_runtime::AcceptOutcome::Rejected { reason }) => Err((
-            StatusCode::CONFLICT,
-            Json(json!({"error": reason.to_string()})),
-        )
-            .into_response()),
-        Ok(outcome) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": format!("unexpected runtime accept outcome: {outcome:?}"),
-            })),
-        )
-            .into_response()),
-        Err(meerkat_runtime::RuntimeDriverError::NotReady { state }) => Err((
-            StatusCode::CONFLICT,
-            Json(json!({"error": format!("runtime not accepting input while in state: {state}")})),
-        )
-            .into_response()),
-        Err(err) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": err.to_string()})),
-        )
-            .into_response()),
-    }
 }
 
 /// Admit a correlated terminal peer response through the typed runtime ingress.
@@ -1983,7 +1883,6 @@ async fn post_peer_response_terminal(
 
     let session_id =
         resolve_session_id_for_state(&id, &state).map_err(IntoResponse::into_response)?;
-    ensure_runtime_session_registered(&state, &session_id).await?;
 
     let input = meerkat_runtime::Input::Peer(meerkat_runtime::PeerInput {
         header: meerkat_runtime::InputHeader {
@@ -2019,34 +1918,6 @@ async fn post_peer_response_terminal(
         handling_mode: None,
     });
 
-    match state.runtime_adapter.accept_input(&session_id, input).await {
-        Ok(
-            meerkat_runtime::AcceptOutcome::Accepted { .. }
-            | meerkat_runtime::AcceptOutcome::Deduplicated { .. },
-        ) => Ok((StatusCode::ACCEPTED, Json(json!({"queued": true})))),
-        Ok(meerkat_runtime::AcceptOutcome::Rejected { reason }) => Err((
-            StatusCode::CONFLICT,
-            Json(json!({"error": reason.to_string()})),
-        )
-            .into_response()),
-        Ok(outcome) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": format!("unexpected runtime accept outcome: {outcome:?}"),
-            })),
-        )
-            .into_response()),
-        Err(meerkat_runtime::RuntimeDriverError::NotReady { state }) => Err((
-            StatusCode::CONFLICT,
-            Json(json!({"error": format!("runtime not accepting input while in state: {state}")})),
-        )
-            .into_response()),
-        Err(err) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": err.to_string()})),
-        )
-            .into_response()),
-    }
 }
 
 /// List skills with provenance information.
@@ -2656,24 +2527,6 @@ async fn create_session_inner(
             return RequestOutcome::Unpublished(Err(api_err));
         }
     };
-
-    // Register executor for the new session.
-    // Session is already committed — failure here must use Published(Err) to
-    // preserve the session for resumption.
-    if let Err(_resp) = ensure_runtime_session_registered(state, &create_result.session_id).await {
-        drop(caller_event_tx);
-        drain_event_forwarder(&session_id, forward_task).await;
-        return RequestOutcome::Published(Err(ApiError::InternalWithData {
-            message: "failed to register runtime executor".to_string(),
-            code: "SESSION_CREATED_WITH_TURN_FAILURE".to_string(),
-            details: json!({
-                "session_id": session_id.to_string(),
-                "session_ref": format_session_ref(&state.realm_id, &session_id),
-                "session_created": true,
-                "resumable": true,
-            }),
-        }));
-    }
 
     // Update peer-ingress context so live sessions always get attached ingress
     // and idle keep_alive sessions retain a persistent host drain.
@@ -3491,14 +3344,6 @@ async fn continue_session_inner(
             }),
         }
     } else {
-        // Ensure session is registered with executor for runtime-backed execution.
-        if let Err(_resp) = ensure_runtime_session_registered(state, &session_id).await {
-            drop(caller_event_tx);
-            drain_event_forwarder(&session_id, forward_task).await;
-            return RequestOutcome::Unpublished(Err(ApiError::NotFound(format!(
-                "Session not found: {session_id}"
-            ))));
-        }
         #[cfg(feature = "comms")]
         {
             let comms_rt = state.session_service.comms_runtime(&session_id).await;
