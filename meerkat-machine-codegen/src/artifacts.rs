@@ -556,8 +556,7 @@ pub fn render_composition_ci_cfg(schema: &CompositionSchema, deep: bool) -> Stri
         .collect::<BTreeMap<_, _>>();
     let domains = collect_composition_binding_domains(schema, &machine_by_instance);
     let named_samples = collect_composition_named_type_samples(schema, &machine_by_instance);
-    let named_bindings =
-        collect_composition_named_bindings(machine_by_instance.values().copied());
+    let named_bindings = collect_composition_named_bindings(machine_by_instance.values().copied());
     let mut instance_invariants = Vec::new();
 
     for instance in &schema.machines {
@@ -665,8 +664,7 @@ pub fn render_composition_witness_cfg(
     let domains = collect_composition_binding_domains(schema, &machine_by_instance);
     let named_samples =
         collect_composition_witness_named_type_samples(schema, witness, &machine_by_instance);
-    let named_bindings =
-        collect_composition_named_bindings(machine_by_instance.values().copied());
+    let named_bindings = collect_composition_named_bindings(machine_by_instance.values().copied());
     let witness_sample_cardinality = schema
         .witness_domain_cardinality
         .max(max_named_sample_cardinality(&named_samples));
@@ -888,142 +886,286 @@ pub fn render_composition_semantic_model(schema: &CompositionSchema) -> String {
     }
 }
 
-/// Renders the generated composition driver module.
+/// Renders the generated per-composition Rust module (Track-B wave-b V2).
 ///
-/// This is a declarative-framework emission: any composition that declares a
-/// `CompositionDriver` descriptor gets a generated Rust module listing the
-/// watched effects and dispatch routes as typed constants, plus a marker
-/// trait reference the implementer consumes.
+/// The emitted module is the typed seam between the composition's route
+/// schema and the runtime composition dispatcher. It declares:
 ///
-/// The generated module intentionally stays thin — it is the schema-to-code
-/// surface the runtime dispatcher
-/// (`meerkat-runtime::composition_dispatch`) and the composition
-/// implementer use to stay in lockstep with the declarative schema.
+/// * a top-level seam-effect enum wrapping each participant machine's
+///   generated `Effect` type (one variant per distinct producer instance),
+/// * the `TypedRoutedInput` descriptor re-exported from the schema
+///   identity layer, and
+/// * a `route_to_input(&SeamEffect) -> Option<TypedRoutedInput>` function
+///   that resolves routed effects to their typed target input using the
+///   composition's `RouteId → (MachineInstanceId, InputVariantId, Vec<(FieldId, FieldId)>)`
+///   table.
 ///
-/// Returns `None` when the composition has no driver descriptor.
+/// Routes with `RouteTargetKind::Signal` are excluded from
+/// `route_to_input`: signals are a separate typed surface owned by the
+/// machine-layer signal handler, not the composition dispatcher.
+///
+/// Returns `None` when the composition declares no driver descriptor; the
+/// driver descriptor continues to carry the Rust emission path for xtask
+/// consumers.
 pub fn render_composition_driver(schema: &CompositionSchema) -> Option<String> {
     let driver = schema.driver.as_ref()?;
+
+    let machine_catalog = canonical_machine_schemas();
+    let machine_by_name = machine_catalog
+        .iter()
+        .map(|machine| (machine.machine.as_str(), machine))
+        .collect::<BTreeMap<_, _>>();
+
+    // Distinct producer instances, preserving declaration order from the
+    // composition schema so generated variants stay deterministic.
+    let mut producers: Vec<(&str, &MachineSchema)> = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for instance in &schema.machines {
+        if !seen.insert(instance.instance_id.as_str()) {
+            continue;
+        }
+        let Some(machine) = machine_by_name.get(instance.machine_name.as_str()).copied() else {
+            continue;
+        };
+        producers.push((instance.instance_id.as_str(), machine));
+    }
+
+    let composition_name = schema.name.as_str();
+    let seam_effect_enum = format!("{}Effect", to_pascal_case(composition_name));
 
     let mut out = String::new();
     pushln!(
         &mut out,
-        "// @generated — composition driver descriptor for `{}`",
-        schema.name
+        "// @generated — composition module for `{composition_name}`"
     );
     pushln!(
         &mut out,
-        "// DO NOT EDIT. Emitted by meerkat-machine-codegen::render_composition_driver."
+        "// DO NOT EDIT. Emitted by meerkat_machine_codegen::render_composition_driver."
     );
     pushln!(
         &mut out,
-        "// Source of truth: catalog::compositions::{}",
-        schema.name
+        "// Source of truth: catalog::compositions::{composition_name}"
+    );
+    pushln!(
+        &mut out,
+        "// Driver: `{}` (rust path: `{}`).",
+        driver.name,
+        driver.rust.module_path
     );
     out.push('\n');
 
+    pushln!(
+        &mut out,
+        "use meerkat_machine_schema::identity::{{FieldId, InputVariantId, MachineInstanceId}};"
+    );
     for import in &driver.rust.required_imports {
         pushln!(&mut out, "{import}");
     }
-    if !driver.rust.required_imports.is_empty() {
-        out.push('\n');
-    }
-
-    pushln!(
-        &mut out,
-        "/// Logical name of this composition driver. Used at runtime for"
-    );
-    pushln!(&mut out, "/// registration and diagnostics.");
-    pushln!(
-        &mut out,
-        "pub const DRIVER_NAME: &str = \"{}\";",
-        driver.name
-    );
     out.push('\n');
 
-    pushln!(&mut out, "/// Effect variants this driver observes.");
+    // TypedRoutedInput — the route descriptor returned by `route_to_input`.
     pushln!(
         &mut out,
-        "/// Each entry is `(producer_instance, effect_variant)`."
+        "/// Typed route descriptor resolved for a producer effect."
     );
-    pushln!(&mut out, "pub const WATCHED_EFFECTS: &[(&str, &str)] = &[");
-    for watched in &driver.watched_effects {
+    pushln!(&mut out, "///");
+    pushln!(
+        &mut out,
+        "/// `bindings` lists producer-field → consumer-field pairs in the"
+    );
+    pushln!(
+        &mut out,
+        "/// order declared by the composition schema. The composition"
+    );
+    pushln!(
+        &mut out,
+        "/// dispatcher uses these to construct the typed consumer input."
+    );
+    pushln!(&mut out, "#[derive(Debug, Clone, PartialEq, Eq)]");
+    pushln!(&mut out, "pub struct TypedRoutedInput {{");
+    pushln!(&mut out, "    pub instance_id: MachineInstanceId,");
+    pushln!(&mut out, "    pub variant: InputVariantId,");
+    pushln!(&mut out, "    pub bindings: Vec<(FieldId, FieldId)>,");
+    pushln!(&mut out, "}}");
+    out.push('\n');
+
+    // Seam effect enum: one variant per distinct producer instance.
+    pushln!(
+        &mut out,
+        "/// Sum of every participant-machine effect type that can be routed"
+    );
+    pushln!(
+        &mut out,
+        "/// through this composition. One variant per producer instance."
+    );
+    pushln!(&mut out, "#[derive(Debug, Clone, PartialEq, Eq)]");
+    pushln!(&mut out, "pub enum {seam_effect_enum} {{");
+    if producers.is_empty() {
         pushln!(
             &mut out,
-            "    (\"{}\", \"{}\"),",
-            watched.producer_instance,
-            watched.effect_variant
+            "    // (composition declares no participant machines)"
         );
     }
-    pushln!(&mut out, "];");
+    for (instance_id, machine) in &producers {
+        let variant = to_pascal_case(instance_id);
+        let machine_path = producer_effect_path(machine);
+        pushln!(&mut out, "    {variant}({machine_path}),");
+    }
+    pushln!(&mut out, "}}");
     out.push('\n');
 
+    // route_to_input — match arms per input-kind route.
     pushln!(
         &mut out,
-        "/// Dispatch routes this driver may emit. Each entry is"
+        "/// Resolve a routed producer effect to its typed consumer input."
+    );
+    pushln!(&mut out, "///");
+    pushln!(
+        &mut out,
+        "/// Returns `None` when the effect variant has no declared input"
     );
     pushln!(
         &mut out,
-        "/// `(route_name, target_instance, target_kind, input_variant)`."
+        "/// route in this composition (including signal-kind routes, which"
     );
     pushln!(
         &mut out,
-        "pub const DISPATCH_ROUTES: &[(&str, &str, &str, &str)] = &["
+        "/// are handled by the signal surface, not the dispatcher)."
     );
-    for dispatch in &driver.dispatch_routes {
-        let kind_name = match dispatch.target_kind {
-            RouteTargetKind::Input => "Input",
-            RouteTargetKind::Signal => "Signal",
-        };
+    pushln!(
+        &mut out,
+        "pub fn route_to_input(effect: &{seam_effect_enum}) -> Option<TypedRoutedInput> {{"
+    );
+    pushln!(&mut out, "    match effect {{");
+    for (instance_id, machine) in &producers {
+        let variant = to_pascal_case(instance_id);
+        let machine_path = producer_effect_path(machine);
+        let input_routes: Vec<&Route> = schema
+            .routes
+            .iter()
+            .filter(|route| {
+                route.from_machine.as_str() == *instance_id
+                    && route.to.kind == RouteTargetKind::Input
+            })
+            .collect();
+        if input_routes.is_empty() {
+            pushln!(
+                &mut out,
+                "        {seam_effect_enum}::{variant}(_) => None,"
+            );
+            continue;
+        }
         pushln!(
             &mut out,
-            "    (\"{}\", \"{}\", \"{}\", \"{}\"),",
-            dispatch.name,
-            dispatch.target_instance,
-            kind_name,
-            dispatch.input_variant
+            "        {seam_effect_enum}::{variant}(inner) => match inner {{"
         );
+        for route in input_routes {
+            let effect_variant = route.effect_variant.as_str();
+            let target_machine = route.to.machine.as_str();
+            let target_variant = route.to.input_variant.as_str();
+            pushln!(
+                &mut out,
+                "            {machine_path}::{effect_variant}(_) => Some(TypedRoutedInput {{"
+            );
+            pushln!(
+                &mut out,
+                "                instance_id: MachineInstanceId::parse(\"{target_machine}\").expect(\"composition instance slug\"),"
+            );
+            pushln!(
+                &mut out,
+                "                variant: InputVariantId::parse(\"{target_variant}\").expect(\"composition input slug\"),"
+            );
+            if route.bindings.is_empty() {
+                pushln!(&mut out, "                bindings: Vec::new(),");
+            } else {
+                pushln!(&mut out, "                bindings: vec![");
+                for binding in &route.bindings {
+                    let from_field = match &binding.source {
+                        RouteBindingSource::Field { from_field, .. } => from_field.as_str(),
+                        RouteBindingSource::Literal(_) | RouteBindingSource::OwnerProvided => {
+                            continue;
+                        }
+                    };
+                    let to_field = binding.to_field.as_str();
+                    pushln!(
+                        &mut out,
+                        "                    (FieldId::parse(\"{from_field}\").expect(\"route producer field slug\"), FieldId::parse(\"{to_field}\").expect(\"route consumer field slug\")),"
+                    );
+                }
+                pushln!(&mut out, "                ],");
+            }
+            pushln!(&mut out, "            }}),");
+        }
+        pushln!(&mut out, "            _ => None,");
+        pushln!(&mut out, "        }},");
     }
-    pushln!(&mut out, "];");
-    out.push('\n');
-
-    pushln!(
-        &mut out,
-        "/// Generated marker: the driver type name declared in the schema."
-    );
-    pushln!(&mut out, "/// The application-side driver must satisfy the");
-    pushln!(
-        &mut out,
-        "/// `meerkat_runtime::composition_dispatch::CompositionDriverTrait`"
-    );
-    pushln!(&mut out, "/// contract under this name.");
-    pushln!(
-        &mut out,
-        "pub const DRIVER_TYPE: &str = \"{}\";",
-        driver.rust.driver_type
-    );
-    pushln!(
-        &mut out,
-        "pub const STORE_PLAN_TYPE: &str = \"{}\";",
-        driver.rust.store_plan_type
-    );
-    pushln!(
-        &mut out,
-        "pub const WORK_TYPE: &str = \"{}\";",
-        driver.rust.work_type
-    );
-    pushln!(
-        &mut out,
-        "pub const DECISION_TYPE: &str = \"{}\";",
-        driver.rust.decision_type
-    );
+    pushln!(&mut out, "    }}");
+    pushln!(&mut out, "}}");
 
     Some(out)
 }
 
-// Keep the legacy module import alive so existing consumers that reference
-// `meerkat_machine_codegen::templates` continue to resolve during the
-// transition. The hand-crafted `flow_frame_loop_driver.rs.tmpl` template
-// has been deleted — the generic emission above replaces it.
+/// Return the fully-qualified path to a producer machine's generated
+/// `Effect` enum. Consumed by the per-composition emission above.
+fn producer_effect_path(machine: &MachineSchema) -> String {
+    format!(
+        "crate::generated::{}::Effect",
+        machine_module_slug(machine.machine.as_str())
+    )
+}
+
+/// Slug a machine name into its generated-kernel submodule (mirror of the
+/// `machine_slug` helper in the render module — copied here so the
+/// artifacts layer doesn't depend on render-internal visibility).
+fn machine_module_slug(machine_name: &str) -> String {
+    let trimmed = machine_name.strip_suffix("Machine").unwrap_or(machine_name);
+    to_snake_case_local(trimmed)
+}
+
+fn to_snake_case_local(value: &str) -> String {
+    let mut out = String::new();
+    let mut previous_is_sep = true;
+    for ch in value.chars() {
+        if ch == '_' || ch == '-' || ch == ' ' {
+            if !previous_is_sep {
+                out.push('_');
+                previous_is_sep = true;
+            }
+            continue;
+        }
+        if ch.is_ascii_uppercase() {
+            if !out.is_empty() && !previous_is_sep {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+            previous_is_sep = false;
+        } else {
+            out.push(ch.to_ascii_lowercase());
+            previous_is_sep = false;
+        }
+    }
+    out.trim_matches('_').to_owned()
+}
+
+/// PascalCase a slug-identifier (letters, digits, `_`, `-`). Used to
+/// derive Rust enum names from composition and instance slugs.
+fn to_pascal_case(value: &str) -> String {
+    let mut out = String::new();
+    let mut capitalize = true;
+    for ch in value.chars() {
+        if ch == '_' || ch == '-' || ch == ' ' {
+            capitalize = true;
+            continue;
+        }
+        if capitalize {
+            out.extend(ch.to_uppercase());
+            capitalize = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
 
 pub fn render_machine_semantic_model(schema: &MachineSchema) -> String {
     let mut compiler = MachineTlaCompiler::new(schema);
@@ -2155,12 +2297,9 @@ fn render_default_domain_assignment(
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        TypeRef::Named(name) | TypeRef::Enum(name) => render_named_domain_assignment(
-            name,
-            sample_cardinality,
-            named_samples,
-            named_bindings,
-        ),
+        TypeRef::Named(name) | TypeRef::Enum(name) => {
+            render_named_domain_assignment(name, sample_cardinality, named_samples, named_bindings)
+        }
         TypeRef::Seq(inner) => {
             let samples = sample_values(
                 inner,
@@ -2398,9 +2537,7 @@ fn collect_composition_named_bindings<'a>(
     for machine in machines_by_instance {
         for binding in &machine.named_types {
             let slug = binding.name.as_str().to_owned();
-            merged
-                .entry(slug)
-                .or_insert_with(|| binding.rust.clone());
+            merged.entry(slug).or_insert_with(|| binding.rust.clone());
         }
     }
     merged
