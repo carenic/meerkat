@@ -3,180 +3,201 @@
 Status: Analysis input for wave (c) coupling decisions. READ-ONLY survey.
 Scope: The 5 canonical machines in the 0.6 catalog as of `meerkat-machine-schema/src/catalog/dsl/`.
 
-## 0. Baseline
+## 0. Policy reframe (this doc's anchor)
 
-Historical base rate from the 0.5→0.6 chronicle: **1 of 16 v0.5 machines survived to 0.6 by name** (`flow_run`); 94% non-survival. That is the prior we should couple against. Wave (c) will bind shell code much more tightly to today's machines; anything we hardcode by Rust type or struct name becomes the next wave-a demolition target when one of them moves.
+Before any analysis: the following policy is stated, not open.
 
-Current canonical set (5), sizes measured against `catalog/dsl/*.rs`:
+1. **No splits.** The 25+ → 5 machine reduction was the fix for systematic seam failures across the 0.5 codebase. Re-introducing machines re-introduces those failures. Split risk is therefore treated as a policy non-risk in this document; we do not score it. Any future pressure to "lift a concern out" is rejected by default.
+2. **Architectural intent is two machines**: `MeerkatMachine` and `MobMachine`. The other three — `ScheduleLifecycleMachine`, `OccurrenceLifecycleMachine`, `AuthMachine` — are **tolerated as independent**, under a tacit agreement that they *may* fold into `MeerkatMachine` in a future release for architectural cleanliness. That direction of motion (merge up into Meerkat) is the only live boundary question.
+3. **Verification cost is not the forcing function.** TLA+ on the current catalog runs in seconds; complexity budget is not the reason a merge would happen. Merges would be for seam / dogma cleanliness, not for model-checking cost.
 
-| Machine | DSL LOC | Phases | Core role |
+Baseline prior: 1 of 16 v0.5 machines survived to 0.6 by name (`flow_run`). The chronicle's 94% non-survival rate should not be read as "splits are likely"; it should be read as "merges/collapses are the direction of travel, and we should couple wave (c) against that."
+
+## 1. Machine sizes
+
+| Machine | DSL LOC | Phases | Role |
 |---|---|---|---|
-| `MeerkatMachine` | 3059 | 8 (Initializing / Idle / Attached / Running / Retired / Stopped / Destroyed / + Recovering dead) | session-scoped execution kernel |
-| `MobMachine` | 1387 | 4 (Running / Stopped / Completed / Destroyed) | mob-scoped orchestration + topology |
-| `OccurrenceLifecycleMachine` | 345 | 9 (Pending / Claimed / Dispatching / AwaitingCompletion / Completed / Skipped / Misfired / Superseded / DeliveryFailed) | per-occurrence dispatch |
-| `ScheduleLifecycleMachine` | 224 | 3 (Active / Paused / Deleted) | schedule trigger lifecycle |
-| `AuthMachine` | 164 | 5 (Valid / Expiring / Refreshing / ReauthRequired / Released) | per-binding auth lease |
+| `MeerkatMachine` | 3059 | 8 | session-scoped execution kernel |
+| `MobMachine` | 1387 | 4 | mob-scoped orchestration + topology |
+| `OccurrenceLifecycleMachine` | 345 | 9 | per-occurrence dispatch |
+| `ScheduleLifecycleMachine` | 224 | 3 | schedule trigger lifecycle |
+| `AuthMachine` | 164 | 5 | per-binding auth lease |
 
-The sizes matter: `MeerkatMachine` is an order of magnitude bigger than any sibling. Big machines have more heterogeneous concerns, and therefore more split risk.
+Schedule + Occurrence + Auth combined = 733 DSL LOC, about one-quarter the size of MeerkatMachine today.
 
-## 1. Per-machine concern enumeration
+## 2. Per-machine concern enumeration
 
-### 1.1 MeerkatMachine (`meerkat-machine-schema/src/catalog/dsl/meerkat_machine.rs:9-220`)
+Kept for grounding — useful regardless of boundary policy. Citations are to `meerkat-machine-schema/src/catalog/dsl/`.
 
-Concerns owned by the extended state block (verbatim groups from the DSL file, cited):
+### 2.1 MeerkatMachine (`meerkat_machine.rs:9-220`)
 
-1. **Session lifecycle & identity** — `session_id`, `active_runtime_id`, `active_fence_token`, `current_run_id`, `pre_run_phase`, `lifecycle_phase` (lines 10-15).
-2. **Ops / turn execution** — `silent_intent_overrides` (16), committed-visible-set transitions (`PublishCommittedVisibleSet*` lines 981-1087), boundary apply (`BoundaryAppliedPublish` 972).
-3. **Realtime attachment authority** — `realtime_intent_present`, `realtime_binding_state`, `realtime_binding_authority_epoch`, `realtime_reattach_required`, `realtime_next_authority_epoch` (20-24); plus `realtime_product_turn_phase` (76), `realtime_projection_freshness` (87), `realtime_reconnect_policy` (96).
-4. **Live-topology reconfigure** — `live_topology_phase` (27), `ReconfigureSessionLlmIdentity*` transitions (803-832).
-5. **MCP server authority** — `mcp_server_states` (32).
-6. **Peer interaction lifecycle** — `pending_peer_requests`, `inbound_peer_requests` (41-43).
-7. **Session context advancement** — `last_session_context_updated_at_ms` (53).
-8. **Interaction stream lifecycle** — `reserved_interaction_streams`, `attached_interaction_streams` (66-67).
-9. **Peer-ingress transport capability** — `peer_ingress_owner_kind`, `peer_ingress_comms_runtime_id`, `peer_ingress_mob_id` (110-112).
-10. **Supervisor-bridge authorization** — `supervisor_binding_kind` + bound name/peer_id/address/epoch (130-134).
-11. **Track-B peer projection** — `local_endpoint`, `direct_peer_endpoints`, `mob_overlay_peer_endpoints`, `peer_projection_epoch`, `mob_overlay_epoch` (175-179).
-12. **Drain lifecycle** — `NotifyDrainExited` (928), `EnsureDrainRunning*` (1283-1299).
+1. Session lifecycle & identity — `session_id`, `active_runtime_id`, `active_fence_token`, `current_run_id`, `pre_run_phase`, `lifecycle_phase` (10-15).
+2. Ops / turn execution — `silent_intent_overrides` (16); committed-visible-set transitions (981-1087); boundary apply (972).
+3. Realtime attachment authority — `realtime_intent_present`, `realtime_binding_state`, `realtime_binding_authority_epoch`, `realtime_reattach_required`, `realtime_next_authority_epoch` (20-24); `realtime_product_turn_phase` (76); `realtime_projection_freshness` (87); `realtime_reconnect_policy` (96).
+4. Live-topology reconfigure — `live_topology_phase` (27); `ReconfigureSessionLlmIdentity*` transitions (803-832).
+5. MCP server authority — `mcp_server_states` (32).
+6. Peer interaction lifecycle — `pending_peer_requests`, `inbound_peer_requests` (41-43).
+7. Session context advancement — `last_session_context_updated_at_ms` (53).
+8. Interaction stream lifecycle — `reserved_interaction_streams`, `attached_interaction_streams` (66-67).
+9. Peer-ingress transport capability — `peer_ingress_owner_kind` and companions (110-112).
+10. Supervisor-bridge authorization — `supervisor_binding_kind` and companions (130-134).
+11. Track-B peer projection — `local_endpoint`, `direct_peer_endpoints`, `mob_overlay_peer_endpoints`, `peer_projection_epoch`, `mob_overlay_epoch` (175-179).
+12. Drain lifecycle — `NotifyDrainExited` (928); `EnsureDrainRunning*` (1283-1299).
 
-That is 12 distinct concerns in one machine. Nothing enforces they stay together.
+### 2.2 MobMachine (`mob_machine.rs:9-50`)
 
-### 1.2 MobMachine (`.../dsl/mob_machine.rs:9-50`)
+1. Mob lifecycle (72-76).
+2. Member lifecycle / runtime roster (11-21).
+3. Coordinator binding (16; signals 151-152).
+4. Run accounting (14-15).
+5. Identity↔runtime map (29).
+6. Wiring graph (25).
+7. Member-session bindings + topology epoch (48-49).
+8. Task board (32-36).
+9. Flow/frame/loop execution — via compat kernels `FlowRunMachine`, `FlowFrameMachine`, `LoopIterationMachine` in `meerkat-machine-schema/src/compat/`.
 
-1. **Mob lifecycle** — `lifecycle_phase` with 4 phases (72-76).
-2. **Member lifecycle (runtime roster)** — `live_runtime_ids`, `externally_addressable_runtime_ids`, `runtime_fence_tokens`, `member_state_markers` (11-21).
-3. **Coordinator binding** — `coordinator_bound` (16), `BindCoordinator`/`UnbindCoordinator` signals (151-152).
-4. **Run accounting** — `active_run_count`, `pending_spawn_count` (14-15).
-5. **Identity↔runtime map** — `identity_to_runtime` (29).
-6. **Wiring graph** — `wiring_edges` (25).
-7. **Member-session bindings (W3-H / dogma #4)** — `member_session_bindings: Map<AgentIdentity, SessionId>` (48) + `topology_epoch` (49).
-8. **Task board** — `tasks`, `in_progress_task_ids`, `completed_task_ids` (32-36).
-9. **Flow/frame/loop execution** — consumed via compat bridges (`FlowRunMachine`, `FlowFrameMachine`, `LoopIterationMachine` in `meerkat-machine-schema/src/compat/`); the mob authority machine calls out to those kernels rather than owning them inline.
+### 2.3 OccurrenceLifecycleMachine (`occurrence_lifecycle.rs:8-63`)
 
-### 1.3 OccurrenceLifecycleMachine (`.../dsl/occurrence_lifecycle.rs:8-29`)
+1. Occurrence lifecycle phase — 9 phases; terminal `[Completed, Skipped, Misfired, Superseded, DeliveryFailed]`.
+2. Claim / lease management (15-19).
+3. Dispatch correlation (20-25).
+4. Failure classification (22-26).
+5. Revision / supersede (12-27).
+6. Targeting (14-15).
 
-1. **Occurrence lifecycle phase** — 9 phases, terminal set `[Completed, Skipped, Misfired, Superseded, DeliveryFailed]` (53-63).
-2. **Claim / lease management** — `claimed_by`, `lease_expires_at_utc_ms`, `claimed_at_utc_ms`, `claim_token` (15-19).
-3. **Dispatch correlation** — `delivery_correlation_id`, `last_receipt`, `dispatched_at_utc_ms`, `completed_at_utc_ms` (20-25).
-4. **Failure classification** — `failure_class`, `failure_detail`, `attempt_count` (22-26).
-5. **Revision / supersede** — `schedule_revision`, `occurrence_ordinal`, `superseded_by_revision` (12-27).
-6. **Targeting** — `target_binding_key`, `due_at_utc_ms` (14-15).
+### 2.4 ScheduleLifecycleMachine (`schedule_lifecycle.rs:8-37`)
 
-### 1.4 ScheduleLifecycleMachine (`.../dsl/schedule_lifecycle.rs:8-18`)
+1. Schedule phase — Active / Paused / Deleted.
+2. Trigger key (11).
+3. Target binding (12).
+4. Policies — misfire / overlap / missing-target (13-15).
+5. Planning window (16-17).
+6. Revision (10).
 
-1. **Schedule phase** — Active / Paused / Deleted (33-37).
-2. **Trigger key** — `trigger_key` (11).
-3. **Target binding** — `target_binding_key` (12).
-4. **Policies** — `misfire_policy`, `overlap_policy`, `missing_target_policy` (13-15).
-5. **Planning window** — `planning_cursor_utc_ms`, `next_occurrence_ordinal` (16-17).
-6. **Revision** — `revision` (10).
+### 2.5 AuthMachine (`auth_machine.rs:24-50`)
 
-### 1.5 AuthMachine (`.../dsl/auth_machine.rs:24-50`)
+1. Lease phase — Valid / Expiring / Refreshing / ReauthRequired / Released.
+2. Expiry watermark (31).
+3. Refresh bookkeeping (32-33).
 
-1. **Lease phase** — Valid / Expiring / Refreshing / ReauthRequired / Released (44-50).
-2. **Expiry watermark** — `expires_at` (31).
-3. **Refresh bookkeeping** — `last_refresh`, `refresh_attempt` (32-33).
+Per-binding instance, <200 LOC including transitions. The header (3-23) documents that absorption into MeerkatMachine was tried, reviewed, and reversed — but the review rationale was "orthogonal per-binding fact," which is a *preference* argument, not a *forcing* one. It remains a merge candidate.
 
-That's it. Per-binding, 3 fields, <200 LOC including transitions.
+## 3. Split risk — out of scope
 
-## 2. Split-risk analysis
+Per the policy in §0, split risk is not analyzed. Any proposal that moves a concern out of `MeerkatMachine` or `MobMachine` into a new machine is rejected by default. The concern enumeration in §2 exists to ground merge analysis and to inform wave (c) coupling — not to argue for future fission.
 
-### MeerkatMachine — **HIGH** split risk
+## 4. Merge analysis (the live question)
 
-This is the obvious candidate. Twelve concerns, 3059 LOC, three of them (realtime attachment, supervisor-bridge authorization, Track-B peer projection) are recent additions with their own epoch namespaces (`realtime_next_authority_epoch`, `supervisor_bound_epoch`, `peer_projection_epoch` distinct from `mob_overlay_epoch`). The DSL comments even disclaim the coupling — Track-B calls out "dogma #11: derived projections never authoritative" (lines 149-150), and the peer-ingress block explicitly names "the s71 regression class closed structurally" (lines 107-108) as the rationale for absorbing it.
+Architectural intent: 2 machines (`MeerkatMachine`, `MobMachine`). Today we have 5. Score merge likelihood for the three tolerated-independents, and enumerate the criteria that would actually flip the decision.
 
-Candidate future splits:
+### 4.1 AuthMachine → MeerkatMachine
 
-- **Realtime attachment sub-machine.** 8 realtime fields (20-24, 76, 87-88, 96) with their own authority epoch. A realtime-focused overhaul (the `realtime-259-port-plan.md` already cited in comments) is the most likely trigger.
-- **Peer interaction / interaction-stream sub-machine.** Fields 41-67 are one coupled subsystem (peer request lifecycle, stream reservation/attach). Already has two independent cleanup effects (`PeerInteractionCleanup`, `InteractionStreamCleanup`).
-- **Supervisor-bridge authorization sub-machine.** Fields 130-134 are a self-contained authorization fact with its own invariant (`supervisor_binding_consistency`).
-- **Track-B peer projection sub-machine.** Already described as "peer-projection state" with its own epoch (175-179).
+**Merge likelihood: Medium.**
 
-The machine also straddles two timescales: *per-turn* (pre_run_phase, silent_intent_overrides, current_run_id) versus *across-turns* (mcp_server_states, supervisor_binding_kind, realtime_binding_state). That heterogeneity is the textbook tell for future separability.
+Signal for merge:
+- Tiny (164 LOC, 3 stateful fields, 5 phases, 1 cross-machine routed effect absent).
+- Already attempted once; reversal rationale (`auth_machine.rs:3-23`) is "orthogonal per-binding fact," which is a *preference* argument rooted in TLC state-space pressure — and §0 says TLC cost is no longer the forcing function.
+- AuthMachine has a per-binding cardinality (`<realm_id>:<binding_id>`) that `MeerkatMachine` today does not natively model per-session. That's a real data-model friction. But `MeerkatMachine` already carries maps keyed on composite IDs (`mcp_server_states: Map<McpServerId, ...>`), so the pattern is precedented.
+- No shell-side public-surface coupling today — see §5.3: only schema / catalog / tests reference the type. A merge is therefore a low-blast-radius change.
 
-### MobMachine — **MEDIUM** split risk
+Signal against merge:
+- Per-binding instance lifecycle is genuinely orthogonal to session lifecycle (auth can expire while no session is running).
+- The original review explicitly landed on "keep separate." That decision should be honored unless a forcing signal appears.
 
-Slimmer and more coherent after the 0.6 simplification pass (`machine-simplification-proposal.md:43-97` documents the deliberate pruning of kickoff / step-dispatch / frame-terminal / loop-mirror layers). However:
+**Concrete criteria that would trigger a merge decision:**
+1. A dogma violation where auth-lease truth and session truth drift (e.g. a shell holds "this session has valid auth" while the AuthMachine says `ReauthRequired`). That's the classic "one semantic fact, one owner" (dogma §1) break that forces collapse.
+2. A new feature that requires atomic state transitions across auth and session (e.g. "pause all sessions on this binding while lease refreshes"). Two-machine atomicity is expensive; merged-machine atomicity is a single transition.
+3. AuthMachine acquiring >1 cross-machine routed effect to MeerkatMachine.
+4. Auth state escaping into `MeerkatMachine` shadow fields — i.e. the 0.5-style seam failure that motivated the collapse in the first place.
 
-- **Flow/frame/loop execution** lives in separate compat kernels (`FlowRunMachine`, `FlowFrameMachine`, `LoopIterationMachine`). They are the one name-survivor from 0.5 for a reason — they have already proven separable. Risk: they re-absorb into Mob, or further split as distributed mob topologies land.
-- **Task board** (fields 32-36) is orthogonal to roster/wiring. If cross-mob task migration or persistent task queues land, this could lift into its own machine.
-- **W3-H member-session bindings** are DSL-canonical but new (2026-04 per memory/feedback_preserve_bridge_transport). Any identity-first refactor that changes the identity↔runtime↔session cardinality will touch it.
+### 4.2 ScheduleLifecycleMachine + OccurrenceLifecycleMachine → MeerkatMachine
 
-### OccurrenceLifecycleMachine — **LOW–MEDIUM** split risk
+**Merge likelihood: Low (as a pair); Very low (individually).**
 
-A 9-phase lifecycle with a clean terminal set. Claim/lease management is arguably separable from dispatch-correlation state, and future leader-elected delivery would stress that seam, but today it's tight.
+Signal for merge:
+- Combined 569 DSL LOC. Not a complexity barrier.
+- Both ultimately deliver into session/mob — their outputs become `MeerkatMachine` inputs.
 
-### ScheduleLifecycleMachine — **LOW** split risk
+Signal against merge:
+- Cardinality is fundamentally wrong for folding into `MeerkatMachine`. Schedules/occurrences are runtime-level, not session-scoped. A `MeerkatMachine` instance exists per session; schedules outlive sessions, fire when no session is attached, and target `target_binding_key`s that may resolve to zero or many sessions.
+- Schedule→Occurrence is already modeled as cross-machine routing (`meerkat-schedule/src/machines/schedule_lifecycle.rs:82`: `disposition SupersedePendingOccurrences => routed [OccurrenceLifecycleMachine]`). That routing is explicit about a 1:N parent-child relationship.
+- Folding them into `MeerkatMachine` would require `MeerkatMachine` state to carry schedule maps and occurrence maps. That is not a cleanliness win — it mixes per-session and cross-session state in one machine, which is precisely what the 0.5→0.6 collapse was trying to avoid.
 
-Small, simple, 3 phases. No plausible split axis.
+**If merge happens, it probably isn't into MeerkatMachine.** A more coherent merge would be `ScheduleLifecycleMachine + OccurrenceLifecycleMachine → ScheduleMachine` (one machine, per-schedule instance, occurrences modeled as an inner map). That stays within the "fewer machines" policy while respecting cardinality.
 
-### AuthMachine — **LOW** split risk
+**Concrete criteria that would trigger a (Schedule+Occurrence) → Schedule merge:**
+1. Durable evidence of a seam failure across the Schedule/Occurrence boundary (e.g. an occurrence lingering after its schedule is deleted, or a revision race).
+2. `SupersedePendingOccurrences` acquiring siblings — i.e. the Schedule→Occurrence routing contract growing to >3 routed dispositions, at which point the routing itself becomes a shadow machine.
+3. Planning-window bookkeeping (`planning_cursor_utc_ms`, `next_occurrence_ordinal`) needing per-occurrence reconciliation that's hard to express across two machines.
 
-164 LOC, 3 stateful fields, per-binding instance. Already the result of a *merge rejection*: the auth_machine.rs header (lines 3-23) documents that the original design absorbed auth into MeerkatMachine and was **refactored out after review**. So the direction of drift has already been settled against absorption.
+**Criteria that would trigger a (Schedule or Occurrence) → MeerkatMachine merge:** essentially none that are plausible today. Would require eliminating the runtime-level scheduler and making schedules session-scoped, which is a product-level pivot, not an architectural cleanup.
 
-## 3. Merge-risk analysis
+### 4.3 Summary of merge pressure
 
-- **Occurrence + Schedule merge.** They share a domain (scheduler), but Schedule is a 1:N parent to Occurrence. `SupersedePendingOccurrences` in `meerkat-schedule/src/machines/schedule_lifecycle.rs:82` is `disposition => routed [OccurrenceLifecycleMachine]`, i.e. already modeled as cross-machine routing. Merging would force Schedule state to carry per-occurrence state, which is a strictly worse data model. **Low merge risk.** Opportunity: if a scheduler rewrite re-does the cardinality, they could collapse, but nothing in-repo hints at this.
-- **AuthMachine → MeerkatMachine absorption.** Already rejected and documented (`auth_machine.rs:3-23`). **Very low merge risk.**
-- **Schedule+Occurrence → MeerkatMachine.** No — they are runtime-level, not session-scoped. Cardinality is wrong.
-- **MobMachine + MeerkatMachine.** No — different scope (mob vs session). But the member-session binding map (`member_session_bindings`) is the exact seam where the two meet today, and cross-machine invariants (Track-B overlay) already flow between them. Risk is *further seam-protocolization*, not merge.
+| Merge | Likelihood | Blocking factor |
+|---|---|---|
+| Auth → Meerkat | Medium | Per-binding vs per-session cardinality; prior rejection |
+| Schedule → Meerkat | Very low | Cardinality (runtime vs session) |
+| Occurrence → Meerkat | Very low | Cardinality |
+| Schedule + Occurrence → one Schedule machine | Low | No forcing signal today, but the cleanest consolidation if pressure appears |
 
-Net: the 5 machines look stable against merges; splits are the only realistic direction of change.
+Net: `Schedule` and `Occurrence` are stable as two independents. `AuthMachine` is the one with a non-trivial chance of folding up.
 
-## 4. Current tight coupling (top offenders)
+## 5. Current shell-level coupling
 
-### 4.1 Struct-name imports of `MeerkatMachine`
+### 5.1 MeerkatMachine struct-name use (237+ sites)
 
-237 constructor sites (`MeerkatMachine::ephemeral()` / `MeerkatMachine::persistent(...)`) across non-target, non-test code. Highest-density offenders (live):
+Constructor sites `MeerkatMachine::ephemeral()` / `MeerkatMachine::persistent(...)` across non-target, non-test code. Highest-density live offenders:
 
-- `meerkat-cli/src/main.rs` — 14 occurrences, 5 at construction (`main.rs:5250, 9398, 9463, 9904, 10066`).
-- `meerkat-rpc/src/router.rs` — 4 occurrences, including `router.rs:2539` constructing `MeerkatMachine::persistent(...)` directly in the RPC surface.
+- `meerkat-cli/src/main.rs` — 14 occurrences; 5 constructor sites (`main.rs:5250, 9398, 9463, 9904, 10066`).
+- `meerkat-rpc/src/router.rs` — `router.rs:2539` constructs `MeerkatMachine::persistent(...)` in the RPC surface.
 - `meerkat-rest/src/lib.rs` — 3 occurrences.
-- `meerkat-mob/src/runtime/local_bridge.rs` — 7 constructor sites (`local_bridge.rs:252, 265, 278, 297, 316, 335, 350`).
+- `meerkat-mob/src/runtime/local_bridge.rs` — 7 constructor sites (lines 252, 265, 278, 297, 316, 335, 350).
 - `meerkat-mob-mcp/src/` — 5 constructor sites across `surface.rs`, `lib.rs`, `agent_tools.rs`.
-- `meerkat/src/service_factory.rs` — 2 constructor sites (`service_factory.rs:719, 920`).
+- `meerkat/src/service_factory.rs` — 2 sites (lines 719, 920).
 - `meerkat-openai/src/realtime_attachment.rs` — 3 sites.
 
-All of these bind the surface crate to the concrete struct `MeerkatMachine`. If the machine splits into (e.g.) `SessionCoreMachine + RealtimeAttachmentMachine`, every one of these call sites becomes a wave-a-style edit.
+These are **fine** under the current policy — shell may tightly couple to the two-machine set. But see §6 for one cheap hedge.
 
-### 4.2 String-literal machine names
+### 5.2 MobMachine
 
-`MachineId::parse("...")` appears in the compat bridges (`meerkat-machine-schema/src/compat/*.rs:15,598,1942,2089,2095,2101`) and `xtask/src/ownership_ledger.rs` has **28 literal `"MeerkatMachine"` occurrences** plus `xtask/src/rmat_policy.rs:191,193` hardcoding the `("MobMachine", ..., "MeerkatMachine")` tuple for routed-disposition rewrites. These are the RMAT-audit side; they are policy code, but they still encode machine identity as a string key and will need touching on any rename.
+Only `meerkat-mob/src/runtime/builder.rs` and `.../handle.rs` import `MobMachine` directly. Tight coupling, narrow blast radius.
 
-### 4.3 Schedule / Occurrence / Auth
+### 5.3 Schedule / Occurrence / Auth
 
-- `meerkat-schedule/src/lifecycle.rs` uses `sched_dsl::ScheduleLifecycleMachineAuthority` / `occ_dsl::OccurrenceLifecycleMachineAuthority` directly (lines 188-720). Single crate, tight coupling, but scoped.
-- `meerkat-machine-schema/src/lib.rs:61-79` hardcodes the four names `"ScheduleLifecycleMachine"`, `"OccurrenceLifecycleMachine"` in composition contract checks.
-- `AuthMachine` is only referenced in schema / catalog / tests / `e2e_auth_lane.rs` — no surface crate hardcodes its name today. Good.
+- `meerkat-schedule/src/lifecycle.rs` uses `sched_dsl::ScheduleLifecycleMachineAuthority` / `occ_dsl::OccurrenceLifecycleMachineAuthority` directly (lines 188-720). One crate, scoped.
+- `meerkat-machine-schema/src/lib.rs:61-79` hardcodes the names `"ScheduleLifecycleMachine"` and `"OccurrenceLifecycleMachine"` in composition contract checks.
+- `AuthMachine` is referenced only by schema, catalog, tests, and `tests/integration/tests/e2e_auth_lane.rs:190`. **No surface crate hardcodes its name.** This is the merge candidate most pre-adapted for the move — folding its 3 fields into `MeerkatMachine` would touch `meerkat-runtime/src/handles/auth_lease.rs` (the registry) but leave every surface crate untouched.
 
-### 4.4 No typed `MachineId`-keyed shell dispatch exists
+### 5.4 RMAT / xtask policy tables
 
-`MachineId` is a kernel-level identity (`meerkat-machine-kernels/src/runtime.rs:176-217`) used by the schema, compositions, and coverage manifests. It is **not** used by any shell crate for lookup; shells reach for `meerkat_runtime::MeerkatMachine` by Rust path. Wave (b)'s B-1 typed newtype exists but has no consumer in the shell dispatch path.
+`xtask/src/ownership_ledger.rs` has 28 string-literal `"MeerkatMachine"` entries; `xtask/src/rmat_policy.rs:191-193` hardcodes `("MobMachine", input, "MeerkatMachine")` tuples for routed-disposition rewrites. These are policy code, not shell, but they encode identity as strings. A future Auth → Meerkat merge would need a single pass here.
 
-## 5. Coupling recommendations for wave (c)
+## 6. Wave (c) coupling recommendations
 
-Bind shell code to machines in ways that tolerate a future split:
+Biased toward "couple tightly to the 5 machines, keep one cheap escape hatch."
 
-1. **Shell-level lookup by `MachineId`, not by Rust path.** Wave (c) should introduce an `Arc<dyn MachineHandle>` (or equivalent trait object) keyed by `MachineId`, so CLI/REST/RPC/MCP/mob-bridge obtain the session/mob/schedule/occurrence/auth handle via typed lookup. The 237 `MeerkatMachine::ephemeral()` call sites should reduce to a single factory that a split cannot multiply.
-2. **Never re-export concrete `MeerkatMachine`/`MobMachine` from the facade.** Today `meerkat-runtime::MeerkatMachine` is imported from 7+ surface crates. If wave (c) wraps this in a `MachineRegistry` or `SessionBindings` opaque type, the split cost collapses to one crate.
-3. **Namespace DSL per machine so splitting is a module-move.** `catalog/dsl/meerkat_machine.rs` is one 3059-line file. If the realtime sub-state (fields 20-96) were in `catalog/dsl/meerkat_machine/realtime.rs` today, lifting it to its own machine would be an rg+mv plus a regen. Wave (c) should enforce one-concern-per-file within any machine >500 LOC.
-4. **Keep machine identity off the wire.** Audit `meerkat-contracts` for any public wire/SDK type that mentions `MeerkatMachine`/`MobMachine`/etc. by name. SDK users should not be able to build code against a machine name; a split then has no external contract cost. (Not exhaustively checked in this pass — flag for wave (c) implementers.)
-5. **Protocolize cross-machine seams before wave (c) hardens shell bindings.** Today, `member_session_bindings` (Mob) and Track-B peer projection (Meerkat) are implicitly coupled via `RecomputeMobPeerOverlay`. Formalize that seam as an in-repo obligation ledger entry (the `formal-seam-closure.md` pattern) so a future Meerkat split cannot silently drop the obligation.
-6. **RMAT policy table by typed machine id.** `xtask/src/rmat_policy.rs:191-193` uses `(&str, &str, &str)` tuple keys; migrate to `(MachineId, InputVariantId, MachineId)`. Compiler-enforced after a rename.
+1. **Shell code may couple tightly.** The policy says no splits, so the 237-site `MeerkatMachine::ephemeral()` footprint is acceptable. Don't over-engineer split-resilience.
+2. **One cheap hedge: typed `MachineId` lookup where the cost is near zero.** Wave (b) landed the typed `MachineId` newtype (`meerkat-machine-schema/src/identity.rs:130`). Shell code that builds lookup tables keyed on machine identity (RMAT policy, xtask ownership ledger, composition contract checks) should use `MachineId` rather than `&str`. That way, an Auth → Meerkat fold is `s/MachineId::parse("AuthMachine")/MachineId::parse("MeerkatMachine")/` at a small set of call sites rather than a rewrite of dispatch.
+3. **Per-surface constructor funnels.** The CLI has 5 `MeerkatMachine::ephemeral()` sites; RPC, REST, mob-mcp each have their own. Wave (c) should consolidate per-surface construction to one helper (`service_factory::build_meerkat_machine(...)` already partially exists). If Auth merges into Meerkat, the signature change hits 1 site per surface rather than 14.
+4. **Keep machine identity off the public wire.** Audit `meerkat-contracts` in wave (c) to ensure no SDK/JSON-RPC wire type mentions `MeerkatMachine` / `MobMachine` / etc. by name. SDK clients should never be able to build code against machine identity. Not exhaustively scanned in this pass — flag for wave (c) implementers. (A merge should never be a public-wire breaking change.)
+5. **Protocolize the Auth↔Meerkat seam now.** Since Auth is the live merge candidate, wave (c) should explicitly model the seam between `AuthMachine` and `MeerkatMachine` as a formal handoff (the `docs/architecture/formal-seam-closure.md` pattern). That does two things: (a) it closes the §4.1 trigger condition #1 (state drift) by design; (b) if a future merge does happen, the seam *becomes* internal transitions of `MeerkatMachine` with no surface change.
+6. **No new machines in wave (c).** Direct corollary of §0. If wave (c) implementers reach for "let's lift X into its own machine," the review answer is "no — extend `MeerkatMachine` or `MobMachine`."
 
-## 6. Leading indicators to track
+## 7. Leading indicators for merge decisions
 
-The chronicle's "`meerkat-core` churn velocity" is one. Others specific to machine-boundary moves:
+What to watch in the coming releases to decide if a merge is justified. These are merge-triggering signals, not split-predicting ones (per §0).
 
-1. **DSL LOC growth rate per machine.** `MeerkatMachine` going from N to 2N in a release is the loudest split signal; track the 3 biggest machines per minor.
-2. **Number of distinct epoch namespaces inside one machine.** `MeerkatMachine` today has at least 4 independent epoch counters (`realtime_next_authority_epoch`, `peer_projection_epoch`, `mob_overlay_epoch`, `supervisor_bound_epoch`, plus implicit turn epoch). Every new epoch field is a latent split axis — each epoch usually means "this concern has its own linearization order."
-3. **Count of distinct terminal/cleanup effects.** `PeerInteractionCleanup` + `InteractionStreamCleanup` + `CommsTrustReconcileRequested` living in one machine means that machine is running three independent reclamation loops. >2 is a smell.
-4. **Cross-machine routed effects.** Each new `routed [Other]` disposition (e.g. `SupersedePendingOccurrences` → `OccurrenceLifecycleMachine`) is evidence the seam is load-bearing. If a single machine accumulates many inbound routes, it's pulling gravity; if a machine accumulates many outbound routes, it's probably fissioning.
-5. **Surface-only input growth.** `machine-simplification-proposal.md:43-58` shows 40+ Meerkat queries moved to `surface_only_inputs`. Continued growth of this list in one machine is a tell that the machine has become an API facade rather than an authority — a refactoring pressure that often precedes a split.
-6. **TLC state-space inflation per minor.** Post-simplification baseline (`machine-simplification-proposal.md:29,37`): Meerkat 3,959 distinct states, Mob 6,401. Monitor: a >2x jump with no new phases means new orthogonal state — i.e. an in-progress hidden machine.
-7. **Hopcroft quotient ratio (raw / phase).** Same source: phase-quotient close to raw quotient = clean phase-projection; divergence = internal state the phase projection does not see, which is also a split tell.
+1. **State drift between a sibling machine and its parent.** If `AuthMachine` lease truth diverges from whatever `MeerkatMachine` believes about auth validity — even for one session — that is a dogma §1 break and the strongest merge forcing function.
+2. **Cross-machine routed-disposition count.** Today `ScheduleLifecycleMachine` has exactly one routed effect to Occurrence (`SupersedePendingOccurrences`, `meerkat-schedule/src/machines/schedule_lifecycle.rs:82`). If that grows to ≥3, the routing contract is itself a shadow machine — merge (likely Schedule + Occurrence) is the cleanup.
+3. **Shell fields that mirror sibling-machine state.** If audit finds handwritten shell code caching `AuthLifecyclePhase` values or polling `AuthMachineAuthority` to synthesize session-level decisions, the machine is paying the cost of separation without the semantic benefit. Merge.
+4. **Cardinality coincidence.** Today `AuthMachine` is per-binding, `MeerkatMachine` per-session. If a realm configuration ever forces 1:1 auth:session for a meaningful subset of deployments (e.g. user-session-bound OAuth), the cardinality argument against merge weakens.
+5. **Epoch namespace proliferation inside MeerkatMachine or MobMachine.** Already 4+ independent epoch namespaces live inside `MeerkatMachine` (`realtime_next_authority_epoch`, `peer_projection_epoch`, `mob_overlay_epoch`, `supervisor_bound_epoch`). Read this as: the parent machines are *already* absorbing the state a split would have lifted out. This is the policy working; track whether a new epoch family appears with each release.
+6. **Surface-only input growth.** `machine-simplification-proposal.md` documents 40+ Meerkat inputs reclassified as `surface_only`. Continued growth means the machine is becoming an API facade, which is evidence the fact population inside it is stable (good — nothing to merge into from outside) or evidence that it is attracting accidental API surface (neutral).
+7. **TLC green continues at seconds-scale.** Per §0, this is not a forcing function for further collapse, but a regression (TLC going from seconds to minutes) would be the one signal we *don't* want to ignore — it would indicate state inflation that simplification passes should address.
 
-Track items (1), (2), (4) routinely in CI; (6) and (7) are already emitted by `cargo xtask machine-hopcroft`. Budget a wave-c-review gate that fails if any machine's DSL LOC grows >25% in one release without a corresponding split.
+Track items (1), (2), (3) routinely; they are the ones that would actually flip a merge decision.
 
 ## Summary
 
-`MeerkatMachine` carries high split risk (12 concerns, multiple epoch namespaces, three recent additions that already read as future sub-machines); `MobMachine` is medium (stable core but flow/frame kernels and task board are separable); `OccurrenceLifecycleMachine` is low-medium; `ScheduleLifecycleMachine` and `AuthMachine` are low. The biggest wave-(c)-observable coupling problem today is the 237+ direct constructor sites of `MeerkatMachine` spread across every surface crate plus `meerkat-mob-mcp`, `meerkat-openai`, and the CLI — any split turns each into an edit. Wave (c) should route all shell-to-machine lookups through a `MachineId`-keyed registry, keep machine identity off the public wire, file-split any machine >500 LOC by concern, and treat cross-machine routed dispositions + per-machine epoch-namespace count as the leading indicators that a boundary move is coming.
+Per the stated policy, splits are rejected by default; the only live boundary question is whether `AuthMachine`, `ScheduleLifecycleMachine`, or `OccurrenceLifecycleMachine` should later fold up toward the 2-machine architectural intent. `AuthMachine` is the one with non-trivial (medium) merge likelihood: it's tiny, already tried once, has no surface-crate coupling, and could be absorbed into `MeerkatMachine` with a single-pass touch. `ScheduleLifecycleMachine` + `OccurrenceLifecycleMachine` are unlikely to fold into `MeerkatMachine` at all (cardinality is wrong); if they merge, it's with each other into one `ScheduleMachine`, driven by routed-disposition growth across their shared seam. Wave (c) should let shell code couple tightly to the current 5-machine set, route composition-layer and xtask-policy identity through typed `MachineId` (near-zero cost), funnel per-surface constructors to one site per surface, keep machine identity off the public wire, and protocolize the Auth↔Meerkat seam today so a future fold lands as internal-to-Meerkat transitions with no surface break. The leading indicator to watch is auth-state drift across the Auth/Meerkat boundary — that's the one signal that would turn the medium-likelihood merge into a forced one.
