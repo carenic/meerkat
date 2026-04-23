@@ -96,9 +96,6 @@ pub struct RuntimeTurnMetadata {
     /// Handling mode for staged ordinary work when admitted through runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handling_mode: Option<HandlingMode>,
-    /// `None` = use session default; `Some(true)` = force keep-alive; `Some(false)` = force non-keep-alive.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keep_alive: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_references: Option<Vec<SkillKey>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -114,11 +111,6 @@ pub struct RuntimeTurnMetadata {
     /// Override provider-specific parameters for this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_params: Option<serde_json::Value>,
-    /// Override realm-scoped connection binding for this turn (deferral
-    /// §2). On materialized sessions, scopes the hot-swap credential
-    /// fetch to this realm + binding.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub connection_ref: Option<crate::ConnectionRef>,
     /// Optional normalized rendering metadata for this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_metadata: Option<RenderMetadata>,

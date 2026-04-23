@@ -717,20 +717,6 @@ pub struct StartTurnRequest {
     pub skill_references: Option<Vec<crate::skills::SkillKey>>,
     /// Optional per-turn flow tool overlay (ephemeral, non-persistent).
     pub flow_tool_overlay: Option<TurnToolOverlay>,
-    /// Optional additional instructions prepended as `[SYSTEM NOTICE: ...]` to the user prompt.
-    ///
-    /// Unlike `SessionBuildOptions.additional_instructions` (which are appended to the
-    /// system prompt as extra sections at session creation), turn-level instructions
-    /// are prepended to the user message as `[SYSTEM NOTICE: {instruction}]` blocks.
-    /// This distinction means create-time instructions persist across turns (system prompt)
-    /// while turn-level instructions are per-turn only (conversation history).
-    pub additional_instructions: Option<Vec<String>>,
-    /// Typed execution intent from the runtime layer.
-    ///
-    /// `Some(ContentTurn)` forces `run_turn`, `Some(ResumePending)` forces
-    /// `run_pending`. `None` preserves the existing `has_prompt` heuristic
-    /// for non-runtime substrate-direct paths.
-    pub execution_kind: Option<crate::lifecycle::run_primitive::RuntimeExecutionKind>,
 }
 
 /// Request to append runtime system context to an existing session.
