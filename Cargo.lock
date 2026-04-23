@@ -6856,6 +6856,7 @@ dependencies = [
  "quote",
  "serde",
  "serde_json",
+ "serde_yaml",
  "syn",
  "tempfile",
  "toml 0.8.23",
