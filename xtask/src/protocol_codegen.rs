@@ -257,10 +257,10 @@ fn generate_obligation_struct(
     protocol: &EffectHandoffProtocol,
     producer_machine: &MachineSchema,
 ) -> Result<String> {
-    let obligation_type = format!("{}Obligation", to_pascal_case(&protocol.name));
+    let obligation_type = format!("{}Obligation", to_pascal_case(protocol.name.as_str()));
     let producer_effect = producer_machine
         .effects
-        .variant_named(&protocol.effect_variant)
+        .variant_named(protocol.effect_variant.as_str())
         .context("producer effect variant missing")?;
 
     writeln!(out, "#[derive(Debug, Clone)]")?;
@@ -269,13 +269,15 @@ fn generate_obligation_struct(
         writeln!(out, "    _private: (),")?;
     } else {
         for field in &protocol.obligation_fields {
-            let effect_field = producer_effect.field_named(field).with_context(|| {
-                format!("obligation field `{field}` missing from producer effect")
-            })?;
+            let effect_field = producer_effect
+                .field_named(field.as_str())
+                .with_context(|| {
+                    format!("obligation field `{field}` missing from producer effect")
+                })?;
             writeln!(
                 out,
                 "    pub {}: {},",
-                to_snake_case(field),
+                to_snake_case(field.as_str()),
                 rust_type(&effect_field.ty)
             )?;
         }
@@ -323,10 +325,10 @@ fn generate_executor_helpers(
         .context("executor trigger variant missing from producer machine")?;
     let producer_effect = producer_machine
         .effects
-        .variant_named(&protocol.effect_variant)
+        .variant_named(protocol.effect_variant.as_str())
         .context("producer effect missing")?;
 
-    let result_type = format!("{}ExecutionResult", to_pascal_case(&protocol.name));
+    let result_type = format!("{}ExecutionResult", to_pascal_case(protocol.name.as_str()));
     writeln!(out, "#[derive(Debug)]")?;
     writeln!(out, "pub struct {result_type} {{")?;
     writeln!(out, "    pub effects: Vec<{effect_enum}>,")?;
@@ -338,7 +340,13 @@ fn generate_executor_helpers(
     let trigger_params = trigger_variant
         .fields
         .iter()
-        .map(|field| format!("{}: {}", to_snake_case(&field.name), rust_type(&field.ty)))
+        .map(|field| {
+            format!(
+                "{}: {}",
+                to_snake_case(field.name.as_str()),
+                rust_type(&field.ty)
+            )
+        })
         .collect::<Vec<_>>();
     writeln!(
         out,
@@ -379,7 +387,7 @@ fn generate_executor_helpers(
             feedback,
             producer_machine
                 .inputs
-                .variant_named(&feedback.input_variant)?,
+                .variant_named(feedback.input_variant.as_str())?,
             FeedbackReturnKind::Effects,
             obligation_type,
         )?;
@@ -394,7 +402,7 @@ fn generate_executor_helpers(
                 feedback,
                 producer_machine
                     .inputs
-                    .variant_named(&feedback.input_variant)?,
+                    .variant_named(feedback.input_variant.as_str())?,
                 FeedbackReturnKind::Effects,
             )?;
         }
@@ -419,7 +427,7 @@ fn generate_effect_extractor_helpers(
     );
     let producer_effect = producer_machine
         .effects
-        .variant_named(&protocol.effect_variant)
+        .variant_named(protocol.effect_variant.as_str())
         .context("producer effect missing")?;
 
     writeln!(
@@ -450,15 +458,18 @@ fn generate_effect_extractor_helpers(
     }
 
     for feedback in &protocol.allowed_feedback_inputs {
-        let target_machine =
-            machine_for_instance(composition, machine_by_name, &feedback.machine_instance)?;
+        let target_machine = machine_for_instance(
+            composition,
+            machine_by_name,
+            feedback.machine_instance.as_str(),
+        )?;
         generate_feedback_submitter(
             out,
             protocol,
             feedback,
             target_machine
                 .inputs
-                .variant_named(&feedback.input_variant)?,
+                .variant_named(feedback.input_variant.as_str())?,
             FeedbackReturnKind::Transition(std::marker::PhantomData),
             obligation_type,
         )?;
@@ -518,7 +529,7 @@ fn generate_handle_bridge_helpers(
     for feedback in &protocol.allowed_feedback_inputs {
         let method_name = rust
             .handle_method_names
-            .get(&feedback.input_variant)
+            .get(feedback.input_variant.as_str())
             .with_context(|| {
                 format!(
                     "HandleBridge missing handle_method_names entry for `{}`",
@@ -540,9 +551,12 @@ fn generate_handle_bridge_helpers(
             ProtocolGenerationMode::Executor => true,
         };
         let fn_name = if another_mode_emits_submit {
-            format!("submit_{}_handle", to_snake_case(&feedback.input_variant))
+            format!(
+                "submit_{}_handle",
+                to_snake_case(feedback.input_variant.as_str())
+            )
         } else {
-            format!("submit_{}", to_snake_case(&feedback.input_variant))
+            format!("submit_{}", to_snake_case(feedback.input_variant.as_str()))
         };
 
         // When `handle_method_forwarded_fields` is declared for this
@@ -553,7 +567,7 @@ fn generate_handle_bridge_helpers(
         // declaration order.
         let forwarded: Option<&Vec<String>> = rust
             .handle_method_forwarded_fields
-            .get(&feedback.input_variant);
+            .get(feedback.input_variant.as_str());
         let mut owner_params: Vec<String> = Vec::new();
         let mut call_args: Vec<String> = Vec::new();
         for binding in &feedback.field_bindings {
@@ -562,18 +576,24 @@ fn generate_handle_bridge_helpers(
                     if let Some(allowed) = forwarded
                         && !allowed
                             .iter()
-                            .any(|f| to_snake_case(f) == to_snake_case(field))
+                            .any(|f| to_snake_case(f.as_str()) == to_snake_case(field.as_str()))
                     {
                         continue;
                     }
-                    let accessor_key =
-                        format!("{}.{}", feedback.input_variant, to_snake_case(field));
+                    let accessor_key = format!(
+                        "{}.{}",
+                        feedback.input_variant,
+                        to_snake_case(field.as_str())
+                    );
                     let suffix = rust
                         .handle_arg_accessors
                         .get(&accessor_key)
                         .cloned()
                         .unwrap_or_default();
-                    call_args.push(format!("obligation.{}{suffix}", to_snake_case(field)));
+                    call_args.push(format!(
+                        "obligation.{}{suffix}",
+                        to_snake_case(field.as_str())
+                    ));
                 }
                 FeedbackFieldSource::OwnerContext(name) => {
                     let snake = to_snake_case(name);
@@ -617,7 +637,7 @@ fn emit_accept_helper(
     obligation_type: &str,
     bridge_source: &str,
 ) -> Result<()> {
-    let accept_name = format!("accept_{}", to_snake_case(&protocol.effect_variant));
+    let accept_name = format!("accept_{}", to_snake_case(protocol.effect_variant.as_str()));
     writeln!(
         out,
         "pub fn {accept_name}(source: {bridge_source}) -> {obligation_type} {{"
@@ -627,7 +647,7 @@ fn emit_accept_helper(
         writeln!(out, "        _private: (),")?;
     } else {
         for field in &protocol.obligation_fields {
-            let rust_field = to_snake_case(field);
+            let rust_field = to_snake_case(field.as_str());
             writeln!(out, "        {rust_field}: source.{rust_field},")?;
         }
     }
@@ -653,15 +673,18 @@ fn generate_shell_bridge_helpers(
     emit_accept_helper(out, protocol, obligation_type, bridge_source)?;
 
     for feedback in &protocol.allowed_feedback_inputs {
-        let target_machine =
-            machine_for_instance(composition, machine_by_name, &feedback.machine_instance)?;
+        let target_machine = machine_for_instance(
+            composition,
+            machine_by_name,
+            feedback.machine_instance.as_str(),
+        )?;
         generate_feedback_submitter(
             out,
             protocol,
             feedback,
             target_machine
                 .inputs
-                .variant_named(&feedback.input_variant)?,
+                .variant_named(feedback.input_variant.as_str())?,
             FeedbackReturnKind::Transition(std::marker::PhantomData),
             obligation_type,
         )?;
@@ -711,7 +734,7 @@ fn generate_feedback_submitter(
     } else {
         "_obligation"
     };
-    let fn_name = format!("submit_{}", to_snake_case(&feedback.input_variant));
+    let fn_name = format!("submit_{}", to_snake_case(feedback.input_variant.as_str()));
     let return_type = match return_kind {
         FeedbackReturnKind::Effects => format!(
             "Result<Vec<{}>, {}>",
@@ -775,7 +798,7 @@ fn generate_notify_helper(
             .context("notify error type missing")?,
     );
     let owner_params = owner_context_params(target_variant, feedback)?;
-    let fn_name = format!("notify_{}", to_snake_case(&feedback.input_variant));
+    let fn_name = format!("notify_{}", to_snake_case(feedback.input_variant.as_str()));
     let return_type = match return_kind {
         FeedbackReturnKind::Effects => format!(
             "Result<Vec<{}>, {}>",
@@ -825,7 +848,7 @@ fn machine_for_instance<'a>(
     let instance = composition
         .machines
         .iter()
-        .find(|instance| instance.instance_id == instance_id)
+        .find(|instance| instance.instance_id.as_str() == instance_id)
         .with_context(|| format!("machine instance `{instance_id}` missing from composition"))?;
     machine_by_name
         .get(instance.machine_name.as_str())
@@ -843,7 +866,8 @@ fn rust_type(ty: &TypeRef) -> String {
         TypeRef::U32 => "u32".into(),
         TypeRef::U64 => "u64".into(),
         TypeRef::String => "String".into(),
-        TypeRef::Named(name) | TypeRef::Enum(name) => name.clone(),
+        TypeRef::Named(name) => name.as_str().to_string(),
+        TypeRef::Enum(name) => name.as_str().to_string(),
         TypeRef::Option(inner) => format!("Option<{}>", rust_type(inner)),
         TypeRef::Set(inner) | TypeRef::Seq(inner) => format!("Vec<{}>", rust_type(inner)),
         TypeRef::Map(key, value) => {
@@ -867,7 +891,7 @@ fn owner_context_params(
             && seen.insert(name.clone())
         {
             let field = target_variant
-                .field_named(&binding.input_field)
+                .field_named(binding.input_field.as_str())
                 .with_context(|| {
                     format!(
                         "missing validated feedback binding field `{}`",
@@ -882,14 +906,14 @@ fn owner_context_params(
 
 fn ctor_field_list(variant: &meerkat_machine_schema::VariantSchema) -> String {
     if variant.fields.is_empty() {
-        variant.name.clone()
+        variant.name.as_str().to_string()
     } else {
         let fields = variant
             .fields
             .iter()
             .map(|field| {
-                let name = to_snake_case(&field.name);
-                if field.name == name {
+                let name = to_snake_case(field.name.as_str());
+                if field.name.as_str() == name {
                     name
                 } else {
                     format!("{}: {}", field.name, name)
@@ -919,7 +943,7 @@ fn ctor_field_list_from_bindings(
                 target_variant.name
             );
         }
-        return Ok(target_variant.name.clone());
+        return Ok(target_variant.name.as_str().to_string());
     }
 
     let fields = target_variant
@@ -935,11 +959,11 @@ fn ctor_field_list_from_bindings(
                 })?;
             let value = match &binding.source {
                 FeedbackFieldSource::ObligationField(source) => {
-                    format!("obligation.{}", to_snake_case(source))
+                    format!("obligation.{}", to_snake_case(source.as_str()))
                 }
                 FeedbackFieldSource::OwnerContext(name) => to_snake_case(name),
             };
-            if field.name == value {
+            if field.name.as_str() == value {
                 Ok(value)
             } else {
                 Ok(format!("{}: {}", field.name, value))
@@ -964,7 +988,7 @@ fn ctor_field_list_from_bindings_without_obligation(
     feedback: &meerkat_machine_schema::FeedbackInputRef,
 ) -> Result<String> {
     if target_variant.fields.is_empty() {
-        return Ok(target_variant.name.clone());
+        return Ok(target_variant.name.as_str().to_string());
     }
 
     let fields = target_variant
@@ -985,7 +1009,7 @@ fn ctor_field_list_from_bindings_without_obligation(
                     field.name
                 ),
             };
-            if field.name == value {
+            if field.name.as_str() == value {
                 Ok(value)
             } else {
                 Ok(format!("{}: {}", field.name, value))
@@ -1023,10 +1047,12 @@ fn obligation_ctor_expr(
         .obligation_fields
         .iter()
         .map(|field| -> Result<String> {
-            let rust_name = to_snake_case(field);
-            let effect_field = producer_effect.field_named(field).with_context(|| {
-                format!("obligation field `{field}` missing from producer effect")
-            })?;
+            let rust_name = to_snake_case(field.as_str());
+            let effect_field = producer_effect
+                .field_named(field.as_str())
+                .with_context(|| {
+                    format!("obligation field `{field}` missing from producer effect")
+                })?;
             Ok(format!(
                 "{rust_name}: {}",
                 clone_expr_for_type(&effect_field.ty, &rust_name)
@@ -1040,7 +1066,7 @@ fn obligation_ctor_expr(
 fn clone_expr_for_type(ty: &TypeRef, rust_name: &str) -> String {
     match ty {
         TypeRef::Bool | TypeRef::U32 | TypeRef::U64 | TypeRef::Enum(_) => format!("*{rust_name}"),
-        TypeRef::Named(name) if is_known_copy_named_type(name) => format!("*{rust_name}"),
+        TypeRef::Named(name) if is_known_copy_named_type(name.as_str()) => format!("*{rust_name}"),
         _ => format!("{rust_name}.clone()"),
     }
 }

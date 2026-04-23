@@ -135,7 +135,7 @@ fn terminal_surface_mapping_matches_codegen_output() {
     let machines: Vec<MachineSchema> = canonical_machine_schemas();
     let meerkat_machine = machines
         .iter()
-        .find(|m| m.machine == "MeerkatMachine")
+        .find(|m| m.machine.as_str() == "MeerkatMachine")
         .expect("MeerkatMachine must be a canonical schema");
 
     let rendered = xtask::protocol_codegen::render_terminal_surface_mapping(meerkat_machine)
