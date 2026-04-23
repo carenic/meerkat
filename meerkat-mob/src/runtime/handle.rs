@@ -11,7 +11,7 @@ use crate::runtime::reconcile::{
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
 use meerkat_core::comms::{
-    PeerDirectoryEntry, PeerReachability, PeerReachabilityReason, TrustedPeerSpec,
+    PeerDirectoryEntry, PeerReachability, PeerReachabilityReason, TrustedPeerDescriptor,
 };
 use meerkat_core::ops::OperationId;
 use meerkat_core::ops_lifecycle::OpsLifecycleRegistry;
@@ -161,10 +161,23 @@ pub struct MobMemberListEntry {
     // which regression-asserts that). Callers that need to bridge a
     // member to a realtime session use `mob/member_status`, which
     // surfaces `current_session_id` explicitly.
+    //
+    // `agent_runtime_id` and `fence_token` are binding-era atoms used
+    // by the bridge for wiring and stale-command rejection. They are
+    // `pub(crate)` and `#[serde(skip)]` so they do not leak to
+    // app-facing payloads (wire contract: app tools receive
+    // `agent_identity`, surfaces project `current_session_id` for
+    // realtime). External consumers that legitimately need these
+    // atoms (mob-mcp, mob-pack verify paths) route through a typed
+    // helper; they never reach into the field directly.
+    #[serde(skip)]
+    pub(crate) agent_runtime_id: AgentRuntimeId,
+    #[serde(skip)]
+    pub(crate) fence_token: FenceToken,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) peer_id: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) external_peer_specs: BTreeMap<AgentIdentity, TrustedPeerSpec>,
+    pub(crate) external_peer_specs: BTreeMap<AgentIdentity, TrustedPeerDescriptor>,
     #[serde(skip)]
     pub(crate) current_session_id: Option<SessionId>,
     #[serde(skip)]
@@ -333,17 +346,34 @@ pub(crate) struct MemberSpawnReceipt {
 
 /// Public result from a successful member spawn.
 ///
-/// Carries identity-native fields only — no session IDs or internal refs.
+/// The identity-native `agent_identity` is the public contract — it is
+/// what app-facing payloads surface. `agent_runtime_id` and `fence_token`
+/// are carried for crate-internal bridging (provisioning, wiring) but
+/// `pub(crate)` so external consumers must route through a `MobMemberView`
+/// or the identity seam rather than reading these binding-era atoms
+/// directly.
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct SpawnResult {
-    /// Stable member identity.
+    /// Stable member identity — the one app-facing identity atom.
     pub agent_identity: AgentIdentity,
+    /// Composite runtime id. `pub(crate)` — binding-era detail, not
+    /// an app-facing identity.
+    #[serde(skip)]
+    pub(crate) agent_runtime_id: AgentRuntimeId,
+    /// Fence token for stale-command rejection. `pub(crate)` — the
+    /// bridge uses it; app-facing payloads do not surface it.
+    #[serde(skip)]
+    pub(crate) fence_token: FenceToken,
 }
 
 impl SpawnResult {
     /// Create a new spawn result from identity-native fields.
-    pub fn new(agent_identity: AgentIdentity) -> Self {
+    pub fn new(
+        agent_identity: AgentIdentity,
+        agent_runtime_id: AgentRuntimeId,
+        fence_token: FenceToken,
+    ) -> Self {
         Self {
             agent_identity,
             agent_runtime_id,
@@ -442,7 +472,7 @@ pub enum PeerTarget {
     /// Another member in the same mob roster.
     Local(AgentIdentity),
     /// A trusted peer that lives outside the local mob roster.
-    External(TrustedPeerSpec),
+    External(TrustedPeerDescriptor),
 }
 
 // DELETE_ME A5 DSL-schema migration: `MeerkatId` is now a type alias

@@ -11,7 +11,7 @@ use crate::runtime::handle::MemberSpawnReceipt;
 use crate::tokio;
 use async_trait::async_trait;
 use meerkat_core::PendingSystemContextAppend;
-use meerkat_core::comms::TrustedPeerSpec;
+use meerkat_core::comms::TrustedPeerDescriptor;
 use meerkat_core::event_injector::SubscribableInjector;
 #[cfg(feature = "runtime-adapter")]
 use meerkat_core::lifecycle::core_executor::{CoreApplyOutput, CoreExecutor, CoreExecutorError};
@@ -95,7 +95,7 @@ pub trait MobProvisioner: Send + Sync {
         member_ref: &MemberRef,
         fallback_name: &str,
         fallback_peer_id: &str,
-    ) -> Result<TrustedPeerSpec, MobError>;
+    ) -> Result<TrustedPeerDescriptor, MobError>;
     /// Resolve the live canonical mob-child lifecycle operation for an
     /// existing member bridge.
     async fn active_operation_id_for_member(&self, member_ref: &MemberRef) -> Option<OperationId>;
@@ -153,8 +153,8 @@ impl SessionBackend {
     fn trusted_peer_spec(
         fallback_name: &str,
         fallback_peer_id: &str,
-    ) -> Result<TrustedPeerSpec, MobError> {
-        TrustedPeerSpec::new(
+    ) -> Result<TrustedPeerDescriptor, MobError> {
+        TrustedPeerDescriptor::new(
             fallback_name,
             fallback_peer_id,
             format!("inproc://{fallback_name}"),
@@ -1022,7 +1022,7 @@ impl MobProvisioner for SessionBackend {
         member_ref: &MemberRef,
         fallback_name: &str,
         fallback_peer_id: &str,
-    ) -> Result<TrustedPeerSpec, MobError> {
+    ) -> Result<TrustedPeerDescriptor, MobError> {
         let trusted_peer = Self::trusted_peer_spec(fallback_name, fallback_peer_id)?;
         self.ops_adapter
             .mark_member_peer_ready(member_ref, fallback_name, trusted_peer.clone())
@@ -1167,14 +1167,14 @@ impl MultiBackendProvisioner {
         self
     }
 
-    async fn peer_only_spec(&self, member_ref: &MemberRef) -> Result<TrustedPeerSpec, MobError> {
+    async fn peer_only_spec(&self, member_ref: &MemberRef) -> Result<TrustedPeerDescriptor, MobError> {
         match member_ref {
             MemberRef::BackendPeer {
                 peer_id,
                 address,
                 session_id: None,
                 ..
-            } => TrustedPeerSpec::new(
+            } => TrustedPeerDescriptor::new(
                 address
                     .strip_prefix("inproc://")
                     .map(|value| value.split('?').next().unwrap_or(value).to_string())
@@ -1192,8 +1192,8 @@ impl MultiBackendProvisioner {
     fn peer_only_spec_from_parts(
         peer_id: &str,
         address: &str,
-    ) -> Result<TrustedPeerSpec, MobError> {
-        TrustedPeerSpec::new(
+    ) -> Result<TrustedPeerDescriptor, MobError> {
+        TrustedPeerDescriptor::new(
             address
                 .strip_prefix("inproc://")
                 .map(|value| value.split('?').next().unwrap_or(value).to_string())
@@ -1208,8 +1208,8 @@ impl MultiBackendProvisioner {
         peer_name: &str,
         peer_id: &str,
         address: &str,
-    ) -> Result<TrustedPeerSpec, MobError> {
-        TrustedPeerSpec::new(
+    ) -> Result<TrustedPeerDescriptor, MobError> {
+        TrustedPeerDescriptor::new(
             peer_name.to_string(),
             peer_id.to_string(),
             address.to_string(),
@@ -1266,9 +1266,9 @@ impl MultiBackendProvisioner {
 
     async fn ensure_supervisor_authorized(
         &self,
-        peer: &TrustedPeerSpec,
+        peer: &TrustedPeerDescriptor,
         binding: Option<(&str, &str, Option<&str>)>,
-    ) -> Result<TrustedPeerSpec, MobError> {
+    ) -> Result<TrustedPeerDescriptor, MobError> {
         let payload = self.bridge_supervisor_payload().await?;
         let command = super::bridge_protocol::BridgeCommand::AuthorizeSupervisor(payload);
         let value = self
@@ -1299,7 +1299,7 @@ impl MultiBackendProvisioner {
 
     async fn send_bridge_command_typed<R: DeserializeOwned>(
         &self,
-        peer: &TrustedPeerSpec,
+        peer: &TrustedPeerDescriptor,
         command: &super::bridge_protocol::BridgeCommand,
         timeout: Duration,
     ) -> Result<R, MobError> {
@@ -1317,7 +1317,7 @@ impl MultiBackendProvisioner {
 
     async fn bind_peer_only_member(
         &self,
-        peer: &TrustedPeerSpec,
+        peer: &TrustedPeerDescriptor,
         peer_id: &str,
         address: &str,
         bootstrap_token: Option<&str>,
@@ -1694,7 +1694,7 @@ impl MobProvisioner for MultiBackendProvisioner {
         member_ref: &MemberRef,
         fallback_name: &str,
         fallback_peer_id: &str,
-    ) -> Result<TrustedPeerSpec, MobError> {
+    ) -> Result<TrustedPeerDescriptor, MobError> {
         match member_ref {
             MemberRef::Session { .. } => {
                 self.session
@@ -1727,7 +1727,7 @@ impl MobProvisioner for MultiBackendProvisioner {
                         .await;
                 }
                 // No bridge — use the real BackendPeer identity directly.
-                TrustedPeerSpec::new(fallback_name, peer_id.clone(), address.clone())
+                TrustedPeerDescriptor::new(fallback_name, peer_id.clone(), address.clone())
                     .map_err(|error| MobError::WiringError(format!("invalid peer spec: {error}")))
             }
         }

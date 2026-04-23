@@ -3,7 +3,7 @@ use crate::store::SupervisorAuthorityRecord;
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
 use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
-use meerkat_core::comms::{CommsCommand, InputStreamMode, PeerName, SendReceipt, TrustedPeerSpec};
+use meerkat_core::comms::{CommsCommand, InputStreamMode, PeerName, SendReceipt, TrustedPeerDescriptor};
 use meerkat_core::interaction::{
     InteractionContent, PeerInputCandidate, TerminalityClass, classify_response_terminality,
 };
@@ -84,9 +84,9 @@ impl MobSupervisorBridge {
         self.runtime().await as Arc<dyn CoreCommsRuntime>
     }
 
-    pub(crate) async fn supervisor_spec(&self) -> Result<TrustedPeerSpec, MobError> {
+    pub(crate) async fn supervisor_spec(&self) -> Result<TrustedPeerDescriptor, MobError> {
         let authority = self.authority().await;
-        TrustedPeerSpec::new(
+        TrustedPeerDescriptor::new(
             self.participant_name.clone(),
             authority.public_peer_id,
             format!("inproc://{}", self.participant_name),
@@ -97,7 +97,7 @@ impl MobSupervisorBridge {
     /// Send a typed bridge command and return the raw JSON response.
     pub(crate) async fn send_bridge_command(
         &self,
-        recipient: &TrustedPeerSpec,
+        recipient: &TrustedPeerDescriptor,
         command: &super::bridge_protocol::BridgeCommand,
         timeout: Duration,
     ) -> Result<serde_json::Value, MobError> {
@@ -112,7 +112,7 @@ impl MobSupervisorBridge {
 
     pub(crate) async fn request_json<T: serde::Serialize>(
         &self,
-        recipient: &TrustedPeerSpec,
+        recipient: &TrustedPeerDescriptor,
         intent: &str,
         payload: &T,
         timeout: Duration,

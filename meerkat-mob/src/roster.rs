@@ -14,7 +14,7 @@
 use crate::event::{MemberRef, MobEvent, MobEventKind};
 use crate::ids::{AgentIdentity, AgentRuntimeId, FenceToken, Generation, ProfileName};
 use crate::runtime_mode::MobRuntimeMode;
-use meerkat_core::comms::TrustedPeerSpec;
+use meerkat_core::comms::TrustedPeerDescriptor;
 use meerkat_core::time_compat::SystemTime;
 use meerkat_core::types::SessionId;
 use serde::{Deserialize, Serialize};
@@ -99,7 +99,7 @@ pub struct RosterEntry {
     pub(crate) peer_id: Option<String>,
     /// Trusted specs for external peers keyed by their projected peer name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) external_peer_specs: BTreeMap<AgentIdentity, TrustedPeerSpec>,
+    pub(crate) external_peer_specs: BTreeMap<AgentIdentity, TrustedPeerDescriptor>,
     /// Effective profile override from `SpawnTooling::Profile` resolution.
     ///
     /// When a member is spawned with an explicit tooling profile (inline or realm),
@@ -506,7 +506,7 @@ mod tests {
     use super::*;
     use crate::ids::{MeerkatId, MobId};
     use chrono::Utc;
-    use meerkat_core::comms::TrustedPeerSpec;
+    use meerkat_core::comms::TrustedPeerDescriptor;
     use uuid::Uuid;
 
     fn session_id() -> SessionId {
@@ -751,7 +751,7 @@ mod tests {
         roster.wire_external(
             &MeerkatId::from("a"),
             &MeerkatId::from("remote-mob/worker/agent-b"),
-            TrustedPeerSpec::new(
+            TrustedPeerDescriptor::new(
                 "remote-mob/worker/agent-b",
                 "ed25519:remote-b",
                 "inproc://remote-mob/worker/agent-b",

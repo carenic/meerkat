@@ -89,7 +89,7 @@ max_flow_duration_ms = 30000
 max_step_retries = 1
 max_orphaned_turns = 8
 "#;
-use meerkat_core::comms::TrustedPeerSpec;
+use meerkat_core::comms::TrustedPeerDescriptor;
 use meerkat_core::ops_lifecycle::{
     OperationKind, OperationPeerHandle, OperationProgressUpdate, OperationResult, OperationSpec,
     OperationStatus, OperationTerminalOutcome, OpsLifecycleRegistry,
@@ -206,7 +206,7 @@ async fn ops_registry_integration_red_ok_tracks_mob_member_peer_ready_and_comple
             &op_id,
             OperationPeerHandle {
                 peer_name: "member-alpha".into(),
-                trusted_peer: TrustedPeerSpec::new(
+                trusted_peer: TrustedPeerDescriptor::new(
                     "member-alpha",
                     "member-alpha-id",
                     "inproc://member-alpha",
