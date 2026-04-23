@@ -279,11 +279,6 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
                 "RuntimeRealtimeAttachmentStatusParams",
                 "RuntimeRealtimeAttachmentStatusResult",
             ),
-            // `session/retire`, `session/reset`, `session/submission`,
-            // `session/submissions` were deleted in wave-b; their
-            // `Runtime{Retire,Reset}{Params,Result}` and
-            // `Input{State,List}{Params,Result}` wire types are gone with
-            // them. Do not re-introduce.
         ]);
     }
 

@@ -23,26 +23,38 @@ pub enum PeerResponseTerminalStatusWire {
 }
 
 /// Dedicated request payload for `session/peer_response_terminal`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// Not `PartialEq`: `result` is opaque peer-returned bytes carried as
+/// `Box<RawValue>` (pass-through fidelity — the peer is the typed
+/// authority over its own payload shape). Allow-listed per
+/// `dogma-blind-spots` §7 alongside tool-call args.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionPeerResponseTerminalParams {
     pub session_id: String,
     pub peer_name: PeerName,
     pub request_id: String,
     pub status: PeerResponseTerminalStatusWire,
-    pub result: serde_json::Value,
+    #[cfg_attr(feature = "schema", schemars(with = "serde_json::Value"))]
+    pub result: Box<serde_json::value::RawValue>,
 }
 
 /// Typed event envelope for the generic `session/external_event` and
 /// `/sessions/{id}/external-events` surfaces.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// Not `PartialEq`: the `GenericJson.payload` and
+/// `PeerResponseTerminal.result` bodies ride as `Box<RawValue>` — opaque
+/// caller-supplied JSON that never gets pattern-matched at this layer.
+/// Allow-listed per `dogma-blind-spots` §7.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionExternalEventEnvelope {
     /// Generic external JSON event admitted as `Input::ExternalEvent`.
     GenericJson {
         event_type: String,
-        payload: serde_json::Value,
+        #[cfg_attr(feature = "schema", schemars(with = "serde_json::Value"))]
+        payload: Box<serde_json::value::RawValue>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         blocks: Option<Vec<WireContentBlock>>,
     },
@@ -54,15 +66,10 @@ pub enum SessionExternalEventEnvelope {
         peer_name: PeerName,
         request_id: String,
         status: PeerResponseTerminalStatusWire,
-        result: serde_json::Value,
+        #[cfg_attr(feature = "schema", schemars(with = "serde_json::Value"))]
+        result: Box<serde_json::value::RawValue>,
     },
 }
-
-// `RuntimeRetireParams`, `RuntimeResetParams`, `InputStateParams`, and
-// `InputListParams` (and their `*Result` counterparts below) were deleted
-// in Wave B. Wave A removed the shell verbs (`session/retire`,
-// `session/reset`, `session/submission`, `session/submissions`); the wire
-// types are gone so they cannot regrow.
 
 /// Public runtime state projection used by RPC surfaces.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -252,8 +259,6 @@ pub struct WireInputState {
     pub updated_at: String,
 }
 
-// `InputStateResult` was deleted in Wave B alongside `InputStateParams`.
-
 /// Response payload for `session/submit`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -270,10 +275,6 @@ pub struct RuntimeAcceptResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<WireInputState>,
 }
-
-// `RuntimeRetireResult`, `RuntimeResetResult`, and `InputListResult` were
-// deleted in Wave B. See the deletion note on the corresponding `*Params`
-// types above.
 
 // -----------------------------------------------------------------------
 // V8 — Typed replacement for untyped `session/accept_input` ingress.
