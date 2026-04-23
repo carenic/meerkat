@@ -129,46 +129,6 @@ pub(crate) struct MobStartupKickoffSnapshot {
     pub ready_runtime_ids: std::collections::BTreeSet<String>,
 }
 
-/// W3-H: mob-side event mirror of the MobMachine's
-/// `MemberSessionBindingSet / Rotated / Released` DSL effects. The mob
-/// actor forwards each DSL effect onto a `broadcast::Sender` so external
-/// observers (notably the realtime WS in meerkat-rpc, which needs this
-/// type at its visibility boundary to type the receiver) can subscribe to
-/// identity→session binding lifecycle without needing to poll.
-///
-/// Each variant carries the `mob_id` the event originated from plus the
-/// `agent_identity` it concerns so subscribers can filter to only the
-/// events they care about.
-///
-/// Three-variant shape intentional — rotation is a first-class
-/// machine-emitted meaning. Collapsing to a Cleared+Set pair would push
-/// "interpret a debounce window as rotation" into the observer, which is
-/// exactly the pattern dogma #3 targets.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MemberRealtimeBindingEvent {
-    /// The identity gained a fresh realtime binding (no prior binding).
-    Set {
-        mob_id: crate::ids::MobId,
-        agent_identity: crate::ids::AgentIdentity,
-        bridge_session_id: meerkat_core::types::SessionId,
-    },
-    /// The identity's realtime binding atomically rotated to a new bridge
-    /// session (respawn flow — shell retired the old member then spawned a
-    /// replacement under the same identity).
-    Rotated {
-        mob_id: crate::ids::MobId,
-        agent_identity: crate::ids::AgentIdentity,
-        old_session_id: meerkat_core::types::SessionId,
-        new_session_id: meerkat_core::types::SessionId,
-    },
-    /// The identity's realtime binding was released (terminal retire).
-    Released {
-        mob_id: crate::ids::MobId,
-        agent_identity: crate::ids::AgentIdentity,
-        session_id: meerkat_core::types::SessionId,
-    },
-}
-
 /// Heap-allocated payload for `MobCommand::SubmitWork`. Boxing keeps the
 /// command-channel variant width bounded by the pointer, not by the full
 /// `ContentInput` + render metadata footprint.

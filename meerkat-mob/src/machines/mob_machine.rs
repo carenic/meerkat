@@ -1063,18 +1063,6 @@ machine! {
             PersistKickoffUpdate { member_id: String, phase: KickoffPhase },
             PersistKickoffFailureUpdate { member_id: String, phase: KickoffPhase, error: String },
             EmitKickoffLifecycleNotice { member_id: String, intent: Enum<KickoffIntent> },
-            // W3-H / dogma #4: canonical realtime-binding lifecycle effects.
-            // Three-variant shape (Set / Rotated / Released) so rotation is a
-            // first-class machine-emitted meaning rather than a shell-observer
-            // pattern-match over a Cleared+Set debounce window — the latter
-            // would re-impose the "shell interprets DSL state as semantic"
-            // pattern that dogma #3 specifically targets. Guard-split Spawn
-            // emits Set vs Rotated; guard-split Retire emits Released vs
-            // nothing, so each transition picks the correct typed effect
-            // atomically.
-            MemberSessionBindingSet { agent_identity: AgentIdentity, bridge_session_id: SessionId },
-            MemberSessionBindingRotated { agent_identity: AgentIdentity, old_session_id: SessionId, new_session_id: SessionId },
-            MemberSessionBindingReleased { agent_identity: AgentIdentity, session_id: SessionId },
             // Track-B (R5): canonical topology-change signals consumed by
             // the `RecomputeMobPeerOverlay` composition driver.
             //
@@ -1112,9 +1100,6 @@ machine! {
         disposition PersistKickoffUpdate => local,
         disposition PersistKickoffFailureUpdate => local,
         disposition EmitKickoffLifecycleNotice => external,
-        disposition MemberSessionBindingSet => external,
-        disposition MemberSessionBindingRotated => external,
-        disposition MemberSessionBindingReleased => external,
         disposition WiringGraphChanged => external,
         disposition MemberSessionBindingChanged => external,
 
@@ -1178,7 +1163,6 @@ machine! {
             to Running
             emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation }
             emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Spawned }
-            emit MemberSessionBindingSet { agent_identity: agent_identity, bridge_session_id: bridge_session_id }
         }
 
         transition SpawnRunningReplacing {
@@ -1204,7 +1188,6 @@ machine! {
             to Running
             emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation }
             emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Spawned }
-            emit MemberSessionBindingRotated { agent_identity: agent_identity, old_session_id: replacing.get("value"), new_session_id: bridge_session_id }
         }
 
         transition ObserveRuntimeReady {
@@ -1709,7 +1692,6 @@ machine! {
                 self.topology_epoch += 1;
             }
             to Running
-            emit MemberSessionBindingSet { agent_identity: agent_identity, bridge_session_id: session_id }
             emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: None, new_session_id: Some(session_id) }
         }
 
@@ -1728,7 +1710,6 @@ machine! {
                 self.topology_epoch += 1;
             }
             to Running
-            emit MemberSessionBindingRotated { agent_identity: agent_identity, old_session_id: old_session_id, new_session_id: new_session_id }
             emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(old_session_id), new_session_id: Some(new_session_id) }
         }
 
@@ -1746,7 +1727,6 @@ machine! {
                 self.topology_epoch += 1;
             }
             to Running
-            emit MemberSessionBindingReleased { agent_identity: agent_identity, session_id: session_id }
             emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(session_id), new_session_id: None }
         }
 
@@ -2410,7 +2390,6 @@ machine! {
             }
             to Running
             emit RequestRuntimeRetire
-            emit MemberSessionBindingReleased { agent_identity: agent_identity, session_id: releasing.get("value") }
         }
 
         transition RetireRunningPreservingBinding {
@@ -2454,7 +2433,6 @@ machine! {
             }
             to Stopped
             emit RequestRuntimeRetire
-            emit MemberSessionBindingReleased { agent_identity: agent_identity, session_id: releasing.get("value") }
         }
 
         transition RetireStoppedPreservingBinding {
