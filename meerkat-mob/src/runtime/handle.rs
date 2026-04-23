@@ -222,27 +222,11 @@ pub enum MobMemberStatus {
 pub struct MemberRespawnReceipt {
     /// The member identity that was respawned.
     pub identity: AgentIdentity,
-    /// Runtime id for the current incarnation after respawn completes.
-    pub agent_runtime_id: AgentRuntimeId,
-    /// Fence token for the superseded incarnation.
-    pub previous_fence_token: FenceToken,
-    /// Fence token for the current incarnation.
-    pub fence_token: FenceToken,
 }
 
 impl MemberRespawnReceipt {
-    pub fn new(
-        identity: AgentIdentity,
-        agent_runtime_id: AgentRuntimeId,
-        previous_fence_token: FenceToken,
-        fence_token: FenceToken,
-    ) -> Self {
-        Self {
-            identity,
-            agent_runtime_id,
-            previous_fence_token,
-            fence_token,
-        }
+    pub fn new(identity: AgentIdentity) -> Self {
+        Self { identity }
     }
 }
 
@@ -318,10 +302,6 @@ pub enum MobDestroyError {
 pub struct PreviousMemberCleanupReport {
     /// Stable member identity.
     pub identity: AgentIdentity,
-    /// Runtime id of the incarnation being replaced.
-    pub agent_runtime_id: AgentRuntimeId,
-    /// Fence token of the incarnation being replaced.
-    pub fence_token: FenceToken,
     /// Whether graceful retire was attempted.
     pub retire_attempted: bool,
     /// Error returned from the graceful retire attempt, when any.
@@ -359,19 +339,11 @@ pub(crate) struct MemberSpawnReceipt {
 pub struct SpawnResult {
     /// Stable member identity.
     pub agent_identity: AgentIdentity,
-    /// Identity-native runtime ID for this incarnation.
-    pub agent_runtime_id: AgentRuntimeId,
-    /// Fence token for stale-command rejection.
-    pub fence_token: FenceToken,
 }
 
 impl SpawnResult {
     /// Create a new spawn result from identity-native fields.
-    pub fn new(
-        agent_identity: AgentIdentity,
-        agent_runtime_id: AgentRuntimeId,
-        fence_token: FenceToken,
-    ) -> Self {
+    pub fn new(agent_identity: AgentIdentity) -> Self {
         Self {
             agent_identity,
             agent_runtime_id,
@@ -425,10 +397,6 @@ pub enum MobRespawnError {
 pub struct MemberDeliveryReceipt {
     /// The member identity.
     pub identity: AgentIdentity,
-    /// Runtime id for the incarnation that accepted the work.
-    pub agent_runtime_id: AgentRuntimeId,
-    /// Fence token for the incarnation that accepted the work.
-    pub fence_token: FenceToken,
     /// How the message was handled.
     pub handling_mode: HandlingMode,
 }
@@ -439,8 +407,6 @@ pub struct MemberDeliveryReceipt {
 pub struct WorkDeliveryReceipt {
     /// The work reference for the submitted unit.
     pub work_ref: WorkRef,
-    /// The runtime ID of the target member.
-    pub runtime_id: AgentRuntimeId,
 }
 
 /// Options for helper convenience spawns.
@@ -467,10 +433,6 @@ pub struct HelperResult {
     pub tokens_used: u64,
     /// Stable member identity for the helper run.
     pub agent_identity: AgentIdentity,
-    /// Runtime id for the helper incarnation.
-    pub agent_runtime_id: AgentRuntimeId,
-    /// Fence token for the helper incarnation.
-    pub fence_token: FenceToken,
 }
 
 /// Target for a wire operation from a local mob member.
