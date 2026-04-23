@@ -181,8 +181,8 @@ mod tests {
 
     #[test]
     fn trims_surrounding_whitespace() {
-        let cref = parse_connection_ref_user_input("  dev:openai  ")
-            .expect("whitespace is trimmed");
+        let cref =
+            parse_connection_ref_user_input("  dev:openai  ").expect("whitespace is trimmed");
         assert_eq!(cref.realm.as_str(), "dev");
         assert_eq!(cref.binding.as_str(), "openai");
     }

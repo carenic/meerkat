@@ -31,8 +31,8 @@ use meerkat_core::service::{
     TurnToolOverlay,
 };
 use meerkat_core::{
-    AgentEvent, BlobId, EventEnvelope, RealmConfig, RealmLocator, RealmSelection, ScopedAgentEvent,
-    StreamScopeFrame, format_verbose_event,
+    AgentEvent, BlobId, ConnectionRef, EventEnvelope, RealmConfig, RealmLocator, RealmSelection,
+    ScopedAgentEvent, StreamScopeFrame, format_verbose_event,
 };
 use meerkat_core::{
     Config, ConfigDelta, ConfigEnvelope, ConfigEnvelopePolicy, ConfigStore, FileConfigStore,
@@ -1190,6 +1190,21 @@ enum Commands {
             help_heading = "Advanced options"
         )]
         line_format: LineFormat,
+
+        /// Typed connection reference `realm:binding[:profile]`.
+        ///
+        /// Parsed at the CLI boundary by
+        /// `cli_parse::parse_connection_ref_user_input`; a typed
+        /// [`meerkat_core::ConnectionRef`] is threaded through
+        /// `SessionBuildOptions.connection_ref`. Opaque-string
+        /// ferry through the runtime is prohibited by the
+        /// wave-b deletion of `ConnectionRef::parse` / `Display`.
+        #[arg(
+            long = "connection-ref",
+            value_name = "REALM:BINDING[:PROFILE]",
+            help_heading = "Connection options"
+        )]
+        connection_ref: Option<String>,
     },
 
     /// Session management
@@ -1994,6 +2009,17 @@ async fn main() -> anyhow::Result<ExitCode> {
             let wait_for_mcp_enabled = wait_for_mcp;
             #[cfg(not(feature = "mcp"))]
             let wait_for_mcp_enabled = false;
+            // Wave-c C-12: parse user-supplied `realm:binding[:profile]`
+            // at the CLI argument boundary. Downstream receives the
+            // typed `Option<ConnectionRef>`; the opaque-string form
+            // never crosses into session-build options.
+            let connection_ref = match connection_ref.as_deref() {
+                None => None,
+                Some(raw) => Some(
+                    cli_parse::parse_connection_ref_user_input(raw)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                ),
+            };
             Box::pin(handle_run_command(
                 prompt,
                 resume,
@@ -2121,7 +2147,7 @@ async fn handle_run_command(
     keep_alive: bool,
     stdin: StdinMode,
     line_format: LineFormat,
-    connection_ref: Option<String>,
+    connection_ref: Option<ConnectionRef>,
     scope: &RuntimeScope,
 ) -> anyhow::Result<()> {
     if let Some(session_id) = resume {
@@ -5074,7 +5100,7 @@ async fn run_agent(
     app_context: Option<String>,
     _config_base_dir: PathBuf,
     hooks_override: HookRunOverrides,
-    #[allow(unused_variables)] connection_ref: Option<String>,
+    connection_ref: Option<ConnectionRef>,
     scope: &RuntimeScope,
 ) -> anyhow::Result<()> {
     #[cfg(not(feature = "session-store"))]
@@ -5121,15 +5147,25 @@ async fn run_agent(
         let keep_alive = resolve_keep_alive(keep_alive)?;
         let effective_mob = cfg!(feature = "mob") && (enable_mob || config.tools.mob_enabled);
         let flow_tool_overlay = build_flow_tool_overlay(allow_tools, block_tools);
+        // Wave-c C-12: the canonical runtime identity for a skill is
+        // `SkillKey { source_uuid, skill_name }` (C-1 / C-4 upstream retype).
+        // CLI `--skill NAME` arguments default to the builtin (inventory)
+        // source — explicit source-scoped selection is not a CLI surface
+        // today and would be a separate feature. `SkillName::parse` enforces
+        // the lowercase-slug rule; we surface parse errors directly to the
+        // user rather than silently dropping.
         let preload_skills = if preload_skills.is_empty() {
             None
         } else {
-            Some(
-                preload_skills
-                    .into_iter()
-                    .map(meerkat_core::skills::SkillId)
-                    .collect(),
-            )
+            let keys: Result<Vec<meerkat_core::skills::SkillKey>, _> = preload_skills
+                .into_iter()
+                .map(|raw| {
+                    meerkat_core::skills::SkillName::parse(&raw)
+                        .map(meerkat_core::skills::SkillKey::builtin)
+                        .map_err(|e| anyhow::anyhow!("invalid --skill value `{raw}`: {e}"))
+                })
+                .collect();
+            Some(keys?)
         };
         let session = Session::new();
         let session_id = session.id().clone();
@@ -5296,6 +5332,7 @@ async fn run_agent(
             call_timeout_override: Default::default(),
             blob_store_override: None,
             mob_tools: mob_tools_factory,
+            connection_ref,
         };
         build.apply_generated_create_only_mob_operator_access(
             meerkat_core::ToolCategoryOverride::from_effective(effective_mob),
@@ -5799,6 +5836,27 @@ async fn resume_session_with_llm_override(
             .await
             .map_err(|e| anyhow::anyhow!("runtime bindings: {e}"))?;
 
+        // Wave-c C-12: lift runtime-side preload-skill names into typed
+        // `SkillKey`s (builtin source) before the SessionBuildOptions
+        // construction so a parse error surfaces loud on resume instead
+        // of panicking at the collect site.
+        let resumed_preload_skills: Option<Vec<meerkat_core::skills::SkillKey>> =
+            if runtime_preload_skills.is_empty() {
+                None
+            } else {
+                let keys: Result<Vec<_>, _> = runtime_preload_skills
+                    .into_iter()
+                    .map(|raw| {
+                        meerkat_core::skills::SkillName::parse(&raw)
+                            .map(meerkat_core::skills::SkillKey::builtin)
+                            .map_err(|e| {
+                                anyhow::anyhow!("invalid preloaded skill name `{raw}`: {e}")
+                            })
+                    })
+                    .collect();
+                Some(keys?)
+            };
+
         let mut build = SessionBuildOptions {
             provider: Some(provider_core),
             self_hosted_server_id: stored_metadata
@@ -5821,12 +5879,7 @@ async fn resume_session_with_llm_override(
             override_mob: meerkat_core::ToolCategoryOverride::Inherit,
             schedule_tools: None,
             mob_tool_authority_context: None,
-            preload_skills: (!runtime_preload_skills.is_empty()).then(|| {
-                runtime_preload_skills
-                    .into_iter()
-                    .map(meerkat_core::skills::SkillId)
-                    .collect()
-            }),
+            preload_skills: resumed_preload_skills,
             peer_meta: stored_metadata.as_ref().and_then(|m| m.peer_meta.clone()),
             realm_id: stored_metadata
                 .as_ref()
@@ -7198,7 +7251,9 @@ async fn handle_skills_command(
     command: SkillsCommands,
     scope: &RuntimeScope,
 ) -> anyhow::Result<()> {
-    use meerkat_core::skills::{SkillFilter, SkillId};
+    // Wave-c C-12: the canonical runtime identity for a skill is
+    // `SkillKey { source_uuid, skill_name }` (C-1 / C-4 upstream retype).
+    use meerkat_core::skills::{SkillFilter, SkillKey, SkillName};
 
     // Load config from the active realm (not global defaults)
     let (config, realm_root) = load_config(scope).await?;
@@ -7315,7 +7370,7 @@ async fn handle_skills_command(
                 let wire: Vec<meerkat_contracts::SkillEntry> = entries
                     .iter()
                     .map(|e| meerkat_contracts::SkillEntry {
-                        id: e.descriptor.id.0.clone(),
+                        id: e.descriptor.key.skill_name.as_str().to_owned(),
                         name: e.descriptor.name.clone(),
                         description: e.descriptor.description.clone(),
                         scope: e.descriptor.scope.to_string(),
@@ -7340,7 +7395,7 @@ async fn handle_skills_command(
                     };
                     println!(
                         "{:<40} {:<15} {:<10} {}",
-                        entry.descriptor.id.0,
+                        entry.descriptor.key.skill_name.as_str(),
                         entry.descriptor.source_name,
                         entry.descriptor.scope,
                         status,
@@ -7350,14 +7405,21 @@ async fn handle_skills_command(
             }
         }
         SkillsCommands::Inspect { id, source, json } => {
+            // Wave-c C-12: parse the user-supplied slug into a typed
+            // `SkillName` and build a builtin-source `SkillKey`. Explicit
+            // source-scoped selection comes through the `source` flag
+            // forwarded as the second arg to `load_from_source`.
+            let skill_name = SkillName::parse(id.as_str())
+                .map_err(|e| anyhow::anyhow!("invalid skill id `{id}`: {e}"))?;
+            let key = SkillKey::builtin(skill_name);
             let doc = skill_runtime
-                .load_from_source(&SkillId::from(id.as_str()), source.as_deref())
+                .load_from_source(&key, source.as_deref())
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to inspect skill: {e}"))?;
 
             if json {
                 let wire = meerkat_contracts::SkillInspectResponse {
-                    id: doc.descriptor.id.0.clone(),
+                    id: doc.descriptor.key.skill_name.as_str().to_owned(),
                     name: doc.descriptor.name.clone(),
                     description: doc.descriptor.description.clone(),
                     scope: doc.descriptor.scope.to_string(),
@@ -7366,7 +7428,7 @@ async fn handle_skills_command(
                 };
                 println!("{}", serde_json::to_string_pretty(&wire)?);
             } else {
-                println!("ID:          {}", doc.descriptor.id);
+                println!("ID:          {}", doc.descriptor.key.skill_name);
                 println!("Name:        {}", doc.descriptor.name);
                 println!("Description: {}", doc.descriptor.description);
                 println!("Scope:       {}", doc.descriptor.scope);
