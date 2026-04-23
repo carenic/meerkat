@@ -486,19 +486,6 @@ pub struct OperationInput {
     pub event: OpEvent,
 }
 
-/// Classify an input's execution intent for the runtime loop.
-///
-/// `Continuation` inputs map to `ResumePending`; everything else is `ContentTurn`.
-/// Terminal peer responses are always `ContentTurn` regardless of handling_mode.
-pub(crate) fn classify_execution_kind(
-    input: &Input,
-) -> meerkat_core::lifecycle::RuntimeExecutionKind {
-    match input {
-        Input::Continuation(_) => meerkat_core::lifecycle::RuntimeExecutionKind::ResumePending,
-        _ => meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
