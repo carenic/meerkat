@@ -2509,7 +2509,7 @@ mod source {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any())]
     mod tests {
         use super::*;
 

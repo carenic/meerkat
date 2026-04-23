@@ -46,7 +46,10 @@ fn with_named_types(mut schema: MachineSchema, bindings: Vec<NamedTypeBinding>) 
 }
 
 pub fn dsl_auth_machine() -> MachineSchema {
-    auth_machine::AuthMachineState::schema()
+    with_named_types(
+        auth_machine::AuthMachineState::schema(),
+        vec![NamedTypeBinding::string("AuthLifecyclePhase")],
+    )
 }
 
 pub fn dsl_meerkat_machine() -> MachineSchema {
@@ -60,12 +63,20 @@ pub fn dsl_meerkat_machine() -> MachineSchema {
             NamedTypeBinding::string("CommsRuntimeId"),
             NamedTypeBinding::string("InputId"),
             NamedTypeBinding::string("McpServerId"),
+            NamedTypeBinding::string("MeerkatPhase"),
             NamedTypeBinding::string("MobId"),
             NamedTypeBinding::string("OperationId"),
+            NamedTypeBinding::string("OperationKind"),
             NamedTypeBinding::string("PeerCorrelationId"),
             NamedTypeBinding::string("RunId"),
             NamedTypeBinding::string("SessionId"),
+            NamedTypeBinding::string("SessionLlmCapabilitySurface"),
+            NamedTypeBinding::string("SessionLlmCapabilitySurfaceStatus"),
+            NamedTypeBinding::string("SessionLlmIdentity"),
+            NamedTypeBinding::string("SessionToolVisibilityDelta"),
+            NamedTypeBinding::string("SessionToolVisibilityState"),
             NamedTypeBinding::string("ToolFilter"),
+            NamedTypeBinding::string("ToolVisibilityWitness"),
             NamedTypeBinding::string("WorkId"),
             // Wave-c C-6r: typed PeerEndpoint twin.
             NamedTypeBinding::type_path(
@@ -93,22 +104,33 @@ pub fn dsl_mob_machine() -> MachineSchema {
             NamedTypeBinding::u64("Generation"),
             NamedTypeBinding::string("AgentIdentity"),
             NamedTypeBinding::string("AgentRuntimeId"),
+            NamedTypeBinding::string("MobMemberState"),
+            NamedTypeBinding::string("MobPhase"),
+            NamedTypeBinding::string("MobTask"),
             NamedTypeBinding::string("SessionId"),
             NamedTypeBinding::string("TaskId"),
+            NamedTypeBinding::string("TaskStatus"),
+            NamedTypeBinding::string("WiringEdge"),
             NamedTypeBinding::string("WorkId"),
         ],
     )
 }
 
 pub fn dsl_schedule_lifecycle_machine() -> MachineSchema {
-    schedule_lifecycle::ScheduleLifecycleMachineState::schema()
+    with_named_types(
+        schedule_lifecycle::ScheduleLifecycleMachineState::schema(),
+        vec![NamedTypeBinding::string("ScheduleLifecycleState")],
+    )
 }
 
 pub fn dsl_occurrence_lifecycle_machine() -> MachineSchema {
     with_named_types(
         occurrence_lifecycle::OccurrenceLifecycleMachineState::schema(),
         vec![
+            NamedTypeBinding::string("ClaimToken"),
+            NamedTypeBinding::string("DeliveryReceipt"),
             NamedTypeBinding::string("OccurrenceId"),
+            NamedTypeBinding::string("OccurrenceLifecycleState"),
             NamedTypeBinding::string("ScheduleId"),
         ],
     )

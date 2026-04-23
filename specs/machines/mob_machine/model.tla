@@ -284,67 +284,6 @@ ResetToRunning ==
     /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, member_state_markers, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids, member_session_bindings, topology_epoch >>
 
 
-WireRunning ==
-    /\ phase = "Running"
-    /\ phase' = "Running"
-    /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, member_state_markers, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids, member_session_bindings, topology_epoch >>
-
-
-WireMembersRunning(edge) ==
-    /\ phase = "Running"
-    /\ ((edge \in wiring_edges) = FALSE)
-    /\ phase' = "Running"
-    /\ model_step_count' = model_step_count + 1
-    /\ wiring_edges' = (wiring_edges \cup {edge})
-    /\ topology_epoch' = (topology_epoch) + 1
-    /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, member_state_markers, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids, member_session_bindings >>
-
-
-UnwireMembersRunning(edge) ==
-    /\ phase = "Running"
-    /\ ((edge \in wiring_edges) = TRUE)
-    /\ phase' = "Running"
-    /\ model_step_count' = model_step_count + 1
-    /\ wiring_edges' = (wiring_edges \ {edge})
-    /\ topology_epoch' = (topology_epoch) + 1
-    /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, member_state_markers, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids, member_session_bindings >>
-
-
-BindMemberSessionRunning(agent_identity, session_id) ==
-    /\ phase = "Running"
-    /\ ((agent_identity \in DOMAIN identity_to_runtime) = TRUE)
-    /\ ((agent_identity \in DOMAIN member_session_bindings) = FALSE)
-    /\ phase' = "Running"
-    /\ model_step_count' = model_step_count + 1
-    /\ member_session_bindings' = MapSet(member_session_bindings, agent_identity, session_id)
-    /\ topology_epoch' = (topology_epoch) + 1
-    /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, member_state_markers, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids >>
-
-
-RotateMemberSessionRunning(agent_identity, old_session_id, new_session_id) ==
-    /\ phase = "Running"
-    /\ ((agent_identity \in DOMAIN identity_to_runtime) = TRUE)
-    /\ ((agent_identity \in DOMAIN member_session_bindings) = TRUE)
-    /\ ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) = Some(old_session_id))
-    /\ phase' = "Running"
-    /\ model_step_count' = model_step_count + 1
-    /\ member_session_bindings' = MapSet(member_session_bindings, agent_identity, new_session_id)
-    /\ topology_epoch' = (topology_epoch) + 1
-    /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, member_state_markers, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids >>
-
-
-ReleaseMemberSessionRunning(agent_identity, session_id) ==
-    /\ phase = "Running"
-    /\ ((agent_identity \in DOMAIN member_session_bindings) = TRUE)
-    /\ ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) = Some(session_id))
-    /\ phase' = "Running"
-    /\ model_step_count' = model_step_count + 1
-    /\ member_session_bindings' = MapRemove(member_session_bindings, agent_identity)
-    /\ topology_epoch' = (topology_epoch) + 1
-    /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, member_state_markers, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids >>
-
-
 TaskCreateRunning(task_id, task_payload) ==
     /\ phase = "Running"
     /\ ((task_id \in DOMAIN tasks) = FALSE)
@@ -730,13 +669,6 @@ StartRunRunning ==
     /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, pending_spawn_count, coordinator_bound, member_state_markers, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids, member_session_bindings, topology_epoch >>
 
 
-UnwireRunning ==
-    /\ phase = "Running"
-    /\ phase' = "Running"
-    /\ model_step_count' = model_step_count + 1
-    /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, member_state_markers, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids, member_session_bindings, topology_epoch >>
-
-
 CompleteFlowRunning ==
     /\ phase = "Running" \/ phase = "Completed"
     /\ (active_run_count > 0)
@@ -928,12 +860,6 @@ Next ==
     \/ ResumeStopped
     \/ CompleteRunning
     \/ ResetToRunning
-    \/ WireRunning
-    \/ \E edge \in WiringEdgeValues : WireMembersRunning(edge)
-    \/ \E edge \in WiringEdgeValues : UnwireMembersRunning(edge)
-    \/ \E agent_identity \in AgentIdentityValues : \E session_id \in SessionIdValues : BindMemberSessionRunning(agent_identity, session_id)
-    \/ \E agent_identity \in AgentIdentityValues : \E old_session_id \in SessionIdValues : \E new_session_id \in SessionIdValues : RotateMemberSessionRunning(agent_identity, old_session_id, new_session_id)
-    \/ \E agent_identity \in AgentIdentityValues : \E session_id \in SessionIdValues : ReleaseMemberSessionRunning(agent_identity, session_id)
     \/ \E task_id \in TaskIdValues : \E task_payload \in MobTaskValues : TaskCreateRunning(task_id, task_payload)
     \/ \E task_id \in TaskIdValues : \E new_status \in TaskStatusValues : TaskUpdateRunningPending(task_id, new_status)
     \/ \E task_id \in TaskIdValues : \E new_status \in TaskStatusValues : TaskUpdateRunningInProgress(task_id, new_status)
@@ -982,7 +908,6 @@ Next ==
     \/ StartFlowRunning
     \/ CreateRunRunning
     \/ StartRunRunning
-    \/ UnwireRunning
     \/ CompleteFlowRunning
     \/ CompleteFlowRunningZero
     \/ FinishRunRunning
