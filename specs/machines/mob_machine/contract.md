@@ -30,8 +30,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `Retire`(agent_runtime_id: AgentRuntimeId, agent_identity: AgentIdentity, releasing: Option<SessionId>)
 - `Respawn`(agent_runtime_id: AgentRuntimeId)
 - `RetireAll`
-- `Wire`
-- `Unwire`
 - `WireMembers`(edge: WiringEdge)
 - `UnwireMembers`(edge: WiringEdge)
 - `BindMemberSession`(agent_identity: AgentIdentity, session_id: SessionId)
@@ -128,9 +126,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `AdmitPeerInput`
 - `EmitProgressNote`
 - `EmitTaskNotice`
-- `MemberSessionBindingSet`(agent_identity: AgentIdentity, bridge_session_id: SessionId)
-- `MemberSessionBindingRotated`(agent_identity: AgentIdentity, old_session_id: SessionId, new_session_id: SessionId)
-- `MemberSessionBindingReleased`(agent_identity: AgentIdentity, session_id: SessionId)
 - `WiringGraphChanged`(epoch: u64)
 - `MemberSessionBindingChanged`(epoch: u64, agent_identity: AgentIdentity, old_session_id: Option<SessionId>, new_session_id: Option<SessionId>)
 
@@ -145,7 +140,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `coordinator_bound`
   - `no_prior_session_binding`
   - `replacing_absent`
-- Emits: `RequestRuntimeBinding`, `EmitMemberLifecycleNotice`, `MemberSessionBindingSet`
+- Emits: `RequestRuntimeBinding`, `EmitMemberLifecycleNotice`
 - To: `Running`
 
 ### `SpawnRunningReplacing`
@@ -155,7 +150,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `coordinator_bound`
   - `prior_session_binding_present`
   - `replacing_present`
-- Emits: `RequestRuntimeBinding`, `EmitMemberLifecycleNotice`, `MemberSessionBindingRotated`
+- Emits: `RequestRuntimeBinding`, `EmitMemberLifecycleNotice`
 - To: `Running`
 
 ### `ObserveRuntimeReady`
@@ -298,56 +293,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - From: `Running`, `Stopped`, `Completed`
 - On: `Reset`()
 - Emits: `EmitRunLifecycleNotice`
-- To: `Running`
-
-### `WireRunning`
-- From: `Running`
-- On: `Wire`()
-- Emits: `NotifyCoordinator`
-- To: `Running`
-
-### `WireMembersRunning`
-- From: `Running`
-- On: `WireMembers`(edge)
-- Guards:
-  - `edge_not_already_wired`
-- Emits: `WiringGraphChanged`
-- To: `Running`
-
-### `UnwireMembersRunning`
-- From: `Running`
-- On: `UnwireMembers`(edge)
-- Guards:
-  - `edge_currently_wired`
-- Emits: `WiringGraphChanged`
-- To: `Running`
-
-### `BindMemberSessionRunning`
-- From: `Running`
-- On: `BindMemberSession`(agent_identity, session_id)
-- Guards:
-  - `identity_has_runtime`
-  - `no_prior_session_binding`
-- Emits: `MemberSessionBindingSet`, `MemberSessionBindingChanged`
-- To: `Running`
-
-### `RotateMemberSessionRunning`
-- From: `Running`
-- On: `RotateMemberSession`(agent_identity, old_session_id, new_session_id)
-- Guards:
-  - `identity_has_runtime`
-  - `prior_session_binding_present`
-  - `old_session_id_matches_current`
-- Emits: `MemberSessionBindingRotated`, `MemberSessionBindingChanged`
-- To: `Running`
-
-### `ReleaseMemberSessionRunning`
-- From: `Running`
-- On: `ReleaseMemberSession`(agent_identity, session_id)
-- Guards:
-  - `prior_session_binding_present`
-  - `session_id_matches_current`
-- Emits: `MemberSessionBindingReleased`, `MemberSessionBindingChanged`
 - To: `Running`
 
 ### `TaskCreateRunning`
@@ -655,12 +600,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `EmitRunLifecycleNotice`
 - To: `Running`
 
-### `UnwireRunning`
-- From: `Running`
-- On: `Unwire`()
-- Emits: `NotifyCoordinator`
-- To: `Running`
-
 ### `CompleteFlowRunning`
 - From: `Running`, `Completed`
 - On: `CompleteFlow`()
@@ -701,7 +640,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `runtime_id_present`
   - `prior_session_binding_present`
   - `releasing_present`
-- Emits: `RequestRuntimeRetire`, `MemberSessionBindingReleased`
+- Emits: `RequestRuntimeRetire`
 - To: `Running`
 
 ### `RetireRunningPreservingBinding`
@@ -734,7 +673,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `runtime_id_present`
   - `prior_session_binding_present`
   - `releasing_present`
-- Emits: `RequestRuntimeRetire`, `MemberSessionBindingReleased`
+- Emits: `RequestRuntimeRetire`
 - To: `Stopped`
 
 ### `RetireStoppedPreservingBinding`

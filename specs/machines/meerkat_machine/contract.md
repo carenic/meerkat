@@ -18,6 +18,9 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `realtime_binding_authority_epoch`: `Option<u64>`
 - `realtime_reattach_required`: `Bool`
 - `realtime_next_authority_epoch`: `u64`
+- `realtime_reconnect_attempt_count`: `u64`
+- `realtime_reconnect_next_retry_at_ms`: `Option<u64>`
+- `realtime_reconnect_deadline_at_ms`: `Option<u64>`
 - `live_topology_phase`: `LiveTopologyPhase`
 - `mcp_server_states`: `Map<McpServerId, McpServerState>`
 - `pending_peer_requests`: `Map<PeerCorrelationId, OutboundPeerRequestState>`
@@ -88,6 +91,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `DetachRealtimeBinding`
 - `RequireRealtimeReattach`
 - `PublishRealtimeSignal`(authority_epoch: u64, next_binding_state: RealtimeBindingState)
+- `ProjectRealtimeReconnectProgress`(attempt_count: u64, next_retry_at_ms: Option<u64>, deadline_at_ms: Option<u64>)
+- `ClearRealtimeReconnectProgress`
 - `OpsBarrierSatisfied`(operation_ids: Set<OperationId>)
 - `McpServerConnectPending`(server_id: McpServerId)
 - `McpServerConnected`(server_id: McpServerId)
@@ -213,6 +218,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RejectSurfaceCall`
 - `RealtimeIntentProjected`(present: Bool)
 - `RealtimeBindingRotated`(authority_epoch: u64)
+- `RealtimeReconnectProgressProjected`(attempt_count: u64, next_retry_at_ms: Option<u64>, deadline_at_ms: Option<u64>)
 - `McpServerStateChanged`(server_id: McpServerId, new_state: McpServerState)
 - `McpServerReloadRequested`(server_id: McpServerId)
 - `PeerInteractionStateChanged`(corr_id: PeerCorrelationId, new_state: OutboundPeerRequestState)
@@ -1540,6 +1546,86 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `authority_matches_current`
   - `no_topology_reconfigure_in_progress`
   - `valid_next_state`
+- To: `Stopped`
+
+### `ProjectRealtimeReconnectProgressIdle`
+- From: `Idle`
+- On: `ProjectRealtimeReconnectProgress`(attempt_count, next_retry_at_ms, deadline_at_ms)
+- Guards:
+  - `session_registered`
+- Emits: `RealtimeReconnectProgressProjected`
+- To: `Idle`
+
+### `ProjectRealtimeReconnectProgressAttached`
+- From: `Attached`
+- On: `ProjectRealtimeReconnectProgress`(attempt_count, next_retry_at_ms, deadline_at_ms)
+- Guards:
+  - `session_registered`
+- Emits: `RealtimeReconnectProgressProjected`
+- To: `Attached`
+
+### `ProjectRealtimeReconnectProgressRunning`
+- From: `Running`
+- On: `ProjectRealtimeReconnectProgress`(attempt_count, next_retry_at_ms, deadline_at_ms)
+- Guards:
+  - `session_registered`
+- Emits: `RealtimeReconnectProgressProjected`
+- To: `Running`
+
+### `ProjectRealtimeReconnectProgressRetired`
+- From: `Retired`
+- On: `ProjectRealtimeReconnectProgress`(attempt_count, next_retry_at_ms, deadline_at_ms)
+- Guards:
+  - `session_registered`
+- Emits: `RealtimeReconnectProgressProjected`
+- To: `Retired`
+
+### `ProjectRealtimeReconnectProgressStopped`
+- From: `Stopped`
+- On: `ProjectRealtimeReconnectProgress`(attempt_count, next_retry_at_ms, deadline_at_ms)
+- Guards:
+  - `session_registered`
+- Emits: `RealtimeReconnectProgressProjected`
+- To: `Stopped`
+
+### `ClearRealtimeReconnectProgressIdle`
+- From: `Idle`
+- On: `ClearRealtimeReconnectProgress`()
+- Guards:
+  - `session_registered`
+- Emits: `RealtimeReconnectProgressProjected`
+- To: `Idle`
+
+### `ClearRealtimeReconnectProgressAttached`
+- From: `Attached`
+- On: `ClearRealtimeReconnectProgress`()
+- Guards:
+  - `session_registered`
+- Emits: `RealtimeReconnectProgressProjected`
+- To: `Attached`
+
+### `ClearRealtimeReconnectProgressRunning`
+- From: `Running`
+- On: `ClearRealtimeReconnectProgress`()
+- Guards:
+  - `session_registered`
+- Emits: `RealtimeReconnectProgressProjected`
+- To: `Running`
+
+### `ClearRealtimeReconnectProgressRetired`
+- From: `Retired`
+- On: `ClearRealtimeReconnectProgress`()
+- Guards:
+  - `session_registered`
+- Emits: `RealtimeReconnectProgressProjected`
+- To: `Retired`
+
+### `ClearRealtimeReconnectProgressStopped`
+- From: `Stopped`
+- On: `ClearRealtimeReconnectProgress`()
+- Guards:
+  - `session_registered`
+- Emits: `RealtimeReconnectProgressProjected`
 - To: `Stopped`
 
 ### `McpServerConnectPendingIdle`
