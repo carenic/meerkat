@@ -110,6 +110,20 @@ machine! {
             // `peer_ingress_mob_id` are populated iff the kind variant names
             // them; the `peer_ingress_owner_consistency` invariant enforces
             // pairing.
+            //
+            // C-F3 — `peer_ingress_mob_id` has a cross-machine "mob-exists"
+            // contract: when a mob is destroyed, every session whose
+            // `peer_ingress_mob_id == Some(that_mob)` must receive a
+            // `DetachIngress` input before the mob fires its own
+            // `RequestRuntimeDestroy`. That ordering is formalised as the
+            // `mob_destroying_session_ingress` handoff obligation declared
+            // on the `mob_destroy_session_ingress_bundle` compat
+            // composition — see `meerkat-machine-schema/src/compat/
+            // mob_destroy_session_ingress_bridge.rs`. The
+            // `xtask seam-inventory` destroy-obligation-pairing check
+            // (`## Destroy-obligation Pairing`) flags any canonical
+            // routed `Request*Destroy*` effect that lacks the paired
+            // ingress-detach ack protocol.
             peer_ingress_owner_kind: Enum<PeerIngressOwnerKind>,
             peer_ingress_comms_runtime_id: Option<CommsRuntimeId>,
             peer_ingress_mob_id: Option<MobId>,
