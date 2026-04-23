@@ -858,9 +858,6 @@ where
     #[allow(dead_code)] // Used by comms_impl when comms feature is enabled
     pub(crate) silent_comms_intents: Vec<String>,
     /// Optional shared lifecycle registry for async operations.
-    ///
-    /// When set, the agent loop waits on the exact turn-local operation IDs
-    /// registered in `turn_state.pending_op_refs()`.
     pub(crate) ops_lifecycle: Option<Arc<dyn crate::ops_lifecycle::OpsLifecycleRegistry>>,
     /// Optional completion feed for cursor-based completion delivery.
     pub(crate) completion_feed: Option<Arc<dyn crate::completion_feed::CompletionFeed>>,

@@ -430,21 +430,6 @@ where
             .await
     }
 
-    async fn session_belongs_to_mob(&self, _session_id: &SessionId, _mob_id: &MobId) -> bool {
-        self.load_persisted_session(_session_id)
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|session| session_has_persisted_mob_binding(&session, _mob_id))
-    }
-
-    async fn load_persisted_session(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Option<Session>, SessionError> {
-        meerkat_session::PersistentSessionService::<B>::load_persisted(self, session_id).await
-    }
-
     async fn discard_live_session(&self, session_id: &SessionId) -> Result<(), SessionError> {
         meerkat_session::PersistentSessionService::<B>::discard_live_session(self, session_id).await
     }

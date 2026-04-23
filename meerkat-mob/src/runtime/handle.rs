@@ -79,10 +79,6 @@ fn map_runtime_realtime_attachment_status(
 pub struct MobMemberSnapshot {
     /// Current lifecycle status.
     pub status: MobMemberStatus,
-    /// Identity-native runtime ID for this incarnation.
-    pub agent_runtime_id: AgentRuntimeId,
-    /// Fence token for the current incarnation.
-    pub fence_token: FenceToken,
     /// Preview of the current bridge session's last committed assistant text.
     pub output_preview: Option<String>,
     /// Error description (if the member errored).
@@ -145,10 +141,6 @@ impl MobMemberSnapshot {
 pub struct MobMemberListEntry {
     /// Canonical member identity.
     pub agent_identity: AgentIdentity,
-    /// Identity-native runtime ID for this incarnation.
-    pub agent_runtime_id: AgentRuntimeId,
-    /// Fence token for the current incarnation.
-    pub fence_token: FenceToken,
     /// Member role (profile name).
     pub role: ProfileName,
     pub runtime_mode: MobRuntimeMode,
