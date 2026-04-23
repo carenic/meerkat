@@ -294,34 +294,6 @@ pub enum MobEventKind {
         /// Current kickoff snapshot.
         kickoff: MobMemberKickoffSnapshot,
     },
-    /// Bidirectional trust was established between two members.
-    MembersWired {
-        /// First member.
-        a: AgentIdentity,
-        /// Second member.
-        b: AgentIdentity,
-    },
-    /// Trust was established from a local member to an external peer.
-    ExternalPeerWired {
-        /// Local member that trusts the external peer.
-        local: AgentIdentity,
-        /// Full trusted-peer specification for replay/respawn restore.
-        spec: TrustedPeerSpec,
-    },
-    /// Trust was removed from a local member to an external peer.
-    ExternalPeerUnwired {
-        /// Local member removing trust.
-        local: AgentIdentity,
-        /// External peer name that was removed from the local projection.
-        peer_name: String,
-    },
-    /// Bidirectional trust was removed between two members.
-    MembersUnwired {
-        /// First member.
-        a: AgentIdentity,
-        /// Second member.
-        b: AgentIdentity,
-    },
     /// A task was created on the shared task board.
     TaskCreated {
         /// Unique task identifier.

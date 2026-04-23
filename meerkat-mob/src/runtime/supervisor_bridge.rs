@@ -119,7 +119,6 @@ impl MobSupervisorBridge {
     ) -> Result<serde_json::Value, MobError> {
         let _request_guard = self.request_lock.lock().await;
         let runtime = self.runtime().await;
-        runtime.add_trusted_peer(recipient.clone()).await?;
         let to = PeerName::new(recipient.name.clone()).map_err(|error| {
             MobError::WiringError(format!(
                 "invalid supervisor recipient name '{}': {error}",

@@ -96,12 +96,6 @@ pub trait MobProvisioner: Send + Sync {
         fallback_name: &str,
         fallback_peer_id: &str,
     ) -> Result<TrustedPeerSpec, MobError>;
-    async fn reconcile_member_trust(
-        &self,
-        member_ref: &MemberRef,
-        desired_specs: &[TrustedPeerSpec],
-        candidate_specs: &[TrustedPeerSpec],
-    ) -> Result<(), MobError>;
     /// Resolve the live canonical mob-child lifecycle operation for an
     /// existing member bridge.
     async fn active_operation_id_for_member(&self, member_ref: &MemberRef) -> Option<OperationId>;
@@ -1036,36 +1030,6 @@ impl MobProvisioner for SessionBackend {
         Ok(trusted_peer)
     }
 
-    async fn reconcile_member_trust(
-        &self,
-        member_ref: &MemberRef,
-        desired_specs: &[TrustedPeerSpec],
-        _candidate_specs: &[TrustedPeerSpec],
-    ) -> Result<(), MobError> {
-        let Some(comms) = self.comms_runtime(member_ref).await else {
-            return if desired_specs.is_empty() {
-                Ok(())
-            } else {
-                Err(MobError::WiringError(format!(
-                    "resume requires comms runtime for wired member '{member_ref:?}'"
-                )))
-            };
-        };
-        let desired_peer_ids = desired_specs
-            .iter()
-            .map(|spec| spec.peer_id.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        for peer in comms.peers().await {
-            if !desired_peer_ids.contains(&peer.peer_id) {
-                let _ = comms.remove_trusted_peer(&peer.peer_id).await?;
-            }
-        }
-        for spec in desired_specs {
-            comms.add_trusted_peer(spec.clone()).await?;
-        }
-        Ok(())
-    }
-
     async fn active_operation_id_for_member(&self, member_ref: &MemberRef) -> Option<OperationId> {
         let bridge_session_id = member_ref.bridge_session_id()?;
         self.ops_adapter
@@ -1419,73 +1383,6 @@ impl MultiBackendProvisioner {
         Ok(())
     }
 
-    async fn reconcile_peer_only_binding_trust(
-        &self,
-        binding: &RuntimeBinding,
-        desired_specs: &[TrustedPeerSpec],
-        candidate_specs: &[TrustedPeerSpec],
-    ) -> Result<(), MobError> {
-        let RuntimeBinding::External {
-            peer_id,
-            address,
-            bootstrap_token,
-        } = binding
-        else {
-            return Err(MobError::Internal(
-                "peer-only trust reconciliation requires an external binding".to_string(),
-            ));
-        };
-        let peer = Self::peer_only_spec_from_parts(peer_id, address)?;
-        let peer = self
-            .ensure_supervisor_authorized(
-                &peer,
-                Some((
-                    peer_id.as_str(),
-                    address.as_str(),
-                    bootstrap_token
-                        .as_ref()
-                        .map(super::bridge_protocol::BridgeBootstrapToken::as_str),
-                )),
-            )
-            .await?;
-        let authority = self.supervisor_bridge.authority().await;
-        let sup_spec = self.supervisor_bridge.supervisor_spec().await?;
-        let desired_peer_ids = desired_specs
-            .iter()
-            .map(|spec| spec.peer_id.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        for candidate in candidate_specs {
-            if desired_peer_ids.contains(candidate.peer_id.as_str()) {
-                continue;
-            }
-            let command = super::bridge_protocol::BridgeCommand::UnwireMember(
-                super::bridge_protocol::BridgePeerWiringPayload {
-                    supervisor: sup_spec.clone().into(),
-                    epoch: authority.epoch,
-                    protocol_version: authority.protocol_version,
-                    peer_spec: candidate.clone().into(),
-                },
-            );
-            let _ack: super::bridge_protocol::BridgeAck = self
-                .send_bridge_command_typed(&peer, &command, Duration::from_secs(5))
-                .await?;
-        }
-        for desired in desired_specs {
-            let command = super::bridge_protocol::BridgeCommand::WireMember(
-                super::bridge_protocol::BridgePeerWiringPayload {
-                    supervisor: sup_spec.clone().into(),
-                    epoch: authority.epoch,
-                    protocol_version: authority.protocol_version,
-                    peer_spec: desired.clone().into(),
-                },
-            );
-            let _ack: super::bridge_protocol::BridgeAck = self
-                .send_bridge_command_typed(&peer, &command, Duration::from_secs(5))
-                .await?;
-        }
-        Ok(())
-    }
-
     async fn external_member_ref(
         &self,
         _create_session: CreateSessionRequest,
@@ -1832,39 +1729,6 @@ impl MobProvisioner for MultiBackendProvisioner {
                 // No bridge — use the real BackendPeer identity directly.
                 TrustedPeerSpec::new(fallback_name, peer_id.clone(), address.clone())
                     .map_err(|error| MobError::WiringError(format!("invalid peer spec: {error}")))
-            }
-        }
-    }
-
-    async fn reconcile_member_trust(
-        &self,
-        member_ref: &MemberRef,
-        desired_specs: &[TrustedPeerSpec],
-        candidate_specs: &[TrustedPeerSpec],
-    ) -> Result<(), MobError> {
-        match member_ref {
-            MemberRef::BackendPeer {
-                peer_id,
-                address,
-                bootstrap_token,
-                session_id: None,
-                ..
-            } => {
-                self.reconcile_peer_only_binding_trust(
-                    &RuntimeBinding::External {
-                        peer_id: peer_id.clone(),
-                        address: address.clone(),
-                        bootstrap_token: bootstrap_token.clone(),
-                    },
-                    desired_specs,
-                    candidate_specs,
-                )
-                .await
-            }
-            _ => {
-                self.session
-                    .reconcile_member_trust(member_ref, desired_specs, candidate_specs)
-                    .await
             }
         }
     }

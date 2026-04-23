@@ -81,7 +81,6 @@ mod handle;
 pub mod local_bridge;
 pub mod loop_iteration_authority;
 mod mob_runtime_bridge_authority;
-mod mob_wiring_authority;
 mod ops_adapter;
 pub mod path;
 mod pending_spawn_lineage;

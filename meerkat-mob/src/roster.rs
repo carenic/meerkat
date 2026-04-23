@@ -1,7 +1,7 @@
 //! Roster tracking for active mob members.
 //!
-//! The `Roster` is a projection built from `MemberSpawned`, `MemberRetired`,
-//! `MembersWired`, and `MembersUnwired` events.
+//! The `Roster` is a projection built from `MemberSpawned` and `MemberRetired`
+//! events.
 //!
 //! Projection contract:
 //! - `Roster` is not canonical transport/comms trust truth.
@@ -199,22 +199,6 @@ impl Roster {
                     entry.agent_runtime_id = agent_runtime_id.clone();
                 }
             }
-            MobEventKind::MembersWired { a, b } => {
-                self.wire_identities(a, b);
-            }
-            MobEventKind::ExternalPeerWired { local, spec } => {
-                self.wire_external_identity(
-                    local,
-                    &AgentIdentity::from(spec.name.clone()),
-                    spec.clone(),
-                );
-            }
-            MobEventKind::ExternalPeerUnwired { local, peer_name } => {
-                self.unwire_external_identity(local, &AgentIdentity::from(peer_name.as_str()));
-            }
-            MobEventKind::MembersUnwired { a, b } => {
-                self.unwire_identities(a, b);
-            }
             MobEventKind::MemberKickoffUpdated { member, kickoff } => {
                 self.set_kickoff_by_identity(member, Some(kickoff.clone()));
             }
@@ -286,85 +270,6 @@ impl Roster {
         identity: &AgentIdentity,
     ) -> Option<&mut RosterEntry> {
         self.entries.get_mut(identity)
-    }
-
-    /// Wire two members in the roster projection (bidirectional set update).
-    pub(crate) fn wire(&mut self, a: &AgentIdentity, b: &AgentIdentity) {
-        self.wire_identities(a, b);
-    }
-
-    /// Wire two members in the roster projection (identity-native path).
-    pub fn wire_identities(&mut self, a: &AgentIdentity, b: &AgentIdentity) {
-        if let Some(entry_a) = self.entries.get_mut(a) {
-            entry_a.wired_to.insert(b.clone());
-        }
-        if let Some(entry_b) = self.entries.get_mut(b) {
-            entry_b.wired_to.insert(a.clone());
-        }
-    }
-
-    /// Wire a local member to an external peer name.
-    pub fn wire_external(
-        &mut self,
-        local: &AgentIdentity,
-        peer_name: &AgentIdentity,
-        spec: TrustedPeerSpec,
-    ) {
-        self.wire_external_identity(local, peer_name, spec);
-    }
-
-    /// Wire a local member identity to an external peer name.
-    pub fn wire_external_identity(
-        &mut self,
-        local: &AgentIdentity,
-        peer_name: &AgentIdentity,
-        spec: TrustedPeerSpec,
-    ) {
-        if let Some(entry) = self.entries.get_mut(local) {
-            entry.wired_to.insert(peer_name.clone());
-            entry.external_peer_specs.insert(peer_name.clone(), spec);
-        }
-    }
-
-    pub fn wire_external_peer(
-        &mut self,
-        local: &AgentIdentity,
-        peer_name: &AgentIdentity,
-        spec: TrustedPeerSpec,
-    ) {
-        self.wire_external(local, peer_name, spec);
-    }
-
-    /// Unwire two members in the roster projection (bidirectional set update).
-    pub(crate) fn unwire(&mut self, a: &AgentIdentity, b: &AgentIdentity) {
-        self.unwire_identities(a, b);
-    }
-
-    /// Remove the projection edge between two identities.
-    pub fn unwire_identities(&mut self, a: &AgentIdentity, b: &AgentIdentity) {
-        if let Some(entry_a) = self.entries.get_mut(a) {
-            entry_a.wired_to.remove(b);
-        }
-        if let Some(entry_b) = self.entries.get_mut(b) {
-            entry_b.wired_to.remove(a);
-        }
-    }
-
-    /// Unwire a local member from an external peer.
-    pub(crate) fn unwire_external(&mut self, local: &AgentIdentity, peer_name: &AgentIdentity) {
-        self.unwire_external_identity(local, peer_name);
-    }
-
-    /// Remove the projected external peer edge from an identity.
-    pub(crate) fn unwire_external_identity(
-        &mut self,
-        local: &AgentIdentity,
-        peer_name: &AgentIdentity,
-    ) {
-        if let Some(entry) = self.entries.get_mut(local) {
-            entry.wired_to.remove(peer_name);
-            entry.external_peer_specs.remove(peer_name);
-        }
     }
 
     /// Returns `true` when every projected edge is reciprocal and endpoint-present.
@@ -721,13 +626,6 @@ mod tests {
         }
     }
 
-    fn wired_kind(a: &str, b: &str) -> MobEventKind {
-        MobEventKind::MembersWired {
-            a: AgentIdentity::from(a),
-            b: AgentIdentity::from(b),
-        }
-    }
-
     #[test]
     fn test_roster_add_and_get() {
         let mut roster = Roster::new();
@@ -966,74 +864,6 @@ mod tests {
 
         let all: Vec<_> = roster.list().collect();
         assert_eq!(all.len(), 2);
-    }
-
-    #[test]
-    fn test_roster_project_from_events() {
-        let sid1 = session_id();
-        let sid2 = session_id();
-        let events = vec![
-            make_event(
-                1,
-                spawned_kind(
-                    "a",
-                    "worker",
-                    MobRuntimeMode::AutonomousHost,
-                    MemberRef::from_bridge_session_id(sid1),
-                    BTreeMap::new(),
-                ),
-            ),
-            make_event(
-                2,
-                spawned_kind(
-                    "b",
-                    "worker",
-                    MobRuntimeMode::AutonomousHost,
-                    MemberRef::from_bridge_session_id(sid2),
-                    BTreeMap::new(),
-                ),
-            ),
-            make_event(3, wired_kind("a", "b")),
-        ];
-        let roster = Roster::project(&events);
-        assert_eq!(roster.len(), 2);
-        let peers_a = &roster.get(&MeerkatId::from("a")).unwrap().wired_to;
-        assert!(peers_a.contains(&AgentIdentity::from("b")));
-    }
-
-    #[test]
-    fn test_roster_project_with_retire() {
-        let sid1 = session_id();
-        let sid2 = session_id();
-        let events = vec![
-            make_event(
-                1,
-                spawned_kind(
-                    "a",
-                    "worker",
-                    MobRuntimeMode::AutonomousHost,
-                    MemberRef::from_bridge_session_id(sid1.clone()),
-                    BTreeMap::new(),
-                ),
-            ),
-            make_event(
-                2,
-                spawned_kind(
-                    "b",
-                    "worker",
-                    MobRuntimeMode::AutonomousHost,
-                    MemberRef::from_bridge_session_id(sid2.clone()),
-                    BTreeMap::new(),
-                ),
-            ),
-            make_event(3, wired_kind("a", "b")),
-            make_event(4, retired_kind("a", "worker")),
-        ];
-        let roster = Roster::project(&events);
-        assert_eq!(roster.len(), 1);
-        assert!(roster.get(&MeerkatId::from("a")).is_none());
-        let peers_b = &roster.get(&MeerkatId::from("b")).unwrap().wired_to;
-        assert!(peers_b.is_empty());
     }
 
     #[test]

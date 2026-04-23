@@ -1177,9 +1177,6 @@ impl MobBuilder {
                 );
             }
 
-            provisioner
-                .reconcile_member_trust(&entry.member_ref, &desired_specs, &candidate_specs)
-                .await?;
         }
         // Notify orchestrator that the mob resumed.
         if notify_orchestrator_on_resume

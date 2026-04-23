@@ -2,10 +2,6 @@ use super::disposal::{
     BulkBestEffort, DisposalContext, DisposalReport, DisposalStep, ErrorPolicy, WarnAndContinue,
 };
 use super::mob_runtime_bridge_authority::{MobRuntimeBridgeAuthority, MobRuntimeBridgeEffect};
-use super::mob_wiring_authority::{
-    ExternalUnwirePlan, ExternalWireInput, ExternalWirePlan, LocalUnwirePlan, LocalWirePlan,
-    MobWiringAuthority,
-};
 use super::provision_guard::PendingProvision;
 use super::transaction::LifecycleRollback;
 use super::*;
@@ -4558,7 +4554,6 @@ impl MobActor {
         match step {
             DisposalStep::StopHostLoop => self.dispose_stop_host_loop(ctx).await,
             DisposalStep::NotifyPeers => self.dispose_notify_peers(ctx).await,
-            DisposalStep::RemoveTrustEdges => self.dispose_remove_trust_edges(ctx).await,
             DisposalStep::ArchiveSession => self.dispose_archive_session(ctx).await,
         }
     }
@@ -4619,55 +4614,6 @@ impl MobActor {
                 && first_error.is_none()
             {
                 first_error = Some(error);
-            }
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
-    /// Remove the retiring member's trust edges from all wired peers.
-    ///
-    /// Iterates the full `wired_to` set; skips absent peers and peers
-    /// missing comms.
-    async fn dispose_remove_trust_edges(&self, ctx: &DisposalContext) -> Result<(), MobError> {
-        let retiring_peer_id = if let Some(retiring_key) = &ctx.retiring_key {
-            retiring_key.clone()
-        } else if let MemberRef::BackendPeer {
-            peer_id,
-            session_id: None,
-            ..
-        } = &ctx.entry.member_ref
-        {
-            peer_id.clone()
-        } else {
-            return Ok(());
-        };
-        let mut first_error: Option<MobError> = None;
-        for peer_identity in &ctx.entry.wired_to {
-            let peer_member_ref = {
-                let roster = self.roster.read().await;
-                roster
-                    .get_by_identity(peer_identity)
-                    .map(|e| e.member_ref.clone())
-            };
-            let Some(peer_member_ref) = peer_member_ref else {
-                tracing::debug!(
-                    mob_id = %self.definition.id,
-                    agent_identity = %ctx.agent_identity,
-                    peer_id = %peer_identity,
-                    "dispose_remove_trust_edges: skipping absent peer"
-                );
-                continue;
-            };
-            let Some(peer_comms) = self.provisioner_comms(&peer_member_ref).await else {
-                continue;
-            };
-            if let Err(error) = peer_comms.remove_trusted_peer(&retiring_peer_id).await
-                && first_error.is_none()
-            {
-                first_error = Some(error.into());
             }
         }
         match first_error {
@@ -6359,75 +6305,6 @@ impl MobActor {
             }
         }
 
-        let spawned_key = spawned_comms.as_ref().and_then(|comms| comms.public_key());
-        let spawned_spec = if let (Some(spawned_key), Some(spawned_entry)) =
-            (spawned_key.clone(), spawned_entry.as_ref())
-        {
-            let spawned_comms_name = self.comms_name_for(spawned_entry);
-            Some(
-                self.provisioner
-                    .trusted_peer_spec(member_ref, &spawned_comms_name, &spawned_key)
-                    .await?,
-            )
-        } else {
-            None
-        };
-
-        if let Some(spawned_key) = spawned_key {
-            for peer_meerkat_id in &cleanup_peers {
-                let is_wired_peer = wired_peers.contains(peer_meerkat_id);
-                let peer_entry = {
-                    let roster = self.roster.read().await;
-                    roster.get(peer_meerkat_id).cloned()
-                };
-                let Some(peer_entry) = peer_entry else {
-                    if is_wired_peer {
-                        return Err(rollback
-                            .fail(MobError::Internal(format!(
-                                "spawn rollback cannot remove trust for '{agent_identity}': wired peer '{peer_meerkat_id}' missing from roster"
-                            )))
-                            .await);
-                    }
-                    continue;
-                };
-                let peer_comms = self.provisioner_comms(&peer_entry.member_ref).await;
-                let Some(peer_comms) = peer_comms else {
-                    if is_wired_peer {
-                        return Err(rollback
-                            .fail(MobError::Internal(format!(
-                                "spawn rollback cannot remove trust for '{agent_identity}': comms runtime missing for wired peer '{peer_meerkat_id}'"
-                            )))
-                            .await);
-                    }
-                    continue;
-                };
-                if let Err(error) = peer_comms.remove_trusted_peer(&spawned_key).await {
-                    if is_wired_peer {
-                        return Err(rollback
-                            .fail(MobError::Internal(format!(
-                                "spawn rollback cannot remove trust for '{agent_identity}' from wired peer '{peer_meerkat_id}': {error}"
-                            )))
-                            .await);
-                    }
-                    continue;
-                }
-                if let Some(spawned_spec) = spawned_spec.clone() {
-                    rollback.defer(
-                        format!(
-                            "restore trust '{peer_meerkat_id}' -> '{agent_identity}' during spawn rollback"
-                        ),
-                        {
-                            let peer_comms = peer_comms.clone();
-                            move || async move {
-                                peer_comms.add_trusted_peer(spawned_spec).await?;
-                                Ok(())
-                            }
-                        },
-                    );
-                }
-            }
-        }
-
         // Reuse disposal pipeline methods for session archive + roster removal.
         let rollback_ctx = DisposalContext {
             agent_identity: agent_identity.clone(),
@@ -6645,9 +6522,6 @@ impl MobActor {
         {
             WiringEndpoint::Local { spec, .. } | WiringEndpoint::PeerOnly { spec, .. } => spec,
         };
-        sender_comms
-            .add_trusted_peer(recipient_spec.clone())
-            .await?;
         let peer_name = PeerName::new(recipient_spec.name.clone()).map_err(|error| {
             MobError::WiringError(format!(
                 "notify_peer_added: invalid recipient comms name '{}': {error}",
@@ -6687,9 +6561,6 @@ impl MobActor {
         {
             WiringEndpoint::Local { spec, .. } | WiringEndpoint::PeerOnly { spec, .. } => spec,
         };
-        sender_comms
-            .add_trusted_peer(recipient_spec.clone())
-            .await?;
         let peer_name = PeerName::new(recipient_spec.name.clone()).map_err(|error| {
             MobError::WiringError(format!(
                 "notify_peer_retired: invalid peer comms name '{}': {error}",
