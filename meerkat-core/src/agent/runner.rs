@@ -984,16 +984,12 @@ where
         if let Some(refs) = self.pending_skill_references.take()
             && !refs.is_empty()
         {
-            let canonical_ids: Vec<crate::skills::SkillId> = refs
-                .into_iter()
-                .map(|key| {
-                })
-                .collect();
-            match engine.resolve_and_render(&canonical_ids).await {
+            let canonical_keys: Vec<crate::skills::SkillKey> = refs.into_iter().collect();
+            match engine.resolve_and_render(&canonical_keys).await {
                 Ok(resolved) => {
                     for skill in &resolved {
                         tracing::info!(
-                            skill_id = %skill.id.0,
+                            skill_key = %skill.key,
                             "Per-turn skill activation via skill_references"
                         );
                         prefix_parts.push(skill.rendered_body.clone());

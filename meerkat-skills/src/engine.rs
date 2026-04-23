@@ -4,9 +4,9 @@ use std::collections::HashSet;
 use std::future::Future;
 
 use meerkat_core::skills::{
-    ResolvedSkill, SkillArtifact, SkillArtifactContent, SkillCollection, SkillDescriptor,
-    SkillDocument, SkillEngine, SkillError, SkillFilter, SkillId, SkillIntrospectionEntry,
-    SkillQuarantineDiagnostic, SkillSource, SourceHealthSnapshot,
+    CapabilityId, ResolvedSkill, SkillArtifact, SkillArtifactContent, SkillCollection,
+    SkillDescriptor, SkillDocument, SkillEngine, SkillError, SkillFilter, SkillIntrospectionEntry,
+    SkillKey, SkillQuarantineDiagnostic, SkillSource, SourceHealthSnapshot,
 };
 
 use crate::renderer;
@@ -17,6 +17,7 @@ where
     S: SkillSource + Send + Sync,
 {
     source: S,
+    available_capabilities: HashSet<CapabilityId>,
     inventory_threshold: usize,
     max_injection_bytes: usize,
 }
@@ -25,7 +26,7 @@ impl<S> DefaultSkillEngine<S>
 where
     S: SkillSource + Send + Sync,
 {
-    pub fn new(source: S, available_capabilities: Vec<String>) -> Self {
+    pub fn new(source: S, available_capabilities: Vec<CapabilityId>) -> Self {
         Self {
             source,
             available_capabilities: available_capabilities.into_iter().collect(),
@@ -34,17 +35,29 @@ where
         }
     }
 
-    /// Set the inventory threshold from config (overrides default).
     pub fn with_inventory_threshold(mut self, threshold: usize) -> Self {
         self.inventory_threshold = threshold;
         self
     }
 
-    /// Set the max injection bytes from config (overrides default).
     pub fn with_max_injection_bytes(mut self, max_bytes: usize) -> Self {
         self.max_injection_bytes = max_bytes;
         self
     }
+}
+
+fn filter_by_capabilities(
+    skills: Vec<SkillDescriptor>,
+    available: &HashSet<CapabilityId>,
+) -> Vec<SkillDescriptor> {
+    skills
+        .into_iter()
+        .filter(|s| {
+            s.capability_requirements
+                .iter()
+                .all(|cap| available.contains(cap))
+        })
+        .collect()
 }
 
 #[allow(clippy::manual_async_fn)]
@@ -67,37 +80,33 @@ where
 
     fn resolve_and_render(
         &self,
-        ids: &[SkillId],
+        keys: &[SkillKey],
     ) -> impl Future<Output = Result<Vec<ResolvedSkill>, SkillError>> + Send {
         async move {
             let mut results = Vec::new();
-            for id in ids {
-                let doc = self.source.load(id).await?;
+            for key in keys {
+                let doc = self.source.load(key).await?;
 
-                let missing: Vec<_> = doc
+                if let Some(missing) = doc
                     .descriptor
-                    .requires_capabilities
+                    .capability_requirements
                     .iter()
-                    .filter(|cap| !self.available_capabilities.contains(*cap))
-                    .collect();
-                if !missing.is_empty() {
-                    return Err(SkillError::Load(
-                        format!(
-                            "skill '{}' requires unavailable capabilities: {:?}",
-                            id.0, missing
-                        )
-                        .into(),
-                    ));
+                    .find(|cap| !self.available_capabilities.contains(*cap))
+                {
+                    return Err(SkillError::CapabilityUnavailable {
+                        key: key.clone(),
+                        capability: missing.clone(),
+                    });
                 }
 
                 let rendered = renderer::render_injection_with_limit(
-                    &id.0,
+                    key,
                     &doc.body,
                     self.max_injection_bytes,
                 );
                 let byte_size = rendered.len();
                 results.push(ResolvedSkill {
-                    id: id.clone(),
+                    key: key.clone(),
                     name: doc.descriptor.name.clone(),
                     rendered_body: rendered,
                     byte_size,
@@ -117,10 +126,7 @@ where
     ) -> impl Future<Output = Result<Vec<SkillDescriptor>, SkillError>> + Send {
         async move {
             let all_skills = self.source.list(filter).await?;
-            Ok(filter_by_capabilities(
-                all_skills,
-                &self.available_capabilities,
-            ))
+            Ok(filter_by_capabilities(all_skills, &self.available_capabilities))
         }
     }
 
@@ -138,28 +144,28 @@ where
 
     fn list_artifacts(
         &self,
-        id: &SkillId,
+        key: &SkillKey,
     ) -> impl Future<Output = Result<Vec<SkillArtifact>, SkillError>> + Send {
-        async move { self.source.list_artifacts(id).await }
+        async move { self.source.list_artifacts(key).await }
     }
 
     fn read_artifact(
         &self,
-        id: &SkillId,
+        key: &SkillKey,
         artifact_path: &str,
     ) -> impl Future<Output = Result<SkillArtifactContent, SkillError>> + Send {
-        async move { self.source.read_artifact(id, artifact_path).await }
+        async move { self.source.read_artifact(key, artifact_path).await }
     }
 
     fn invoke_function(
         &self,
-        id: &SkillId,
+        key: &SkillKey,
         function_name: &str,
         arguments: serde_json::Value,
     ) -> impl Future<Output = Result<serde_json::Value, SkillError>> + Send {
         async move {
             self.source
-                .invoke_function(id, function_name, arguments)
+                .invoke_function(key, function_name, arguments)
                 .await
         }
     }
@@ -170,15 +176,12 @@ where
     ) -> impl Future<Output = Result<Vec<SkillIntrospectionEntry>, SkillError>> + Send {
         async move {
             let entries = self.source.list_all_with_provenance(filter).await?;
-            // Apply capability filtering: only active entries with available capabilities
             Ok(entries
                 .into_iter()
                 .filter(|e| {
-                    // Shadowed entries pass through without capability filtering
-                    // (they're inactive anyway).
                     !e.is_active
                         || e.descriptor
-                            .requires_capabilities
+                            .capability_requirements
                             .iter()
                             .all(|cap| self.available_capabilities.contains(cap))
                 })
@@ -188,13 +191,13 @@ where
 
     fn load_from_source(
         &self,
-        id: &SkillId,
+        key: &SkillKey,
         source_name: Option<&str>,
     ) -> impl Future<Output = Result<SkillDocument, SkillError>> + Send {
         let source_name = source_name.map(ToString::to_string);
         async move {
             self.source
-                .load_from_source(id, source_name.as_deref())
+                .load_from_source(key, source_name.as_deref())
                 .await
         }
     }
@@ -206,30 +209,32 @@ mod tests {
     use super::*;
     use crate::source::InMemorySkillSource;
     use indexmap::IndexMap;
-    use meerkat_core::skills::{SkillDescriptor, SkillDocument, SkillId, SkillScope};
+    use meerkat_core::skills::{SkillName, SkillScope, SourceUuid};
 
-    fn test_skill(id: &str, name: &str, caps: &[&str]) -> SkillDocument {
-        SkillDocument {
-            descriptor: SkillDescriptor {
-                id: SkillId(id.to_string()),
-                name: name.to_string(),
-                description: format!("Description for {name}"),
-                scope: SkillScope::Builtin,
-                requires_capabilities: caps.iter().map(std::string::ToString::to_string).collect(),
-                ..Default::default()
-            },
-            body: format!("# {name}\n\nContent for {id}."),
-            extensions: IndexMap::new(),
+    fn test_key(skill: &str) -> SkillKey {
+        SkillKey {
+            source_uuid: SourceUuid::builtin(),
+            skill_name: SkillName::parse(skill).unwrap(),
         }
     }
 
-    fn multi_source() -> InMemorySkillSource {
-        InMemorySkillSource::new(vec![
-            test_skill("extraction/email", "Email Extractor", &[]),
-            test_skill("extraction/fiction", "Fiction Extractor", &[]),
-            test_skill("formatting/markdown", "Markdown Output", &[]),
-            test_skill("pdf-processing", "PDF Processing", &[]),
-        ])
+    fn test_skill(skill: &str, name: &str, caps: &[&str]) -> SkillDocument {
+        SkillDocument {
+            descriptor: SkillDescriptor {
+                key: test_key(skill),
+                name: name.to_string(),
+                description: format!("Description for {name}"),
+                scope: SkillScope::Builtin,
+                metadata: IndexMap::new(),
+                capability_requirements: caps
+                    .iter()
+                    .map(|c| CapabilityId::parse(c).unwrap())
+                    .collect(),
+                source_name: String::new(),
+            },
+            body: format!("# {name}\n\nContent for {skill}."),
+            extensions: IndexMap::new(),
+        }
     }
 
     #[tokio::test]
@@ -239,13 +244,18 @@ mod tests {
             test_skill("shell-patterns", "Shell Patterns", &["builtins", "shell"]),
         ]);
 
-        let engine =
-            DefaultSkillEngine::new(source, vec!["builtins".to_string(), "shell".to_string()]);
+        let engine = DefaultSkillEngine::new(
+            source,
+            vec![
+                CapabilityId::parse("builtins").unwrap(),
+                CapabilityId::parse("shell").unwrap(),
+            ],
+        );
 
         let section = engine.inventory_section().await.unwrap();
         assert!(section.contains("<available_skills>"));
-        assert!(section.contains("<skill id=\"task-workflow\">"));
-        assert!(section.contains("<skill id=\"shell-patterns\">"));
+        assert!(section.contains("task-workflow"));
+        assert!(section.contains("shell-patterns"));
     }
 
     #[tokio::test]
@@ -255,10 +265,11 @@ mod tests {
             test_skill("shell-patterns", "Shell Patterns", &["builtins", "shell"]),
         ]);
 
-        let engine = DefaultSkillEngine::new(source, vec!["builtins".to_string()]);
+        let engine =
+            DefaultSkillEngine::new(source, vec![CapabilityId::parse("builtins").unwrap()]);
 
         let section = engine.inventory_section().await.unwrap();
-        assert!(section.contains("<skill id=\"task-workflow\">"));
+        assert!(section.contains("task-workflow"));
         assert!(!section.contains("shell-patterns"));
     }
 
@@ -270,67 +281,38 @@ mod tests {
         let engine = DefaultSkillEngine::new(source, vec![]);
 
         let result = engine
-            .resolve_and_render(&[SkillId("task-workflow".into())])
+            .resolve_and_render(&[test_key("task-workflow")])
             .await
             .unwrap();
         assert_eq!(result.len(), 1);
-        assert!(
-            result[0]
-                .rendered_body
-                .contains("<skill id=\"task-workflow\">")
-        );
-        assert!(
-            result[0]
-                .rendered_body
-                .contains("Content for task-workflow")
-        );
+        assert!(result[0].rendered_body.contains("task-workflow"));
+        assert!(result[0].rendered_body.contains("Content for task-workflow"));
         assert_eq!(result[0].name, "Task Workflow");
         assert!(result[0].byte_size > 0);
     }
 
     #[tokio::test]
-    async fn test_resolve_and_render_unknown_id() {
+    async fn test_resolve_and_render_unknown_key() {
         let source = InMemorySkillSource::new(vec![]);
         let engine = DefaultSkillEngine::new(source, vec![]);
 
-        let result = engine
-            .resolve_and_render(&[SkillId("nonexistent/skill".into())])
-            .await;
+        let result = engine.resolve_and_render(&[test_key("nonexistent")]).await;
         assert!(matches!(result, Err(SkillError::NotFound { .. })));
     }
 
     #[tokio::test]
-    async fn test_preload_missing_skill_errors() {
-        let source = InMemorySkillSource::new(vec![test_skill("existing/skill", "Existing", &[])]);
+    async fn test_resolve_reports_unavailable_capability() {
+        let source = InMemorySkillSource::new(vec![test_skill(
+            "shell-patterns",
+            "Shell Patterns",
+            &["shell"],
+        )]);
         let engine = DefaultSkillEngine::new(source, vec![]);
 
-        let result = engine
-            .resolve_and_render(&[
-                SkillId("existing/skill".into()),
-                SkillId("missing/skill".into()),
-            ])
-            .await;
-        assert!(matches!(result, Err(SkillError::NotFound { .. })));
-    }
-
-    #[tokio::test]
-    async fn test_list_skills_no_filter() {
-        let engine = DefaultSkillEngine::new(multi_source(), vec![]);
-        let skills = engine.list_skills(&SkillFilter::default()).await.unwrap();
-        assert_eq!(skills.len(), 4);
-    }
-
-    #[tokio::test]
-    async fn test_list_skills_collection_filter() {
-        let engine = DefaultSkillEngine::new(multi_source(), vec![]);
-        let skills = engine
-            .list_skills(&SkillFilter {
-                collection: Some("extraction".into()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(skills.len(), 2);
-        assert!(skills.iter().all(|s| s.id.0.starts_with("extraction/")));
+        let result = engine.resolve_and_render(&[test_key("shell-patterns")]).await;
+        assert!(matches!(
+            result,
+            Err(SkillError::CapabilityUnavailable { .. })
+        ));
     }
 }

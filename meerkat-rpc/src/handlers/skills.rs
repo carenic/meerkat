@@ -1,10 +1,14 @@
 //! Handlers for `skills/list` and `skills/inspect`.
+//!
+//! Post-V4 the runtime keys skills by `SkillKey` (source_uuid + skill_name).
+//! This handler projects the typed key onto the existing wire `SkillEntry`
+//! shape by rendering `"{source_uuid}/{skill_name}"` — the wire contract
+//! itself is owned by `meerkat-contracts` and a separate task retypes it
+//! to carry `source_uuid` and `skill_name` as distinct fields.
 
 use std::sync::Arc;
 
-use meerkat_core::skills::{SkillFilter, SkillId, SkillRuntime};
-use serde::Deserialize;
-use serde_json::value::RawValue;
+use meerkat_core::skills::{SkillFilter, SkillRuntime};
 
 use crate::protocol::{RpcId, RpcResponse};
 
@@ -28,7 +32,10 @@ pub async fn handle_list(
             let wire: Vec<meerkat_contracts::SkillEntry> = entries
                 .iter()
                 .map(|e| meerkat_contracts::SkillEntry {
-                    id: e.descriptor.id.0.clone(),
+                    id: format!(
+                        "{}/{}",
+                        e.descriptor.key.source_uuid, e.descriptor.key.skill_name
+                    ),
                     name: e.descriptor.name.clone(),
                     description: e.descriptor.description.clone(),
                     scope: e.descriptor.scope.to_string(),
@@ -43,4 +50,3 @@ pub async fn handle_list(
         Err(e) => RpcResponse::error(id, -32603, format!("skill list failed: {e}")),
     }
 }
-

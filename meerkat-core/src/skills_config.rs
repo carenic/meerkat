@@ -14,9 +14,9 @@ use std::path::PathBuf;
 use std::{fmt::Write as _, hash::Hasher};
 
 use crate::skills::{
-    SkillAlias, SkillError, SkillKeyRemap, SkillScope, SourceHealthThresholds,
-    SourceIdentityLineage, SourceIdentityRecord, SourceIdentityRegistry, SourceIdentityStatus,
-    SourceTransportKind, SourceUuid,
+    SkillAlias, SkillError, SkillKeyRemap, SourceHealthThresholds, SourceIdentityLineage,
+    SourceIdentityRecord, SourceIdentityRegistry, SourceIdentityStatus, SourceTransportKind,
+    SourceUuid,
 };
 
 // ---------------------------------------------------------------------------
