@@ -98,16 +98,17 @@ pub type TurnResult = meerkat_contracts::WireRunResult;
 // ---------------------------------------------------------------------------
 
 fn canonical_skill_ids(
-    runtime: &SessionRuntime,
+    _runtime: &SessionRuntime,
     skill_refs: Option<Vec<SkillRef>>,
-    skill_references: Option<Vec<String>>,
+    _skill_references: Option<Vec<String>>,
 ) -> Result<Option<Vec<SkillKey>>, meerkat_core::skills::SkillError> {
+    // Post-wave-a dogma: legacy string `skill_references` path has been retired;
+    // only typed `skill_refs` is consulted at the wire boundary.
     let params = SkillsParams {
         preload_skills: None,
         skill_refs,
-        skill_references,
     };
-    params.canonical_skill_keys_with_registry(&runtime.skill_identity_registry())
+    Ok(params.canonical_skill_keys())
 }
 
 /// Collect per-turn override fields into a struct for `SessionRuntime::start_turn`.

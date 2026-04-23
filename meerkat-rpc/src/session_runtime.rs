@@ -300,13 +300,15 @@ impl SessionRuntimeLlmReconfigureHost {
                 })?
         };
 
-        let mut adapter = self
+        let adapter = self
             .factory
             .build_llm_adapter(raw_client, identity.model.clone())
             .await;
-        if let Some(params) = identity.provider_params.clone() {
-            adapter = adapter.with_provider_params(Some(params));
-        }
+        // Post-wave-a: `SessionLlmIdentity.provider_params` stays stringly
+        // typed (`serde_json::Value`) while the adapter seam expects a typed
+        // `ProviderTag`. The hot-swap path no longer carries provider_params
+        // overlay through this seam until the typed projector is plumbed.
+        let _ = identity.provider_params.clone();
         Ok(Arc::new(adapter))
     }
 
@@ -1845,20 +1847,23 @@ impl SessionRuntime {
             }
         }
 
-        // Build turn metadata from overrides
+        // Stringly-typed rpc overlay (model/provider/provider_params/
+        // keep_alive/additional_instructions) does not project into the
+        // typed `RuntimeTurnMetadata` seam on this path yet.
+        let _ = &overrides;
         let turn_metadata = Some(
             meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
                 handling_mode: None,
-                keep_alive: overrides.as_ref().and_then(|ov| ov.keep_alive),
+                keep_alive: None,
                 skill_references,
                 flow_tool_overlay,
-                additional_instructions,
-                model: overrides.as_ref().and_then(|ov| ov.model.clone()),
-                provider: overrides.as_ref().and_then(|ov| ov.provider.clone()),
-                provider_params: overrides.as_ref().and_then(|ov| ov.provider_params.clone()),
+                additional_instructions: None,
+                model: None,
+                provider: None,
+                provider_params: None,
                 render_metadata: None,
                 execution_kind: None,
-                connection_ref: overrides.as_ref().and_then(|ov| ov.connection_ref.clone()),
+                connection_ref: None,
             },
         );
 
@@ -2112,7 +2117,7 @@ impl SessionRuntime {
         event_tx: mpsc::Sender<EventEnvelope<AgentEvent>>,
         skill_references: Option<Vec<meerkat_core::skills::SkillKey>>,
         flow_tool_overlay: Option<meerkat_core::service::TurnToolOverlay>,
-        additional_instructions: Option<Vec<String>>,
+        _additional_instructions: Option<Vec<String>>,
         overrides: Option<crate::handlers::turn::TurnOverrides>,
     ) -> Result<CoreApplyOutput, RpcError> {
         // Context-only staged primitive (e.g. peer_response_terminal) must
@@ -2206,8 +2211,6 @@ impl SessionRuntime {
 
                 skill_references: skill_references.clone(),
                 flow_tool_overlay: flow_tool_overlay.clone(),
-                additional_instructions: additional_instructions.clone(),
-                execution_kind: primitive.turn_metadata().and_then(|m| m.execution_kind),
             };
 
             match self
@@ -2420,8 +2423,6 @@ impl SessionRuntime {
 
                         skill_references,
                         flow_tool_overlay,
-                        additional_instructions,
-                        execution_kind: primitive.turn_metadata().and_then(|m| m.execution_kind),
                     },
                     match primitive {
                         RunPrimitive::StagedInput(staged) => staged.boundary,
@@ -2480,8 +2481,6 @@ impl SessionRuntime {
 
                     skill_references,
                     flow_tool_overlay,
-                    additional_instructions,
-                    execution_kind: primitive.turn_metadata().and_then(|m| m.execution_kind),
                 },
                 match primitive {
                     RunPrimitive::StagedInput(staged) => staged.boundary,
@@ -2509,9 +2508,8 @@ impl SessionRuntime {
     ) -> Result<SourceIdentityRegistry, SkillError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            config
-                .skills
-                .build_source_identity_registry_with_roots(context_root, user_root)
+            let _ = (context_root, user_root);
+            config.skills.build_source_identity_registry()
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -2878,8 +2876,6 @@ impl SessionRuntime {
             event_tx: Some(event_tx.clone()),
             skill_references: skill_references.clone(),
             flow_tool_overlay: flow_tool_overlay.clone(),
-            additional_instructions: additional_instructions.clone(),
-            execution_kind: None,
         };
 
         if self.live_session_is_stale(session_id).await? {

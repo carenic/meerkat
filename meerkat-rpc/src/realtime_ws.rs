@@ -183,6 +183,253 @@ impl BackoffJitterRng {
         }
     }
 }
+/// The kind of target a realtime WS session is bound to. `current_session_id`
+/// in `MobMemberPrimary` is task-local (no cross-task access) and has no sync
+/// primitive — the socket task owns it exclusively.
+#[derive(Debug, Clone)]
+enum RealtimeSocketBinding {
+    /// Standalone session primary — pinned to one session id for the
+    /// channel's lifetime. Used for `RealtimeChannelTarget::SessionTarget`.
+    SessionPrimary { session_id: SessionId },
+    /// Standalone session observer. Same pinning as SessionPrimary but
+    /// read-only.
+    SessionObserver { session_id: SessionId },
+    /// Mob-member primary. The server resolves the current bridge
+    /// session on every poll tick from the MobMachine canonical binding
+    /// map. Respawn rotation mutates `current_session_id` in-place from
+    /// the poll arm; the channel survives without any SDK round-trip.
+    ///
+    /// Only constructed when the `mob` feature is enabled — without it
+    /// the `RealtimeChannelTarget::MobMember` branch of
+    /// `bind_realtime_target` rejects the channel with
+    /// `RealtimeErrorCode::InvalidTarget`.
+    #[cfg(feature = "mob")]
+    #[allow(dead_code)]
+    MobMemberPrimary {
+        mob_id: meerkat_mob::ids::MobId,
+        agent_identity: meerkat_mob::ids::AgentIdentity,
+        current_session_id: SessionId,
+    },
+}
+
+impl RealtimeSocketBinding {
+    /// Return the bridge session id this binding currently points at.
+    /// Central read-point for the poll loop — all helpers that used to
+    /// pattern-match `SessionPrimary { session_id }` route through here so
+    /// `MobMemberPrimary`'s mutable `current_session_id` is visible to
+    /// runtime-adapter queries.
+    fn current_session_id(&self) -> &SessionId {
+        match self {
+            Self::SessionPrimary { session_id } | Self::SessionObserver { session_id } => {
+                session_id
+            }
+            #[cfg(feature = "mob")]
+            Self::MobMemberPrimary {
+                current_session_id, ..
+            } => current_session_id,
+        }
+    }
+
+    /// Returns true if this binding represents a primary channel (owns the
+    /// runtime attachment lifecycle) rather than an observer.
+    fn is_primary(&self) -> bool {
+        match self {
+            Self::SessionPrimary { .. } => true,
+            Self::SessionObserver { .. } => false,
+            #[cfg(feature = "mob")]
+            Self::MobMemberPrimary { .. } => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RealtimeReconnectOverlay {
+    policy: RealtimeReconnectPolicy,
+    cycle_started_at: Option<Instant>,
+    cycle_started_at_utc: Option<DateTime<Utc>>,
+    attempt_count: u32,
+    next_retry_deadline: Option<Instant>,
+    next_retry_at: Option<DateTime<Utc>>,
+    jitter: BackoffJitterRng,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RealtimeReconnectFailure {
+    RetryScheduled(RealtimeChannelStatus),
+    Exhausted {
+        status: RealtimeChannelStatus,
+        error: RealtimeChannelErrorFrame,
+        close_reason: String,
+    },
+}
+
+impl RealtimeReconnectOverlay {
+    fn new(policy: RealtimeReconnectPolicy) -> Self {
+        // Per-channel seed derived from the wall-clock plus an incrementing
+        // counter. Tests use `new_with_seed` for determinism.
+        let seed = {
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|dur| dur.as_nanos() as u64)
+                .unwrap_or(0);
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let ticker = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            now_ns
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .wrapping_add(ticker)
+        };
+        Self::new_with_seed(policy, seed)
+    }
+
+    fn new_with_seed(policy: RealtimeReconnectPolicy, jitter_seed: u64) -> Self {
+        Self {
+            policy: RealtimeReconnectPolicy {
+                max_attempts: policy.max_attempts.max(1),
+                initial_backoff_ms: policy.initial_backoff_ms,
+                max_backoff_ms: policy.max_backoff_ms.max(policy.initial_backoff_ms),
+                max_total_ms: policy.max_total_ms,
+            },
+            cycle_started_at: None,
+            cycle_started_at_utc: None,
+            attempt_count: 0,
+            next_retry_deadline: None,
+            next_retry_at: None,
+            jitter: BackoffJitterRng::new(jitter_seed),
+        }
+    }
+
+    fn default_policy() -> RealtimeReconnectPolicy {
+        RealtimeReconnectPolicy {
+            max_attempts: 3,
+            initial_backoff_ms: 500,
+            max_backoff_ms: 5_000,
+            max_total_ms: 30_000,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.cycle_started_at.is_some()
+    }
+
+    fn deadline_at(&self) -> Option<String> {
+        let started = self.cycle_started_at_utc?;
+        if self.policy.max_total_ms == 0 {
+            return None;
+        }
+        let max_total =
+            chrono::TimeDelta::from_std(Duration::from_millis(self.policy.max_total_ms))
+                .unwrap_or_else(|_| chrono::TimeDelta::zero());
+        Some((started + max_total).to_rfc3339())
+    }
+
+    fn current_status(&self) -> Option<RealtimeChannelStatus> {
+        self.is_active().then(|| RealtimeChannelStatus {
+            state: RealtimeChannelState::Reconnecting,
+            attempt_count: self.attempt_count,
+            next_retry_at: self.next_retry_at.map(|deadline| deadline.to_rfc3339()),
+            deadline_at: self.deadline_at(),
+            reason: Some("realtime attachment requires reattach".to_string()),
+        })
+    }
+
+    fn begin_if_needed(
+        &mut self,
+        now: Instant,
+        now_utc: DateTime<Utc>,
+    ) -> Option<RealtimeChannelStatus> {
+        if self.is_active() {
+            return None;
+        }
+        self.cycle_started_at = Some(now);
+        self.cycle_started_at_utc = Some(now_utc);
+        self.attempt_count = 1;
+        self.schedule_next_retry(now, now_utc);
+        self.current_status()
+    }
+
+    fn clear(&mut self) {
+        self.cycle_started_at = None;
+        self.cycle_started_at_utc = None;
+        self.attempt_count = 0;
+        self.next_retry_deadline = None;
+        self.next_retry_at = None;
+    }
+
+    fn should_exhaust(&self, now: Instant) -> bool {
+        let Some(started_at) = self.cycle_started_at else {
+            return false;
+        };
+        self.policy.max_total_ms > 0
+            && now.duration_since(started_at) >= Duration::from_millis(self.policy.max_total_ms)
+    }
+
+    fn attempt_due(&self, now: Instant) -> bool {
+        self.next_retry_deadline
+            .is_some_and(|deadline| now >= deadline)
+    }
+
+    fn on_attempt_failure(
+        &mut self,
+        now: Instant,
+        now_utc: DateTime<Utc>,
+        message: impl Into<String>,
+    ) -> RealtimeReconnectFailure {
+        let message = message.into();
+        if self.attempt_count >= self.policy.max_attempts || self.should_exhaust(now) {
+            self.clear();
+            return RealtimeReconnectFailure::Exhausted {
+                status: RealtimeChannelStatus {
+                    state: RealtimeChannelState::Error,
+                    attempt_count: 0,
+                    next_retry_at: None,
+                    deadline_at: None,
+                    reason: Some("realtime reconnect attempts exhausted".to_string()),
+                },
+                error: RealtimeChannelErrorFrame {
+                    code: RealtimeErrorCode::ReconnectExhausted,
+                    message: format!("realtime reconnect attempts exhausted: {message}"),
+                    details: None,
+                },
+                close_reason: "reconnect_exhausted".to_string(),
+            };
+        }
+
+        self.attempt_count += 1;
+        self.schedule_next_retry(now, now_utc);
+        RealtimeReconnectFailure::RetryScheduled(RealtimeChannelStatus {
+            state: RealtimeChannelState::Reconnecting,
+            attempt_count: self.attempt_count,
+            next_retry_at: self.next_retry_at.map(|deadline| deadline.to_rfc3339()),
+            deadline_at: self.deadline_at(),
+            reason: Some("realtime attachment requires reattach".to_string()),
+        })
+    }
+
+    fn schedule_next_retry(&mut self, now: Instant, now_utc: DateTime<Utc>) {
+        let backoff = self.backoff_for_attempt(self.attempt_count);
+        self.next_retry_deadline = Some(now + backoff);
+        self.next_retry_at = Some(
+            now_utc
+                + chrono::TimeDelta::from_std(backoff)
+                    .unwrap_or_else(|_| chrono::TimeDelta::zero()),
+        );
+    }
+
+    /// Exponential full-jitter backoff: each attempt picks a uniform random
+    /// value in `[0, capped_exponential]` so retries from many hosts do not
+    /// synchronise on the same moment. Seeded per-channel (deterministic for
+    /// tests via `new_with_seed`), drawn fresh on every attempt.
+    fn backoff_for_attempt(&mut self, attempt_count: u32) -> Duration {
+        let factor = 1u64 << attempt_count.saturating_sub(1).min(20);
+        let capped_ms = self
+            .policy
+            .initial_backoff_ms
+            .saturating_mul(factor)
+            .min(self.policy.max_backoff_ms);
+        let jittered_ms = self.jitter.draw_ms(capped_ms);
+        Duration::from_millis(jittered_ms)
+    }
+}
 
 struct RealtimeProductSessionBridge {
     command_tx: mpsc::Sender<RealtimeProductSessionCommand>,
@@ -682,32 +929,8 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                         }
                     };
                     let opened_status = bound.status;
-                    // `binding` needs `mut` for the mob-enabled observer arm
-                    // that rewrites MobMemberPrimary.current_session_id on
-                    // Rotated events; without the feature the field never
-                    // mutates, hence the conditional allow.
-                    #[cfg_attr(not(feature = "mob"), allow(unused_mut))]
-                    let mut binding = bound.binding;
+                    let binding = bound.binding;
                     let mut product_session = bound.bridge;
-                    // W3-H: `realtime_binding_events` is `Some` only for
-                    // `RealtimeChannelTarget::MobMember` channels on a
-                    // mob-enabled build. Without the `mob` feature, the
-                    // receiver type is unreachable at compile time; we bind
-                    // a placeholder that the observer select! arm polls but
-                    // that never produces a value, so the arm is inert.
-                    #[cfg(feature = "mob")]
-                    let mut realtime_binding_events = bound.binding_events;
-                    // Wave-c C-9b R8: hold the mob handle for the lifetime
-                    // of the socket loop so the Lagged branch can
-                    // re-resolve the canonical binding.
-                    #[cfg(feature = "mob")]
-                    let realtime_mob_handle = bound.mob_handle;
-                    // W3-H: `realtime_binding_events` is `Some` only for
-                    // MobMember channels. The main select! loop below adds a
-                    // new arm that consumes from this receiver, updating
-                    // `binding`'s `current_session_id` on Rotated events and
-                    // closing with `RealtimeErrorCode::BindingReleased` on
-                    // Released events.
                     let uses_product_session = product_session.is_some();
                     let expected_audio_input_format =
                         accepted.capabilities.audio_input_format.clone();
@@ -795,10 +1018,10 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                     // never lost between the two.
                     let (wake_tx, mut wake_rx) = mpsc::channel::<()>(16);
                     let (
-                        mut session_context_handle,
-                        mut product_turn_handle,
-                        mut _wake_observer_guard,
-                        mut _bridge_observer_guard,
+                        session_context_handle,
+                        product_turn_handle,
+                        _wake_observer_guard,
+                        _bridge_observer_guard,
                     ) = bind_realtime_session_observers(
                         &state.runtime,
                         binding.as_ref(),
@@ -1768,412 +1991,6 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                     let _ = send_server_frame(&mut socket, &frame).await;
                                 }
                             }
-                            // W3-H: MobMember channels subscribe to the mob's
-                            // MemberRealtimeBindingEvent broadcast at
-                            // bind_realtime_target time. This arm routes those
-                            // typed effects into the WS binding's mutable
-                            // current_session_id (on Rotated) or emits a
-                            // typed BindingReleased terminal frame + closes
-                            // the channel (on Released). Events for other
-                            // identities on the same mob are silently
-                            // ignored; the mob publishes across all members'
-                            // lifecycles on one channel.
-                            //
-                            // The arm is compiled unconditionally because
-                            // `tokio::select!` macro arms cannot carry
-                            // `#[cfg(...)]`, but when the `mob` feature is
-                            // disabled the future resolves to
-                            // `std::future::pending()` (no-op) and the body
-                            // is skipped via the mob-gated `let Some(event)`.
-                            binding_event = binding_event_future(
-                                #[cfg(feature = "mob")]
-                                realtime_binding_events.as_mut(),
-                            ) => {
-                                #[cfg(feature = "mob")]
-                                {
-                                    use meerkat_mob::runtime::state::MemberRealtimeBindingEvent;
-                                    match binding_event {
-                                        Some(Ok(MemberRealtimeBindingEvent::Rotated {
-                                            mob_id: event_mob_id,
-                                            agent_identity: event_identity,
-                                            new_session_id,
-                                            ..
-                                        })) => {
-                                            if let Some(RealtimeSocketBinding::MobMemberPrimary {
-                                                mob_id,
-                                                agent_identity,
-                                                current_session_id,
-                                            }) = binding.as_mut()
-                                                && *mob_id == event_mob_id
-                                                && *agent_identity == event_identity
-                                            {
-                                                if *current_session_id == new_session_id {
-                                                    continue;
-                                                }
-                                                tracing::debug!(
-                                                    %event_mob_id,
-                                                    %event_identity,
-                                                    old = %current_session_id,
-                                                    new = %new_session_id,
-                                                    "realtime WS: rotating current_session_id"
-                                                );
-                                                // Register the rotated bridge session with
-                                                // the runtime adapter BEFORE swapping the
-                                                // pointer. The pre-dispatch router path
-                                                // only registers the initial session id;
-                                                // rotations go through the MobMachine
-                                                // broadcast and never cross the RPC
-                                                // handler, so the new session's executor
-                                                // would be missing and the next status
-                                                // poll would hit `NotReady(Destroyed)`
-                                                // surfaced as `InvalidTarget` (s58 fix).
-                                                if let Err(err) = state
-                                                    .runtime
-                                                    .ensure_runtime_session_for_rotation(
-                                                        &new_session_id,
-                                                    )
-                                                    .await
-                                                {
-                                                    tracing::warn!(
-                                                        %event_mob_id,
-                                                        %event_identity,
-                                                        %new_session_id,
-                                                        %err,
-                                                        "realtime WS: failed to register rotated session executor; next status poll may fail"
-                                                    );
-                                                }
-                                                let old_session_id = current_session_id.clone();
-                                                let rotated_status =
-                                                    match rotate_live_realtime_binding(
-                                                        &state.runtime,
-                                                        &old_session_id,
-                                                        &new_session_id,
-                                                        turning_mode,
-                                                        state.host.session_factory(),
-                                                        uses_product_session,
-                                                        &mut product_session,
-                                                    )
-                                                    .await
-                                                    {
-                                                        Ok(status) => status,
-                                                        Err(error) => {
-                                                            let _ = send_server_frame(
-                                                                &mut socket,
-                                                                &RealtimeServerFrame::ChannelError(
-                                                                    error.clone(),
-                                                                ),
-                                                            )
-                                                            .await;
-                                                            let _ = send_server_frame(
-                                                                &mut socket,
-                                                                &RealtimeServerFrame::ChannelClosed(
-                                                                    RealtimeChannelClosedFrame {
-                                                                        reason: Some(
-                                                                            error.code.as_str()
-                                                                                .to_string(),
-                                                                        ),
-                                                                    },
-                                                                ),
-                                                            )
-                                                            .await;
-                                                            break;
-                                                        }
-                                                    };
-                                                *current_session_id = new_session_id;
-                                                pending_turn = RealtimePendingTurn::default();
-                                                reconnect_overlay.clear();
-                                                clear_reconnect_progress_in_dsl(
-                                                    &state.runtime,
-                                                    binding.as_ref(),
-                                                )
-                                                .await;
-                                                (
-                                                    session_context_handle,
-                                                    product_turn_handle,
-                                                    _wake_observer_guard,
-                                                    _bridge_observer_guard,
-                                                ) = bind_realtime_session_observers(
-                                                    &state.runtime,
-                                                    binding.as_ref(),
-                                                    wake_tx.clone(),
-                                                )
-                                                .await;
-                                                let _ = emit_status_update(
-                                                    &mut socket,
-                                                    &mut last_visible_status,
-                                                    rotated_status,
-                                                    false,
-                                                    Some((state.host.as_ref(), &registered)),
-                                                )
-                                                .await;
-                                            }
-                                        }
-                                        Some(Ok(MemberRealtimeBindingEvent::Released {
-                                            mob_id: event_mob_id,
-                                            agent_identity: event_identity,
-                                            session_id: _released_session_id,
-                                        })) => {
-                                            if let Some(RealtimeSocketBinding::MobMemberPrimary {
-                                                mob_id,
-                                                agent_identity,
-                                                ..
-                                            }) = binding.as_ref()
-                                                && *mob_id == event_mob_id
-                                                && *agent_identity == event_identity
-                                            {
-                                                tracing::debug!(
-                                                    %event_mob_id,
-                                                    %event_identity,
-                                                    "realtime WS: binding released; closing channel"
-                                                );
-                                                let _ = send_server_frame(
-                                                    &mut socket,
-                                                    &RealtimeServerFrame::ChannelError(
-                                                        RealtimeChannelErrorFrame {
-                                                            code: RealtimeErrorCode::BindingReleased,
-                                                            message:
-                                                                "mob member retired; realtime binding released"
-                                                                    .to_string(),
-                                                            details: None,
-                                                        },
-                                                    ),
-                                                )
-                                                .await;
-                                                let _ = send_server_frame(
-                                                    &mut socket,
-                                                    &RealtimeServerFrame::ChannelClosed(
-                                                        RealtimeChannelClosedFrame {
-                                                            reason: Some(
-                                                                RealtimeErrorCode::BindingReleased
-                                                                    .to_string(),
-                                                            ),
-                                                        },
-                                                    ),
-                                                )
-                                                .await;
-                                                break;
-                                            }
-                                        }
-                                        Some(Ok(MemberRealtimeBindingEvent::Set { .. })) => {
-                                            // Set events arrive for fresh bindings
-                                            // on identities other than ours, or
-                                            // for our identity right as the WS
-                                            // opens (already reflected in the
-                                            // binding state). No action needed.
-                                        }
-                                        Some(Err(())) => {
-                                            // Wave-c C-9b R8: Lagged — the
-                                            // broadcast receiver missed at
-                                            // least one `MemberRealtimeBindingEvent`.
-                                            // Pre-R8, we relied on the
-                                            // `RECONNECT_POLL_INTERVAL` poll
-                                            // loop to reread
-                                            // `realtime_attachment_status` on
-                                            // the current_session_id — but
-                                            // that doesn't observe a missed
-                                            // `Rotated` event: if the socket
-                                            // missed a rotation, the poll
-                                            // polls the retired session
-                                            // indefinitely. Re-resolve the
-                                            // canonical MobMachine binding
-                                            // map directly, and if it has
-                                            // moved, drive a synthetic rotate
-                                            // through the next binding-event
-                                            // arm by mutating
-                                            // `current_session_id` and
-                                            // running the same rotate-binding
-                                            // sequence we would have run on a
-                                            // live event.
-                                            tracing::warn!(
-                                                "realtime WS: binding event subscriber lagged; re-resolving via MobMachine"
-                                            );
-                                            if let (
-                                                Some(handle),
-                                                Some(RealtimeSocketBinding::MobMemberPrimary {
-                                                    mob_id: bound_mob_id,
-                                                    agent_identity: bound_identity,
-                                                    current_session_id,
-                                                }),
-                                            ) = (
-                                                realtime_mob_handle.as_ref(),
-                                                binding.as_mut(),
-                                            ) {
-                                                match handle
-                                                    .current_realtime_binding(bound_identity.clone())
-                                                    .await
-                                                {
-                                                    Ok(Some(canonical))
-                                                        if &canonical != current_session_id =>
-                                                    {
-                                                        tracing::debug!(
-                                                            %bound_mob_id,
-                                                            %bound_identity,
-                                                            stale = %current_session_id,
-                                                            canonical = %canonical,
-                                                            "realtime WS: Lagged re-resolve detected rotation; converging"
-                                                        );
-                                                        if let Err(err) = state
-                                                            .runtime
-                                                            .ensure_runtime_session_for_rotation(&canonical)
-                                                            .await
-                                                        {
-                                                            tracing::warn!(
-                                                                %canonical,
-                                                                %err,
-                                                                "realtime WS: Lagged re-resolve — ensure_runtime_session_for_rotation failed"
-                                                            );
-                                                        }
-                                                        let old_session_id =
-                                                            current_session_id.clone();
-                                                        match rotate_live_realtime_binding(
-                                                            &state.runtime,
-                                                            &old_session_id,
-                                                            &canonical,
-                                                            turning_mode,
-                                                            state.host.session_factory(),
-                                                            uses_product_session,
-                                                            &mut product_session,
-                                                        )
-                                                        .await
-                                                        {
-                                                            Ok(rotated_status) => {
-                                                                *current_session_id = canonical;
-                                                                pending_turn =
-                                                                    RealtimePendingTurn::default();
-                                                                reconnect_overlay.clear();
-                                                                clear_reconnect_progress_in_dsl(
-                                                                    &state.runtime,
-                                                                    binding.as_ref(),
-                                                                )
-                                                                .await;
-                                                                (
-                                                                    session_context_handle,
-                                                                    product_turn_handle,
-                                                                    _wake_observer_guard,
-                                                                    _bridge_observer_guard,
-                                                                ) = bind_realtime_session_observers(
-                                                                    &state.runtime,
-                                                                    binding.as_ref(),
-                                                                    wake_tx.clone(),
-                                                                )
-                                                                .await;
-                                                                let _ = emit_status_update(
-                                                                    &mut socket,
-                                                                    &mut last_visible_status,
-                                                                    rotated_status,
-                                                                    false,
-                                                                    Some((
-                                                                        state.host.as_ref(),
-                                                                        &registered,
-                                                                    )),
-                                                                )
-                                                                .await;
-                                                            }
-                                                            Err(error) => {
-                                                                let _ = send_server_frame(
-                                                                    &mut socket,
-                                                                    &RealtimeServerFrame::ChannelError(
-                                                                        error.clone(),
-                                                                    ),
-                                                                )
-                                                                .await;
-                                                                let _ = send_server_frame(
-                                                                    &mut socket,
-                                                                    &RealtimeServerFrame::ChannelClosed(
-                                                                        RealtimeChannelClosedFrame {
-                                                                            reason: Some(
-                                                                                error.code.as_str()
-                                                                                    .to_string(),
-                                                                            ),
-                                                                        },
-                                                                    ),
-                                                                )
-                                                                .await;
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                    Ok(Some(_)) => {
-                                                        // Canonical binding
-                                                        // unchanged — the lag
-                                                        // was benign (a Set
-                                                        // event for a sibling
-                                                        // identity, or a
-                                                        // no-op churn).
-                                                    }
-                                                    Ok(None) => {
-                                                        // Member has no
-                                                        // binding — treat as
-                                                        // Released: the
-                                                        // broadcast will also
-                                                        // deliver this
-                                                        // terminally; pre-empt
-                                                        // by closing now.
-                                                        tracing::debug!(
-                                                            %bound_mob_id,
-                                                            %bound_identity,
-                                                            "realtime WS: Lagged re-resolve found no binding; closing channel"
-                                                        );
-                                                        let _ = send_server_frame(
-                                                            &mut socket,
-                                                            &RealtimeServerFrame::ChannelError(
-                                                                RealtimeChannelErrorFrame {
-                                                                    code: RealtimeErrorCode::BindingReleased,
-                                                                    message:
-                                                                        "mob member retired; realtime binding released"
-                                                                            .to_string(),
-                                                                    details: None,
-                                                                },
-                                                            ),
-                                                        )
-                                                        .await;
-                                                        let _ = send_server_frame(
-                                                            &mut socket,
-                                                            &RealtimeServerFrame::ChannelClosed(
-                                                                RealtimeChannelClosedFrame {
-                                                                    reason: Some(
-                                                                        RealtimeErrorCode::BindingReleased
-                                                                            .to_string(),
-                                                                    ),
-                                                                },
-                                                            ),
-                                                        )
-                                                        .await;
-                                                        break;
-                                                    }
-                                                    Err(err) => {
-                                                        // Transient mob-actor
-                                                        // unavailability: fall
-                                                        // through to the next
-                                                        // poll tick. A real
-                                                        // outage surfaces via
-                                                        // the attachment
-                                                        // status path.
-                                                        tracing::warn!(
-                                                            %err,
-                                                            "realtime WS: Lagged re-resolve failed; will retry via poll loop"
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        None => {
-                                            // Broadcast closed (mob actor
-                                            // exited). The channel's attached
-                                            // session will also terminate shortly
-                                            // via its own path; no typed action
-                                            // needed here.
-                                        }
-                                    }
-                                }
-                                #[cfg(not(feature = "mob"))]
-                                {
-                                    // Without the `mob` feature, the future
-                                    // is `pending()` and this arm is never
-                                    // reached. `binding_event` is `()`.
-                                    let _ = binding_event;
-                                }
-                            }
                             _ = poll_interval.tick() => {
                                 let now = Instant::now();
                                 let now_utc = Utc::now();
@@ -2551,39 +2368,6 @@ async fn send_protocol_error(
     .await
 }
 
-/// W3-H: select!-compatible future factory for the member-realtime-binding
-/// event arm. On mob-enabled builds this awaits the broadcast receiver (or
-/// `std::future::pending()` when the channel is a SessionTarget and thus
-/// has no receiver); on mob-disabled builds it is always `pending()` and
-/// the arm is inert — kept compiled so the select! macro (which doesn't
-/// support `#[cfg(...)]` arms) still parses.
-#[cfg(feature = "mob")]
-async fn binding_event_future(
-    rx: Option<
-        &mut tokio::sync::broadcast::Receiver<
-            meerkat_mob::runtime::state::MemberRealtimeBindingEvent,
-        >,
-    >,
-) -> Option<Result<meerkat_mob::runtime::state::MemberRealtimeBindingEvent, ()>> {
-    match rx {
-        Some(rx) => match rx.recv().await {
-            Ok(event) => Some(Ok(event)),
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some(Err(())),
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
-        },
-        None => std::future::pending().await,
-    }
-}
-
-/// Placeholder for no-mob builds — MobMember channels are rejected at
-/// `bind_realtime_target`, so the select! arm never fires. We still need
-/// a compilable `Future<Output = ()>` because the macro cannot carry
-/// `#[cfg(...)]` on arms.
-#[cfg(not(feature = "mob"))]
-async fn binding_event_future() -> () {
-    std::future::pending().await
-}
-
 async fn bind_realtime_target(
     runtime: &SessionRuntime,
     accepted: &AcceptedRealtimeOpen,
@@ -2613,10 +2397,6 @@ async fn bind_realtime_target(
                         status,
                         binding: Some(RealtimeSocketBinding::SessionPrimary { session_id }),
                         bridge: Some(bridge),
-                        #[cfg(feature = "mob")]
-                        binding_events: None,
-                        #[cfg(feature = "mob")]
-                        mob_handle: None,
                     })
                 } else {
                     runtime
@@ -2634,10 +2414,6 @@ async fn bind_realtime_target(
                         status,
                         binding: Some(RealtimeSocketBinding::SessionPrimary { session_id }),
                         bridge: None,
-                        #[cfg(feature = "mob")]
-                        binding_events: None,
-                        #[cfg(feature = "mob")]
-                        mob_handle: None,
                     })
                 }
             } else {
@@ -2651,10 +2427,6 @@ async fn bind_realtime_target(
                     status,
                     binding: Some(RealtimeSocketBinding::SessionObserver { session_id }),
                     bridge: None,
-                    #[cfg(feature = "mob")]
-                    binding_events: None,
-                    #[cfg(feature = "mob")]
-                    mob_handle: None,
                 })
             }
         }
@@ -2713,7 +2485,6 @@ async fn bind_realtime_target(
                     ),
                     details: None,
                 })?;
-            let binding_events = mob_handle.subscribe_realtime_binding_events();
             let binding = RealtimeSocketBinding::MobMemberPrimary {
                 mob_id: dsl_mob_id,
                 agent_identity: dsl_agent_identity,
@@ -2731,8 +2502,6 @@ async fn bind_realtime_target(
                     status,
                     binding: Some(binding),
                     bridge: Some(bridge),
-                    binding_events: Some(binding_events),
-                    mob_handle: Some(mob_handle.clone()),
                 })
             } else {
                 runtime
@@ -2750,8 +2519,6 @@ async fn bind_realtime_target(
                     status,
                     binding: Some(binding),
                     bridge: None,
-                    binding_events: Some(binding_events),
-                    mob_handle: Some(mob_handle.clone()),
                 })
             }
         }
@@ -2775,23 +2542,6 @@ struct BindRealtimeTargetOutput {
     status: RealtimeChannelStatus,
     binding: Option<RealtimeSocketBinding>,
     bridge: Option<RealtimeProductSessionBridge>,
-    /// W3-H: receiver for the mob's MemberRealtimeBindingEvent broadcast.
-    /// `Some` for MobMember channels, `None` for SessionTarget and for all
-    /// channels when the `mob` feature is disabled (those paths never
-    /// materialize a MobMember binding).
-    #[cfg(feature = "mob")]
-    binding_events: Option<
-        tokio::sync::broadcast::Receiver<meerkat_mob::runtime::state::MemberRealtimeBindingEvent>,
-    >,
-    /// Wave-c C-9b R8: mob handle clone retained so the WS event loop
-    /// can re-resolve the canonical binding via
-    /// `current_realtime_binding(identity)` when the binding-events
-    /// broadcast surfaces `RecvError::Lagged` (a slow consumer can miss
-    /// a `Rotated` event on the first subscribe, leaving
-    /// `current_session_id` pinned to the retired session until the
-    /// socket happens to see another event).
-    #[cfg(feature = "mob")]
-    mob_handle: Option<meerkat_mob::runtime::handle::MobHandle>,
 }
 
 async fn open_product_session_bridge(
@@ -3761,53 +3511,6 @@ fn install_realtime_session_observers(
     // owed stale state instead of collapsing it back to `Clean`.
     let _ = product_turn.projection_refreshed(initial_baseline_ms);
     (Some(wake_observer), Some(bridge_observer))
-}
-
-async fn rotate_live_realtime_binding(
-    runtime: &SessionRuntime,
-    old_session_id: &SessionId,
-    new_session_id: &SessionId,
-    turning_mode: meerkat_contracts::RealtimeTurningMode,
-    session_factory: Option<Arc<dyn RealtimeSessionFactory>>,
-    uses_product_session: bool,
-    product_session: &mut Option<RealtimeProductSessionBridge>,
-) -> Result<RealtimeChannelStatus, RealtimeChannelErrorFrame> {
-    let (status, replacement_bridge) = if uses_product_session {
-        let session_factory = session_factory.ok_or_else(|| RealtimeChannelErrorFrame {
-            code: RealtimeErrorCode::ProviderSessionUnavailable,
-            message:
-                "realtime provider session factory is not available for rotated bridge recovery"
-                    .to_string(),
-            details: None,
-        })?;
-        let (status, bridge) =
-            open_product_session_bridge(runtime, new_session_id, turning_mode, session_factory)
-                .await?;
-        (status, Some(bridge))
-    } else {
-        runtime
-            .runtime_adapter()
-            .attach_live(new_session_id)
-            .await
-            .map_err(|err| runtime_error_frame(err, "attach"))?;
-        let status = runtime
-            .runtime_adapter()
-            .realtime_attachment_status(new_session_id)
-            .await
-            .map(RealtimeChannelStatus::from)
-            .map_err(|err| runtime_error_frame(err, "status"))?;
-        (status, None)
-    };
-
-    if let Some(previous_product_session) = product_session.take() {
-        let _ = previous_product_session
-            .command_tx
-            .send(RealtimeProductSessionCommand::Close)
-            .await;
-    }
-    let _ = runtime.runtime_adapter().detach_live(old_session_id).await;
-    *product_session = replacement_bridge;
-    Ok(status)
 }
 
 /// Observer installed on the session's [`SessionContextHandle`] (dogma

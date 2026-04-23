@@ -116,9 +116,10 @@ impl CommsSendParams {
     pub fn peer_name(&self) -> Option<&str> {
         use meerkat_core::comms::CommsCommandRequest;
         match &self.command {
-            CommsCommandRequest::PeerMessage { to, .. }
-            | CommsCommandRequest::PeerRequest { to, .. }
-            | CommsCommandRequest::PeerResponse { to, .. } => Some(to.as_str()),
+            // Post-wave-a dogma: the peer-targeted `CommsCommandRequest`
+            // variants were retired; only `Input` remains on the canonical
+            // comms surface. Peer messaging now flows through its own
+            // dedicated seam.
             CommsCommandRequest::Input { .. } => None,
         }
     }

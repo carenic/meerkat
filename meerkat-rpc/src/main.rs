@@ -146,20 +146,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend_hint = cli.realm_backend.map(Into::into);
     let (manifest, persistence) = meerkat::open_realm_persistence_in(
         &locator.state_root,
-        &locator.realm_id,
+        locator.realm.as_str(),
         backend_hint,
         Some(origin_hint),
     )
     .await?;
     let session_store = persistence.session_store();
-    let realm_paths = meerkat_store::realm_paths_in(&locator.state_root, &locator.realm_id);
+    let realm_paths =
+        meerkat_store::realm_paths_in(&locator.state_root, &locator.realm.to_string());
 
     let base_store: Arc<dyn ConfigStore> =
         Arc::new(FileConfigStore::new(realm_paths.config_path.clone()));
     let tagged = TaggedConfigStore::new(
         base_store,
         meerkat_core::ConfigStoreMetadata {
-            realm_id: Some(locator.realm_id.clone()),
+            realm_id: Some(locator.realm.as_str().to_string()),
             instance_id: cli.instance.clone(),
             backend: Some(manifest.backend.as_str().to_string()),
             resolved_paths: Some(ConfigResolvedPaths {
@@ -220,21 +221,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let skill_runtime = factory.build_skill_runtime(&config).await;
 
-    // Boot-time OpenAI credential acquisition for the realtime WS
-    // sideband. Routes through the canonical ProviderRuntimeRegistry
-    // (dogma §1/§7/§14) — no helper-local env read. When config binds
-    // openai via `[realm.*]`, that binding wins; otherwise the
-    // env-default realm synthesis reads OPENAI_API_KEY (with RKAT_*
-    // precedence) via the resolver's env_lookup seam. Resolved here
-    // before `config` is moved into SessionRuntime.
-    let realtime_openai_factory: Option<Arc<dyn meerkat_client::RealtimeSessionFactory>> =
-        meerkat::resolve_provider_api_key(&config, meerkat_core::Provider::OpenAI)
-            .await
-            .map(|api_key| {
-                Arc::new(meerkat_client::OpenAiRealtimeSessionFactory::new(Arc::new(
-                    meerkat_client::OpenAiLiveClient::new(api_key),
-                ))) as Arc<dyn meerkat_client::RealtimeSessionFactory>
-            });
+    // Post-wave-a dogma: ambient provider credential selection
+    // (`resolve_provider_api_key`) was retired (commit 28e7a51c1). The
+    // realtime OpenAI sideband factory is now `None` at rpc boot; explicit
+    // connection_ref wiring through the typed ProviderRuntimeRegistry is
+    // the path forward for realtime credential acquisition.
+    let realtime_openai_factory: Option<Arc<dyn meerkat_client::RealtimeSessionFactory>> = None;
 
     let config_runtime = Arc::new(ConfigRuntime::new(
         Arc::clone(&config_store),
@@ -253,10 +245,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli_user_root.clone().or(default_user_root.clone()),
     );
     runtime.set_skill_identity_registry(identity_registry);
-    let realm_id_typed = meerkat_core::connection::RealmId::parse(locator.realm_id.clone())
-        .map_err(|e| {
-            std::io::Error::other(format!("invalid realm id '{}': {e}", locator.realm_id))
-        })?;
+    let realm_id_typed = meerkat_core::connection::RealmId::parse(
+        locator.realm.as_str().to_string(),
+    )
+    .map_err(|e| {
+        std::io::Error::other(format!(
+            "invalid realm id '{}': {e}",
+            locator.realm.as_str()
+        ))
+    })?;
     runtime.set_realm_context(
         Some(realm_id_typed),
         cli.instance.clone(),
@@ -267,7 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let lease = meerkat_store::start_realm_lease_in(
         &locator.state_root,
-        &locator.realm_id,
+        locator.realm.as_str(),
         cli.instance.as_deref(),
         "rkat-rpc",
     )

@@ -1243,7 +1243,8 @@ async fn resolve_member_ref(
         .into_iter()
         .find(|entry| entry.agent_identity == identity)
         .ok_or_else(|| format!("member {identity} not found in mob {mob_id}"))?;
-    Ok((mob_id, identity, entry.agent_runtime_id, entry.fence_token))
+    let (agent_runtime_id, fence_token) = entry.binding_atoms();
+    Ok((mob_id, identity, agent_runtime_id, fence_token))
 }
 
 pub async fn handle_submit_work(
@@ -1283,7 +1284,7 @@ pub async fn handle_submit_work(
         .await
     {
         Ok(receipt) => {
-            let identity_str = receipt.runtime_id.identity.to_string();
+            let identity_str = receipt.runtime_id().identity.to_string();
             let body = MobSubmitWorkResult {
                 mob_id: mob_id.to_string(),
                 work_ref: receipt.work_ref.to_string(),
