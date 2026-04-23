@@ -1,5 +1,6 @@
 //! meerkat-cli - Headless CLI for Meerkat
 
+mod cli_parse;
 #[cfg(feature = "mcp")]
 mod mcp;
 #[cfg(feature = "comms")]
