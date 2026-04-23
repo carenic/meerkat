@@ -843,9 +843,6 @@ pub struct CreateSessionRequest {
     /// Provider-specific parameters (for example reasoning config).
     #[serde(default)]
     pub provider_params: Option<Value>,
-    /// Override the realm-scoped connection binding for this session.
-    #[serde(default)]
-    pub connection_ref: Option<meerkat_core::ConnectionRef>,
     /// Skills to preload into the system prompt.
     #[serde(default)]
     pub preload_skills: Option<Vec<String>>,
@@ -2585,7 +2582,6 @@ async fn create_session_inner(
         instance_id: state.instance_id.clone(),
         backend: Some(state.backend.clone()),
         config_generation: current_generation,
-        connection_ref: req.connection_ref.clone(),
         keep_alive,
         checkpointer: None,
         silent_comms_intents: Vec::new(),

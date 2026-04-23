@@ -25,9 +25,6 @@
 
 import type { SessionConfig } from './types.js';
 
-/** `realm:binding` credential selector. */
-export type ConnectionRef = string;
-
 /** Host-page resolver callback that the WASM runtime invokes when the
  * selected binding's credential source is `external_resolver`. Takes a
  * `realm:binding` key, returns a bearer token string (or a promise). */
@@ -265,13 +262,3 @@ export function clearExternalAuthResolver(wasm: {
   wasm.register_external_auth_resolver(undefined);
 }
 
-/**
- * Build a SessionConfig with a specific `connection_ref` targeting a
- * bootstrap-declared binding. Thin ergonomic wrapper.
- */
-export function withConnectionRef(
-  connectionRef: ConnectionRef,
-  base: Omit<SessionConfig, 'connectionRef'>,
-): SessionConfig {
-  return { ...base, connectionRef };
-}

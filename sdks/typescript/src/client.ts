@@ -2734,12 +2734,6 @@ export class MeerkatClient {
 
     if (options.model) params.model = options.model;
     if (options.provider) params.provider = options.provider;
-    if (options.connectionRef) {
-      params.connection_ref = {
-        realm_id: options.connectionRef.realmId,
-        binding_id: options.connectionRef.bindingId,
-      };
-    }
     if (options.systemPrompt) params.system_prompt = options.systemPrompt;
     if (options.maxTokens) params.max_tokens = options.maxTokens;
     if (options.outputSchema != null) params.output_schema = options.outputSchema;

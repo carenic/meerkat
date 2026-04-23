@@ -1025,22 +1025,6 @@ enum Commands {
         )]
         provider: Option<Provider>,
 
-        /// Route this session's LLM calls through a realm-scoped
-        /// provider binding instead of resolving credentials from env
-        /// vars or flat config. Format: `<realm_id>:<binding_id>`,
-        /// referencing a `[realm.<realm_id>.binding.<binding_id>]`
-        /// entry in the active Config. When set, the provider runtime
-        /// registry resolves the binding's auth profile and backend
-        /// profile through the standard `ProviderRuntime::resolve`
-        /// pipeline — the same path that CLI `rkat auth login` /
-        /// REST+RPC OAuth completion handlers write into.
-        #[arg(
-            long = "connection-ref",
-            value_name = "REALM:BINDING",
-            help_heading = "Common options"
-        )]
-        connection_ref: Option<String>,
-
         /// Maximum tokens per turn (defaults to config when omitted)
         #[arg(long, hide_short_help = true, help_heading = "Advanced options")]
         max_tokens: Option<u32>,
@@ -5295,13 +5279,6 @@ async fn run_agent(
             instance_id: scope.instance_id.clone(),
             backend: Some(manifest.backend.as_str().to_string()),
             config_generation: None,
-            connection_ref: connection_ref
-                .as_deref()
-                .and_then(|raw| raw.split_once(':'))
-                .map(|(realm_id, binding_id)| meerkat_core::ConnectionRef {
-                    realm_id: realm_id.to_string(),
-                    binding_id: binding_id.to_string(),
-                }),
             keep_alive,
             checkpointer: None,
             silent_comms_intents: Vec::new(),

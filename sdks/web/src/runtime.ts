@@ -36,11 +36,9 @@ function toWasmConfig(config: RuntimeConfig): Record<string, unknown> {
 function sessionToWasm(config: SessionConfig): Record<string, unknown> {
   // Plan §4d.wasm.2 + §6.13: per-session api_key / base_url fields are
   // deleted. Credentials come from bootstrap-populated config.realm or
-  // the host's registered external-auth resolver; connection_ref is
-  // the optional per-session binding selector.
+  // the host's registered external-auth resolver.
   return {
     model: config.model,
-    connection_ref: config.connectionRef,
     system_prompt: config.systemPrompt,
     max_tokens: config.maxTokens,
     comms_name: config.commsName,
