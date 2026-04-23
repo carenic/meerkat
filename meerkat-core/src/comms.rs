@@ -267,6 +267,49 @@ impl TrustedPeerDescriptor {
         })
     }
 
+    /// Typed sibling of [`Self::test_only_unsigned`]: build a descriptor
+    /// from an already-typed [`PeerId`] instead of a stringly-typed peer-id
+    /// argument.
+    ///
+    /// Post-#24 `PeerId` is a typed UUID; `PeerId::parse` only accepts
+    /// hyphenated UUID strings. The stringly-typed
+    /// [`Self::test_only_unsigned`] accepts anything `AsRef<str>` and
+    /// round-trips through `PeerId::parse`, which is the right contract
+    /// for call sites whose peer-id comes off the wire (comms-drain
+    /// supervisor reconcile, ops lifecycle) — they receive a UUID string
+    /// and the helper validates it.
+    ///
+    /// Test fixtures that mint a peer locally do NOT have a UUID string
+    /// to start from. They have a debug-friendly alias (`"remote-agent-b"`,
+    /// `"stale-peer"`) and want a random `PeerId`. The stringly form
+    /// forced them to either (a) stamp the alias in as an invalid UUID
+    /// (which rejects post-#24) or (b) reach outside the helper to mint
+    /// a UUID separately. This typed sibling accepts the typed `PeerId`
+    /// directly, skipping the parse round-trip.
+    pub fn test_only_unsigned_typed(
+        name: impl Into<String>,
+        peer_id: PeerId,
+        address: impl AsRef<str>,
+    ) -> Result<Self, String> {
+        let name = PeerName::new(name).map_err(|e| format!("invalid peer name: {e}"))?;
+        let address_raw = address.as_ref();
+        let (scheme, endpoint) = address_raw
+            .split_once("://")
+            .ok_or_else(|| format!("peer address missing transport scheme: {address_raw}"))?;
+        let transport = match scheme {
+            "inproc" => PeerTransport::Inproc,
+            "uds" => PeerTransport::Uds,
+            "tcp" => PeerTransport::Tcp,
+            other => return Err(format!("unknown peer address transport: {other}")),
+        };
+        Ok(Self {
+            peer_id,
+            name,
+            address: PeerAddress::new(transport, endpoint),
+            pubkey: [0u8; 32],
+        })
+    }
+
     /// Attach a non-zero Ed25519 signing pubkey. Test and production
     /// paths that already have a derived `PeerId` + pubkey use the
     /// field-literal constructor directly; this helper is for

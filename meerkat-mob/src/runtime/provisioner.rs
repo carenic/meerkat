@@ -490,15 +490,23 @@ mod tests {
     #[cfg(feature = "runtime-adapter")]
     #[test]
     fn validated_external_peer_spec_preserves_the_validated_peer_name() {
+        // Post-#24 `PeerId` is a typed UUID; `PeerId::parse` rejects the
+        // legacy `ed25519:<alias>` shape that this test previously pinned.
+        // The contract being asserted here is preservation of the peer
+        // name + address through validation, so we feed a round-trippable
+        // UUID string and round-trip through `PeerId::to_string()` on the
+        // way out.
+        let peer_id = meerkat_core::comms::PeerId::new();
+        let peer_id_str = peer_id.to_string();
         let spec = MultiBackendProvisioner::validated_external_peer_spec(
             "mob/worker/member-1",
-            "ed25519:member-1",
+            &peer_id_str,
             "tcp://example.invalid/member-1",
         )
         .expect("external peer spec should validate");
 
         assert_eq!(spec.name.as_str(), "mob/worker/member-1");
-        assert_eq!(spec.peer_id.to_string(), "ed25519:member-1");
+        assert_eq!(spec.peer_id.to_string(), peer_id_str);
         assert_eq!(spec.address.to_string(), "tcp://example.invalid/member-1");
     }
 }

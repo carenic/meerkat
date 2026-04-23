@@ -8500,9 +8500,9 @@ async fn test_resume_prunes_stale_trust_not_present_in_roster() {
         .expect("spawn w-2");
     handle.stop().await.expect("stop");
 
-    let stale = TrustedPeerDescriptor::test_only_unsigned(
+    let stale = TrustedPeerDescriptor::test_only_unsigned_typed(
         "remote-mob/worker/stale-peer",
-        "ed25519:stale-peer",
+        meerkat_core::comms::PeerId::new(),
         "inproc://remote-mob/worker/stale-peer",
     )
     .expect("valid stale peer");
@@ -8548,9 +8548,9 @@ async fn test_resume_restores_external_wiring_from_event_log() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead");
-    let external = TrustedPeerDescriptor::test_only_unsigned(
+    let external = TrustedPeerDescriptor::test_only_unsigned_typed(
         "remote-mob/worker/agent-b",
-        "ed25519:remote-agent-b",
+        meerkat_core::comms::PeerId::new(),
         "inproc://remote-mob/worker/agent-b",
     )
     .expect("valid external peer");
@@ -9646,9 +9646,9 @@ async fn test_wire_external_adds_trusted_peer_and_tracks_projection() {
         .expect("session-backed")
         .clone();
 
-    let external = TrustedPeerDescriptor::test_only_unsigned(
+    let external = TrustedPeerDescriptor::test_only_unsigned_typed(
         "remote-mob/worker/agent-b",
-        "ed25519:remote-agent-b",
+        meerkat_core::comms::PeerId::new(),
         "inproc://remote-mob/worker/agent-b",
     )
     .expect("valid external peer");
@@ -9696,9 +9696,9 @@ async fn test_respawn_restores_external_wiring_from_roster_spec() {
         .expect("session-backed")
         .clone();
 
-    let external = TrustedPeerDescriptor::test_only_unsigned(
+    let external = TrustedPeerDescriptor::test_only_unsigned_typed(
         "remote-mob/worker/agent-b",
-        "ed25519:remote-agent-b",
+        meerkat_core::comms::PeerId::new(),
         "inproc://remote-mob/worker/agent-b",
     )
     .expect("valid external peer");
@@ -9753,9 +9753,9 @@ async fn test_unwire_external_removes_trust_and_projection() {
         .bridge_session_id()
         .expect("session-backed")
         .clone();
-    let external = TrustedPeerDescriptor::test_only_unsigned(
+    let external = TrustedPeerDescriptor::test_only_unsigned_typed(
         "remote-mob/worker/agent-b",
-        "ed25519:remote-agent-b",
+        meerkat_core::comms::PeerId::new(),
         "inproc://remote-mob/worker/agent-b",
     )
     .expect("valid external peer");
@@ -9819,9 +9819,9 @@ async fn test_wire_external_rejects_with_scope_deferred_wiring_error() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead");
-    let external = TrustedPeerDescriptor::test_only_unsigned(
+    let external = TrustedPeerDescriptor::test_only_unsigned_typed(
         "remote-mob/worker/agent-b",
-        "ed25519:remote-agent-b",
+        meerkat_core::comms::PeerId::new(),
         "inproc://remote-mob/worker/agent-b",
     )
     .expect("valid external peer");
@@ -9852,9 +9852,9 @@ async fn test_unwire_external_rejects_with_scope_deferred_wiring_error() {
         .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
         .await
         .expect("spawn lead");
-    let external = TrustedPeerDescriptor::test_only_unsigned(
+    let external = TrustedPeerDescriptor::test_only_unsigned_typed(
         "remote-mob/worker/agent-b",
-        "ed25519:remote-agent-b",
+        meerkat_core::comms::PeerId::new(),
         "inproc://remote-mob/worker/agent-b",
     )
     .expect("valid external peer");
