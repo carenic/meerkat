@@ -28,6 +28,7 @@ pub mod coalescing;
 pub mod comms_bridge;
 pub mod comms_drain;
 pub mod completion;
+pub mod composition;
 pub(crate) mod control_plane;
 pub mod detached_wake;
 pub mod driver;
