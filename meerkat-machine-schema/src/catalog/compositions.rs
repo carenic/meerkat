@@ -102,15 +102,35 @@ pub fn schedule_bundle_composition() -> CompositionSchema {
         ],
         handoff_protocols: vec![],
         entry_inputs: vec![],
-        routes: vec![route(
-            "revision_supersede_enters_occurrence_authority",
-            "schedule",
-            "SupersedePendingOccurrences",
-            "occurrence",
-            RouteTargetKind::Input,
-            "Supersede",
-            &[bind("superseded_by_revision", "superseding_revision")],
-        )],
+        routes: vec![
+            route(
+                "revision_supersede_enters_occurrence_authority",
+                "schedule",
+                "SupersedePendingOccurrences",
+                "occurrence",
+                RouteTargetKind::Input,
+                "Supersede",
+                &[bind("superseded_by_revision", "superseding_revision")],
+            ),
+            // Reciprocal ack (wave-d D-f): once an occurrence absorbs
+            // Supersede it emits OccurrencesSuperseded, routed back to
+            // the schedule as ConfirmOccurrencesSuperseded so the
+            // schedule authority observes which occurrences actually
+            // superseded rather than inferring it from the outbound
+            // route alone.
+            route(
+                "occurrence_supersede_ack_returns_to_schedule",
+                "occurrence",
+                "OccurrencesSuperseded",
+                "schedule",
+                RouteTargetKind::Input,
+                "ConfirmOccurrencesSuperseded",
+                &[
+                    bind("occurrence_id", "occurrence_id"),
+                    bind("superseding_revision", "superseding_revision"),
+                ],
+            ),
+        ],
         route_target_selectors: vec![],
         driver: None,
         transaction_plans: vec![
@@ -155,11 +175,28 @@ pub fn schedule_bundle_composition() -> CompositionSchema {
                 references_machines: vec![mi_id("schedule"), mi_id("occurrence")],
                 references_actors: vec![act_id("schedule_authority"), act_id("occurrence_authority")],
             },
+            // Wave-d D-f: reciprocal ack closes the supersede loop.
+            CompositionInvariant {
+                name: "occurrence_supersede_ack_route_present".into(),
+                kind: CompositionInvariantKind::RoutePresent {
+                    from_machine: mi_id("occurrence"),
+                    effect_variant: ev_id("OccurrencesSuperseded"),
+                    to_machine: mi_id("schedule"),
+                    input_variant: rv(RouteTargetKind::Input, "ConfirmOccurrencesSuperseded"),
+                },
+                statement: "the occurrence authority's supersede-consumption ack returns to the schedule authority through the reciprocal route so the schedule observes completion".into(),
+                references_machines: vec![mi_id("schedule"), mi_id("occurrence")],
+                references_actors: vec![act_id("schedule_authority"), act_id("occurrence_authority")],
+            },
         ],
         witnesses: vec![
             witness(
                 "revision_supersede_route",
                 &["revision_supersede_enters_occurrence_authority"],
+            ),
+            witness(
+                "occurrence_supersede_ack_route",
+                &["occurrence_supersede_ack_returns_to_schedule"],
             ),
             witness("pause_resume_without_revision", &[]),
         ],

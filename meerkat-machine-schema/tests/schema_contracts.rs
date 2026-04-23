@@ -1,4 +1,9 @@
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, unused_imports)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    unused_imports
+)]
 
 use std::collections::BTreeMap;
 
@@ -1515,4 +1520,133 @@ mod compat_bridge_parity {
             "bridge ScheduleSurfaceCompletion gained extra fields not on runtime — audit both"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// D-f: Schedule ↔ Occurrence supersede reciprocal ack route.
+//
+// The SupersedePendingOccurrences route is one-way (Schedule → Occurrence).
+// Per wave-d d.0 #43, the occurrence side must emit a confirmation effect
+// that flows back as a Schedule input so the schedule machine observes which
+// occurrences it actually superseded.
+//
+// These tests pin the shape of the reciprocal round-trip:
+//   1. OccurrenceLifecycleMachine defines `OccurrencesSuperseded` effect.
+//   2. The Supersede transition emits it alongside `Superseded`.
+//   3. ScheduleLifecycleMachine defines `ConfirmOccurrencesSuperseded` input.
+//   4. A schedule transition consumes the ack and records the outcome.
+//   5. `schedule_bundle_composition` registers the reciprocal route wiring
+//      the occurrence effect to the schedule input.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn occurrence_lifecycle_machine_defines_occurrences_superseded_effect() {
+    let schema = occurrence_lifecycle_machine();
+    let effect_names = schema
+        .effects
+        .variants
+        .iter()
+        .map(|variant| variant.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        effect_names.contains(&"OccurrencesSuperseded"),
+        "OccurrenceLifecycleMachine must define reciprocal-ack effect OccurrencesSuperseded; found {effect_names:?}",
+    );
+}
+
+#[test]
+fn occurrence_supersede_transition_emits_occurrences_superseded() {
+    let schema = occurrence_lifecycle_machine();
+    let supersede_transitions = schema
+        .transitions
+        .iter()
+        .filter(|transition| transition.on.variant_str() == "Supersede")
+        .collect::<Vec<_>>();
+    assert!(
+        !supersede_transitions.is_empty(),
+        "OccurrenceLifecycleMachine must retain at least one Supersede transition"
+    );
+
+    for transition in supersede_transitions {
+        let emits = transition
+            .emit
+            .iter()
+            .map(|emit| emit.variant.as_str())
+            .collect::<Vec<_>>();
+        let transition_name = &transition.name;
+        assert!(
+            emits.contains(&"OccurrencesSuperseded"),
+            "Supersede transition {transition_name} must emit OccurrencesSuperseded (found emits: {emits:?})",
+        );
+    }
+}
+
+#[test]
+fn schedule_lifecycle_machine_defines_confirm_occurrences_superseded_input() {
+    let schema = schedule_lifecycle_machine();
+    let input_names = schema
+        .inputs
+        .variants
+        .iter()
+        .map(|variant| variant.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        input_names.contains(&"ConfirmOccurrencesSuperseded"),
+        "ScheduleLifecycleMachine must define reciprocal-ack input ConfirmOccurrencesSuperseded; found {input_names:?}",
+    );
+}
+
+#[test]
+fn schedule_has_transition_consuming_confirm_occurrences_superseded() {
+    let schema = schedule_lifecycle_machine();
+    let transitioned = schema
+        .transitions
+        .iter()
+        .map(|transition| transition.on.variant_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        transitioned.contains("ConfirmOccurrencesSuperseded"),
+        "ScheduleLifecycleMachine must model ConfirmOccurrencesSuperseded with at least one transition"
+    );
+}
+
+#[test]
+fn schedule_bundle_registers_occurrences_superseded_reciprocal_route() {
+    let composition = meerkat_machine_schema::catalog::schedule_bundle_composition();
+    let reciprocal = composition
+        .routes
+        .iter()
+        .find(|route| {
+            route.from_machine.as_str() == "occurrence"
+                && route.effect_variant.as_str() == "OccurrencesSuperseded"
+        })
+        .expect(
+            "schedule_bundle must register a reciprocal route from occurrence.OccurrencesSuperseded",
+        );
+
+    assert_eq!(
+        reciprocal.to.machine.as_str(),
+        "schedule",
+        "reciprocal ack must target the schedule instance"
+    );
+    match &reciprocal.to.input_variant {
+        RouteVariantId::Input(input) => assert_eq!(
+            input.as_str(),
+            "ConfirmOccurrencesSuperseded",
+            "reciprocal ack must target ConfirmOccurrencesSuperseded input"
+        ),
+        other => panic!("reciprocal ack route must target an Input variant, got {other:?}"),
+    }
+}
+
+#[test]
+fn schedule_bundle_validates_with_reciprocal_ack_route() {
+    let composition = meerkat_machine_schema::catalog::schedule_bundle_composition();
+    let canonical_machines = canonical_machine_schemas();
+    let canonical_machine_refs = canonical_machines.iter().collect::<Vec<_>>();
+    assert_eq!(
+        composition.validate_against(&canonical_machine_refs),
+        Ok(()),
+        "schedule_bundle composition must validate after the reciprocal ack is wired"
+    );
 }

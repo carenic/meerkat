@@ -101,7 +101,13 @@ pub fn dsl_mob_machine() -> MachineSchema {
 }
 
 pub fn dsl_schedule_lifecycle_machine() -> MachineSchema {
-    schedule_lifecycle::ScheduleLifecycleMachineState::schema()
+    with_named_types(
+        schedule_lifecycle::ScheduleLifecycleMachineState::schema(),
+        // Schedule-side reciprocal ack tracks `Set<OccurrenceId>` and
+        // receives `ConfirmOccurrencesSuperseded { occurrence_id }` from
+        // the occurrence authority; both sides must agree on the atom.
+        vec![NamedTypeBinding::string("OccurrenceId")],
+    )
 }
 
 pub fn dsl_occurrence_lifecycle_machine() -> MachineSchema {

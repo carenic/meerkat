@@ -15,6 +15,12 @@ machine! {
             missing_target_policy: Enum<MissingTargetPolicy>,
             planning_cursor_utc_ms: Option<u64>,
             next_occurrence_ordinal: u64,
+            // Reciprocal-ack accumulator (wave-d D-f): occurrence ids
+            // whose supersession the occurrence authority has confirmed.
+            // The schedule side observes the completion of the
+            // SupersedePendingOccurrences route by counting acks rather
+            // than assuming every in-flight Supersede landed.
+            superseded_ack_ids: Set<OccurrenceId>,
         }
 
         init(Active) {
@@ -26,6 +32,7 @@ machine! {
             missing_target_policy = MissingTargetPolicy::MarkMisfired,
             planning_cursor_utc_ms = None,
             next_occurrence_ordinal = 0,
+            superseded_ack_ids = EmptySet,
         }
 
         terminal [Deleted]
@@ -58,6 +65,12 @@ machine! {
             Pause { at_utc_ms: u64 },
             Resume { at_utc_ms: u64 },
             Delete { at_utc_ms: u64 },
+            // Reciprocal ack (wave-d D-f): OccurrenceLifecycleMachine
+            // reports back the occurrence_id it superseded along with
+            // the revision that requested the supersession. The schedule
+            // side records the ack so the SupersedePendingOccurrences
+            // route has an observable completion signal.
+            ConfirmOccurrencesSuperseded { occurrence_id: OccurrenceId, superseding_revision: u64 },
         }
 
         effect ScheduleLifecycleEffect {
@@ -203,6 +216,42 @@ machine! {
             emit EmitScheduleNotice { new_state: self.lifecycle_phase, revision: self.revision }
             emit SupersedePendingOccurrences { superseding_revision: self.revision }
         }
+
+        // --- Reciprocal ack (wave-d D-f) ---
+        //
+        // The occurrence authority absorbs Supersede and reports its own
+        // occurrence_id back to the schedule. We accept the ack in every
+        // phase — a revision-affecting transition (Revise*, Delete*) can
+        // leave the schedule in Deleted while acks are still arriving,
+        // and the acks must land regardless of the schedule's onward
+        // trajectory.
+
+        transition ConfirmOccurrencesSupersededActive {
+            on input ConfirmOccurrencesSuperseded { occurrence_id, superseding_revision }
+            guard { self.lifecycle_phase == Phase::Active }
+            update {
+                self.superseded_ack_ids.insert(occurrence_id);
+            }
+            to Active
+        }
+
+        transition ConfirmOccurrencesSupersededPaused {
+            on input ConfirmOccurrencesSuperseded { occurrence_id, superseding_revision }
+            guard { self.lifecycle_phase == Phase::Paused }
+            update {
+                self.superseded_ack_ids.insert(occurrence_id);
+            }
+            to Paused
+        }
+
+        transition ConfirmOccurrencesSupersededDeleted {
+            on input ConfirmOccurrencesSuperseded { occurrence_id, superseding_revision }
+            guard { self.lifecycle_phase == Phase::Deleted }
+            update {
+                self.superseded_ack_ids.insert(occurrence_id);
+            }
+            to Deleted
+        }
     }
 }
 
@@ -221,4 +270,17 @@ pub enum OverlapPolicy {
 pub enum MissingTargetPolicy {
     MarkMisfired,
     Skip,
+}
+
+// OccurrenceId is defined alongside OccurrenceLifecycleMachine; redeclare
+// locally so the schedule-lifecycle DSL macro can compile its generated
+// struct. The typed atom (`NamedTypeBinding::string("OccurrenceId")`)
+// registered in `dsl/mod.rs` keeps schema emission consistent with the
+// occurrence side.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub struct OccurrenceId(pub String);
+impl<T: Into<String>> From<T> for OccurrenceId {
+    fn from(s: T) -> Self {
+        Self(s.into())
+    }
 }
