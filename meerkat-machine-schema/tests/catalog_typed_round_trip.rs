@@ -22,6 +22,7 @@ use meerkat_machine_schema::identity::{
     MachineId, MachineInstanceId, PhaseId, ProtocolId, RouteId, SignalVariantId, TransitionId,
 };
 use meerkat_machine_schema::{
+    RouteVariantId,
     CompositionSchema, MachineSchema, TriggerMatch, TypeRef, canonical_composition_schemas,
     canonical_machine_schemas,
 };
@@ -245,6 +246,12 @@ fn assert_typed_composition_schema(composition: &CompositionSchema) {
             EffectVariantId::parse(route.effect_variant.as_str()).unwrap()
         );
         assert_machine_instance_id_roundtrip(&route.to.machine);
+        assert_route_variant_id_roundtrip(&route.to.input_variant);
+        assert_eq!(
+            route.to.kind,
+            route.to.input_variant.kind(),
+            "RouteTarget.kind must mirror the arm of its RouteVariantId",
+        );
     }
     for entry_input in &composition.entry_inputs {
         assert_machine_instance_id_roundtrip(&entry_input.machine);
@@ -313,4 +320,22 @@ fn assert_enum_variant_id_roundtrip(id: &EnumVariantId) {
 fn assert_machine_instance_id_roundtrip(id: &MachineInstanceId) {
     let rt: MachineInstanceId = MachineInstanceId::parse(id.as_str()).unwrap();
     assert_eq!(rt, *id, "MachineInstanceId round-trip");
+}
+
+fn assert_route_variant_id_roundtrip(variant: &RouteVariantId) {
+    // Round-trip through the typed arm, not just the slug — asserting that
+    // a signal-arm variant never silently migrates into the input arm.
+    match variant {
+        RouteVariantId::Input(id) => {
+            let rt: InputVariantId = InputVariantId::parse(id.as_str()).unwrap();
+            assert_eq!(rt, *id, "InputVariantId round-trip on RouteVariantId::Input");
+        }
+        RouteVariantId::Signal(id) => {
+            let rt: SignalVariantId = SignalVariantId::parse(id.as_str()).unwrap();
+            assert_eq!(
+                rt, *id,
+                "SignalVariantId round-trip on RouteVariantId::Signal"
+            );
+        }
+    }
 }

@@ -7,7 +7,7 @@ use meerkat_machine_schema::catalog::dsl::{
 };
 use meerkat_machine_schema::{
     CompositionDriver, CompositionDriverRustBinding, CompositionSchemaError, DriverDispatchRoute,
-    RouteTargetKind, WatchedEffect, canonical_composition_coverage_manifests,
+    RouteTargetKind, RouteVariantId, WatchedEffect, canonical_composition_coverage_manifests,
     canonical_composition_schemas, canonical_machine_coverage_manifests, canonical_machine_schemas,
     meerkat_mob_seam_composition,
 };
@@ -791,7 +791,7 @@ fn noop_driver_on_meerkat_mob_seam() -> CompositionDriver {
             name: RouteId::parse("noop_dispatch").expect("valid route slug"),
             target_instance: MachineInstanceId::parse("meerkat").expect("valid MachineInstanceId"),
             target_kind: RouteTargetKind::Input,
-            input_variant: "PrepareBindings".into(),
+            input_variant: RouteVariantId::Input(InputVariantId::parse("PrepareBindings").expect("valid input-variant slug")),
         }],
     }
 }
@@ -873,7 +873,7 @@ fn composition_driver_rejects_dispatch_route_input_variant_missing_on_target() {
     let mob = mob_machine();
     let mut composition = meerkat_mob_seam_composition();
     let mut driver = noop_driver_on_meerkat_mob_seam();
-    driver.dispatch_routes[0].input_variant = "NoSuchInput".into();
+    driver.dispatch_routes[0].input_variant = RouteVariantId::Input(InputVariantId::parse("NoSuchInput").expect("valid input-variant slug"));
     composition.driver = Some(driver);
 
     let result = composition.validate_against(&[&meerkat, &mob]);
