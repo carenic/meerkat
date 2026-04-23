@@ -205,7 +205,8 @@ async fn ops_registry_integration_red_ok_tracks_mob_member_peer_ready_and_comple
         .peer_ready(
             &op_id,
             OperationPeerHandle {
-                peer_name: "member-alpha".into(),
+                peer_name: meerkat_core::comms::PeerName::new("member-alpha")
+                    .expect("valid peer name"),
                 trusted_peer: TrustedPeerDescriptor::test_only_unsigned(
                     "member-alpha",
                     "member-alpha-id",

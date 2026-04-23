@@ -646,10 +646,9 @@ mod tests {
 
         configure_peer_ingress(&adapter, &service, &result.session_id, false).await;
         let persisted = service
-            .load_persisted(&result.session_id)
+            .export_live_session(&result.session_id)
             .await
-            .expect("load persisted session")
-            .expect("persisted session");
+            .expect("export live session");
         assert!(
             persisted
                 .session_metadata()

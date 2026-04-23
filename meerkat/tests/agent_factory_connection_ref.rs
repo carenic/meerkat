@@ -84,7 +84,6 @@ fn config_with_realm() -> Config {
                 source: CredentialSourceSpec::InlineSecret {
                     secret: secret.into(),
                 },
-                storage: None,
                 constraints: Default::default(),
                 metadata_defaults: Default::default(),
             },
@@ -122,8 +121,9 @@ fn config_with_realm() -> Config {
 
 fn conn_ref(binding: &str) -> ConnectionRef {
     ConnectionRef {
-        realm_id: "dev".into(),
-        binding_id: binding.into(),
+        realm: meerkat_core::RealmId::parse("dev").expect("valid realm"),
+        binding: meerkat_core::BindingId::parse(binding).expect("valid binding"),
+        profile: None,
     }
 }
 

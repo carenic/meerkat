@@ -497,9 +497,9 @@ mod tests {
         )
         .expect("external peer spec should validate");
 
-        assert_eq!(spec.name, "mob/worker/member-1");
-        assert_eq!(spec.peer_id, "ed25519:member-1");
-        assert_eq!(spec.address, "tcp://example.invalid/member-1");
+        assert_eq!(spec.name.as_str(), "mob/worker/member-1");
+        assert_eq!(spec.peer_id.to_string(), "ed25519:member-1");
+        assert_eq!(spec.address.to_string(), "tcp://example.invalid/member-1");
     }
 }
 

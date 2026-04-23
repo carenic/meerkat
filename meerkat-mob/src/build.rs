@@ -836,7 +836,9 @@ mod tests {
             .as_ref()
             .expect("preload_skills should be set");
         assert!(
-            preload.iter().any(|id| id.0 == "mob-communication"),
+            preload
+                .iter()
+                .any(|id| id.skill_name.as_str() == "mob-communication"),
             "preload_skills should include mob-communication"
         );
     }

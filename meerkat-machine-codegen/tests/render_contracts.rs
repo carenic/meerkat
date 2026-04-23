@@ -103,7 +103,7 @@ fn renders_kernel_seam_composition_with_routes() {
 fn renders_machine_mapping_coverage_with_named_items() {
     let coverage = canonical_machine_coverage_manifests()
         .into_iter()
-        .find(|item| item.machine == "MeerkatMachine")
+        .find(|item| item.machine.as_str() == "MeerkatMachine")
         .expect("meerkat coverage");
     let rendered = render_machine_mapping_coverage(&meerkat_machine(), &coverage);
 
@@ -119,7 +119,7 @@ fn renders_machine_mapping_coverage_with_named_items() {
 fn renders_composition_mapping_coverage_with_routes() {
     let coverage = canonical_composition_coverage_manifests()
         .into_iter()
-        .find(|item| item.composition == "meerkat_mob_seam")
+        .find(|item| item.composition.as_str() == "meerkat_mob_seam")
         .expect("kernel seam coverage");
     let rendered = render_composition_mapping_coverage(&meerkat_mob_seam_composition(), &coverage);
 
@@ -134,7 +134,7 @@ fn renders_composition_mapping_coverage_with_routes() {
 fn merges_mapping_document_by_appending_and_replacing_generated_block() {
     let coverage = canonical_machine_coverage_manifests()
         .into_iter()
-        .find(|item| item.machine == "MeerkatMachine")
+        .find(|item| item.machine.as_str() == "MeerkatMachine")
         .expect("meerkat coverage");
     let generated = render_machine_mapping_coverage(&meerkat_machine(), &coverage);
 

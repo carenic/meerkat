@@ -3481,7 +3481,7 @@ mod tests {
     #[tokio::test]
     async fn mob_member_stream_surfaces_run_completed_for_late_terminal_peer_response() {
         use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
-        use meerkat_core::comms::{CommsCommand, PeerName, TrustedPeerSpec};
+        use meerkat_core::comms::{CommsCommand, PeerName, TrustedPeerDescriptor};
         use meerkat_core::interaction::InteractionId;
 
         let (router, mut notif_rx) = test_router().await;
@@ -3581,7 +3581,7 @@ mod tests {
 
         CoreCommsRuntime::add_trusted_peer(
             &*sender,
-            TrustedPeerSpec::new(
+            TrustedPeerDescriptor::test_only_unsigned(
                 format!("{mob_id}/worker/worker-1"),
                 operator_peer_id,
                 operator_addr,
@@ -3592,8 +3592,12 @@ mod tests {
         .expect("sender trusts worker");
         CoreCommsRuntime::add_trusted_peer(
             operator_comms.as_ref(),
-            TrustedPeerSpec::new("router-peer-response-sender", sender_peer_id, sender_addr)
-                .expect("sender trusted peer spec"),
+            TrustedPeerDescriptor::test_only_unsigned(
+                "router-peer-response-sender",
+                sender_peer_id,
+                sender_addr,
+            )
+            .expect("sender trusted peer spec"),
         )
         .await
         .expect("worker trusts sender");

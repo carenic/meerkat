@@ -749,11 +749,13 @@ async fn contract_mobx_001_trust_accepts_non_inproc_addresses_and_preserves_peer
         .find(|entry| entry.name.as_str() == peer_name)
         .expect("trusted peer should be listed");
     assert_eq!(
-        entry.peer_id, peer_id,
+        entry.peer_id.to_string(),
+        peer_id,
         "peer_id semantics must remain stable for remove operations"
     );
     assert_eq!(
-        entry.address, backend_address,
+        entry.address.to_string(),
+        backend_address,
         "runtime should preserve backend-provided address string"
     );
 
@@ -1105,8 +1107,6 @@ async fn contract_mob_001_keep_alive_session_stays_alive() {
                 event_tx: None,
                 skill_references: None,
                 flow_tool_overlay: None,
-                additional_instructions: None,
-                execution_kind: None,
             },
         )
         .await
@@ -1180,8 +1180,6 @@ async fn contract_mob_007_session_archive_removes_from_active_list() {
                 event_tx: None,
                 skill_references: None,
                 flow_tool_overlay: None,
-                additional_instructions: None,
-                execution_kind: None,
             },
         )
         .await;

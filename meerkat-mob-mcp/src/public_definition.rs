@@ -393,7 +393,12 @@ mod tests {
                     meerkat_core::OutputSchema::new(serde_json::json!({"type":"object"}))
                         .expect("valid output schema"),
                 ),
-                provider_params: Some(serde_json::json!({"reasoning_effort":"medium"})),
+                provider_params: Some(
+                    meerkat_contracts::wire::runtime::WireProviderParamsOverride {
+                        reasoning: Some(meerkat_contracts::wire::runtime::WireReasoningMode::Emit),
+                        ..Default::default()
+                    },
+                ),
             }),
         );
 

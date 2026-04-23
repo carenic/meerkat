@@ -1235,8 +1235,8 @@ async fn test_preload_missing_skill_fails_build() {
 
     let build_config = AgentBuildConfig {
         llm_client_override: Some(Arc::new(MockLlmClient)),
-        preload_skills: Some(vec![meerkat_core::skills::SkillId(
-            "nonexistent/skill".into(),
+        preload_skills: Some(vec![meerkat_core::skills::SkillKey::builtin(
+            meerkat_core::skills::SkillName::parse("nonexistent-skill").expect("valid skill name"),
         )]),
         ..AgentBuildConfig::new("claude-sonnet-4-5")
     };
@@ -1278,7 +1278,9 @@ async fn test_mixed_validity_skills_quarantine_preserves_valid_preload() {
 
     let valid_build = AgentBuildConfig {
         llm_client_override: Some(Arc::new(MockLlmClient)),
-        preload_skills: Some(vec![meerkat_core::skills::SkillId("valid-skill".into())]),
+        preload_skills: Some(vec![meerkat_core::skills::SkillKey::builtin(
+            meerkat_core::skills::SkillName::parse("valid-skill").expect("valid skill name"),
+        )]),
         ..AgentBuildConfig::new("claude-sonnet-4-5")
     };
     let valid_result = factory.build_agent(valid_build, &config).await;
@@ -1294,13 +1296,17 @@ async fn test_mixed_validity_skills_quarantine_preserves_valid_preload() {
         .expect("valid preload session metadata");
     assert_eq!(
         metadata.tooling.active_skills,
-        Some(vec![meerkat_core::skills::SkillId("valid-skill".into())]),
+        Some(vec![meerkat_core::skills::SkillKey::builtin(
+            meerkat_core::skills::SkillName::parse("valid-skill").expect("valid skill name"),
+        )]),
         "session metadata should persist only the explicitly preloaded skills"
     );
 
     let invalid_build = AgentBuildConfig {
         llm_client_override: Some(Arc::new(MockLlmClient)),
-        preload_skills: Some(vec![meerkat_core::skills::SkillId("broken-skill".into())]),
+        preload_skills: Some(vec![meerkat_core::skills::SkillKey::builtin(
+            meerkat_core::skills::SkillName::parse("broken-skill").expect("valid skill name"),
+        )]),
         ..AgentBuildConfig::new("claude-sonnet-4-5")
     };
     let invalid_result = factory.build_agent(invalid_build, &config).await;
@@ -1337,8 +1343,9 @@ async fn test_resume_does_not_mutate_persisted_active_skills_when_current_surfac
                 comms: ToolCategoryOverride::Disable,
                 mob: ToolCategoryOverride::Disable,
                 memory: ToolCategoryOverride::Disable,
-                active_skills: Some(vec![meerkat_core::skills::SkillId(
-                    "nonexistent-legacy-skill".into(),
+                active_skills: Some(vec![meerkat_core::skills::SkillKey::builtin(
+                    meerkat_core::skills::SkillName::parse("nonexistent-legacy-skill")
+                        .expect("valid skill name"),
                 )]),
             },
             keep_alive: false,
@@ -1368,8 +1375,9 @@ async fn test_resume_does_not_mutate_persisted_active_skills_when_current_surfac
         .expect("session should have metadata");
     assert_eq!(
         metadata.tooling.active_skills,
-        Some(vec![meerkat_core::skills::SkillId(
-            "nonexistent-legacy-skill".into(),
+        Some(vec![meerkat_core::skills::SkillKey::builtin(
+            meerkat_core::skills::SkillName::parse("nonexistent-legacy-skill")
+                .expect("valid skill name"),
         )]),
         "resume may drop unavailable skills from the live surface projection, but it must not rewrite durable session behavior truth"
     );
@@ -1993,7 +2001,8 @@ impl LlmClient for ParamsCaptureClient {
     {
         *self.captured.lock().unwrap() = request
             .provider_params
-            .clone()
+            .as_ref()
+            .map(|tag| serde_json::to_value(tag).unwrap_or(serde_json::json!({})))
             .unwrap_or(serde_json::json!({}));
         Box::pin(stream::iter(vec![
             Ok(LlmEvent::TextDelta {
@@ -2180,8 +2189,9 @@ async fn hot_swap_scopes_resolve_to_session_connection_ref() {
         self_hosted_server_id: None,
         provider_params: None,
         connection_ref: Some(meerkat_core::ConnectionRef {
-            realm_id: "tenant_a".to_string(),
-            binding_id: "default".to_string(),
+            realm: meerkat_core::RealmId::parse("tenant_a").expect("valid realm"),
+            binding: meerkat_core::BindingId::parse("default").expect("valid binding"),
+            profile: None,
         }),
     };
     let err = match factory
@@ -2203,8 +2213,9 @@ fn session_metadata_projects_connection_ref_into_llm_identity() {
     // Dogma §1/§13: SessionMetadata is the canonical owner;
     // SessionLlmIdentity is a read/write projection. Verify round-trip.
     let conn_ref = meerkat_core::ConnectionRef {
-        realm_id: "prod".to_string(),
-        binding_id: "openai_default".to_string(),
+        realm: meerkat_core::RealmId::parse("prod").expect("valid realm"),
+        binding: meerkat_core::BindingId::parse("openai_default").expect("valid binding"),
+        profile: None,
     };
     let mut metadata = SessionMetadata {
         schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
@@ -2229,8 +2240,9 @@ fn session_metadata_projects_connection_ref_into_llm_identity() {
 
     // Overwrite via apply_llm_identity — connection_ref should change.
     let swapped_ref = meerkat_core::ConnectionRef {
-        realm_id: "tenant_b".to_string(),
-        binding_id: "default".to_string(),
+        realm: meerkat_core::RealmId::parse("tenant_b").expect("valid realm"),
+        binding: meerkat_core::BindingId::parse("default").expect("valid binding"),
+        profile: None,
     };
     let new_identity = SessionLlmIdentity {
         model: "gpt-5.4".to_string(),

@@ -1975,7 +1975,10 @@ mod tests {
                     stream: _,
                 } => {
                     let trusted = self.trusted.read().await;
-                    if !trusted.values().any(|peer| peer.name == to.as_str()) {
+                    if !trusted
+                        .values()
+                        .any(|peer| peer.name.as_str() == to.as_str())
+                    {
                         return Err(SendError::PeerNotFound(to.as_string()));
                     }
                     drop(trusted);
@@ -2012,7 +2015,7 @@ mod tests {
                 .values()
                 .filter_map(|peer| {
                     Some(PeerDirectoryEntry {
-                        name: meerkat_core::comms::PeerName::new(&peer.name).ok()?,
+                        name: meerkat_core::comms::PeerName::new(peer.name.as_str()).ok()?,
                         peer_id: peer.peer_id.clone(),
                         address: peer.address.clone(),
                         source: PeerDirectorySource::Trusted,
