@@ -377,7 +377,6 @@ mod tests {
             source: meerkat_core::CredentialSourceSpec::InlineSecret {
                 secret: "sk-x".into(),
             },
-            storage: Default::default(),
             constraints: Default::default(),
             metadata_defaults: Default::default(),
         }

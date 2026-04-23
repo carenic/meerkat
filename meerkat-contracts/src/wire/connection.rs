@@ -104,9 +104,6 @@ pub struct WireAuthProfile {
     /// "external_resolver" / "platform_default" / "command" /
     /// "file_descriptor".
     pub source_kind: String,
-    /// Discriminator for the storage variant:
-    /// "keyring" / "file" / "auto" / "ephemeral" / "host_managed".
-    pub storage_kind: String,
 }
 
 impl From<&meerkat_core::AuthProfile> for WireAuthProfile {
@@ -119,19 +116,11 @@ impl From<&meerkat_core::AuthProfile> for WireAuthProfile {
             meerkat_core::CredentialSourceSpec::Command { .. } => "command",
             meerkat_core::CredentialSourceSpec::FileDescriptor { .. } => "file_descriptor",
         };
-        let storage_kind = match &value.storage {
-            meerkat_core::CredentialStorageSpec::Keyring => "keyring",
-            meerkat_core::CredentialStorageSpec::File { .. } => "file",
-            meerkat_core::CredentialStorageSpec::Auto => "auto",
-            meerkat_core::CredentialStorageSpec::Ephemeral => "ephemeral",
-            meerkat_core::CredentialStorageSpec::HostManaged => "host_managed",
-        };
         Self {
             id: value.id.clone(),
             provider: value.provider.as_str().to_string(),
             auth_method: value.auth_method.clone(),
             source_kind: source_kind.to_string(),
-            storage_kind: storage_kind.to_string(),
         }
     }
 }
@@ -309,69 +298,6 @@ mod tests {
         };
         let w: WireBackendProfile = (&bp).into();
         assert_eq!(w.provider, "openai");
-    }
-
-    #[test]
-    fn auth_profile_discriminators_are_snake_case() {
-        use meerkat_core::{AuthProfile, CredentialSourceSpec, CredentialStorageSpec, Provider};
-        let cases = [
-            (
-                CredentialSourceSpec::InlineSecret { secret: "x".into() },
-                CredentialStorageSpec::Keyring,
-                "inline_secret",
-                "keyring",
-            ),
-            (
-                CredentialSourceSpec::ExternalResolver { handle: "x".into() },
-                CredentialStorageSpec::Ephemeral,
-                "external_resolver",
-                "ephemeral",
-            ),
-            (
-                CredentialSourceSpec::PlatformDefault,
-                CredentialStorageSpec::Auto,
-                "platform_default",
-                "auto",
-            ),
-            (
-                CredentialSourceSpec::Command {
-                    program: "/bin/sh".into(),
-                    args: Vec::new(),
-                    cwd: None,
-                    env: Default::default(),
-                    timeout_ms: 30_000,
-                    refresh_interval_ms: None,
-                },
-                CredentialStorageSpec::HostManaged,
-                "command",
-                "host_managed",
-            ),
-            (
-                CredentialSourceSpec::FileDescriptor {
-                    fd: 3,
-                    scope_override: None,
-                },
-                CredentialStorageSpec::File {
-                    path: "/tmp/x".into(),
-                },
-                "file_descriptor",
-                "file",
-            ),
-        ];
-        for (source, storage, expected_source, expected_storage) in cases {
-            let ap = AuthProfile {
-                id: "a".into(),
-                provider: Provider::OpenAI,
-                auth_method: "api_key".into(),
-                source,
-                storage,
-                constraints: Default::default(),
-                metadata_defaults: Default::default(),
-            };
-            let w: WireAuthProfile = (&ap).into();
-            assert_eq!(w.source_kind, expected_source);
-            assert_eq!(w.storage_kind, expected_storage);
-        }
     }
 
     #[test]

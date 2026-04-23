@@ -62,7 +62,7 @@ pub struct BackendProfile {
     pub options: serde_json::Value,
 }
 
-/// Auth profile: how credentials are obtained, stored, refreshed, constrained.
+/// Auth profile: how credentials are obtained, refreshed, constrained.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AuthProfile {
@@ -70,8 +70,6 @@ pub struct AuthProfile {
     pub provider: Provider,
     pub auth_method: String,
     pub source: CredentialSourceSpec,
-    #[serde(default)]
-    pub storage: CredentialStorageSpec,
     #[serde(default)]
     pub constraints: AuthConstraints,
     #[serde(default)]
@@ -129,21 +127,6 @@ pub enum CredentialSourceSpec {
 
 fn default_command_timeout_ms() -> u64 {
     30_000
-}
-
-/// How credentials are stored by the host.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CredentialStorageSpec {
-    Keyring,
-    File {
-        path: PathBuf,
-    },
-    #[default]
-    Auto,
-    Ephemeral,
-    HostManaged,
 }
 
 /// Policy overrides carried on a binding.
@@ -221,7 +204,6 @@ impl RealmConnectionSet {
                 provider,
                 auth_method: cfg.auth_method.clone(),
                 source: cfg.source.clone(),
-                storage: cfg.storage.clone().unwrap_or_default(),
                 constraints: cfg.constraints.clone(),
                 metadata_defaults: cfg.metadata_defaults.clone(),
             };
@@ -327,7 +309,6 @@ impl RealmConnectionSet {
             provider,
             auth_method: "api_key".to_string(),
             source,
-            storage: CredentialStorageSpec::Ephemeral,
             constraints: AuthConstraints::default(),
             metadata_defaults: AuthMetadataDefaults::default(),
         };
@@ -473,7 +454,6 @@ impl RealmConfigSection {
                     source: CredentialSourceSpec::InlineSecret {
                         secret: (*secret).to_string(),
                     },
-                    storage: Some(CredentialStorageSpec::Ephemeral),
                     constraints: AuthConstraints::default(),
                     metadata_defaults: AuthMetadataDefaults::default(),
                 },
@@ -520,8 +500,6 @@ pub struct AuthProfileConfig {
     pub provider: String,
     pub auth_method: String,
     pub source: CredentialSourceSpec,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub storage: Option<CredentialStorageSpec>,
     #[serde(default)]
     pub constraints: AuthConstraints,
     #[serde(default)]
@@ -592,27 +570,6 @@ mod tests {
         assert!(
             err.to_string().contains("nonexistent") || err.to_string().contains("unknown variant"),
             "serde error should mention unknown variant: {err}",
-        );
-    }
-
-    #[test]
-    fn credential_storage_spec_serde_roundtrip_all_variants() {
-        for storage in [
-            CredentialStorageSpec::Keyring,
-            CredentialStorageSpec::File {
-                path: std::path::PathBuf::from("/tmp/meerkat-secret.json"),
-            },
-            CredentialStorageSpec::Auto,
-            CredentialStorageSpec::Ephemeral,
-            CredentialStorageSpec::HostManaged,
-        ] {
-            let s = serde_json::to_string(&storage).unwrap();
-            let back: CredentialStorageSpec = serde_json::from_str(&s).unwrap();
-            assert_eq!(back, storage);
-        }
-        assert_eq!(
-            CredentialStorageSpec::default(),
-            CredentialStorageSpec::Auto
         );
     }
 
