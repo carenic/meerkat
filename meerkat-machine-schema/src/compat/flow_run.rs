@@ -5,10 +5,15 @@ use crate::{
     Guard, HelperSchema, InitSchema, InputMatch, InvariantSchema, MachineSchema, Quantifier,
     RustBinding, StateSchema, TransitionSchema, TriggerKind, TypeRef, Update, VariantSchema,
 };
+use crate::identity::{
+    EffectVariantId, EnumTypeId, EnumVariantId, FieldId, InputVariantId, MachineId,
+    NamedTypeId, PhaseId, ProtocolId, TransitionId,
+};
+use crate::machine::TriggerMatch;
 
 pub fn flow_run_machine() -> MachineSchema {
     MachineSchema {
-        machine: "FlowRunMachine".into(),
+        machine: MachineId::parse("FlowRunMachine").expect("valid machine slug"),
         version: 5,
         rust: RustBinding {
             crate_name: "meerkat-mob".into(),
@@ -29,95 +34,93 @@ pub fn flow_run_machine() -> MachineSchema {
             fields: vec![
                 field(
                     "tracked_steps",
-                    TypeRef::Set(Box::new(TypeRef::Named("StepId".into()))),
+                    TypeRef::Set(Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))),
                 ),
                 field(
                     "ordered_steps",
-                    TypeRef::Seq(Box::new(TypeRef::Named("StepId".into()))),
+                    TypeRef::Seq(Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))),
                 ),
                 field(
                     "step_status",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named("StepId".into())),
-                        Box::new(TypeRef::Option(Box::new(TypeRef::Enum(
-                            "StepRunStatus".into(),
-                        )))),
+                        Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
+                        Box::new(TypeRef::Option(Box::new(TypeRef::Enum(EnumTypeId::parse("StepRunStatus").expect("valid enum-type slug"))))),
                     ),
                 ),
                 field(
                     "output_recorded",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named("StepId".into())),
+                        Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
                         Box::new(TypeRef::Bool),
                     ),
                 ),
                 field(
                     "step_condition_results",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named("StepId".into())),
+                        Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
                         Box::new(TypeRef::Option(Box::new(TypeRef::Bool))),
                     ),
                 ),
                 field(
                     "step_has_conditions",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named("StepId".into())),
+                        Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
                         Box::new(TypeRef::Bool),
                     ),
                 ),
                 field(
                     "step_dependencies",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named("StepId".into())),
-                        Box::new(TypeRef::Seq(Box::new(TypeRef::Named("StepId".into())))),
+                        Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
+                        Box::new(TypeRef::Seq(Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))))),
                     ),
                 ),
                 field(
                     "step_dependency_modes",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named("StepId".into())),
-                        Box::new(TypeRef::Enum("DependencyMode".into())),
+                        Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
+                        Box::new(TypeRef::Enum(EnumTypeId::parse("DependencyMode").expect("valid enum-type slug"))),
                     ),
                 ),
                 field(
                     "step_branches",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named("StepId".into())),
-                        Box::new(TypeRef::Option(Box::new(TypeRef::Named("BranchId".into())))),
+                        Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
+                        Box::new(TypeRef::Option(Box::new(TypeRef::Named(NamedTypeId::parse("BranchId").expect("valid named-type slug"))))),
                     ),
                 ),
                 field(
                     "step_collection_policies",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named("StepId".into())),
-                        Box::new(TypeRef::Enum("CollectionPolicyKind".into())),
+                        Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
+                        Box::new(TypeRef::Enum(EnumTypeId::parse("CollectionPolicyKind").expect("valid enum-type slug"))),
                     ),
                 ),
                 field(
                     "step_quorum_thresholds",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named("StepId".into())),
+                        Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
                         Box::new(TypeRef::U32),
                     ),
                 ),
                 field(
                     "step_target_counts",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named("StepId".into())),
+                        Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
                         Box::new(TypeRef::U32),
                     ),
                 ),
                 field(
                     "step_target_success_counts",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named("StepId".into())),
+                        Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
                         Box::new(TypeRef::U32),
                     ),
                 ),
                 field(
                     "step_target_terminal_failure_counts",
                     TypeRef::Map(
-                        Box::new(TypeRef::Named("StepId".into())),
+                        Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
                         Box::new(TypeRef::U32),
                     ),
                 ),
@@ -132,19 +135,19 @@ pub fn flow_run_machine() -> MachineSchema {
                 // v2: frame/loop registries and slot schedulers
                 field(
                     "ready_frames",
-                    TypeRef::Seq(Box::new(TypeRef::Named("FrameId".into()))),
+                    TypeRef::Seq(Box::new(TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug")))),
                 ),
                 field(
                     "ready_frame_membership",
-                    TypeRef::Set(Box::new(TypeRef::Named("FrameId".into()))),
+                    TypeRef::Set(Box::new(TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug")))),
                 ),
                 field(
                     "pending_body_frame_loops",
-                    TypeRef::Seq(Box::new(TypeRef::Named("LoopInstanceId".into()))),
+                    TypeRef::Seq(Box::new(TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug")))),
                 ),
                 field(
                     "pending_body_frame_loop_membership",
-                    TypeRef::Set(Box::new(TypeRef::Named("LoopInstanceId".into()))),
+                    TypeRef::Set(Box::new(TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug")))),
                 ),
                 field("active_node_count", TypeRef::U32),
                 field("active_frame_count", TypeRef::U32),
@@ -156,11 +159,11 @@ pub fn flow_run_machine() -> MachineSchema {
                 // SeqPopFront runs, because effects are evaluated against post-update state
                 // and the head is gone by then. Do NOT read these fields between transitions;
                 // their values are stale until the next pump assigns them.
-                field("last_granted_frame", TypeRef::Named("FrameId".into())),
-                field("last_granted_loop", TypeRef::Named("LoopInstanceId".into())),
+                field("last_granted_frame", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
+                field("last_granted_loop", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
             ],
             init: InitSchema {
-                phase: "Absent".into(),
+            phase: PhaseId::parse("Absent").expect("valid phase slug"),
                 fields: vec![
                     init("tracked_steps", Expr::EmptySet),
                     init("ordered_steps", Expr::SeqLiteral(vec![])),
@@ -196,63 +199,61 @@ pub fn flow_run_machine() -> MachineSchema {
                     init("last_granted_loop", Expr::String(String::new())),
                 ],
             },
-            terminal_phases: vec!["Completed".into(), "Failed".into(), "Canceled".into()],
+            terminal_phases: vec![PhaseId::parse("Completed").expect("valid phase slug"), PhaseId::parse("Failed").expect("valid phase slug"), PhaseId::parse("Canceled").expect("valid phase slug")],
         },
         inputs: EnumSchema {
             name: "FlowRunInput".into(),
             variants: vec![
                 VariantSchema {
-                    name: "CreateRun".into(),
+                name: EnumVariantId::parse("CreateRun").expect("valid variant slug"),
                     fields: vec![
                         field(
                             "step_ids",
-                            TypeRef::Seq(Box::new(TypeRef::Named("StepId".into()))),
+                            TypeRef::Seq(Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))),
                         ),
                         field(
                             "ordered_steps",
-                            TypeRef::Seq(Box::new(TypeRef::Named("StepId".into()))),
+                            TypeRef::Seq(Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))),
                         ),
                         field(
                             "step_has_conditions",
                             TypeRef::Map(
-                                Box::new(TypeRef::Named("StepId".into())),
+                                Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
                                 Box::new(TypeRef::Bool),
                             ),
                         ),
                         field(
                             "step_dependencies",
                             TypeRef::Map(
-                                Box::new(TypeRef::Named("StepId".into())),
-                                Box::new(TypeRef::Seq(Box::new(TypeRef::Named("StepId".into())))),
+                                Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
+                                Box::new(TypeRef::Seq(Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))))),
                             ),
                         ),
                         field(
                             "step_dependency_modes",
                             TypeRef::Map(
-                                Box::new(TypeRef::Named("StepId".into())),
-                                Box::new(TypeRef::Enum("DependencyMode".into())),
+                                Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
+                                Box::new(TypeRef::Enum(EnumTypeId::parse("DependencyMode").expect("valid enum-type slug"))),
                             ),
                         ),
                         field(
                             "step_branches",
                             TypeRef::Map(
-                                Box::new(TypeRef::Named("StepId".into())),
-                                Box::new(TypeRef::Option(Box::new(TypeRef::Named(
-                                    "BranchId".into(),
-                                )))),
+                                Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
+                                Box::new(TypeRef::Option(Box::new(TypeRef::Named(NamedTypeId::parse("BranchId").expect("valid named-type slug"))))),
                             ),
                         ),
                         field(
                             "step_collection_policies",
                             TypeRef::Map(
-                                Box::new(TypeRef::Named("StepId".into())),
-                                Box::new(TypeRef::Enum("CollectionPolicyKind".into())),
+                                Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
+                                Box::new(TypeRef::Enum(EnumTypeId::parse("CollectionPolicyKind").expect("valid enum-type slug"))),
                             ),
                         ),
                         field(
                             "step_quorum_thresholds",
                             TypeRef::Map(
-                                Box::new(TypeRef::Named("StepId".into())),
+                                Box::new(TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
                                 Box::new(TypeRef::U32),
                             ),
                         ),
@@ -266,98 +267,98 @@ pub fn flow_run_machine() -> MachineSchema {
                 },
                 variant("StartRun"),
                 VariantSchema {
-                    name: "DispatchStep".into(),
-                    fields: vec![field("step_id", TypeRef::Named("StepId".into()))],
+                name: EnumVariantId::parse("DispatchStep").expect("valid variant slug"),
+                    fields: vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 },
                 VariantSchema {
-                    name: "CompleteStep".into(),
-                    fields: vec![field("step_id", TypeRef::Named("StepId".into()))],
+                name: EnumVariantId::parse("CompleteStep").expect("valid variant slug"),
+                    fields: vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 },
                 VariantSchema {
-                    name: "RecordStepOutput".into(),
-                    fields: vec![field("step_id", TypeRef::Named("StepId".into()))],
+                name: EnumVariantId::parse("RecordStepOutput").expect("valid variant slug"),
+                    fields: vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 },
                 VariantSchema {
-                    name: "ConditionPassed".into(),
-                    fields: vec![field("step_id", TypeRef::Named("StepId".into()))],
+                name: EnumVariantId::parse("ConditionPassed").expect("valid variant slug"),
+                    fields: vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 },
                 VariantSchema {
-                    name: "ConditionRejected".into(),
-                    fields: vec![field("step_id", TypeRef::Named("StepId".into()))],
+                name: EnumVariantId::parse("ConditionRejected").expect("valid variant slug"),
+                    fields: vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 },
                 VariantSchema {
-                    name: "FailStep".into(),
-                    fields: vec![field("step_id", TypeRef::Named("StepId".into()))],
+                name: EnumVariantId::parse("FailStep").expect("valid variant slug"),
+                    fields: vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 },
                 VariantSchema {
-                    name: "SkipStep".into(),
-                    fields: vec![field("step_id", TypeRef::Named("StepId".into()))],
+                name: EnumVariantId::parse("SkipStep").expect("valid variant slug"),
+                    fields: vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 },
                 VariantSchema {
-                    name: "ProjectFrameStepStatus".into(),
+                name: EnumVariantId::parse("ProjectFrameStepStatus").expect("valid variant slug"),
                     fields: vec![
-                        field("step_id", TypeRef::Named("StepId".into())),
-                        field("step_status", TypeRef::Enum("StepRunStatus".into())),
+                        field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
+                        field("step_status", TypeRef::Enum(EnumTypeId::parse("StepRunStatus").expect("valid enum-type slug"))),
                         field("append_failure_ledger", TypeRef::Bool),
                     ],
                 },
                 VariantSchema {
-                    name: "CancelStep".into(),
-                    fields: vec![field("step_id", TypeRef::Named("StepId".into()))],
+                name: EnumVariantId::parse("CancelStep").expect("valid variant slug"),
+                    fields: vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 },
                 VariantSchema {
-                    name: "RegisterTargets".into(),
+                name: EnumVariantId::parse("RegisterTargets").expect("valid variant slug"),
                     fields: vec![
-                        field("step_id", TypeRef::Named("StepId".into())),
+                        field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
                         field("target_count", TypeRef::U32),
                     ],
                 },
                 VariantSchema {
-                    name: "RecordTargetSuccess".into(),
+                name: EnumVariantId::parse("RecordTargetSuccess").expect("valid variant slug"),
                     fields: vec![
-                        field("step_id", TypeRef::Named("StepId".into())),
-                        field("target_id", TypeRef::Named("MeerkatId".into())),
+                        field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
+                        field("target_id", TypeRef::Named(NamedTypeId::parse("MeerkatId").expect("valid named-type slug"))),
                     ],
                 },
                 VariantSchema {
-                    name: "RecordTargetTerminalFailure".into(),
-                    fields: vec![field("step_id", TypeRef::Named("StepId".into()))],
+                name: EnumVariantId::parse("RecordTargetTerminalFailure").expect("valid variant slug"),
+                    fields: vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 },
                 VariantSchema {
-                    name: "RecordTargetCanceled".into(),
+                name: EnumVariantId::parse("RecordTargetCanceled").expect("valid variant slug"),
                     fields: vec![
-                        field("step_id", TypeRef::Named("StepId".into())),
-                        field("target_id", TypeRef::Named("MeerkatId".into())),
+                        field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
+                        field("target_id", TypeRef::Named(NamedTypeId::parse("MeerkatId").expect("valid named-type slug"))),
                     ],
                 },
                 VariantSchema {
-                    name: "RecordTargetFailure".into(),
+                name: EnumVariantId::parse("RecordTargetFailure").expect("valid variant slug"),
                     fields: vec![
-                        field("step_id", TypeRef::Named("StepId".into())),
-                        field("target_id", TypeRef::Named("MeerkatId".into())),
+                        field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
+                        field("target_id", TypeRef::Named(NamedTypeId::parse("MeerkatId").expect("valid named-type slug"))),
                         field("retry_key", TypeRef::String),
                     ],
                 },
                 VariantSchema {
-                    name: "RegisterReadyFrame".into(),
-                    fields: vec![field("frame_id", TypeRef::Named("FrameId".into()))],
+                name: EnumVariantId::parse("RegisterReadyFrame").expect("valid variant slug"),
+                    fields: vec![field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug")))],
                 },
                 variant("PumpNodeScheduler"),
                 VariantSchema {
-                    name: "RegisterPendingBodyFrame".into(),
+                name: EnumVariantId::parse("RegisterPendingBodyFrame").expect("valid variant slug"),
                     fields: vec![
-                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
+                        field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
                         field("depth", TypeRef::U32),
                     ],
                 },
                 variant("PumpFrameScheduler"),
                 VariantSchema {
-                    name: "NodeExecutionReleased".into(),
-                    fields: vec![field("frame_id", TypeRef::Named("FrameId".into()))],
+                name: EnumVariantId::parse("NodeExecutionReleased").expect("valid variant slug"),
+                    fields: vec![field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug")))],
                 },
                 VariantSchema {
-                    name: "FrameTerminated".into(),
-                    fields: vec![field("frame_id", TypeRef::Named("FrameId".into()))],
+                name: EnumVariantId::parse("FrameTerminated").expect("valid variant slug"),
+                    fields: vec![field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug")))],
                 },
                 variant("TerminalizeCompleted"),
                 variant("TerminalizeFailed"),
@@ -373,67 +374,67 @@ pub fn flow_run_machine() -> MachineSchema {
             name: "FlowRunEffect".into(),
             variants: vec![
                 VariantSchema {
-                    name: "EmitFlowRunNotice".into(),
-                    fields: vec![field("run_status", TypeRef::Enum("FlowRunStatus".into()))],
+                name: EnumVariantId::parse("EmitFlowRunNotice").expect("valid variant slug"),
+                    fields: vec![field("run_status", TypeRef::Enum(EnumTypeId::parse("FlowRunStatus").expect("valid enum-type slug")))],
                 },
                 VariantSchema {
-                    name: "EmitStepNotice".into(),
+                name: EnumVariantId::parse("EmitStepNotice").expect("valid variant slug"),
                     fields: vec![
-                        field("step_id", TypeRef::Named("StepId".into())),
-                        field("step_status", TypeRef::Enum("StepRunStatus".into())),
+                        field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
+                        field("step_status", TypeRef::Enum(EnumTypeId::parse("StepRunStatus").expect("valid enum-type slug"))),
                     ],
                 },
                 VariantSchema {
-                    name: "AppendFailureLedger".into(),
-                    fields: vec![field("step_id", TypeRef::Named("StepId".into()))],
+                name: EnumVariantId::parse("AppendFailureLedger").expect("valid variant slug"),
+                    fields: vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 },
                 VariantSchema {
-                    name: "PersistStepOutput".into(),
-                    fields: vec![field("step_id", TypeRef::Named("StepId".into()))],
+                name: EnumVariantId::parse("PersistStepOutput").expect("valid variant slug"),
+                    fields: vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 },
                 VariantSchema {
-                    name: "AdmitStepWork".into(),
-                    fields: vec![field("step_id", TypeRef::Named("StepId".into()))],
+                name: EnumVariantId::parse("AdmitStepWork").expect("valid variant slug"),
+                    fields: vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 },
                 VariantSchema {
-                    name: "FlowTerminalized".into(),
-                    fields: vec![field("run_status", TypeRef::Enum("FlowRunStatus".into()))],
+                name: EnumVariantId::parse("FlowTerminalized").expect("valid variant slug"),
+                    fields: vec![field("run_status", TypeRef::Enum(EnumTypeId::parse("FlowRunStatus").expect("valid enum-type slug")))],
                 },
                 VariantSchema {
-                    name: "EscalateSupervisor".into(),
-                    fields: vec![field("step_id", TypeRef::Named("StepId".into()))],
+                name: EnumVariantId::parse("EscalateSupervisor").expect("valid variant slug"),
+                    fields: vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 },
                 VariantSchema {
-                    name: "ProjectTargetSuccess".into(),
+                name: EnumVariantId::parse("ProjectTargetSuccess").expect("valid variant slug"),
                     fields: vec![
-                        field("step_id", TypeRef::Named("StepId".into())),
-                        field("target_id", TypeRef::Named("MeerkatId".into())),
+                        field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
+                        field("target_id", TypeRef::Named(NamedTypeId::parse("MeerkatId").expect("valid named-type slug"))),
                     ],
                 },
                 VariantSchema {
-                    name: "ProjectTargetFailure".into(),
+                name: EnumVariantId::parse("ProjectTargetFailure").expect("valid variant slug"),
                     fields: vec![
-                        field("step_id", TypeRef::Named("StepId".into())),
-                        field("target_id", TypeRef::Named("MeerkatId".into())),
+                        field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
+                        field("target_id", TypeRef::Named(NamedTypeId::parse("MeerkatId").expect("valid named-type slug"))),
                     ],
                 },
                 VariantSchema {
-                    name: "ProjectTargetCanceled".into(),
+                name: EnumVariantId::parse("ProjectTargetCanceled").expect("valid variant slug"),
                     fields: vec![
-                        field("step_id", TypeRef::Named("StepId".into())),
-                        field("target_id", TypeRef::Named("MeerkatId".into())),
+                        field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
+                        field("target_id", TypeRef::Named(NamedTypeId::parse("MeerkatId").expect("valid named-type slug"))),
                     ],
                 },
                 // v2 effects
                 VariantSchema {
-                    name: "GrantNodeSlot".into(),
-                    fields: vec![field("frame_id", TypeRef::Named("FrameId".into()))],
+                name: EnumVariantId::parse("GrantNodeSlot").expect("valid variant slug"),
+                    fields: vec![field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug")))],
                 },
                 VariantSchema {
-                    name: "GrantBodyFrameStart".into(),
+                name: EnumVariantId::parse("GrantBodyFrameStart").expect("valid variant slug"),
                     fields: vec![field(
                         "loop_instance_id",
-                        TypeRef::Named("LoopInstanceId".into()),
+                        TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug")),
                     )],
                 },
             ],
@@ -446,54 +447,52 @@ pub fn flow_run_machine() -> MachineSchema {
                 Expr::Or(vec![
                     Expr::Eq(
                         Box::new(Expr::CurrentPhase),
-                        Box::new(Expr::Phase("Completed".into())),
+                        Box::new(Expr::Phase(PhaseId::parse("Completed").expect("valid phase slug"))),
                     ),
                     Expr::Eq(
                         Box::new(Expr::CurrentPhase),
-                        Box::new(Expr::Phase("Failed".into())),
+                        Box::new(Expr::Phase(PhaseId::parse("Failed").expect("valid phase slug"))),
                     ),
                     Expr::Eq(
                         Box::new(Expr::CurrentPhase),
-                        Box::new(Expr::Phase("Canceled".into())),
+                        Box::new(Expr::Phase(PhaseId::parse("Canceled").expect("valid phase slug"))),
                     ),
                 ]),
             ),
             helper(
                 "StepIsTracked",
-                vec![field("step_id", TypeRef::Named("StepId".into()))],
+                vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 TypeRef::Bool,
                 Expr::Contains {
-                    collection: Box::new(Expr::Field("tracked_steps".into())),
+                    collection: Box::new(Expr::Field(FieldId::parse("tracked_steps").expect("valid field slug"))),
                     value: Box::new(Expr::Binding("step_id".into())),
                 },
             ),
             helper(
                 "StepStatusIs",
                 vec![
-                    field("step_id", TypeRef::Named("StepId".into())),
-                    field("expected_status", TypeRef::Enum("StepRunStatus".into())),
+                    field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
+                    field("expected_status", TypeRef::Enum(EnumTypeId::parse("StepRunStatus").expect("valid enum-type slug"))),
                 ],
                 TypeRef::Bool,
                 Expr::Eq(
                     Box::new(Expr::MapGet {
-                        map: Box::new(Expr::Field("step_status".into())),
+                        map: Box::new(Expr::Field(FieldId::parse("step_status").expect("valid field slug"))),
                         key: Box::new(Expr::Binding("step_id".into())),
                     }),
-                    Box::new(Expr::Some(Box::new(Expr::Binding(
-                        "expected_status".into(),
-                    )))),
+                    Box::new(Expr::Some(Box::new(Expr::Binding("expected_status".into())))),
                 ),
             ),
             helper(
                 "StepOutputRecordedIs",
                 vec![
-                    field("step_id", TypeRef::Named("StepId".into())),
+                    field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
                     field("expected", TypeRef::Bool),
                 ],
                 TypeRef::Bool,
                 Expr::Eq(
                     Box::new(Expr::MapGet {
-                        map: Box::new(Expr::Field("output_recorded".into())),
+                        map: Box::new(Expr::Field(FieldId::parse("output_recorded").expect("valid field slug"))),
                         key: Box::new(Expr::Binding("step_id".into())),
                     }),
                     Box::new(Expr::Binding("expected".into())),
@@ -502,13 +501,13 @@ pub fn flow_run_machine() -> MachineSchema {
             helper(
                 "StepConditionRecordedIs",
                 vec![
-                    field("step_id", TypeRef::Named("StepId".into())),
+                    field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug"))),
                     field("expected", TypeRef::Option(Box::new(TypeRef::Bool))),
                 ],
                 TypeRef::Bool,
                 Expr::Eq(
                     Box::new(Expr::MapGet {
-                        map: Box::new(Expr::Field("step_condition_results".into())),
+                        map: Box::new(Expr::Field(FieldId::parse("step_condition_results").expect("valid field slug"))),
                         key: Box::new(Expr::Binding("step_id".into())),
                     }),
                     Box::new(Expr::Binding("expected".into())),
@@ -516,12 +515,12 @@ pub fn flow_run_machine() -> MachineSchema {
             ),
             helper(
                 "StepConditionAllowsDispatch",
-                vec![field("step_id", TypeRef::Named("StepId".into()))],
+                vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 TypeRef::Bool,
                 Expr::Or(vec![
                     Expr::Eq(
                         Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field("step_has_conditions".into())),
+                            map: Box::new(Expr::Field(FieldId::parse("step_has_conditions").expect("valid field slug"))),
                             key: Box::new(Expr::Binding("step_id".into())),
                         }),
                         Box::new(Expr::Bool(false)),
@@ -539,19 +538,17 @@ pub fn flow_run_machine() -> MachineSchema {
                 "AllTrackedStepsInAllowedStatuses",
                 vec![field(
                     "allowed_statuses",
-                    TypeRef::Seq(Box::new(TypeRef::Option(Box::new(TypeRef::Enum(
-                        "StepRunStatus".into(),
-                    ))))),
+                    TypeRef::Seq(Box::new(TypeRef::Option(Box::new(TypeRef::Enum(EnumTypeId::parse("StepRunStatus").expect("valid enum-type slug")))))),
                 )],
                 TypeRef::Bool,
                 Expr::Quantified {
                     quantifier: Quantifier::All,
                     binding: "step_id".into(),
-                    over: Box::new(Expr::Field("tracked_steps".into())),
+                    over: Box::new(Expr::Field(FieldId::parse("tracked_steps").expect("valid field slug"))),
                     body: Box::new(Expr::Contains {
                         collection: Box::new(Expr::Binding("allowed_statuses".into())),
                         value: Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field("step_status".into())),
+                            map: Box::new(Expr::Field(FieldId::parse("step_status").expect("valid field slug"))),
                             key: Box::new(Expr::Binding("step_id".into())),
                         }),
                     }),
@@ -559,15 +556,15 @@ pub fn flow_run_machine() -> MachineSchema {
             ),
             helper(
                 "NoTrackedStepInStatus",
-                vec![field("status", TypeRef::Enum("StepRunStatus".into()))],
+                vec![field("status", TypeRef::Enum(EnumTypeId::parse("StepRunStatus").expect("valid enum-type slug")))],
                 TypeRef::Bool,
                 Expr::Quantified {
                     quantifier: Quantifier::All,
                     binding: "step_id".into(),
-                    over: Box::new(Expr::Field("tracked_steps".into())),
+                    over: Box::new(Expr::Field(FieldId::parse("tracked_steps").expect("valid field slug"))),
                     body: Box::new(Expr::Neq(
                         Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field("step_status".into())),
+                            map: Box::new(Expr::Field(FieldId::parse("step_status").expect("valid field slug"))),
                             key: Box::new(Expr::Binding("step_id".into())),
                         }),
                         Box::new(Expr::Some(Box::new(Expr::Binding("status".into())))),
@@ -576,15 +573,15 @@ pub fn flow_run_machine() -> MachineSchema {
             ),
             helper(
                 "AnyTrackedStepInStatus",
-                vec![field("status", TypeRef::Enum("StepRunStatus".into()))],
+                vec![field("status", TypeRef::Enum(EnumTypeId::parse("StepRunStatus").expect("valid enum-type slug")))],
                 TypeRef::Bool,
                 Expr::Quantified {
                     quantifier: Quantifier::Any,
                     binding: "step_id".into(),
-                    over: Box::new(Expr::Field("tracked_steps".into())),
+                    over: Box::new(Expr::Field(FieldId::parse("tracked_steps").expect("valid field slug"))),
                     body: Box::new(Expr::Eq(
                         Box::new(Expr::MapGet {
-                            map: Box::new(Expr::Field("step_status".into())),
+                            map: Box::new(Expr::Field(FieldId::parse("step_status").expect("valid field slug"))),
                             key: Box::new(Expr::Binding("step_id".into())),
                         }),
                         Box::new(Expr::Some(Box::new(Expr::Binding("status".into())))),
@@ -593,7 +590,7 @@ pub fn flow_run_machine() -> MachineSchema {
             ),
             helper(
                 "StepHasDependencies",
-                vec![field("step_id", TypeRef::Named("StepId".into()))],
+                vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 TypeRef::Bool,
                 Expr::Gt(
                     Box::new(Expr::Len(Box::new(step_dependencies_for("step_id")))),
@@ -602,7 +599,7 @@ pub fn flow_run_machine() -> MachineSchema {
             ),
             helper(
                 "AllDependenciesCompleted",
-                vec![field("step_id", TypeRef::Named("StepId".into()))],
+                vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 TypeRef::Bool,
                 Expr::Quantified {
                     quantifier: Quantifier::All,
@@ -621,7 +618,7 @@ pub fn flow_run_machine() -> MachineSchema {
             ),
             helper(
                 "AllDependenciesSkipped",
-                vec![field("step_id", TypeRef::Named("StepId".into()))],
+                vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 TypeRef::Bool,
                 Expr::Quantified {
                     quantifier: Quantifier::All,
@@ -640,7 +637,7 @@ pub fn flow_run_machine() -> MachineSchema {
             ),
             helper(
                 "AnyDependencyCompleted",
-                vec![field("step_id", TypeRef::Named("StepId".into()))],
+                vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 TypeRef::Bool,
                 Expr::Quantified {
                     quantifier: Quantifier::Any,
@@ -659,7 +656,7 @@ pub fn flow_run_machine() -> MachineSchema {
             ),
             helper(
                 "StepDependencyReady",
-                vec![field("step_id", TypeRef::Named("StepId".into()))],
+                vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 TypeRef::Bool,
                 Expr::IfElse {
                     condition: Box::new(Expr::Eq(
@@ -685,7 +682,7 @@ pub fn flow_run_machine() -> MachineSchema {
             ),
             helper(
                 "StepDependencyShouldSkip",
-                vec![field("step_id", TypeRef::Named("StepId".into()))],
+                vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 TypeRef::Bool,
                 Expr::And(vec![
                     Expr::Eq(
@@ -704,7 +701,7 @@ pub fn flow_run_machine() -> MachineSchema {
             ),
             helper(
                 "StepBranchBlocked",
-                vec![field("step_id", TypeRef::Named("StepId".into()))],
+                vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 TypeRef::Bool,
                 Expr::IfElse {
                     condition: Box::new(Expr::Eq(
@@ -715,7 +712,7 @@ pub fn flow_run_machine() -> MachineSchema {
                     else_expr: Box::new(Expr::Quantified {
                         quantifier: Quantifier::Any,
                         binding: "candidate".into(),
-                        over: Box::new(Expr::Field("tracked_steps".into())),
+                        over: Box::new(Expr::Field(FieldId::parse("tracked_steps").expect("valid field slug"))),
                         body: Box::new(Expr::And(vec![
                             Expr::Neq(
                                 Box::new(Expr::Binding("candidate".into())),
@@ -742,15 +739,15 @@ pub fn flow_run_machine() -> MachineSchema {
                 TypeRef::Bool,
                 Expr::And(vec![
                     Expr::Gt(
-                        Box::new(Expr::Field("escalation_threshold".into())),
+                        Box::new(Expr::Field(FieldId::parse("escalation_threshold").expect("valid field slug"))),
                         Box::new(Expr::U64(0)),
                     ),
                     Expr::Gte(
                         Box::new(Expr::Add(
-                            Box::new(Expr::Field("consecutive_failure_count".into())),
+                            Box::new(Expr::Field(FieldId::parse("consecutive_failure_count").expect("valid field slug"))),
                             Box::new(Expr::U64(1)),
                         )),
-                        Box::new(Expr::Field("escalation_threshold".into())),
+                        Box::new(Expr::Field(FieldId::parse("escalation_threshold").expect("valid field slug"))),
                     ),
                 ]),
             ),
@@ -766,12 +763,12 @@ pub fn flow_run_machine() -> MachineSchema {
                 TypeRef::Bool,
                 Expr::Lte(
                     Box::new(target_retry_count_for("retry_key")),
-                    Box::new(Expr::Field("max_step_retries".into())),
+                    Box::new(Expr::Field(FieldId::parse("max_step_retries").expect("valid field slug"))),
                 ),
             ),
             helper(
                 "CollectionSatisfied",
-                vec![field("step_id", TypeRef::Named("StepId".into()))],
+                vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 TypeRef::Bool,
                 Expr::IfElse {
                     condition: Box::new(Expr::Eq(
@@ -807,7 +804,7 @@ pub fn flow_run_machine() -> MachineSchema {
             ),
             helper(
                 "CollectionFeasible",
-                vec![field("step_id", TypeRef::Named("StepId".into()))],
+                vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 TypeRef::Bool,
                 Expr::IfElse {
                     condition: Box::new(Expr::Eq(
@@ -852,25 +849,25 @@ pub fn flow_run_machine() -> MachineSchema {
             ),
             helper(
                 "StepTargetCount",
-                vec![field("step_id", TypeRef::Named("StepId".into()))],
+                vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 TypeRef::U32,
                 step_target_count_for("step_id"),
             ),
             helper(
                 "StepTargetSuccessCount",
-                vec![field("step_id", TypeRef::Named("StepId".into()))],
+                vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 TypeRef::U32,
                 step_target_success_count_for("step_id"),
             ),
             helper(
                 "StepTargetTerminalFailureCount",
-                vec![field("step_id", TypeRef::Named("StepId".into()))],
+                vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 TypeRef::U32,
                 step_target_terminal_failure_count_for("step_id"),
             ),
             helper(
                 "RemainingTargetCount",
-                vec![field("step_id", TypeRef::Named("StepId".into()))],
+                vec![field("step_id", TypeRef::Named(NamedTypeId::parse("StepId").expect("valid named-type slug")))],
                 TypeRef::U32,
                 remaining_target_count_for("step_id"),
             ),
@@ -882,7 +879,7 @@ pub fn flow_run_machine() -> MachineSchema {
                 expr: Expr::Quantified {
                     quantifier: Quantifier::All,
                     binding: "step_id".into(),
-                    over: Box::new(Expr::Field("tracked_steps".into())),
+                    over: Box::new(Expr::Field(FieldId::parse("tracked_steps").expect("valid field slug"))),
                     body: Box::new(Expr::Or(vec![
                         Expr::Not(Box::new(Expr::Call {
                             helper: "StepOutputRecordedIs".into(),
@@ -916,7 +913,7 @@ pub fn flow_run_machine() -> MachineSchema {
                 expr: Expr::Or(vec![
                     Expr::Neq(
                         Box::new(Expr::CurrentPhase),
-                        Box::new(Expr::Phase("Completed".into())),
+                        Box::new(Expr::Phase(PhaseId::parse("Completed").expect("valid phase slug"))),
                     ),
                     Expr::Call {
                         helper: "AllTrackedStepsInAllowedStatuses".into(),
@@ -935,7 +932,7 @@ pub fn flow_run_machine() -> MachineSchema {
                         args: vec![step_status(StepStatusVariant::Failed)],
                     })),
                     Expr::Gte(
-                        Box::new(Expr::Field("failure_count".into())),
+                        Box::new(Expr::Field(FieldId::parse("failure_count").expect("valid field slug"))),
                         Box::new(Expr::U64(1)),
                     ),
                 ]),
@@ -945,7 +942,7 @@ pub fn flow_run_machine() -> MachineSchema {
                 expr: Expr::Or(vec![
                     Expr::Neq(
                         Box::new(Expr::CurrentPhase),
-                        Box::new(Expr::Phase("Failed".into())),
+                        Box::new(Expr::Phase(PhaseId::parse("Failed").expect("valid phase slug"))),
                     ),
                     Expr::Bool(true),
                 ]),
@@ -953,27 +950,23 @@ pub fn flow_run_machine() -> MachineSchema {
         ],
         transitions: vec![
             TransitionSchema {
-                name: "CreateRun".into(),
-                from: vec!["Absent".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "CreateRun".into(),
-                    bindings: vec![
-                        "step_ids".into(),
-                        "ordered_steps".into(),
-                        "step_has_conditions".into(),
-                        "step_dependencies".into(),
-                        "step_dependency_modes".into(),
-                        "step_branches".into(),
-                        "step_collection_policies".into(),
-                        "step_quorum_thresholds".into(),
-                        "escalation_threshold".into(),
-                        "max_step_retries".into(),
-                        "max_active_nodes".into(),
-                        "max_active_frames".into(),
-                        "max_frame_depth".into(),
-                    ],
-                },
+                name: TransitionId::parse("CreateRun").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Absent").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("CreateRun").expect("valid input-variant slug"), bindings: vec![
+                        FieldId::parse("step_ids").expect("valid field slug"),
+                        FieldId::parse("ordered_steps").expect("valid field slug"),
+                        FieldId::parse("step_has_conditions").expect("valid field slug"),
+                        FieldId::parse("step_dependencies").expect("valid field slug"),
+                        FieldId::parse("step_dependency_modes").expect("valid field slug"),
+                        FieldId::parse("step_branches").expect("valid field slug"),
+                        FieldId::parse("step_collection_policies").expect("valid field slug"),
+                        FieldId::parse("step_quorum_thresholds").expect("valid field slug"),
+                        FieldId::parse("escalation_threshold").expect("valid field slug"),
+                        FieldId::parse("max_step_retries").expect("valid field slug"),
+                        FieldId::parse("max_active_nodes").expect("valid field slug"),
+                        FieldId::parse("max_active_frames").expect("valid field slug"),
+                        FieldId::parse("max_frame_depth").expect("valid field slug"),
+                    ] },
                 guards: vec![
                     Guard {
                         name: "step_ids_are_non_empty".into(),
@@ -1001,9 +994,7 @@ pub fn flow_run_machine() -> MachineSchema {
                         expr: Expr::Quantified {
                             quantifier: Quantifier::All,
                             binding: "step_id".into(),
-                            over: Box::new(Expr::MapKeys(Box::new(Expr::Binding(
-                                "step_dependencies".into(),
-                            )))),
+                            over: Box::new(Expr::MapKeys(Box::new(Expr::Binding("step_dependencies".into())))),
                             body: Box::new(Expr::Quantified {
                                 quantifier: Quantifier::All,
                                 binding: "dependency".into(),
@@ -1023,124 +1014,124 @@ pub fn flow_run_machine() -> MachineSchema {
                 ],
                 updates: vec![
                     Update::Assign {
-                        field: "tracked_steps".into(),
+                        field: FieldId::parse("tracked_steps").expect("valid field slug"),
                         expr: Expr::EmptySet,
                     },
                     Update::Assign {
-                        field: "ordered_steps".into(),
+                        field: FieldId::parse("ordered_steps").expect("valid field slug"),
                         expr: Expr::Binding("ordered_steps".into()),
                     },
                     Update::Assign {
-                        field: "step_status".into(),
+                        field: FieldId::parse("step_status").expect("valid field slug"),
                         expr: Expr::EmptyMap,
                     },
                     Update::Assign {
-                        field: "output_recorded".into(),
+                        field: FieldId::parse("output_recorded").expect("valid field slug"),
                         expr: Expr::EmptyMap,
                     },
                     Update::Assign {
-                        field: "step_condition_results".into(),
+                        field: FieldId::parse("step_condition_results").expect("valid field slug"),
                         expr: Expr::EmptyMap,
                     },
                     Update::Assign {
-                        field: "step_has_conditions".into(),
+                        field: FieldId::parse("step_has_conditions").expect("valid field slug"),
                         expr: Expr::Binding("step_has_conditions".into()),
                     },
                     Update::Assign {
-                        field: "failure_count".into(),
+                        field: FieldId::parse("failure_count").expect("valid field slug"),
                         expr: Expr::U64(0),
                     },
                     Update::Assign {
-                        field: "consecutive_failure_count".into(),
+                        field: FieldId::parse("consecutive_failure_count").expect("valid field slug"),
                         expr: Expr::U64(0),
                     },
                     Update::Assign {
-                        field: "step_dependencies".into(),
+                        field: FieldId::parse("step_dependencies").expect("valid field slug"),
                         expr: Expr::Binding("step_dependencies".into()),
                     },
                     Update::Assign {
-                        field: "step_dependency_modes".into(),
+                        field: FieldId::parse("step_dependency_modes").expect("valid field slug"),
                         expr: Expr::Binding("step_dependency_modes".into()),
                     },
                     Update::Assign {
-                        field: "step_branches".into(),
+                        field: FieldId::parse("step_branches").expect("valid field slug"),
                         expr: Expr::Binding("step_branches".into()),
                     },
                     Update::Assign {
-                        field: "step_collection_policies".into(),
+                        field: FieldId::parse("step_collection_policies").expect("valid field slug"),
                         expr: Expr::Binding("step_collection_policies".into()),
                     },
                     Update::Assign {
-                        field: "step_quorum_thresholds".into(),
+                        field: FieldId::parse("step_quorum_thresholds").expect("valid field slug"),
                         expr: Expr::Binding("step_quorum_thresholds".into()),
                     },
                     Update::Assign {
-                        field: "step_target_counts".into(),
+                        field: FieldId::parse("step_target_counts").expect("valid field slug"),
                         expr: Expr::EmptyMap,
                     },
                     Update::Assign {
-                        field: "step_target_success_counts".into(),
+                        field: FieldId::parse("step_target_success_counts").expect("valid field slug"),
                         expr: Expr::EmptyMap,
                     },
                     Update::Assign {
-                        field: "step_target_terminal_failure_counts".into(),
+                        field: FieldId::parse("step_target_terminal_failure_counts").expect("valid field slug"),
                         expr: Expr::EmptyMap,
                     },
                     Update::Assign {
-                        field: "target_retry_counts".into(),
+                        field: FieldId::parse("target_retry_counts").expect("valid field slug"),
                         expr: Expr::EmptyMap,
                     },
                     Update::Assign {
-                        field: "escalation_threshold".into(),
+                        field: FieldId::parse("escalation_threshold").expect("valid field slug"),
                         expr: Expr::Binding("escalation_threshold".into()),
                     },
                     Update::Assign {
-                        field: "max_step_retries".into(),
+                        field: FieldId::parse("max_step_retries").expect("valid field slug"),
                         expr: Expr::Binding("max_step_retries".into()),
                     },
                     // v2 field inits in CreateRun
                     Update::Assign {
-                        field: "ready_frames".into(),
+                        field: FieldId::parse("ready_frames").expect("valid field slug"),
                         expr: Expr::SeqLiteral(vec![]),
                     },
                     Update::Assign {
-                        field: "ready_frame_membership".into(),
+                        field: FieldId::parse("ready_frame_membership").expect("valid field slug"),
                         expr: Expr::EmptySet,
                     },
                     Update::Assign {
-                        field: "pending_body_frame_loops".into(),
+                        field: FieldId::parse("pending_body_frame_loops").expect("valid field slug"),
                         expr: Expr::SeqLiteral(vec![]),
                     },
                     Update::Assign {
-                        field: "pending_body_frame_loop_membership".into(),
+                        field: FieldId::parse("pending_body_frame_loop_membership").expect("valid field slug"),
                         expr: Expr::EmptySet,
                     },
                     Update::Assign {
-                        field: "active_node_count".into(),
+                        field: FieldId::parse("active_node_count").expect("valid field slug"),
                         expr: Expr::U64(0),
                     },
                     Update::Assign {
-                        field: "active_frame_count".into(),
+                        field: FieldId::parse("active_frame_count").expect("valid field slug"),
                         expr: Expr::U64(0),
                     },
                     Update::Assign {
-                        field: "max_active_nodes".into(),
+                        field: FieldId::parse("max_active_nodes").expect("valid field slug"),
                         expr: Expr::Binding("max_active_nodes".into()),
                     },
                     Update::Assign {
-                        field: "max_active_frames".into(),
+                        field: FieldId::parse("max_active_frames").expect("valid field slug"),
                         expr: Expr::Binding("max_active_frames".into()),
                     },
                     Update::Assign {
-                        field: "max_frame_depth".into(),
+                        field: FieldId::parse("max_frame_depth").expect("valid field slug"),
                         expr: Expr::Binding("max_frame_depth".into()),
                     },
                     Update::Assign {
-                        field: "last_granted_frame".into(),
+                        field: FieldId::parse("last_granted_frame").expect("valid field slug"),
                         expr: Expr::String(String::new()),
                     },
                     Update::Assign {
-                        field: "last_granted_loop".into(),
+                        field: FieldId::parse("last_granted_loop").expect("valid field slug"),
                         expr: Expr::String(String::new()),
                     },
                     Update::ForEach {
@@ -1148,43 +1139,43 @@ pub fn flow_run_machine() -> MachineSchema {
                         over: Expr::Binding("step_ids".into()),
                         updates: vec![
                             Update::SetInsert {
-                                field: "tracked_steps".into(),
+                                field: FieldId::parse("tracked_steps").expect("valid field slug"),
                                 value: Expr::Binding("step_id".into()),
                             },
                             Update::MapInsert {
-                                field: "step_status".into(),
+                                field: FieldId::parse("step_status").expect("valid field slug"),
                                 key: Expr::Binding("step_id".into()),
                                 value: Expr::None,
                             },
                             Update::MapInsert {
-                                field: "output_recorded".into(),
+                                field: FieldId::parse("output_recorded").expect("valid field slug"),
                                 key: Expr::Binding("step_id".into()),
                                 value: Expr::Bool(false),
                             },
                             Update::MapInsert {
-                                field: "step_condition_results".into(),
+                                field: FieldId::parse("step_condition_results").expect("valid field slug"),
                                 key: Expr::Binding("step_id".into()),
                                 value: Expr::None,
                             },
                             Update::MapInsert {
-                                field: "step_target_counts".into(),
+                                field: FieldId::parse("step_target_counts").expect("valid field slug"),
                                 key: Expr::Binding("step_id".into()),
                                 value: Expr::U64(0),
                             },
                             Update::MapInsert {
-                                field: "step_target_success_counts".into(),
+                                field: FieldId::parse("step_target_success_counts").expect("valid field slug"),
                                 key: Expr::Binding("step_id".into()),
                                 value: Expr::U64(0),
                             },
                             Update::MapInsert {
-                                field: "step_target_terminal_failure_counts".into(),
+                                field: FieldId::parse("step_target_terminal_failure_counts").expect("valid field slug"),
                                 key: Expr::Binding("step_id".into()),
                                 value: Expr::U64(0),
                             },
                         ],
                     },
                 ],
-                to: "Pending".into(),
+                to: PhaseId::parse("Pending").expect("valid phase slug"),
                 emit: vec![flow_run_notice(FlowRunPhaseVariant::Pending)],
             },
             transition(
@@ -1224,7 +1215,7 @@ pub fn flow_run_machine() -> MachineSchema {
                     },
                 ],
                 vec![Update::MapInsert {
-                    field: "step_status".into(),
+                    field: FieldId::parse("step_status").expect("valid field slug"),
                     key: Expr::Binding("step_id".into()),
                     value: Expr::Some(Box::new(step_status(StepStatusVariant::Dispatched))),
                 }],
@@ -1246,12 +1237,12 @@ pub fn flow_run_machine() -> MachineSchema {
                 ],
                 vec![
                     Update::MapInsert {
-                        field: "step_status".into(),
+                        field: FieldId::parse("step_status").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::Some(Box::new(step_status(StepStatusVariant::Completed))),
                     },
                     Update::Assign {
-                        field: "consecutive_failure_count".into(),
+                        field: FieldId::parse("consecutive_failure_count").expect("valid field slug"),
                         expr: Expr::U64(0),
                     },
                 ],
@@ -1272,7 +1263,7 @@ pub fn flow_run_machine() -> MachineSchema {
                     },
                 ],
                 vec![Update::MapInsert {
-                    field: "output_recorded".into(),
+                    field: FieldId::parse("output_recorded").expect("valid field slug"),
                     key: Expr::Binding("step_id".into()),
                     value: Expr::Bool(true),
                 }],
@@ -1286,7 +1277,7 @@ pub fn flow_run_machine() -> MachineSchema {
                     step_is_not_started_guard("step_id", "step_is_not_started"),
                 ],
                 vec![Update::MapInsert {
-                    field: "step_condition_results".into(),
+                    field: FieldId::parse("step_condition_results").expect("valid field slug"),
                     key: Expr::Binding("step_id".into()),
                     value: Expr::Some(Box::new(Expr::Bool(true))),
                 }],
@@ -1301,12 +1292,12 @@ pub fn flow_run_machine() -> MachineSchema {
                 ],
                 vec![
                     Update::MapInsert {
-                        field: "step_condition_results".into(),
+                        field: FieldId::parse("step_condition_results").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::Some(Box::new(Expr::Bool(false))),
                     },
                     Update::MapInsert {
-                        field: "step_status".into(),
+                        field: FieldId::parse("step_status").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::Some(Box::new(step_status(StepStatusVariant::Skipped))),
                     },
@@ -1333,16 +1324,16 @@ pub fn flow_run_machine() -> MachineSchema {
                 ],
                 vec![
                     Update::MapInsert {
-                        field: "step_status".into(),
+                        field: FieldId::parse("step_status").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::Some(Box::new(step_status(StepStatusVariant::Failed))),
                     },
                     Update::Increment {
-                        field: "failure_count".into(),
+                        field: FieldId::parse("failure_count").expect("valid field slug"),
                         amount: 1,
                     },
                     Update::Increment {
-                        field: "consecutive_failure_count".into(),
+                        field: FieldId::parse("consecutive_failure_count").expect("valid field slug"),
                         amount: 1,
                     },
                 ],
@@ -1372,16 +1363,16 @@ pub fn flow_run_machine() -> MachineSchema {
                 ],
                 vec![
                     Update::MapInsert {
-                        field: "step_status".into(),
+                        field: FieldId::parse("step_status").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::Some(Box::new(step_status(StepStatusVariant::Failed))),
                     },
                     Update::Increment {
-                        field: "failure_count".into(),
+                        field: FieldId::parse("failure_count").expect("valid field slug"),
                         amount: 1,
                     },
                     Update::Increment {
-                        field: "consecutive_failure_count".into(),
+                        field: FieldId::parse("consecutive_failure_count").expect("valid field slug"),
                         amount: 1,
                     },
                 ],
@@ -1398,7 +1389,7 @@ pub fn flow_run_machine() -> MachineSchema {
                     step_is_not_started_guard("step_id", "step_is_not_started"),
                 ],
                 vec![Update::MapInsert {
-                    field: "step_status".into(),
+                    field: FieldId::parse("step_status").expect("valid field slug"),
                     key: Expr::Binding("step_id".into()),
                     value: Expr::Some(Box::new(step_status(StepStatusVariant::Skipped))),
                 }],
@@ -1417,17 +1408,17 @@ pub fn flow_run_machine() -> MachineSchema {
                 ],
                 vec![
                     Update::MapInsert {
-                        field: "step_status".into(),
+                        field: FieldId::parse("step_status").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::Some(Box::new(step_status(StepStatusVariant::Completed))),
                     },
                     Update::MapInsert {
-                        field: "output_recorded".into(),
+                        field: FieldId::parse("output_recorded").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::Bool(true),
                     },
                     Update::Assign {
-                        field: "consecutive_failure_count".into(),
+                        field: FieldId::parse("consecutive_failure_count").expect("valid field slug"),
                         expr: Expr::U64(0),
                     },
                 ],
@@ -1446,12 +1437,12 @@ pub fn flow_run_machine() -> MachineSchema {
                 ],
                 vec![
                     Update::MapInsert {
-                        field: "step_status".into(),
+                        field: FieldId::parse("step_status").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::Some(Box::new(step_status(StepStatusVariant::Skipped))),
                     },
                     Update::MapInsert {
-                        field: "output_recorded".into(),
+                        field: FieldId::parse("output_recorded").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::Bool(false),
                     },
@@ -1483,21 +1474,21 @@ pub fn flow_run_machine() -> MachineSchema {
                 ],
                 vec![
                     Update::MapInsert {
-                        field: "step_status".into(),
+                        field: FieldId::parse("step_status").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::Some(Box::new(step_status(StepStatusVariant::Failed))),
                     },
                     Update::MapInsert {
-                        field: "output_recorded".into(),
+                        field: FieldId::parse("output_recorded").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::Bool(false),
                     },
                     Update::Increment {
-                        field: "failure_count".into(),
+                        field: FieldId::parse("failure_count").expect("valid field slug"),
                         amount: 1,
                     },
                     Update::Increment {
-                        field: "consecutive_failure_count".into(),
+                        field: FieldId::parse("consecutive_failure_count").expect("valid field slug"),
                         amount: 1,
                     },
                 ],
@@ -1531,21 +1522,21 @@ pub fn flow_run_machine() -> MachineSchema {
                 ],
                 vec![
                     Update::MapInsert {
-                        field: "step_status".into(),
+                        field: FieldId::parse("step_status").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::Some(Box::new(step_status(StepStatusVariant::Failed))),
                     },
                     Update::MapInsert {
-                        field: "output_recorded".into(),
+                        field: FieldId::parse("output_recorded").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::Bool(false),
                     },
                     Update::Increment {
-                        field: "failure_count".into(),
+                        field: FieldId::parse("failure_count").expect("valid field slug"),
                         amount: 1,
                     },
                     Update::Increment {
-                        field: "consecutive_failure_count".into(),
+                        field: FieldId::parse("consecutive_failure_count").expect("valid field slug"),
                         amount: 1,
                     },
                 ],
@@ -1576,21 +1567,21 @@ pub fn flow_run_machine() -> MachineSchema {
                 ],
                 vec![
                     Update::MapInsert {
-                        field: "step_status".into(),
+                        field: FieldId::parse("step_status").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::Some(Box::new(step_status(StepStatusVariant::Failed))),
                     },
                     Update::MapInsert {
-                        field: "output_recorded".into(),
+                        field: FieldId::parse("output_recorded").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::Bool(false),
                     },
                     Update::Increment {
-                        field: "failure_count".into(),
+                        field: FieldId::parse("failure_count").expect("valid field slug"),
                         amount: 1,
                     },
                     Update::Increment {
-                        field: "consecutive_failure_count".into(),
+                        field: FieldId::parse("consecutive_failure_count").expect("valid field slug"),
                         amount: 1,
                     },
                 ],
@@ -1621,21 +1612,21 @@ pub fn flow_run_machine() -> MachineSchema {
                 ],
                 vec![
                     Update::MapInsert {
-                        field: "step_status".into(),
+                        field: FieldId::parse("step_status").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::Some(Box::new(step_status(StepStatusVariant::Failed))),
                     },
                     Update::MapInsert {
-                        field: "output_recorded".into(),
+                        field: FieldId::parse("output_recorded").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::Bool(false),
                     },
                     Update::Increment {
-                        field: "failure_count".into(),
+                        field: FieldId::parse("failure_count").expect("valid field slug"),
                         amount: 1,
                     },
                     Update::Increment {
-                        field: "consecutive_failure_count".into(),
+                        field: FieldId::parse("consecutive_failure_count").expect("valid field slug"),
                         amount: 1,
                     },
                 ],
@@ -1661,52 +1652,44 @@ pub fn flow_run_machine() -> MachineSchema {
                     },
                 ],
                 vec![Update::MapInsert {
-                    field: "step_status".into(),
+                    field: FieldId::parse("step_status").expect("valid field slug"),
                     key: Expr::Binding("step_id".into()),
                     value: Expr::Some(Box::new(step_status(StepStatusVariant::Canceled))),
                 }],
                 vec![step_notice("step_id", StepStatusVariant::Canceled)],
             ),
             TransitionSchema {
-                name: "RegisterTargets".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "RegisterTargets".into(),
-                    bindings: vec!["step_id".into(), "target_count".into()],
-                },
+                name: TransitionId::parse("RegisterTargets").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("RegisterTargets").expect("valid input-variant slug"), bindings: vec![FieldId::parse("step_id").expect("valid field slug"), FieldId::parse("target_count").expect("valid field slug")] },
                 guards: vec![
                     tracked_step_guard("step_id"),
                     step_is_not_started_guard("step_id", "step_is_not_started"),
                 ],
                 updates: vec![
                     Update::MapInsert {
-                        field: "step_target_counts".into(),
+                        field: FieldId::parse("step_target_counts").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::Binding("target_count".into()),
                     },
                     Update::MapInsert {
-                        field: "step_target_success_counts".into(),
+                        field: FieldId::parse("step_target_success_counts").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::U64(0),
                     },
                     Update::MapInsert {
-                        field: "step_target_terminal_failure_counts".into(),
+                        field: FieldId::parse("step_target_terminal_failure_counts").expect("valid field slug"),
                         key: Expr::Binding("step_id".into()),
                         value: Expr::U64(0),
                     },
                 ],
-                to: "Running".into(),
+                to: PhaseId::parse("Running").expect("valid phase slug"),
                 emit: vec![],
             },
             TransitionSchema {
-                name: "RecordTargetSuccess".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "RecordTargetSuccess".into(),
-                    bindings: vec!["step_id".into(), "target_id".into()],
-                },
+                name: TransitionId::parse("RecordTargetSuccess").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("RecordTargetSuccess").expect("valid input-variant slug"), bindings: vec![FieldId::parse("step_id").expect("valid field slug"), FieldId::parse("target_id").expect("valid field slug")] },
                 guards: vec![
                     tracked_step_guard("step_id"),
                     step_status_guard(
@@ -1716,30 +1699,25 @@ pub fn flow_run_machine() -> MachineSchema {
                     ),
                 ],
                 updates: vec![Update::MapInsert {
-                    field: "step_target_success_counts".into(),
+                    field: FieldId::parse("step_target_success_counts").expect("valid field slug"),
                     key: Expr::Binding("step_id".into()),
                     value: Expr::Add(
                         Box::new(step_target_success_count_for("step_id")),
                         Box::new(Expr::U64(1)),
                     ),
                 }],
-                to: "Running".into(),
-                emit: vec![EffectEmit {
-                    variant: "ProjectTargetSuccess".into(),
+                to: PhaseId::parse("Running").expect("valid phase slug"),
+                emit: vec![EffectEmit { variant: EffectVariantId::parse("ProjectTargetSuccess").expect("valid effect-variant slug"),
                     fields: IndexMap::from([
-                        ("step_id".into(), Expr::Binding("step_id".into())),
-                        ("target_id".into(), Expr::Binding("target_id".into())),
+                        (FieldId::parse("step_id").expect("valid field slug"), Expr::Binding("step_id".into())),
+                        (FieldId::parse("target_id").expect("valid field slug"), Expr::Binding("target_id".into())),
                     ]),
                 }],
             },
             TransitionSchema {
-                name: "RecordTargetTerminalFailure".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "RecordTargetTerminalFailure".into(),
-                    bindings: vec!["step_id".into()],
-                },
+                name: TransitionId::parse("RecordTargetTerminalFailure").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("RecordTargetTerminalFailure").expect("valid input-variant slug"), bindings: vec![FieldId::parse("step_id").expect("valid field slug")] },
                 guards: vec![
                     tracked_step_guard("step_id"),
                     step_status_guard(
@@ -1749,24 +1727,20 @@ pub fn flow_run_machine() -> MachineSchema {
                     ),
                 ],
                 updates: vec![Update::MapInsert {
-                    field: "step_target_terminal_failure_counts".into(),
+                    field: FieldId::parse("step_target_terminal_failure_counts").expect("valid field slug"),
                     key: Expr::Binding("step_id".into()),
                     value: Expr::Add(
                         Box::new(step_target_terminal_failure_count_for("step_id")),
                         Box::new(Expr::U64(1)),
                     ),
                 }],
-                to: "Running".into(),
+                to: PhaseId::parse("Running").expect("valid phase slug"),
                 emit: vec![],
             },
             TransitionSchema {
-                name: "RecordTargetCanceled".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "RecordTargetCanceled".into(),
-                    bindings: vec!["step_id".into(), "target_id".into()],
-                },
+                name: TransitionId::parse("RecordTargetCanceled").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("RecordTargetCanceled").expect("valid input-variant slug"), bindings: vec![FieldId::parse("step_id").expect("valid field slug"), FieldId::parse("target_id").expect("valid field slug")] },
                 guards: vec![
                     tracked_step_guard("step_id"),
                     step_status_guard(
@@ -1776,30 +1750,25 @@ pub fn flow_run_machine() -> MachineSchema {
                     ),
                 ],
                 updates: vec![Update::MapInsert {
-                    field: "step_target_terminal_failure_counts".into(),
+                    field: FieldId::parse("step_target_terminal_failure_counts").expect("valid field slug"),
                     key: Expr::Binding("step_id".into()),
                     value: Expr::Add(
                         Box::new(step_target_terminal_failure_count_for("step_id")),
                         Box::new(Expr::U64(1)),
                     ),
                 }],
-                to: "Running".into(),
-                emit: vec![EffectEmit {
-                    variant: "ProjectTargetCanceled".into(),
+                to: PhaseId::parse("Running").expect("valid phase slug"),
+                emit: vec![EffectEmit { variant: EffectVariantId::parse("ProjectTargetCanceled").expect("valid effect-variant slug"),
                     fields: IndexMap::from([
-                        ("step_id".into(), Expr::Binding("step_id".into())),
-                        ("target_id".into(), Expr::Binding("target_id".into())),
+                        (FieldId::parse("step_id").expect("valid field slug"), Expr::Binding("step_id".into())),
+                        (FieldId::parse("target_id").expect("valid field slug"), Expr::Binding("target_id".into())),
                     ]),
                 }],
             },
             TransitionSchema {
-                name: "RecordTargetFailure".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "RecordTargetFailure".into(),
-                    bindings: vec!["step_id".into(), "target_id".into(), "retry_key".into()],
-                },
+                name: TransitionId::parse("RecordTargetFailure").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("RecordTargetFailure").expect("valid input-variant slug"), bindings: vec![FieldId::parse("step_id").expect("valid field slug"), FieldId::parse("target_id").expect("valid field slug"), FieldId::parse("retry_key").expect("valid field slug")] },
                 guards: vec![
                     tracked_step_guard("step_id"),
                     step_status_guard(
@@ -1809,20 +1778,19 @@ pub fn flow_run_machine() -> MachineSchema {
                     ),
                 ],
                 updates: vec![Update::MapInsert {
-                    field: "target_retry_counts".into(),
+                    field: FieldId::parse("target_retry_counts").expect("valid field slug"),
                     key: Expr::Binding("retry_key".into()),
                     value: Expr::Add(
                         Box::new(target_retry_count_for("retry_key")),
                         Box::new(Expr::U64(1)),
                     ),
                 }],
-                to: "Running".into(),
+                to: PhaseId::parse("Running").expect("valid phase slug"),
                 emit: vec![
-                    EffectEmit {
-                        variant: "ProjectTargetFailure".into(),
+                    EffectEmit { variant: EffectVariantId::parse("ProjectTargetFailure").expect("valid effect-variant slug"),
                         fields: IndexMap::from([
-                            ("step_id".into(), Expr::Binding("step_id".into())),
-                            ("target_id".into(), Expr::Binding("target_id".into())),
+                            (FieldId::parse("step_id").expect("valid field slug"), Expr::Binding("step_id".into())),
+                            (FieldId::parse("target_id").expect("valid field slug"), Expr::Binding("target_id".into())),
                         ]),
                     },
                     effect_with_step("AppendFailureLedger", "step_id"),
@@ -1830,59 +1798,51 @@ pub fn flow_run_machine() -> MachineSchema {
             },
             // RegisterReadyFrame: add frame to ready queue (dedup via membership set)
             TransitionSchema {
-                name: "RegisterReadyFrame".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "RegisterReadyFrame".into(),
-                    bindings: vec!["frame_id".into()],
-                },
+                name: TransitionId::parse("RegisterReadyFrame").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("RegisterReadyFrame").expect("valid input-variant slug"), bindings: vec![FieldId::parse("frame_id").expect("valid field slug")] },
                 guards: vec![Guard {
                     name: "frame_not_already_ready".into(),
                     expr: Expr::Not(Box::new(Expr::Contains {
-                        collection: Box::new(Expr::Field("ready_frame_membership".into())),
+                        collection: Box::new(Expr::Field(FieldId::parse("ready_frame_membership").expect("valid field slug"))),
                         value: Box::new(Expr::Binding("frame_id".into())),
                     })),
                 }],
                 updates: vec![
                     Update::SeqAppend {
-                        field: "ready_frames".into(),
+                        field: FieldId::parse("ready_frames").expect("valid field slug"),
                         value: Expr::Binding("frame_id".into()),
                     },
                     Update::SetInsert {
-                        field: "ready_frame_membership".into(),
+                        field: FieldId::parse("ready_frame_membership").expect("valid field slug"),
                         value: Expr::Binding("frame_id".into()),
                     },
                 ],
-                to: "Running".into(),
+                to: PhaseId::parse("Running").expect("valid phase slug"),
                 emit: vec![],
             },
             // PumpNodeScheduler: grant one node slot if queue is non-empty and under limit
             TransitionSchema {
-                name: "PumpNodeScheduler".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "PumpNodeScheduler".into(),
-                    bindings: vec![],
-                },
+                name: TransitionId::parse("PumpNodeScheduler").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("PumpNodeScheduler").expect("valid input-variant slug"), bindings: vec![] },
                 guards: vec![Guard {
                     // 0 means unlimited (dogma Rule 5: zero-as-unlimited is a typed semantic,
                     // not a convention; it must be encoded in the guard, not only in comments).
                     name: "ready_frames_available_and_under_limit".into(),
                     expr: Expr::And(vec![
                         Expr::Gt(
-                            Box::new(Expr::Len(Box::new(Expr::Field("ready_frames".into())))),
+                            Box::new(Expr::Len(Box::new(Expr::Field(FieldId::parse("ready_frames").expect("valid field slug"))))),
                             Box::new(Expr::U64(0)),
                         ),
                         Expr::Or(vec![
                             Expr::Eq(
-                                Box::new(Expr::Field("max_active_nodes".into())),
+                                Box::new(Expr::Field(FieldId::parse("max_active_nodes").expect("valid field slug"))),
                                 Box::new(Expr::U64(0)),
                             ),
                             Expr::Lt(
-                                Box::new(Expr::Field("active_node_count".into())),
-                                Box::new(Expr::Field("max_active_nodes".into())),
+                                Box::new(Expr::Field(FieldId::parse("active_node_count").expect("valid field slug"))),
+                                Box::new(Expr::Field(FieldId::parse("max_active_nodes").expect("valid field slug"))),
                             ),
                         ]),
                     ]),
@@ -1890,106 +1850,91 @@ pub fn flow_run_machine() -> MachineSchema {
                 updates: vec![
                     // Capture the head frame_id before popping
                     Update::Assign {
-                        field: "last_granted_frame".into(),
-                        expr: Expr::Head(Box::new(Expr::Field("ready_frames".into()))),
+                        field: FieldId::parse("last_granted_frame").expect("valid field slug"),
+                        expr: Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_frames").expect("valid field slug")))),
                     },
                     // Remove from membership set
                     Update::SetRemove {
-                        field: "ready_frame_membership".into(),
-                        value: Expr::Head(Box::new(Expr::Field("ready_frames".into()))),
+                        field: FieldId::parse("ready_frame_membership").expect("valid field slug"),
+                        value: Expr::Head(Box::new(Expr::Field(FieldId::parse("ready_frames").expect("valid field slug")))),
                     },
                     // Pop from queue
                     Update::SeqPopFront {
-                        field: "ready_frames".into(),
+                        field: FieldId::parse("ready_frames").expect("valid field slug"),
                     },
                     // Increment active node count
                     Update::Increment {
-                        field: "active_node_count".into(),
+                        field: FieldId::parse("active_node_count").expect("valid field slug"),
                         amount: 1,
                     },
                 ],
-                to: "Running".into(),
-                emit: vec![EffectEmit {
-                    variant: "GrantNodeSlot".into(),
-                    fields: IndexMap::from([(
-                        "frame_id".into(),
-                        Expr::Field("last_granted_frame".into()),
+                to: PhaseId::parse("Running").expect("valid phase slug"),
+                emit: vec![EffectEmit { variant: EffectVariantId::parse("GrantNodeSlot").expect("valid effect-variant slug"),
+                    fields: IndexMap::from([(FieldId::parse("frame_id").expect("valid field slug"), Expr::Field(FieldId::parse("last_granted_frame").expect("valid field slug")),
                     )]),
                 }],
             },
             // RegisterPendingBodyFrame: add loop instance to pending frame queue (with depth guard)
             TransitionSchema {
-                name: "RegisterPendingBodyFrame".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "RegisterPendingBodyFrame".into(),
-                    bindings: vec!["loop_instance_id".into(), "depth".into()],
-                },
+                name: TransitionId::parse("RegisterPendingBodyFrame").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("RegisterPendingBodyFrame").expect("valid input-variant slug"), bindings: vec![FieldId::parse("loop_instance_id").expect("valid field slug"), FieldId::parse("depth").expect("valid field slug")] },
                 guards: vec![
                     Guard {
                         // 0 means unlimited: skip the depth check when max_frame_depth == 0.
                         name: "depth_within_limit".into(),
                         expr: Expr::Or(vec![
                             Expr::Eq(
-                                Box::new(Expr::Field("max_frame_depth".into())),
+                                Box::new(Expr::Field(FieldId::parse("max_frame_depth").expect("valid field slug"))),
                                 Box::new(Expr::U64(0)),
                             ),
                             Expr::Lte(
                                 Box::new(Expr::Binding("depth".into())),
-                                Box::new(Expr::Field("max_frame_depth".into())),
+                                Box::new(Expr::Field(FieldId::parse("max_frame_depth").expect("valid field slug"))),
                             ),
                         ]),
                     },
                     Guard {
                         name: "loop_not_already_pending".into(),
                         expr: Expr::Not(Box::new(Expr::Contains {
-                            collection: Box::new(Expr::Field(
-                                "pending_body_frame_loop_membership".into(),
-                            )),
+                            collection: Box::new(Expr::Field(FieldId::parse("pending_body_frame_loop_membership").expect("valid field slug"))),
                             value: Box::new(Expr::Binding("loop_instance_id".into())),
                         })),
                     },
                 ],
                 updates: vec![
                     Update::SeqAppend {
-                        field: "pending_body_frame_loops".into(),
+                        field: FieldId::parse("pending_body_frame_loops").expect("valid field slug"),
                         value: Expr::Binding("loop_instance_id".into()),
                     },
                     Update::SetInsert {
-                        field: "pending_body_frame_loop_membership".into(),
+                        field: FieldId::parse("pending_body_frame_loop_membership").expect("valid field slug"),
                         value: Expr::Binding("loop_instance_id".into()),
                     },
                 ],
-                to: "Running".into(),
+                to: PhaseId::parse("Running").expect("valid phase slug"),
                 emit: vec![],
             },
             // PumpFrameScheduler: grant one body frame start if queue is non-empty and under limit
             TransitionSchema {
-                name: "PumpFrameScheduler".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "PumpFrameScheduler".into(),
-                    bindings: vec![],
-                },
+                name: TransitionId::parse("PumpFrameScheduler").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("PumpFrameScheduler").expect("valid input-variant slug"), bindings: vec![] },
                 guards: vec![Guard {
                     name: "pending_loops_available_and_under_frame_limit".into(),
                     expr: Expr::And(vec![
                         Expr::Gt(
-                            Box::new(Expr::Len(Box::new(Expr::Field(
-                                "pending_body_frame_loops".into(),
-                            )))),
+                            Box::new(Expr::Len(Box::new(Expr::Field(FieldId::parse("pending_body_frame_loops").expect("valid field slug"))))),
                             Box::new(Expr::U64(0)),
                         ),
                         Expr::Or(vec![
                             Expr::Eq(
-                                Box::new(Expr::Field("max_active_frames".into())),
+                                Box::new(Expr::Field(FieldId::parse("max_active_frames").expect("valid field slug"))),
                                 Box::new(Expr::U64(0)),
                             ),
                             Expr::Lt(
-                                Box::new(Expr::Field("active_frame_count".into())),
-                                Box::new(Expr::Field("max_active_frames".into())),
+                                Box::new(Expr::Field(FieldId::parse("active_frame_count").expect("valid field slug"))),
+                                Box::new(Expr::Field(FieldId::parse("max_active_frames").expect("valid field slug"))),
                             ),
                         ]),
                     ]),
@@ -1997,87 +1942,72 @@ pub fn flow_run_machine() -> MachineSchema {
                 updates: vec![
                     // Capture the head loop_instance_id before popping
                     Update::Assign {
-                        field: "last_granted_loop".into(),
-                        expr: Expr::Head(Box::new(Expr::Field("pending_body_frame_loops".into()))),
+                        field: FieldId::parse("last_granted_loop").expect("valid field slug"),
+                        expr: Expr::Head(Box::new(Expr::Field(FieldId::parse("pending_body_frame_loops").expect("valid field slug")))),
                     },
                     // Remove from membership set
                     Update::SetRemove {
-                        field: "pending_body_frame_loop_membership".into(),
-                        value: Expr::Head(Box::new(Expr::Field("pending_body_frame_loops".into()))),
+                        field: FieldId::parse("pending_body_frame_loop_membership").expect("valid field slug"),
+                        value: Expr::Head(Box::new(Expr::Field(FieldId::parse("pending_body_frame_loops").expect("valid field slug")))),
                     },
                     // Pop from queue
                     Update::SeqPopFront {
-                        field: "pending_body_frame_loops".into(),
+                        field: FieldId::parse("pending_body_frame_loops").expect("valid field slug"),
                     },
                     // Increment active frame count
                     Update::Increment {
-                        field: "active_frame_count".into(),
+                        field: FieldId::parse("active_frame_count").expect("valid field slug"),
                         amount: 1,
                     },
                 ],
-                to: "Running".into(),
-                emit: vec![EffectEmit {
-                    variant: "GrantBodyFrameStart".into(),
-                    fields: IndexMap::from([(
-                        "loop_instance_id".into(),
-                        Expr::Field("last_granted_loop".into()),
+                to: PhaseId::parse("Running").expect("valid phase slug"),
+                emit: vec![EffectEmit { variant: EffectVariantId::parse("GrantBodyFrameStart").expect("valid effect-variant slug"),
+                    fields: IndexMap::from([(FieldId::parse("loop_instance_id").expect("valid field slug"), Expr::Field(FieldId::parse("last_granted_loop").expect("valid field slug")),
                     )]),
                 }],
             },
             // NodeExecutionReleased: decrements active_node_count by 1
             TransitionSchema {
-                name: "NodeExecutionReleased".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "NodeExecutionReleased".into(),
-                    bindings: vec!["frame_id".into()],
-                },
+                name: TransitionId::parse("NodeExecutionReleased").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("NodeExecutionReleased").expect("valid input-variant slug"), bindings: vec![FieldId::parse("frame_id").expect("valid field slug")] },
                 guards: vec![Guard {
                     name: "at_least_one_active_node".into(),
                     expr: Expr::Gt(
-                        Box::new(Expr::Field("active_node_count".into())),
+                        Box::new(Expr::Field(FieldId::parse("active_node_count").expect("valid field slug"))),
                         Box::new(Expr::U64(0)),
                     ),
                 }],
                 updates: vec![Update::Decrement {
-                    field: "active_node_count".into(),
+                    field: FieldId::parse("active_node_count").expect("valid field slug"),
                     amount: 1,
                 }],
-                to: "Running".into(),
+                to: PhaseId::parse("Running").expect("valid phase slug"),
                 emit: vec![],
             },
             // FrameTerminated: decrement active_frame_count by 1
             TransitionSchema {
-                name: "FrameTerminated".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "FrameTerminated".into(),
-                    bindings: vec!["frame_id".into()],
-                },
+                name: TransitionId::parse("FrameTerminated").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("FrameTerminated").expect("valid input-variant slug"), bindings: vec![FieldId::parse("frame_id").expect("valid field slug")] },
                 guards: vec![Guard {
                     name: "at_least_one_active_frame".into(),
                     expr: Expr::Gt(
-                        Box::new(Expr::Field("active_frame_count".into())),
+                        Box::new(Expr::Field(FieldId::parse("active_frame_count").expect("valid field slug"))),
                         Box::new(Expr::U64(0)),
                     ),
                 }],
                 updates: vec![Update::Decrement {
-                    field: "active_frame_count".into(),
+                    field: FieldId::parse("active_frame_count").expect("valid field slug"),
                     amount: 1,
                 }],
-                to: "Running".into(),
+                to: PhaseId::parse("Running").expect("valid phase slug"),
                 emit: vec![],
             },
             TransitionSchema {
-                name: "TerminalizeCompleted".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "TerminalizeCompleted".into(),
-                    bindings: vec![],
-                },
+                name: TransitionId::parse("TerminalizeCompleted").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("TerminalizeCompleted").expect("valid input-variant slug"), bindings: vec![] },
                 guards: vec![Guard {
                     name: "all_steps_are_completed_or_skipped".into(),
                     expr: Expr::Call {
@@ -2089,26 +2019,20 @@ pub fn flow_run_machine() -> MachineSchema {
                     },
                 }],
                 updates: vec![],
-                to: "Completed".into(),
+                to: PhaseId::parse("Completed").expect("valid phase slug"),
                 emit: vec![
                     flow_run_notice(FlowRunPhaseVariant::Completed),
-                    EffectEmit {
-                        variant: "FlowTerminalized".into(),
-                        fields: IndexMap::from([(
-                            "run_status".into(),
+                    EffectEmit { variant: EffectVariantId::parse("FlowTerminalized").expect("valid effect-variant slug"),
+                        fields: IndexMap::from([(FieldId::parse("run_status").expect("valid field slug"),
                             flow_run_status(FlowRunPhaseVariant::Completed),
                         )]),
                     },
                 ],
             },
             TransitionSchema {
-                name: "TerminalizeFailed".into(),
-                from: vec!["Pending".into(), "Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "TerminalizeFailed".into(),
-                    bindings: vec![],
-                },
+                name: TransitionId::parse("TerminalizeFailed").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Pending").expect("valid phase slug"), PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("TerminalizeFailed").expect("valid input-variant slug"), bindings: vec![] },
                 guards: vec![Guard {
                     name: "no_step_remains_dispatched".into(),
                     expr: Expr::Call {
@@ -2117,26 +2041,20 @@ pub fn flow_run_machine() -> MachineSchema {
                     },
                 }],
                 updates: vec![],
-                to: "Failed".into(),
+                to: PhaseId::parse("Failed").expect("valid phase slug"),
                 emit: vec![
                     flow_run_notice(FlowRunPhaseVariant::Failed),
-                    EffectEmit {
-                        variant: "FlowTerminalized".into(),
-                        fields: IndexMap::from([(
-                            "run_status".into(),
+                    EffectEmit { variant: EffectVariantId::parse("FlowTerminalized").expect("valid effect-variant slug"),
+                        fields: IndexMap::from([(FieldId::parse("run_status").expect("valid field slug"),
                             flow_run_status(FlowRunPhaseVariant::Failed),
                         )]),
                     },
                 ],
             },
             TransitionSchema {
-                name: "TerminalizeCanceled".into(),
-                from: vec!["Pending".into(), "Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "TerminalizeCanceled".into(),
-                    bindings: vec![],
-                },
+                name: TransitionId::parse("TerminalizeCanceled").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Pending").expect("valid phase slug"), PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("TerminalizeCanceled").expect("valid input-variant slug"), bindings: vec![] },
                 guards: vec![Guard {
                     name: "no_step_remains_dispatched".into(),
                     expr: Expr::Call {
@@ -2145,13 +2063,11 @@ pub fn flow_run_machine() -> MachineSchema {
                     },
                 }],
                 updates: vec![],
-                to: "Canceled".into(),
+                to: PhaseId::parse("Canceled").expect("valid phase slug"),
                 emit: vec![
                     flow_run_notice(FlowRunPhaseVariant::Canceled),
-                    EffectEmit {
-                        variant: "FlowTerminalized".into(),
-                        fields: IndexMap::from([(
-                            "run_status".into(),
+                    EffectEmit { variant: EffectVariantId::parse("FlowTerminalized").expect("valid effect-variant slug"),
+                        fields: IndexMap::from([(FieldId::parse("run_status").expect("valid field slug"),
                             flow_run_status(FlowRunPhaseVariant::Canceled),
                         )]),
                     },
@@ -2171,19 +2087,19 @@ pub fn flow_run_machine() -> MachineSchema {
             disposition(
                 "AdmitStepWork",
                 EffectDisposition::Routed {
-                    consumer_machines: vec!["RuntimeControlMachine".into()],
+                    consumer_machines: vec![MachineId::parse("RuntimeControlMachine").expect("valid machine slug")],
                 },
             ),
             disposition(
                 "FlowTerminalized",
                 EffectDisposition::Routed {
-                    consumer_machines: vec!["MobOrchestratorMachine".into()],
+                    consumer_machines: vec![MachineId::parse("MobOrchestratorMachine").expect("valid machine slug")],
                 },
             ),
             disposition(
                 "EscalateSupervisor",
                 EffectDisposition::Routed {
-                    consumer_machines: vec!["MobOrchestratorMachine".into()],
+                    consumer_machines: vec![MachineId::parse("MobOrchestratorMachine").expect("valid machine slug")],
                 },
             ),
             disposition("ProjectTargetSuccess", EffectDisposition::External),
@@ -2198,7 +2114,7 @@ pub fn flow_run_machine() -> MachineSchema {
 
 fn disposition(name: &str, d: EffectDisposition) -> EffectDispositionRule {
     EffectDispositionRule {
-        effect_variant: name.into(),
+        effect_variant: EffectVariantId::parse(name).expect("valid effect-variant slug"),
         disposition: d,
         handoff_protocol: None,
     }
@@ -2206,21 +2122,21 @@ fn disposition(name: &str, d: EffectDisposition) -> EffectDispositionRule {
 
 fn variant(name: &str) -> VariantSchema {
     VariantSchema {
-        name: name.into(),
+        name: EnumVariantId::parse(name).expect("valid variant slug"),
         fields: vec![],
     }
 }
 
 fn field(name: &str, ty: TypeRef) -> FieldSchema {
     FieldSchema {
-        name: name.into(),
+        name: FieldId::parse(name).expect("valid field slug"),
         ty,
     }
 }
 
 fn init(field: &str, expr: Expr) -> FieldInit {
     FieldInit {
-        field: field.into(),
+        field: FieldId::parse(field).expect("valid field slug"),
         expr,
     }
 }
@@ -2243,16 +2159,12 @@ fn transition(
     to: &str,
 ) -> TransitionSchema {
     TransitionSchema {
-        name: name.into(),
-        from: from.iter().map(|phase| (*phase).to_owned()).collect(),
-        on: InputMatch {
-            kind: TriggerKind::Input,
-            variant: input_variant.into(),
-            bindings: vec![],
-        },
+        name: TransitionId::parse(name).expect("valid transition slug"),
+        from: from.iter().map(|phase| PhaseId::parse(*phase).expect("valid phase slug")).collect(),
+        on: TriggerMatch::Input { variant: InputVariantId::parse(input_variant).expect("valid input-variant slug"), bindings: vec![] },
         guards,
         updates: vec![],
-        to: to.into(),
+        to: PhaseId::parse(to).expect("valid phase slug"),
         emit,
     }
 }
@@ -2296,13 +2208,9 @@ fn step_transition(
     emit: Vec<EffectEmit>,
 ) -> TransitionSchema {
     TransitionSchema {
-        name: name.into(),
+        name: TransitionId::parse(name).expect("valid transition slug"),
         from: vec![flow_run_phase_name(FlowRunPhaseVariant::Running)],
-        on: InputMatch {
-            kind: TriggerKind::Input,
-            variant: input_variant.into(),
-            bindings: vec!["step_id".into()],
-        },
+        on: TriggerMatch::Input { variant: InputVariantId::parse(input_variant).expect("valid input-variant slug"), bindings: vec![FieldId::parse("step_id").expect("valid field slug")] },
         guards,
         updates,
         to: flow_run_phase_name(FlowRunPhaseVariant::Running),
@@ -2317,17 +2225,13 @@ fn frame_projection_transition(
     emit: Vec<EffectEmit>,
 ) -> TransitionSchema {
     TransitionSchema {
-        name: name.into(),
+        name: TransitionId::parse(name).expect("valid transition slug"),
         from: vec![flow_run_phase_name(FlowRunPhaseVariant::Running)],
-        on: InputMatch {
-            kind: TriggerKind::Input,
-            variant: "ProjectFrameStepStatus".into(),
-            bindings: vec![
-                "step_id".into(),
-                "step_status".into(),
-                "append_failure_ledger".into(),
-            ],
-        },
+        on: TriggerMatch::Input { variant: InputVariantId::parse("ProjectFrameStepStatus").expect("valid input-variant slug"), bindings: vec![
+                FieldId::parse("step_id").expect("valid field slug"),
+                FieldId::parse("step_status").expect("valid field slug"),
+                FieldId::parse("append_failure_ledger").expect("valid field slug"),
+            ] },
         guards,
         updates,
         to: flow_run_phase_name(FlowRunPhaseVariant::Running),
@@ -2372,7 +2276,7 @@ fn frame_projectable_guard(binding: &str) -> Guard {
 fn step_is_not_started_expr(binding: &str) -> Expr {
     Expr::Eq(
         Box::new(Expr::MapGet {
-            map: Box::new(Expr::Field("step_status".into())),
+            map: Box::new(Expr::Field(FieldId::parse("step_status").expect("valid field slug"))),
             key: Box::new(Expr::Binding(binding.into())),
         }),
         Box::new(Expr::None),
@@ -2437,18 +2341,14 @@ fn map_keys_match_step_ids_guard(map_binding: &str) -> Guard {
                 binding: "step_key".into(),
                 over: Box::new(Expr::MapKeys(Box::new(Expr::Binding(map_binding.into())))),
                 body: Box::new(Expr::Contains {
-                    collection: Box::new(Expr::SeqElements(Box::new(Expr::Binding(
-                        "step_ids".into(),
-                    )))),
+                    collection: Box::new(Expr::SeqElements(Box::new(Expr::Binding("step_ids".into())))),
                     value: Box::new(Expr::Binding("step_key".into())),
                 }),
             },
             Expr::Quantified {
                 quantifier: Quantifier::All,
                 binding: "step_id".into(),
-                over: Box::new(Expr::SeqElements(Box::new(Expr::Binding(
-                    "step_ids".into(),
-                )))),
+                over: Box::new(Expr::SeqElements(Box::new(Expr::Binding("step_ids".into())))),
                 body: Box::new(Expr::Contains {
                     collection: Box::new(Expr::MapKeys(Box::new(Expr::Binding(
                         map_binding.into(),
@@ -2463,13 +2363,11 @@ fn map_keys_match_step_ids_guard(map_binding: &str) -> Guard {
 fn step_dependencies_for(binding: &str) -> Expr {
     Expr::IfElse {
         condition: Box::new(Expr::Contains {
-            collection: Box::new(Expr::MapKeys(Box::new(Expr::Field(
-                "step_dependencies".into(),
-            )))),
+            collection: Box::new(Expr::MapKeys(Box::new(Expr::Field(FieldId::parse("step_dependencies").expect("valid field slug"))))),
             value: Box::new(Expr::Binding(binding.into())),
         }),
         then_expr: Box::new(Expr::MapGet {
-            map: Box::new(Expr::Field("step_dependencies".into())),
+            map: Box::new(Expr::Field(FieldId::parse("step_dependencies").expect("valid field slug"))),
             key: Box::new(Expr::Binding(binding.into())),
         }),
         else_expr: Box::new(Expr::SeqLiteral(vec![])),
@@ -2479,13 +2377,11 @@ fn step_dependencies_for(binding: &str) -> Expr {
 fn step_dependency_mode_for(binding: &str) -> Expr {
     Expr::IfElse {
         condition: Box::new(Expr::Contains {
-            collection: Box::new(Expr::MapKeys(Box::new(Expr::Field(
-                "step_dependency_modes".into(),
-            )))),
+            collection: Box::new(Expr::MapKeys(Box::new(Expr::Field(FieldId::parse("step_dependency_modes").expect("valid field slug"))))),
             value: Box::new(Expr::Binding(binding.into())),
         }),
         then_expr: Box::new(Expr::MapGet {
-            map: Box::new(Expr::Field("step_dependency_modes".into())),
+            map: Box::new(Expr::Field(FieldId::parse("step_dependency_modes").expect("valid field slug"))),
             key: Box::new(Expr::Binding(binding.into())),
         }),
         else_expr: Box::new(dependency_mode(DependencyModeVariant::All)),
@@ -2495,11 +2391,11 @@ fn step_dependency_mode_for(binding: &str) -> Expr {
 fn step_branch_for(binding: &str) -> Expr {
     Expr::IfElse {
         condition: Box::new(Expr::Contains {
-            collection: Box::new(Expr::MapKeys(Box::new(Expr::Field("step_branches".into())))),
+            collection: Box::new(Expr::MapKeys(Box::new(Expr::Field(FieldId::parse("step_branches").expect("valid field slug"))))),
             value: Box::new(Expr::Binding(binding.into())),
         }),
         then_expr: Box::new(Expr::MapGet {
-            map: Box::new(Expr::Field("step_branches".into())),
+            map: Box::new(Expr::Field(FieldId::parse("step_branches").expect("valid field slug"))),
             key: Box::new(Expr::Binding(binding.into())),
         }),
         else_expr: Box::new(Expr::None),
@@ -2509,13 +2405,11 @@ fn step_branch_for(binding: &str) -> Expr {
 fn step_collection_policy_for(binding: &str) -> Expr {
     Expr::IfElse {
         condition: Box::new(Expr::Contains {
-            collection: Box::new(Expr::MapKeys(Box::new(Expr::Field(
-                "step_collection_policies".into(),
-            )))),
+            collection: Box::new(Expr::MapKeys(Box::new(Expr::Field(FieldId::parse("step_collection_policies").expect("valid field slug"))))),
             value: Box::new(Expr::Binding(binding.into())),
         }),
         then_expr: Box::new(Expr::MapGet {
-            map: Box::new(Expr::Field("step_collection_policies".into())),
+            map: Box::new(Expr::Field(FieldId::parse("step_collection_policies").expect("valid field slug"))),
             key: Box::new(Expr::Binding(binding.into())),
         }),
         else_expr: Box::new(collection_policy_kind(CollectionPolicyVariant::All)),
@@ -2525,13 +2419,11 @@ fn step_collection_policy_for(binding: &str) -> Expr {
 fn step_quorum_threshold_for(binding: &str) -> Expr {
     Expr::IfElse {
         condition: Box::new(Expr::Contains {
-            collection: Box::new(Expr::MapKeys(Box::new(Expr::Field(
-                "step_quorum_thresholds".into(),
-            )))),
+            collection: Box::new(Expr::MapKeys(Box::new(Expr::Field(FieldId::parse("step_quorum_thresholds").expect("valid field slug"))))),
             value: Box::new(Expr::Binding(binding.into())),
         }),
         then_expr: Box::new(Expr::MapGet {
-            map: Box::new(Expr::Field("step_quorum_thresholds".into())),
+            map: Box::new(Expr::Field(FieldId::parse("step_quorum_thresholds").expect("valid field slug"))),
             key: Box::new(Expr::Binding(binding.into())),
         }),
         else_expr: Box::new(Expr::U64(0)),
@@ -2541,13 +2433,11 @@ fn step_quorum_threshold_for(binding: &str) -> Expr {
 fn step_target_count_for(binding: &str) -> Expr {
     Expr::IfElse {
         condition: Box::new(Expr::Contains {
-            collection: Box::new(Expr::MapKeys(Box::new(Expr::Field(
-                "step_target_counts".into(),
-            )))),
+            collection: Box::new(Expr::MapKeys(Box::new(Expr::Field(FieldId::parse("step_target_counts").expect("valid field slug"))))),
             value: Box::new(Expr::Binding(binding.into())),
         }),
         then_expr: Box::new(Expr::MapGet {
-            map: Box::new(Expr::Field("step_target_counts".into())),
+            map: Box::new(Expr::Field(FieldId::parse("step_target_counts").expect("valid field slug"))),
             key: Box::new(Expr::Binding(binding.into())),
         }),
         else_expr: Box::new(Expr::U64(0)),
@@ -2557,13 +2447,11 @@ fn step_target_count_for(binding: &str) -> Expr {
 fn step_target_success_count_for(binding: &str) -> Expr {
     Expr::IfElse {
         condition: Box::new(Expr::Contains {
-            collection: Box::new(Expr::MapKeys(Box::new(Expr::Field(
-                "step_target_success_counts".into(),
-            )))),
+            collection: Box::new(Expr::MapKeys(Box::new(Expr::Field(FieldId::parse("step_target_success_counts").expect("valid field slug"))))),
             value: Box::new(Expr::Binding(binding.into())),
         }),
         then_expr: Box::new(Expr::MapGet {
-            map: Box::new(Expr::Field("step_target_success_counts".into())),
+            map: Box::new(Expr::Field(FieldId::parse("step_target_success_counts").expect("valid field slug"))),
             key: Box::new(Expr::Binding(binding.into())),
         }),
         else_expr: Box::new(Expr::U64(0)),
@@ -2573,13 +2461,11 @@ fn step_target_success_count_for(binding: &str) -> Expr {
 fn step_target_terminal_failure_count_for(binding: &str) -> Expr {
     Expr::IfElse {
         condition: Box::new(Expr::Contains {
-            collection: Box::new(Expr::MapKeys(Box::new(Expr::Field(
-                "step_target_terminal_failure_counts".into(),
-            )))),
+            collection: Box::new(Expr::MapKeys(Box::new(Expr::Field(FieldId::parse("step_target_terminal_failure_counts").expect("valid field slug"))))),
             value: Box::new(Expr::Binding(binding.into())),
         }),
         then_expr: Box::new(Expr::MapGet {
-            map: Box::new(Expr::Field("step_target_terminal_failure_counts".into())),
+            map: Box::new(Expr::Field(FieldId::parse("step_target_terminal_failure_counts").expect("valid field slug"))),
             key: Box::new(Expr::Binding(binding.into())),
         }),
         else_expr: Box::new(Expr::U64(0)),
@@ -2596,13 +2482,11 @@ fn remaining_target_count_for(binding: &str) -> Expr {
 fn target_retry_count_for(binding: &str) -> Expr {
     Expr::IfElse {
         condition: Box::new(Expr::Contains {
-            collection: Box::new(Expr::MapKeys(Box::new(Expr::Field(
-                "target_retry_counts".into(),
-            )))),
+            collection: Box::new(Expr::MapKeys(Box::new(Expr::Field(FieldId::parse("target_retry_counts").expect("valid field slug"))))),
             value: Box::new(Expr::Binding(binding.into())),
         }),
         then_expr: Box::new(Expr::MapGet {
-            map: Box::new(Expr::Field("target_retry_counts".into())),
+            map: Box::new(Expr::Field(FieldId::parse("target_retry_counts").expect("valid field slug"))),
             key: Box::new(Expr::Binding(binding.into())),
         }),
         else_expr: Box::new(Expr::U64(0)),
@@ -2610,76 +2494,85 @@ fn target_retry_count_for(binding: &str) -> Expr {
 }
 
 fn flow_run_notice(status_variant: FlowRunPhaseVariant) -> EffectEmit {
-    EffectEmit {
-        variant: "EmitFlowRunNotice".into(),
-        fields: IndexMap::from([("run_status".into(), flow_run_status(status_variant))]),
+    EffectEmit { variant: EffectVariantId::parse("EmitFlowRunNotice").expect("valid effect-variant slug"),
+        fields: IndexMap::from([(FieldId::parse("run_status").expect("valid field slug"), flow_run_status(status_variant))]),
     }
 }
 
 fn step_notice(step_binding: &str, status_variant: StepStatusVariant) -> EffectEmit {
-    EffectEmit {
-        variant: "EmitStepNotice".into(),
+    EffectEmit { variant: EffectVariantId::parse("EmitStepNotice").expect("valid effect-variant slug"),
         fields: IndexMap::from([
-            ("step_id".into(), Expr::Binding(step_binding.into())),
-            ("step_status".into(), step_status(status_variant)),
+            (FieldId::parse("step_id").expect("valid field slug"), Expr::Binding(step_binding.into())),
+            (FieldId::parse("step_status").expect("valid field slug"), step_status(status_variant)),
         ]),
     }
 }
 
 fn effect_with_step(variant: &str, step_binding: &str) -> EffectEmit {
     EffectEmit {
-        variant: variant.into(),
-        fields: IndexMap::from([("step_id".into(), Expr::Binding(step_binding.into()))]),
+        variant: EffectVariantId::parse(variant).expect("valid effect-variant slug"),
+        fields: IndexMap::from([(FieldId::parse("step_id").expect("valid field slug"), Expr::Binding(step_binding.into()))]),
     }
 }
 
-fn flow_run_phase_name(variant: FlowRunPhaseVariant) -> String {
-    match variant {
-        FlowRunPhaseVariant::Pending => "Pending".into(),
-        FlowRunPhaseVariant::Running => "Running".into(),
-        FlowRunPhaseVariant::Completed => "Completed".into(),
-        FlowRunPhaseVariant::Failed => "Failed".into(),
-        FlowRunPhaseVariant::Canceled => "Canceled".into(),
-    }
+fn flow_run_phase_name(variant: FlowRunPhaseVariant) -> PhaseId {
+    let slug = match variant {
+        FlowRunPhaseVariant::Pending => "Pending",
+        FlowRunPhaseVariant::Running => "Running",
+        FlowRunPhaseVariant::Completed => "Completed",
+        FlowRunPhaseVariant::Failed => "Failed",
+        FlowRunPhaseVariant::Canceled => "Canceled",
+    };
+    PhaseId::parse(slug).expect("valid phase slug")
 }
 
 fn flow_run_status(variant: FlowRunPhaseVariant) -> Expr {
+    let slug = match variant {
+        FlowRunPhaseVariant::Pending => "Pending",
+        FlowRunPhaseVariant::Running => "Running",
+        FlowRunPhaseVariant::Completed => "Completed",
+        FlowRunPhaseVariant::Failed => "Failed",
+        FlowRunPhaseVariant::Canceled => "Canceled",
+    };
     Expr::NamedVariant {
-        enum_name: "FlowRunStatus".into(),
-        variant: flow_run_phase_name(variant),
+        enum_name: EnumTypeId::parse("FlowRunStatus").expect("valid enum-type slug"),
+        variant: EnumVariantId::parse(slug).expect("valid enum-variant slug"),
     }
 }
 
 fn step_status(variant: StepStatusVariant) -> Expr {
+    let slug = match variant {
+        StepStatusVariant::Dispatched => "Dispatched",
+        StepStatusVariant::Completed => "Completed",
+        StepStatusVariant::Failed => "Failed",
+        StepStatusVariant::Skipped => "Skipped",
+        StepStatusVariant::Canceled => "Canceled",
+    };
     Expr::NamedVariant {
-        enum_name: "StepRunStatus".into(),
-        variant: match variant {
-            StepStatusVariant::Dispatched => "Dispatched".into(),
-            StepStatusVariant::Completed => "Completed".into(),
-            StepStatusVariant::Failed => "Failed".into(),
-            StepStatusVariant::Skipped => "Skipped".into(),
-            StepStatusVariant::Canceled => "Canceled".into(),
-        },
+        enum_name: EnumTypeId::parse("StepRunStatus").expect("valid enum-type slug"),
+        variant: EnumVariantId::parse(slug).expect("valid enum-variant slug"),
     }
 }
 
 fn dependency_mode(variant: DependencyModeVariant) -> Expr {
+    let slug = match variant {
+        DependencyModeVariant::All => "All",
+        DependencyModeVariant::Any => "Any",
+    };
     Expr::NamedVariant {
-        enum_name: "DependencyMode".into(),
-        variant: match variant {
-            DependencyModeVariant::All => "All".into(),
-            DependencyModeVariant::Any => "Any".into(),
-        },
+        enum_name: EnumTypeId::parse("DependencyMode").expect("valid enum-type slug"),
+        variant: EnumVariantId::parse(slug).expect("valid enum-variant slug"),
     }
 }
 
 fn collection_policy_kind(variant: CollectionPolicyVariant) -> Expr {
+    let slug = match variant {
+        CollectionPolicyVariant::All => "All",
+        CollectionPolicyVariant::Any => "Any",
+        CollectionPolicyVariant::Quorum => "Quorum",
+    };
     Expr::NamedVariant {
-        enum_name: "CollectionPolicyKind".into(),
-        variant: match variant {
-            CollectionPolicyVariant::All => "All".into(),
-            CollectionPolicyVariant::Any => "Any".into(),
-            CollectionPolicyVariant::Quorum => "Quorum".into(),
-        },
+        enum_name: EnumTypeId::parse("CollectionPolicyKind").expect("valid enum-type slug"),
+        variant: EnumVariantId::parse(slug).expect("valid enum-variant slug"),
     }
 }

@@ -5,10 +5,15 @@ use crate::{
     Guard, InitSchema, InputMatch, MachineSchema, RustBinding, StateSchema, TransitionSchema,
     TriggerKind, TypeRef, Update, VariantSchema,
 };
+use crate::identity::{
+    EffectVariantId, EnumTypeId, EnumVariantId, FieldId, InputVariantId, MachineId,
+    NamedTypeId, PhaseId, ProtocolId, TransitionId,
+};
+use crate::machine::TriggerMatch;
 
 pub fn loop_iteration_machine() -> MachineSchema {
     MachineSchema {
-        machine: "LoopIterationMachine".into(),
+        machine: MachineId::parse("LoopIterationMachine").expect("valid machine slug"),
         version: 2,
         rust: RustBinding {
             crate_name: "meerkat-mob".into(),
@@ -28,22 +33,22 @@ pub fn loop_iteration_machine() -> MachineSchema {
             },
             fields: vec![
                 // Stored so effects on later transitions can reference the loop's identity
-                field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
-                field("parent_frame_id", TypeRef::Named("FrameId".into())),
-                field("parent_node_id", TypeRef::Named("FlowNodeId".into())),
-                field("loop_id", TypeRef::Named("LoopId".into())),
+                field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
+                field("parent_frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
+                field("parent_node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
+                field("loop_id", TypeRef::Named(NamedTypeId::parse("LoopId").expect("valid named-type slug"))),
                 field("depth", TypeRef::U32),
-                field("stage", TypeRef::Enum("LoopIterationStage".into())),
+                field("stage", TypeRef::Enum(EnumTypeId::parse("LoopIterationStage").expect("valid enum-type slug"))),
                 field("current_iteration", TypeRef::U32),
                 field("last_completed_iteration", TypeRef::U32),
                 field("max_iterations", TypeRef::U32),
                 field(
                     "active_body_frame_id",
-                    TypeRef::Option(Box::new(TypeRef::Named("FrameId".into()))),
+                    TypeRef::Option(Box::new(TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug")))),
                 ),
             ],
             init: InitSchema {
-                phase: "Absent".into(),
+            phase: PhaseId::parse("Absent").expect("valid phase slug"),
                 fields: vec![
                     init("loop_instance_id", Expr::String(String::new())),
                     init("parent_frame_id", Expr::String(String::new())),
@@ -53,8 +58,8 @@ pub fn loop_iteration_machine() -> MachineSchema {
                     init(
                         "stage",
                         Expr::NamedVariant {
-                            enum_name: "LoopIterationStage".into(),
-                            variant: "AwaitingBodyFrame".into(),
+                            enum_name: EnumTypeId::parse("LoopIterationStage").expect("valid enum-type slug"),
+                            variant: EnumVariantId::parse("AwaitingBodyFrame").expect("valid enum-variant slug"),
                         },
                     ),
                     init("current_iteration", Expr::U64(0)),
@@ -64,74 +69,74 @@ pub fn loop_iteration_machine() -> MachineSchema {
                 ],
             },
             terminal_phases: vec![
-                "Completed".into(),
-                "Exhausted".into(),
-                "Failed".into(),
-                "Canceled".into(),
+                PhaseId::parse("Completed").expect("valid phase slug"),
+                PhaseId::parse("Exhausted").expect("valid phase slug"),
+                PhaseId::parse("Failed").expect("valid phase slug"),
+                PhaseId::parse("Canceled").expect("valid phase slug"),
             ],
         },
         inputs: EnumSchema {
             name: "LoopIterationInput".into(),
             variants: vec![
                 VariantSchema {
-                    name: "StartLoop".into(),
+                name: EnumVariantId::parse("StartLoop").expect("valid variant slug"),
                     fields: vec![
-                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
+                        field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
                         field("max_iterations", TypeRef::U32),
-                        field("parent_frame_id", TypeRef::Named("FrameId".into())),
-                        field("parent_node_id", TypeRef::Named("FlowNodeId".into())),
-                        field("loop_id", TypeRef::Named("LoopId".into())),
+                        field("parent_frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
+                        field("parent_node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
+                        field("loop_id", TypeRef::Named(NamedTypeId::parse("LoopId").expect("valid named-type slug"))),
                         field("depth", TypeRef::U32),
                     ],
                 },
                 VariantSchema {
-                    name: "BodyFrameStarted".into(),
+                name: EnumVariantId::parse("BodyFrameStarted").expect("valid variant slug"),
                     fields: vec![
-                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
-                        field("frame_id", TypeRef::Named("FrameId".into())),
+                        field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
+                        field("frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
                         field("iteration", TypeRef::U32),
                     ],
                 },
                 VariantSchema {
-                    name: "BodyFrameCompleted".into(),
+                name: EnumVariantId::parse("BodyFrameCompleted").expect("valid variant slug"),
                     fields: vec![
-                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
+                        field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
                         field("iteration", TypeRef::U32),
                     ],
                 },
                 VariantSchema {
-                    name: "BodyFrameFailed".into(),
+                name: EnumVariantId::parse("BodyFrameFailed").expect("valid variant slug"),
                     fields: vec![
-                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
+                        field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
                         field("iteration", TypeRef::U32),
                     ],
                 },
                 VariantSchema {
-                    name: "BodyFrameCanceled".into(),
+                name: EnumVariantId::parse("BodyFrameCanceled").expect("valid variant slug"),
                     fields: vec![
-                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
+                        field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
                         field("iteration", TypeRef::U32),
                     ],
                 },
                 VariantSchema {
-                    name: "UntilConditionMet".into(),
+                name: EnumVariantId::parse("UntilConditionMet").expect("valid variant slug"),
                     fields: vec![
-                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
+                        field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
                         field("iteration", TypeRef::U32),
                     ],
                 },
                 VariantSchema {
-                    name: "UntilConditionFailed".into(),
+                name: EnumVariantId::parse("UntilConditionFailed").expect("valid variant slug"),
                     fields: vec![
-                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
+                        field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
                         field("iteration", TypeRef::U32),
                     ],
                 },
                 VariantSchema {
-                    name: "CancelLoop".into(),
+                name: EnumVariantId::parse("CancelLoop").expect("valid variant slug"),
                     fields: vec![field(
                         "loop_instance_id",
-                        TypeRef::Named("LoopInstanceId".into()),
+                        TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug")),
                     )],
                 },
             ],
@@ -145,52 +150,52 @@ pub fn loop_iteration_machine() -> MachineSchema {
             name: "LoopIterationEffect".into(),
             variants: vec![
                 VariantSchema {
-                    name: "RequestBodyFrameStart".into(),
+                name: EnumVariantId::parse("RequestBodyFrameStart").expect("valid variant slug"),
                     fields: vec![
-                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
+                        field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
                         field("depth", TypeRef::U32),
                     ],
                 },
                 VariantSchema {
-                    name: "EvaluateUntilCondition".into(),
+                name: EnumVariantId::parse("EvaluateUntilCondition").expect("valid variant slug"),
                     fields: vec![
-                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
+                        field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
                         field("iteration", TypeRef::U32),
-                        field("parent_frame_id", TypeRef::Named("FrameId".into())),
-                        field("parent_node_id", TypeRef::Named("FlowNodeId".into())),
-                        field("loop_id", TypeRef::Named("LoopId".into())),
+                        field("parent_frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
+                        field("parent_node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
+                        field("loop_id", TypeRef::Named(NamedTypeId::parse("LoopId").expect("valid named-type slug"))),
                     ],
                 },
                 VariantSchema {
-                    name: "LoopCompleted".into(),
+                name: EnumVariantId::parse("LoopCompleted").expect("valid variant slug"),
                     fields: vec![
-                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
-                        field("parent_frame_id", TypeRef::Named("FrameId".into())),
-                        field("parent_node_id", TypeRef::Named("FlowNodeId".into())),
+                        field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
+                        field("parent_frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
+                        field("parent_node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
                     ],
                 },
                 VariantSchema {
-                    name: "LoopExhausted".into(),
+                name: EnumVariantId::parse("LoopExhausted").expect("valid variant slug"),
                     fields: vec![
-                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
-                        field("parent_frame_id", TypeRef::Named("FrameId".into())),
-                        field("parent_node_id", TypeRef::Named("FlowNodeId".into())),
+                        field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
+                        field("parent_frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
+                        field("parent_node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
                     ],
                 },
                 VariantSchema {
-                    name: "LoopFailed".into(),
+                name: EnumVariantId::parse("LoopFailed").expect("valid variant slug"),
                     fields: vec![
-                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
-                        field("parent_frame_id", TypeRef::Named("FrameId".into())),
-                        field("parent_node_id", TypeRef::Named("FlowNodeId".into())),
+                        field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
+                        field("parent_frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
+                        field("parent_node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
                     ],
                 },
                 VariantSchema {
-                    name: "LoopCanceled".into(),
+                name: EnumVariantId::parse("LoopCanceled").expect("valid variant slug"),
                     fields: vec![
-                        field("loop_instance_id", TypeRef::Named("LoopInstanceId".into())),
-                        field("parent_frame_id", TypeRef::Named("FrameId".into())),
-                        field("parent_node_id", TypeRef::Named("FlowNodeId".into())),
+                        field("loop_instance_id", TypeRef::Named(NamedTypeId::parse("LoopInstanceId").expect("valid named-type slug"))),
+                        field("parent_frame_id", TypeRef::Named(NamedTypeId::parse("FrameId").expect("valid named-type slug"))),
+                        field("parent_node_id", TypeRef::Named(NamedTypeId::parse("FlowNodeId").expect("valid named-type slug"))),
                     ],
                 },
             ],
@@ -201,478 +206,442 @@ pub fn loop_iteration_machine() -> MachineSchema {
         transitions: vec![
             // StartLoop: Absent -> Running, stores loop identity, emits RequestBodyFrameStart
             TransitionSchema {
-                name: "StartLoop".into(),
-                from: vec!["Absent".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "StartLoop".into(),
-                    bindings: vec![
-                        "loop_instance_id".into(),
-                        "max_iterations".into(),
-                        "parent_frame_id".into(),
-                        "parent_node_id".into(),
-                        "loop_id".into(),
-                        "depth".into(),
-                    ],
-                },
+                name: TransitionId::parse("StartLoop").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Absent").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("StartLoop").expect("valid input-variant slug"), bindings: vec![
+                        FieldId::parse("loop_instance_id").expect("valid field slug"),
+                        FieldId::parse("max_iterations").expect("valid field slug"),
+                        FieldId::parse("parent_frame_id").expect("valid field slug"),
+                        FieldId::parse("parent_node_id").expect("valid field slug"),
+                        FieldId::parse("loop_id").expect("valid field slug"),
+                        FieldId::parse("depth").expect("valid field slug"),
+                    ] },
                 guards: vec![],
                 updates: vec![
                     Update::Assign {
-                        field: "loop_instance_id".into(),
+                        field: FieldId::parse("loop_instance_id").expect("valid field slug"),
                         expr: Expr::Binding("loop_instance_id".into()),
                     },
                     Update::Assign {
-                        field: "parent_frame_id".into(),
+                        field: FieldId::parse("parent_frame_id").expect("valid field slug"),
                         expr: Expr::Binding("parent_frame_id".into()),
                     },
                     Update::Assign {
-                        field: "parent_node_id".into(),
+                        field: FieldId::parse("parent_node_id").expect("valid field slug"),
                         expr: Expr::Binding("parent_node_id".into()),
                     },
                     Update::Assign {
-                        field: "loop_id".into(),
+                        field: FieldId::parse("loop_id").expect("valid field slug"),
                         expr: Expr::Binding("loop_id".into()),
                     },
                     Update::Assign {
-                        field: "depth".into(),
+                        field: FieldId::parse("depth").expect("valid field slug"),
                         expr: Expr::Binding("depth".into()),
                     },
                     Update::Assign {
-                        field: "stage".into(),
+                        field: FieldId::parse("stage").expect("valid field slug"),
                         expr: Expr::NamedVariant {
-                            enum_name: "LoopIterationStage".into(),
-                            variant: "AwaitingBodyFrame".into(),
+                            enum_name: EnumTypeId::parse("LoopIterationStage").expect("valid enum-type slug"),
+                            variant: EnumVariantId::parse("AwaitingBodyFrame").expect("valid enum-variant slug"),
                         },
                     },
                     Update::Assign {
-                        field: "max_iterations".into(),
+                        field: FieldId::parse("max_iterations").expect("valid field slug"),
                         expr: Expr::Binding("max_iterations".into()),
                     },
                     Update::Assign {
-                        field: "current_iteration".into(),
+                        field: FieldId::parse("current_iteration").expect("valid field slug"),
                         expr: Expr::U64(0),
                     },
                     Update::Assign {
-                        field: "last_completed_iteration".into(),
+                        field: FieldId::parse("last_completed_iteration").expect("valid field slug"),
                         expr: Expr::U64(0),
                     },
                     Update::Assign {
-                        field: "active_body_frame_id".into(),
+                        field: FieldId::parse("active_body_frame_id").expect("valid field slug"),
                         expr: Expr::None,
                     },
                 ],
-                to: "Running".into(),
+                to: PhaseId::parse("Running").expect("valid phase slug"),
                 emit: vec![effect(
                     "RequestBodyFrameStart",
                     vec![
-                        ("loop_instance_id", Expr::Field("loop_instance_id".into())),
-                        ("depth", Expr::Field("depth".into())),
+                        ("loop_instance_id", Expr::Field(FieldId::parse("loop_instance_id").expect("valid field slug"))),
+                        ("depth", Expr::Field(FieldId::parse("depth").expect("valid field slug"))),
                     ],
                 )],
             },
             // BodyFrameStarted: Running -> Running, records active frame
             TransitionSchema {
-                name: "BodyFrameStarted".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "BodyFrameStarted".into(),
-                    bindings: vec![
-                        "loop_instance_id".into(),
-                        "frame_id".into(),
-                        "iteration".into(),
-                    ],
-                },
+                name: TransitionId::parse("BodyFrameStarted").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("BodyFrameStarted").expect("valid input-variant slug"), bindings: vec![
+                        FieldId::parse("loop_instance_id").expect("valid field slug"),
+                        FieldId::parse("frame_id").expect("valid field slug"),
+                        FieldId::parse("iteration").expect("valid field slug"),
+                    ] },
                 guards: vec![
                     Guard {
                         name: "loop_identity_matches".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("loop_instance_id".into())),
+                            Box::new(Expr::Field(FieldId::parse("loop_instance_id").expect("valid field slug"))),
                             Box::new(Expr::Binding("loop_instance_id".into())),
                         ),
                     },
                     Guard {
                         name: "awaiting_body_frame".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("stage".into())),
+                            Box::new(Expr::Field(FieldId::parse("stage").expect("valid field slug"))),
                             Box::new(Expr::NamedVariant {
-                                enum_name: "LoopIterationStage".into(),
-                                variant: "AwaitingBodyFrame".into(),
+                                enum_name: EnumTypeId::parse("LoopIterationStage").expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("AwaitingBodyFrame").expect("valid enum-variant slug"),
                             }),
                         ),
                     },
                     Guard {
                         name: "iteration_matches_current".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("current_iteration".into())),
+                            Box::new(Expr::Field(FieldId::parse("current_iteration").expect("valid field slug"))),
                             Box::new(Expr::Binding("iteration".into())),
                         ),
                     },
                 ],
                 updates: vec![
                     Update::Assign {
-                        field: "active_body_frame_id".into(),
+                        field: FieldId::parse("active_body_frame_id").expect("valid field slug"),
                         expr: Expr::Some(Box::new(Expr::Binding("frame_id".into()))),
                     },
                     Update::Assign {
-                        field: "stage".into(),
+                        field: FieldId::parse("stage").expect("valid field slug"),
                         expr: Expr::NamedVariant {
-                            enum_name: "LoopIterationStage".into(),
-                            variant: "BodyFrameActive".into(),
+                            enum_name: EnumTypeId::parse("LoopIterationStage").expect("valid enum-type slug"),
+                            variant: EnumVariantId::parse("BodyFrameActive").expect("valid enum-variant slug"),
                         },
                     },
                 ],
-                to: "Running".into(),
+                to: PhaseId::parse("Running").expect("valid phase slug"),
                 emit: vec![],
             },
             // BodyFrameCompleted: Running -> Running, increments iteration, emits EvaluateUntilCondition
             TransitionSchema {
-                name: "BodyFrameCompleted".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "BodyFrameCompleted".into(),
-                    bindings: vec!["loop_instance_id".into(), "iteration".into()],
-                },
+                name: TransitionId::parse("BodyFrameCompleted").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("BodyFrameCompleted").expect("valid input-variant slug"), bindings: vec![FieldId::parse("loop_instance_id").expect("valid field slug"), FieldId::parse("iteration").expect("valid field slug")] },
                 guards: vec![
                     Guard {
                         name: "loop_identity_matches".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("loop_instance_id".into())),
+                            Box::new(Expr::Field(FieldId::parse("loop_instance_id").expect("valid field slug"))),
                             Box::new(Expr::Binding("loop_instance_id".into())),
                         ),
                     },
                     Guard {
                         name: "body_frame_active".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("stage".into())),
+                            Box::new(Expr::Field(FieldId::parse("stage").expect("valid field slug"))),
                             Box::new(Expr::NamedVariant {
-                                enum_name: "LoopIterationStage".into(),
-                                variant: "BodyFrameActive".into(),
+                                enum_name: EnumTypeId::parse("LoopIterationStage").expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("BodyFrameActive").expect("valid enum-variant slug"),
                             }),
                         ),
                     },
                     Guard {
                         name: "iteration_matches_current".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("current_iteration".into())),
+                            Box::new(Expr::Field(FieldId::parse("current_iteration").expect("valid field slug"))),
                             Box::new(Expr::Binding("iteration".into())),
                         ),
                     },
                 ],
                 updates: vec![
                     Update::Assign {
-                        field: "active_body_frame_id".into(),
+                        field: FieldId::parse("active_body_frame_id").expect("valid field slug"),
                         expr: Expr::None,
                     },
                     Update::Assign {
-                        field: "last_completed_iteration".into(),
+                        field: FieldId::parse("last_completed_iteration").expect("valid field slug"),
                         expr: Expr::Binding("iteration".into()),
                     },
                     Update::Increment {
-                        field: "current_iteration".into(),
+                        field: FieldId::parse("current_iteration").expect("valid field slug"),
                         amount: 1,
                     },
                     Update::Assign {
-                        field: "stage".into(),
+                        field: FieldId::parse("stage").expect("valid field slug"),
                         expr: Expr::NamedVariant {
-                            enum_name: "LoopIterationStage".into(),
-                            variant: "AwaitingUntil".into(),
+                            enum_name: EnumTypeId::parse("LoopIterationStage").expect("valid enum-type slug"),
+                            variant: EnumVariantId::parse("AwaitingUntil").expect("valid enum-variant slug"),
                         },
                     },
                 ],
-                to: "Running".into(),
+                to: PhaseId::parse("Running").expect("valid phase slug"),
                 emit: vec![effect(
                     "EvaluateUntilCondition",
                     vec![
-                        ("loop_instance_id", Expr::Field("loop_instance_id".into())),
-                        ("iteration", Expr::Field("last_completed_iteration".into())),
-                        ("parent_frame_id", Expr::Field("parent_frame_id".into())),
-                        ("parent_node_id", Expr::Field("parent_node_id".into())),
-                        ("loop_id", Expr::Field("loop_id".into())),
+                        ("loop_instance_id", Expr::Field(FieldId::parse("loop_instance_id").expect("valid field slug"))),
+                        ("iteration", Expr::Field(FieldId::parse("last_completed_iteration").expect("valid field slug"))),
+                        ("parent_frame_id", Expr::Field(FieldId::parse("parent_frame_id").expect("valid field slug"))),
+                        ("parent_node_id", Expr::Field(FieldId::parse("parent_node_id").expect("valid field slug"))),
+                        ("loop_id", Expr::Field(FieldId::parse("loop_id").expect("valid field slug"))),
                     ],
                 )],
             },
             // UntilConditionMet: Running -> Completed, emits LoopCompleted
             TransitionSchema {
-                name: "UntilConditionMet".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "UntilConditionMet".into(),
-                    bindings: vec!["loop_instance_id".into(), "iteration".into()],
-                },
+                name: TransitionId::parse("UntilConditionMet").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("UntilConditionMet").expect("valid input-variant slug"), bindings: vec![FieldId::parse("loop_instance_id").expect("valid field slug"), FieldId::parse("iteration").expect("valid field slug")] },
                 guards: vec![
                     Guard {
                         name: "loop_identity_matches".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("loop_instance_id".into())),
+                            Box::new(Expr::Field(FieldId::parse("loop_instance_id").expect("valid field slug"))),
                             Box::new(Expr::Binding("loop_instance_id".into())),
                         ),
                     },
                     Guard {
                         name: "awaiting_until".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("stage".into())),
+                            Box::new(Expr::Field(FieldId::parse("stage").expect("valid field slug"))),
                             Box::new(Expr::NamedVariant {
-                                enum_name: "LoopIterationStage".into(),
-                                variant: "AwaitingUntil".into(),
+                                enum_name: EnumTypeId::parse("LoopIterationStage").expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("AwaitingUntil").expect("valid enum-variant slug"),
                             }),
                         ),
                     },
                     Guard {
                         name: "iteration_matches_last_completed".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("last_completed_iteration".into())),
+                            Box::new(Expr::Field(FieldId::parse("last_completed_iteration").expect("valid field slug"))),
                             Box::new(Expr::Binding("iteration".into())),
                         ),
                     },
                 ],
                 updates: vec![],
-                to: "Completed".into(),
+                to: PhaseId::parse("Completed").expect("valid phase slug"),
                 emit: vec![effect(
                     "LoopCompleted",
                     vec![
-                        ("loop_instance_id", Expr::Field("loop_instance_id".into())),
-                        ("parent_frame_id", Expr::Field("parent_frame_id".into())),
-                        ("parent_node_id", Expr::Field("parent_node_id".into())),
+                        ("loop_instance_id", Expr::Field(FieldId::parse("loop_instance_id").expect("valid field slug"))),
+                        ("parent_frame_id", Expr::Field(FieldId::parse("parent_frame_id").expect("valid field slug"))),
+                        ("parent_node_id", Expr::Field(FieldId::parse("parent_node_id").expect("valid field slug"))),
                     ],
                 )],
             },
             // UntilConditionFailed: Running -> Running (guard: not yet exhausted), re-requests body frame
             TransitionSchema {
-                name: "UntilConditionFailed".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "UntilConditionFailed".into(),
-                    bindings: vec!["loop_instance_id".into(), "iteration".into()],
-                },
+                name: TransitionId::parse("UntilConditionFailed").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("UntilConditionFailed").expect("valid input-variant slug"), bindings: vec![FieldId::parse("loop_instance_id").expect("valid field slug"), FieldId::parse("iteration").expect("valid field slug")] },
                 guards: vec![
                     Guard {
                         name: "loop_identity_matches".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("loop_instance_id".into())),
+                            Box::new(Expr::Field(FieldId::parse("loop_instance_id").expect("valid field slug"))),
                             Box::new(Expr::Binding("loop_instance_id".into())),
                         ),
                     },
                     Guard {
                         name: "awaiting_until".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("stage".into())),
+                            Box::new(Expr::Field(FieldId::parse("stage").expect("valid field slug"))),
                             Box::new(Expr::NamedVariant {
-                                enum_name: "LoopIterationStage".into(),
-                                variant: "AwaitingUntil".into(),
+                                enum_name: EnumTypeId::parse("LoopIterationStage").expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("AwaitingUntil").expect("valid enum-variant slug"),
                             }),
                         ),
                     },
                     Guard {
                         name: "iteration_matches_last_completed".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("last_completed_iteration".into())),
+                            Box::new(Expr::Field(FieldId::parse("last_completed_iteration").expect("valid field slug"))),
                             Box::new(Expr::Binding("iteration".into())),
                         ),
                     },
                     Guard {
                         name: "iterations_not_exhausted".into(),
                         expr: Expr::Lt(
-                            Box::new(Expr::Field("current_iteration".into())),
-                            Box::new(Expr::Field("max_iterations".into())),
+                            Box::new(Expr::Field(FieldId::parse("current_iteration").expect("valid field slug"))),
+                            Box::new(Expr::Field(FieldId::parse("max_iterations").expect("valid field slug"))),
                         ),
                     },
                 ],
                 updates: vec![Update::Assign {
-                    field: "stage".into(),
+                    field: FieldId::parse("stage").expect("valid field slug"),
                     expr: Expr::NamedVariant {
-                        enum_name: "LoopIterationStage".into(),
-                        variant: "AwaitingBodyFrame".into(),
+                        enum_name: EnumTypeId::parse("LoopIterationStage").expect("valid enum-type slug"),
+                        variant: EnumVariantId::parse("AwaitingBodyFrame").expect("valid enum-variant slug"),
                     },
                 }],
-                to: "Running".into(),
+                to: PhaseId::parse("Running").expect("valid phase slug"),
                 emit: vec![effect(
                     "RequestBodyFrameStart",
                     vec![
-                        ("loop_instance_id", Expr::Field("loop_instance_id".into())),
-                        ("depth", Expr::Field("depth".into())),
+                        ("loop_instance_id", Expr::Field(FieldId::parse("loop_instance_id").expect("valid field slug"))),
+                        ("depth", Expr::Field(FieldId::parse("depth").expect("valid field slug"))),
                     ],
                 )],
             },
             // ExhaustedIterations: Running -> Exhausted (guard: current_iteration >= max_iterations)
             // Uses same input variant as UntilConditionFailed but with complementary guard
             TransitionSchema {
-                name: "ExhaustedIterations".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "UntilConditionFailed".into(),
-                    bindings: vec!["loop_instance_id".into(), "iteration".into()],
-                },
+                name: TransitionId::parse("ExhaustedIterations").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("UntilConditionFailed").expect("valid input-variant slug"), bindings: vec![FieldId::parse("loop_instance_id").expect("valid field slug"), FieldId::parse("iteration").expect("valid field slug")] },
                 guards: vec![
                     Guard {
                         name: "loop_identity_matches".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("loop_instance_id".into())),
+                            Box::new(Expr::Field(FieldId::parse("loop_instance_id").expect("valid field slug"))),
                             Box::new(Expr::Binding("loop_instance_id".into())),
                         ),
                     },
                     Guard {
                         name: "awaiting_until".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("stage".into())),
+                            Box::new(Expr::Field(FieldId::parse("stage").expect("valid field slug"))),
                             Box::new(Expr::NamedVariant {
-                                enum_name: "LoopIterationStage".into(),
-                                variant: "AwaitingUntil".into(),
+                                enum_name: EnumTypeId::parse("LoopIterationStage").expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("AwaitingUntil").expect("valid enum-variant slug"),
                             }),
                         ),
                     },
                     Guard {
                         name: "iteration_matches_last_completed".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("last_completed_iteration".into())),
+                            Box::new(Expr::Field(FieldId::parse("last_completed_iteration").expect("valid field slug"))),
                             Box::new(Expr::Binding("iteration".into())),
                         ),
                     },
                     Guard {
                         name: "iterations_exhausted".into(),
                         expr: Expr::Gte(
-                            Box::new(Expr::Field("current_iteration".into())),
-                            Box::new(Expr::Field("max_iterations".into())),
+                            Box::new(Expr::Field(FieldId::parse("current_iteration").expect("valid field slug"))),
+                            Box::new(Expr::Field(FieldId::parse("max_iterations").expect("valid field slug"))),
                         ),
                     },
                 ],
                 updates: vec![],
-                to: "Exhausted".into(),
+                to: PhaseId::parse("Exhausted").expect("valid phase slug"),
                 emit: vec![effect(
                     "LoopExhausted",
                     vec![
-                        ("loop_instance_id", Expr::Field("loop_instance_id".into())),
-                        ("parent_frame_id", Expr::Field("parent_frame_id".into())),
-                        ("parent_node_id", Expr::Field("parent_node_id".into())),
+                        ("loop_instance_id", Expr::Field(FieldId::parse("loop_instance_id").expect("valid field slug"))),
+                        ("parent_frame_id", Expr::Field(FieldId::parse("parent_frame_id").expect("valid field slug"))),
+                        ("parent_node_id", Expr::Field(FieldId::parse("parent_node_id").expect("valid field slug"))),
                     ],
                 )],
             },
             // BodyFrameFailed: Running -> Failed, emits LoopFailed
             TransitionSchema {
-                name: "BodyFrameFailed".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "BodyFrameFailed".into(),
-                    bindings: vec!["loop_instance_id".into(), "iteration".into()],
-                },
+                name: TransitionId::parse("BodyFrameFailed").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("BodyFrameFailed").expect("valid input-variant slug"), bindings: vec![FieldId::parse("loop_instance_id").expect("valid field slug"), FieldId::parse("iteration").expect("valid field slug")] },
                 guards: vec![
                     Guard {
                         name: "loop_identity_matches".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("loop_instance_id".into())),
+                            Box::new(Expr::Field(FieldId::parse("loop_instance_id").expect("valid field slug"))),
                             Box::new(Expr::Binding("loop_instance_id".into())),
                         ),
                     },
                     Guard {
                         name: "body_frame_active".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("stage".into())),
+                            Box::new(Expr::Field(FieldId::parse("stage").expect("valid field slug"))),
                             Box::new(Expr::NamedVariant {
-                                enum_name: "LoopIterationStage".into(),
-                                variant: "BodyFrameActive".into(),
+                                enum_name: EnumTypeId::parse("LoopIterationStage").expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("BodyFrameActive").expect("valid enum-variant slug"),
                             }),
                         ),
                     },
                     Guard {
                         name: "iteration_matches_current".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("current_iteration".into())),
+                            Box::new(Expr::Field(FieldId::parse("current_iteration").expect("valid field slug"))),
                             Box::new(Expr::Binding("iteration".into())),
                         ),
                     },
                 ],
                 updates: vec![Update::Assign {
-                    field: "active_body_frame_id".into(),
+                    field: FieldId::parse("active_body_frame_id").expect("valid field slug"),
                     expr: Expr::None,
                 }],
-                to: "Failed".into(),
+                to: PhaseId::parse("Failed").expect("valid phase slug"),
                 emit: vec![effect(
                     "LoopFailed",
                     vec![
-                        ("loop_instance_id", Expr::Field("loop_instance_id".into())),
-                        ("parent_frame_id", Expr::Field("parent_frame_id".into())),
-                        ("parent_node_id", Expr::Field("parent_node_id".into())),
+                        ("loop_instance_id", Expr::Field(FieldId::parse("loop_instance_id").expect("valid field slug"))),
+                        ("parent_frame_id", Expr::Field(FieldId::parse("parent_frame_id").expect("valid field slug"))),
+                        ("parent_node_id", Expr::Field(FieldId::parse("parent_node_id").expect("valid field slug"))),
                     ],
                 )],
             },
             // BodyFrameCanceled: Running -> Canceled, emits LoopCanceled
             TransitionSchema {
-                name: "BodyFrameCanceled".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "BodyFrameCanceled".into(),
-                    bindings: vec!["loop_instance_id".into(), "iteration".into()],
-                },
+                name: TransitionId::parse("BodyFrameCanceled").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("BodyFrameCanceled").expect("valid input-variant slug"), bindings: vec![FieldId::parse("loop_instance_id").expect("valid field slug"), FieldId::parse("iteration").expect("valid field slug")] },
                 guards: vec![
                     Guard {
                         name: "loop_identity_matches".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("loop_instance_id".into())),
+                            Box::new(Expr::Field(FieldId::parse("loop_instance_id").expect("valid field slug"))),
                             Box::new(Expr::Binding("loop_instance_id".into())),
                         ),
                     },
                     Guard {
                         name: "body_frame_active".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("stage".into())),
+                            Box::new(Expr::Field(FieldId::parse("stage").expect("valid field slug"))),
                             Box::new(Expr::NamedVariant {
-                                enum_name: "LoopIterationStage".into(),
-                                variant: "BodyFrameActive".into(),
+                                enum_name: EnumTypeId::parse("LoopIterationStage").expect("valid enum-type slug"),
+                                variant: EnumVariantId::parse("BodyFrameActive").expect("valid enum-variant slug"),
                             }),
                         ),
                     },
                     Guard {
                         name: "iteration_matches_current".into(),
                         expr: Expr::Eq(
-                            Box::new(Expr::Field("current_iteration".into())),
+                            Box::new(Expr::Field(FieldId::parse("current_iteration").expect("valid field slug"))),
                             Box::new(Expr::Binding("iteration".into())),
                         ),
                     },
                 ],
                 updates: vec![Update::Assign {
-                    field: "active_body_frame_id".into(),
+                    field: FieldId::parse("active_body_frame_id").expect("valid field slug"),
                     expr: Expr::None,
                 }],
-                to: "Canceled".into(),
+                to: PhaseId::parse("Canceled").expect("valid phase slug"),
                 emit: vec![effect(
                     "LoopCanceled",
                     vec![
-                        ("loop_instance_id", Expr::Field("loop_instance_id".into())),
-                        ("parent_frame_id", Expr::Field("parent_frame_id".into())),
-                        ("parent_node_id", Expr::Field("parent_node_id".into())),
+                        ("loop_instance_id", Expr::Field(FieldId::parse("loop_instance_id").expect("valid field slug"))),
+                        ("parent_frame_id", Expr::Field(FieldId::parse("parent_frame_id").expect("valid field slug"))),
+                        ("parent_node_id", Expr::Field(FieldId::parse("parent_node_id").expect("valid field slug"))),
                     ],
                 )],
             },
             // CancelLoop: Running -> Canceled, emits LoopCanceled
             TransitionSchema {
-                name: "CancelLoop".into(),
-                from: vec!["Running".into()],
-                on: InputMatch {
-                    kind: TriggerKind::Input,
-                    variant: "CancelLoop".into(),
-                    bindings: vec!["loop_instance_id".into()],
-                },
+                name: TransitionId::parse("CancelLoop").expect("valid transition slug"),
+                from: vec![PhaseId::parse("Running").expect("valid phase slug")],
+                on: TriggerMatch::Input { variant: InputVariantId::parse("CancelLoop").expect("valid input-variant slug"), bindings: vec![FieldId::parse("loop_instance_id").expect("valid field slug")] },
                 guards: vec![Guard {
                     name: "loop_identity_matches".into(),
                     expr: Expr::Eq(
-                        Box::new(Expr::Field("loop_instance_id".into())),
+                        Box::new(Expr::Field(FieldId::parse("loop_instance_id").expect("valid field slug"))),
                         Box::new(Expr::Binding("loop_instance_id".into())),
                     ),
                 }],
                 updates: vec![],
-                to: "Canceled".into(),
+                to: PhaseId::parse("Canceled").expect("valid phase slug"),
                 emit: vec![effect(
                     "LoopCanceled",
                     vec![
-                        ("loop_instance_id", Expr::Field("loop_instance_id".into())),
-                        ("parent_frame_id", Expr::Field("parent_frame_id".into())),
-                        ("parent_node_id", Expr::Field("parent_node_id".into())),
+                        ("loop_instance_id", Expr::Field(FieldId::parse("loop_instance_id").expect("valid field slug"))),
+                        ("parent_frame_id", Expr::Field(FieldId::parse("parent_frame_id").expect("valid field slug"))),
+                        ("parent_node_id", Expr::Field(FieldId::parse("parent_node_id").expect("valid field slug"))),
                     ],
                 )],
             },
@@ -691,11 +660,10 @@ pub fn loop_iteration_machine() -> MachineSchema {
 
 fn routed_disposition(name: &str, consumer_machines: &[&str]) -> EffectDispositionRule {
     EffectDispositionRule {
-        effect_variant: name.into(),
+        effect_variant: EffectVariantId::parse(name).expect("valid effect-variant slug"),
         disposition: EffectDisposition::Routed {
             consumer_machines: consumer_machines
-                .iter()
-                .map(|item| (*item).into())
+                .iter().map(|item| MachineId::parse(*item).expect("valid machine slug"))
                 .collect(),
         },
         handoff_protocol: None,
@@ -704,39 +672,42 @@ fn routed_disposition(name: &str, consumer_machines: &[&str]) -> EffectDispositi
 
 fn handoff_disposition(name: &str, protocol: &str) -> EffectDispositionRule {
     EffectDispositionRule {
-        effect_variant: name.into(),
+        effect_variant: EffectVariantId::parse(name).expect("valid effect-variant slug"),
         disposition: EffectDisposition::External,
-        handoff_protocol: Some(protocol.into()),
+        handoff_protocol: Some(ProtocolId::parse(protocol).expect("valid protocol slug")),
     }
 }
 
 fn variant(name: &str) -> VariantSchema {
     VariantSchema {
-        name: name.into(),
+        name: EnumVariantId::parse(name).expect("valid variant slug"),
         fields: vec![],
     }
 }
 
 fn field(name: &str, ty: TypeRef) -> FieldSchema {
     FieldSchema {
-        name: name.into(),
+        name: FieldId::parse(name).expect("valid field slug"),
         ty,
     }
 }
 
 fn init(field: &str, expr: Expr) -> FieldInit {
     FieldInit {
-        field: field.into(),
+        field: FieldId::parse(field).expect("valid field slug"),
         expr,
     }
 }
 
 fn effect(variant: &str, fields: Vec<(&str, Expr)>) -> EffectEmit {
     EffectEmit {
-        variant: variant.into(),
+        variant: EffectVariantId::parse(variant).expect("valid effect-variant slug"),
         fields: fields
             .into_iter()
-            .map(|(name, expr)| (name.into(), expr))
-            .collect::<IndexMap<String, Expr>>(),
+            .map(|(name, expr)| (
+                FieldId::parse(name).expect("valid field slug"),
+                expr,
+            ))
+            .collect::<IndexMap<FieldId, Expr>>(),
     }
 }
