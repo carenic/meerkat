@@ -3773,50 +3773,12 @@ impl MobActor {
         // From this point, rollback_failed_spawn handles cleanup via the
         // disposal pipeline.
         let member_ref = provision.commit()?;
-        let member_comms = self.provisioner_comms(&member_ref).await;
-        let peer_id = member_comms.as_ref().and_then(|comms| comms.public_key());
-
-        // Bootstrap supervisor trust on the member's comms runtime.
-        //
-        // The supervisor sends protocol-level lifecycle notifications
-        // (`mob.peer_added`, `mob.peer_retired`, …) to every member. These
-        // are not auth-exempt, so the receiving member must already trust
-        // the supervisor's peer id or the classified inbox will drop the
-        // envelope at admission. External peers get this edge via the
-        // supervisor-bridge `BindMember` bootstrap; session-backed members
-        // had no equivalent seam before W1-B.
-        //
-        // Use the *private* trust seam: the supervisor is a control-plane
-        // peer and must NOT leak into the member's `comms.peers` directory,
-        // REST, RPC, or MCP surface — clients would otherwise be able to
-        // target the supervisor bridge as an ordinary sendable peer.
-        // `add_private_trusted_peer` wires only the admission gate.
-        if let Some(member_comms) = member_comms.as_ref() {
-            match self.supervisor_bridge.supervisor_spec().await {
-                Ok(sup_spec) => {
-                    if let Err(err) = member_comms.add_private_trusted_peer(sup_spec).await {
-                        tracing::warn!(
-                            agent_identity = %agent_identity,
-                            error = %err,
-                            "could not register supervisor private-trust on session-backed \
-                             member comms; lifecycle notifications may be dropped at admission"
-                        );
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        agent_identity = %agent_identity,
-                        error = %err,
-                        "supervisor_spec unavailable; cannot bootstrap member→supervisor trust"
-                    );
-                }
-            }
-        }
+        let _ = self.provisioner_comms(&member_ref).await;
 
         // Resolve `external_addressable` from the effective profile so we
-        // can inform both the shell roster and the DSL (see the
-        // `MobMachineInput::Spawn` dispatch below). Honours any override
-        // previously applied via `SpawnTooling::Profile` resolution.
+        // can inform the DSL (see the `MobMachineInput::Spawn` dispatch
+        // below). Honours any override previously applied via
+        // `SpawnTooling::Profile` resolution.
         let external_addressable = if let Some(profile) = effective_profile_override.as_ref() {
             profile.external_addressable
         } else {
@@ -3826,26 +3788,6 @@ impl MobActor {
                 .map(|profile| profile.external_addressable)
                 .unwrap_or(false)
         };
-
-        {
-            let mut roster = self.roster.write().await;
-            let inserted = roster.add_member(crate::roster::RosterAddEntry {
-                agent_identity: identity.clone(),
-                generation,
-                fence_token,
-                agent_runtime_id: agent_runtime_id.clone(),
-                role: profile_name.clone(),
-                runtime_mode,
-                member_ref: member_ref.clone(),
-                peer_id,
-                labels,
-                effective_profile_override,
-            });
-            debug_assert!(
-                inserted,
-                "duplicate meerkat insert should be prevented before add()"
-            );
-        }
 
         // Feed `Spawn` into the MobMachine DSL so it populates
         // `live_runtime_ids` + `externally_addressable_runtime_ids` and
@@ -6123,35 +6065,9 @@ impl MobActor {
                     Err(error) => Some(error),
                 };
                 if let Some(error) = authorize_error {
-                    let mut rollback_errors = Vec::new();
-                    for (rotated_peer, rotated_binding) in rotated_peers.iter().rev() {
-                        if let Err(rollback_error) = self
-                            .bind_peer_only_member_for_binding(rotated_peer, rotated_binding)
-                            .await
-                        {
-                            rollback_errors
-                                .push(format!("{}: {rollback_error}", rotated_peer.peer_id));
-                        }
-                    }
-                    let mut message = format!("failed to rotate supervisor authority: {error}");
-                    if !rollback_errors.is_empty() {
-                        message.push_str(&format!(
-                            "; rollback failures: {}",
-                            rollback_errors.join(", ")
-                        ));
-                    }
-                    if !rollback_errors.is_empty() {
-                        self.runtime_metadata
-                            .put_supervisor_authority(&self.definition.id, &next)
-                            .await?;
-                        self.supervisor_bridge.rotate(next.clone()).await?;
-                        self.reinstall_session_backed_supervisor_trust(&current, &next)
-                            .await;
-                        message.push_str(
-                            "; local supervisor authority advanced to the partially applied next authority to preserve deterministic recovery",
-                        );
-                    }
-                    return Err(MobError::WiringError(message));
+                    return Err(MobError::WiringError(format!(
+                        "failed to rotate supervisor authority: {error}"
+                    )));
                 }
                 rotated_peers.push((effective_peer, effective_binding));
             }
@@ -6161,97 +6077,11 @@ impl MobActor {
             .put_supervisor_authority(&self.definition.id, &next)
             .await?;
         self.supervisor_bridge.rotate(next.clone()).await?;
-        self.reinstall_session_backed_supervisor_trust(&current, &next)
-            .await;
         Ok(super::handle::SupervisorRotationReport {
             previous_epoch: current.epoch,
             current_epoch: next.epoch,
             public_peer_id,
         })
-    }
-
-    /// Re-install supervisor private trust on every session-backed member
-    /// after a supervisor rotation.
-    ///
-    /// External (peer-only) members receive the new authority through the
-    /// `AuthorizeSupervisor` bridge command that runs earlier in
-    /// `handle_rotate_supervisor`. Session-backed members have no bridge
-    /// channel — they trust the supervisor via the private-trust seam
-    /// installed during `finalize_spawn_from_pending`. Without this step,
-    /// after a rotation the old supervisor peer id is still in the member's
-    /// private-trust set and the new supervisor's lifecycle notifications
-    /// (`mob.peer_added`, `mob.peer_retired`, …) get dropped at the
-    /// classified inbox's admission gate.
-    ///
-    /// Best-effort: a failure on one member is logged but does not abort
-    /// the rotation — the local authority is already advanced at this
-    /// point, so recovery is a per-member reconciliation problem, not a
-    /// "reject rotation" problem.
-    async fn reinstall_session_backed_supervisor_trust(
-        &self,
-        previous: &crate::store::SupervisorAuthorityRecord,
-        next: &crate::store::SupervisorAuthorityRecord,
-    ) {
-        let next_spec = match self.supervisor_bridge.supervisor_spec().await {
-            Ok(spec) => spec,
-            Err(error) => {
-                tracing::warn!(
-                    mob_id = %self.definition.id,
-                    %error,
-                    "supervisor_spec unavailable after rotation; \
-                     session-backed members will not receive rotated lifecycle notifications"
-                );
-                return;
-            }
-        };
-
-        let session_backed: Vec<RosterEntry> = {
-            let roster = self.roster.read().await;
-            roster
-                .list_all()
-                .filter(|entry| entry.member_ref.bridge_session_id().is_some())
-                .cloned()
-                .collect()
-        };
-
-        for entry in session_backed {
-            let Some(member_comms) = self.provisioner_comms(&entry.member_ref).await else {
-                tracing::debug!(
-                    mob_id = %self.definition.id,
-                    agent_identity = %entry.agent_identity,
-                    "no provisioner comms for session-backed member during rotation trust re-install"
-                );
-                continue;
-            };
-
-            if let Err(error) = member_comms
-                .remove_private_trusted_peer(&previous.public_peer_id)
-                .await
-            {
-                tracing::warn!(
-                    mob_id = %self.definition.id,
-                    agent_identity = %entry.agent_identity,
-                    previous_peer_id = %previous.public_peer_id,
-                    %error,
-                    "failed to revoke previous supervisor private-trust during rotation; \
-                     old supervisor may still be accepted by the member's inbox"
-                );
-            }
-
-            if let Err(error) = member_comms
-                .add_private_trusted_peer(next_spec.clone())
-                .await
-            {
-                tracing::warn!(
-                    mob_id = %self.definition.id,
-                    agent_identity = %entry.agent_identity,
-                    next_peer_id = %next.public_peer_id,
-                    %error,
-                    "failed to install rotated supervisor private-trust on session-backed member; \
-                     lifecycle notifications from the new supervisor will be dropped at admission"
-                );
-            }
-        }
     }
 
     /// Cancel checkpointers and transition to Stopped. Used by `handle_reset`
