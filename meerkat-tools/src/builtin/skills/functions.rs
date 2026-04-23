@@ -79,13 +79,19 @@ impl BuiltinTool for SkillInvokeFunctionTool {
     }
 
     async fn call(&self, args: Value) -> Result<ToolOutput, BuiltinToolError> {
-        let key = parse_key(&args)?;
+        let raw_key = parse_key(&args)?;
         let function_name = args
             .get("function_name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
                 BuiltinToolError::InvalidArgs("missing 'function_name' parameter".into())
             })?;
+        // Apply source-identity lineage remaps before dispatch.
+        let key = self
+            .engine
+            .canonical_skill_key(&raw_key)
+            .await
+            .map_err(|e| BuiltinToolError::ExecutionFailed(e.to_string()))?;
         let output = self
             .engine
             .invoke_function(

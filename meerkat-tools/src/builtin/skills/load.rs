@@ -78,7 +78,15 @@ impl BuiltinTool for LoadSkillTool {
     }
 
     async fn call(&self, args: Value) -> Result<ToolOutput, BuiltinToolError> {
-        let key = parse_key(&args)?;
+        let raw_key = parse_key(&args)?;
+        // Apply the source-identity lineage remap chain before dispatch
+        // so legacy source_uuids that have since been rotated/merged
+        // still resolve to the canonical backing skill.
+        let key = self
+            .engine
+            .canonical_skill_key(&raw_key)
+            .await
+            .map_err(|e| BuiltinToolError::ExecutionFailed(e.to_string()))?;
         let results = self
             .engine
             .resolve_and_render(&[key.clone()])

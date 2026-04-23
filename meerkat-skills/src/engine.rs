@@ -2,11 +2,13 @@
 
 use std::collections::HashSet;
 use std::future::Future;
+use std::sync::Arc;
 
 use meerkat_core::skills::{
     CapabilityId, ResolvedSkill, SkillArtifact, SkillArtifactContent, SkillCollection,
     SkillDescriptor, SkillDocument, SkillEngine, SkillError, SkillFilter, SkillIntrospectionEntry,
-    SkillKey, SkillQuarantineDiagnostic, SkillSource, SourceHealthSnapshot,
+    SkillKey, SkillQuarantineDiagnostic, SkillRef, SkillSource, SourceHealthSnapshot,
+    SourceIdentityRegistry,
 };
 
 use crate::renderer;
@@ -20,6 +22,13 @@ where
     available_capabilities: HashSet<CapabilityId>,
     inventory_threshold: usize,
     max_injection_bytes: usize,
+    /// Optional source-identity registry used to apply lineage remap
+    /// chains on incoming `SkillKey`s. When absent (tests, minimal
+    /// embeddings), `canonical_skill_key` is the identity function; the
+    /// pre-V4 behavior is preserved. When present (facade-constructed
+    /// engines), the builtin skill tools get lineage-aware key
+    /// resolution.
+    registry: Option<Arc<SourceIdentityRegistry>>,
 }
 
 impl<S> DefaultSkillEngine<S>
@@ -32,6 +41,7 @@ where
             available_capabilities: available_capabilities.into_iter().collect(),
             inventory_threshold: renderer::DEFAULT_INVENTORY_THRESHOLD,
             max_injection_bytes: renderer::MAX_INJECTION_BYTES,
+            registry: None,
         }
     }
 
@@ -42,6 +52,14 @@ where
 
     pub fn with_max_injection_bytes(mut self, max_bytes: usize) -> Self {
         self.max_injection_bytes = max_bytes;
+        self
+    }
+
+    /// Attach a `SourceIdentityRegistry` so `canonical_skill_key`
+    /// applies the lineage remap chain. Without one, the engine falls
+    /// back to the identity projection.
+    pub fn with_source_identity_registry(mut self, registry: Arc<SourceIdentityRegistry>) -> Self {
+        self.registry = Some(registry);
         self
     }
 }
@@ -199,6 +217,20 @@ where
             self.source
                 .load_from_source(key, source_name.as_deref())
                 .await
+        }
+    }
+
+    fn canonical_skill_key(
+        &self,
+        key: &SkillKey,
+    ) -> impl Future<Output = Result<SkillKey, SkillError>> + Send {
+        let registry = self.registry.clone();
+        let reference = SkillRef::from(key.clone());
+        async move {
+            match registry {
+                Some(reg) => reg.canonical_skill_key(&reference),
+                None => Ok(reference.into_key()),
+            }
         }
     }
 }

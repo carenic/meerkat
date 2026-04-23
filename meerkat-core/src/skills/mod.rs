@@ -967,6 +967,23 @@ pub trait SkillEngine: Send + Sync {
         let missing = key.clone();
         async move { Err(SkillError::NotFound { key: missing }) }
     }
+
+    /// Apply the engine's source-identity lineage remap chain to `key`,
+    /// producing the canonical `SkillKey` to use for downstream resolve
+    /// operations. Engines that do not own a `SourceIdentityRegistry`
+    /// return the input unchanged — the default preserves pre-V4
+    /// behavior for lightweight/test engines while giving registry-backed
+    /// engines (e.g. `meerkat_skills::DefaultSkillEngine`) a typed seam
+    /// that builtin skill tools can consume before calling resolve,
+    /// closing the lineage-remap gap on `load_skill` / `read_artifact` /
+    /// `invoke_function` / `list_artifacts`.
+    fn canonical_skill_key(
+        &self,
+        key: &SkillKey,
+    ) -> impl Future<Output = Result<SkillKey, SkillError>> + Send {
+        let canonical = key.clone();
+        async move { Ok(canonical) }
+    }
 }
 
 type OwnedSkillFuture<T> = Pin<Box<dyn Future<Output = Result<T, SkillError>> + Send + 'static>>;
@@ -987,6 +1004,7 @@ type ListAllWithProvenanceFn =
     dyn Fn(SkillFilter) -> OwnedSkillFuture<Vec<SkillIntrospectionEntry>> + Send + Sync;
 type LoadFromSourceFn =
     dyn Fn(SkillKey, Option<String>) -> OwnedSkillFuture<SkillDocument> + Send + Sync;
+type CanonicalSkillKeyFn = dyn Fn(SkillKey) -> OwnedSkillFuture<SkillKey> + Send + Sync;
 
 #[derive(Clone)]
 #[allow(clippy::struct_field_names)]
@@ -1002,6 +1020,7 @@ pub struct SkillRuntime {
     invoke_function_fn: Arc<InvokeFunctionFn>,
     list_all_with_provenance_fn: Arc<ListAllWithProvenanceFn>,
     load_from_source_fn: Arc<LoadFromSourceFn>,
+    canonical_skill_key_fn: Arc<CanonicalSkillKeyFn>,
 }
 
 impl SkillRuntime {
@@ -1019,6 +1038,7 @@ impl SkillRuntime {
         let read_artifact_engine = Arc::clone(&engine);
         let invoke_function_engine = Arc::clone(&engine);
         let provenance_engine = Arc::clone(&engine);
+        let canonical_engine = Arc::clone(&engine);
         let load_from_source_engine = engine;
 
         Self {
@@ -1071,6 +1091,10 @@ impl SkillRuntime {
                 Box::pin(
                     async move { engine.load_from_source(&key, source_name.as_deref()).await },
                 )
+            }),
+            canonical_skill_key_fn: Arc::new(move |key: SkillKey| {
+                let engine = Arc::clone(&canonical_engine);
+                Box::pin(async move { engine.canonical_skill_key(&key).await })
             }),
         }
     }
@@ -1141,6 +1165,12 @@ impl SkillRuntime {
         source_name: Option<&str>,
     ) -> Result<SkillDocument, SkillError> {
         (self.load_from_source_fn)(key.clone(), source_name.map(ToString::to_string)).await
+    }
+
+    /// Apply the engine's source-identity lineage remap chain to `key`.
+    /// See [`SkillEngine::canonical_skill_key`] for semantics.
+    pub async fn canonical_skill_key(&self, key: &SkillKey) -> Result<SkillKey, SkillError> {
+        (self.canonical_skill_key_fn)(key.clone()).await
     }
 }
 
