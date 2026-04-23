@@ -19,6 +19,10 @@ use crate::{
     EffectDisposition, EffectDispositionRule, EnumSchema, FieldSchema, InitSchema, MachineSchema,
     RustBinding, StateSchema, TypeRef, VariantSchema,
 };
+use crate::identity::{
+    EffectVariantId, EnumTypeId, EnumVariantId, FieldId, InputVariantId, MachineId,
+    NamedTypeId, PhaseId, ProtocolId, TransitionId,
+};
 
 /// Minimal compat machine that hosts the `ops_barrier_satisfaction`
 /// handoff protocol's producer declaration. Its only effect variant is
@@ -26,7 +30,7 @@ use crate::{
 /// with `handoff_protocol = Some("ops_barrier_satisfaction")`.
 pub fn ops_barrier_bridge_machine() -> MachineSchema {
     MachineSchema {
-        machine: "OpsBarrierBridgeMachine".into(),
+        machine: MachineId::parse("OpsBarrierBridgeMachine").expect("valid machine slug"),
         version: 1,
         rust: RustBinding {
             crate_name: "meerkat-core".into(),
@@ -39,7 +43,7 @@ pub fn ops_barrier_bridge_machine() -> MachineSchema {
             },
             fields: vec![],
             init: InitSchema {
-                phase: "Idle".into(),
+            phase: PhaseId::parse("Idle").expect("valid phase slug"),
                 fields: vec![],
             },
             terminal_phases: vec![],
@@ -47,15 +51,15 @@ pub fn ops_barrier_bridge_machine() -> MachineSchema {
         inputs: EnumSchema {
             name: "OpsBarrierBridgeInput".into(),
             variants: vec![VariantSchema {
-                name: "OpsBarrierSatisfied".into(),
+                name: EnumVariantId::parse("OpsBarrierSatisfied").expect("valid variant slug"),
                 fields: vec![
                     FieldSchema {
-                        name: "wait_request_id".into(),
-                        ty: TypeRef::Named("WaitRequestId".into()),
+                name: FieldId::parse("wait_request_id").expect("valid field slug"),
+                        ty: TypeRef::Named(NamedTypeId::parse("WaitRequestId").expect("valid named-type slug")),
                     },
                     FieldSchema {
-                        name: "operation_ids".into(),
-                        ty: TypeRef::Seq(Box::new(TypeRef::Named("OperationId".into()))),
+                name: FieldId::parse("operation_ids").expect("valid field slug"),
+                        ty: TypeRef::Seq(Box::new(TypeRef::Named(NamedTypeId::parse("OperationId").expect("valid named-type slug")))),
                     },
                 ],
             }],
@@ -67,36 +71,36 @@ pub fn ops_barrier_bridge_machine() -> MachineSchema {
         effects: EnumSchema {
             name: "OpsBarrierBridgeEffect".into(),
             variants: vec![VariantSchema {
-                name: "WaitAllSatisfied".into(),
+                name: EnumVariantId::parse("WaitAllSatisfied").expect("valid variant slug"),
                 fields: vec![
                     FieldSchema {
-                        name: "wait_request_id".into(),
-                        ty: TypeRef::Named("WaitRequestId".into()),
+                name: FieldId::parse("wait_request_id").expect("valid field slug"),
+                        ty: TypeRef::Named(NamedTypeId::parse("WaitRequestId").expect("valid named-type slug")),
                     },
                     FieldSchema {
-                        name: "operation_ids".into(),
-                        ty: TypeRef::Seq(Box::new(TypeRef::Named("OperationId".into()))),
+                name: FieldId::parse("operation_ids").expect("valid field slug"),
+                        ty: TypeRef::Seq(Box::new(TypeRef::Named(NamedTypeId::parse("OperationId").expect("valid named-type slug")))),
                     },
                 ],
             }],
         },
         transitions: vec![],
-        surface_only_inputs: vec!["OpsBarrierSatisfied".into()],
+        surface_only_inputs: vec![InputVariantId::parse("OpsBarrierSatisfied").expect("valid input-variant slug")],
         helpers: vec![],
         derived: vec![],
         invariants: vec![],
         ci_step_limit: None,
         effect_dispositions: vec![EffectDispositionRule {
-            effect_variant: "WaitAllSatisfied".into(),
+            effect_variant: EffectVariantId::parse("WaitAllSatisfied").expect("valid effect-variant slug"),
             disposition: EffectDisposition::External,
-            handoff_protocol: Some("ops_barrier_satisfaction".into()),
+            handoff_protocol: Some(ProtocolId::parse("ops_barrier_satisfaction").expect("valid protocol slug")),
         }],
     }
 }
 
 fn variant(name: &str) -> VariantSchema {
     VariantSchema {
-        name: name.into(),
+        name: EnumVariantId::parse(name).expect("valid variant slug"),
         fields: vec![],
     }
 }

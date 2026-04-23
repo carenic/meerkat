@@ -17,12 +17,16 @@ use crate::{
     EffectDisposition, EffectDispositionRule, EnumSchema, FieldSchema, InitSchema, MachineSchema,
     RustBinding, StateSchema, TypeRef, VariantSchema,
 };
+use crate::identity::{
+    EffectVariantId, EnumTypeId, EnumVariantId, FieldId, InputVariantId, MachineId,
+    NamedTypeId, PhaseId, ProtocolId, TransitionId,
+};
 
 /// Minimal compat machine hosting the surface handoff protocols'
 /// producer annotations.
 pub fn external_tool_surface_bridge_machine() -> MachineSchema {
     MachineSchema {
-        machine: "ExternalToolSurfaceBridgeMachine".into(),
+        machine: MachineId::parse("ExternalToolSurfaceBridgeMachine").expect("valid machine slug"),
         version: 1,
         rust: RustBinding {
             crate_name: "meerkat-mcp".into(),
@@ -35,7 +39,7 @@ pub fn external_tool_surface_bridge_machine() -> MachineSchema {
             },
             fields: vec![],
             init: InitSchema {
-                phase: "Idle".into(),
+            phase: PhaseId::parse("Idle").expect("valid phase slug"),
                 fields: vec![],
             },
             terminal_phases: vec![],
@@ -44,42 +48,42 @@ pub fn external_tool_surface_bridge_machine() -> MachineSchema {
             name: "ExternalToolSurfaceBridgeInput".into(),
             variants: vec![
                 VariantSchema {
-                    name: "SnapshotAligned".into(),
+                name: EnumVariantId::parse("SnapshotAligned").expect("valid variant slug"),
                     fields: vec![FieldSchema {
-                        name: "snapshot_epoch".into(),
+                name: FieldId::parse("snapshot_epoch").expect("valid field slug"),
                         ty: TypeRef::U64,
                     }],
                 },
                 VariantSchema {
-                    name: "PendingSucceeded".into(),
+                name: EnumVariantId::parse("PendingSucceeded").expect("valid variant slug"),
                     fields: vec![
                         FieldSchema {
-                            name: "surface_id".into(),
-                            ty: TypeRef::Named("SurfaceId".into()),
+                name: FieldId::parse("surface_id").expect("valid field slug"),
+                            ty: TypeRef::Named(NamedTypeId::parse("SurfaceId").expect("valid named-type slug")),
                         },
                         FieldSchema {
-                            name: "pending_task_sequence".into(),
+                name: FieldId::parse("pending_task_sequence").expect("valid field slug"),
                             ty: TypeRef::U64,
                         },
                         FieldSchema {
-                            name: "staged_intent_sequence".into(),
+                name: FieldId::parse("staged_intent_sequence").expect("valid field slug"),
                             ty: TypeRef::U64,
                         },
                     ],
                 },
                 VariantSchema {
-                    name: "PendingFailed".into(),
+                name: EnumVariantId::parse("PendingFailed").expect("valid variant slug"),
                     fields: vec![
                         FieldSchema {
-                            name: "surface_id".into(),
-                            ty: TypeRef::Named("SurfaceId".into()),
+                name: FieldId::parse("surface_id").expect("valid field slug"),
+                            ty: TypeRef::Named(NamedTypeId::parse("SurfaceId").expect("valid named-type slug")),
                         },
                         FieldSchema {
-                            name: "pending_task_sequence".into(),
+                name: FieldId::parse("pending_task_sequence").expect("valid field slug"),
                             ty: TypeRef::U64,
                         },
                         FieldSchema {
-                            name: "reason".into(),
+                name: FieldId::parse("reason").expect("valid field slug"),
                             ty: TypeRef::String,
                         },
                     ],
@@ -94,34 +98,34 @@ pub fn external_tool_surface_bridge_machine() -> MachineSchema {
             name: "ExternalToolSurfaceBridgeEffect".into(),
             variants: vec![
                 VariantSchema {
-                    name: "RefreshVisibleSurfaceSet".into(),
+                name: EnumVariantId::parse("RefreshVisibleSurfaceSet").expect("valid variant slug"),
                     fields: vec![FieldSchema {
-                        name: "snapshot_epoch".into(),
+                name: FieldId::parse("snapshot_epoch").expect("valid field slug"),
                         ty: TypeRef::U64,
                     }],
                 },
                 VariantSchema {
-                    name: "ScheduleSurfaceCompletion".into(),
+                name: EnumVariantId::parse("ScheduleSurfaceCompletion").expect("valid variant slug"),
                     fields: vec![
                         FieldSchema {
-                            name: "surface_id".into(),
-                            ty: TypeRef::Named("SurfaceId".into()),
+                name: FieldId::parse("surface_id").expect("valid field slug"),
+                            ty: TypeRef::Named(NamedTypeId::parse("SurfaceId").expect("valid named-type slug")),
                         },
                         FieldSchema {
-                            name: "operation".into(),
-                            ty: TypeRef::Named("SurfaceDeltaOperation".into()),
+                name: FieldId::parse("operation").expect("valid field slug"),
+                            ty: TypeRef::Named(NamedTypeId::parse("SurfaceDeltaOperation").expect("valid named-type slug")),
                         },
                         FieldSchema {
-                            name: "pending_task_sequence".into(),
+                name: FieldId::parse("pending_task_sequence").expect("valid field slug"),
                             ty: TypeRef::U64,
                         },
                         FieldSchema {
-                            name: "staged_intent_sequence".into(),
+                name: FieldId::parse("staged_intent_sequence").expect("valid field slug"),
                             ty: TypeRef::U64,
                         },
                         FieldSchema {
-                            name: "applied_at_turn".into(),
-                            ty: TypeRef::Named("TurnNumber".into()),
+                name: FieldId::parse("applied_at_turn").expect("valid field slug"),
+                            ty: TypeRef::Named(NamedTypeId::parse("TurnNumber").expect("valid named-type slug")),
                         },
                     ],
                 },
@@ -129,9 +133,9 @@ pub fn external_tool_surface_bridge_machine() -> MachineSchema {
         },
         transitions: vec![],
         surface_only_inputs: vec![
-            "SnapshotAligned".into(),
-            "PendingSucceeded".into(),
-            "PendingFailed".into(),
+            InputVariantId::parse("SnapshotAligned").expect("valid input-variant slug"),
+            InputVariantId::parse("PendingSucceeded").expect("valid input-variant slug"),
+            InputVariantId::parse("PendingFailed").expect("valid input-variant slug"),
         ],
         helpers: vec![],
         derived: vec![],
@@ -139,14 +143,14 @@ pub fn external_tool_surface_bridge_machine() -> MachineSchema {
         ci_step_limit: None,
         effect_dispositions: vec![
             EffectDispositionRule {
-                effect_variant: "RefreshVisibleSurfaceSet".into(),
+                effect_variant: EffectVariantId::parse("RefreshVisibleSurfaceSet").expect("valid effect-variant slug"),
                 disposition: EffectDisposition::External,
-                handoff_protocol: Some("surface_snapshot_alignment".into()),
+                handoff_protocol: Some(ProtocolId::parse("surface_snapshot_alignment").expect("valid protocol slug")),
             },
             EffectDispositionRule {
-                effect_variant: "ScheduleSurfaceCompletion".into(),
+                effect_variant: EffectVariantId::parse("ScheduleSurfaceCompletion").expect("valid effect-variant slug"),
                 disposition: EffectDisposition::External,
-                handoff_protocol: Some("surface_completion".into()),
+                handoff_protocol: Some(ProtocolId::parse("surface_completion").expect("valid protocol slug")),
             },
         ],
     }
@@ -154,7 +158,7 @@ pub fn external_tool_surface_bridge_machine() -> MachineSchema {
 
 fn variant(name: &str) -> VariantSchema {
     VariantSchema {
-        name: name.into(),
+        name: EnumVariantId::parse(name).expect("valid variant slug"),
         fields: vec![],
     }
 }
