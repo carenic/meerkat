@@ -442,7 +442,6 @@ pub(crate) fn spawn_runtime_loop_with_completions(
         meerkat_core::lifecycle::run_control::RunControlCommand,
     >,
     completions: Option<crate::meerkat_machine::SharedCompletionRegistry>,
-    detached_wake: Option<std::sync::Arc<crate::detached_wake::DetachedWakeState>>,
     completion_feed: Option<std::sync::Arc<dyn meerkat_core::completion_feed::CompletionFeed>>,
     epoch_cursor_state: Option<std::sync::Arc<meerkat_core::EpochCursorState>>,
     machine_weak: std::sync::Weak<crate::meerkat_machine::MeerkatMachine>,
@@ -480,13 +479,12 @@ pub(crate) fn spawn_runtime_loop_with_completions(
                 .unwrap_or(initial_watermark);
 
         loop {
-            // Build a future for the idle wake. Feed-based if available,
-            // otherwise falls back to DetachedWakeState Notify.
+            // Build a future for the idle wake. Backed by the completion feed
+            // when present; otherwise pends forever (no background ops can
+            // complete without a feed-producing ops registry).
             let idle_wake = async {
                 if let Some(ref feed) = completion_feed {
                     feed.wait_for_advance(observed_seq).await;
-                } else if let Some(ref state) = detached_wake {
-                    state.notify.notified().await;
                 } else {
                     std::future::pending::<()>().await;
                 }
@@ -532,7 +530,6 @@ pub(crate) fn spawn_runtime_loop_with_completions(
                             if maybe_inject_feed_wake(
                                 &driver,
                                 completion_feed.as_deref(),
-                                detached_wake.as_ref(),
                                 &mut observed_seq,
                                 &mut last_injected_seq,
                                 epoch_cursor_state.as_deref(),
@@ -612,28 +609,6 @@ pub(crate) fn spawn_runtime_loop_with_completions(
                                 cs.runtime_observed_seq.store(batch.watermark, std::sync::atomic::Ordering::Release);
                             }
                         }
-                    } else if let Some(ref state) = detached_wake
-                        && state.pending.load(std::sync::atomic::Ordering::Acquire)
-                    {
-                        // Legacy detached wake path (no feed).
-                        let input = crate::input::Input::Continuation(
-                            crate::input::ContinuationInput::detached_background_op_completed(),
-                        );
-                        let mut d = driver.lock().await;
-                        if d.as_driver_mut().accept_input(input).await.is_ok() {
-                            clear_legacy_detached_wake_signal(state);
-                        }
-                        drop(d);
-                        if process_queue(
-                            &driver,
-                            &mut *executor,
-                            &mut control_rx,
-                            completions.as_ref(),
-                        &machine_weak, &session_id,)
-                        .await
-                        {
-                            break;
-                        }
                     }
                 }
             }
@@ -651,96 +626,61 @@ pub(crate) fn spawn_runtime_loop_with_completions(
 ///
 /// Called after queue processing completes (session has returned to idle).
 /// Returns `true` if a continuation was injected (caller should process_queue).
-/// Supports both feed-based (new) and DetachedWakeState (legacy) paths.
 async fn maybe_inject_feed_wake(
     driver: &crate::meerkat_machine::SharedDriver,
     feed: Option<&dyn meerkat_core::completion_feed::CompletionFeed>,
-    wake_state: Option<&std::sync::Arc<crate::detached_wake::DetachedWakeState>>,
     observed_seq: &mut meerkat_core::completion_feed::CompletionSeq,
     last_injected_seq: &mut meerkat_core::completion_feed::CompletionSeq,
     epoch_cursor_state: Option<&meerkat_core::EpochCursorState>,
 ) -> bool {
-    if let Some(feed) = feed {
-        let batch = feed.list_since(*observed_seq);
+    let Some(feed) = feed else {
+        return false;
+    };
+    let batch = feed.list_since(*observed_seq);
 
-        let has_new_bg_completion = batch.entries.iter().any(|e| {
-            e.kind == meerkat_core::ops_lifecycle::OperationKind::BackgroundToolOp
-                && e.seq > *last_injected_seq
-        });
+    let has_new_bg_completion = batch.entries.iter().any(|e| {
+        e.kind == meerkat_core::ops_lifecycle::OperationKind::BackgroundToolOp
+            && e.seq > *last_injected_seq
+    });
 
-        if !has_new_bg_completion {
-            // No new BG completions — advance to prevent hot-spin
-            // on non-BG entries (MobMemberChild, etc.).
-            *observed_seq = batch.watermark;
-            if let Some(cs) = epoch_cursor_state {
-                cs.runtime_observed_seq
-                    .store(batch.watermark, std::sync::atomic::Ordering::Release);
-            }
-            return false;
-        }
-
-        // Verify quiescence before injecting.
-        let d = driver.lock().await;
-        if !d.is_quiescent_for_detached_wake() {
-            // Non-quiescent: do NOT advance observed_seq. The completion
-            // stays visible for the next wake so it's not permanently lost.
-            return false;
-        }
-        drop(d);
-
-        let input = crate::input::Input::Continuation(
-            crate::input::ContinuationInput::detached_background_op_completed(),
-        );
-        let mut d = driver.lock().await;
-        if d.as_driver_mut().accept_input(input).await.is_ok() {
-            *last_injected_seq = batch.watermark;
-            if let Some(cs) = epoch_cursor_state {
-                cs.runtime_last_injected_seq
-                    .store(batch.watermark, std::sync::atomic::Ordering::Release);
-            }
-        }
-        // Advance cursor after injection attempt (quiescent path).
+    if !has_new_bg_completion {
+        // No new BG completions — advance to prevent hot-spin
+        // on non-BG entries (MobMemberChild, etc.).
         *observed_seq = batch.watermark;
         if let Some(cs) = epoch_cursor_state {
             cs.runtime_observed_seq
                 .store(batch.watermark, std::sync::atomic::Ordering::Release);
         }
-        true
-    } else {
-        // Legacy DetachedWakeState path
-        let Some(state) = wake_state else {
-            return false;
-        };
-
-        if !state.pending.load(std::sync::atomic::Ordering::Acquire) {
-            return false;
-        }
-        if state.signaled.load(std::sync::atomic::Ordering::Acquire) {
-            return false;
-        }
-
-        let d = driver.lock().await;
-        if !d.is_quiescent_for_detached_wake() {
-            return false;
-        }
-        drop(d);
-
-        // Legacy path: fire notify to wake the idle arm on next iteration.
-        state
-            .signaled
-            .store(true, std::sync::atomic::Ordering::Release);
-        state.notify.notify_one();
-        false // Legacy path doesn't inject inline — idle arm handles it
+        return false;
     }
-}
 
-fn clear_legacy_detached_wake_signal(state: &crate::detached_wake::DetachedWakeState) {
-    state
-        .pending
-        .store(false, std::sync::atomic::Ordering::Release);
-    state
-        .signaled
-        .store(false, std::sync::atomic::Ordering::Release);
+    // Verify quiescence before injecting.
+    let d = driver.lock().await;
+    if !d.is_quiescent_for_detached_wake() {
+        // Non-quiescent: do NOT advance observed_seq. The completion
+        // stays visible for the next wake so it's not permanently lost.
+        return false;
+    }
+    drop(d);
+
+    let input = crate::input::Input::Continuation(
+        crate::input::ContinuationInput::detached_background_op_completed(),
+    );
+    let mut d = driver.lock().await;
+    if d.as_driver_mut().accept_input(input).await.is_ok() {
+        *last_injected_seq = batch.watermark;
+        if let Some(cs) = epoch_cursor_state {
+            cs.runtime_last_injected_seq
+                .store(batch.watermark, std::sync::atomic::Ordering::Release);
+        }
+    }
+    // Advance cursor after injection attempt (quiescent path).
+    *observed_seq = batch.watermark;
+    if let Some(cs) = epoch_cursor_state {
+        cs.runtime_observed_seq
+            .store(batch.watermark, std::sync::atomic::Ordering::Release);
+    }
+    true
 }
 
 /// Process all queued inputs until the queue is empty.
@@ -1740,22 +1680,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn clear_legacy_detached_wake_signal_resets_pending_and_signaled() {
-        let state = crate::detached_wake::DetachedWakeState::new();
-        state
-            .pending
-            .store(true, std::sync::atomic::Ordering::Release);
-        state
-            .signaled
-            .store(true, std::sync::atomic::Ordering::Release);
-
-        clear_legacy_detached_wake_signal(&state);
-
-        assert!(!state.pending.load(std::sync::atomic::Ordering::Acquire));
-        assert!(!state.signaled.load(std::sync::atomic::Ordering::Acquire));
-    }
-
     #[tokio::test]
     async fn maybe_inject_feed_wake_feed_path_injects_inline_continuation_when_quiescent() {
         let driver = make_shared_ephemeral_driver("feed-inline");
@@ -1776,7 +1700,6 @@ mod tests {
         let injected = maybe_inject_feed_wake(
             &driver,
             Some(feed.as_ref()),
-            None,
             &mut observed_seq,
             &mut last_injected_seq,
             None,
@@ -1808,40 +1731,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maybe_inject_feed_wake_legacy_path_sets_signaled_without_inline_injection() {
-        let driver = make_shared_ephemeral_driver("legacy-signal");
-        let state = Arc::new(crate::detached_wake::DetachedWakeState::new());
-        state
-            .pending
-            .store(true, std::sync::atomic::Ordering::Release);
-
+    async fn maybe_inject_feed_wake_without_feed_is_noop() {
+        let driver = make_shared_ephemeral_driver("no-feed");
         let mut observed_seq = 0;
         let mut last_injected_seq = 0;
 
         let injected = maybe_inject_feed_wake(
             &driver,
             None,
-            Some(&state),
             &mut observed_seq,
             &mut last_injected_seq,
             None,
         )
         .await;
 
-        assert!(
-            !injected,
-            "legacy detached wake should only signal the idle arm, not inject inline"
-        );
-        assert!(state.pending.load(std::sync::atomic::Ordering::Acquire));
-        assert!(state.signaled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!injected, "no feed means no injection");
         assert_eq!(observed_seq, 0);
         assert_eq!(last_injected_seq, 0);
 
         let guard = driver.lock().await;
         assert!(
             guard.as_driver().active_input_ids().is_empty(),
-            "legacy signaling path should not enqueue a continuation inline"
+            "no feed must not enqueue anything"
         );
+    }
+
+    #[tokio::test]
+    async fn maybe_inject_feed_wake_no_bg_completions_advances_observed_seq() {
+        let driver = make_shared_ephemeral_driver("advance-only");
+        let registry = crate::ops_lifecycle::RuntimeOpsLifecycleRegistry::new();
+        let feed = registry.completion_feed_handle();
+        let mut observed_seq = 0;
+        let mut last_injected_seq = 0;
+
+        let injected = maybe_inject_feed_wake(
+            &driver,
+            Some(feed.as_ref()),
+            &mut observed_seq,
+            &mut last_injected_seq,
+            None,
+        )
+        .await;
+
+        assert!(!injected, "empty feed should not inject");
+        assert_eq!(observed_seq, feed.watermark());
+        assert_eq!(last_injected_seq, 0);
+
+        let guard = driver.lock().await;
+        assert!(guard.as_driver().active_input_ids().is_empty());
     }
 
     // --- execution_kind stamping tests ---

@@ -50,7 +50,6 @@ impl MeerkatMachine {
             current_capability_surface: None,
             capability_surface_status: SessionLlmCapabilitySurfaceStatus::Unresolved,
             phase: RegistrationPhase::Queuing,
-            detached_wake: None,
             dsl_authority,
             drain_slot: CommsDrainSlot::new(),
         };
@@ -232,7 +231,6 @@ impl MeerkatMachine {
                             capability_surface_status:
                                 SessionLlmCapabilitySurfaceStatus::Unresolved,
                             phase: RegistrationPhase::Queuing,
-                            detached_wake: None,
                             dsl_authority,
                             drain_slot: CommsDrainSlot::new(),
                         },
@@ -285,13 +283,6 @@ impl MeerkatMachine {
             }
             !driver_guard.as_driver().active_input_ids().is_empty()
         };
-
-        // Wire detached-op wake state: the ops lifecycle registry will set
-        // `pending = true` and fire `notify` when a BackgroundToolOp reaches
-        // terminal. The waker task (spawned after attachment below) then injects
-        // a continuation through the canonical ingress seam.
-        let detached_wake_state = Arc::new(crate::detached_wake::DetachedWakeState::new());
-        ops_lifecycle.set_detached_wake(Arc::clone(&detached_wake_state));
 
         // Wire persistence channel if a durable store is available.
         if let Some(ref store) = self.store {
@@ -349,7 +340,6 @@ impl MeerkatMachine {
                 wake_rx,
                 control_rx,
                 Some(completions.clone()),
-                Some(Arc::clone(&detached_wake_state)),
                 Some(completion_feed),
                 entry_cursor_state,
                 Arc::downgrade(self),
@@ -376,7 +366,6 @@ impl MeerkatMachine {
                         match pending_loop_handle.take() {
                             Some(loop_handle) => {
                                 entry.attach_runtime_loop(wake_tx.clone(), control_tx, loop_handle);
-                                entry.detached_wake = Some(Arc::clone(&detached_wake_state));
                                 (true, false)
                             }
                             None => {
