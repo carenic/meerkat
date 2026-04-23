@@ -32,7 +32,7 @@ pub use runtime_backed::configure_peer_ingress;
 #[cfg(feature = "session-store")]
 pub use runtime_backed::{
     PersistentRuntimeExecutor, SurfaceRuntimeMaterializeError, build_runtime_backed_service,
-    default_persistent_executor, materialize_session, wire_runtime_bindings,
+    default_persistent_executor, materialize_session,
 };
 #[cfg(feature = "session-store")]
 pub use runtime_schedule_host::spawn_runtime_backed_schedule_host;

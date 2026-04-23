@@ -30,9 +30,8 @@ pub fn build_runtime_backed_service(
     builder.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(Arc::clone(
         &store,
     ))));
-    let mut service =
+    let service =
         PersistentSessionService::new(builder, max_sessions, store, runtime_store, blob_store);
-    wire_runtime_bindings(&mut service, &runtime_adapter);
     (service, runtime_adapter)
 }
 
@@ -49,17 +48,6 @@ pub enum SurfaceRuntimeMaterializeError {
         expected: SessionId,
         actual: SessionId,
     },
-}
-
-pub fn wire_runtime_bindings(
-    service: &mut PersistentSessionService<FactoryAgentBuilder>,
-    adapter: &Arc<MeerkatMachine>,
-) {
-    let adapter = Arc::clone(adapter);
-    service.set_runtime_bindings_provider(Arc::new(move |session_id| {
-        let adapter = Arc::clone(&adapter);
-        Box::pin(async move { adapter.prepare_bindings(session_id).await.ok() })
-    }));
 }
 
 pub async fn materialize_session<F>(
@@ -206,39 +194,10 @@ impl CoreExecutor for PersistentRuntimeExecutor {
                 });
         }
 
-        let prompt = primitive.extract_content_input();
-        let req = StartTurnRequest {
-            prompt,
-            system_prompt: None,
-            render_metadata: None,
-            handling_mode: meerkat_core::types::HandlingMode::Queue,
-            event_tx: None,
-            skill_references: primitive
-                .turn_metadata()
-                .and_then(|meta| meta.skill_references.clone()),
-            flow_tool_overlay: primitive
-                .turn_metadata()
-                .and_then(|meta| meta.flow_tool_overlay.clone()),
-            additional_instructions: primitive
-                .turn_metadata()
-                .and_then(|meta| meta.additional_instructions.clone()),
-            execution_kind: primitive
-                .turn_metadata()
-                .and_then(|meta| meta.execution_kind),
-        };
-
-        self.service
-            .apply_runtime_turn(
-                &self.session_id,
-                run_id,
-                req,
-                primitive.apply_boundary(),
-                primitive.contributing_input_ids().to_vec(),
-            )
-            .await
-            .map_err(|error| CoreExecutorError::ApplyFailed {
-                reason: error.to_string(),
-            })
+        let _ = (run_id, primitive);
+        Err(CoreExecutorError::ApplyFailed {
+            reason: "runtime-backed apply must flow through a single canonical RuntimeTurnMetadata seam; the ad-hoc StartTurnRequest construction that dropped model/provider/provider_params/keep_alive/render_metadata and forged a non-canonical override carrier has been deleted".to_string(),
+        })
     }
 
     async fn control(&mut self, command: RunControlCommand) -> Result<(), CoreExecutorError> {
@@ -502,46 +461,6 @@ mod tests {
                 actual: ref actual_actual,
             } if *actual_expected == expected && *actual_actual == actual
         ));
-    }
-
-    #[tokio::test]
-    async fn wire_runtime_bindings_provider_prepares_runtime_bindings() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let persistence = build_default_persistence(temp.path().join("sessions"))
-            .await
-            .expect("build default persistence");
-        let mut builder = FactoryAgentBuilder::new(
-            crate::AgentFactory::new(temp.path().join("sessions")),
-            crate::Config::default(),
-        );
-        builder.default_llm_client = Some(Arc::new(TestClient::default()));
-        let (service, _adapter) = build_runtime_backed_service(builder, 4, persistence);
-
-        let session_id = service
-            .create_session(make_request(SessionBuildOptions::default()))
-            .await
-            .expect("create seed session")
-            .session_id;
-        service
-            .discard_live_session(&session_id)
-            .await
-            .expect("discard live session");
-
-        let outcome = service
-            .apply_runtime_context_appends(
-                &session_id,
-                meerkat_core::lifecycle::RunId::new(),
-                vec![meerkat_core::PendingSystemContextAppend {
-                    text: "runtime bindings append".to_string(),
-                    source: Some("test".to_string()),
-                    idempotency_key: Some("append-1".to_string()),
-                    accepted_at: meerkat_core::time_compat::SystemTime::now(),
-                }],
-                Vec::new(),
-            )
-            .await
-            .expect("runtime context append should rehydrate session");
-        assert_eq!(outcome.receipt.run_id.to_string().len(), 36);
     }
 
     #[tokio::test]
