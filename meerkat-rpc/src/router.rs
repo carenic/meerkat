@@ -6026,9 +6026,9 @@ mod tests {
         assert_eq!(error_code(&resp), error::INVALID_PARAMS);
     }
 
-    /// 8e. Unknown aliases fail deterministically with configured registry.
+    /// 8e. Retired legacy alias ingress is ignored even when a registry exists.
     #[tokio::test]
-    async fn session_create_rejects_unknown_alias_with_registry() {
+    async fn session_create_ignores_legacy_skill_references_with_registry() {
         let (router, _notif_rx) = test_router_with_registry(alias_registry()).await;
         let req = make_request(
             "session/create",
@@ -6039,7 +6039,8 @@ mod tests {
         );
 
         let resp = router.dispatch(req).await.unwrap();
-        assert_eq!(error_code(&resp), error::INVALID_PARAMS);
+        let result = result_value(&resp);
+        assert!(result["session_id"].as_str().is_some());
     }
 
     /// 9. `turn/interrupt` on an idle session returns ok.
@@ -6191,20 +6192,24 @@ mod tests {
         assert_eq!(final_config["config"]["max_tokens"], new_max_tokens);
     }
 
-    /// 12b. `config/patch` refreshes runtime identity registry used by session handlers.
+    /// 12b. `config/patch` does not re-enable retired legacy skill alias ingress.
     #[tokio::test]
-    async fn config_patch_refreshes_identity_registry_for_alias_resolution() {
+    async fn config_patch_keeps_legacy_skill_references_ignored() {
         let (router, _notif_rx) = test_router().await;
 
-        let fail_before = make_request(
+        let ignored_before = make_request(
             "session/create",
             serde_json::json!({
                 "prompt": "hello",
                 "skill_references": ["legacy/email"]
             }),
         );
-        let fail_before_resp = router.dispatch(fail_before).await.unwrap();
-        assert_eq!(error_code(&fail_before_resp), error::INVALID_PARAMS);
+        let ignored_before_resp = router.dispatch(ignored_before).await.unwrap();
+        assert!(
+            result_value(&ignored_before_resp)["session_id"]
+                .as_str()
+                .is_some()
+        );
 
         let set_req = make_request(
             "config/patch",
@@ -6245,15 +6250,15 @@ mod tests {
             set_resp.error
         );
 
-        let success_after = make_request(
+        let ignored_after = make_request(
             "session/create",
             serde_json::json!({
                 "prompt": "hello",
                 "skill_references": ["legacy/email"]
             }),
         );
-        let success_after_resp = router.dispatch(success_after).await.unwrap();
-        let result = result_value(&success_after_resp);
+        let ignored_after_resp = router.dispatch(ignored_after).await.unwrap();
+        let result = result_value(&ignored_after_resp);
         assert!(result["session_id"].as_str().is_some());
     }
 
