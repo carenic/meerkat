@@ -255,6 +255,12 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
 
     if options.runtime_available {
         methods.extend([
+            RpcMethodDescriptor::basic("session/status", "Get a session's current runtime state"),
+            RpcMethodDescriptor::basic("session/submit", "Accept a runtime input for a session"),
+            RpcMethodDescriptor::basic("session/retire", "Retire a session runtime"),
+            RpcMethodDescriptor::basic("session/reset", "Reset a session runtime"),
+            RpcMethodDescriptor::basic("session/submission", "Get a runtime input state"),
+            RpcMethodDescriptor::basic("session/submissions", "List active runtime inputs"),
             RpcMethodDescriptor::typed(
                 "realtime/open_info",
                 "Get bootstrap metadata for opening a realtime channel",

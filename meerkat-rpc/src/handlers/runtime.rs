@@ -8,8 +8,9 @@ use meerkat_contracts::{
     RuntimeRealtimeAttachmentStatusResult, WireInputLifecycleState, WireInputState,
     WireInputStateHistoryEntry, WireRealtimeAttachmentStatus, wire::runtime::WireInputPolicy,
 };
-use meerkat_core::SessionId;
+use meerkat_core::{InputId, SessionId};
 use meerkat_runtime::service_ext::SessionServiceRuntimeExt;
+use uuid::Uuid;
 
 use super::{RpcResponseExt, parse_params};
 use crate::protocol::{RpcId, RpcResponse};
@@ -58,7 +59,24 @@ fn to_wire_input_lifecycle_state(
     })
 }
 
-fn to_wire_input_state(
+pub(crate) fn to_wire_runtime_state(
+    state: meerkat_runtime::RuntimeState,
+) -> meerkat_contracts::WireRuntimeState {
+    match state {
+        meerkat_runtime::RuntimeState::Initializing => {
+            meerkat_contracts::WireRuntimeState::Initializing
+        }
+        meerkat_runtime::RuntimeState::Idle => meerkat_contracts::WireRuntimeState::Idle,
+        meerkat_runtime::RuntimeState::Attached => meerkat_contracts::WireRuntimeState::Attached,
+        meerkat_runtime::RuntimeState::Running => meerkat_contracts::WireRuntimeState::Running,
+        meerkat_runtime::RuntimeState::Retired => meerkat_contracts::WireRuntimeState::Retired,
+        meerkat_runtime::RuntimeState::Stopped => meerkat_contracts::WireRuntimeState::Stopped,
+        meerkat_runtime::RuntimeState::Destroyed => meerkat_contracts::WireRuntimeState::Destroyed,
+        _ => meerkat_contracts::WireRuntimeState::Destroyed,
+    }
+}
+
+pub(crate) fn to_wire_input_state(
     bundle: meerkat_runtime::input_state::StoredInputState,
 ) -> Result<WireInputState, String> {
     // Wave B: fields that were raw `serde_json::Value` pre-B-9 are now
@@ -164,6 +182,182 @@ pub(crate) fn to_wire_accept_result(
 }
 
 // ---- Handlers ----
+
+pub async fn handle_runtime_status(
+    id: Option<RpcId>,
+    params: Option<&RawValue>,
+    adapter: &dyn SessionServiceRuntimeExt,
+) -> RpcResponse {
+    let params: RuntimeRealtimeAttachmentStatusParams = match parse_params(params) {
+        Ok(p) => p,
+        Err(resp) => return resp.with_id(id),
+    };
+    let session_id = match SessionId::parse(&params.session_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return RpcResponse::error(id, crate::error::INVALID_PARAMS, "Invalid session ID");
+        }
+    };
+
+    match adapter.runtime_state(&session_id).await {
+        Ok(state) => RpcResponse::success(
+            id,
+            serde_json::json!({ "state": to_wire_runtime_state(state) }),
+        ),
+        Err(err) => RpcResponse::error(id, crate::error::INVALID_PARAMS, err.to_string()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimeSubmitParams {
+    session_id: String,
+    input: meerkat_runtime::Input,
+}
+
+pub async fn handle_runtime_submit(
+    id: Option<RpcId>,
+    params: Option<&RawValue>,
+    adapter: &dyn SessionServiceRuntimeExt,
+) -> RpcResponse {
+    let params: RuntimeSubmitParams = match parse_params(params) {
+        Ok(p) => p,
+        Err(resp) => return resp.with_id(id),
+    };
+    let session_id = match SessionId::parse(&params.session_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return RpcResponse::error(id, crate::error::INVALID_PARAMS, "Invalid session ID");
+        }
+    };
+
+    match adapter.accept_input(&session_id, params.input).await {
+        Ok(outcome) => match to_wire_accept_result(outcome) {
+            Ok(result) => RpcResponse::success(id, result),
+            Err(err) => RpcResponse::error(id, crate::error::INTERNAL_ERROR, err),
+        },
+        Err(err) => RpcResponse::error(id, crate::error::INVALID_PARAMS, err.to_string()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimeSubmissionParams {
+    session_id: String,
+    input_id: String,
+}
+
+pub async fn handle_runtime_submission(
+    id: Option<RpcId>,
+    params: Option<&RawValue>,
+    adapter: &dyn SessionServiceRuntimeExt,
+) -> RpcResponse {
+    let params: RuntimeSubmissionParams = match parse_params(params) {
+        Ok(p) => p,
+        Err(resp) => return resp.with_id(id),
+    };
+    let session_id = match SessionId::parse(&params.session_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return RpcResponse::error(id, crate::error::INVALID_PARAMS, "Invalid session ID");
+        }
+    };
+    let input_id = match Uuid::parse_str(&params.input_id) {
+        Ok(id) => InputId::from_uuid(id),
+        Err(err) => {
+            return RpcResponse::error(
+                id,
+                crate::error::INVALID_PARAMS,
+                format!("invalid input_id: {err}"),
+            );
+        }
+    };
+
+    match adapter.input_state(&session_id, &input_id).await {
+        Ok(Some(state)) => match to_wire_input_state(state) {
+            Ok(result) => RpcResponse::success(id, result),
+            Err(err) => RpcResponse::error(id, crate::error::INTERNAL_ERROR, err),
+        },
+        Ok(None) => RpcResponse::error(id, crate::error::INVALID_PARAMS, "input not found"),
+        Err(err) => RpcResponse::error(id, crate::error::INVALID_PARAMS, err.to_string()),
+    }
+}
+
+pub async fn handle_runtime_submissions(
+    id: Option<RpcId>,
+    params: Option<&RawValue>,
+    adapter: &dyn SessionServiceRuntimeExt,
+) -> RpcResponse {
+    let params: RuntimeRealtimeAttachmentStatusParams = match parse_params(params) {
+        Ok(p) => p,
+        Err(resp) => return resp.with_id(id),
+    };
+    let session_id = match SessionId::parse(&params.session_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return RpcResponse::error(id, crate::error::INVALID_PARAMS, "Invalid session ID");
+        }
+    };
+
+    let input_ids = match adapter.list_active_inputs(&session_id).await {
+        Ok(ids) => ids,
+        Err(err) => return RpcResponse::error(id, crate::error::INVALID_PARAMS, err.to_string()),
+    };
+    let mut inputs = Vec::with_capacity(input_ids.len());
+    for input_id in input_ids {
+        match adapter.input_state(&session_id, &input_id).await {
+            Ok(Some(state)) => match to_wire_input_state(state) {
+                Ok(wire) => inputs.push(wire),
+                Err(err) => return RpcResponse::error(id, crate::error::INTERNAL_ERROR, err),
+            },
+            Ok(None) => {}
+            Err(err) => {
+                return RpcResponse::error(id, crate::error::INVALID_PARAMS, err.to_string());
+            }
+        }
+    }
+    RpcResponse::success(id, serde_json::json!({ "inputs": inputs }))
+}
+
+pub async fn handle_runtime_retire(
+    id: Option<RpcId>,
+    params: Option<&RawValue>,
+    adapter: &dyn SessionServiceRuntimeExt,
+) -> RpcResponse {
+    let params: RuntimeRealtimeAttachmentStatusParams = match parse_params(params) {
+        Ok(p) => p,
+        Err(resp) => return resp.with_id(id),
+    };
+    let session_id = match SessionId::parse(&params.session_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return RpcResponse::error(id, crate::error::INVALID_PARAMS, "Invalid session ID");
+        }
+    };
+    match adapter.retire_runtime(&session_id).await {
+        Ok(report) => RpcResponse::success(id, report),
+        Err(err) => RpcResponse::error(id, crate::error::INVALID_PARAMS, err.to_string()),
+    }
+}
+
+pub async fn handle_runtime_reset(
+    id: Option<RpcId>,
+    params: Option<&RawValue>,
+    adapter: &dyn SessionServiceRuntimeExt,
+) -> RpcResponse {
+    let params: RuntimeRealtimeAttachmentStatusParams = match parse_params(params) {
+        Ok(p) => p,
+        Err(resp) => return resp.with_id(id),
+    };
+    let session_id = match SessionId::parse(&params.session_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return RpcResponse::error(id, crate::error::INVALID_PARAMS, "Invalid session ID");
+        }
+    };
+    match adapter.reset_runtime(&session_id).await {
+        Ok(report) => RpcResponse::success(id, report),
+        Err(err) => RpcResponse::error(id, crate::error::INVALID_PARAMS, err.to_string()),
+    }
+}
 
 /// Handle `session/realtime_attachment_status` — get live attachment status for a session.
 pub async fn handle_runtime_realtime_attachment_status(

@@ -1121,6 +1121,11 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}", get(get_session).delete(archive_session))
         .route("/sessions/{id}/history", get(get_session_history))
         .route("/sessions/{id}/interrupt", post(interrupt_session))
+        .route("/sessions/{id}/status", get(get_runtime_status))
+        .route(
+            "/sessions/{id}/realtime-attachment-status",
+            get(get_realtime_attachment_status),
+        )
         .route("/sessions/{id}/system_context", post(append_system_context))
         .route("/sessions/{id}/messages", post(continue_session))
         .route("/sessions/{id}/external-events", post(post_external_event))
@@ -1157,6 +1162,8 @@ pub fn router(state: AppState) -> Router {
         .route("/capabilities", get(get_capabilities))
         .route("/models/catalog", get(get_models_catalog))
         .route("/realtime/status", post(realtime_status))
+        .route("/realtime/capabilities", post(realtime_capabilities))
+        .route("/realtime/open_info", post(realtime_open_info))
         // Phase 4d — auth + realm endpoints.
         .route(
             "/auth/profiles",
@@ -1286,6 +1293,84 @@ fn realtime_status_from_runtime(
     }
 }
 
+fn runtime_state_to_wire(
+    state: meerkat_runtime::RuntimeState,
+) -> meerkat_contracts::WireRuntimeState {
+    match state {
+        meerkat_runtime::RuntimeState::Initializing => {
+            meerkat_contracts::WireRuntimeState::Initializing
+        }
+        meerkat_runtime::RuntimeState::Idle => meerkat_contracts::WireRuntimeState::Idle,
+        meerkat_runtime::RuntimeState::Attached => meerkat_contracts::WireRuntimeState::Attached,
+        meerkat_runtime::RuntimeState::Running => meerkat_contracts::WireRuntimeState::Running,
+        meerkat_runtime::RuntimeState::Retired => meerkat_contracts::WireRuntimeState::Retired,
+        meerkat_runtime::RuntimeState::Stopped => meerkat_contracts::WireRuntimeState::Stopped,
+        meerkat_runtime::RuntimeState::Destroyed => meerkat_contracts::WireRuntimeState::Destroyed,
+        _ => meerkat_contracts::WireRuntimeState::Destroyed,
+    }
+}
+
+async fn get_runtime_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let session_id =
+        resolve_session_id_for_state(&id, &state).map_err(IntoResponse::into_response)?;
+    ensure_rest_session_runtime_executor(&state, &session_id).await;
+    let adapter = get_runtime_adapter(&state);
+    let runtime_state = adapter.runtime_state(&session_id).await.map_err(|err| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response()
+    })?;
+    Ok(Json(json!({
+        "state": runtime_state_to_wire(runtime_state),
+    })))
+}
+
+async fn get_realtime_attachment_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let session_id =
+        resolve_session_id_for_state(&id, &state).map_err(IntoResponse::into_response)?;
+    ensure_rest_session_runtime_executor(&state, &session_id).await;
+    let adapter = get_runtime_adapter(&state);
+    let status = adapter
+        .realtime_attachment_status(&session_id)
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response()
+        })?;
+    let wire = match status {
+        meerkat_runtime::RealtimeAttachmentStatus::Unattached => {
+            meerkat_contracts::WireRealtimeAttachmentStatus::Unattached
+        }
+        meerkat_runtime::RealtimeAttachmentStatus::IntentPresentUnbound => {
+            meerkat_contracts::WireRealtimeAttachmentStatus::IntentPresentUnbound
+        }
+        meerkat_runtime::RealtimeAttachmentStatus::BindingNotReady => {
+            meerkat_contracts::WireRealtimeAttachmentStatus::BindingNotReady
+        }
+        meerkat_runtime::RealtimeAttachmentStatus::BindingReady => {
+            meerkat_contracts::WireRealtimeAttachmentStatus::BindingReady
+        }
+        meerkat_runtime::RealtimeAttachmentStatus::ReplacementPending => {
+            meerkat_contracts::WireRealtimeAttachmentStatus::ReplacementPending
+        }
+        meerkat_runtime::RealtimeAttachmentStatus::ReattachRequired => {
+            meerkat_contracts::WireRealtimeAttachmentStatus::ReattachRequired
+        }
+    };
+    Ok(Json(json!({ "status": wire })))
+}
+
 // `realtime_status_from_mob_serialized` and
 // `ensure_realtime_mob_member_target_available` were removed in Phase
 // 5G/T5i alongside the `RealtimeChannelTarget::MobMemberTarget` variant.
@@ -1298,6 +1383,7 @@ async fn realtime_status(
     // the MobMcpState resolver. SessionTarget parses directly; MobMember
     // reads the canonical binding map on the MobMachine.
     let sid = resolve_realtime_target_session_rest(&state, &body.target).await?;
+    ensure_rest_session_runtime_executor(&state, &sid).await;
     let adapter = get_runtime_adapter(&state);
     let live_status = adapter
         .realtime_attachment_status(&sid)
@@ -1312,6 +1398,125 @@ async fn realtime_status(
     let status = realtime_status_from_runtime(live_status);
 
     Ok(Json(RealtimeStatusResult { status }))
+}
+
+fn conservative_realtime_capabilities() -> RealtimeCapabilities {
+    RealtimeCapabilities {
+        input_kinds: vec![
+            meerkat_contracts::RealtimeInputKind::Text,
+            meerkat_contracts::RealtimeInputKind::Audio,
+        ],
+        output_kinds: vec![
+            meerkat_contracts::RealtimeOutputKind::Text,
+            meerkat_contracts::RealtimeOutputKind::Audio,
+        ],
+        turning_modes: vec![meerkat_contracts::RealtimeTurningMode::ProviderManaged],
+        interrupt_supported: true,
+        transcript_supported: true,
+        tool_lifecycle_events_supported: false,
+        video_supported: false,
+        audio_input_format: None,
+        audio_output_format: None,
+    }
+}
+
+async fn realtime_capabilities(
+    State(state): State<AppState>,
+    Json(body): Json<RealtimeCapabilitiesParams>,
+) -> Result<Json<RealtimeCapabilitiesResult>, Response> {
+    let sid = resolve_realtime_target_session_rest(&state, &body.target).await?;
+    ensure_rest_session_runtime_executor(&state, &sid).await;
+    let adapter = get_runtime_adapter(&state);
+    adapter
+        .realtime_attachment_status(&sid)
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response()
+        })?;
+    Ok(Json(RealtimeCapabilitiesResult {
+        capabilities: conservative_realtime_capabilities(),
+    }))
+}
+
+async fn realtime_open_info(
+    State(state): State<AppState>,
+    Json(body): Json<RealtimeOpenRequest>,
+) -> Result<Json<Value>, Response> {
+    let sid = resolve_realtime_target_session_rest(&state, &body.target).await?;
+    ensure_rest_session_runtime_executor(&state, &sid).await;
+    let adapter = get_runtime_adapter(&state);
+    adapter
+        .realtime_attachment_status(&sid)
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response()
+        })?;
+
+    let Some(addr) = state.realtime_rpc_tcp_addr.as_deref() else {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "error": "realtime/open_info is unavailable until the realtime websocket host ships"
+            })),
+        )
+            .into_response());
+    };
+
+    let mut stream = TcpStream::connect(addr).await.map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("realtime rpc connection failed: {err}")})),
+        )
+            .into_response()
+    })?;
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "realtime/open_info",
+        "params": body,
+    });
+    stream
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("realtime rpc write failed: {err}")})),
+            )
+                .into_response()
+        })?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("realtime rpc read failed: {err}")})),
+        )
+            .into_response()
+    })?;
+    let response: Value = serde_json::from_str(&line).map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("realtime rpc response was invalid: {err}")})),
+        )
+            .into_response()
+    })?;
+    if !response.get("error").is_none_or(serde_json::Value::is_null) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": response["error"].clone()})),
+        )
+            .into_response());
+    }
+    Ok(Json(response["result"].clone()))
 }
 
 /// W3-H: resolve a `RealtimeChannelTarget` to a `SessionId` inside a REST

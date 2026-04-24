@@ -1193,6 +1193,114 @@ impl MethodRouter {
                 .await
             }
             #[cfg(not(feature = "mini-surface"))]
+            "session/status" => {
+                if self.runtime_adapter.runtime_mode() != meerkat_runtime::RuntimeMode::V9Compliant
+                {
+                    RpcResponse::error(
+                        id,
+                        error::METHOD_NOT_FOUND,
+                        "Method not found: session/status",
+                    )
+                } else {
+                    let session_id = match self.session_id_from_runtime_params(id.clone(), params) {
+                        Ok(session_id) => session_id,
+                        Err(response) => return Some(response),
+                    };
+                    if let Err(response) = self.ensure_runtime_session_registered(&session_id).await
+                    {
+                        return Some(response.with_id(id));
+                    }
+                    handlers::runtime::handle_runtime_status(
+                        id,
+                        params,
+                        self.runtime_adapter.as_ref(),
+                    )
+                    .await
+                }
+            }
+            #[cfg(not(feature = "mini-surface"))]
+            "session/submit" => {
+                if self.runtime_adapter.runtime_mode() != meerkat_runtime::RuntimeMode::V9Compliant
+                {
+                    RpcResponse::error(
+                        id,
+                        error::METHOD_NOT_FOUND,
+                        "Method not found: session/submit",
+                    )
+                } else {
+                    let session_id = match self.session_id_from_runtime_params(id.clone(), params) {
+                        Ok(session_id) => session_id,
+                        Err(response) => return Some(response),
+                    };
+                    if let Err(response) = self.ensure_runtime_session_registered(&session_id).await
+                    {
+                        return Some(response.with_id(id));
+                    }
+                    handlers::runtime::handle_runtime_submit(
+                        id,
+                        params,
+                        self.runtime_adapter.as_ref(),
+                    )
+                    .await
+                }
+            }
+            #[cfg(not(feature = "mini-surface"))]
+            "session/submission" => {
+                let session_id = match self.session_id_from_runtime_params(id.clone(), params) {
+                    Ok(session_id) => session_id,
+                    Err(response) => return Some(response),
+                };
+                if let Err(response) = self.ensure_runtime_session_registered(&session_id).await {
+                    return Some(response.with_id(id));
+                }
+                handlers::runtime::handle_runtime_submission(
+                    id,
+                    params,
+                    self.runtime_adapter.as_ref(),
+                )
+                .await
+            }
+            #[cfg(not(feature = "mini-surface"))]
+            "session/submissions" => {
+                let session_id = match self.session_id_from_runtime_params(id.clone(), params) {
+                    Ok(session_id) => session_id,
+                    Err(response) => return Some(response),
+                };
+                if let Err(response) = self.ensure_runtime_session_registered(&session_id).await {
+                    return Some(response.with_id(id));
+                }
+                handlers::runtime::handle_runtime_submissions(
+                    id,
+                    params,
+                    self.runtime_adapter.as_ref(),
+                )
+                .await
+            }
+            #[cfg(not(feature = "mini-surface"))]
+            "session/retire" => {
+                let session_id = match self.session_id_from_runtime_params(id.clone(), params) {
+                    Ok(session_id) => session_id,
+                    Err(response) => return Some(response),
+                };
+                if let Err(response) = self.ensure_runtime_session_registered(&session_id).await {
+                    return Some(response.with_id(id));
+                }
+                handlers::runtime::handle_runtime_retire(id, params, self.runtime_adapter.as_ref())
+                    .await
+            }
+            #[cfg(not(feature = "mini-surface"))]
+            "session/reset" => {
+                let session_id = match self.session_id_from_runtime_params(id.clone(), params) {
+                    Ok(session_id) => session_id,
+                    Err(response) => return Some(response),
+                };
+                if let Err(response) = self.ensure_runtime_session_registered(&session_id).await {
+                    return Some(response.with_id(id));
+                }
+                handlers::runtime::handle_runtime_reset(id, params, self.runtime_adapter.as_ref())
+                    .await
+            }
+            #[cfg(not(feature = "mini-surface"))]
             "realtime/open_info" => {
                 if self.runtime_adapter.runtime_mode() != meerkat_runtime::RuntimeMode::V9Compliant
                 {
