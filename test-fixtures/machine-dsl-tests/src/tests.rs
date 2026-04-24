@@ -1057,7 +1057,14 @@ mod order_lifecycle {
 
     #[test]
     fn schema_is_valid() {
-        let schema = OrderLifecycleState::schema();
+        // Order-lifecycle is an in-module test fixture (not catalogued in
+        // `meerkat-machine-schema/src/catalog/dsl/mod.rs`). Its only
+        // named-type reference is the `OrderPhase` enum it declares
+        // locally. B-4 (`c0cb12071`) made `named_types` validation-gated;
+        // populate inline.
+        use meerkat_machine_schema::identity::NamedTypeBinding;
+        let mut schema = OrderLifecycleState::schema();
+        schema.named_types = vec![NamedTypeBinding::string("OrderPhase")];
         schema
             .validate()
             .expect("order lifecycle schema should be valid");

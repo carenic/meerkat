@@ -1176,7 +1176,22 @@ mod tests {
 
     #[test]
     fn schema_validates() {
-        let schema = MobMachineState::schema();
+        // B-4 (`c0cb12071`): every `TypeRef::Named(...)` in the schema must
+        // have a matching entry in `MachineSchema.named_types`. The DSL
+        // macro emits `named_types: vec![]`; production catalogs populate
+        // them via `catalog::dsl::mod::with_named_types`. This test-fixture
+        // mirrors the mob-machine catalog binding set from
+        // `meerkat-machine-schema/src/catalog/dsl/mod.rs::dsl_mob_machine`.
+        use meerkat_machine_schema::identity::NamedTypeBinding;
+        let mut schema = MobMachineState::schema();
+        schema.named_types = vec![
+            NamedTypeBinding::u64("FenceToken"),
+            NamedTypeBinding::u64("Generation"),
+            NamedTypeBinding::string("AgentIdentity"),
+            NamedTypeBinding::string("AgentRuntimeId"),
+            NamedTypeBinding::string("MobPhase"),
+            NamedTypeBinding::string("WorkId"),
+        ];
         schema
             .validate()
             .expect("mob machine schema should validate");

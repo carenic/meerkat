@@ -1536,7 +1536,45 @@ mod tests {
 
     #[test]
     fn schema_validates() {
-        let schema = MeerkatMachineState::schema();
+        // Mirror the meerkat-machine catalog binding set from
+        // `meerkat-machine-schema/src/catalog/dsl/mod.rs::dsl_meerkat_machine`.
+        // B-4 (`c0cb12071`) made `MachineSchema.named_types` validation-
+        // gated; catalogs populate via `with_named_types`, DSL macro
+        // emits `vec![]`, so the test fixture must populate inline.
+        use meerkat_machine_schema::identity::NamedTypeBinding;
+        let mut schema = MeerkatMachineState::schema();
+        schema.named_types = vec![
+            NamedTypeBinding::u64("BoundarySequence"),
+            NamedTypeBinding::u64("FenceToken"),
+            NamedTypeBinding::u64("Generation"),
+            NamedTypeBinding::string("AgentRuntimeId"),
+            NamedTypeBinding::string("CommsRuntimeId"),
+            NamedTypeBinding::string("InputId"),
+            NamedTypeBinding::string("McpServerId"),
+            NamedTypeBinding::string("MeerkatPhase"),
+            NamedTypeBinding::string("MobId"),
+            NamedTypeBinding::string("OperationId"),
+            NamedTypeBinding::string("OperationKind"),
+            NamedTypeBinding::string("PeerCorrelationId"),
+            NamedTypeBinding::string("RunId"),
+            NamedTypeBinding::string("SessionId"),
+            NamedTypeBinding::string("SessionLlmCapabilitySurface"),
+            NamedTypeBinding::string("SessionLlmCapabilitySurfaceStatus"),
+            NamedTypeBinding::string("SessionLlmIdentity"),
+            NamedTypeBinding::string("SessionToolVisibilityDelta"),
+            NamedTypeBinding::string("SessionToolVisibilityState"),
+            NamedTypeBinding::string("ToolFilter"),
+            NamedTypeBinding::string("ToolVisibilityWitness"),
+            NamedTypeBinding::string("WorkId"),
+            // PeerEndpoint etc. are type_path bindings in the catalog;
+            // for this test-fixture lib-scope validation, string is
+            // sufficient (validation checks binding existence, not the
+            // Rust-atom shape).
+            NamedTypeBinding::string("PeerEndpoint"),
+            NamedTypeBinding::string("PeerName"),
+            NamedTypeBinding::string("PeerId"),
+            NamedTypeBinding::string("PeerAddress"),
+        ];
         schema
             .validate()
             .expect("meerkat machine schema should validate");

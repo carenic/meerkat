@@ -481,7 +481,19 @@ mod tests {
 
     #[test]
     fn schema_validates() {
-        let schema = OccurrenceLifecycleMachineState::schema();
+        // Mirror the occurrence-lifecycle catalog binding set from
+        // `meerkat-machine-schema/src/catalog/dsl/mod.rs::dsl_occurrence_lifecycle_machine`.
+        // B-4 (`c0cb12071`) made `named_types` validation-gated; DSL macro
+        // emits `vec![]`.
+        use meerkat_machine_schema::identity::NamedTypeBinding;
+        let mut schema = OccurrenceLifecycleMachineState::schema();
+        schema.named_types = vec![
+            NamedTypeBinding::string("ClaimToken"),
+            NamedTypeBinding::string("DeliveryReceipt"),
+            NamedTypeBinding::string("OccurrenceId"),
+            NamedTypeBinding::string("OccurrenceLifecycleState"),
+            NamedTypeBinding::string("ScheduleId"),
+        ];
         schema
             .validate()
             .expect("occurrence lifecycle schema should validate");
