@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meerkat_core::agent::CommsRuntime;
-use meerkat_core::comms::{CommsCommand, PeerName, TrustedPeerDescriptor};
+use meerkat_core::comms::{CommsCommand, PeerId, PeerName, TrustedPeerDescriptor};
 use meerkat_core::event::AgentEvent;
 use meerkat_core::interaction::{InteractionContent, PeerInputCandidate, PeerInputClass};
 use meerkat_core::lifecycle::RunControlCommand;
@@ -1724,6 +1724,21 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use uuid::Uuid;
 
+    // Post-#24 `PeerId` is a typed UUID and `PeerId::parse` rejects the
+    // legacy `ed25519:<alias>` form. Tests in this module previously fed
+    // hardcoded `PEER_ID_RECEIVER` / `PEER_ID_SUPERVISOR` literals
+    // into `BridgePeerSpec.peer_id` / `BootstrapRuntime.peer_id` /
+    // `TrustedPeerDescriptor::test_only_unsigned(...)`; downstream
+    // `PeerId::parse` rejected. These stable UUID-string constants
+    // substitute for the aliases so sender-vs-receiver comparisons still
+    // match (same string across sites) while the string is a valid UUID.
+    // Chosen pattern: zero-padded hex `-` UUIDs with an alias hint in the
+    // last hex group so commit diffs stay readable.
+    const PEER_ID_RECEIVER: &str = "00000000-0000-0000-0000-00000000aaaa"; // "receiver"
+    const PEER_ID_SUPERVISOR: &str = "00000000-0000-0000-0000-00000000bbbb"; // "supervisor"
+    const PEER_ID_CURRENT_SUPERVISOR: &str = "00000000-0000-0000-0000-00000000cccc"; // "current-supervisor"
+    const PEER_ID_OLD_SUPERVISOR: &str = "00000000-0000-0000-0000-00000000dddd"; // "old-supervisor"
+
     struct BootstrapRuntime {
         peer_id: String,
         address: String,
@@ -1930,13 +1945,13 @@ mod tests {
     #[test]
     fn validate_bind_request_rejects_missing_or_wrong_bootstrap_token() {
         let runtime: Arc<dyn CommsRuntime> = Arc::new(bootstrap_runtime(
-            "ed25519:receiver",
+            PEER_ID_RECEIVER,
             "inproc://receiver",
             Some("expected-token"),
         ));
         let supervisor = BridgePeerSpec {
             name: "mob/__mob_supervisor__".to_string(),
-            peer_id: "ed25519:supervisor".to_string(),
+            peer_id: PEER_ID_SUPERVISOR.to_string(),
             address: "inproc://mob/__mob_supervisor__".to_string(),
             pubkey: [0u8; 32],
         };
@@ -1944,7 +1959,7 @@ mod tests {
             supervisor: supervisor.clone(),
             epoch: 0,
             protocol_version: SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
-            expected_peer_id: "ed25519:receiver".to_string(),
+            expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: runtime.advertised_address().unwrap(),
             bootstrap_token: "wrong-token".into(),
         };
@@ -1961,13 +1976,13 @@ mod tests {
     #[test]
     fn validate_bind_request_accepts_matching_bootstrap_token() {
         let runtime: Arc<dyn CommsRuntime> = Arc::new(bootstrap_runtime(
-            "ed25519:receiver",
+            PEER_ID_RECEIVER,
             "inproc://receiver",
             Some("expected-token"),
         ));
         let supervisor = BridgePeerSpec {
             name: "mob/__mob_supervisor__".to_string(),
-            peer_id: "ed25519:supervisor".to_string(),
+            peer_id: PEER_ID_SUPERVISOR.to_string(),
             address: "inproc://mob/__mob_supervisor__".to_string(),
             pubkey: [0u8; 32],
         };
@@ -1975,7 +1990,7 @@ mod tests {
             supervisor: supervisor.clone(),
             epoch: 0,
             protocol_version: SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
-            expected_peer_id: "ed25519:receiver".to_string(),
+            expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: runtime.advertised_address().unwrap(),
             bootstrap_token: "expected-token".into(),
         };
@@ -1990,7 +2005,7 @@ mod tests {
     #[test]
     fn validate_bind_request_returns_runtime_advertised_address() {
         let runtime: Arc<dyn CommsRuntime> = Arc::new(bootstrap_runtime(
-            "ed25519:receiver",
+            PEER_ID_RECEIVER,
             &format!(
                 "inproc://receiver-real?{SUPERVISOR_BRIDGE_BOOTSTRAP_TOKEN_PARAM}=expected-token"
             ),
@@ -1998,7 +2013,7 @@ mod tests {
         ));
         let supervisor = BridgePeerSpec {
             name: "mob/__mob_supervisor__".to_string(),
-            peer_id: "ed25519:supervisor".to_string(),
+            peer_id: PEER_ID_SUPERVISOR.to_string(),
             address: "inproc://mob/__mob_supervisor__".to_string(),
             pubkey: [0u8; 32],
         };
@@ -2006,7 +2021,7 @@ mod tests {
             supervisor: supervisor.clone(),
             epoch: 0,
             protocol_version: SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
-            expected_peer_id: "ed25519:receiver".to_string(),
+            expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: "inproc://receiver-real".to_string(),
             bootstrap_token: "expected-token".into(),
         };
@@ -2020,13 +2035,13 @@ mod tests {
     #[test]
     fn validate_bind_request_rejects_mismatched_expected_address() {
         let runtime: Arc<dyn CommsRuntime> = Arc::new(bootstrap_runtime(
-            "ed25519:receiver",
+            PEER_ID_RECEIVER,
             "inproc://receiver-real",
             Some("expected-token"),
         ));
         let supervisor = BridgePeerSpec {
             name: "mob/__mob_supervisor__".to_string(),
-            peer_id: "ed25519:supervisor".to_string(),
+            peer_id: PEER_ID_SUPERVISOR.to_string(),
             address: "inproc://mob/__mob_supervisor__".to_string(),
             pubkey: [0u8; 32],
         };
@@ -2034,7 +2049,7 @@ mod tests {
             supervisor: supervisor.clone(),
             epoch: 0,
             protocol_version: SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
-            expected_peer_id: "ed25519:receiver".to_string(),
+            expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: "inproc://receiver-stale".to_string(),
             bootstrap_token: "expected-token".into(),
         };
@@ -2051,13 +2066,13 @@ mod tests {
     #[test]
     fn validate_bind_request_rejects_protocol_version_mismatch() {
         let runtime: Arc<dyn CommsRuntime> = Arc::new(bootstrap_runtime(
-            "ed25519:receiver",
+            PEER_ID_RECEIVER,
             "inproc://receiver",
             Some("expected-token"),
         ));
         let supervisor = BridgePeerSpec {
             name: "mob/__mob_supervisor__".to_string(),
-            peer_id: "ed25519:supervisor".to_string(),
+            peer_id: PEER_ID_SUPERVISOR.to_string(),
             address: "inproc://mob/__mob_supervisor__".to_string(),
             pubkey: [0u8; 32],
         };
@@ -2065,7 +2080,7 @@ mod tests {
             supervisor: supervisor.clone(),
             epoch: 0,
             protocol_version: SUPERVISOR_BRIDGE_PROTOCOL_VERSION + 1,
-            expected_peer_id: "ed25519:receiver".to_string(),
+            expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: runtime.advertised_address().unwrap(),
             bootstrap_token: "expected-token".into(),
         };
@@ -2086,13 +2101,13 @@ mod tests {
         // fields. Uses the literal `1` (not `SUPERVISOR_BRIDGE_PROTOCOL_VERSION
         // - 1`) so that a future v3 bump re-confirms v1 stays rejected.
         let runtime: Arc<dyn CommsRuntime> = Arc::new(bootstrap_runtime(
-            "ed25519:receiver",
+            PEER_ID_RECEIVER,
             "inproc://receiver",
             Some("expected-token"),
         ));
         let supervisor = BridgePeerSpec {
             name: "mob/__mob_supervisor__".to_string(),
-            peer_id: "ed25519:supervisor".to_string(),
+            peer_id: PEER_ID_SUPERVISOR.to_string(),
             address: "inproc://mob/__mob_supervisor__".to_string(),
             pubkey: [0u8; 32],
         };
@@ -2100,7 +2115,7 @@ mod tests {
             supervisor: supervisor.clone(),
             epoch: 0,
             protocol_version: 1,
-            expected_peer_id: "ed25519:receiver".to_string(),
+            expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: runtime.advertised_address().unwrap(),
             bootstrap_token: "expected-token".into(),
         };
@@ -2113,20 +2128,20 @@ mod tests {
     #[test]
     fn validate_bind_request_rejects_invalid_supervisor_peer_name() {
         let runtime: Arc<dyn CommsRuntime> = Arc::new(bootstrap_runtime(
-            "ed25519:receiver",
+            PEER_ID_RECEIVER,
             "inproc://receiver",
             Some("expected-token"),
         ));
         let payload = meerkat_contracts::wire::supervisor_bridge::BridgeBindPayload {
             supervisor: BridgePeerSpec {
                 name: "".to_string(),
-                peer_id: "ed25519:supervisor".to_string(),
+                peer_id: PEER_ID_SUPERVISOR.to_string(),
                 address: "inproc://mob/__mob_supervisor__".to_string(),
                 pubkey: [0u8; 32],
             },
             epoch: 0,
             protocol_version: SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
-            expected_peer_id: "ed25519:receiver".to_string(),
+            expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: runtime.advertised_address().unwrap(),
             bootstrap_token: "expected-token".into(),
         };
@@ -2144,13 +2159,13 @@ mod tests {
         meerkat_contracts::wire::supervisor_bridge::BridgeBindPayload {
             supervisor: BridgePeerSpec {
                 name: "mob/__mob_supervisor__".to_string(),
-                peer_id: "ed25519:supervisor".to_string(),
+                peer_id: PEER_ID_SUPERVISOR.to_string(),
                 address: "inproc://mob/__mob_supervisor__".to_string(),
                 pubkey: [0u8; 32],
             },
             epoch: 1,
             protocol_version: SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
-            expected_peer_id: "ed25519:receiver".to_string(),
+            expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: "inproc://receiver".to_string(),
             bootstrap_token: "expected-token".into(),
         }
@@ -2341,7 +2356,7 @@ mod tests {
                 protocol_version: SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
                 expected_peer_id: runtime
                     .public_key()
-                    .unwrap_or_else(|| "ed25519:receiver".to_string()),
+                    .unwrap_or_else(|| PEER_ID_RECEIVER.to_string()),
                 expected_address: runtime
                     .advertised_address()
                     .unwrap_or_else(|| "inproc://bind-rebind-receiver".to_string()),
@@ -2384,7 +2399,7 @@ mod tests {
         let sent: Arc<tokio::sync::Mutex<Vec<CommsCommand>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let runtime: Arc<dyn CommsRuntime> = Arc::new(CapturingRuntime {
-            peer_id: "ed25519:receiver".to_string(),
+            peer_id: PEER_ID_RECEIVER.to_string(),
             advertised_address: Some("inproc://receiver".to_string()),
             bootstrap_token: Some("expected-token".to_string()),
             inbox_notify: Arc::new(tokio::sync::Notify::new()),
@@ -2393,9 +2408,9 @@ mod tests {
         let adapter = Arc::new(MeerkatMachine::ephemeral());
         let session_id = SessionId::new();
         adapter.register_session(session_id.clone()).await;
-        let current = TrustedPeerDescriptor::test_only_unsigned(
+        let current = TrustedPeerDescriptor::test_only_unsigned_typed(
             "mob/__mob_supervisor__",
-            "ed25519:current-supervisor",
+            PeerId::new(),
             "inproc://mob/__mob_supervisor__",
         )
         .expect("valid supervisor spec");
@@ -2424,7 +2439,7 @@ mod tests {
                 supervisor: adversary,
                 epoch: 2,
                 protocol_version: SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
-                expected_peer_id: "ed25519:receiver".to_string(),
+                expected_peer_id: PEER_ID_RECEIVER.to_string(),
                 expected_address: "inproc://receiver".to_string(),
                 bootstrap_token: "expected-token".into(),
             },
@@ -2547,7 +2562,7 @@ mod tests {
         let sent: Arc<tokio::sync::Mutex<Vec<CommsCommand>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let runtime: Arc<dyn CommsRuntime> = Arc::new(CapturingRuntime {
-            peer_id: "ed25519:receiver".to_string(),
+            peer_id: PEER_ID_RECEIVER.to_string(),
             // Simulate the invariant violation: no advertised address at the
             // moment of idempotent ack.
             advertised_address: None,
@@ -2558,9 +2573,9 @@ mod tests {
         let adapter = Arc::new(MeerkatMachine::ephemeral());
         let session_id = SessionId::new();
         adapter.register_session(session_id.clone()).await;
-        let authorized = TrustedPeerDescriptor::test_only_unsigned(
+        let authorized = TrustedPeerDescriptor::test_only_unsigned_typed(
             "mob/__mob_supervisor__",
-            "ed25519:supervisor",
+            PeerId::new(),
             "inproc://mob/__mob_supervisor__",
         )
         .expect("valid supervisor spec");
@@ -2665,7 +2680,7 @@ mod tests {
         let payload = BridgeSupervisorPayload {
             supervisor: BridgePeerSpec {
                 name: "mob/__mob_supervisor__".to_string(),
-                peer_id: "ed25519:supervisor".to_string(),
+                peer_id: PEER_ID_SUPERVISOR.to_string(),
                 address: "inproc://mob/__mob_supervisor__".to_string(),
                 pubkey: [0u8; 32],
             },
@@ -2691,7 +2706,7 @@ mod tests {
         let payload = BridgeSupervisorPayload {
             supervisor: BridgePeerSpec {
                 name: "mob/__mob_supervisor__".to_string(),
-                peer_id: "ed25519:supervisor".to_string(),
+                peer_id: PEER_ID_SUPERVISOR.to_string(),
                 address: "inproc://mob/__mob_supervisor__".to_string(),
                 pubkey: [0u8; 32],
             },
@@ -2724,13 +2739,13 @@ mod tests {
     #[test]
     fn validate_bind_request_rejects_empty_bootstrap_token_at_runtime() {
         let runtime: Arc<dyn CommsRuntime> = Arc::new(bootstrap_runtime(
-            "ed25519:receiver",
+            PEER_ID_RECEIVER,
             "inproc://receiver",
             Some(""),
         ));
         let supervisor = BridgePeerSpec {
             name: "mob/__mob_supervisor__".to_string(),
-            peer_id: "ed25519:supervisor".to_string(),
+            peer_id: PEER_ID_SUPERVISOR.to_string(),
             address: "inproc://mob/__mob_supervisor__".to_string(),
             pubkey: [0u8; 32],
         };
@@ -2738,7 +2753,7 @@ mod tests {
             supervisor: supervisor.clone(),
             epoch: 0,
             protocol_version: SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
-            expected_peer_id: "ed25519:receiver".to_string(),
+            expected_peer_id: PEER_ID_RECEIVER.to_string(),
             expected_address: runtime.advertised_address().unwrap(),
             bootstrap_token: "whatever".into(),
         };
@@ -2764,7 +2779,7 @@ mod tests {
         let payload = BridgeSupervisorPayload {
             supervisor: BridgePeerSpec {
                 name: "mob/__mob_supervisor__".to_string(),
-                peer_id: "ed25519:supervisor".to_string(),
+                peer_id: PEER_ID_SUPERVISOR.to_string(),
                 address: "inproc://mob/__mob_supervisor__".to_string(),
                 pubkey: [0u8; 32],
             },
@@ -2785,9 +2800,9 @@ mod tests {
         // Back-stops every command that calls `require_authorized_supervisor`
         // (revoke/observe/interrupt/retire/destroy/deliver/wire/unwire). A v1
         // payload must not coast on idempotent-ack or sender-match.
-        let supervisor = TrustedPeerDescriptor::test_only_unsigned(
+        let supervisor = TrustedPeerDescriptor::test_only_unsigned_typed(
             "mob/__mob_supervisor__",
-            "ed25519:supervisor",
+            PeerId::new(),
             "inproc://mob/__mob_supervisor__",
         )
         .expect("valid supervisor spec");
@@ -2838,7 +2853,7 @@ mod tests {
         let payload = sample_bind_payload();
         let sender = payload.supervisor.peer_id.clone();
         let mut runtime_impl = bootstrap_runtime(
-            "ed25519:receiver",
+            PEER_ID_RECEIVER,
             "inproc://receiver",
             Some("expected-token"),
         );
@@ -2872,9 +2887,9 @@ mod tests {
     async fn authorize_supervisor_restores_old_binding_when_new_trust_publish_fails() {
         // DOGMA-19 defensive scan: the old supervisor remains authoritative
         // until the new supervisor trust publishes successfully.
-        let old_supervisor = TrustedPeerDescriptor::test_only_unsigned(
+        let old_supervisor = TrustedPeerDescriptor::test_only_unsigned_typed(
             "mob/__mob_supervisor__",
-            "ed25519:old-supervisor",
+            PeerId::new(),
             "inproc://mob/__mob_supervisor__",
         )
         .expect("valid old supervisor");
@@ -2890,7 +2905,7 @@ mod tests {
             protocol_version: SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
         };
         let mut runtime_impl = bootstrap_runtime(
-            "ed25519:receiver",
+            PEER_ID_RECEIVER,
             "inproc://receiver",
             Some("expected-token"),
         );
@@ -2946,9 +2961,9 @@ mod tests {
     async fn authorize_supervisor_rolls_back_when_old_trust_removal_fails() {
         // DOGMA-19 defensive scan: if the old trust cannot be retired after
         // the DSL rotates, restore the old binding and clean the new trust up.
-        let old_supervisor = TrustedPeerDescriptor::test_only_unsigned(
+        let old_supervisor = TrustedPeerDescriptor::test_only_unsigned_typed(
             "mob/__mob_supervisor__",
-            "ed25519:old-supervisor",
+            PeerId::new(),
             "inproc://mob/__mob_supervisor__",
         )
         .expect("valid old supervisor");
@@ -2964,7 +2979,7 @@ mod tests {
             protocol_version: SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
         };
         let mut runtime_impl = bootstrap_runtime(
-            "ed25519:receiver",
+            PEER_ID_RECEIVER,
             "inproc://receiver",
             Some("expected-token"),
         );
@@ -3019,20 +3034,20 @@ mod tests {
     #[tokio::test]
     async fn revoke_supervisor_keeps_authority_when_trust_removal_fails() {
         let mut runtime_impl = bootstrap_runtime(
-            "ed25519:receiver",
+            PEER_ID_RECEIVER,
             "inproc://receiver",
             Some("expected-token"),
         );
         runtime_impl
             .remove_trusted_peer_errors
-            .insert("ed25519:supervisor".to_string(), "boom".to_string());
+            .insert(PEER_ID_SUPERVISOR.to_string(), "boom".to_string());
         let runtime: Arc<dyn CommsRuntime> = Arc::new(runtime_impl);
         let adapter = Arc::new(MeerkatMachine::ephemeral());
         let session_id = SessionId::new();
         adapter.register_session(session_id.clone()).await;
         let supervisor = BridgePeerSpec {
             name: "mob/__mob_supervisor__".to_string(),
-            peer_id: "ed25519:supervisor".to_string(),
+            peer_id: PEER_ID_SUPERVISOR.to_string(),
             address: "inproc://mob/__mob_supervisor__".to_string(),
             pubkey: [0u8; 32],
         };
