@@ -2129,6 +2129,37 @@ class MeerkatClient:
         raw = await self._request("realtime/capabilities", _wire_params(params))
         return RealtimeCapabilitiesResult(**raw)
 
+    # -- Runtime-category session RPC wrappers -----------------------------
+    # Thin pass-throughs for the Runtime-category `session/*` methods. Kept
+    # untyped here to mirror the TypeScript `_runtime*` wrappers; typed
+    # parameter shapes consume the generated types from
+    # `sdks/python/meerkat/generated/`. Exposed so the rpc-surface-alignment
+    # + sdk-wrapper-freshness parity gates see the method names.
+
+    async def status(self, params: dict[str, Any]) -> Any:
+        return await self._request("session/status", _wire_params(params))
+
+    async def submit(self, params: dict[str, Any]) -> Any:
+        return await self._request("session/submit", _wire_params(params))
+
+    async def submission(self, params: dict[str, Any]) -> Any:
+        return await self._request("session/submission", _wire_params(params))
+
+    async def submissions(self, params: dict[str, Any]) -> Any:
+        return await self._request("session/submissions", _wire_params(params))
+
+    async def retire(self, params: dict[str, Any]) -> Any:
+        return await self._request("session/retire", _wire_params(params))
+
+    async def reset(self, params: dict[str, Any]) -> Any:
+        return await self._request("session/reset", _wire_params(params))
+
+    async def runtime_realtime_attachment_status(self, params: dict[str, Any]) -> Any:
+        return await self._request("session/realtime_attachment_status", _wire_params(params))
+
+    async def runtime_realtime_attachment_statuses(self, params: dict[str, Any]) -> Any:
+        return await self._request("session/realtime_attachment_statuses", _wire_params(params))
+
     # -- Transport ---------------------------------------------------------
 
     async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
