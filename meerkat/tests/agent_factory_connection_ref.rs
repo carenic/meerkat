@@ -339,11 +339,23 @@ async fn llm_client_override_beats_connection_ref() {
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn build_agent_without_connection_ref_uses_flat_path() {
-    // Plan §6.9 deleted the legacy per-provider config block. The flat path now relies on the
-    // `[realm.default]` inline-secret binding or env vars. This
-    // test asserts the shared-map path: no connection_ref, api_key
-    // resolved from the map, agent builds successfully.
+async fn build_agent_without_connection_ref_rejects_with_ambient_credential_refusal() {
+    // Wave-C auth-seam cleanup (dogma §15/§19, commit `28e7a51c1`)
+    // deleted env-default realm synthesis AND first-matching-provider
+    // promotion. `AgentFactory::build_agent` with no `connection_ref`
+    // now rejects with `BuildAgentError::ConnectionResolution`
+    // regardless of whether `config.realm["default"]` holds a matching
+    // provider — the refusal is intentional because "ambient" resolution
+    // was the silent-bypass path the deletion targeted.
+    //
+    // When the deletion is reversed (a follow-up task would need to
+    // reintroduce explicit-realm resolution as a distinct path from
+    // ambient/env-default), this test fails loudly and points whoever
+    // restores the behavior at this site.
+    //
+    // Pre-Wave-C, this test asserted the positive path: `config.realm["default"]`
+    // inline API keys should be honored without an explicit connection_ref.
+    // That path is now gone by construction.
     let temp = tempfile::tempdir().unwrap();
     let factory = temp_factory(&temp);
     let mut config = config_with_realm();
@@ -351,18 +363,19 @@ async fn build_agent_without_connection_ref_uses_flat_path() {
     config.realm.insert("default".to_string(), section);
 
     let build = AgentBuildConfig::new("gpt-5.2");
-    // No connection_ref — flat path must run unchanged.
     assert!(build.connection_ref.is_none());
 
-    let agent = factory
-        .build_agent(build, &config)
-        .await
-        .expect("flat path builds client when api_key is configured");
-    let metadata = agent
-        .session()
-        .session_metadata()
-        .expect("session metadata written");
-    assert_eq!(metadata.provider, Provider::OpenAI);
+    match factory.build_agent(build, &config).await {
+        Ok(_) => panic!(
+            "build_agent without connection_ref must reject with ambient-credential refusal \
+             per wave-c auth-seam cleanup (dogma §15/§19)"
+        ),
+        Err(meerkat::BuildAgentError::ConnectionResolution(msg)) => assert!(
+            msg.contains("ambient credential selection refused"),
+            "expected ambient-credential refusal, got: {msg}"
+        ),
+        Err(other) => panic!("expected BuildAgentError::ConnectionResolution, got: {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------
