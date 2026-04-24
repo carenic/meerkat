@@ -193,7 +193,7 @@ define_identity!(
 /// the old `render_named_type_alias_target` allow-list which silently defaulted
 /// unknown aliases to `String`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum RustTypeAtom {
     U64,
     U32,
