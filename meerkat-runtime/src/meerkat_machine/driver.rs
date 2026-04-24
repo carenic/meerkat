@@ -644,6 +644,12 @@ fn machine_apply_turn_run_completed(
     let mut auth = authority
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if auth.state.lifecycle_phase != crate::meerkat_machine::dsl::MeerkatPhase::Running
+        || auth.state.current_run_id.as_ref().map(|id| id.0.as_str())
+            != Some(run_id.to_string().as_str())
+    {
+        return Ok(());
+    }
     crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
         &mut *auth,
         crate::meerkat_machine::dsl::MeerkatMachineInput::RunCompleted {
@@ -667,6 +673,12 @@ fn machine_apply_turn_run_failed(
     let mut auth = authority
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if auth.state.lifecycle_phase != crate::meerkat_machine::dsl::MeerkatPhase::Running
+        || auth.state.current_run_id.as_ref().map(|id| id.0.as_str())
+            != Some(run_id.to_string().as_str())
+    {
+        return Ok(());
+    }
     crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
         &mut *auth,
         crate::meerkat_machine::dsl::MeerkatMachineInput::RunFailed {
