@@ -313,12 +313,21 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
 
     fn snapshot(&self) -> TurnStateSnapshot {
         let state = self.dsl.snapshot_state();
-        TurnStateSnapshot {
-            active_run_id: state
+        let turn_phase = map_turn_phase(state.turn_phase);
+        let active_run_id = if matches!(
+            turn_phase,
+            TurnPhase::Completed | TurnPhase::Failed | TurnPhase::Cancelled
+        ) {
+            None
+        } else {
+            state
                 .current_run_id
                 .as_ref()
-                .and_then(|run_id| uuid::Uuid::parse_str(&run_id.0).ok().map(RunId::from_uuid)),
-            turn_phase: map_turn_phase(state.turn_phase),
+                .and_then(|run_id| uuid::Uuid::parse_str(&run_id.0).ok().map(RunId::from_uuid))
+        };
+        TurnStateSnapshot {
+            active_run_id,
+            turn_phase,
             primitive_kind: state.primitive_kind.map(TurnPrimitiveKind::from),
             admitted_content_shape: state.admitted_content_shape.clone(),
             vision_enabled: state.vision_enabled,
@@ -386,5 +395,29 @@ mod tests {
             snapshot.primitive_kind,
             Some(TurnPrimitiveKind::ConversationTurn)
         );
+    }
+
+    #[test]
+    fn snapshot_clears_active_run_id_after_terminal_turn() {
+        let handle = RuntimeTurnStateHandle::ephemeral();
+        let run_id = RunId(Uuid::from_u128(8));
+
+        handle
+            .start_conversation_run(
+                run_id,
+                TurnPrimitiveKind::ConversationTurn,
+                "conversation".into(),
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+        handle.primitive_applied().unwrap();
+        handle.llm_returned_terminal().unwrap();
+        handle.boundary_complete().unwrap();
+
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.turn_phase, TurnPhase::Completed);
+        assert_eq!(snapshot.active_run_id, None);
     }
 }
