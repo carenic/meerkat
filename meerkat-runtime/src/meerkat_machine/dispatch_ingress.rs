@@ -241,6 +241,8 @@ impl MeerkatMachine {
                     )
                     .await
                     .map_err(|reason| RuntimeDriverError::ValidationFailed { reason })?;
+                    let mut resolved = resolved;
+                    resolved.policy.wake_mode = crate::policy::WakeMode::None;
                     let result = match driver
                         .accept_resolved_input(input, resolved)
                         .await

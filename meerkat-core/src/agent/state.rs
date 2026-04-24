@@ -401,13 +401,19 @@ where
         };
 
         let result = match input {
-            // Runtime Start* inputs absorb primitive details that the
-            // standalone fallback receives later via PrimitiveApplied, so defer the
-            // runtime mutation until PrimitiveApplied carries the full payload.
-            TurnExecutionInput::StartConversationRun { .. }
-            | TurnExecutionInput::StartImmediateAppend { .. }
-            | TurnExecutionInput::StartImmediateContext { .. } => {
-                return Ok(());
+            TurnExecutionInput::StartConversationRun { run_id } => handle.start_conversation_run(
+                run_id.clone(),
+                crate::turn_execution_authority::TurnPrimitiveKind::ConversationTurn,
+                "conversation".to_string(),
+                false,
+                false,
+                0,
+            ),
+            TurnExecutionInput::StartImmediateAppend { run_id } => {
+                handle.start_immediate_append(run_id.clone(), "immediate_append".to_string())
+            }
+            TurnExecutionInput::StartImmediateContext { run_id } => {
+                handle.start_immediate_context(run_id.clone(), "immediate_context".to_string())
             }
             TurnExecutionInput::PrimitiveApplied {
                 run_id: _,
@@ -624,7 +630,11 @@ where
         let mut event_stream_open = true;
 
         // --- Authority lifecycle: start a conversation run ---
-        let run_id = RunId(uuid::Uuid::new_v4());
+        let run_id = self
+            .turn_state_handle
+            .as_deref()
+            .and_then(|handle| handle.snapshot().active_run_id)
+            .unwrap_or_else(|| RunId(uuid::Uuid::new_v4()));
         self.apply_turn_input(TurnExecutionInput::StartConversationRun {
             run_id: run_id.clone(),
         })?;

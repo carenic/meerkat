@@ -59,6 +59,10 @@ impl IngressView<'_> {
         self.driver.admitted_content_shape(input_id)
     }
 
+    pub(crate) fn policy(&self, input_id: &InputId) -> Option<&crate::policy::PolicyDecision> {
+        self.driver.admitted_policy(input_id)
+    }
+
     pub(crate) fn request_id(&self, input_id: &InputId) -> Option<crate::ingress_types::RequestId> {
         self.driver.admitted_request_id(input_id)
     }
@@ -650,8 +654,20 @@ pub(crate) fn machine_input_boundary(
 
 pub(crate) fn machine_select_runtime_loop_batch(driver: &DriverEntry) -> Vec<InputId> {
     let ingress = driver.driver_ingress();
+    let should_drive_loop = |id: &InputId| {
+        ingress.policy(id).is_none_or(|policy| {
+            !matches!(policy.wake_mode, crate::policy::WakeMode::None)
+                || matches!(
+                    policy.drain_policy,
+                    crate::policy::DrainPolicy::Immediate | crate::policy::DrainPolicy::SteerBatch
+                )
+        })
+    };
     let steer = ingress.steer_queue();
     if let Some(first) = steer.first() {
+        if !should_drive_loop(first) {
+            return Vec::new();
+        }
         let target_boundary = machine_input_boundary(driver, first);
         return steer
             .iter()
@@ -661,11 +677,13 @@ pub(crate) fn machine_select_runtime_loop_batch(driver: &DriverEntry) -> Vec<Inp
     }
 
     let queue = ingress.queue();
-    if let Some(first) = queue.first() {
+    if let Some(driver_index) = queue.iter().position(should_drive_loop) {
+        let first = &queue[driver_index];
+        let prefix = &queue[..=driver_index];
         if ingress.is_prompt(first) {
-            return vec![first.clone()];
+            return prefix.to_vec();
         }
-        return queue
+        return queue[..]
             .iter()
             .take_while(|id| !ingress.is_prompt(id))
             .cloned()

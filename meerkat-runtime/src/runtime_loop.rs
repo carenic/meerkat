@@ -182,30 +182,33 @@ fn primitive_admitted_content_shape(primitive: &RunPrimitive) -> String {
 fn primitive_turn_start_input(
     run_id: &RunId,
     primitive: &RunPrimitive,
-) -> crate::meerkat_machine::dsl::MeerkatMachineInput {
+) -> Option<crate::meerkat_machine::dsl::MeerkatMachineInput> {
     let admitted_content_shape = primitive_admitted_content_shape(primitive);
     match primitive {
-        RunPrimitive::ImmediateAppend(_) => {
+        RunPrimitive::ImmediateAppend(_) => Some(
             crate::meerkat_machine::dsl::MeerkatMachineInput::StartImmediateAppend {
                 run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
                 admitted_content_shape,
-            }
-        }
-        RunPrimitive::ImmediateContextAppend(_) => {
+            },
+        ),
+        RunPrimitive::ImmediateContextAppend(_) => Some(
             crate::meerkat_machine::dsl::MeerkatMachineInput::StartImmediateContext {
                 run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
                 admitted_content_shape,
-            }
-        }
+            },
+        ),
         RunPrimitive::StagedInput(staged)
             if staged.appends.is_empty() && !staged.context_appends.is_empty() =>
         {
-            crate::meerkat_machine::dsl::MeerkatMachineInput::StartImmediateContext {
-                run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
-                admitted_content_shape,
-            }
+            Some(
+                crate::meerkat_machine::dsl::MeerkatMachineInput::StartImmediateContext {
+                    run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
+                    admitted_content_shape,
+                },
+            )
         }
-        RunPrimitive::StagedInput(_) => {
+        RunPrimitive::StagedInput(_) => None,
+        _ => Some(
             crate::meerkat_machine::dsl::MeerkatMachineInput::StartConversationRun {
                 run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
                 primitive_kind: crate::meerkat_machine::dsl::TurnPrimitiveKind::ConversationTurn,
@@ -213,16 +216,8 @@ fn primitive_turn_start_input(
                 vision_enabled: false,
                 image_tool_results_enabled: false,
                 max_extraction_retries: 0,
-            }
-        }
-        _ => crate::meerkat_machine::dsl::MeerkatMachineInput::StartConversationRun {
-            run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
-            primitive_kind: crate::meerkat_machine::dsl::TurnPrimitiveKind::ConversationTurn,
-            admitted_content_shape,
-            vision_enabled: false,
-            image_tool_results_enabled: false,
-            max_extraction_retries: 0,
-        },
+            },
+        ),
     }
 }
 
@@ -231,6 +226,9 @@ async fn prepare_turn_state_for_primitive(
     run_id: &RunId,
     primitive: &RunPrimitive,
 ) -> Result<(), crate::RuntimeDriverError> {
+    let Some(input) = primitive_turn_start_input(run_id, primitive) else {
+        return Ok(());
+    };
     let authority = {
         let driver = driver.lock().await;
         driver.shared_dsl_authority()
@@ -238,16 +236,13 @@ async fn prepare_turn_state_for_primitive(
     let mut auth = authority
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
-        &mut *auth,
-        primitive_turn_start_input(run_id, primitive),
-    )
-    .map(|_| ())
-    .map_err(|err| {
-        crate::RuntimeDriverError::Internal(format!(
-            "failed to start runtime turn state for run {run_id}: {err}"
-        ))
-    })
+    crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(&mut *auth, input)
+        .map(|_| ())
+        .map_err(|err| {
+            crate::RuntimeDriverError::Internal(format!(
+                "failed to start runtime turn state for run {run_id}: {err}"
+            ))
+        })
 }
 
 fn external_event_projection_text(event: &crate::input::ExternalEventInput) -> String {
