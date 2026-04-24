@@ -65,5 +65,20 @@ pub async fn resolve_repositories_with_roots(
         }
     }
 
+    if sources.is_empty()
+        && let Some(root) = context_root
+    {
+        let default_project_skills = root.join(".rkat/skills");
+        if default_project_skills.is_dir() {
+            sources.push(NamedSource {
+                name: "project".to_string(),
+                source: SourceNode::Filesystem(FilesystemSkillSource::new(
+                    default_project_skills,
+                    SkillScope::Project,
+                )),
+            });
+        }
+    }
+
     Ok(Some(CompositeSkillSource::from_named(sources)))
 }
