@@ -517,7 +517,26 @@ fn scenario_env(spec: &Spec) -> Result<Vec<(String, String)>, String> {
 fn scenario_cargo_target_dir(spec: &Spec) -> Result<PathBuf, String> {
     Ok(cargo_target_dir()?
         .join("e2e-lanes")
+        .join(source_revision_key())
         .join(scenario_artifact_key(spec)))
+}
+
+fn source_revision_key() -> String {
+    static SOURCE_REVISION: OnceLock<String> = OnceLock::new();
+    SOURCE_REVISION
+        .get_or_init(|| {
+            std::process::Command::new("git")
+                .args(["rev-parse", "--short=12", "HEAD"])
+                .current_dir(workspace_root())
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|revision| sanitize_artifact_key(revision.trim()))
+                .filter(|revision| !revision.is_empty())
+                .unwrap_or_else(|| "worktree".to_string())
+        })
+        .clone()
 }
 
 fn scenario_artifact_key(spec: &Spec) -> String {
@@ -3213,6 +3232,7 @@ fn suite_spec(name: &str) -> Option<&'static Spec> {
 mod tests {
     use super::{
         Lane, normalize_command_with_env, repo_cargo, sanitize_artifact_key, scenario_spec,
+        source_revision_key,
     };
 
     #[test]
@@ -3234,6 +3254,16 @@ mod tests {
             normalize_command_with_env(&["cargo", "run", "{cargo_target_dir}/debug/rkat"], &env);
         assert_eq!(argv[0], repo_cargo().display().to_string());
         assert_eq!(argv[2], "/tmp/meerkat-e2e-scenario-target/debug/rkat");
+    }
+
+    #[test]
+    fn source_revision_key_is_path_safe() {
+        let key = source_revision_key();
+        assert!(!key.is_empty());
+        assert!(
+            key.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        );
     }
 
     #[test]
