@@ -14,7 +14,7 @@
 //!
 //! ### Session (runtime-backed session-handle façades)
 //! - `create_session(mobpack_bytes, config_json)` → handle
-//! - `start_turn(handle, prompt, options_json)` → JSON result
+//! - `start_turn(handle, prompt)` → JSON result
 //! - `get_session_state(handle)` → JSON
 //! - `destroy_session(handle)`
 //! - `inspect_mobpack(mobpack_bytes)` → JSON
