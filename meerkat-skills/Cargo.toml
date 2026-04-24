@@ -48,14 +48,9 @@ urlencoding = "2"
 
 [package.metadata.cargo-machete]
 # async-trait, strum: proc macros (derive).
-# gix, reqwest, urlencoding, wiremock: pre-declared for the `skills-git` /
-# `skills-http` features and the wiremock-driven integration tests. The
-# current source/git.rs, source/http.rs, and tests are Wave-b stubs
-# described as "wave-c/wave-d rebuild" — deps stay declared so the feature
-# surface stays activatable and the real-impl addition doesn't need to
-# re-plumb Cargo.toml. cargo-machete ignores them here rather than have
-# the workspace lint gate flag pre-declared stubs.
-ignored = ["async-trait", "strum", "gix", "reqwest", "urlencoding", "wiremock"]
+# reqwest/urlencoding/wiremock: native HTTP transport and wiremock-driven
+# integration tests.
+ignored = ["async-trait", "strum", "reqwest", "urlencoding", "wiremock"]
 
 [lints]
 workspace = true

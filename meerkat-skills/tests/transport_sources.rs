@@ -99,6 +99,7 @@ async fn http_source_serves_stale_cache_after_refresh_error() {
     );
 
     assert_eq!(source.list(&SkillFilter::default()).await.unwrap().len(), 1);
+    server.reset().await;
     let stale = source.list(&SkillFilter::default()).await.unwrap();
     assert_eq!(stale.len(), 1);
     assert_eq!(stale[0].key.skill_name.as_str(), "cached");
