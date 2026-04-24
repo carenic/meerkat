@@ -419,6 +419,50 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         Ok(session)
     }
 
+    /// Apply a runtime-turn metadata LLM identity update to a live session.
+    ///
+    /// This is intentionally not exposed through the public
+    /// `SessionService::hot_swap_session_llm_identity` trait method: callers
+    /// must arrive here through the runtime-owned turn/reconfigure path, after
+    /// the runtime has resolved the typed metadata and built the client.
+    pub async fn apply_runtime_session_llm_identity(
+        &self,
+        id: &SessionId,
+        client: std::sync::Arc<dyn meerkat_core::AgentLlmClient>,
+        identity: meerkat_core::SessionLlmIdentity,
+    ) -> Result<(), SessionError> {
+        self.inner
+            .hot_swap_session_llm_identity(id, client, identity)
+            .await?;
+        self.persist_full_session(id).await.map(|_| ())
+    }
+
+    /// Apply a runtime-turn metadata keep-alive update to a live session.
+    ///
+    /// The public trait method remains blocked so keep-alive changes do not
+    /// bypass the runtime turn metadata seam.
+    pub async fn apply_runtime_session_keep_alive(
+        &self,
+        id: &SessionId,
+        keep_alive: bool,
+    ) -> Result<(), SessionError> {
+        let previous = self
+            .export_session_with_labels(id)
+            .await
+            .ok()
+            .and_then(|session| session.session_metadata().map(|meta| meta.keep_alive));
+        self.inner.update_session_keep_alive(id, keep_alive).await?;
+        match self.persist_full_session(id).await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                if let Some(previous) = previous {
+                    let _ = self.inner.update_session_keep_alive(id, previous).await;
+                }
+                Err(error)
+            }
+        }
+    }
+
     async fn load_authoritative_session_base(
         &self,
         id: &SessionId,
@@ -3738,9 +3782,7 @@ mod tests {
             .expect_err("runtime-backed recovery should reject missing bindings");
 
         assert!(
-            error
-                .to_string()
-                .contains("refusing StandaloneEphemeral fallback"),
+            error.to_string().contains("session not found"),
             "unexpected error: {error}"
         );
     }
@@ -3778,7 +3820,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("refusing StandaloneEphemeral fallback"),
+                .contains("stored-session recovery via non-canonical runtime-binding providers has been deleted"),
             "unexpected error: {error}"
         );
     }
@@ -3925,9 +3967,9 @@ mod tests {
 
         // Update keep_alive to true on the live session.
         service
-            .update_session_keep_alive(&id, true)
+            .apply_runtime_session_keep_alive(&id, true)
             .await
-            .expect("update_session_keep_alive should succeed");
+            .expect("runtime keep_alive update should succeed");
 
         // Verify the store reflects the update.
         let persisted = store.load(&id).await.unwrap().unwrap();
@@ -3956,7 +3998,7 @@ mod tests {
 
         // --- Transition: false → true with store failure ---
         fail_store.set_fail_save(true);
-        let result = service.update_session_keep_alive(&id, true).await;
+        let result = service.apply_runtime_session_keep_alive(&id, true).await;
         assert!(result.is_err(), "false→true should fail when store fails");
         fail_store.set_fail_save(false);
         let exported = service.export_session_with_labels(&id).await.unwrap();
@@ -3966,13 +4008,16 @@ mod tests {
         );
 
         // --- Bring live state to true successfully ---
-        service.update_session_keep_alive(&id, true).await.unwrap();
+        service
+            .apply_runtime_session_keep_alive(&id, true)
+            .await
+            .unwrap();
         let exported = service.export_session_with_labels(&id).await.unwrap();
         assert!(exported.session_metadata().unwrap().keep_alive);
 
         // --- Transition: true → true with store failure (idempotent retry) ---
         fail_store.set_fail_save(true);
-        let result = service.update_session_keep_alive(&id, true).await;
+        let result = service.apply_runtime_session_keep_alive(&id, true).await;
         assert!(result.is_err(), "true→true should fail when store fails");
         fail_store.set_fail_save(false);
         let exported = service.export_session_with_labels(&id).await.unwrap();
@@ -3983,7 +4028,7 @@ mod tests {
 
         // --- Transition: true → false with store failure ---
         fail_store.set_fail_save(true);
-        let result = service.update_session_keep_alive(&id, false).await;
+        let result = service.apply_runtime_session_keep_alive(&id, false).await;
         assert!(result.is_err(), "true→false should fail when store fails");
         fail_store.set_fail_save(false);
         let exported = service.export_session_with_labels(&id).await.unwrap();

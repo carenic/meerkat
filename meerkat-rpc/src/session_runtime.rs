@@ -471,7 +471,7 @@ impl SessionLlmReconfigureHost for SessionRuntimeLlmReconfigureHost {
     ) -> Result<(), RuntimeDriverError> {
         let adapter = self.build_adapter_for_llm_identity(identity).await?;
         self.service
-            .hot_swap_session_llm_identity(session_id, adapter, identity.clone())
+            .apply_runtime_session_llm_identity(session_id, adapter, identity.clone())
             .await
             .map_err(session_error_to_runtime_driver)
     }
@@ -1901,7 +1901,7 @@ impl SessionRuntime {
             // Persist explicit override so subsequent inheriting calls observe it.
             if keep_alive_override.is_some() {
                 self.service
-                    .update_session_keep_alive(session_id, keep_alive)
+                    .apply_runtime_session_keep_alive(session_id, keep_alive)
                     .await
                     .map_err(session_error_to_rpc)?;
             }
@@ -2907,7 +2907,7 @@ impl SessionRuntime {
                 });
             }
             self.service
-                .update_session_keep_alive(session_id, keep_alive)
+                .apply_runtime_session_keep_alive(session_id, keep_alive)
                 .await
                 .map_err(session_error_to_rpc)?;
             // W2-G: never reconfigure a mob-owned drain from the
