@@ -121,6 +121,19 @@ impl MobSupervisorBridge {
     ) -> Result<serde_json::Value, MobError> {
         let _request_guard = self.request_lock.lock().await;
         let runtime = self.runtime().await;
+        // #31 Wave D (D-trust-reconciliation subsystem 1): bootstrap comms
+        // trust for the recipient so the supervisor can address the external
+        // peer at all. The pre-Wave-A implementation did this via
+        // `runtime.add_trusted_peer(recipient.clone())` at the head of this
+        // method (deleted by `0ad584cde` as a shell-authority violation
+        // piggybacked onto every request). Restoring the trust bootstrap
+        // here keeps supervisor bridge commands (BindMember,
+        // AuthorizeSupervisor, WireMember, UnwireMember, RetireMember)
+        // deliverable at spawn time for external backend members — without
+        // the install, `send` below fails with
+        // `SendError::PeerNotFound(recipient.name)` because the supervisor
+        // runtime's trusted-peer directory is empty for the new member.
+        runtime.add_trusted_peer(recipient.clone()).await?;
         let to = PeerName::new(recipient.name.clone()).map_err(|error| {
             MobError::WiringError(format!(
                 "invalid supervisor recipient name '{}': {error}",
