@@ -17441,64 +17441,23 @@ async fn test_unwire_prunes_stale_local_trust_when_projection_is_already_absent(
     );
 }
 
-#[tokio::test]
-async fn test_unwire_external_prunes_stale_trust_when_projection_is_already_absent() {
-    let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
-    let (handle, service) = create_test_mob_with_real_comms(sample_definition()).await;
-
-    let sid = handle
-        .spawn(ProfileName::from("lead"), MeerkatId::from("l-1"), None)
-        .await
-        .expect("spawn lead")
-        .bridge_session_id()
-        .expect("session-backed")
-        .clone();
-    let spec = TrustedPeerDescriptor::test_only_unsigned(
-        "remote-mob/worker/agent-x",
-        meerkat_comms::Keypair::generate()
-            .public_key()
-            .to_peer_id()
-            .to_string(),
-        "inproc://remote-mob/worker/agent-x",
-    )
-    .expect("valid external peer");
-    handle
-        .wire(
-            AgentIdentity::from("l-1"),
-            PeerTarget::External(spec.clone()),
-        )
-        .await
-        .expect("wire external");
-    handle
-        .unwire(
-            AgentIdentity::from("l-1"),
-            PeerTarget::External(spec.clone()),
-        )
-        .await
-        .expect("initial external unwire");
-
-    let comms = service.real_comms(&sid).await.expect("comms for l-1");
-    comms
-        .add_trusted_peer(spec.clone())
-        .await
-        .expect("re-add stale external trust");
-
-    handle
-        .unwire(
-            AgentIdentity::from("l-1"),
-            PeerTarget::External(spec.clone()),
-        )
-        .await
-        .expect("idempotent external stale-trust cleanup");
-
-    let peers = CoreCommsRuntime::peers(&*comms).await;
-    assert!(
-        !peers
-            .iter()
-            .any(|entry| entry.name.as_str() == spec.name.as_str()),
-        "idempotent external unwire should prune stale trust"
-    );
-}
+// `test_unwire_external_prunes_stale_trust_when_projection_is_already_absent`
+// deleted as part of #31 Class G. The test's unique coverage — second
+// `unwire(PeerTarget::External)` idempotently prunes stale comms trust
+// re-added externally — required `handle.wire(PeerTarget::External)` to
+// succeed at setup, but that positive path was scope-deferred in Wave D
+// (see `MobActor::handle_wire` at `actor.rs:4160-4173`:
+// `"external peer wiring requires supervisor-owned trust authority; \
+// scope-deferred beyond Wave D ..."`). With the positive path rejecting,
+// the stale-trust-reinjection scenario is unreachable. #25 Q2 already
+// pins the scope-deferred rejection contract via the two
+// `test_(un)wire_external_rejects_with_scope_deferred_wiring_error`
+// tripwires in this file (around line 9816/9849); adding a third
+// rejection-assertion variant here would be pure duplication.
+//
+// When supervisor-owned trust authority lands and external peer wiring
+// is restored (c.f. #28 D-obs-audit follow-up), this stale-trust-cleanup
+// scenario can be re-authored against the restored positive path.
 
 #[tokio::test]
 async fn test_retire_updates_peers_and_sends_retired_notifications() {
