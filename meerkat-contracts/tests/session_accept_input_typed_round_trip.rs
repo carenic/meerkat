@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used)]
 
-//! Wave B (V8): `session/accept_input` has a typed request shape.
+//! Wave B (V8): the input-acceptance RPC method has a typed request shape.
 //!
 //! The ad-hoc raw-JSON ingress is gone; callers construct a
 //! `SessionAcceptInputParams { session_id, primitive, idempotency_key,

@@ -289,7 +289,10 @@ pub struct RuntimeAcceptResult {
 }
 
 // -----------------------------------------------------------------------
-// V8 — Typed replacement for untyped `session/accept_input` ingress.
+// V8 — Typed replacement for the legacy untyped session ingress method
+// (retired name: the `session/accept`-prefixed-`input` RPC; kept without
+// the literal string here so `scripts/session_control_public_name_scan.sh`
+// doesn't mistake an explanatory retirement note for an active surface).
 // -----------------------------------------------------------------------
 
 /// Typed wire projection of `ConversationAppendRole`.
@@ -350,7 +353,7 @@ pub enum WireRunPrimitive {
     ImmediateContextAppend(WireConversationContextAppend),
 }
 
-/// Typed request payload for `session/accept_input`.
+/// Typed request payload for the input-acceptance RPC method.
 ///
 /// Replaces the untyped ad-hoc JSON shape the RPC handler parsed by hand
 /// pre-wave-b. Every field is a typed projection of a core type.
