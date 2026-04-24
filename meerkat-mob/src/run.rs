@@ -552,7 +552,7 @@ impl MobRun {
             ),
             loop_id: mob_dsl::LoopId::from(snapshot.kernel_state.loop_id.as_str()),
             depth: snapshot.kernel_state.depth,
-            max_iterations: snapshot.kernel_state.max_iterations,
+            max_iterations: snapshot.kernel_state.max_iterations as u64,
         })
     }
 
@@ -610,7 +610,7 @@ impl MobRun {
     ) -> mob_dsl::MobMachineInput {
         mob_dsl::MobMachineInput::RecordLoopBodyFrameCompleted {
             loop_instance_id: mob_dsl::LoopInstanceId::from(loop_instance_id.as_str()),
-            iteration,
+            iteration: iteration as u64,
         }
     }
 
@@ -623,12 +623,12 @@ impl MobRun {
         if until_met {
             mob_dsl::MobMachineInput::RecordLoopUntilConditionMet {
                 loop_instance_id,
-                iteration,
+                iteration: iteration as u64,
             }
         } else {
             mob_dsl::MobMachineInput::RecordLoopUntilConditionFailed {
                 loop_instance_id,
-                iteration,
+                iteration: iteration as u64,
             }
         }
     }

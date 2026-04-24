@@ -765,9 +765,9 @@ machine! {
             loop_definition: Map<LoopInstanceId, LoopId>,
             loop_depth: Map<LoopInstanceId, u32>,
             loop_stage: Map<LoopInstanceId, Enum<LoopIterationStage>>,
-            loop_current_iteration: Map<LoopInstanceId, u32>,
-            loop_last_completed_iteration: Map<LoopInstanceId, u32>,
-            loop_max_iterations: Map<LoopInstanceId, u32>,
+            loop_current_iteration: Map<LoopInstanceId, u64>,
+            loop_last_completed_iteration: Map<LoopInstanceId, u64>,
+            loop_max_iterations: Map<LoopInstanceId, u64>,
             loop_active_body_frame: Map<LoopInstanceId, Option<FrameId>>,
             pending_spawn_count: u64,
             coordinator_bound: bool,
@@ -934,19 +934,19 @@ machine! {
                 parent_node_id: FlowNodeId,
                 loop_id: LoopId,
                 depth: u32,
-                max_iterations: u32,
+                max_iterations: u64,
             },
             RecordLoopBodyFrameCompleted {
                 loop_instance_id: LoopInstanceId,
-                iteration: u32,
+                iteration: u64,
             },
             RecordLoopUntilConditionMet {
                 loop_instance_id: LoopInstanceId,
-                iteration: u32,
+                iteration: u64,
             },
             RecordLoopUntilConditionFailed {
                 loop_instance_id: LoopInstanceId,
-                iteration: u32,
+                iteration: u64,
             },
             ProjectRunStatus {
                 run_id: RunId,
@@ -2261,8 +2261,8 @@ machine! {
                 self.loop_definition.insert(loop_instance_id, loop_id);
                 self.loop_depth.insert(loop_instance_id, depth);
                 self.loop_stage.insert(loop_instance_id, LoopIterationStage::AwaitingBodyFrame);
-                self.loop_current_iteration.insert(loop_instance_id, 0);
-                self.loop_last_completed_iteration.insert(loop_instance_id, 0);
+                self.loop_current_iteration.insert(loop_instance_id, 0u32);
+                self.loop_last_completed_iteration.insert(loop_instance_id, 0u32);
                 self.loop_max_iterations.insert(loop_instance_id, max_iterations);
                 self.loop_active_body_frame.insert(loop_instance_id, None);
             }
@@ -2280,7 +2280,7 @@ machine! {
             update {
                 self.loop_stage.insert(loop_instance_id, LoopIterationStage::AwaitingUntilEvaluation);
                 self.loop_last_completed_iteration.insert(loop_instance_id, iteration);
-                self.loop_current_iteration.insert(loop_instance_id, iteration + 1);
+                self.loop_current_iteration.insert(loop_instance_id, iteration + 1u32);
                 self.loop_active_body_frame.insert(loop_instance_id, None);
             }
             to Running
