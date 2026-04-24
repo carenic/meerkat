@@ -20815,6 +20815,7 @@ struct MobRuntimeParitySnapshotSummary {
     // empty BTreeMap for the parity evaluator; full projection through the
     // runtime-parity snapshot is a follow-up to the observer wiring PR.
     member_session_bindings: BTreeMap<String, String>,
+    pending_session_ingress_detach_runtime_ids: BTreeSet<String>,
     // Track-B (R5): monotonically increasing topology epoch. Incremented on
     // every mutation of `wiring_edges` or `member_session_bindings`. Stubbed
     // here as 0 for the parity evaluator; full projection lands with the
@@ -21488,6 +21489,7 @@ async fn mob_runtime_parity_snapshot_summary(
         in_progress_task_ids,
         completed_task_ids,
         member_session_bindings,
+        pending_session_ingress_detach_runtime_ids,
     ) = dsl_t2
         .map(|snap| {
             (
@@ -21519,6 +21521,10 @@ async fn mob_runtime_parity_snapshot_summary(
                     .into_iter()
                     .map(|(k, v)| (format!("{k:?}"), format!("{v:?}")))
                     .collect::<BTreeMap<_, _>>(),
+                snap.pending_session_ingress_detach_runtime_ids
+                    .into_iter()
+                    .map(|id| format!("{id:?}"))
+                    .collect::<BTreeSet<_>>(),
             )
         })
         .unwrap_or_default();
@@ -21557,6 +21563,7 @@ async fn mob_runtime_parity_snapshot_summary(
         in_progress_task_ids,
         completed_task_ids,
         member_session_bindings,
+        pending_session_ingress_detach_runtime_ids,
         // Track-B (R5): stubbed 0 here; full projection lands alongside
         // `member_session_bindings` wiring-through when the observer
         // runtime exposes the field.
@@ -21617,6 +21624,9 @@ fn mob_runtime_parity_field_value(
                 .keys()
                 .map(|k| (k.clone(), 0u64))
                 .collect(),
+        )),
+        "pending_session_ingress_detach_runtime_ids" => Some(MobRuntimeParityExprValue::Set(
+            snapshot.pending_session_ingress_detach_runtime_ids.clone(),
         )),
         "topology_epoch" => Some(MobRuntimeParityExprValue::U64(snapshot.topology_epoch)),
         "externally_addressable_runtime_ids" => Some(MobRuntimeParityExprValue::Set(

@@ -31,7 +31,10 @@ use meerkat_core::{
     SessionSystemContextState,
 };
 use std::collections::{BTreeMap, HashMap};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::RwLock;
+#[cfg(target_arch = "wasm32")]
+use tokio_with_wasm::alias::sync::RwLock;
 
 use crate::AgentBuildConfig;
 

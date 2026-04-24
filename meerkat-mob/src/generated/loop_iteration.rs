@@ -339,7 +339,7 @@ pub fn transition<C: Context>(
                 loop_id: payload.loop_id.clone(),
                 depth: payload.depth,
                 stage: LoopIterationStage::AwaitingBodyFrame,
-                current_iteration: 1,
+                current_iteration: 0,
                 last_completed_iteration: 0,
                 max_iterations: payload.max_iterations,
                 active_body_frame_id: None,
@@ -409,6 +409,7 @@ pub fn transition<C: Context>(
             let mut next_state = state.clone();
             next_state.stage = LoopIterationStage::AwaitingUntil;
             next_state.last_completed_iteration = payload.iteration;
+            next_state.current_iteration = state.current_iteration + 1;
             next_state.active_body_frame_id = None;
             Ok(Outcome {
                 transition_id: TransitionId::BodyFrameCompleted,
@@ -560,7 +561,6 @@ pub fn transition<C: Context>(
                     parent_node_id: state.parent_node_id.clone(),
                 })]
             } else {
-                next_state.current_iteration = state.current_iteration + 1;
                 next_state.stage = LoopIterationStage::AwaitingBodyFrame;
                 vec![Effect::RequestBodyFrameStart(
                     effects::RequestBodyFrameStart {

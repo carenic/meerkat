@@ -2295,6 +2295,14 @@ impl MobActor {
                     let result = self.apply_dsl_input(*input, "project_machine_input");
                     let _ = reply_tx.send(result);
                 }
+                MobCommand::ProjectMachineSignal { signal } => {
+                    if let Err(error) = self.apply_dsl_signal(signal, "project_machine_signal") {
+                        tracing::error!(
+                            error = %error,
+                            "typed composition signal projection failed"
+                        );
+                    }
+                }
                 MobCommand::FlowFinished { run_id } => {
                     if let Err(error) = self
                         .handle_flow_cleanup(run_id, "flow finished cleanup")
@@ -2345,6 +2353,9 @@ impl MobActor {
                         in_progress_task_ids: dsl.in_progress_task_ids.clone(),
                         completed_task_ids: dsl.completed_task_ids.clone(),
                         member_session_bindings: dsl.member_session_bindings.clone(),
+                        pending_session_ingress_detach_runtime_ids: dsl
+                            .pending_session_ingress_detach_runtime_ids
+                            .clone(),
                     });
                 }
                 MobCommand::StartupKickoffSnapshot { reply_tx } => {
@@ -5884,7 +5895,13 @@ impl MobActor {
             },
             "handle_retire_inner_mark_retiring",
         )?;
-        if let Some(session_id) = detach_session_id {
+        let runtime_id = mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id);
+        let detach_obligation_open = self
+            .dsl_authority
+            .state
+            .pending_session_ingress_detach_runtime_ids
+            .contains(&runtime_id);
+        if let (true, Some(session_id)) = (detach_obligation_open, detach_session_id) {
             self.detach_session_ingress_for_mob_destroy(&entry, &session_id)
                 .await?;
         }

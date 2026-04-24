@@ -498,7 +498,17 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         };
 
         Ok(match (store_snapshot, runtime_snapshot) {
-            (Some(store_session), Some(runtime_session)) => {
+            (Some(store_session), Some(mut runtime_session)) => {
+                if runtime_session.session_metadata().is_none()
+                    && let Some(metadata) = store_session.session_metadata()
+                    && let Err(err) = runtime_session.set_session_metadata(metadata)
+                {
+                    tracing::warn!(
+                        session_id = %id,
+                        error = %err,
+                        "failed to restore session metadata from durable session-store snapshot onto newer runtime snapshot"
+                    );
+                }
                 if runtime_session.updated_at() >= store_session.updated_at() {
                     Some(runtime_session)
                 } else {
@@ -1844,11 +1854,12 @@ mod tests {
         DeferredPromptPolicy, InitialTurnPolicy, SessionBuildOptions, SessionService,
         SessionServiceControlExt,
     };
+    use meerkat_core::session::SESSION_METADATA_KEY;
     use meerkat_core::types::{
         ContentBlock, ContentInput, ImageData, Message, ToolCall, ToolResult, UserMessage,
     };
     use meerkat_core::{RunId, lifecycle::run_primitive::RunApplyBoundary};
-    use meerkat_runtime::InMemoryRuntimeStore;
+    use meerkat_runtime::{InMemoryRuntimeStore, RuntimeStore};
     use meerkat_store::{MemoryBlobStore, MemoryStore, SessionStoreError};
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -3666,6 +3677,75 @@ mod tests {
             .expect("append should persist pending control state");
         assert_eq!(state.pending.len(), 1);
         assert_eq!(state.pending[0].text, "runtime append");
+    }
+
+    #[tokio::test]
+    async fn test_authoritative_runtime_snapshot_preserves_store_owned_session_metadata() {
+        let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+        let runtime_store = Arc::new(InMemoryRuntimeStore::new());
+        let service = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            Arc::clone(&store),
+            Some(runtime_store.clone()),
+            memory_blob_store(),
+        );
+
+        let result = service
+            .create_session(create_request_with_metadata(
+                "hello",
+                meerkat_core::service::InitialTurnPolicy::Defer,
+            ))
+            .await
+            .expect("create_session should succeed");
+        let store_session = store
+            .load(&result.session_id)
+            .await
+            .expect("store load should succeed")
+            .expect("store snapshot should exist");
+        let expected_metadata = store_session
+            .session_metadata()
+            .expect("store snapshot should carry durable session metadata");
+
+        let mut runtime_session = store_session.clone();
+        runtime_session.push(Message::User(UserMessage::text_with_render_metadata(
+            "runtime-only turn",
+            None,
+        )));
+        runtime_session.remove_metadata(SESSION_METADATA_KEY);
+        let session_snapshot =
+            serde_json::to_vec(&runtime_session).expect("runtime snapshot should serialize");
+        runtime_store
+            .commit_session_boundary(
+                &PersistentSessionService::<DummyBuilder>::runtime_id_for_session(
+                    &result.session_id,
+                ),
+                meerkat_runtime::SessionDelta { session_snapshot },
+                RunId::new(),
+                RunApplyBoundary::Immediate,
+                vec![],
+                vec![],
+            )
+            .await
+            .expect("runtime snapshot commit should succeed");
+
+        let authoritative = service
+            .load_authoritative_session(&result.session_id)
+            .await
+            .expect("authoritative load should succeed")
+            .expect("authoritative session should exist");
+
+        assert_eq!(
+            authoritative.messages().len(),
+            runtime_session.messages().len(),
+            "newer runtime snapshot still owns committed conversation state"
+        );
+        let actual_metadata = authoritative
+            .session_metadata()
+            .expect("authoritative session should preserve durable metadata");
+        assert_eq!(actual_metadata.model, expected_metadata.model);
+        assert_eq!(actual_metadata.provider, expected_metadata.provider);
+        assert_eq!(actual_metadata.max_tokens, expected_metadata.max_tokens);
     }
 
     #[tokio::test]

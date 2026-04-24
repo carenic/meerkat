@@ -95,7 +95,7 @@ mod session_management;
 mod traits;
 mod visibility;
 
-pub use composition::MeerkatConsumerSurface;
+pub use composition::{MeerkatCompositionSignalDispatcher, MeerkatConsumerSurface};
 
 pub use comms_drain::{
     CommsDrainMode, CommsDrainPhase, DrainExitReason, PeerEndpointStageError, PeerIngressOwner,
@@ -364,14 +364,40 @@ impl MeerkatMachine {
         String,
     > {
         let authority = self.session_dsl_authority(session_id).await?;
-        let mut authority = authority
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous_state = Box::new(authority.state.clone());
-        let effects = dsl::MeerkatMachineMutator::apply(&mut *authority, input)
-            .map(|transition| transition.effects)
-            .map_err(|err| dsl_authority::map_error(err, context))?;
+        let (previous_state, effects) = {
+            let mut authority = authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous_state = Box::new(authority.state.clone());
+            let effects = dsl::MeerkatMachineMutator::apply(&mut *authority, input)
+                .map(|transition| transition.effects)
+                .map_err(|err| dsl_authority::map_error(err, context))?;
+            (previous_state, effects)
+        };
+        self.dispatch_routed_signals_from_effects(&effects).await?;
         Ok((previous_state, effects))
+    }
+
+    async fn dispatch_routed_signals_from_effects(
+        &self,
+        effects: &[dsl::MeerkatMachineEffect],
+    ) -> Result<(), String> {
+        let dispatcher = {
+            self.composition_signal_dispatcher
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+        let Some(dispatcher) = dispatcher else {
+            return Ok(());
+        };
+
+        for effect in effects {
+            if let Some(signal) = composition::lift_routed_signal(effect) {
+                composition::dispatch_routed_signal(&dispatcher, signal).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn restore_session_dsl_state(
@@ -436,6 +462,11 @@ pub struct MeerkatMachine {
     /// it for their lifetime; the registry is scoped to this `MeerkatMachine`
     /// instance, so tests / multi-runtime processes get clean isolation.
     session_claims: Arc<crate::handles::RuntimeSessionClaimRegistry>,
+    /// Optional typed signal dispatcher for MeerkatMachine lifecycle
+    /// effects routed by `meerkat_mob_seam` into MobMachine observation
+    /// signals.
+    composition_signal_dispatcher:
+        StdRwLock<Option<composition::MeerkatCompositionSignalDispatcher>>,
 }
 
 impl MeerkatMachine {
@@ -457,6 +488,7 @@ impl MeerkatMachine {
             blob_store: None,
             llm_reconfigure_host: StdRwLock::new(None),
             session_claims: Arc::new(crate::handles::RuntimeSessionClaimRegistry::new()),
+            composition_signal_dispatcher: StdRwLock::new(None),
         }
     }
 
@@ -469,6 +501,7 @@ impl MeerkatMachine {
             blob_store: Some(blob_store),
             llm_reconfigure_host: StdRwLock::new(None),
             session_claims: Arc::new(crate::handles::RuntimeSessionClaimRegistry::new()),
+            composition_signal_dispatcher: StdRwLock::new(None),
         }
     }
 
@@ -486,6 +519,7 @@ impl MeerkatMachine {
             blob_store: None,
             llm_reconfigure_host: StdRwLock::new(None),
             session_claims: Arc::new(crate::handles::RuntimeSessionClaimRegistry::new()),
+            composition_signal_dispatcher: StdRwLock::new(None),
         }
     }
 
@@ -495,6 +529,19 @@ impl MeerkatMachine {
     /// machine instance so tests / parallel runtimes do not collide.
     pub fn session_claim_handle(&self) -> Arc<dyn meerkat_core::handles::SessionClaimHandle> {
         Arc::clone(&self.session_claims) as Arc<dyn meerkat_core::handles::SessionClaimHandle>
+    }
+
+    /// Attach the typed composition signal dispatcher used for
+    /// MeerkatMachine -> MobMachine lifecycle observation routes.
+    pub fn set_composition_signal_dispatcher(
+        &self,
+        dispatcher: composition::MeerkatCompositionSignalDispatcher,
+    ) {
+        let mut slot = self
+            .composition_signal_dispatcher
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(dispatcher);
     }
 
     /// Apply a routed-input variant delivered by the `meerkat_mob_seam`
@@ -522,12 +569,15 @@ impl MeerkatMachine {
         let authority = Arc::clone(&entry.dsl_authority);
         drop(sessions);
 
-        let mut guard = authority
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        dsl::MeerkatMachineMutator::apply(&mut *guard, input)
-            .map(|_transition| ())
-            .map_err(|err| format!("{err}"))
+        let effects = {
+            let mut guard = authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            dsl::MeerkatMachineMutator::apply(&mut *guard, input)
+                .map(|transition| transition.effects)
+                .map_err(|err| format!("{err}"))?
+        };
+        self.dispatch_routed_signals_from_effects(&effects).await
     }
 
     #[cfg(test)]

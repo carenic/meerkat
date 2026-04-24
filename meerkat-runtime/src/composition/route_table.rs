@@ -5,14 +5,9 @@
 //! `(producer_instance, effect_variant)`. It mirrors the
 //! `route_to_input` function the codegen emits (B-4 + B-4b) but consumes
 //! the schema directly so the runtime doesn't need to depend on a
-//! generated file tree at wire-up time.
-//!
-//! Signal-kind routes are stored on a separate index
-//! ([`RouteTable::signal_routes`]) so the input dispatcher can refuse them
-//! with a typed [`super::DispatchRefusal::SignalOutOfScope`] instead of
-//! silently dropping them. Wiring signals into their own typed surface is
-//! flagged as a wave-b follow-up (see `docs/dogma-wave-b-plan.md` §V2
-//! note on signal surfaces).
+//! generated file tree at wire-up time. Input-kind and signal-kind routes
+//! are indexed separately and consumed by their matching typed dispatcher
+//! surfaces.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -42,6 +37,19 @@ pub struct RoutedInputDescriptor {
     pub bindings: Vec<(FieldId, FieldId)>,
 }
 
+/// Typed signal-route descriptor returned by [`RouteTable::resolve_signal`].
+///
+/// Always signal-kind: input routes are isolated on the input index and
+/// never surface through signal resolution. `bindings` has the same
+/// producer-field-to-consumer-field meaning as [`RoutedInputDescriptor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedSignalDescriptor {
+    pub route_id: RouteId,
+    pub instance_id: MachineInstanceId,
+    pub signal_variant: SignalVariantId,
+    pub bindings: Vec<(FieldId, FieldId)>,
+}
+
 /// Errors surfaced when building a [`RouteTable`] from a schema.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RouteTableError {
@@ -58,6 +66,20 @@ pub enum RouteTableError {
         existing_route: RouteId,
         duplicate_route: RouteId,
     },
+    /// Two signal routes declared for the same `(producer_instance,
+    /// variant)` pair. Signal routes are a typed dispatch surface too,
+    /// so duplicate declarations are rejected instead of last-writer
+    /// silently winning.
+    #[error(
+        "composition declares duplicate signal route for producer {instance} variant {variant}: \
+         existing={existing_route}, duplicate={duplicate_route}"
+    )]
+    DuplicateSignalRoute {
+        instance: MachineInstanceId,
+        variant: EffectVariantId,
+        existing_route: RouteId,
+        duplicate_route: RouteId,
+    },
     /// An Input-kind route carried a Signal-typed variant id. Schema
     /// validation normally rejects this at declaration time; the table
     /// builder surfaces it as a typed error rather than panicking so
@@ -65,6 +87,12 @@ pub enum RouteTableError {
     /// failure instead of a crash.
     #[error("input-kind route {route} in composition has a signal-typed variant id `{variant}`")]
     InputRouteCarriesSignalVariant { route: RouteId, variant: String },
+    /// A Signal-kind route carried an Input-typed variant id. Schema
+    /// validation normally rejects this at declaration time; the table
+    /// builder returns a typed error to keep malformed hand-assembled
+    /// schemas deterministic.
+    #[error("signal-kind route {route} in composition has an input-typed variant id `{variant}`")]
+    SignalRouteCarriesInputVariant { route: RouteId, variant: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -81,14 +109,7 @@ struct InputKey {
 #[derive(Clone)]
 pub struct RouteTable {
     inputs: HashMap<InputKey, RoutedInputDescriptor>,
-    signals: HashMap<InputKey, SignalDescriptor>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SignalDescriptor {
-    route_id: RouteId,
-    instance_id: MachineInstanceId,
-    signal_variant: SignalVariantId,
+    signals: HashMap<InputKey, RoutedSignalDescriptor>,
 }
 
 impl fmt::Debug for RouteTable {
@@ -110,7 +131,7 @@ impl RouteTable {
     /// a separate map).
     pub fn from_schema(schema: &CompositionSchema) -> Result<Self, RouteTableError> {
         let mut inputs: HashMap<InputKey, RoutedInputDescriptor> = HashMap::new();
-        let mut signals: HashMap<InputKey, SignalDescriptor> = HashMap::new();
+        let mut signals: HashMap<InputKey, RoutedSignalDescriptor> = HashMap::new();
 
         for route in &schema.routes {
             let key = InputKey {
@@ -132,22 +153,16 @@ impl RouteTable {
                     inputs.insert(key, descriptor);
                 }
                 RouteTargetKind::Signal => {
-                    if let RouteVariantId::Signal(signal_variant) = &route.to.input_variant {
-                        signals.insert(
-                            key,
-                            SignalDescriptor {
-                                route_id: route.name.clone(),
-                                instance_id: route.to.machine.clone(),
-                                signal_variant: signal_variant.clone(),
-                            },
-                        );
+                    let descriptor = Self::build_signal_descriptor(route)?;
+                    if let Some(existing) = signals.get(&key) {
+                        return Err(RouteTableError::DuplicateSignalRoute {
+                            instance: key.instance.clone(),
+                            variant: key.variant.clone(),
+                            existing_route: existing.route_id.clone(),
+                            duplicate_route: route.name.clone(),
+                        });
                     }
-                    // Kind==Signal with a non-Signal variant id would be a
-                    // schema invariant violation; the schema's own
-                    // `RouteTarget::new` enforces the pairing, so this
-                    // branch is unreachable in practice. We intentionally
-                    // avoid panicking here — a malformed schema is caught
-                    // at schema-validation time, not at route-table build.
+                    signals.insert(key, descriptor);
                 }
             }
         }
@@ -166,7 +181,35 @@ impl RouteTable {
             }
         };
 
-        let bindings: Vec<(FieldId, FieldId)> = route
+        Ok(RoutedInputDescriptor {
+            route_id: route.name.clone(),
+            instance_id: route.to.machine.clone(),
+            input_variant,
+            bindings: Self::field_bindings(route),
+        })
+    }
+
+    fn build_signal_descriptor(route: &Route) -> Result<RoutedSignalDescriptor, RouteTableError> {
+        let signal_variant = match &route.to.input_variant {
+            RouteVariantId::Signal(id) => id.clone(),
+            RouteVariantId::Input(id) => {
+                return Err(RouteTableError::SignalRouteCarriesInputVariant {
+                    route: route.name.clone(),
+                    variant: id.as_str().to_owned(),
+                });
+            }
+        };
+
+        Ok(RoutedSignalDescriptor {
+            route_id: route.name.clone(),
+            instance_id: route.to.machine.clone(),
+            signal_variant,
+            bindings: Self::field_bindings(route),
+        })
+    }
+
+    fn field_bindings(route: &Route) -> Vec<(FieldId, FieldId)> {
+        route
             .bindings
             .iter()
             .filter_map(|binding| match &binding.source {
@@ -175,14 +218,7 @@ impl RouteTable {
                 }
                 RouteBindingSource::Literal(_) | RouteBindingSource::OwnerProvided => None,
             })
-            .collect();
-
-        Ok(RoutedInputDescriptor {
-            route_id: route.name.clone(),
-            instance_id: route.to.machine.clone(),
-            input_variant,
-            bindings,
-        })
+            .collect()
     }
 
     /// Resolve a producer `(instance_id, effect_variant)` to the typed
@@ -200,6 +236,20 @@ impl RouteTable {
         })
     }
 
+    /// Resolve a producer `(instance_id, effect_variant)` to the typed
+    /// signal descriptor. Returns `None` if no signal-kind route exists
+    /// for the pair.
+    pub fn resolve_signal(
+        &self,
+        instance_id: &MachineInstanceId,
+        effect_variant: &EffectVariantId,
+    ) -> Option<&RoutedSignalDescriptor> {
+        self.signals.get(&InputKey {
+            instance: instance_id.clone(),
+            variant: effect_variant.clone(),
+        })
+    }
+
     /// Count of input-kind routes. Primarily for diagnostics.
     pub fn len(&self) -> usize {
         self.inputs.len()
@@ -210,9 +260,7 @@ impl RouteTable {
         self.inputs.is_empty()
     }
 
-    /// Number of signal-kind routes this table is aware of. The dispatcher
-    /// never consumes them; they're exposed for the signal surface
-    /// follow-up and for RMAT audits that want to prove signal coverage.
+    /// Number of signal-kind routes this table is aware of.
     pub fn signal_route_count(&self) -> usize {
         self.signals.len()
     }
@@ -275,6 +323,34 @@ mod tests {
         // `RuntimeBound` is a Signal-kind route; it must NOT surface in
         // the input-lookup path.
         assert!(table.resolve(&meerkat, &runtime_bound).is_none());
+    }
+
+    #[test]
+    fn resolves_runtime_bound_signal_binding_to_mob_signal() {
+        let schema = meerkat_mob_seam_composition();
+        let table = RouteTable::from_schema(&schema).unwrap();
+
+        let meerkat = MachineInstanceId::parse("meerkat").unwrap();
+        let runtime_bound = EffectVariantId::parse("RuntimeBound").unwrap();
+        let descriptor = table
+            .resolve_signal(&meerkat, &runtime_bound)
+            .expect("known signal route");
+
+        assert_eq!(descriptor.route_id.as_str(), "runtime_bound_reaches_mob");
+        assert_eq!(descriptor.instance_id.as_str(), "mob");
+        assert_eq!(descriptor.signal_variant.as_str(), "ObserveRuntimeReady");
+        let field_pairs: Vec<(&str, &str)> = descriptor
+            .bindings
+            .iter()
+            .map(|(from, to)| (from.as_str(), to.as_str()))
+            .collect();
+        assert_eq!(
+            field_pairs,
+            vec![
+                ("agent_runtime_id", "agent_runtime_id"),
+                ("fence_token", "fence_token"),
+            ]
+        );
     }
 
     #[test]

@@ -2113,6 +2113,33 @@ class MeerkatClient:
             {"mob_id": mob_id, "filter": filter},
         )
 
+    async def status(self, session_id: str) -> RuntimeStateResult:
+        """Return the runtime state for a session via `session/status`."""
+        raw = await self._request("session/status", {"session_id": session_id})
+        return RuntimeStateResult(**raw)
+
+    async def submit(
+        self, session_id: str, input: dict[str, Any]
+    ) -> RuntimeAcceptResult:
+        """Submit a runtime input via `session/submit`."""
+        raw = await self._request(
+            "session/submit",
+            {"session_id": session_id, "input": input},
+        )
+        return RuntimeAcceptResult(**raw)
+
+    async def submission(
+        self, session_id: str, input_id: str
+    ) -> WireInputState | None:
+        """Read one runtime input state via `session/submission`."""
+        raw = await self._request(
+            "session/submission",
+            {"session_id": session_id, "input_id": input_id},
+        )
+        if raw is None:
+            return None
+        return self._parse_wire_input_state(raw)
+
     async def realtime_open_info(
         self, request: RealtimeOpenRequest | dict[str, Any]
     ) -> RealtimeOpenInfo:

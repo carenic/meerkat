@@ -793,9 +793,9 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
         }),
         21 => Some(&Spec {
             id: Some(21),
-            lane: Lane::Live,
-            title: "REST runtime accept input roundtrip",
-            timeout_secs: 900,
+            lane: Lane::Smoke,
+            title: "RPC mob deferred callback tools",
+            timeout_secs: 1500,
             required_env: &[&["RKAT_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"]],
             required_bins: &["cargo"],
             cwd: ".",
@@ -803,18 +803,18 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
             cargo_bin_env: &[],
             pre_commands: &[],
             command: CommandSpec::CargoTest {
-                package: "meerkat-rest",
-                test_target: "live_rest_matrix",
-                test_name: "e2e_scenario_21_rest_runtime_accept_input_roundtrip",
-                features: &["integration-real-tests"],
+                package: "meerkat-rpc",
+                test_target: "live_smoke_rpc",
+                test_name: "e2e_scenario_21_mob_callback_tools",
+                features: &[],
                 all_features: false,
             },
         }),
         22 => Some(&Spec {
             id: Some(22),
-            lane: Lane::Live,
-            title: "REST runtime reset and retire semantics",
-            timeout_secs: 900,
+            lane: Lane::Smoke,
+            title: "RPC transport backpressure",
+            timeout_secs: 1500,
             required_env: &[&["RKAT_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"]],
             required_bins: &["cargo"],
             cwd: ".",
@@ -822,10 +822,10 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
             cargo_bin_env: &[],
             pre_commands: &[],
             command: CommandSpec::CargoTest {
-                package: "meerkat-rest",
-                test_target: "live_rest_matrix",
-                test_name: "e2e_scenario_22_rest_runtime_reset_and_retire_drain_staged_inputs",
-                features: &["integration-real-tests"],
+                package: "meerkat-rpc",
+                test_target: "live_smoke_rpc",
+                test_name: "e2e_scenario_22_transport_backpressure",
+                features: &[],
                 all_features: false,
             },
         }),
@@ -1209,7 +1209,7 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
             ],
             command: CommandSpec::Pytest {
                 test_file: "tests/test_e2e_smoke.py",
-                test_name: "test_smoke_scenario_39_persistent_reconnect_and_runtime_accept",
+                test_name: "test_smoke_scenario_39_persistent_reconnect_and_session_submit",
             },
         }),
         40 => Some(&Spec {
@@ -3170,8 +3170,8 @@ mod tests {
         let system = (15..=56)
             .filter(|id| scenario_spec(*id).map(|spec| spec.lane) == Some(Lane::System))
             .count();
-        assert_eq!(live, 26);
-        assert_eq!(smoke, 15);
+        assert_eq!(live, 24);
+        assert_eq!(smoke, 17);
         assert_eq!(system, 1);
     }
 }

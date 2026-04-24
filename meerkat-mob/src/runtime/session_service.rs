@@ -350,6 +350,13 @@ where
         }
     }
 
+    async fn load_persisted_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<Session>, SessionError> {
+        self.load_authoritative_session(session_id).await
+    }
+
     async fn execution_snapshot(
         &self,
         session_id: &SessionId,

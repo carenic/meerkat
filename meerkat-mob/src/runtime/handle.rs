@@ -153,6 +153,17 @@ impl MobMemberSnapshot {
     pub fn agent_identity(&self) -> &AgentIdentity {
         &self.agent_runtime_id.identity
     }
+
+    /// Runtime incarnation identity for diagnostic/control projections.
+    ///
+    /// These atoms stay out of generic `Serialize` output so app-facing
+    /// receipts do not couple callers to bridge internals. Surfaces that own a
+    /// control contract, such as `mob/member_status`, must opt in through this
+    /// accessor and project the fields explicitly.
+    #[must_use]
+    pub fn runtime_identity_fields(&self) -> (&AgentRuntimeId, FenceToken) {
+        (&self.agent_runtime_id, self.fence_token)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3560,6 +3571,34 @@ mod tests {
         // (derived from `agent_runtime_id.identity`).
         assert!(snapshot_value.get("agent_runtime_id").is_none());
         assert!(snapshot_value.get("fence_token").is_none());
+    }
+
+    #[test]
+    fn mob_member_snapshot_exposes_runtime_identity_only_by_accessor() {
+        let runtime_id = AgentRuntimeId::new(AgentIdentity::from("worker"), Generation::new(3));
+        let snapshot = MobMemberSnapshot {
+            status: MobMemberStatus::Active,
+            agent_runtime_id: runtime_id.clone(),
+            fence_token: FenceToken::new(9),
+            output_preview: None,
+            error: None,
+            tokens_used: 0,
+            is_final: false,
+            realtime_attachment_status: None,
+            current_session_id: None,
+            current_bridge_session_id: None,
+            peer_connectivity: None,
+            kickoff: None,
+        };
+
+        let snapshot_value =
+            serde_json::to_value(&snapshot).expect("snapshot should serialize to json");
+        assert!(snapshot_value.get("agent_runtime_id").is_none());
+        assert!(snapshot_value.get("fence_token").is_none());
+
+        let (projected_runtime_id, projected_fence_token) = snapshot.runtime_identity_fields();
+        assert_eq!(projected_runtime_id, &runtime_id);
+        assert_eq!(projected_fence_token, FenceToken::new(9));
     }
 
     #[test]

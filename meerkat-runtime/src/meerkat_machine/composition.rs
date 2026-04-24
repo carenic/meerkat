@@ -37,9 +37,14 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use meerkat_core::types::SessionId;
-use meerkat_machine_schema::identity::{FieldId, InputVariantId, MachineInstanceId};
+use meerkat_machine_schema::identity::{
+    CompositionId, EffectVariantId, FieldId, InputVariantId, MachineId, MachineInstanceId,
+};
 
-use crate::composition::{ConsumerSurface, OwnedFieldValue};
+use crate::composition::{
+    CompositionSignalDispatcher, FieldValue, ProducerInstance, ProducerSignal, SignalPayload,
+};
+use crate::composition::{ConsumerSurface, OwnedFieldValue, SignalDispatchOutcome};
 use crate::meerkat_machine::{MeerkatMachine, dsl as mm_dsl};
 
 /// Consumer-side surface for the `meerkat_mob_seam` composition.
@@ -68,6 +73,133 @@ pub struct MeerkatConsumerSurface {
     /// session and the surface refuses variants whose projected
     /// `agent_runtime_id` disagrees.
     pinned_session: Option<SessionId>,
+}
+
+/// Producer-side signal source sum for MeerkatMachine lifecycle effects
+/// routed through the `meerkat_mob_seam` signal surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeerkatSeamSignal {
+    RuntimeBound {
+        agent_runtime_id: mm_dsl::AgentRuntimeId,
+        fence_token: mm_dsl::FenceToken,
+    },
+    RuntimeRetired {
+        agent_runtime_id: mm_dsl::AgentRuntimeId,
+        fence_token: mm_dsl::FenceToken,
+    },
+    RuntimeDestroyed {
+        agent_runtime_id: mm_dsl::AgentRuntimeId,
+        fence_token: mm_dsl::FenceToken,
+    },
+}
+
+impl MeerkatSeamSignal {
+    pub fn variant_id(&self) -> EffectVariantId {
+        let slug = match self {
+            Self::RuntimeBound { .. } => "RuntimeBound",
+            Self::RuntimeRetired { .. } => "RuntimeRetired",
+            Self::RuntimeDestroyed { .. } => "RuntimeDestroyed",
+        };
+        match EffectVariantId::parse(slug) {
+            Ok(id) => id,
+            Err(err) => unreachable!("meerkat seam signal slug rejected: {err}"),
+        }
+    }
+
+    fn field(&self, id: &FieldId) -> Option<FieldValue<'_>> {
+        let (agent_runtime_id, fence_token) = match self {
+            Self::RuntimeBound {
+                agent_runtime_id,
+                fence_token,
+            }
+            | Self::RuntimeRetired {
+                agent_runtime_id,
+                fence_token,
+            }
+            | Self::RuntimeDestroyed {
+                agent_runtime_id,
+                fence_token,
+            } => (agent_runtime_id, fence_token),
+        };
+        match id.as_str() {
+            "agent_runtime_id" => Some(FieldValue::Str(agent_runtime_id.0.as_str())),
+            "fence_token" => Some(FieldValue::U64(fence_token.0)),
+            _ => None,
+        }
+    }
+}
+
+impl ProducerSignal for MeerkatSeamSignal {
+    fn variant_id(&self) -> EffectVariantId {
+        self.variant_id()
+    }
+
+    fn field(&self, id: &FieldId) -> Option<FieldValue<'_>> {
+        self.field(id)
+    }
+}
+
+pub type MeerkatCompositionSignalDispatcher =
+    Arc<dyn CompositionSignalDispatcher<Signal = MeerkatSeamSignal>>;
+
+pub fn meerkat_producer_instance() -> ProducerInstance {
+    let composition = match CompositionId::parse("meerkat_mob_seam") {
+        Ok(id) => id,
+        Err(err) => unreachable!("canonical composition slug rejected: {err}"),
+    };
+    let machine = match MachineId::parse("MeerkatMachine") {
+        Ok(id) => id,
+        Err(err) => unreachable!("canonical machine id rejected: {err}"),
+    };
+    ProducerInstance {
+        composition,
+        instance_id: meerkat_instance_id().clone(),
+        machine,
+    }
+}
+
+pub fn lift_routed_signal(effect: &mm_dsl::MeerkatMachineEffect) -> Option<MeerkatSeamSignal> {
+    match effect {
+        mm_dsl::MeerkatMachineEffect::RuntimeBound {
+            agent_runtime_id,
+            fence_token,
+        } => Some(MeerkatSeamSignal::RuntimeBound {
+            agent_runtime_id: agent_runtime_id.clone(),
+            fence_token: *fence_token,
+        }),
+        mm_dsl::MeerkatMachineEffect::RuntimeRetired {
+            agent_runtime_id,
+            fence_token,
+        } => Some(MeerkatSeamSignal::RuntimeRetired {
+            agent_runtime_id: agent_runtime_id.clone(),
+            fence_token: *fence_token,
+        }),
+        mm_dsl::MeerkatMachineEffect::RuntimeDestroyed {
+            agent_runtime_id,
+            fence_token,
+        } => Some(MeerkatSeamSignal::RuntimeDestroyed {
+            agent_runtime_id: agent_runtime_id.clone(),
+            fence_token: *fence_token,
+        }),
+        _ => None,
+    }
+}
+
+pub async fn dispatch_routed_signal(
+    dispatcher: &MeerkatCompositionSignalDispatcher,
+    signal: MeerkatSeamSignal,
+) -> Result<SignalDispatchOutcome, String> {
+    let variant = signal.variant_id();
+    dispatcher
+        .dispatch_signal(
+            meerkat_producer_instance(),
+            SignalPayload::Emitted {
+                variant,
+                body: signal,
+            },
+        )
+        .await
+        .map_err(|refusal| refusal.to_string())
 }
 
 impl std::fmt::Debug for MeerkatConsumerSurface {
@@ -247,6 +379,10 @@ impl ConsumerSurface for MeerkatConsumerSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::composition::{
+        CatalogCompositionSignalDispatcher, OwnedFieldValue, RouteTable, SignalConsumerSurface,
+    };
+    use meerkat_machine_schema::identity::SignalVariantId;
 
     fn fld(slug: &str) -> FieldId {
         FieldId::parse(slug).expect("field slug")
@@ -333,5 +469,63 @@ mod tests {
             .await
             .expect_err("session_id disagrees with pinned session");
         assert!(err.contains("pinned"), "{err}");
+    }
+
+    #[derive(Default)]
+    struct RecordingSignalSurface {
+        log: tokio::sync::Mutex<Vec<(SignalVariantId, Vec<(FieldId, OwnedFieldValue)>)>>,
+    }
+
+    #[async_trait]
+    impl SignalConsumerSurface for RecordingSignalSurface {
+        fn instance_id(&self) -> &MachineInstanceId {
+            static ID: OnceLock<MachineInstanceId> = OnceLock::new();
+            ID.get_or_init(|| MachineInstanceId::parse("mob").expect("canonical instance id"))
+        }
+
+        async fn receive_signal(
+            &self,
+            variant: SignalVariantId,
+            projected_fields: Vec<(FieldId, OwnedFieldValue)>,
+        ) -> Result<(), String> {
+            self.log.lock().await.push((variant, projected_fields));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn routed_prepare_bindings_dispatches_runtime_bound_signal() {
+        let machine = Arc::new(MeerkatMachine::ephemeral());
+        let session_id = SessionId::new();
+        machine.register_session(session_id.clone()).await;
+
+        let signal_surface = Arc::new(RecordingSignalSurface::default());
+        let schema = meerkat_machine_schema::catalog::meerkat_mob_seam_composition();
+        let table = RouteTable::from_schema(&schema).expect("catalog routes");
+        let dispatcher: CatalogCompositionSignalDispatcher<MeerkatSeamSignal> =
+            CatalogCompositionSignalDispatcher::new(schema.name.clone(), table)
+                .with_consumer(signal_surface.clone());
+        machine.set_composition_signal_dispatcher(Arc::new(dispatcher));
+
+        machine
+            .apply_routed_meerkat_input(
+                &session_id,
+                mm_dsl::MeerkatMachineInput::PrepareBindings {
+                    agent_runtime_id: mm_dsl::AgentRuntimeId("rt-1".into()),
+                    fence_token: mm_dsl::FenceToken(11),
+                    generation: mm_dsl::Generation(0),
+                    session_id: mm_dsl::SessionId(session_id.to_string()),
+                },
+            )
+            .await
+            .expect("routed input applies and emits signal");
+
+        let log = signal_surface.log.lock().await;
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].0.as_str(), "ObserveRuntimeReady");
+        assert_eq!(log[0].1[0].0.as_str(), "agent_runtime_id");
+        assert!(matches!(&log[0].1[0].1, OwnedFieldValue::Str(value) if value == "rt-1"));
+        assert_eq!(log[0].1[1].0.as_str(), "fence_token");
+        assert!(matches!(log[0].1[1].1, OwnedFieldValue::U64(11)));
     }
 }

@@ -1,5 +1,5 @@
 import { KNOWN_AGENT_EVENT_TYPES } from './generated/events.js';
-import type { AgentEvent, Usage } from './generated/events.js';
+import type { AgentEvent, SkillKey, Usage } from './generated/events.js';
 
 // ─── Bootstrap config ───────────────────────────────────────────
 
@@ -47,6 +47,8 @@ export interface InitResult {
 export interface SessionConfig {
   /** LLM model identifier. */
   model: string;
+  /** Optional realm-qualified auth binding reference (`realm:binding[:profile]`). */
+  connectionRef?: string;
   /** System prompt. */
   systemPrompt?: string;
   /** Max tokens per response. Default: 4096. */
@@ -183,9 +185,11 @@ export type {
   RunFailedEvent,
   RunStartedEvent,
   SessionId,
-  SkillId,
+  SkillKey,
+  SkillName,
   SkillsResolvedEvent,
   SkillResolutionFailedEvent,
+  SourceUuid,
   StopReason,
   StreamTruncatedEvent,
   TextCompleteEvent,
@@ -215,6 +219,9 @@ export type {
   InteractionCompleteEvent,
   InteractionFailedEvent,
 } from './generated/events.js';
+
+/** Backward-compatible alias for the generated skill key shape. */
+export type SkillId = SkillKey;
 
 // ─── Mob types (matches meerkat-mob Rust wire format) ───────────
 

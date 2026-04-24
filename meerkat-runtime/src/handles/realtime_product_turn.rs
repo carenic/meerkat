@@ -256,6 +256,23 @@ impl RealtimeProductTurnHandle for RuntimeRealtimeProductTurnHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(&observer));
     }
 
+    fn install_projection_freshness_observer_with_snapshot(
+        &self,
+        observer: Arc<dyn RealtimeProjectionFreshnessObserver>,
+    ) -> (RealtimeProjectionFreshness, u64) {
+        self.dsl.with_state_lock(|state| {
+            *self
+                .freshness_observer
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Arc::downgrade(&observer));
+            (
+                map_freshness(state.realtime_projection_freshness),
+                state.realtime_projection_frontier_ms,
+            )
+        })
+    }
+
     // ---- Reconnect policy (dogma round 2, U-C) ----
 
     fn classify_client_input_submitted(&self) -> Result<bool, DslTransitionError> {

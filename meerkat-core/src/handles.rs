@@ -1338,6 +1338,25 @@ pub trait RealtimeProductTurnHandle: Send + Sync {
         observer: Arc<dyn RealtimeProjectionFreshnessObserver>,
     );
 
+    /// Atomically install a typed observer and return the current
+    /// freshness snapshot as a single authority read. Implementations
+    /// MUST hold the same authority lock that projection transitions use
+    /// for both observer installation and the `(freshness, frontier)`
+    /// sample, so no `RealtimeProjectionFreshnessChanged` effect can
+    /// slip between "observer visible" and "socket seeded from the DSL".
+    ///
+    /// Callers that only need best-effort notification may use
+    /// [`Self::install_projection_freshness_observer`]. Realtime socket
+    /// bindings should prefer this method so wake registration and the
+    /// typed DSL snapshot share one ordering point.
+    fn install_projection_freshness_observer_with_snapshot(
+        &self,
+        observer: Arc<dyn RealtimeProjectionFreshnessObserver>,
+    ) -> (RealtimeProjectionFreshness, u64) {
+        self.install_projection_freshness_observer(observer);
+        (self.projection_freshness(), self.projection_frontier_ms())
+    }
+
     // ---- Reconnect policy (dogma round 2, U-C / dogma #1, #3, #18, #20) ----
 
     /// Fire `ClassifyRealtimeClientInputSubmitted` — the client's input

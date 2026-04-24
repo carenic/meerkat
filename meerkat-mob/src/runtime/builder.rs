@@ -1494,7 +1494,14 @@ impl MobBuilder {
         // standalone path (no consumer exists by construction).
         #[cfg(feature = "runtime-adapter")]
         let composition_binding = match &runtime_adapter {
-            Some(adapter) => super::composition::wired_binding_from_runtime_adapter(adapter),
+            Some(adapter) => {
+                let binding = super::composition::wired_binding_from_runtime_adapter(adapter);
+                super::composition::attach_signal_dispatcher_to_runtime_adapter(
+                    adapter,
+                    command_tx.clone(),
+                );
+                binding
+            }
             None => meerkat_runtime::composition::CompositionBinding::Standalone,
         };
         #[cfg(not(feature = "runtime-adapter"))]

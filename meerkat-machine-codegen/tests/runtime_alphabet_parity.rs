@@ -174,6 +174,8 @@ fn mob_machine_inputs_equal_runtime_manifest_exactly() {
         "BindMemberSession",
         "RotateMemberSession",
         "ReleaseMemberSession",
+        "SessionIngressDetachedForMobDestroy",
+        "SessionIngressDetachFailedForMobDestroy",
     ];
     let actual: BTreeSet<&str> = variant_names(&schema.inputs.variants)
         .into_iter()

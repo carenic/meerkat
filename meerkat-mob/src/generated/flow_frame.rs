@@ -445,11 +445,14 @@ fn is_terminal(status: NodeRunStatus) -> bool {
 }
 
 fn dependency_satisfied(status: NodeRunStatus) -> bool {
-    matches!(status, NodeRunStatus::Completed | NodeRunStatus::Skipped)
+    matches!(status, NodeRunStatus::Completed)
 }
 
 fn dependency_terminal_failure(status: NodeRunStatus) -> bool {
-    matches!(status, NodeRunStatus::Failed | NodeRunStatus::Canceled)
+    matches!(
+        status,
+        NodeRunStatus::Failed | NodeRunStatus::Skipped | NodeRunStatus::Canceled
+    )
 }
 
 fn refresh_ready_frontier(state: &mut State) {

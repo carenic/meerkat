@@ -11,7 +11,7 @@ use meerkat_core::skills::{SkillError, SkillScope};
 use meerkat_core::skills_config::{SkillRepoTransport, SkillsConfig};
 
 use crate::source::composite::NamedSource;
-use crate::source::{CompositeSkillSource, FilesystemSkillSource, SourceNode};
+use crate::source::{CompositeSkillSource, EmbeddedSkillSource, FilesystemSkillSource, SourceNode};
 
 pub async fn resolve_repositories(
     config: &SkillsConfig,
@@ -31,7 +31,10 @@ pub async fn resolve_repositories_with_roots(
         return Ok(None);
     }
 
-    let mut sources: Vec<NamedSource> = Vec::new();
+    let mut sources: Vec<NamedSource> = vec![NamedSource {
+        name: "embedded".to_string(),
+        source: SourceNode::Embedded(EmbeddedSkillSource::new()),
+    }];
     for repo in &config.repositories {
         match &repo.transport {
             SkillRepoTransport::Filesystem { path } => {
@@ -65,9 +68,7 @@ pub async fn resolve_repositories_with_roots(
         }
     }
 
-    if sources.is_empty()
-        && let Some(root) = context_root
-    {
+    if let Some(root) = context_root {
         let default_project_skills = root.join(".rkat/skills");
         if default_project_skills.is_dir() {
             sources.push(NamedSource {
