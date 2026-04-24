@@ -123,7 +123,14 @@ impl AgentToolDispatcher for MemorySearchDispatcher {
                 })
             })
             .collect();
-        let payload = json!({ "results": items }).to_string();
+        // Bare-array wire shape: the tool returns a list of result objects,
+        // and every test in this module expects `Vec<Value>` via
+        // `serde_json::from_str`. The `0c9acc473` wave-d baseline wrapped
+        // items in `{"results": items}` but that wrapper isn't consumed by
+        // any production caller (only test fixtures that parse as Vec),
+        // and MCP-style tool outputs conventionally emit the list directly
+        // when the result is a list.
+        let payload = Value::Array(items).to_string();
         Ok(meerkat_core::ops::ToolDispatchOutcome::from(
             ToolResult::new(call.id.to_string(), payload, false),
         ))
