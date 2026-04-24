@@ -10,7 +10,7 @@
 //! `{ realm: RealmId, binding: BindingId, profile: Option<ProfileId> }`.
 //!
 //! The tripwire at `meerkat-cli/tests/connection_ref_single_parser.rs`
-//! enforces that exactly one `fn parse_connection_ref_user_input` lives
+//! enforces that exactly one parser function with this symbol lives
 //! under `meerkat-cli/src/`. That is the structural guard against
 //! ad-hoc colon-split parsing drifting back into handler code.
 //!
