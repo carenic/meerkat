@@ -13,8 +13,8 @@ use crate::{
     CompositionInvariant, CompositionInvariantKind, CompositionSchema, CompositionStateLimits,
     CompositionTransactionPlan, CompositionWitness, DriverDispatchRoute, EffectHandoffProtocol,
     EntryInput, FeedbackFieldBinding, FeedbackFieldSource, FeedbackInputRef, MachineInstance,
-    ProtocolGenerationMode, ProtocolHelperReturnShape, ProtocolRustBinding, Route,
-    RouteBindingSource, RouteDelivery, RouteFieldBinding, RouteTarget, RouteTargetKind,
+    ProtocolGenerationMode, ProtocolHandleArgKey, ProtocolHelperReturnShape, ProtocolRustBinding,
+    Route, RouteBindingSource, RouteDelivery, RouteFieldBinding, RouteTarget, RouteTargetKind,
     RouteVariantId, WatchedEffect,
 };
 
@@ -519,8 +519,7 @@ pub fn meerkat_mob_seam_composition() -> CompositionSchema {
         // `CatalogCompositionDispatcher`) consumes. The four `watched_effects`
         // and `dispatch_routes` below mirror the four Input-kind `routes`
         // above (producer=mob, consumer=meerkat); Signal-kind routes are
-        // excluded by `render_composition_driver` and handled by the signal
-        // surface.
+        // emitted through the generated `route_to_signal` surface.
         driver: Some(CompositionDriver {
             name: "meerkat_mob_seam_driver".into(),
             rust: CompositionDriverRustBinding {
@@ -860,13 +859,16 @@ fn flow_frame_loop_composition() -> CompositionSchema {
 /// secondary `HandleBridge` (handle-driven submitter suffixed `_handle`).
 fn mob_bundle_composition() -> CompositionSchema {
     let mut handle_methods = BTreeMap::new();
-    handle_methods.insert("OpsBarrierSatisfied".into(), "ops_barrier_satisfied".into());
+    handle_methods.insert(iv_id("OpsBarrierSatisfied"), "ops_barrier_satisfied".into());
     // Handle method takes `operation_ids: BTreeSet<String>` — the obligation
     // field is `Set<OperationId>` which renders as `Vec<OperationId>`. The
     // accessor rewrites the reference to stringify each operation id.
     let mut handle_accessors = BTreeMap::new();
     handle_accessors.insert(
-        "OpsBarrierSatisfied.operation_ids".into(),
+        ProtocolHandleArgKey {
+            input_variant: iv_id("OpsBarrierSatisfied"),
+            obligation_field: fld_id("operation_ids"),
+        },
         ".iter().map(ToString::to_string).collect()".into(),
     );
     // Handle method takes only `operation_ids`; the obligation carries
@@ -874,16 +876,15 @@ fn mob_bundle_composition() -> CompositionSchema {
     // never consumes (the ops-lifecycle owner matches on it internally,
     // not through the handle).
     let mut handle_forwarded_fields = BTreeMap::new();
-    handle_forwarded_fields.insert("OpsBarrierSatisfied".into(), vec!["operation_ids".into()]);
+    handle_forwarded_fields.insert(iv_id("OpsBarrierSatisfied"), vec![fld_id("operation_ids")]);
 
     CompositionSchema {
         name: comp_id("mob_bundle"),
         // The producer is the compat `OpsBarrierBridgeMachine` which hosts
         // the handoff-annotated `WaitAllSatisfied` effect declaration.
-        // Its shape mirrors the runtime-owned effect; the canonical
-        // `MeerkatMachine` also declares `WaitAllSatisfied` (without the
-        // handoff annotation the DSL macro cannot emit) so the runtime
-        // shell still observes the effect through its own reducer.
+        // Its shape mirrors the runtime-owned effect; the DSL can now
+        // express this handoff directly when this producer moves back to
+        // the canonical `MeerkatMachine` instance.
         machines: vec![MachineInstance {
             instance_id: mi_id("ops_barrier_bridge"),
             machine_name: mach_id("OpsBarrierBridgeMachine"),
@@ -990,8 +991,9 @@ fn mob_bundle_composition() -> CompositionSchema {
 /// Both protocols' producer-side effects are emitted by the runtime's
 /// hand-written `ExternalToolSurfaceAuthority`. The compat
 /// `ExternalToolSurfaceBridgeMachine` mirrors each effect's shape and
-/// hosts the `handoff_protocol` annotation that the canonical DSL
-/// macro cannot express.
+/// hosts handoff annotations in the same DSL/schema shape now available
+/// to the canonical producer, preserving checked helper output while the
+/// bridge module remains the declared producer.
 ///
 /// - `surface_completion` — EffectExtractor (scans `ExternalToolSurfaceEffect`
 ///   for `ScheduleSurfaceCompletion` variants) + HandleBridge
@@ -1002,32 +1004,44 @@ fn mob_bundle_composition() -> CompositionSchema {
 ///   (`snapshot_aligned`). Same shape, single field.
 fn external_tool_bundle_composition() -> CompositionSchema {
     let mut completion_methods = BTreeMap::new();
-    completion_methods.insert("PendingSucceeded".into(), "mark_pending_succeeded".into());
-    completion_methods.insert("PendingFailed".into(), "mark_pending_failed".into());
+    completion_methods.insert(iv_id("PendingSucceeded"), "mark_pending_succeeded".into());
+    completion_methods.insert(iv_id("PendingFailed"), "mark_pending_failed".into());
     let mut completion_accessors = BTreeMap::new();
     // Handle takes `String` surface_id; obligation carries typed SurfaceId.
-    completion_accessors.insert("PendingSucceeded.surface_id".into(), ".0".into());
-    completion_accessors.insert("PendingFailed.surface_id".into(), ".0".into());
+    completion_accessors.insert(
+        ProtocolHandleArgKey {
+            input_variant: iv_id("PendingSucceeded"),
+            obligation_field: fld_id("surface_id"),
+        },
+        ".0".into(),
+    );
+    completion_accessors.insert(
+        ProtocolHandleArgKey {
+            input_variant: iv_id("PendingFailed"),
+            obligation_field: fld_id("surface_id"),
+        },
+        ".0".into(),
+    );
     let mut completion_forwarded = BTreeMap::new();
     // `mark_pending_succeeded(surface_id, pending_task_sequence, staged_intent_sequence)`.
     completion_forwarded.insert(
-        "PendingSucceeded".into(),
+        iv_id("PendingSucceeded"),
         vec![
-            "surface_id".into(),
-            "pending_task_sequence".into(),
-            "staged_intent_sequence".into(),
+            fld_id("surface_id"),
+            fld_id("pending_task_sequence"),
+            fld_id("staged_intent_sequence"),
         ],
     );
     // `mark_pending_failed(surface_id, reason)` — `reason` is owner-context.
     completion_forwarded.insert(
-        "PendingFailed".into(),
-        vec!["surface_id".into(), "reason".into()],
+        iv_id("PendingFailed"),
+        vec![fld_id("surface_id"), fld_id("reason")],
     );
 
     let mut snapshot_methods = BTreeMap::new();
-    snapshot_methods.insert("SnapshotAligned".into(), "snapshot_aligned".into());
+    snapshot_methods.insert(iv_id("SnapshotAligned"), "snapshot_aligned".into());
     let mut snapshot_forwarded = BTreeMap::new();
-    snapshot_forwarded.insert("SnapshotAligned".into(), vec!["snapshot_epoch".into()]);
+    snapshot_forwarded.insert(iv_id("SnapshotAligned"), vec![fld_id("snapshot_epoch")]);
 
     CompositionSchema {
         name: comp_id("external_tool_bundle"),
@@ -1687,8 +1701,7 @@ fn mob_destroy_session_ingress_bundle_composition() -> CompositionSchema {
 /// `AuthLeaseBridgeMachine` via a route that mirrors the lifecycle
 /// event into the bridge's input; the bridge then hosts the
 /// `handoff_protocol = Some("auth_lease_lifecycle_publication")`
-/// disposition annotation that the canonical DSL macro cannot express
-/// today. The pattern mirrors `supervisor_trust_bundle_composition`
+/// disposition annotation. The pattern mirrors `supervisor_trust_bundle_composition`
 /// and `mob_bundle_composition`: a minimal compat bridge hosts the
 /// protocol annotation, the canonical machine owns the authoritative
 /// state, and a composition Route wires the producer effect into the
