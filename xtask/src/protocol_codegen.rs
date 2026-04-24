@@ -30,6 +30,8 @@ pub fn run_protocol_codegen() -> Result<()> {
         meerkat_machine_schema::ops_barrier_bridge_machine(),
         meerkat_machine_schema::external_tool_surface_bridge_machine(),
         meerkat_machine_schema::auth_lease_bridge_machine(),
+        meerkat_machine_schema::supervisor_trust_bridge_machine(),
+        meerkat_machine_schema::mob_destroy_session_ingress_bridge_machine(),
     ]);
     let machine_by_name: std::collections::BTreeMap<&str, &MachineSchema> =
         machines.iter().map(|m| (m.machine.as_str(), m)).collect();

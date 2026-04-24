@@ -1261,16 +1261,39 @@ fn supervisor_trust_bundle_composition() -> CompositionSchema {
                     required_imports: vec![
                         "use crate::comms_drain::SupervisorTrustBridgeEffect;".into(),
                     ],
-                    authority_type_path: None,
-                    mutator_trait_path: None,
-                    input_enum_path: None,
+                    // Compat bridge — `SupervisorTrustBridgeMachine` is
+                    // intentionally excluded from the canonical TLC state
+                    // space (see `compat/supervisor_trust_bridge.rs`). Its
+                    // authority surface is realised directly on
+                    // `MeerkatMachine`'s DSL (the `SupervisorTrustEdge*`
+                    // inputs at `meerkat-runtime dsl.rs:2598-2615`). These
+                    // paths point to that authority so the schema validator
+                    // accepts the ShellBridge shape; codegen skips this
+                    // protocol because `SupervisorTrustBridgeMachine` is
+                    // not in the canonical codegen machine list
+                    // (`xtask::protocol_codegen` machine registry).
+                    authority_type_path: Some(
+                        "crate::meerkat_machine::dsl::MeerkatMachineAuthority".into(),
+                    ),
+                    mutator_trait_path: Some(
+                        "crate::meerkat_machine::dsl::MeerkatMachineMutator".into(),
+                    ),
+                    input_enum_path: Some(
+                        "crate::meerkat_machine::dsl::MeerkatMachineInput".into(),
+                    ),
                     effect_enum_path: Some(
                         "crate::comms_drain::SupervisorTrustBridgeEffect".into(),
                     ),
-                    transition_type_path: None,
-                    error_type_path: None,
+                    transition_type_path: Some(
+                        "crate::meerkat_machine::dsl::MeerkatMachineTransition".into(),
+                    ),
+                    error_type_path: Some(
+                        "crate::meerkat_machine::dsl::MeerkatMachineTransitionError".into(),
+                    ),
                     executor_trigger_input_variant: None,
-                    bridge_source_type_path: None,
+                    bridge_source_type_path: Some(
+                        "crate::comms_drain::SupervisorTrustBridgeEffect".into(),
+                    ),
                     helper_return_shape: ProtocolHelperReturnShape::Obligations,
                     handle_trait_path: None,
                     handle_method_names: BTreeMap::new(),
@@ -1334,16 +1357,30 @@ fn supervisor_trust_bundle_composition() -> CompositionSchema {
                     required_imports: vec![
                         "use crate::comms_drain::SupervisorTrustBridgeEffect;".into(),
                     ],
-                    authority_type_path: None,
-                    mutator_trait_path: None,
-                    input_enum_path: None,
+                    // See `supervisor_trust_publish` above for the
+                    // compat-bridge rationale for these authority paths.
+                    authority_type_path: Some(
+                        "crate::meerkat_machine::dsl::MeerkatMachineAuthority".into(),
+                    ),
+                    mutator_trait_path: Some(
+                        "crate::meerkat_machine::dsl::MeerkatMachineMutator".into(),
+                    ),
+                    input_enum_path: Some(
+                        "crate::meerkat_machine::dsl::MeerkatMachineInput".into(),
+                    ),
                     effect_enum_path: Some(
                         "crate::comms_drain::SupervisorTrustBridgeEffect".into(),
                     ),
-                    transition_type_path: None,
-                    error_type_path: None,
+                    transition_type_path: Some(
+                        "crate::meerkat_machine::dsl::MeerkatMachineTransition".into(),
+                    ),
+                    error_type_path: Some(
+                        "crate::meerkat_machine::dsl::MeerkatMachineTransitionError".into(),
+                    ),
                     executor_trigger_input_variant: None,
-                    bridge_source_type_path: None,
+                    bridge_source_type_path: Some(
+                        "crate::comms_drain::SupervisorTrustBridgeEffect".into(),
+                    ),
                     helper_return_shape: ProtocolHelperReturnShape::Obligations,
                     handle_trait_path: None,
                     handle_method_names: BTreeMap::new(),
@@ -1520,16 +1557,34 @@ fn mob_destroy_session_ingress_bundle_composition() -> CompositionSchema {
                 required_imports: vec![
                     "use crate::runtime::actor::MobDestroySessionIngressBridgeEffect;".into(),
                 ],
-                authority_type_path: None,
-                mutator_trait_path: None,
-                input_enum_path: None,
+                // Compat bridge — the `MobDestroySessionIngressBridgeMachine`
+                // is declarative-only (codegen skips it because its
+                // producer machine is not in the canonical codegen
+                // machine registry). The DetachIngress ack flows through
+                // `MobMachine`'s DSL; these paths point to that authority
+                // so the schema validator accepts the ShellBridge shape.
+                authority_type_path: Some(
+                    "crate::machines::mob_machine::dsl::MobMachineAuthority".into(),
+                ),
+                mutator_trait_path: Some(
+                    "crate::machines::mob_machine::dsl::MobMachineMutator".into(),
+                ),
+                input_enum_path: Some(
+                    "crate::machines::mob_machine::dsl::MobMachineInput".into(),
+                ),
                 effect_enum_path: Some(
                     "crate::runtime::actor::MobDestroySessionIngressBridgeEffect".into(),
                 ),
-                transition_type_path: None,
-                error_type_path: None,
+                transition_type_path: Some(
+                    "crate::machines::mob_machine::dsl::MobMachineTransition".into(),
+                ),
+                error_type_path: Some(
+                    "crate::machines::mob_machine::dsl::MobMachineTransitionError".into(),
+                ),
                 executor_trigger_input_variant: None,
-                bridge_source_type_path: None,
+                bridge_source_type_path: Some(
+                    "crate::runtime::actor::MobDestroySessionIngressBridgeEffect".into(),
+                ),
                 helper_return_shape: ProtocolHelperReturnShape::Obligations,
                 handle_trait_path: None,
                 handle_method_names: BTreeMap::new(),

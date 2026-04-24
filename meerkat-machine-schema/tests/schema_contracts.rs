@@ -457,8 +457,12 @@ fn mob_machine_merges_flow_task_wiring_and_runtime_bridge_state() {
         // prior realtime binding state).
         "RetireRunningNoBinding",
         "RetireAllRunning",
-        "WireRunning",
-        "UnwireRunning",
+        // Renamed in wave-a track-b `450464072` ("MobMachine
+        // session-binding generalization + topology_epoch") to
+        // disambiguate member-wiring from realtime-transport wiring;
+        // the `Members` infix stayed through the absorption sweep.
+        "WireMembersRunning",
+        "UnwireMembersRunning",
         "StageSpawnRunning",
         "CompleteSpawnRunning",
         "TaskCreateRunning",
@@ -1326,6 +1330,8 @@ mod handoff_binding {
             meerkat_machine_schema::ops_barrier_bridge_machine(),
             meerkat_machine_schema::external_tool_surface_bridge_machine(),
             meerkat_machine_schema::auth_lease_bridge_machine(),
+            meerkat_machine_schema::supervisor_trust_bridge_machine(),
+            meerkat_machine_schema::mob_destroy_session_ingress_bridge_machine(),
         ]);
         let machine_refs: Vec<_> = machines.iter().collect();
         for composition in &compositions {
