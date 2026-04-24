@@ -27,6 +27,28 @@ impl MeerkatMachine {
             tracing::error!(%session_id, error = %err, "failed to recover runtime driver during registration");
             return;
         }
+        // Cold-restart: when `recover()` realizes a stored terminal
+        // runtime state (Retired / Stopped / Destroyed) on the driver's
+        // shell `control_projection`, the DSL authority still holds the
+        // construction-time `Idle`. Re-project the DSL state from the
+        // recovered phase so `existing_session_runtime_state` (which reads
+        // `dsl_authority.state.lifecycle_phase` as the canonical source
+        // post-e5c5ecaf3) surfaces the true stored phase.
+        let recovered_phase = entry.as_driver().runtime_state();
+        if recovered_phase != RuntimeState::Idle {
+            let mut authority = dsl_authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            authority.state = super::dsl_authority::project_state(
+                &session_id,
+                recovered_phase,
+                Some(&runtime_id),
+                None,
+                None,
+                std::collections::BTreeSet::new(),
+                None,
+            );
+        }
         let control_projection = entry.control_projection_handle();
 
         let (ops_lifecycle, epoch_id, cursor_state) =

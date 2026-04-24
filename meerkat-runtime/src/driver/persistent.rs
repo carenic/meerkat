@@ -399,13 +399,19 @@ impl PersistentRuntimeDriver {
     pub async fn destroy(&mut self) -> Result<DestroyReport, RuntimeDriverError> {
         let abandoned = self.inner.destroy_cleanup();
         let input_states = self.inner.stored_input_states_snapshot();
+        // Persist the intent-carrying terminal phase (`Destroyed`),
+        // not the pre-destroy shell phase from
+        // `runtime_state_for_persistence()`. `e5c5ecaf3` removed the
+        // shell `set_control_projection(Destroyed, ...)` write (the DSL
+        // Destroy input is the canonical phase-update path now), so
+        // `runtime_state_for_persistence()` still reads the pre-destroy
+        // shell phase at this point. Without the explicit `Destroyed`
+        // here, the store records the wrong phase and cold restarts
+        // (`cold_reregister_preserves_destroyed_runtime_state`) resurrect
+        // the session as non-Destroyed.
         if let Err(err) = self
             .store
-            .atomic_lifecycle_commit(
-                &self.runtime_id,
-                self.runtime_state_for_persistence(),
-                &input_states,
-            )
+            .atomic_lifecycle_commit(&self.runtime_id, RuntimeState::Destroyed, &input_states)
             .await
         {
             return Err(RuntimeDriverError::Internal(format!(
