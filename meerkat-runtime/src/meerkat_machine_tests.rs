@@ -4043,8 +4043,8 @@ async fn meerkat_machine_spine_snapshot_preserves_completion_waiters_after_retir
         .expect("snapshot should exist after retire wakes the loop");
     assert_eq!(
         after_retire.control.phase,
-        RuntimeState::Running,
-        "retire currently hands preserved queued work to the attached loop, which re-enters Running while draining it"
+        RuntimeState::Retired,
+        "post-`e5c5ecaf3` DSL-authoritative: retire holds lifecycle_phase at Retired through the drain window (Retire transition goes to Retired unconditionally); DSL is source of truth, not control_projection cache"
     );
     assert_eq!(after_retire.completion_waiters.input_count, 1);
     assert_eq!(after_retire.completion_waiters.waiter_count, 1);
@@ -11339,8 +11339,8 @@ async fn reconfigure_session_llm_identity_succeeds_while_running() {
         .phase;
     assert_eq!(
         phase_while_running,
-        RuntimeState::Running,
-        "session should be Running before reconfigure"
+        RuntimeState::Attached,
+        "post-`e5c5ecaf3` DSL-authoritative: spine_snapshot.control.phase projects the DSL lifecycle_phase which is `Attached` while the executor applies — the ReconfigureSessionLlmIdentityAttached DSL transition (dsl.rs:3024) accepts reconfigure from Attached, so this pre-check validates the DSL-visible phase at the reconfigure entry point"
     );
 
     let report = adapter
@@ -11375,8 +11375,8 @@ async fn reconfigure_session_llm_identity_succeeds_while_running() {
         .phase;
     assert_eq!(
         phase_after_reconfigure,
-        RuntimeState::Running,
-        "reconfigure should be a self-loop while apply remains active"
+        RuntimeState::Attached,
+        "post-`e5c5ecaf3` DSL-authoritative: reconfigure is a per-phase self-loop (ReconfigureSessionLlmIdentityAttached at dsl.rs:3024) — the DSL lifecycle_phase stays at `Attached` through reconfigure while the executor applies"
     );
 
     allow_finish.notify_waiters();

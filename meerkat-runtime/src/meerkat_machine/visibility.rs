@@ -280,20 +280,30 @@ impl MeerkatMachine {
             // (`machine_retire` / `machine_destroy` / `machine_stop_runtime`
             // / `machine_reset` used to call `set_control_projection(...)`
             // pre-finalize, deleted by the shadow-truth cleanup). DSL is
-            // the canonical source for `lifecycle_phase`. Read
-            // `control_projection` for `current_run_id` + `pre_run_phase`
-            // (those are still shell-managed), but override `phase` with
-            // the DSL-authoritative value projected via `write_back_phase`.
+            // the canonical source for `lifecycle_phase` AND `current_run_id`
+            // (both fields were updated together by the deleted
+            // `set_control_projection` call; both are tracked on the DSL
+            // side at `dsl.rs::state.lifecycle_phase` + `state.current_run_id`).
+            // Project both from the DSL authority so `spine_snapshot` matches
+            // the DSL's view post-retire/destroy/reset. `pre_run_phase` is
+            // still shell-managed (no DSL counterpart — it's a local cache
+            // for driver roll-back semantics).
             // Mirrors `existing_session_runtime_state` at traits.rs:292-308.
             let mut snapshot = entry.control_snapshot();
-            let dsl_phase = {
+            let (dsl_phase, dsl_current_run_id) = {
                 let authority = entry
                     .dsl_authority
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                authority.state.lifecycle_phase
+                (
+                    authority.state.lifecycle_phase,
+                    authority.state.current_run_id.clone(),
+                )
             };
             snapshot.phase = crate::meerkat_machine::dsl_authority::write_back_phase(dsl_phase);
+            snapshot.current_run_id = dsl_current_run_id
+                .and_then(|id| uuid::Uuid::parse_str(&id.0).ok())
+                .map(meerkat_core::lifecycle::RunId::from_uuid);
             (
                 Arc::clone(&entry.driver),
                 snapshot,
