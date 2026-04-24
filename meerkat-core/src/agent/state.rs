@@ -46,6 +46,37 @@ enum CallTimeoutSource {
     TurnBudget,
 }
 
+fn turn_input_run_id(input: &TurnExecutionInput) -> Option<RunId> {
+    match input {
+        TurnExecutionInput::StartConversationRun { run_id }
+        | TurnExecutionInput::StartImmediateAppend { run_id }
+        | TurnExecutionInput::StartImmediateContext { run_id }
+        | TurnExecutionInput::PrimitiveApplied { run_id, .. }
+        | TurnExecutionInput::LlmReturnedToolCalls { run_id, .. }
+        | TurnExecutionInput::LlmReturnedTerminal { run_id }
+        | TurnExecutionInput::RegisterPendingOps { run_id, .. }
+        | TurnExecutionInput::ToolCallsResolved { run_id }
+        | TurnExecutionInput::OpsBarrierSatisfied { run_id, .. }
+        | TurnExecutionInput::BoundaryContinue { run_id }
+        | TurnExecutionInput::BoundaryComplete { run_id }
+        | TurnExecutionInput::RecoverableFailure { run_id }
+        | TurnExecutionInput::FatalFailure { run_id }
+        | TurnExecutionInput::RetryRequested { run_id }
+        | TurnExecutionInput::CancelNow { run_id }
+        | TurnExecutionInput::CancelAfterBoundary { run_id }
+        | TurnExecutionInput::CancellationObserved { run_id }
+        | TurnExecutionInput::AcknowledgeTerminal { run_id }
+        | TurnExecutionInput::TurnLimitReached { run_id }
+        | TurnExecutionInput::BudgetExhausted { run_id }
+        | TurnExecutionInput::TimeBudgetExceeded { run_id }
+        | TurnExecutionInput::EnterExtraction { run_id, .. }
+        | TurnExecutionInput::ExtractionValidationPassed { run_id }
+        | TurnExecutionInput::ExtractionValidationFailed { run_id, .. }
+        | TurnExecutionInput::ExtractionStart { run_id } => Some(run_id.clone()),
+        TurnExecutionInput::ForceCancelNoRun => None,
+    }
+}
+
 fn synthetic_notice_message(kind: SystemNoticeKind, body: impl Into<String>) -> Message {
     Message::SystemNotice(SystemNoticeMessage::new(kind, body))
 }
@@ -549,6 +580,24 @@ where
         if prev_phase != TurnPhase::CallingLlm && next_phase == TurnPhase::CallingLlm {
             effects.push(TurnExecutionEffect::CheckCompaction);
         }
+        if prev_phase != TurnPhase::Completed
+            && next_phase == TurnPhase::Completed
+            && let Some(run_id) = turn_input_run_id(&input)
+        {
+            effects.push(TurnExecutionEffect::RunCompleted { run_id });
+        }
+        if prev_phase != TurnPhase::Failed
+            && next_phase == TurnPhase::Failed
+            && let Some(run_id) = turn_input_run_id(&input)
+        {
+            effects.push(TurnExecutionEffect::RunFailed { run_id });
+        }
+        if prev_phase != TurnPhase::Cancelled
+            && next_phase == TurnPhase::Cancelled
+            && let Some(run_id) = turn_input_run_id(&input)
+        {
+            effects.push(TurnExecutionEffect::RunCancelled { run_id });
+        }
 
         Ok(TurnExecutionTransition {
             prev_phase,
@@ -566,6 +615,42 @@ where
         event_tx: &Option<mpsc::Sender<AgentEvent>>,
     ) {
         for effect in &transition.effects {
+            match effect {
+                TurnExecutionEffect::RunCompleted { run_id } => {
+                    if let Some(handle) = self.turn_state_handle.as_deref()
+                        && let Err(error) = handle.run_completed(run_id.clone())
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            "runtime turn-state handle rejected RunCompleted effect"
+                        );
+                    }
+                }
+                TurnExecutionEffect::RunFailed { run_id } => {
+                    if let Some(handle) = self.turn_state_handle.as_deref()
+                        && let Err(error) =
+                            handle.run_failed(run_id.clone(), "run failed".to_string())
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            "runtime turn-state handle rejected RunFailed effect"
+                        );
+                    }
+                }
+                TurnExecutionEffect::RunCancelled { run_id } => {
+                    if let Some(handle) = self.turn_state_handle.as_deref()
+                        && let Err(error) = handle.run_cancelled(run_id.clone())
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            "runtime turn-state handle rejected RunCancelled effect"
+                        );
+                    }
+                }
+                TurnExecutionEffect::RunStarted { .. }
+                | TurnExecutionEffect::BoundaryApplied { .. }
+                | TurnExecutionEffect::CheckCompaction => {}
+            }
             if let TurnExecutionEffect::CheckCompaction = effect {
                 let current_boundary_index = self.compaction_cadence.session_boundary_index;
                 if let Some(ref compactor) = self.compactor {
@@ -1883,9 +1968,12 @@ where
                         }
 
                         // Validation passed — complete via authority
-                        self.apply_turn_input(TurnExecutionInput::ExtractionValidationPassed {
-                            run_id: run_id.clone(),
-                        })?;
+                        let t = self.apply_turn_input(
+                            TurnExecutionInput::ExtractionValidationPassed {
+                                run_id: run_id.clone(),
+                            },
+                        )?;
+                        self.execute_turn_effects(&t, turn_count, &event_tx).await;
                         if let Err(e) = self.store.save(&self.session).await {
                             tracing::warn!("Failed to save session: {}", e);
                         }
@@ -1955,9 +2043,10 @@ where
                         }
 
                         // No extraction needed - complete normally
-                        self.apply_turn_input(TurnExecutionInput::BoundaryComplete {
+                        let t = self.apply_turn_input(TurnExecutionInput::BoundaryComplete {
                             run_id: run_id.clone(),
                         })?;
+                        self.execute_turn_effects(&t, turn_count, &event_tx).await;
 
                         // Save session
                         if let Err(e) = self.store.save(&self.session).await {
@@ -2025,9 +2114,10 @@ where
                 }
                 LoopState::DrainingEvents => {
                     // Wait for any pending events to be processed
-                    self.apply_turn_input(TurnExecutionInput::BoundaryComplete {
+                    let t = self.apply_turn_input(TurnExecutionInput::BoundaryComplete {
                         run_id: run_id.clone(),
                     })?;
+                    self.execute_turn_effects(&t, turn_count, &event_tx).await;
                 }
                 LoopState::Cancelling => {
                     // Handle cancellation

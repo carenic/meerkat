@@ -3877,6 +3877,7 @@ machine! {
             }
             update {
                 self.current_run_id = Some(run_id);
+                self.pre_run_phase = Some(PreRunPhase::Attached);
                 self.turn_phase = TurnPhase::ApplyingPrimitive;
                 self.primitive_kind = Some(primitive_kind);
                 self.admitted_content_shape = Some(admitted_content_shape);
@@ -3907,6 +3908,7 @@ machine! {
             }
             update {
                 self.current_run_id = Some(run_id);
+                self.pre_run_phase = Some(PreRunPhase::Attached);
                 self.turn_phase = TurnPhase::ApplyingPrimitive;
                 self.primitive_kind = Some(primitive_kind);
                 self.admitted_content_shape = Some(admitted_content_shape);
@@ -3968,6 +3970,7 @@ machine! {
             }
             update {
                 self.current_run_id = Some(run_id);
+                self.pre_run_phase = Some(PreRunPhase::Attached);
                 self.turn_phase = TurnPhase::ApplyingPrimitive;
                 self.primitive_kind = Some(TurnPrimitiveKind::ImmediateAppend);
                 self.admitted_content_shape = Some(admitted_content_shape);
@@ -3998,6 +4001,7 @@ machine! {
             }
             update {
                 self.current_run_id = Some(run_id);
+                self.pre_run_phase = Some(PreRunPhase::Attached);
                 self.turn_phase = TurnPhase::ApplyingPrimitive;
                 self.primitive_kind = Some(TurnPrimitiveKind::ImmediateAppend);
                 self.admitted_content_shape = Some(admitted_content_shape);
@@ -4059,6 +4063,7 @@ machine! {
             }
             update {
                 self.current_run_id = Some(run_id);
+                self.pre_run_phase = Some(PreRunPhase::Attached);
                 self.turn_phase = TurnPhase::ApplyingPrimitive;
                 self.primitive_kind = Some(TurnPrimitiveKind::ImmediateContextAppend);
                 self.admitted_content_shape = Some(admitted_content_shape);
@@ -4089,6 +4094,7 @@ machine! {
             }
             update {
                 self.current_run_id = Some(run_id);
+                self.pre_run_phase = Some(PreRunPhase::Attached);
                 self.turn_phase = TurnPhase::ApplyingPrimitive;
                 self.primitive_kind = Some(TurnPrimitiveKind::ImmediateContextAppend);
                 self.admitted_content_shape = Some(admitted_content_shape);

@@ -26,6 +26,31 @@ impl RuntimeTurnStateHandle {
     pub fn ephemeral() -> Self {
         Self::new(Arc::new(HandleDslAuthority::ephemeral()))
     }
+
+    fn close_direct_run(
+        &self,
+        run_id: &RunId,
+        terminal_context: &'static str,
+    ) -> Result<(), DslTransitionError> {
+        let state = self.dsl.snapshot_state();
+        let is_bound_running = state.lifecycle_phase == mm_dsl::MeerkatPhase::Running
+            && state
+                .current_run_id
+                .as_ref()
+                .is_some_and(|bound| bound.0 == run_id.to_string())
+            && state.pre_run_phase.is_some();
+        if !is_bound_running {
+            return Ok(());
+        }
+
+        self.dsl.apply_input(
+            mm_dsl::MeerkatMachineInput::Commit {
+                input_id: mm_dsl::InputId::from(format!("direct-run:{run_id}")),
+                run_id: mm_dsl::RunId::from_domain(run_id),
+            },
+            terminal_context,
+        )
+    }
 }
 
 impl TurnStateHandle for RuntimeTurnStateHandle {
@@ -287,7 +312,8 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
                 run_id: mm_dsl::RunId::from_domain(&run_id),
             },
             "TurnStateHandle::run_completed",
-        )
+        )?;
+        self.close_direct_run(&run_id, "TurnStateHandle::run_completed:commit")
     }
 
     fn run_failed(&self, run_id: RunId, error: String) -> Result<(), DslTransitionError> {
@@ -298,7 +324,8 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
                 error,
             },
             "TurnStateHandle::run_failed",
-        )
+        )?;
+        self.close_direct_run(&run_id, "TurnStateHandle::run_failed:commit")
     }
 
     fn run_cancelled(&self, run_id: RunId) -> Result<(), DslTransitionError> {
@@ -308,7 +335,8 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
                 run_id: mm_dsl::RunId::from_domain(&run_id),
             },
             "TurnStateHandle::run_cancelled",
-        )
+        )?;
+        self.close_direct_run(&run_id, "TurnStateHandle::run_cancelled:commit")
     }
 
     fn snapshot(&self) -> TurnStateSnapshot {

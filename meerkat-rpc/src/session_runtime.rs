@@ -4795,18 +4795,22 @@ mod tests {
         let sender = Arc::new(
             meerkat::CommsRuntime::inproc_only("analyst-drain-test").expect("sender comms runtime"),
         );
-        let sender_peer_id = sender.public_key().to_peer_id().to_string();
+        let sender_public_key = sender.public_key();
+        let sender_peer_id = sender_public_key.to_peer_id().to_string();
         let sender_addr = sender.advertised_address();
         let operator_peer_id = operator_comms.public_key().expect("operator peer id");
         let operator_addr = operator_comms
             .advertised_address()
             .expect("operator advertised address");
+        let operator_pubkey =
+            meerkat_comms::PubKey::from_pubkey_string(&operator_peer_id).expect("operator pubkey");
 
         CoreCommsRuntime::add_trusted_peer(
             &*sender,
-            TrustedPeerDescriptor::test_only_unsigned(
+            TrustedPeerDescriptor::unsigned_with_pubkey(
                 operator_name,
-                operator_peer_id,
+                operator_pubkey.to_peer_id().to_string(),
+                *operator_pubkey.as_bytes(),
                 operator_addr,
             )
             .expect("operator trusted peer spec"),
@@ -4815,9 +4819,10 @@ mod tests {
         .expect("sender trusts operator");
         CoreCommsRuntime::add_trusted_peer(
             operator_comms.as_ref(),
-            TrustedPeerDescriptor::test_only_unsigned(
+            TrustedPeerDescriptor::unsigned_with_pubkey(
                 "analyst-drain-test",
                 sender_peer_id,
+                *sender_public_key.as_bytes(),
                 sender_addr,
             )
             .expect("sender trusted peer spec"),
