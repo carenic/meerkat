@@ -592,7 +592,6 @@ pub(crate) fn machine_apply_run_return_projection(
     disposition: RunReturnDisposition<'_>,
     next_phase: RuntimeState,
 ) -> Result<(), crate::runtime_state::RuntimeStateTransitionError> {
-    machine_validate_active_run(driver, run_id, next_phase)?;
     let current_phase = driver.runtime_state();
     if matches!(
         current_phase,
@@ -600,6 +599,10 @@ pub(crate) fn machine_apply_run_return_projection(
     ) {
         return Ok(());
     }
+    if current_phase == next_phase && driver.current_run_id().is_none() {
+        return Ok(());
+    }
+    machine_validate_active_run(driver, run_id, next_phase)?;
 
     // DSL is authoritative for `lifecycle_phase` post-#32 W6-J (dogma #1
     // split). Fire the typed `Commit {input_id, run_id}` or `Fail {run_id}`
@@ -1471,6 +1474,7 @@ pub(crate) async fn commit_runtime_loop_run(
         .machine_realize_boundary_applied(run_id.clone(), receipt, session_snapshot)
         .await
     {
+        let _ = driver.rollback_staged(&consumed_input_ids);
         return Err(RuntimeDriverError::Internal(format!(
             "runtime boundary commit failed: {err}"
         )));
