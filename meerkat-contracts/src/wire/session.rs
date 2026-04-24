@@ -1,6 +1,28 @@
 //! Wire session types.
 
 use serde::{Deserialize, Serialize};
+
+fn serialize_raw_json_box<S>(
+    value: &serde_json::value::RawValue,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let value: serde_json::Value =
+        serde_json::from_str(value.get()).map_err(serde::ser::Error::custom)?;
+    value.serialize(serializer)
+}
+
+fn deserialize_raw_json_box<'de, D>(
+    deserializer: D,
+) -> Result<Box<serde_json::value::RawValue>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    serde_json::value::RawValue::from_string(value.to_string()).map_err(serde::de::Error::custom)
+}
 use std::collections::BTreeMap;
 
 use meerkat_core::{
@@ -342,6 +364,10 @@ pub enum WireAssistantBlock {
         /// invariant ("tool-call args pass through un-parsed from provider
         /// to dispatcher") — see `CLAUDE.md` Rust design principles §3.
         /// Allow-listed by dogma-blind-spots §7.
+        #[serde(
+            serialize_with = "serialize_raw_json_box",
+            deserialize_with = "deserialize_raw_json_box"
+        )]
         #[cfg_attr(feature = "schema", schemars(with = "serde_json::Value"))]
         args: Box<serde_json::value::RawValue>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -418,6 +444,10 @@ impl From<StopReason> for WireStopReason {
 pub struct WireToolCall {
     pub id: String,
     pub name: String,
+    #[serde(
+        serialize_with = "serialize_raw_json_box",
+        deserialize_with = "deserialize_raw_json_box"
+    )]
     #[cfg_attr(feature = "schema", schemars(with = "serde_json::Value"))]
     pub args: Box<serde_json::value::RawValue>,
 }

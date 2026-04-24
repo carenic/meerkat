@@ -1017,10 +1017,13 @@ mod tests {
         let payload: BridgeBindPayload =
             serde_json::from_value(raw.clone()).expect("decode pre-newtype payload");
         assert_eq!(payload.bootstrap_token.as_str(), "tok-raw-string");
+        assert_eq!(payload.supervisor.pubkey, [0u8; 32]);
         let reencoded = serde_json::to_value(&payload).expect("reserialize payload");
+        let mut expected = raw;
+        expected["supervisor"]["pubkey"] = json!(vec![0u8; 32]);
         assert_eq!(
-            reencoded, raw,
-            "newtype round-trip must preserve the pre-newtype wire shape"
+            reencoded, expected,
+            "pre-pubkey payloads must decode and reserialize with the defaulted pubkey"
         );
     }
 }
