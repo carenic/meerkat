@@ -2068,6 +2068,56 @@ class MeerkatClient:
     async def peers(self, session_id: str) -> dict[str, Any]:
         return await self._request("comms/peers", {"session_id": session_id})
 
+    async def status(self, session_id: str) -> RuntimeStateResult:
+        raw = await self._request("session/status", {"session_id": session_id})
+        result = RuntimeStateResult()
+        for key, value in raw.items():
+            setattr(result, key, value)
+        return result
+
+    async def submit(
+        self, session_id: str, input: dict[str, Any] | ContentInput
+    ) -> RuntimeAcceptResult:
+        raw = await self._request(
+            "session/submit",
+            {"session_id": session_id, "input": input},
+        )
+        return RuntimeAcceptResult(**raw)
+
+    async def submission(self, session_id: str, input_id: str) -> WireInputState:
+        raw = await self._request(
+            "session/submission",
+            {"session_id": session_id, "input_id": input_id},
+        )
+        return self._parse_wire_input_state(raw)
+
+    async def submissions(self, session_id: str) -> dict[str, list[WireInputState]]:
+        raw = await self._request("session/submissions", {"session_id": session_id})
+        inputs = raw.get("inputs", [])
+        if not isinstance(inputs, list):
+            raise MeerkatError("INVALID_RESPONSE", "Invalid session/submissions response")
+        return {
+            "inputs": [
+                self._parse_wire_input_state(item)
+                for item in inputs
+                if isinstance(item, dict)
+            ]
+        }
+
+    async def retire(self, session_id: str) -> RuntimeRetireResult:
+        raw = await self._request("session/retire", {"session_id": session_id})
+        result = RuntimeRetireResult()
+        for key, value in raw.items():
+            setattr(result, key, value)
+        return result
+
+    async def reset(self, session_id: str) -> RuntimeResetResult:
+        raw = await self._request("session/reset", {"session_id": session_id})
+        result = RuntimeResetResult()
+        for key, value in raw.items():
+            setattr(result, key, value)
+        return result
+
     async def runtime_realtime_attachment_status(
         self, session_id: str
     ) -> RuntimeRealtimeAttachmentStatusResult:
@@ -2076,6 +2126,14 @@ class MeerkatClient:
             {"session_id": session_id},
         )
         return RuntimeRealtimeAttachmentStatusResult(**raw)
+
+    async def runtime_realtime_attachment_statuses(
+        self, session_ids: list[str]
+    ) -> dict[str, Any]:
+        return await self._request(
+            "session/realtime_attachment_statuses",
+            {"session_ids": session_ids},
+        )
 
     async def mob_ensure_member(
         self, mob_id: str, spec: dict[str, Any]
@@ -2128,37 +2186,6 @@ class MeerkatClient:
     ) -> RealtimeCapabilitiesResult:
         raw = await self._request("realtime/capabilities", _wire_params(params))
         return RealtimeCapabilitiesResult(**raw)
-
-    # -- Runtime-category session RPC wrappers -----------------------------
-    # Thin pass-throughs for the Runtime-category `session/*` methods. Kept
-    # untyped here to mirror the TypeScript `_runtime*` wrappers; typed
-    # parameter shapes consume the generated types from
-    # `sdks/python/meerkat/generated/`. Exposed so the rpc-surface-alignment
-    # + sdk-wrapper-freshness parity gates see the method names.
-
-    async def status(self, params: dict[str, Any]) -> Any:
-        return await self._request("session/status", _wire_params(params))
-
-    async def submit(self, params: dict[str, Any]) -> Any:
-        return await self._request("session/submit", _wire_params(params))
-
-    async def submission(self, params: dict[str, Any]) -> Any:
-        return await self._request("session/submission", _wire_params(params))
-
-    async def submissions(self, params: dict[str, Any]) -> Any:
-        return await self._request("session/submissions", _wire_params(params))
-
-    async def retire(self, params: dict[str, Any]) -> Any:
-        return await self._request("session/retire", _wire_params(params))
-
-    async def reset(self, params: dict[str, Any]) -> Any:
-        return await self._request("session/reset", _wire_params(params))
-
-    async def runtime_realtime_attachment_status(self, params: dict[str, Any]) -> Any:
-        return await self._request("session/realtime_attachment_status", _wire_params(params))
-
-    async def runtime_realtime_attachment_statuses(self, params: dict[str, Any]) -> Any:
-        return await self._request("session/realtime_attachment_statuses", _wire_params(params))
 
     # -- Transport ---------------------------------------------------------
 
