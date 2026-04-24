@@ -132,19 +132,19 @@ impl LocalState {
         let mut fields = self.fields.clone();
 
         let next_phase = match (phase, &input) {
-            (Ready, StartConversationRun { run_id }) => {
+            (Ready | Completed | Failed | Cancelled, StartConversationRun { run_id }) => {
                 fields = LocalFields::init();
                 fields.active_run = Some(run_id.clone());
                 fields.primitive_kind = TurnPrimitiveKind::ConversationTurn;
                 ApplyingPrimitive
             }
-            (Ready, StartImmediateAppend { run_id }) => {
+            (Ready | Completed | Failed | Cancelled, StartImmediateAppend { run_id }) => {
                 fields = LocalFields::init();
                 fields.active_run = Some(run_id.clone());
                 fields.primitive_kind = TurnPrimitiveKind::ImmediateAppend;
                 ApplyingPrimitive
             }
-            (Ready, StartImmediateContext { run_id }) => {
+            (Ready | Completed | Failed | Cancelled, StartImmediateContext { run_id }) => {
                 fields = LocalFields::init();
                 fields.active_run = Some(run_id.clone());
                 fields.primitive_kind = TurnPrimitiveKind::ImmediateContextAppend;

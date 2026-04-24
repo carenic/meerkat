@@ -1325,6 +1325,20 @@ where
                     self.budget.record_usage(&result.usage);
                     self.last_input_tokens = result.usage.input_tokens;
                     self.session.record_usage(result.usage.clone());
+                    if let Err(AgentError::TokenBudgetExceeded { used, limit }) =
+                        self.budget.check()
+                    {
+                        emit_event!(AgentEvent::BudgetWarning {
+                            budget_type: BudgetType::Tokens,
+                            used,
+                            limit,
+                            percent: 1.0,
+                        });
+                        self.apply_turn_input(TurnExecutionInput::BudgetExhausted {
+                            run_id: run_id.clone(),
+                        })?;
+                        return self.build_result(turn_count, tool_call_count).await;
+                    }
 
                     let (blocks, stop_reason, usage) = result.into_parts();
                     let mut assistant_msg = BlockAssistantMessage {
@@ -2025,6 +2039,9 @@ where
 
         let outcome = self.turn_terminal_outcome()?;
         let classification = classify_terminal(&outcome);
+        if classification.is_some() {
+            self.state = LoopState::Completed;
+        }
 
         match classification {
             Some(SurfaceResultClass::HardFailure) => {
