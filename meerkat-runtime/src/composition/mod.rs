@@ -617,6 +617,7 @@ mod tests {
             agent_runtime_id: String,
             fence_token: u64,
             generation: u64,
+            session_id: String,
         },
     }
 
@@ -635,10 +636,12 @@ mod tests {
                     agent_runtime_id,
                     fence_token,
                     generation,
+                    session_id,
                 }) => match id.as_str() {
                     "agent_runtime_id" => Some(FieldValue::Str(agent_runtime_id)),
                     "fence_token" => Some(FieldValue::U64(*fence_token)),
                     "generation" => Some(FieldValue::U64(*generation)),
+                    "session_id" => Some(FieldValue::Str(session_id)),
                     _ => None,
                 },
             }
@@ -684,6 +687,7 @@ mod tests {
                 agent_runtime_id: "rt-1".into(),
                 fence_token: 7,
                 generation: 3,
+                session_id: "019dbd3d-d7ad-75a1-96d0-8013927e78f8".into(),
             }),
         }
     }
@@ -770,6 +774,7 @@ mod tests {
                 agent_runtime_id: "rt".into(),
                 fence_token: 0,
                 generation: 0,
+                session_id: "019dbd3d-d7ad-75a1-96d0-8013927e78f8".into(),
             }),
         };
 

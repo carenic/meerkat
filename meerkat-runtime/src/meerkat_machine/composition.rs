@@ -255,6 +255,10 @@ mod tests {
                     (fld("agent_runtime_id"), OwnedFieldValue::Str("rt-1".into())),
                     // fence_token missing on purpose.
                     (fld("generation"), OwnedFieldValue::U64(3)),
+                    (
+                        fld("session_id"),
+                        OwnedFieldValue::Str("00000000-0000-0000-0000-000000000001".into()),
+                    ),
                 ],
             )
             .await
@@ -265,7 +269,12 @@ mod tests {
     #[tokio::test]
     async fn unknown_variant_is_refused_typed() {
         let machine = Arc::new(MeerkatMachine::ephemeral());
-        let surface = MeerkatConsumerSurface::new(Arc::clone(&machine));
+        // Pin the surface so resolve_session doesn't fail earlier on
+        // missing session_id — this test focuses on variant-rejection,
+        // not session resolution.
+        let pinned =
+            SessionId::parse("00000000-0000-0000-0000-000000000001").expect("uuid literal");
+        let surface = MeerkatConsumerSurface::pinned(Arc::clone(&machine), pinned);
         let err = surface
             .apply_routed_input(iv("Recycle"), vec![])
             .await
@@ -274,7 +283,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unpinned_surface_requires_projected_runtime_id_for_retire() {
+    async fn unpinned_surface_requires_projected_session_id_for_retire() {
         let machine = Arc::new(MeerkatMachine::ephemeral());
         let surface = MeerkatConsumerSurface::new(Arc::clone(&machine));
         // Retire has no fields in the schema; an unpinned surface
@@ -284,11 +293,11 @@ mod tests {
             .apply_routed_input(iv("Retire"), vec![])
             .await
             .expect_err("Retire without target");
-        assert!(err.contains("agent_runtime_id"), "{err}");
+        assert!(err.contains("session_id"), "{err}");
     }
 
     #[tokio::test]
-    async fn pinned_surface_rejects_mismatched_runtime_id() {
+    async fn pinned_surface_rejects_mismatched_session_id() {
         let machine = Arc::new(MeerkatMachine::ephemeral());
         let pinned =
             SessionId::parse("00000000-0000-0000-0000-000000000001").expect("uuid literal");
@@ -303,10 +312,14 @@ mod tests {
                     ),
                     (fld("fence_token"), OwnedFieldValue::U64(1)),
                     (fld("generation"), OwnedFieldValue::U64(0)),
+                    (
+                        fld("session_id"),
+                        OwnedFieldValue::Str("00000000-0000-0000-0000-000000000002".into()),
+                    ),
                 ],
             )
             .await
-            .expect_err("runtime id disagrees with pinned session");
+            .expect_err("session_id disagrees with pinned session");
         assert!(err.contains("pinned"), "{err}");
     }
 }

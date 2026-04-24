@@ -259,6 +259,7 @@ mod tests {
                 ("agent_runtime_id", "agent_runtime_id"),
                 ("fence_token", "fence_token"),
                 ("generation", "generation"),
+                ("session_id", "session_id"),
             ]
         );
     }
