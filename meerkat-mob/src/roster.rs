@@ -281,6 +281,29 @@ impl Roster {
         self.remove_by_identity(agent_identity);
     }
 
+    /// Flip a roster entry's `state` to [`MemberState::Retiring`].
+    ///
+    /// Invoked by the retire pipeline (MobActor::handle_retire_inner) before
+    /// the disposal pipeline starts so that live readers of
+    /// `list_members()` / `list_all_members()` / `member_status()` observe
+    /// the Retiring state while disposal (notify peers, archive session) is
+    /// still in flight. Returns `true` when the member existed and was
+    /// flipped; `false` when absent or already Retiring.
+    ///
+    /// The canonical removal still happens in the finally block of
+    /// `dispose_member` via `dispose_remove_from_roster`, which calls
+    /// `remove_by_identity`. This helper is the observability seam for the
+    /// window between retire-event-appended and roster-entry-removed.
+    pub(crate) fn mark_retiring_by_identity(&mut self, identity: &AgentIdentity) -> bool {
+        match self.entries.get_mut(identity) {
+            Some(entry) if entry.state != MemberState::Retiring => {
+                entry.state = MemberState::Retiring;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Resolve an identity — returns the canonical identity if present.
     #[cfg(test)]
     pub(crate) fn resolve_identity(

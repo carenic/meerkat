@@ -2636,6 +2636,19 @@ impl MobHandle {
         agent_identity: MeerkatId,
         message: meerkat_core::types::ContentInput,
     ) -> Result<(), MobError> {
+        // #31 Wave D: retiring members reject new internal work. This
+        // matches the `member()` gate for external turns so the observable
+        // contract is symmetric across the retire window.
+        {
+            let roster = self.roster.read().await;
+            match roster.get(&agent_identity) {
+                None => return Err(MobError::MemberNotFound(agent_identity)),
+                Some(entry) if entry.state != crate::roster::MemberState::Active => {
+                    return Err(MobError::MemberNotFound(agent_identity));
+                }
+                _ => {}
+            }
+        }
         let material = self.canonical_member_list_material(&agent_identity).await;
         let cmd = Box::new(crate::mob_machine::SubmitWorkCommand {
             runtime_id: material.agent_runtime_id,

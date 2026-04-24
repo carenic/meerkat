@@ -5187,6 +5187,21 @@ impl MobActor {
             "handle_retire_inner_mark_retiring",
         )?;
 
+        // #31 Wave D (D-trust-reconciliation subsystem 4): flip the roster
+        // entry's state to `Retiring` so live readers of
+        // `list_members()` / `member_status()` observe the retiring state
+        // during the disposal window (notify peers, archive session).
+        // The canonical removal still runs in the finally block of
+        // `dispose_member`. Without this explicit flip the
+        // `RosterEntry.state` stayed `Active` right up to removal because
+        // the `MemberRetired` event projection is "remove-by-identity",
+        // not "mark-retiring" — there was a lost observability seam for
+        // the in-flight-retire window.
+        {
+            let mut roster = self.roster.write().await;
+            roster.mark_retiring_by_identity(&entry.agent_identity);
+        }
+
         // Snapshot context and run disposal pipeline.
         let ctx = self
             .disposal_context_from_entry(agent_identity, &entry)
