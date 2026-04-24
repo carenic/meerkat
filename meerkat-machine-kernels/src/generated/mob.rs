@@ -1169,9 +1169,11 @@ mod source {
                     self.member_startup_runtime_ready.remove(agent_runtime_id);
                     self.member_startup_ready.remove(agent_runtime_id);
                     self.member_session_bindings.insert(agent_identity, bridge_session_id);
+                    self.topology_epoch += 1;
                 }
                 to Running
                 emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation, session_id: bridge_session_id }
+                emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: None, new_session_id: Some(bridge_session_id) }
                 emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Spawned }
             }
 
@@ -1194,9 +1196,11 @@ mod source {
                     self.member_startup_runtime_ready.remove(agent_runtime_id);
                     self.member_startup_ready.remove(agent_runtime_id);
                     self.member_session_bindings.insert(agent_identity, bridge_session_id);
+                    self.topology_epoch += 1;
                 }
                 to Running
                 emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation, session_id: bridge_session_id }
+                emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(replacing.get("value")), new_session_id: Some(bridge_session_id) }
                 emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Spawned }
             }
 
@@ -2381,9 +2385,11 @@ mod source {
                 update {
                     self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
                     self.member_session_bindings.remove(agent_identity);
+                    self.topology_epoch += 1;
                 }
                 to Running
                 emit RequestRuntimeRetire { session_id: session_id }
+                emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(releasing.get("value")), new_session_id: None }
             }
 
             transition RetireRunningPreservingBinding {
@@ -2424,9 +2430,11 @@ mod source {
                 update {
                     self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
                     self.member_session_bindings.remove(agent_identity);
+                    self.topology_epoch += 1;
                 }
                 to Stopped
                 emit RequestRuntimeRetire { session_id: session_id }
+                emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(releasing.get("value")), new_session_id: None }
             }
 
             transition RetireStoppedPreservingBinding {
