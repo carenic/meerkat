@@ -117,7 +117,8 @@ SpawnRunningFresh(agent_identity, agent_runtime_id, fence_token, generation, ext
     /\ runtime_fence_tokens' = MapSet(runtime_fence_tokens, agent_runtime_id, fence_token)
     /\ identity_to_runtime' = MapSet(identity_to_runtime, agent_identity, agent_runtime_id)
     /\ member_session_bindings' = MapSet(member_session_bindings, agent_identity, bridge_session_id)
-    /\ UNCHANGED << active_run_count, pending_spawn_count, coordinator_bound, member_state_markers, wiring_edges, tasks, in_progress_task_ids, completed_task_ids, topology_epoch >>
+    /\ topology_epoch' = (topology_epoch) + 1
+    /\ UNCHANGED << active_run_count, pending_spawn_count, coordinator_bound, member_state_markers, wiring_edges, tasks, in_progress_task_ids, completed_task_ids >>
 
 
 SpawnRunningReplacing(agent_identity, agent_runtime_id, fence_token, generation, external_addressable, bridge_session_id, replacing) ==
@@ -132,7 +133,8 @@ SpawnRunningReplacing(agent_identity, agent_runtime_id, fence_token, generation,
     /\ runtime_fence_tokens' = MapSet(runtime_fence_tokens, agent_runtime_id, fence_token)
     /\ identity_to_runtime' = MapSet(identity_to_runtime, agent_identity, agent_runtime_id)
     /\ member_session_bindings' = MapSet(member_session_bindings, agent_identity, bridge_session_id)
-    /\ UNCHANGED << active_run_count, pending_spawn_count, coordinator_bound, member_state_markers, wiring_edges, tasks, in_progress_task_ids, completed_task_ids, topology_epoch >>
+    /\ topology_epoch' = (topology_epoch) + 1
+    /\ UNCHANGED << active_run_count, pending_spawn_count, coordinator_bound, member_state_markers, wiring_edges, tasks, in_progress_task_ids, completed_task_ids >>
 
 
 ObserveRuntimeReady(agent_runtime_id, fence_token) ==
@@ -767,7 +769,8 @@ RetireRunningReleasing(agent_runtime_id, agent_identity, releasing, session_id) 
     /\ model_step_count' = model_step_count + 1
     /\ member_state_markers' = MapSet(member_state_markers, agent_runtime_id, "Retiring")
     /\ member_session_bindings' = MapRemove(member_session_bindings, agent_identity)
-    /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids, topology_epoch >>
+    /\ topology_epoch' = (topology_epoch) + 1
+    /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids >>
 
 
 RetireRunningPreservingBinding(agent_runtime_id, agent_identity, releasing, session_id) ==
@@ -804,7 +807,8 @@ RetireStoppedReleasing(agent_runtime_id, agent_identity, releasing, session_id) 
     /\ model_step_count' = model_step_count + 1
     /\ member_state_markers' = MapSet(member_state_markers, agent_runtime_id, "Retiring")
     /\ member_session_bindings' = MapRemove(member_session_bindings, agent_identity)
-    /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids, topology_epoch >>
+    /\ topology_epoch' = (topology_epoch) + 1
+    /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids >>
 
 
 RetireStoppedPreservingBinding(agent_runtime_id, agent_identity, releasing, session_id) ==

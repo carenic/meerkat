@@ -1176,15 +1176,12 @@ fn owner_actor(name: &str) -> ActorSchema {
 /// (the existing `send_bridge_response` path already surfaces typed
 /// outcomes).
 ///
-/// Mode: ShellBridge. The owner (`comms_drain`) consumes the
-/// obligation via the generated `accept_<effect>` helper, calls
-/// `router.add_trusted_peer` / `remove_trusted_peer`, and submits the
-/// feedback through the generated helper. Until the protocol helpers
-/// are wired through the DSL's transition emission (step 10 codegen
-/// scope), the protocol's declarative presence in the catalog carries
-/// the seam-closure obligation — the producer and feedback shapes are
-/// now part of the closed-world composition registry and appear in
-/// `xtask seam-inventory`.
+/// Mode: EffectExtractor. The owner (`comms_drain`) consumes the
+/// obligation via the generated extractor, calls `router.add_trusted_peer`
+/// / `remove_trusted_peer`, and submits feedback through the runtime's
+/// existing supervisor trust staging methods. Until those staging methods
+/// are lifted behind a sync handle bridge, the generated surface owns the
+/// obligation extraction and the hand-written owner owns the async ack.
 fn supervisor_trust_bundle_composition() -> CompositionSchema {
     CompositionSchema {
         name: comp_id("supervisor_trust_bundle"),
@@ -1214,40 +1211,7 @@ fn supervisor_trust_bundle_composition() -> CompositionSchema {
                     fld_id("address"),
                     fld_id("epoch"),
                 ],
-                allowed_feedback_inputs: vec![
-                    FeedbackInputRef {
-                        machine_instance: mi_id("supervisor_trust_bridge"),
-                        input_variant: iv_id("SupervisorTrustEdgePublished"),
-                        field_bindings: vec![
-                            FeedbackFieldBinding {
-                                input_field: fld_id("peer_id"),
-                                source: FeedbackFieldSource::ObligationField(fld_id("peer_id")),
-                            },
-                            FeedbackFieldBinding {
-                                input_field: fld_id("epoch"),
-                                source: FeedbackFieldSource::ObligationField(fld_id("epoch")),
-                            },
-                        ],
-                    },
-                    FeedbackInputRef {
-                        machine_instance: mi_id("supervisor_trust_bridge"),
-                        input_variant: iv_id("SupervisorTrustEdgePublishFailed"),
-                        field_bindings: vec![
-                            FeedbackFieldBinding {
-                                input_field: fld_id("peer_id"),
-                                source: FeedbackFieldSource::ObligationField(fld_id("peer_id")),
-                            },
-                            FeedbackFieldBinding {
-                                input_field: fld_id("epoch"),
-                                source: FeedbackFieldSource::ObligationField(fld_id("epoch")),
-                            },
-                            FeedbackFieldBinding {
-                                input_field: fld_id("reason"),
-                                source: FeedbackFieldSource::OwnerContext("reason".into()),
-                            },
-                        ],
-                    },
-                ],
+                allowed_feedback_inputs: vec![],
                 closure_policy: ClosurePolicy::AckRequired,
                 liveness_annotation: Some(
                     "eventual feedback under comms transport liveness — \
@@ -1257,7 +1221,7 @@ fn supervisor_trust_bundle_composition() -> CompositionSchema {
                 rust: ProtocolRustBinding {
                     module_path:
                         "meerkat-runtime/src/generated/protocol_supervisor_trust_publish.rs".into(),
-                    generation_mode: ProtocolGenerationMode::ShellBridge,
+                    generation_mode: ProtocolGenerationMode::EffectExtractor,
                     required_imports: vec![
                         "use crate::comms_drain::SupervisorTrustBridgeEffect;".into(),
                     ],
@@ -1310,40 +1274,7 @@ fn supervisor_trust_bundle_composition() -> CompositionSchema {
                 realizing_actor: act_id("supervisor_bridge_owner"),
                 correlation_fields: vec![fld_id("peer_id"), fld_id("epoch")],
                 obligation_fields: vec![fld_id("peer_id"), fld_id("epoch")],
-                allowed_feedback_inputs: vec![
-                    FeedbackInputRef {
-                        machine_instance: mi_id("supervisor_trust_bridge"),
-                        input_variant: iv_id("SupervisorTrustEdgeRevoked"),
-                        field_bindings: vec![
-                            FeedbackFieldBinding {
-                                input_field: fld_id("peer_id"),
-                                source: FeedbackFieldSource::ObligationField(fld_id("peer_id")),
-                            },
-                            FeedbackFieldBinding {
-                                input_field: fld_id("epoch"),
-                                source: FeedbackFieldSource::ObligationField(fld_id("epoch")),
-                            },
-                        ],
-                    },
-                    FeedbackInputRef {
-                        machine_instance: mi_id("supervisor_trust_bridge"),
-                        input_variant: iv_id("SupervisorTrustEdgeRevokeFailed"),
-                        field_bindings: vec![
-                            FeedbackFieldBinding {
-                                input_field: fld_id("peer_id"),
-                                source: FeedbackFieldSource::ObligationField(fld_id("peer_id")),
-                            },
-                            FeedbackFieldBinding {
-                                input_field: fld_id("epoch"),
-                                source: FeedbackFieldSource::ObligationField(fld_id("epoch")),
-                            },
-                            FeedbackFieldBinding {
-                                input_field: fld_id("reason"),
-                                source: FeedbackFieldSource::OwnerContext("reason".into()),
-                            },
-                        ],
-                    },
-                ],
+                allowed_feedback_inputs: vec![],
                 closure_policy: ClosurePolicy::AckRequired,
                 liveness_annotation: Some(
                     "eventual feedback under comms transport liveness — \
@@ -1353,7 +1284,7 @@ fn supervisor_trust_bundle_composition() -> CompositionSchema {
                 rust: ProtocolRustBinding {
                     module_path:
                         "meerkat-runtime/src/generated/protocol_supervisor_trust_revoke.rs".into(),
-                    generation_mode: ProtocolGenerationMode::ShellBridge,
+                    generation_mode: ProtocolGenerationMode::EffectExtractor,
                     required_imports: vec![
                         "use crate::comms_drain::SupervisorTrustBridgeEffect;".into(),
                     ],
@@ -1483,7 +1414,7 @@ fn supervisor_trust_bundle_composition() -> CompositionSchema {
 /// this composition is the declarative witness that pair exists for
 /// the `meerkat_mob_seam` route.
 ///
-/// Mode: ShellBridge. The mob runtime's `handle_destroy` path is the
+/// Mode: EffectExtractor. The mob runtime's `handle_destroy` path is the
 /// effect producer today; when the canonical DSL macro grows
 /// `handoff_protocol` syntax the bridge can retire and the effect
 /// emission can move to `MobMachine::DestroyMob`.
@@ -1506,44 +1437,7 @@ fn mob_destroy_session_ingress_bundle_composition() -> CompositionSchema {
             realizing_actor: act_id("mob_destroy_session_ingress_owner"),
             correlation_fields: vec![fld_id("mob_id"), fld_id("agent_runtime_id")],
             obligation_fields: vec![fld_id("mob_id"), fld_id("agent_runtime_id")],
-            allowed_feedback_inputs: vec![
-                FeedbackInputRef {
-                    machine_instance: mi_id("mob_destroy_session_ingress_bridge"),
-                    input_variant: iv_id("SessionIngressDetachedForMobDestroy"),
-                    field_bindings: vec![
-                        FeedbackFieldBinding {
-                            input_field: fld_id("mob_id"),
-                            source: FeedbackFieldSource::ObligationField(fld_id("mob_id")),
-                        },
-                        FeedbackFieldBinding {
-                            input_field: fld_id("agent_runtime_id"),
-                            source: FeedbackFieldSource::ObligationField(fld_id(
-                                "agent_runtime_id",
-                            )),
-                        },
-                    ],
-                },
-                FeedbackInputRef {
-                    machine_instance: mi_id("mob_destroy_session_ingress_bridge"),
-                    input_variant: iv_id("SessionIngressDetachFailedForMobDestroy"),
-                    field_bindings: vec![
-                        FeedbackFieldBinding {
-                            input_field: fld_id("mob_id"),
-                            source: FeedbackFieldSource::ObligationField(fld_id("mob_id")),
-                        },
-                        FeedbackFieldBinding {
-                            input_field: fld_id("agent_runtime_id"),
-                            source: FeedbackFieldSource::ObligationField(fld_id(
-                                "agent_runtime_id",
-                            )),
-                        },
-                        FeedbackFieldBinding {
-                            input_field: fld_id("reason"),
-                            source: FeedbackFieldSource::OwnerContext("reason".into()),
-                        },
-                    ],
-                },
-            ],
+            allowed_feedback_inputs: vec![],
             closure_policy: ClosurePolicy::AckRequired,
             liveness_annotation: Some(
                 "eventual feedback: the mob destroy path awaits each session's DetachIngress ack before requesting runtime destroy"
@@ -1553,7 +1447,7 @@ fn mob_destroy_session_ingress_bundle_composition() -> CompositionSchema {
                 module_path:
                     "meerkat-mob/src/generated/protocol_mob_destroying_session_ingress.rs"
                         .into(),
-                generation_mode: ProtocolGenerationMode::ShellBridge,
+                generation_mode: ProtocolGenerationMode::EffectExtractor,
                 required_imports: vec![
                     "use crate::runtime::actor::MobDestroySessionIngressBridgeEffect;".into(),
                 ],

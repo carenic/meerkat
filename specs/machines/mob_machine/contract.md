@@ -185,7 +185,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `coordinator_bound`
   - `no_prior_session_binding`
   - `replacing_absent`
-- Emits: `RequestRuntimeBinding`, `EmitMemberLifecycleNotice`
+- Emits: `RequestRuntimeBinding`, `MemberSessionBindingChanged`, `EmitMemberLifecycleNotice`
 - To: `Running`
 
 ### `SpawnRunningReplacing`
@@ -195,7 +195,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `coordinator_bound`
   - `prior_session_binding_present`
   - `replacing_present`
-- Emits: `RequestRuntimeBinding`, `EmitMemberLifecycleNotice`
+- Emits: `RequestRuntimeBinding`, `MemberSessionBindingChanged`, `EmitMemberLifecycleNotice`
 - To: `Running`
 
 ### `ObserveRuntimeReady`
@@ -685,7 +685,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `runtime_id_present`
   - `prior_session_binding_present`
   - `releasing_present`
-- Emits: `RequestRuntimeRetire`
+- Emits: `RequestRuntimeRetire`, `MemberSessionBindingChanged`
 - To: `Running`
 
 ### `RetireRunningPreservingBinding`
@@ -718,7 +718,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `runtime_id_present`
   - `prior_session_binding_present`
   - `releasing_present`
-- Emits: `RequestRuntimeRetire`
+- Emits: `RequestRuntimeRetire`, `MemberSessionBindingChanged`
 - To: `Stopped`
 
 ### `RetireStoppedPreservingBinding`

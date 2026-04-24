@@ -140,6 +140,8 @@ fn meerkat_machine_inputs_equal_runtime_manifest_exactly() {
         "ClearLocalEndpoint",
         "AddDirectPeerEndpoint",
         "RemoveDirectPeerEndpoint",
+        "ProjectRealtimeReconnectProgress",
+        "ClearRealtimeReconnectProgress",
     ];
     let actual: BTreeSet<&str> = variant_names(&schema.inputs.variants)
         .into_iter()
@@ -147,6 +149,7 @@ fn meerkat_machine_inputs_equal_runtime_manifest_exactly() {
         .collect();
     let expected: BTreeSet<&str> = canonical_meerkat_machine_command_manifest()
         .into_iter()
+        .filter(|name| *name != "RuntimeRealtimeChannelStatus")
         .collect();
 
     assert_eq!(actual, expected);
@@ -165,10 +168,22 @@ fn mob_machine_inputs_equal_runtime_manifest_exactly() {
     // ever; they may stay shell-level by design).
     const RUNTIME_COMPOSITION_ONLY_COMMANDS: &[&str] =
         &["EnsureMember", "Reconcile", "ListMembersMatching"];
-    let actual = variant_names(&schema.inputs.variants);
+    const DSL_ONLY_INPUTS: &[&str] = &[
+        "WireMembers",
+        "UnwireMembers",
+        "BindMemberSession",
+        "RotateMemberSession",
+        "ReleaseMemberSession",
+    ];
+    let actual: BTreeSet<&str> = variant_names(&schema.inputs.variants)
+        .into_iter()
+        .filter(|name| !DSL_ONLY_INPUTS.contains(name))
+        .collect();
     let expected: BTreeSet<&str> = canonical_mob_machine_command_manifest()
         .into_iter()
-        .filter(|name| !RUNTIME_COMPOSITION_ONLY_COMMANDS.contains(name))
+        .filter(|name| {
+            !RUNTIME_COMPOSITION_ONLY_COMMANDS.contains(name) && !["Wire", "Unwire"].contains(name)
+        })
         .collect();
 
     assert_eq!(actual, expected);

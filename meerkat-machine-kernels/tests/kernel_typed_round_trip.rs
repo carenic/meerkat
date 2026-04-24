@@ -91,10 +91,13 @@ fn applying_typed_input_yields_typed_transition_outcome() {
             },
         )
         .expect("register session");
-    assert_eq!(register.transition, transition("RegisterSession"));
+    assert_eq!(register.transition, transition("RegisterSessionIdle"));
     assert_eq!(
         register.next_state.fields.get(&field("session_id")),
-        Some(&KernelValue::String("sess-1".into()))
+        Some(&KernelValue::Map(BTreeMap::from([(
+            KernelValue::String("value".into()),
+            KernelValue::String("sess-1".into()),
+        )])))
     );
     for key in register.next_state.fields.keys() {
         let _: &FieldId = key;
