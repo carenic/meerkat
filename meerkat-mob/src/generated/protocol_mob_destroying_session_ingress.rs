@@ -28,3 +28,27 @@ pub fn extract_obligations(
         })
         .collect()
 }
+
+pub fn submit_session_ingress_detached_for_mob_destroy(
+    authority: &mut MobMachineAuthority,
+    obligation: MobDestroyingSessionIngressObligation,
+) -> Result<MobMachineTransition, MobMachineTransitionError> {
+    let transition = authority.apply(MobMachineInput::SessionIngressDetachedForMobDestroy {
+        mob_id: obligation.mob_id,
+        agent_runtime_id: obligation.agent_runtime_id,
+    })?;
+    Ok(transition)
+}
+
+pub fn submit_session_ingress_detach_failed_for_mob_destroy(
+    authority: &mut MobMachineAuthority,
+    obligation: MobDestroyingSessionIngressObligation,
+    reason: String,
+) -> Result<MobMachineTransition, MobMachineTransitionError> {
+    let transition = authority.apply(MobMachineInput::SessionIngressDetachFailedForMobDestroy {
+        mob_id: obligation.mob_id,
+        agent_runtime_id: obligation.agent_runtime_id,
+        reason,
+    })?;
+    Ok(transition)
+}
