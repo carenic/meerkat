@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use meerkat_core::lifecycle::core_executor::{CoreApplyOutput, CoreExecutor, CoreExecutorError};
 use meerkat_core::lifecycle::run_control::RunControlCommand;
-use meerkat_core::lifecycle::run_primitive::{CoreRenderable, RunPrimitive};
+use meerkat_core::lifecycle::run_primitive::{CoreRenderable, RunPrimitive, RuntimeTurnMetadata};
 use meerkat_core::service::SessionService;
+use meerkat_core::types::HandlingMode;
 use meerkat_runtime::meerkat_machine::RuntimeBindingsError;
 use meerkat_runtime::{MeerkatMachine, RuntimeDriverError};
 
@@ -171,6 +172,58 @@ fn pending_system_context_appends(
     )
 }
 
+fn unsupported_runtime_metadata_fields(metadata: &RuntimeTurnMetadata) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if metadata.model.is_some() {
+        fields.push("model");
+    }
+    if metadata.provider.is_some() {
+        fields.push("provider");
+    }
+    if metadata.provider_params.is_some() {
+        fields.push("provider_params");
+    }
+    if metadata.connection_ref.is_some() {
+        fields.push("connection_ref");
+    }
+    if metadata.keep_alive.is_some() {
+        fields.push("keep_alive");
+    }
+    if metadata.additional_instructions.is_some() {
+        fields.push("additional_instructions");
+    }
+    fields
+}
+
+fn start_turn_request_from_primitive(
+    primitive: &RunPrimitive,
+) -> Result<meerkat_core::service::StartTurnRequest, CoreExecutorError> {
+    let metadata = primitive.turn_metadata();
+    if let Some(metadata) = metadata {
+        let unsupported = unsupported_runtime_metadata_fields(metadata);
+        if !unsupported.is_empty() {
+            return Err(CoreExecutorError::ApplyFailed {
+                reason: format!(
+                    "runtime-backed apply cannot yet project {} through StartTurnRequest; refusing to drop canonical RuntimeTurnMetadata fields",
+                    unsupported.join(", ")
+                ),
+            });
+        }
+    }
+
+    Ok(meerkat_core::service::StartTurnRequest {
+        prompt: primitive.extract_content_input(),
+        system_prompt: None,
+        render_metadata: metadata.and_then(|metadata| metadata.render_metadata.clone()),
+        handling_mode: metadata
+            .and_then(|metadata| metadata.handling_mode)
+            .unwrap_or(HandlingMode::Queue),
+        event_tx: None,
+        skill_references: metadata.and_then(|metadata| metadata.skill_references.clone()),
+        flow_tool_overlay: metadata.and_then(|metadata| metadata.flow_tool_overlay.clone()),
+    })
+}
+
 #[async_trait::async_trait]
 impl CoreExecutor for PersistentRuntimeExecutor {
     async fn apply(
@@ -194,10 +247,21 @@ impl CoreExecutor for PersistentRuntimeExecutor {
                 });
         }
 
-        let _ = (run_id, primitive);
-        Err(CoreExecutorError::ApplyFailed {
-            reason: "runtime-backed apply must flow through a single canonical RuntimeTurnMetadata seam; the ad-hoc StartTurnRequest construction that dropped model/provider/provider_params/keep_alive/render_metadata and forged a non-canonical override carrier has been deleted".to_string(),
-        })
+        let boundary = primitive.apply_boundary();
+        let contributing_input_ids = primitive.contributing_input_ids().to_vec();
+        let req = start_turn_request_from_primitive(&primitive)?;
+        self.service
+            .apply_runtime_turn(
+                &self.session_id,
+                run_id,
+                req,
+                boundary,
+                contributing_input_ids,
+            )
+            .await
+            .map_err(|error| CoreExecutorError::ApplyFailed {
+                reason: error.to_string(),
+            })
     }
 
     async fn control(&mut self, command: RunControlCommand) -> Result<(), CoreExecutorError> {
