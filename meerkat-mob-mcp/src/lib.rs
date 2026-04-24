@@ -1512,8 +1512,9 @@ struct LocalCommsRuntime {
 
 impl LocalCommsRuntime {
     fn new(name: &str) -> Self {
+        let _ = name;
         Self {
-            key: format!("ed25519:{name}"),
+            key: meerkat_core::comms::PeerId::new().to_string(),
             trusted: RwLock::new(HashSet::new()),
             notify: Arc::new(tokio::sync::Notify::new()),
         }
@@ -1532,6 +1533,13 @@ impl CoreCommsRuntime for LocalCommsRuntime {
             .write()
             .await
             .insert(peer.peer_id.as_str().to_string());
+        Ok(())
+    }
+
+    async fn add_private_trusted_peer(
+        &self,
+        _peer: TrustedPeerDescriptor,
+    ) -> Result<(), SendError> {
         Ok(())
     }
 
@@ -2908,8 +2916,9 @@ mod tests {
 
     impl MockComms {
         fn new(name: &str) -> Self {
+            let _ = name;
             Self {
-                key: format!("ed25519:{name}"),
+                key: meerkat_core::comms::PeerId::new().to_string(),
                 trusted: RwLock::new(HashSet::new()),
                 notify: Arc::new(Notify::new()),
             }
@@ -2930,6 +2939,13 @@ mod tests {
                 .write()
                 .await
                 .insert(peer.peer_id.as_str().to_string());
+            Ok(())
+        }
+
+        async fn add_private_trusted_peer(
+            &self,
+            _peer: meerkat_core::comms::TrustedPeerDescriptor,
+        ) -> Result<(), SendError> {
             Ok(())
         }
 

@@ -1936,7 +1936,7 @@ mod tests {
         async fn new(name: &str, registry: Arc<TestCommsRegistry>) -> Arc<Self> {
             let runtime = Arc::new(Self {
                 name: name.to_string(),
-                key: format!("ed25519:{name}"),
+                key: meerkat_core::comms::PeerId::new().to_string(),
                 trusted: tokio::sync::RwLock::new(HashMap::new()),
                 inbox: tokio::sync::RwLock::new(Vec::new()),
                 notify: Arc::new(tokio::sync::Notify::new()),
@@ -1958,6 +1958,13 @@ mod tests {
                 .write()
                 .await
                 .insert(peer.peer_id.as_str().to_string(), peer);
+            Ok(())
+        }
+
+        async fn add_private_trusted_peer(
+            &self,
+            _peer: TrustedPeerDescriptor,
+        ) -> Result<(), SendError> {
             Ok(())
         }
 

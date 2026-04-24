@@ -9502,8 +9502,9 @@ mod tests {
 
     impl TestCommsRuntime {
         fn new(name: &str) -> Self {
+            let _ = name;
             Self {
-                key: format!("ed25519:{name}"),
+                key: meerkat_core::comms::PeerId::new().to_string(),
                 trusted: RwLock::new(HashSet::new()),
                 notify: Arc::new(tokio::sync::Notify::new()),
             }
@@ -9518,6 +9519,13 @@ mod tests {
 
         async fn add_trusted_peer(&self, peer: TrustedPeerDescriptor) -> Result<(), SendError> {
             self.trusted.write().await.insert(peer.peer_id.to_string());
+            Ok(())
+        }
+
+        async fn add_private_trusted_peer(
+            &self,
+            _peer: TrustedPeerDescriptor,
+        ) -> Result<(), SendError> {
             Ok(())
         }
 
