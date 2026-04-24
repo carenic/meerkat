@@ -54,7 +54,6 @@ impl MeerkatMachine {
                         .unwrap_or(RuntimeState::Destroyed)
                         .is_idle_or_attached();
                     let resolved = drv.resolve_admission_for_runtime_idle(&input, runtime_idle);
-                    let preview_run_id = RunId::new();
                     self.preview_session_dsl_input(
                         &session_id,
                         crate::meerkat_machine::dsl::MeerkatMachineInput::AcceptWithCompletion {
@@ -66,9 +65,6 @@ impl MeerkatMachine {
                                 .request_immediate_processing,
                             interrupt_yielding: resolved.coarse_flags.interrupt_yielding,
                             wake_if_idle: resolved.coarse_flags.wake_if_idle,
-                            run_id: crate::meerkat_machine::dsl::RunId::from_domain(
-                                &preview_run_id,
-                            ),
                         },
                         "AcceptWithCompletion(Ingest)",
                     )
@@ -97,9 +93,6 @@ impl MeerkatMachine {
                                             .request_immediate_processing,
                                         interrupt_yielding: resolved.coarse_flags.interrupt_yielding,
                                         wake_if_idle: resolved.coarse_flags.wake_if_idle,
-                                        run_id: crate::meerkat_machine::dsl::RunId::from_domain(
-                                            &preview_run_id,
-                                        ),
                                     },
                                     "AcceptWithCompletion(Ingest)",
                                 )

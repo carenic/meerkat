@@ -4198,8 +4198,8 @@ async fn meerkat_machine_spine_snapshot_preserves_completion_waiters_after_recov
         .expect("snapshot should exist while recover replay is in flight");
     assert_eq!(
         during_recover.control.phase,
-        RuntimeState::Attached,
-        "post-`e5c5ecaf3` DSL-authoritative: recover self-loops on Attached (RecoverAttached transition in dsl.rs:3494) — the DSL lifecycle_phase remains Attached through the runtime-loop replay window"
+        RuntimeState::Running,
+        "post-#32 W6-J: during recover_with_runtime_loop, the runtime loop fires DSL `Prepare` which transitions lifecycle_phase to Running; the recover transition itself self-loops on Attached but the apply-in-flight binds to a run_id and sits at Running until Commit returns"
     );
     assert_eq!(during_recover.completion_waiters.input_count, 1);
     assert_eq!(during_recover.completion_waiters.waiter_count, 1);
@@ -4379,8 +4379,8 @@ async fn meerkat_machine_spine_snapshot_preserves_completion_waiters_after_recyc
         .expect("snapshot should exist while recycle replay is in flight");
     assert_eq!(
         during_recycle.control.phase,
-        RuntimeState::Attached,
-        "post-`e5c5ecaf3` DSL-authoritative: recycle from Attached holds lifecycle_phase at Attached while the runtime-loop replays preserved work; DSL is source of truth, not control_projection cache"
+        RuntimeState::Running,
+        "post-#32 W6-J: recycle from Attached starts the loop which fires DSL `Prepare` → Running; the apply-in-flight sits at Running during replay until Commit returns (DSL is source of truth, now with run-lifecycle properly DSL-wired)"
     );
     assert_eq!(during_recycle.completion_waiters.input_count, 1);
     assert_eq!(during_recycle.completion_waiters.waiter_count, 1);
@@ -5615,8 +5615,8 @@ async fn meerkat_machine_spine_snapshot_preserves_wait_all_after_recover_with_ru
         .expect("snapshot should exist while recover replay is in flight");
     assert_eq!(
         during_recover.control.phase,
-        RuntimeState::Attached,
-        "post-`e5c5ecaf3` DSL-authoritative: recover self-loops on Attached (RecoverAttached transition in dsl.rs:3494) — the DSL lifecycle_phase remains Attached through the runtime-loop replay window"
+        RuntimeState::Running,
+        "post-#32 W6-J: during recover_with_runtime_loop, the runtime loop fires DSL `Prepare` which transitions lifecycle_phase to Running; the recover transition itself self-loops on Attached but the apply-in-flight binds to a run_id and sits at Running until Commit returns"
     );
     assert_eq!(
         during_recover.ops.wait_request_id,
@@ -5893,8 +5893,8 @@ async fn meerkat_machine_spine_snapshot_recover_with_runtime_loop_splits_complet
         .expect("snapshot should exist while recover replay is in flight");
     assert_eq!(
         during_recover.control.phase,
-        RuntimeState::Attached,
-        "post-`e5c5ecaf3` DSL-authoritative: recover self-loops on Attached (RecoverAttached transition in dsl.rs:3494) — the DSL lifecycle_phase remains Attached through the runtime-loop replay window"
+        RuntimeState::Running,
+        "post-#32 W6-J: during recover_with_runtime_loop, the runtime loop fires DSL `Prepare` which transitions lifecycle_phase to Running; the recover transition itself self-loops on Attached but the apply-in-flight binds to a run_id and sits at Running until Commit returns"
     );
     assert_eq!(during_recover.completion_waiters.input_count, 1);
     assert_eq!(during_recover.completion_waiters.waiter_count, 1);
@@ -6164,8 +6164,8 @@ async fn meerkat_machine_spine_snapshot_preserves_wait_all_after_recycle_with_ru
         .expect("snapshot should exist after recycle wakes the loop");
     assert_eq!(
         after_recycle.control.phase,
-        RuntimeState::Attached,
-        "post-`e5c5ecaf3` DSL-authoritative: recycle from Attached holds lifecycle_phase at Attached after the loop wake; DSL is source of truth, not control_projection cache"
+        RuntimeState::Running,
+        "post-#32 W6-J: recycle from Attached wakes the loop which fires DSL `Prepare` → Running; the apply-in-flight sits at Running until Commit returns (DSL is source of truth, now with run-lifecycle properly DSL-wired)"
     );
     assert_eq!(
         after_recycle.ops.wait_request_id,
@@ -6413,8 +6413,8 @@ async fn meerkat_machine_spine_snapshot_recycle_with_runtime_loop_splits_complet
         .expect("snapshot should exist while recycle replay is in flight");
     assert_eq!(
         during_recycle.control.phase,
-        RuntimeState::Attached,
-        "post-`e5c5ecaf3` DSL-authoritative: recycle from Attached holds lifecycle_phase at Attached while the runtime-loop replays preserved work; DSL is source of truth, not control_projection cache"
+        RuntimeState::Running,
+        "post-#32 W6-J: recycle from Attached starts the loop which fires DSL `Prepare` → Running; the apply-in-flight sits at Running during replay until Commit returns (DSL is source of truth, now with run-lifecycle properly DSL-wired)"
     );
     assert_eq!(during_recycle.completion_waiters.input_count, 1);
     assert_eq!(during_recycle.completion_waiters.waiter_count, 1);
@@ -11339,8 +11339,8 @@ async fn reconfigure_session_llm_identity_succeeds_while_running() {
         .phase;
     assert_eq!(
         phase_while_running,
-        RuntimeState::Attached,
-        "post-`e5c5ecaf3` DSL-authoritative: spine_snapshot.control.phase projects the DSL lifecycle_phase which is `Attached` while the executor applies — the ReconfigureSessionLlmIdentityAttached DSL transition (dsl.rs:3024) accepts reconfigure from Attached, so this pre-check validates the DSL-visible phase at the reconfigure entry point"
+        RuntimeState::Running,
+        "post-#32 W6-J: DSL `Prepare` fires from `machine_begin_run` during the apply-in-flight, transitioning lifecycle_phase to Running; the reconfigure path enters while the loop holds a run binding, so the DSL-visible phase is Running"
     );
 
     let report = adapter
@@ -11375,8 +11375,8 @@ async fn reconfigure_session_llm_identity_succeeds_while_running() {
         .phase;
     assert_eq!(
         phase_after_reconfigure,
-        RuntimeState::Attached,
-        "post-`e5c5ecaf3` DSL-authoritative: reconfigure is a per-phase self-loop (ReconfigureSessionLlmIdentityAttached at dsl.rs:3024) — the DSL lifecycle_phase stays at `Attached` through reconfigure while the executor applies"
+        RuntimeState::Running,
+        "post-#32 W6-J: reconfigure is a per-phase self-loop — the DSL lifecycle_phase stays at Running while the executor applies (Prepare fired at loop-start, Commit fires at completion)"
     );
 
     allow_finish.notify_waiters();

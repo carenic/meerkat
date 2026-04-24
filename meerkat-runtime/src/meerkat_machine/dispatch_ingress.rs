@@ -45,7 +45,6 @@ impl MeerkatMachine {
                     });
                 }
 
-                let run_id_for_dsl = RunId::new();
                 let (resolved, outcome, handle, accepted_input_id, signal) = {
                     let mut driver = driver.lock().await;
                     let runtime_idle = state.is_idle_or_attached();
@@ -61,9 +60,6 @@ impl MeerkatMachine {
                                 .request_immediate_processing,
                             interrupt_yielding: resolved.coarse_flags.interrupt_yielding,
                             wake_if_idle: resolved.coarse_flags.wake_if_idle,
-                            run_id: crate::meerkat_machine::dsl::RunId::from_domain(
-                                &run_id_for_dsl,
-                            ),
                         },
                         "AcceptWithCompletion",
                     )
@@ -159,9 +155,6 @@ impl MeerkatMachine {
                                     .request_immediate_processing,
                                 interrupt_yielding: resolved.coarse_flags.interrupt_yielding,
                                 wake_if_idle: resolved.coarse_flags.wake_if_idle,
-                                run_id: crate::meerkat_machine::dsl::RunId::from_domain(
-                                    &run_id_for_dsl,
-                                ),
                             },
                             "AcceptWithCompletion",
                         )
@@ -486,8 +479,12 @@ impl MeerkatMachine {
                         let next_phase = crate::runtime_state::run_return_phase_from_pre_run_phase(
                             driver.pre_run_phase(),
                         );
-                        let _ =
-                            machine_apply_run_return_projection(&mut driver, &run_id, next_phase);
+                        let _ = machine_apply_run_return_projection(
+                            &mut driver,
+                            &run_id,
+                            crate::meerkat_machine::driver::RunReturnDisposition::Fail,
+                            next_phase,
+                        );
                         self.restore_session_dsl_state(&session_id, previous_dsl_state)
                             .await;
                         return Err(RuntimeDriverError::Internal(format!(

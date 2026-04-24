@@ -56,7 +56,6 @@ impl SessionAdmissionHandle for RuntimeSessionAdmissionHandle {
         request_immediate_processing: bool,
         interrupt_yielding: bool,
         wake_if_idle: bool,
-        run_id: &RunId,
     ) -> Result<(), DslTransitionError> {
         // intra-machine: no route; dispatcher not applicable (handle targets the meerkat DSL directly, not a CompositionDispatcher seam)
         self.dsl.apply_input(
@@ -65,7 +64,6 @@ impl SessionAdmissionHandle for RuntimeSessionAdmissionHandle {
                 request_immediate_processing,
                 interrupt_yielding,
                 wake_if_idle,
-                run_id: mm_dsl::RunId::from_domain(run_id),
             },
             "SessionAdmissionHandle::accept_with_completion",
         )

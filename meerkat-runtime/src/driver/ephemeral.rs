@@ -302,7 +302,6 @@ impl EphemeralRuntimeDriver {
         self.admission_order = snapshot.admission_order;
     }
 
-    #[cfg(test)]
     pub(crate) fn shared_dsl_authority(&self) -> SharedIngressDslAuthority {
         Arc::clone(&self.dsl.0)
     }

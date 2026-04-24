@@ -592,7 +592,6 @@ pub trait SessionAdmissionHandle: Send + Sync {
         request_immediate_processing: bool,
         interrupt_yielding: bool,
         wake_if_idle: bool,
-        run_id: &RunId,
     ) -> Result<(), DslTransitionError>;
 
     /// Fire the `AcceptWithoutWake { input_id }` input.
