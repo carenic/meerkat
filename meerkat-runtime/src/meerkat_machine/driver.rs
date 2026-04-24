@@ -7,7 +7,7 @@ use meerkat_core::lifecycle::{InputId, RunId};
 use crate::accept::{AcceptOutcome, ResolvedAdmission};
 use crate::driver::ephemeral::EphemeralRuntimeDriver;
 use crate::driver::persistent::PersistentRuntimeDriver;
-use crate::identifiers::LogicalRuntimeId;
+use crate::identifiers::{IdempotencyKey, LogicalRuntimeId};
 use crate::ingress_types::ContentShape;
 use crate::input::Input;
 use crate::input_state::{
@@ -105,6 +105,13 @@ impl DriverEntry {
         match self {
             DriverEntry::Ephemeral(d) => d,
             DriverEntry::Persistent(d) => d,
+        }
+    }
+
+    pub(crate) fn input_id_for_idempotency_key(&self, key: &IdempotencyKey) -> Option<InputId> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.ledger().input_id_for_idempotency_key(key),
+            DriverEntry::Persistent(d) => d.inner_ref().ledger().input_id_for_idempotency_key(key),
         }
     }
 
