@@ -437,6 +437,17 @@ struct MockSessionService {
     flow_turn_overlays: RwLock<Vec<(SessionId, Option<meerkat_core::service::TurnToolOverlay>)>>,
     /// Session IDs for which `subscribe_session_events` must return an error.
     subscribe_fail_sessions: RwLock<HashSet<SessionId>>,
+    /// Session IDs for which `read()`/`list()` should report `is_active=true`.
+    ///
+    /// Mirrors real SessionService semantics: `is_active` tracks in-flight
+    /// turn execution (Admitted/Running/Completing), not session presence.
+    /// A created-but-idle session is not active. Tests that exercise
+    /// in-flight-turn semantics can flip this via
+    /// [`Self::mark_session_active`]. Without this, the disposal-time poll
+    /// loop in [`stop_autonomous_member`] spins the full 40×25ms=1s grace
+    /// window on every retire/complete/reset because the mock was reporting
+    /// an always-`true` flag that the real service never would.
+    active_sessions: RwLock<HashSet<SessionId>>,
 }
 
 impl MockSessionService {
@@ -478,6 +489,7 @@ impl MockSessionService {
             flow_turn_completed_result: RwLock::new("\"Turn completed\"".to_string()),
             flow_turn_overlays: RwLock::new(Vec::new()),
             subscribe_fail_sessions: RwLock::new(HashSet::new()),
+            active_sessions: RwLock::new(HashSet::new()),
         }
     }
 
@@ -1125,6 +1137,10 @@ impl SessionService for MockSessionService {
         if let Some(notifier) = self.keep_alive_notifiers.read().await.get(id).cloned() {
             notifier.notify_waiters();
         }
+        // Real SessionService flips is_active to false once the turn/keep-alive
+        // loop unwinds after interrupt. Mirror that here so the disposal-time
+        // poll loop in `stop_autonomous_member` doesn't spin to its 1s cap.
+        self.active_sessions.write().await.remove(id);
         Ok(())
     }
 
@@ -1137,13 +1153,14 @@ impl SessionService for MockSessionService {
         if !self.sessions.read().await.contains_key(id) {
             return Err(SessionError::NotFound { id: id.clone() });
         }
+        let is_active = self.active_sessions.read().await.contains(id);
         Ok(SessionView {
             state: SessionInfo {
                 session_id: id.clone(),
                 created_at: session.created_at(),
                 updated_at: session.updated_at(),
                 message_count: session.messages().len(),
-                is_active: true,
+                is_active,
                 model: metadata
                     .as_ref()
                     .map(|meta| meta.model.clone())
@@ -1164,6 +1181,7 @@ impl SessionService for MockSessionService {
 
     async fn list(&self, _query: SessionQuery) -> Result<Vec<SessionSummary>, SessionError> {
         let sessions = self.live_session_data.read().await;
+        let active = self.active_sessions.read().await;
         Ok(sessions
             .values()
             .map(|session| SessionSummary {
@@ -1172,7 +1190,7 @@ impl SessionService for MockSessionService {
                 updated_at: session.updated_at(),
                 message_count: session.messages().len(),
                 total_tokens: session.total_tokens(),
-                is_active: true,
+                is_active: active.contains(session.id()),
                 labels: Default::default(),
             })
             .collect())
