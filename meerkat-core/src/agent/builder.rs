@@ -331,8 +331,22 @@ impl AgentBuilder {
             epoch_cursor_state: self.epoch_cursor_state,
             completion_enrichment: self.completion_enrichment,
             mob_authority_handle: None,
+            // Default classification: a runtime-backed agent constructed with
+            // an attached `turn_state_handle` is an ordinary external content
+            // turn unless the runtime surface explicitly restages a different
+            // kind via `set_runtime_execution_kind`. This prevents tests and
+            // direct-call paths (e.g. `agent.run_loop` without going through
+            // `run_inner`) from panicking at `runtime_turn_authority_snapshot`
+            // when the DSL-owned runtime kind has not been stamped yet. Agents
+            // built without a handle (legacy standalone paths, WASM) keep the
+            // field `None`; the snapshot accessor only panics when a handle
+            // *is* attached. See #32 Class W2.
+            runtime_execution_kind: if self.turn_state_handle.is_some() {
+                Some(crate::lifecycle::RuntimeExecutionKind::ContentTurn)
+            } else {
+                None
+            },
             turn_state_handle: self.turn_state_handle,
-            runtime_execution_kind: None,
             external_tool_surface_handle: self.external_tool_surface_handle,
             auth_lease_handle: self.auth_lease_handle,
             mcp_server_lifecycle_handle: self.mcp_server_lifecycle_handle,
@@ -770,6 +784,9 @@ mod tests {
         }
 
         let mut agent = AgentBuilder::new()
+            .with_turn_state_handle(Arc::new(
+                crate::agent::test_turn_state_handle::TestTurnStateHandle::new(),
+            ))
             .with_event_tap(tap)
             .build(client, tools, store)
             .await;

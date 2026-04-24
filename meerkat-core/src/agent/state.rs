@@ -2143,6 +2143,30 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::sync::{Notify, mpsc};
 
+    /// Attach an in-core phase-tracking `TurnStateHandle` to a raw
+    /// `AgentBuilder`.
+    ///
+    /// Wave-A deleted the standalone in-core turn-state fallback
+    /// (`LocalTurnExecutionState`); `Agent::runtime_turn_authority_snapshot`
+    /// now requires a live handle on every run path. Tests that construct
+    /// a bare `AgentBuilder::new()` (wrapped here by this helper) must
+    /// thread a `TurnStateHandle` through the build or the agent loop
+    /// panics the first time it queries turn state.
+    ///
+    /// `meerkat-core` cannot borrow `RuntimeTurnStateHandle` from
+    /// `meerkat-runtime` (circular dev-dep instantiates two copies of
+    /// `meerkat-core` and the trait impls do not unify). Instead we use
+    /// the in-core test helper
+    /// [`super::test_turn_state_handle::TestTurnStateHandle`], which
+    /// ports the deleted pre-wave-a `LocalTurnExecutionState` transition
+    /// logic verbatim so the agent loop sees faithful phase advancement.
+    ///
+    /// See #32 Class W1 — runtime_turn_authority missing handle.
+    fn with_test_turn_state_handle(builder: AgentBuilder) -> AgentBuilder {
+        use crate::agent::test_turn_state_handle::TestTurnStateHandle;
+        builder.with_turn_state_handle(Arc::new(TestTurnStateHandle::new()))
+    }
+
     #[test]
     fn rewrite_assistant_text_rewrites_all_text_blocks() {
         let mut blocks = vec![
@@ -3286,7 +3310,7 @@ mod tests {
     where
         C: AgentLlmClient + ?Sized + 'static,
     {
-        AgentBuilder::new()
+        with_test_turn_state_handle(AgentBuilder::new())
             .build(client, Arc::new(NoTools), Arc::new(NoopStore))
             .await
     }
@@ -3295,7 +3319,7 @@ mod tests {
     async fn reused_session_follow_up_run_can_compact_before_first_llm_call() {
         let client = Arc::new(CompactionAwareLlmClient::new());
         let compactor = Arc::new(TrackingCompactor::new(Some(1)));
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .compactor(compactor.clone())
             .build(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
             .await;
@@ -3355,7 +3379,7 @@ mod tests {
             }
         }
 
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .with_hook_engine(Arc::new(RewriteRunCompletedHook))
             .build(
                 Arc::new(StaticLlmClient),
@@ -3416,7 +3440,7 @@ mod tests {
             }
         }
 
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .with_hook_engine(Arc::new(DenyRunCompletedHook))
             .build(
                 Arc::new(StaticLlmClient),
@@ -3493,7 +3517,7 @@ mod tests {
             Vec::new(),
             vec!["late boundary message".to_string()],
         ]));
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .with_hook_engine(Arc::new(DenyTurnBoundaryHook))
             .with_comms_runtime(comms)
             .build(
@@ -3555,7 +3579,7 @@ mod tests {
             });
         }
 
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .with_event_tap(tap)
             .build(
                 Arc::new(StaticLlmClient),
@@ -3588,7 +3612,7 @@ mod tests {
         let client = Arc::new(RecordingLlmClient::new());
         let skill_engine = Arc::new(RecordingSkillEngine::new());
         let skill_runtime = Arc::new(crate::skills::SkillRuntime::new(skill_engine.clone()));
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .with_skill_engine(skill_runtime)
             .build(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
             .await;
@@ -3645,7 +3669,7 @@ mod tests {
             },
         ])));
 
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .resume_session(session)
             .with_blob_store(blob_store.clone())
             .build(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
@@ -3672,7 +3696,7 @@ mod tests {
     async fn provider_receives_filtered_tools_and_dispatch_blocks_hidden_tools() {
         let client = Arc::new(VisibilityRecordingLlmClient::new());
         let tools = Arc::new(FullToolDispatcher::new(&["visible", "secret"]));
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .build(client.clone(), tools.clone(), Arc::new(NoopStore))
             .await;
 
@@ -3704,7 +3728,7 @@ mod tests {
     async fn external_tool_dispatch_uses_visible_dispatcher() {
         let client = Arc::new(StaticLlmClient);
         let tools = Arc::new(FullToolDispatcher::new(&["visible", "secret"]));
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .build(client, tools.clone(), Arc::new(NoopStore))
             .await;
 
@@ -3726,7 +3750,7 @@ mod tests {
     async fn external_tool_dispatch_blocks_hidden_tools() {
         let client = Arc::new(StaticLlmClient);
         let tools = Arc::new(FullToolDispatcher::new(&["visible", "secret"]));
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .build(client, tools.clone(), Arc::new(NoopStore))
             .await;
         agent
@@ -3771,7 +3795,7 @@ mod tests {
     async fn external_tool_dispatch_applies_session_effects() {
         let client = Arc::new(StaticLlmClient);
         let tools = Arc::new(DeferredLoadDispatcher::new());
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .build(client, tools, Arc::new(NoopStore))
             .await;
 
@@ -3801,7 +3825,7 @@ mod tests {
     async fn provider_and_dispatch_share_the_same_combined_visible_set_for_control_tools() {
         let client = Arc::new(ControlPlaneVisibilityClient::new());
         let tools = Arc::new(PlaneAwareToolDispatcher::new());
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .build(client.clone(), tools.clone(), Arc::new(NoopStore))
             .await;
 
@@ -3838,7 +3862,7 @@ mod tests {
     async fn deferred_tools_become_visible_only_after_load_effect_reaches_the_next_boundary() {
         let client = Arc::new(DeferredLoadVisibilityClient::new());
         let tools = Arc::new(DeferredLoadDispatcher::new());
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .build(client.clone(), tools, Arc::new(NoopStore))
             .await;
         agent.config.max_turns = Some(2);
@@ -3863,7 +3887,7 @@ mod tests {
     async fn deferred_catalog_delta_events_track_hidden_catalog_changes_across_boundaries() {
         let client = Arc::new(DeferredLoadVisibilityClient::new());
         let tools = Arc::new(DeferredLoadDispatcher::new());
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .build(client, tools, Arc::new(NoopStore))
             .await;
         agent.config.max_turns = Some(2);
@@ -3905,7 +3929,7 @@ mod tests {
     async fn direct_builder_exact_catalog_without_control_plane_keeps_deferred_tools_inline() {
         let client = Arc::new(VisibilityRecordingLlmClient::new());
         let tools = Arc::new(DeferredWithoutControlDispatcher::new());
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .build(client.clone(), tools, Arc::new(NoopStore))
             .await;
         agent.config.max_turns = Some(2);
@@ -3930,7 +3954,7 @@ mod tests {
     async fn run_loop_boundary_applies_filter_and_emits_tool_config_changed_and_notice() {
         let client = Arc::new(SingleTurnVisibilityClient::new());
         let tools = Arc::new(FullToolDispatcher::new(&["visible", "secret"]));
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .build(client.clone(), tools, Arc::new(NoopStore))
             .await;
         agent
@@ -3977,7 +4001,7 @@ mod tests {
     async fn run_loop_fails_safe_to_full_tools_with_warning_event_and_notice() {
         let client = Arc::new(SingleTurnVisibilityClient::new());
         let tools = Arc::new(FullToolDispatcher::new(&["visible", "secret"]));
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .build(client.clone(), tools, Arc::new(NoopStore))
             .await;
         agent
@@ -4040,7 +4064,7 @@ mod tests {
             .unwrap(),
         );
 
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .resume_session(session)
             .build(client.clone(), tools, Arc::new(NoopStore))
             .await;
@@ -4069,7 +4093,7 @@ mod tests {
             .unwrap(),
         );
 
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .resume_session(session)
             .build(client.clone(), tools, Arc::new(NoopStore))
             .await;
@@ -4110,7 +4134,7 @@ mod tests {
             .unwrap(),
         );
 
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .resume_session(session)
             .build(client.clone(), tools, Arc::new(NoopStore))
             .await;
@@ -4342,7 +4366,7 @@ mod tests {
 
         let hint = Duration::from_millis(200); // short for CI speed
         let client = Arc::new(RateLimitThenSucceedClient::new(hint));
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .retry_policy(RetryPolicy {
                 max_retries: 3,
                 initial_delay: Duration::from_millis(10),
@@ -4389,7 +4413,7 @@ mod tests {
         use crate::retry::RetryPolicy;
 
         let client = Arc::new(RateLimitThenSucceedClient::new(Duration::ZERO));
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .retry_policy(RetryPolicy {
                 max_retries: 3,
                 initial_delay: Duration::from_millis(10),
@@ -4506,7 +4530,7 @@ mod tests {
             text_response(r#"{"answer": "42"}"#),
         ]));
 
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .output_schema(schema)
             .build(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
             .await;
@@ -4549,7 +4573,7 @@ mod tests {
             text_response(r#"{"name": "meerkat"}"#),
         ]));
 
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .output_schema(schema)
             .structured_output_retries(2)
             .build(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
@@ -4594,7 +4618,7 @@ mod tests {
             text_response("bad json 2"),
         ]));
 
-        let mut agent = AgentBuilder::new()
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .output_schema(schema)
             .structured_output_retries(2)
             .build(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))

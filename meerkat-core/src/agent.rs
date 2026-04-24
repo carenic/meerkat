@@ -10,6 +10,8 @@ mod hook_impl;
 mod runner;
 pub mod skills;
 mod state;
+#[doc(hidden)]
+pub mod test_turn_state_handle;
 use crate::budget::Budget;
 use crate::comms::{
     CommsCommand, EventStream, PeerDirectoryEntry, SendAndStreamError, SendError, SendReceipt,

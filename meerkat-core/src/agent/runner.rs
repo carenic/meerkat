@@ -831,9 +831,23 @@ where
     ) -> Result<RunResult, AgentError> {
         let event_tx = event_tx.or_else(|| self.default_event_tx.clone());
 
-        // Reset state for new run (allows multi-turn on same agent)
+        // Reset state for new run (allows multi-turn on same agent).
+        //
+        // `run_inner` is the entry point for an ordinary content turn. Default
+        // the classification to `ContentTurn` unless the caller staged an
+        // explicit kind via `set_runtime_execution_kind` (e.g. a runtime-backed
+        // surface that propagates `RuntimeTurnMetadata.execution_kind` from a
+        // `StagedRunInput`). Preserving a previously-staged classification
+        // prevents the reset from silently wiping the caller's typed intent.
+        //
+        // `None` is no longer a valid post-reset state: `turn_state_handle`
+        // attaches pair `runtime_execution_kind` with every live-run path,
+        // and `runtime_turn_authority_snapshot` (state.rs) panics on an
+        // unclassified handle. See #32 W2 / PR #299 follow-up.
         self.state = LoopState::CallingLlm;
-        self.runtime_execution_kind = None;
+        if self.runtime_execution_kind.is_none() {
+            self.runtime_execution_kind = Some(crate::lifecycle::RuntimeExecutionKind::ContentTurn);
+        }
         self.extraction_result = None;
         self.extraction_last_error = None;
         self.extraction_schema_warnings = None;
@@ -920,9 +934,17 @@ where
             ));
         };
 
-        // Reset state for new run (allows multi-turn on same agent)
+        // Reset state for new run (allows multi-turn on same agent).
+        //
+        // `run_pending_inner` is the entry point for an explicit continuation
+        // that resumes pending work at a boundary. Default the classification
+        // to `ResumePending` unless the caller staged an explicit kind via
+        // `set_runtime_execution_kind`. See #32 W2 / PR #299 follow-up.
         self.state = LoopState::CallingLlm;
-        self.runtime_execution_kind = None;
+        if self.runtime_execution_kind.is_none() {
+            self.runtime_execution_kind =
+                Some(crate::lifecycle::RuntimeExecutionKind::ResumePending);
+        }
         self.extraction_result = None;
         self.extraction_last_error = None;
         self.extraction_schema_warnings = None;
