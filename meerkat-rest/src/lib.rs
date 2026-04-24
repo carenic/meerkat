@@ -1663,14 +1663,14 @@ pub struct CommsSendRequest {
 impl CommsSendRequest {
     /// Recipient peer name for error normalization, if the command targets one.
     ///
-    /// The typed wire currently carries only the local-session `Input`
-    /// variant, which has no peer recipient; the peer-targeting variants
-    /// were removed when `CommsCommandRequest` was tightened to the single
-    /// input-injection shape.
     fn peer_name(&self) -> Option<&str> {
         use meerkat_core::comms::CommsCommandRequest;
         match &self.command {
             CommsCommandRequest::Input { .. } => None,
+            CommsCommandRequest::PeerMessage { to, .. }
+            | CommsCommandRequest::PeerLifecycle { to, .. }
+            | CommsCommandRequest::PeerRequest { to, .. }
+            | CommsCommandRequest::PeerResponse { to, .. } => Some(to.as_str()),
         }
     }
 }

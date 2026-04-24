@@ -409,6 +409,43 @@ pub enum CommsCommandRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         allow_self_session: Option<bool>,
     },
+    /// Send a one-way peer message.
+    PeerMessage {
+        to: PeerName,
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocks: Option<Vec<ContentBlock>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handling_mode: Option<HandlingMode>,
+    },
+    /// Send a one-way peer lifecycle notification.
+    PeerLifecycle {
+        to: PeerName,
+        lifecycle_kind: PeerLifecycleKind,
+        #[serde(default)]
+        params: serde_json::Value,
+    },
+    /// Send a request to a peer.
+    PeerRequest {
+        to: PeerName,
+        intent: String,
+        #[serde(default)]
+        params: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handling_mode: Option<HandlingMode>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream: Option<InputStreamMode>,
+    },
+    /// Send a response to a prior peer request.
+    PeerResponse {
+        to: PeerName,
+        in_reply_to: InteractionId,
+        status: ResponseStatus,
+        #[serde(default)]
+        result: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handling_mode: Option<HandlingMode>,
+    },
 }
 
 /// Cross-field validation failure for [`CommsCommandRequest::into_command`].
@@ -450,6 +487,57 @@ impl CommsCommandRequest {
                 stream: stream.unwrap_or(InputStreamMode::None),
                 allow_self_session: allow_self_session.unwrap_or(false),
             },
+            CommsCommandRequest::PeerMessage {
+                to,
+                body,
+                blocks,
+                handling_mode,
+            } => CommsCommand::PeerMessage {
+                to,
+                body,
+                blocks,
+                handling_mode: handling_mode.unwrap_or_default(),
+            },
+            CommsCommandRequest::PeerLifecycle {
+                to,
+                lifecycle_kind,
+                params,
+            } => CommsCommand::PeerLifecycle {
+                to,
+                kind: lifecycle_kind,
+                params,
+            },
+            CommsCommandRequest::PeerRequest {
+                to,
+                intent,
+                params,
+                handling_mode,
+                stream,
+            } => CommsCommand::PeerRequest {
+                to,
+                intent,
+                params,
+                handling_mode: handling_mode.unwrap_or_default(),
+                stream: stream.unwrap_or(InputStreamMode::None),
+            },
+            CommsCommandRequest::PeerResponse {
+                to,
+                in_reply_to,
+                status,
+                result,
+                handling_mode,
+            } => {
+                if status == ResponseStatus::Accepted && handling_mode.is_some() {
+                    return Err(CommsCommandError::HandlingModeForbiddenForAcceptedResponse);
+                }
+                CommsCommand::PeerResponse {
+                    to,
+                    in_reply_to,
+                    status,
+                    result,
+                    handling_mode,
+                }
+            }
         })
     }
 
@@ -457,6 +545,10 @@ impl CommsCommandRequest {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Input { .. } => "input",
+            Self::PeerMessage { .. } => "peer_message",
+            Self::PeerLifecycle { .. } => "peer_lifecycle",
+            Self::PeerRequest { .. } => "peer_request",
+            Self::PeerResponse { .. } => "peer_response",
         }
     }
 }
@@ -815,6 +907,7 @@ mod tests {
                 assert_eq!(source, Some(InputSource::Webhook));
                 assert_eq!(handling_mode, Some(HandlingMode::Steer));
             }
+            other => panic!("expected input command request, got {other:?}"),
         }
         Ok(())
     }

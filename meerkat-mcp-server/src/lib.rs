@@ -2348,12 +2348,14 @@ async fn handle_meerkat_comms_send(
                 })),
             )
         })?;
-    // `CommsCommandRequest` currently only carries `Input`; peer-addressed
-    // variants were retired when the typed wire enum collapsed. Leave a
-    // non-exhaustive match so adding a peer variant later re-lights this
-    // site.
     let peer_name: Option<String> = match &input.command {
         meerkat_core::comms::CommsCommandRequest::Input { .. } => None,
+        meerkat_core::comms::CommsCommandRequest::PeerMessage { to, .. }
+        | meerkat_core::comms::CommsCommandRequest::PeerLifecycle { to, .. }
+        | meerkat_core::comms::CommsCommandRequest::PeerRequest { to, .. }
+        | meerkat_core::comms::CommsCommandRequest::PeerResponse { to, .. } => {
+            Some(to.as_str().to_string())
+        }
     };
     let cmd = input.command.into_command(&session_id).map_err(|err| {
         ToolCallError::new(
