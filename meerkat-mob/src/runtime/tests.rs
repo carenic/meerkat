@@ -3931,6 +3931,25 @@ impl SessionAgentBuilder for OverlayProbeSessionAgentBuilder {
         if let Some(system_prompt) = &req.system_prompt {
             builder = builder.system_prompt(system_prompt.clone());
         }
+        if let Some(session) = req
+            .build
+            .as_ref()
+            .and_then(|build| build.resume_session.clone())
+        {
+            builder = builder.resume_session(session);
+        }
+        if let Some(build) = &req.build {
+            match &build.runtime_build_mode {
+                meerkat_core::runtime_epoch::RuntimeBuildMode::SessionOwned(bindings) => {
+                    builder = builder.with_turn_state_handle(Arc::clone(&bindings.turn_state));
+                }
+                meerkat_core::runtime_epoch::RuntimeBuildMode::StandaloneEphemeral => {
+                    builder = builder.with_turn_state_handle(Arc::new(
+                        meerkat_runtime::RuntimeTurnStateHandle::ephemeral(),
+                    ));
+                }
+            }
+        }
 
         let client = Arc::new(OverlayProbeLlmClient {
             provider_visible_tools: Arc::clone(&self.provider_visible_tools),

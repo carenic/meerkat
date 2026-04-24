@@ -207,7 +207,17 @@ fn primitive_turn_start_input(
                 },
             )
         }
-        RunPrimitive::StagedInput(_) => None,
+        RunPrimitive::StagedInput(staged) if staged.appends.is_empty() => None,
+        RunPrimitive::StagedInput(_) => Some(
+            crate::meerkat_machine::dsl::MeerkatMachineInput::StartConversationRun {
+                run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
+                primitive_kind: crate::meerkat_machine::dsl::TurnPrimitiveKind::ConversationTurn,
+                admitted_content_shape,
+                vision_enabled: false,
+                image_tool_results_enabled: false,
+                max_extraction_retries: 0,
+            },
+        ),
         _ => Some(
             crate::meerkat_machine::dsl::MeerkatMachineInput::StartConversationRun {
                 run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
@@ -1218,6 +1228,38 @@ mod tests {
             other => return Err(format!("expected text content, got {other:?}")),
         }
         Ok(())
+    }
+
+    #[test]
+    fn staged_conversation_input_starts_conversation_turn_state() -> Result<(), String> {
+        let input = make_prompt("test prompt");
+        let input_id = input.id().clone();
+        let primitive = input_to_primitive(&input, input_id);
+        let run_id = RunId::new();
+
+        let start_input = primitive_turn_start_input(&run_id, &primitive)
+            .ok_or_else(|| "expected staged content input to start turn state".to_string())?;
+
+        match start_input {
+            crate::meerkat_machine::dsl::MeerkatMachineInput::StartConversationRun {
+                run_id: got_run_id,
+                primitive_kind,
+                admitted_content_shape,
+                ..
+            } => {
+                assert_eq!(
+                    got_run_id,
+                    crate::meerkat_machine::dsl::RunId::from_domain(&run_id)
+                );
+                assert_eq!(
+                    primitive_kind,
+                    crate::meerkat_machine::dsl::TurnPrimitiveKind::ConversationTurn
+                );
+                assert_eq!(admitted_content_shape, "conversation");
+                Ok(())
+            }
+            other => Err(format!("expected StartConversationRun, got {other:?}")),
+        }
     }
 
     #[test]

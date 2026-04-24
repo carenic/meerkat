@@ -434,6 +434,11 @@ where
         };
 
         let result = match input {
+            TurnExecutionInput::StartConversationRun { run_id }
+                if handle.snapshot().active_run_id.as_ref() == Some(run_id) =>
+            {
+                Ok(())
+            }
             TurnExecutionInput::StartConversationRun { run_id } => handle.start_conversation_run(
                 run_id.clone(),
                 crate::turn_execution_authority::TurnPrimitiveKind::ConversationTurn,
@@ -442,8 +447,18 @@ where
                 false,
                 0,
             ),
+            TurnExecutionInput::StartImmediateAppend { run_id }
+                if handle.snapshot().active_run_id.as_ref() == Some(run_id) =>
+            {
+                Ok(())
+            }
             TurnExecutionInput::StartImmediateAppend { run_id } => {
                 handle.start_immediate_append(run_id.clone(), "immediate_append".to_string())
+            }
+            TurnExecutionInput::StartImmediateContext { run_id }
+                if handle.snapshot().active_run_id.as_ref() == Some(run_id) =>
+            {
+                Ok(())
             }
             TurnExecutionInput::StartImmediateContext { run_id } => {
                 handle.start_immediate_context(run_id.clone(), "immediate_context".to_string())
