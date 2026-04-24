@@ -5938,6 +5938,7 @@ mod tests {
                 "prompt": "Say hello",
                 "skill_refs": [
                     {
+                        "kind": "structured",
                         "source_uuid": "dc256086-0d2f-4f61-a307-320d4148107f",
                         "skill_name": "email-extractor"
                     }
@@ -5985,6 +5986,7 @@ mod tests {
                 "session_id": session_id,
                 "prompt": "Follow up",
                 "skill_refs": [{
+                    "kind": "structured",
                     "source_uuid": "dc256086-0d2f-4f61-a307-320d4148107f",
                     "skill_name": "email-extractor"
                 }],
@@ -6012,6 +6014,7 @@ mod tests {
                 "prompt": "Say hello",
                 "skill_refs": [
                     {
+                        "kind": "structured",
                         "source_uuid": "not-a-uuid",
                         "skill_name": "email-extractor"
                     }
