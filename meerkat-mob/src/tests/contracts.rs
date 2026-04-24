@@ -28,6 +28,18 @@ use std::time::SystemTime;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+fn inproc_peer_descriptor(
+    name: &str,
+    runtime: &CommsRuntime,
+) -> Result<TrustedPeerDescriptor, String> {
+    TrustedPeerDescriptor::unsigned_with_pubkey(
+        name,
+        runtime.public_key().to_peer_id().to_string(),
+        *runtime.public_key().as_bytes(),
+        format!("inproc://{name}"),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // CONTRACT-MOB-002: PeerRequest/PeerResponse round-trip via CommsRuntime
 // ---------------------------------------------------------------------------
@@ -42,22 +54,12 @@ async fn contract_mob_002_peer_request_response_round_trip() {
     let receiver = CommsRuntime::inproc_only(&receiver_name).unwrap();
 
     // Establish bidirectional trust
-    let peer_spec = TrustedPeerDescriptor::test_only_unsigned(
-        &receiver_name,
-        receiver.public_key().to_peer_id().to_string(),
-        format!("inproc://{receiver_name}"),
-    )
-    .expect("valid peer spec");
+    let peer_spec = inproc_peer_descriptor(&receiver_name, &receiver).expect("valid peer spec");
     CoreCommsRuntime::add_trusted_peer(&sender, peer_spec)
         .await
         .expect("add sender->receiver trust");
 
-    let reverse_spec = TrustedPeerDescriptor::test_only_unsigned(
-        &sender_name,
-        sender.public_key().to_peer_id().to_string(),
-        format!("inproc://{sender_name}"),
-    )
-    .expect("valid reverse spec");
+    let reverse_spec = inproc_peer_descriptor(&sender_name, &sender).expect("valid reverse spec");
     CoreCommsRuntime::add_trusted_peer(&receiver, reverse_spec)
         .await
         .expect("add receiver->sender trust");
@@ -203,23 +205,13 @@ async fn contract_mob_002b_terminal_transition_drives_registry_cleanup_via_effec
     // Establish bidirectional trust.
     CoreCommsRuntime::add_trusted_peer(
         sender.as_ref(),
-        TrustedPeerDescriptor::test_only_unsigned(
-            &receiver_name,
-            receiver.public_key().to_peer_id().to_string(),
-            format!("inproc://{receiver_name}"),
-        )
-        .unwrap(),
+        inproc_peer_descriptor(&receiver_name, &receiver).unwrap(),
     )
     .await
     .unwrap();
     CoreCommsRuntime::add_trusted_peer(
         &receiver,
-        TrustedPeerDescriptor::test_only_unsigned(
-            &sender_name,
-            sender.public_key().to_peer_id().to_string(),
-            format!("inproc://{sender_name}"),
-        )
-        .unwrap(),
+        inproc_peer_descriptor(&sender_name, sender.as_ref()).unwrap(),
     )
     .await
     .unwrap();
@@ -337,12 +329,7 @@ async fn contract_mob_002c_dsl_reject_refuses_shell_commit() {
 
     CoreCommsRuntime::add_trusted_peer(
         sender.as_ref(),
-        TrustedPeerDescriptor::test_only_unsigned(
-            &receiver_name,
-            receiver.public_key().to_peer_id().to_string(),
-            format!("inproc://{receiver_name}"),
-        )
-        .unwrap(),
+        inproc_peer_descriptor(&receiver_name, &receiver).unwrap(),
     )
     .await
     .unwrap();
@@ -350,12 +337,7 @@ async fn contract_mob_002c_dsl_reject_refuses_shell_commit() {
     // senders at the receiver's inbox.
     CoreCommsRuntime::add_trusted_peer(
         &receiver,
-        TrustedPeerDescriptor::test_only_unsigned(
-            &sender_name,
-            sender.public_key().to_peer_id().to_string(),
-            format!("inproc://{sender_name}"),
-        )
-        .unwrap(),
+        inproc_peer_descriptor(&sender_name, sender.as_ref()).unwrap(),
     )
     .await
     .unwrap();
@@ -452,12 +434,7 @@ async fn contract_mob_002d_inbound_terminal_reply_closes_lifecycle_via_send() {
 
     CoreCommsRuntime::add_trusted_peer(
         responder.as_ref(),
-        TrustedPeerDescriptor::test_only_unsigned(
-            &originator_name,
-            originator.public_key().to_peer_id().to_string(),
-            format!("inproc://{originator_name}"),
-        )
-        .unwrap(),
+        inproc_peer_descriptor(&originator_name, &originator).unwrap(),
     )
     .await
     .unwrap();
@@ -468,12 +445,7 @@ async fn contract_mob_002d_inbound_terminal_reply_closes_lifecycle_via_send() {
     // the DSL transition on the sender side (responder) fires correctly.
     CoreCommsRuntime::add_trusted_peer(
         &originator,
-        TrustedPeerDescriptor::test_only_unsigned(
-            &responder_name,
-            responder.public_key().to_peer_id().to_string(),
-            format!("inproc://{responder_name}"),
-        )
-        .unwrap(),
+        inproc_peer_descriptor(&responder_name, responder.as_ref()).unwrap(),
     )
     .await
     .unwrap();
@@ -566,12 +538,7 @@ async fn contract_mob_003_inproc_namespace_isolation() {
     );
 
     // Now add alpha_b as trusted peer of alpha_a (within the same namespace)
-    let spec = TrustedPeerDescriptor::test_only_unsigned(
-        &alpha_b_name,
-        alpha_b.public_key().to_peer_id().to_string(),
-        format!("inproc://{alpha_b_name}"),
-    )
-    .expect("valid spec");
+    let spec = inproc_peer_descriptor(&alpha_b_name, &alpha_b).expect("valid spec");
     CoreCommsRuntime::add_trusted_peer(&alpha_a, spec)
         .await
         .expect("add trusted peer within namespace");
@@ -605,14 +572,7 @@ async fn contract_mob_004_add_trusted_peer_is_idempotent() {
     let runtime = CommsRuntime::inproc_only(&runtime_name).unwrap();
     let peer = CommsRuntime::inproc_only(&peer_name).unwrap();
 
-    let make_spec = || {
-        TrustedPeerDescriptor::test_only_unsigned(
-            &peer_name,
-            peer.public_key().to_peer_id().to_string(),
-            format!("inproc://{peer_name}"),
-        )
-        .expect("valid spec")
-    };
+    let make_spec = || inproc_peer_descriptor(&peer_name, &peer).expect("valid spec");
 
     // Add the same peer twice
     CoreCommsRuntime::add_trusted_peer(&runtime, make_spec())
@@ -650,12 +610,7 @@ async fn contract_mob_005_remove_trusted_peer_revokes_send() {
     let receiver = CommsRuntime::inproc_only(&receiver_name).unwrap();
 
     // Establish trust
-    let spec = TrustedPeerDescriptor::test_only_unsigned(
-        &receiver_name,
-        receiver.public_key().to_peer_id().to_string(),
-        format!("inproc://{receiver_name}"),
-    )
-    .expect("valid spec");
+    let spec = inproc_peer_descriptor(&receiver_name, &receiver).expect("valid spec");
     CoreCommsRuntime::add_trusted_peer(&sender, spec)
         .await
         .expect("add trusted peer");
@@ -664,12 +619,7 @@ async fn contract_mob_005_remove_trusted_peer_revokes_send() {
     // untrusted senders with `Dropped { UntrustedSender }` (surfaced
     // upstream as `PeerOffline`) instead of silently returning `Ok(())`.
     // Mutual trust matches what real deployments set up.
-    let reverse_spec = TrustedPeerDescriptor::test_only_unsigned(
-        &sender_name,
-        sender.public_key().to_peer_id().to_string(),
-        format!("inproc://{sender_name}"),
-    )
-    .expect("valid spec");
+    let reverse_spec = inproc_peer_descriptor(&sender_name, &sender).expect("valid spec");
     CoreCommsRuntime::add_trusted_peer(&receiver, reverse_spec)
         .await
         .expect("add reverse trusted peer");
@@ -691,8 +641,8 @@ async fn contract_mob_005_remove_trusted_peer_revokes_send() {
     let _ = CoreCommsRuntime::drain_inbox_interactions(&receiver).await;
 
     // Remove trusted peer
-    let peer_id = receiver.public_key().to_peer_id().to_string();
-    let removed = CoreCommsRuntime::remove_trusted_peer(&sender, &peer_id)
+    let peer_pubkey = receiver.public_key().to_pubkey_string();
+    let removed = CoreCommsRuntime::remove_trusted_peer(&sender, &peer_pubkey)
         .await
         .expect("remove should succeed");
     assert!(removed, "should return true for existing peer");
@@ -731,11 +681,13 @@ async fn contract_mobx_001_trust_accepts_non_inproc_addresses_and_preserves_peer
     let runtime = CommsRuntime::inproc_only(&runtime_name).unwrap();
     let peer = CommsRuntime::inproc_only(&peer_name).unwrap();
     let peer_id = peer.public_key().to_peer_id().to_string();
-    let backend_address = format!("https://backend.example.invalid/mesh/{peer_name}");
+    let peer_pubkey = peer.public_key().to_pubkey_string();
+    let backend_address = format!("tcp://backend.example.invalid:{}", 10_000 + suffix.len());
 
-    let spec = TrustedPeerDescriptor::test_only_unsigned(
+    let spec = TrustedPeerDescriptor::unsigned_with_pubkey(
         &peer_name,
         peer_id.clone(),
+        *peer.public_key().as_bytes(),
         backend_address.clone(),
     )
     .expect("valid trusted peer spec");
@@ -759,7 +711,7 @@ async fn contract_mobx_001_trust_accepts_non_inproc_addresses_and_preserves_peer
         "runtime should preserve backend-provided address string"
     );
 
-    let removed = CoreCommsRuntime::remove_trusted_peer(&runtime, &peer_id)
+    let removed = CoreCommsRuntime::remove_trusted_peer(&runtime, &peer_pubkey)
         .await
         .expect("remove_trusted_peer should succeed by peer_id");
     assert!(
@@ -1053,22 +1005,12 @@ async fn contract_mob_001_keep_alive_session_stays_alive() {
     let comms_b = service.comms(&sid_b).await.expect("comms for B");
 
     // Trust both sides so peer requests can flow.
-    let a_to_b = TrustedPeerDescriptor::test_only_unsigned(
-        &b_name,
-        comms_b.public_key().to_peer_id().to_string(),
-        format!("inproc://{b_name}"),
-    )
-    .expect("valid trusted peer spec a->b");
+    let a_to_b = inproc_peer_descriptor(&b_name, &comms_b).expect("valid trusted peer spec a->b");
     CoreCommsRuntime::add_trusted_peer(&*comms_a, a_to_b)
         .await
         .expect("trust a->b");
 
-    let b_to_a = TrustedPeerDescriptor::test_only_unsigned(
-        &a_name,
-        comms_a.public_key().to_peer_id().to_string(),
-        format!("inproc://{a_name}"),
-    )
-    .expect("valid trusted peer spec b->a");
+    let b_to_a = inproc_peer_descriptor(&a_name, &comms_a).expect("valid trusted peer spec b->a");
     CoreCommsRuntime::add_trusted_peer(&*comms_b, b_to_a)
         .await
         .expect("trust b->a");
