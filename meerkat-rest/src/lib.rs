@@ -573,7 +573,7 @@ async fn apply_runtime_turn(
         Some(_policy) => true,
         None => context
             .session_service
-            .load_persisted_session(session_id)
+            .load_authoritative_session(session_id)
             .await
             .ok()
             .flatten()
@@ -602,7 +602,7 @@ async fn apply_runtime_turn(
 
     let session_identity = context
         .session_service
-        .load_persisted_session(session_id)
+        .load_authoritative_session(session_id)
         .await
         .ok()
         .flatten()
@@ -641,7 +641,7 @@ async fn apply_runtime_turn(
         Err(SessionError::NotFound { .. }) => {
             let session = context
                 .session_service
-                .load_persisted_session(session_id)
+                .load_authoritative_session(session_id)
                 .await?
                 .ok_or(SessionError::NotFound {
                     id: session_id.clone(),
@@ -3311,7 +3311,7 @@ async fn continue_session_inner(
 
     let loaded_session = match state
         .session_service
-        .load_persisted_session(&session_id)
+        .load_authoritative_session(&session_id)
         .await
     {
         Ok(v) => v,
@@ -3770,7 +3770,7 @@ async fn session_events(
     // to load_persisted() for inactive sessions.
     let session = state
         .session_service
-        .load_persisted_session(&session_id)
+        .load_authoritative_session(&session_id)
         .await
         .map_err(|e| ApiError::Internal(format!("{e}")))?
         .ok_or_else(|| ApiError::NotFound(format!("Session not found: {id}")))?;
@@ -5646,7 +5646,7 @@ mod tests {
         assert_eq!(payload["error"], "keep_alive requires comms_name");
 
         let session = session_service
-            .load_persisted_session(&created.session_id)
+            .load_authoritative_session(&created.session_id)
             .await
             .expect("load should succeed")
             .expect("session should still exist");
