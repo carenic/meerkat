@@ -4220,16 +4220,21 @@ impl MobActor {
                 // DSL accepted the new edge — record observability event.
                 // Project edge endpoints back into the domain
                 // `AgentIdentity` for the public event surface.
-                self.events
-                    .append(NewMobEvent {
-                        mob_id: self.definition.id.clone(),
-                        timestamp: None,
-                        kind: MobEventKind::MembersWired {
-                            a: AgentIdentity::from(edge.a.0.as_str()),
-                            b: AgentIdentity::from(edge.b.0.as_str()),
-                        },
-                    })
-                    .await?;
+                let event = NewMobEvent {
+                    mob_id: self.definition.id.clone(),
+                    timestamp: None,
+                    kind: MobEventKind::MembersWired {
+                        a: AgentIdentity::from(edge.a.0.as_str()),
+                        b: AgentIdentity::from(edge.b.0.as_str()),
+                    },
+                };
+                let stored = self.events.append(event).await?;
+                // Mirror the event through the roster projection so live
+                // readers of `RosterEntry.wired_to` observe the new edge
+                // immediately (#29 D-roster-wiring-projection: apply() path
+                // + this mirror at the shell append site keep the two
+                // projection entry points in sync).
+                self.roster.write().await.apply_event(&stored);
                 Ok(())
             }
             Err(MobError::Internal(message)) if message.contains("wire_members") => {
@@ -4295,16 +4300,18 @@ impl MobActor {
             "unwire_members",
         ) {
             Ok(()) => {
-                self.events
-                    .append(NewMobEvent {
-                        mob_id: self.definition.id.clone(),
-                        timestamp: None,
-                        kind: MobEventKind::MembersUnwired {
-                            a: AgentIdentity::from(edge.a.0.as_str()),
-                            b: AgentIdentity::from(edge.b.0.as_str()),
-                        },
-                    })
-                    .await?;
+                let event = NewMobEvent {
+                    mob_id: self.definition.id.clone(),
+                    timestamp: None,
+                    kind: MobEventKind::MembersUnwired {
+                        a: AgentIdentity::from(edge.a.0.as_str()),
+                        b: AgentIdentity::from(edge.b.0.as_str()),
+                    },
+                };
+                let stored = self.events.append(event).await?;
+                // Mirror through roster projection — same pattern as the
+                // `MembersWired` event in `handle_wire` (#29).
+                self.roster.write().await.apply_event(&stored);
                 Ok(())
             }
             Err(MobError::Internal(message)) if message.contains("unwire_members") => {

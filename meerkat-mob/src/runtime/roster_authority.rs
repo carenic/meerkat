@@ -1,3 +1,4 @@
+use crate::event::MobEvent;
 use crate::ids::{AgentIdentity, Generation, MeerkatId, ProfileName};
 use crate::roster::{MobMemberKickoffSnapshot, Roster, RosterAddEntry, RosterEntry};
 
@@ -74,6 +75,14 @@ impl RosterAuthority {
     /// Get a specific roster entry.
     pub(crate) fn entry(&self, agent_identity: &MeerkatId) -> Option<RosterEntry> {
         self.roster.get(agent_identity).cloned()
+    }
+
+    /// Apply a `MobEvent` through the underlying `Roster` projection so
+    /// live actor paths that append events also keep the roster's
+    /// projection fields (e.g. `wired_to`) in sync. Mirrors the replay
+    /// path's `Roster::apply` — same match arms, same mutations.
+    pub(crate) fn apply_event(&mut self, event: &MobEvent) {
+        self.roster.apply(event);
     }
 
     pub(crate) fn replace_backend_peer_binding_by_peer_id(

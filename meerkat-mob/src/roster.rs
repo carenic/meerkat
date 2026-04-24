@@ -191,6 +191,27 @@ impl Roster {
             MobEventKind::MemberKickoffUpdated { member, kickoff } => {
                 self.set_kickoff_by_identity(member, Some(kickoff.clone()));
             }
+            MobEventKind::MembersWired { a, b } => {
+                // Project wiring edge into both endpoints' `wired_to` sets.
+                // Restored as part of #29 D-roster-wiring-projection (the
+                // edges were DSL-emit observability restored by #27; the
+                // Roster projection was the missing half that left
+                // `wired_to` empty for all readers).
+                if let Some(entry) = self.entries.get_mut(a) {
+                    entry.wired_to.insert(b.clone());
+                }
+                if let Some(entry) = self.entries.get_mut(b) {
+                    entry.wired_to.insert(a.clone());
+                }
+            }
+            MobEventKind::MembersUnwired { a, b } => {
+                if let Some(entry) = self.entries.get_mut(a) {
+                    entry.wired_to.remove(b);
+                }
+                if let Some(entry) = self.entries.get_mut(b) {
+                    entry.wired_to.remove(a);
+                }
+            }
             MobEventKind::MobReset => {
                 self.entries.clear();
             }
