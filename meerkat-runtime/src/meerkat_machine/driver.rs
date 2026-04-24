@@ -328,6 +328,13 @@ impl DriverEntry {
         }
     }
 
+    pub(crate) fn defer_queued_inputs_behind_backlog(&mut self, input_ids: &[InputId]) {
+        match self {
+            DriverEntry::Ephemeral(d) => d.defer_queued_inputs_behind_backlog(input_ids),
+            DriverEntry::Persistent(d) => d.defer_queued_inputs_behind_backlog(input_ids),
+        }
+    }
+
     pub(crate) async fn machine_realize_boundary_applied(
         &mut self,
         run_id: RunId,

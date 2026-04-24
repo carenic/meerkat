@@ -964,8 +964,11 @@ async fn process_queue(
                             }
                         }
                         let mut d = driver.lock().await;
-                        let should_continue =
-                            d.take_wake_requested() && d.has_queued_input_outside(&input_ids);
+                        let should_continue = d.has_queued_input_outside(&input_ids);
+                        if should_continue {
+                            d.defer_queued_inputs_behind_backlog(&input_ids);
+                            d.take_wake_requested();
+                        }
                         drop(d);
                         if should_continue {
                             continue;

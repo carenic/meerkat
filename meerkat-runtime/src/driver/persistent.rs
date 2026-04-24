@@ -173,6 +173,10 @@ impl PersistentRuntimeDriver {
         self.inner.has_queued_input_outside(excluded)
     }
 
+    pub(crate) fn defer_queued_inputs_behind_backlog(&mut self, input_ids: &[InputId]) {
+        self.inner.defer_queued_inputs_behind_backlog(input_ids);
+    }
+
     pub(crate) fn absorb_post_admission_effects(
         &mut self,
         effects: &[crate::meerkat_machine::dsl::MeerkatMachineEffect],

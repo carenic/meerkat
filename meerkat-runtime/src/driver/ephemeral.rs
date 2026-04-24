@@ -1179,6 +1179,29 @@ impl EphemeralRuntimeDriver {
                 .any(|queued_key| !excluded_keys.contains(queued_key))
         })
     }
+
+    pub(crate) fn defer_queued_inputs_behind_backlog(&mut self, input_ids: &[InputId]) {
+        let keys: Vec<String> = input_ids.iter().map(Self::dsl_key).collect();
+        self.with_dsl_state_mut(|state| {
+            let mut next_seq = state
+                .input_admission_seq
+                .values()
+                .max()
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            for key in &keys {
+                if state.input_lane.contains_key(key) {
+                    state.input_admission_seq.insert(key.clone(), next_seq);
+                    next_seq = next_seq.saturating_add(1);
+                }
+            }
+            state.next_admission_seq = state.next_admission_seq.max(next_seq);
+        });
+        self.rebuild_queue_projections();
+        self.debug_assert_queue_projection_alignment();
+    }
+
     fn existing_superseded_input(
         &self,
         input: &Input,
