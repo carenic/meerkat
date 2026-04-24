@@ -44,7 +44,7 @@ use meerkat_core::{
 };
 #[cfg(not(feature = "memory-store"))]
 use meerkat_core::{SessionId, SessionMeta};
-use meerkat_runtime::RuntimeOpsLifecycleRegistry;
+use meerkat_runtime::{RuntimeOpsLifecycleRegistry, RuntimeTurnStateHandle};
 #[cfg(feature = "jsonl-store")]
 use meerkat_store::JsonlStore;
 #[cfg(all(feature = "memory-store", not(feature = "jsonl-store")))]
@@ -2738,16 +2738,22 @@ impl AgentFactory {
             builder = builder.with_blob_store(blob_store);
         }
         builder = builder.with_ops_lifecycle(Arc::clone(&ops_lifecycle));
-        if let RuntimeBuildMode::SessionOwned(bindings) = resolved_mode {
-            builder = builder.with_epoch_cursor_state(Arc::clone(&bindings.cursor_state));
-            builder =
-                builder.with_tool_visibility_owner(Arc::clone(&bindings.tool_visibility_owner));
-            builder = builder.with_turn_state_handle(Arc::clone(&bindings.turn_state));
-            builder = builder
-                .with_external_tool_surface_handle(Arc::clone(&bindings.external_tool_surface));
-            builder = builder.with_auth_lease_handle(Arc::clone(&bindings.auth_lease));
-            builder = builder
-                .with_mcp_server_lifecycle_handle(Arc::clone(&bindings.mcp_server_lifecycle));
+        match resolved_mode {
+            RuntimeBuildMode::SessionOwned(bindings) => {
+                builder = builder.with_epoch_cursor_state(Arc::clone(&bindings.cursor_state));
+                builder =
+                    builder.with_tool_visibility_owner(Arc::clone(&bindings.tool_visibility_owner));
+                builder = builder.with_turn_state_handle(Arc::clone(&bindings.turn_state));
+                builder = builder
+                    .with_external_tool_surface_handle(Arc::clone(&bindings.external_tool_surface));
+                builder = builder.with_auth_lease_handle(Arc::clone(&bindings.auth_lease));
+                builder = builder
+                    .with_mcp_server_lifecycle_handle(Arc::clone(&bindings.mcp_server_lifecycle));
+            }
+            RuntimeBuildMode::StandaloneEphemeral => {
+                builder =
+                    builder.with_turn_state_handle(Arc::new(RuntimeTurnStateHandle::ephemeral()));
+            }
         }
         // 12h. Wire completion feed + enrichment for cursor-based delivery
         if let Some(feed) = completion_feed {
