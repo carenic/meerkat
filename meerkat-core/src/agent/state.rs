@@ -1180,6 +1180,9 @@ where
                         ..
                     }) = pre_llm_report.decision
                     {
+                        self.apply_turn_input(TurnExecutionInput::FatalFailure {
+                            run_id: run_id.clone(),
+                        })?;
                         return Err(AgentError::HookDenied {
                             point: HookPoint::PreLlmRequest,
                             reason_code,
