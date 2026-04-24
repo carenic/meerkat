@@ -529,15 +529,31 @@ impl MeerkatMachine {
             };
             let mut sessions = self.sessions.write().await;
             if let Some(entry) = sessions.get_mut(session_id) {
-                let mut authority = entry
-                    .dsl_authority
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let _ = crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
-                    &mut *authority,
-                    dsl_input,
-                );
+                let dsl_accepted = {
+                    let mut authority = entry
+                        .dsl_authority
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                        &mut *authority,
+                        dsl_input,
+                    )
+                    .is_ok()
+                };
                 let _ = context;
+                // Shell-side drain slot cleanup: project the accepted DSL
+                // transition into the shell's mechanical slot state (clear
+                // the finished JoinHandle, set `slot.phase` to match the
+                // DSL's `Stopped` or `ExitedRespawnable`). Gated on DSL
+                // acceptance per the bdd460951 dogma ("no shell mutation
+                // after DSL rejection"). Pre-bdd460951 this call was
+                // unconditional; the over-delete stripped it entirely
+                // and shell readers like `current_phase` / spine_snapshot
+                // stopped observing drain exits.
+                if dsl_accepted {
+                    entry.drain_slot.handle.take();
+                    entry.drain_slot.mark_task_exited(reason);
+                }
             }
         }
         if std::env::var_os("RKAT_TRACE_COMMS_DRAIN_BIND").is_some() {
