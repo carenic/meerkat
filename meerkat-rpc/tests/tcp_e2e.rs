@@ -390,7 +390,7 @@ async fn tcp_e2e_realtime_ws_host_coexists_with_tcp_rpc() {
 }
 
 #[tokio::test]
-async fn tcp_e2e_realtime_session_targets_use_product_capabilities_when_openai_is_configured() {
+async fn tcp_e2e_realtime_session_targets_ignore_ambient_openai_credentials() {
     let (mut child, tcp_port, _ws_port) =
         spawn_rpc_tcp_with_realtime_ws_env(&[("OPENAI_API_KEY", "test-openai-key")]).await;
 
@@ -445,10 +445,10 @@ async fn tcp_e2e_realtime_session_targets_use_product_capabilities_when_openai_i
         .as_array()
         .expect("turning_modes should be an array");
     assert!(
-        turning_modes
+        !turning_modes
             .iter()
             .any(|mode| mode.as_str() == Some("explicit_commit")),
-        "session target capabilities should advertise explicit_commit when the product factory is configured: {capabilities}"
+        "env-only OpenAI credentials must not unlock product realtime capabilities: {capabilities}"
     );
 
     let mut stream = write.reunite(reader.into_inner()).unwrap();
@@ -470,8 +470,10 @@ async fn tcp_e2e_realtime_session_targets_use_product_capabilities_when_openai_i
     let mut reader = BufReader::new(read);
     let open_info = read_response_for_id(&mut reader, 4).await;
     assert!(
-        open_info["result"]["open_token"].as_str().is_some(),
-        "open_info should allow explicit_commit when the product factory is configured: {open_info}"
+        open_info["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("explicit_commit")),
+        "open_info should reject explicit_commit without an explicit product realtime factory: {open_info}"
     );
 
     child.kill().await.ok();
