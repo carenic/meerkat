@@ -337,11 +337,32 @@ impl MeerkatMachine {
             let sessions = self.sessions.read().await;
             if let Some(entry) = sessions.get(session_id) {
                 let slot = &entry.drain_slot;
-                MeerkatDrainSnapshot {
-                    slot_present: true,
-                    phase: Some(slot.phase),
-                    mode: slot.mode,
-                    handle_present: slot.handle.is_some(),
+                // Wave-c C-H2 (37cc46a44) collapsed the separate
+                // `comms_drain_slots` map into `RuntimeSessionEntry`, so
+                // the slot is structurally always present once the
+                // session is registered. `slot_present` must keep its
+                // pre-collapse semantics: "has this session been
+                // drain-spawned?" — i.e. true once the slot has moved
+                // past `Inactive` with no bindings. Inactive + no
+                // bindings + no handle means the slot has never run.
+                let activated = slot.phase != crate::meerkat_machine::CommsDrainPhase::Inactive
+                    || slot.mode.is_some()
+                    || slot.handle.is_some()
+                    || slot.bound_runtime.is_some();
+                if activated {
+                    MeerkatDrainSnapshot {
+                        slot_present: true,
+                        phase: Some(slot.phase),
+                        mode: slot.mode,
+                        handle_present: slot.handle.is_some(),
+                    }
+                } else {
+                    MeerkatDrainSnapshot {
+                        slot_present: false,
+                        phase: None,
+                        mode: None,
+                        handle_present: false,
+                    }
                 }
             } else {
                 MeerkatDrainSnapshot {

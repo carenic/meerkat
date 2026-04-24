@@ -101,8 +101,21 @@ impl MeerkatMachine {
                         )
                         .await;
                 }
-                let _ = comms_runtime;
-                Ok(MeerkatMachineCommandResult::Unit)
+
+                // Ownership transitions above have succeeded (or been
+                // idempotently rejected); dispatch the mechanical
+                // drain-task lifecycle side-effect. `update_peer_ingress_
+                // context_inner` stages `SpawnDrain` / `Abort` on the DSL
+                // and, on DSL accept, spawns / aborts the drain task.
+                // On DSL rejection it returns false without mutating
+                // shell slot state (preserving the bdd460951 invariant
+                // "no shell mutation after DSL rejection"). Its return
+                // value is the typed `Spawned(bool)` result the caller
+                // of `maybe_spawn_comms_drain` observes.
+                let spawned = self
+                    .update_peer_ingress_context_inner(&session_id, keep_alive, comms_runtime)
+                    .await;
+                Ok(MeerkatMachineCommandResult::Spawned(spawned))
             }
             MeerkatMachineCommand::NotifyDrainExited { session_id, reason } => {
                 // Guard: session must exist.
