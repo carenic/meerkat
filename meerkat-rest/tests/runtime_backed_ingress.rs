@@ -205,7 +205,17 @@ async fn runtime_backed_external_events_stay_queued_without_waking_idle_sessions
         ))
         .expect("build event request");
 
-    let event_response = app.oneshot(event_request).await.expect("run event request");
+    // Bound the oneshot in a 10s timeout so nextest doesn't hang at workspace
+    // scope if the runtime-backed event path blocks (same pattern as the B
+    // hung-test fix in meerkat-rest/src/lib.rs:5608 — post-commit-failure route
+    // class, tracked for separate root-cause follow-up in #28).
+    let event_response = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        app.oneshot(event_request),
+    )
+    .await
+    .expect("event request did not return within 10s")
+    .expect("run event request");
     assert_eq!(event_response.status(), StatusCode::ACCEPTED);
     let event_body = event_response
         .into_body()
