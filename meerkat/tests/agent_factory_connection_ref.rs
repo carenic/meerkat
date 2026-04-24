@@ -335,27 +335,15 @@ async fn llm_client_override_beats_connection_ref() {
 }
 
 // ---------------------------------------------------------------------
-// Coexistence: absent connection_ref still runs the legacy flat path
+// Coexistence: absent connection_ref still resolves the configured default
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn build_agent_without_connection_ref_rejects_with_ambient_credential_refusal() {
-    // Wave-C auth-seam cleanup (dogma §15/§19, commit `28e7a51c1`)
-    // deleted env-default realm synthesis AND first-matching-provider
-    // promotion. `AgentFactory::build_agent` with no `connection_ref`
-    // now rejects with `BuildAgentError::ConnectionResolution`
-    // regardless of whether `config.realm["default"]` holds a matching
-    // provider — the refusal is intentional because "ambient" resolution
-    // was the silent-bypass path the deletion targeted.
-    //
-    // When the deletion is reversed (a follow-up task would need to
-    // reintroduce explicit-realm resolution as a distinct path from
-    // ambient/env-default), this test fails loudly and points whoever
-    // restores the behavior at this site.
-    //
-    // Pre-Wave-C, this test asserted the positive path: `config.realm["default"]`
-    // inline API keys should be honored without an explicit connection_ref.
-    // That path is now gone by construction.
+async fn build_agent_without_connection_ref_uses_default_realm_binding() {
+    // A missing connection_ref is not an ambient-credential bypass. It resolves
+    // through the same typed realm binding machinery as explicit connection_ref
+    // builds, choosing config.realm["default"].default_binding when present and
+    // persisting the resolved ref into SessionMetadata.
     let temp = tempfile::tempdir().unwrap();
     let factory = temp_factory(&temp);
     let mut config = config_with_realm();
@@ -365,17 +353,24 @@ async fn build_agent_without_connection_ref_rejects_with_ambient_credential_refu
     let build = AgentBuildConfig::new("gpt-5.2");
     assert!(build.connection_ref.is_none());
 
-    match factory.build_agent(build, &config).await {
-        Ok(_) => panic!(
-            "build_agent without connection_ref must reject with ambient-credential refusal \
-             per wave-c auth-seam cleanup (dogma §15/§19)"
-        ),
-        Err(meerkat::BuildAgentError::ConnectionResolution(msg)) => assert!(
-            msg.contains("ambient credential selection refused"),
-            "expected ambient-credential refusal, got: {msg}"
-        ),
-        Err(other) => panic!("expected BuildAgentError::ConnectionResolution, got: {other:?}"),
-    }
+    let agent = factory
+        .build_agent(build, &config)
+        .await
+        .expect("default realm binding should resolve without explicit connection_ref");
+    let metadata = agent
+        .session()
+        .session_metadata()
+        .expect("session metadata written");
+    assert_eq!(metadata.provider, Provider::OpenAI);
+    assert_eq!(
+        metadata.connection_ref.as_ref().map(|conn_ref| {
+            (
+                conn_ref.realm.as_str().to_string(),
+                conn_ref.binding.as_str().to_string(),
+            )
+        }),
+        Some(("default".to_string(), "default_openai".to_string()))
+    );
 }
 
 // ---------------------------------------------------------------------

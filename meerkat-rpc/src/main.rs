@@ -223,12 +223,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let skill_runtime = factory.build_skill_runtime(&config).await;
 
-    // Post-wave-a dogma: ambient provider credential selection
-    // (`resolve_provider_api_key`) was retired (commit 28e7a51c1). The
-    // realtime OpenAI sideband factory is now `None` at rpc boot; explicit
-    // connection_ref wiring through the typed ProviderRuntimeRegistry is
-    // the path forward for realtime credential acquisition.
-    let realtime_openai_factory: Option<Arc<dyn meerkat_client::RealtimeSessionFactory>> = None;
+    let realtime_openai_factory = match factory.build_openai_realtime_session_factory(&config).await
+    {
+        Ok(factory) => Some(factory),
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "OpenAI realtime sideband factory unavailable; realtime websocket host will expose text-only runtime attachment unless credentials are configured"
+            );
+            None
+        }
+    };
 
     let config_runtime = Arc::new(ConfigRuntime::new(
         Arc::clone(&config_store),

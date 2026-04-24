@@ -3282,6 +3282,115 @@ mod tests {
 
     #[cfg(feature = "mob")]
     #[tokio::test]
+    async fn mob_member_status_projects_runtime_identity_fields() {
+        let (router, _notif_rx) = test_router().await;
+
+        let create_resp = router
+            .dispatch(make_request(
+                "mob/create",
+                serde_json::json!({
+                    "definition": {
+                        "id": "mob-member-status-runtime-identity",
+                        "profiles": {
+                            "worker": {
+                                "model": "claude-sonnet-4-5",
+                                "external_addressable": true,
+                                "tools": { "comms": true }
+                            }
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        let mob_id = result_value(&create_resp)["mob_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        router
+            .dispatch(make_request(
+                "mob/spawn",
+                serde_json::json!({
+                    "mob_id": mob_id,
+                    "profile": "worker",
+                    "agent_identity": "worker-1",
+                    "runtime_mode": "turn_driven"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        let status_resp = router
+            .dispatch(make_request(
+                "mob/member_status",
+                serde_json::json!({
+                    "mob_id": mob_id,
+                    "agent_identity": "worker-1"
+                }),
+            ))
+            .await
+            .unwrap();
+        let status = result_value(&status_resp);
+        assert_eq!(status["agent_runtime_id"]["identity"], "worker-1");
+        assert!(
+            status["agent_runtime_id"]["generation"].is_number(),
+            "mob/member_status must include runtime incarnation generation"
+        );
+        assert!(
+            status["fence_token"].is_number(),
+            "mob/member_status must include runtime fence token"
+        );
+    }
+
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn mob_spawn_rejects_unknown_fields() {
+        let (router, _notif_rx) = test_router().await;
+
+        let create_resp = router
+            .dispatch(make_request(
+                "mob/create",
+                serde_json::json!({
+                    "definition": {
+                        "id": "mob-spawn-unknown-field",
+                        "profiles": {
+                            "worker": {
+                                "model": "claude-sonnet-4-5",
+                                "tools": { "comms": true }
+                            }
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        let mob_id = result_value(&create_resp)["mob_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let spawn_resp = router
+            .dispatch(make_request(
+                "mob/spawn",
+                serde_json::json!({
+                    "mob_id": mob_id,
+                    "profile": "worker",
+                    "agent_identity": "worker-1",
+                    "initial_turn": "deferred"
+                }),
+            ))
+            .await
+            .unwrap();
+        let error = spawn_resp.error.expect("unknown field should be rejected");
+        assert!(
+            error.message.contains("unknown field") && error.message.contains("initial_turn"),
+            "unexpected error for unknown mob/spawn field: {error:?}"
+        );
+    }
+
+    #[cfg(feature = "mob")]
+    #[tokio::test]
     async fn mob_member_send_host_route_preserves_steer_mode_rejection() {
         let (router, _notif_rx) = test_router().await;
 

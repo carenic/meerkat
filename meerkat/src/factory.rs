@@ -39,8 +39,9 @@ const DEFAULT_WASM_SYSTEM_PROMPT: &str = r"You are an autonomous agent. Your tas
 - If the task cannot be completed, explain what blocked progress and what was attempted.";
 use meerkat_core::{
     Agent, AgentBuilder, AgentEvent, AgentLlmClient, AgentSessionStore, AgentToolDispatcher,
-    BlobStore, BudgetLimits, Config, HookRunOverrides, ModelRegistry, OutputSchema, Provider,
-    Session, SessionLlmIdentity, SessionMetadata, SessionTooling, ToolCategoryOverride,
+    BindingId, BlobStore, BudgetLimits, Config, ConnectionRef, HookRunOverrides, ModelRegistry,
+    OutputSchema, Provider, RealmConnectionSet, RealmId, Session, SessionLlmIdentity,
+    SessionMetadata, SessionTooling, ToolCategoryOverride,
 };
 #[cfg(not(feature = "memory-store"))]
 use meerkat_core::{SessionId, SessionMeta};
@@ -861,6 +862,111 @@ impl std::fmt::Debug for AgentFactory {
 }
 
 impl AgentFactory {
+    fn env_default_connection_ref() -> Result<ConnectionRef, String> {
+        Ok(ConnectionRef {
+            realm: RealmId::parse("env_default").map_err(|e| e.to_string())?,
+            binding: BindingId::parse("default").map_err(|e| e.to_string())?,
+            profile: None,
+        })
+    }
+
+    fn resolve_realm_binding_for_provider(
+        config: &Config,
+        provider: Provider,
+        connection_ref: Option<&ConnectionRef>,
+        preferred_realm: Option<&str>,
+    ) -> Result<(RealmConnectionSet, String, ConnectionRef), String> {
+        if let Some(conn_ref) = connection_ref {
+            if let Some(section) = config.realm.get(conn_ref.realm.as_str()) {
+                let realm = RealmConnectionSet::from_config(conn_ref.realm.as_str(), section)
+                    .map_err(|e| e.to_string())?;
+                return Ok((realm, conn_ref.binding.to_string(), conn_ref.clone()));
+            }
+            if conn_ref.realm.as_str() == "env_default" && conn_ref.binding.as_str() == "default" {
+                let realm = RealmConnectionSet::synthesize_env_default(provider);
+                return Ok((realm, "default".to_string(), conn_ref.clone()));
+            }
+            return Err(format!(
+                "realm '{}' not found in config.realm",
+                conn_ref.realm
+            ));
+        }
+
+        for realm_id in preferred_realm
+            .into_iter()
+            .chain(std::iter::once("default"))
+        {
+            let Some(section) = config.realm.get(realm_id) else {
+                continue;
+            };
+            let Some(binding_id) = section.default_binding.as_deref() else {
+                continue;
+            };
+            let realm =
+                RealmConnectionSet::from_config(realm_id, section).map_err(|e| e.to_string())?;
+            let (_binding, backend, auth) = realm
+                .lookup_binding(binding_id)
+                .map_err(|e| e.to_string())?;
+            if backend.provider != provider || auth.provider != provider {
+                return Err(format!(
+                    "default binding '{realm_id}:{binding_id}' is for provider {:?}, \
+                     but model resolution selected provider {:?}",
+                    backend.provider, provider
+                ));
+            }
+            let connection_ref = ConnectionRef {
+                realm: RealmId::parse(realm_id).map_err(|e| e.to_string())?,
+                binding: BindingId::parse(binding_id).map_err(|e| e.to_string())?,
+                profile: None,
+            };
+            return Ok((realm, binding_id.to_string(), connection_ref));
+        }
+
+        let connection_ref = Self::env_default_connection_ref()?;
+        let realm = RealmConnectionSet::synthesize_env_default(provider);
+        Ok((realm, "default".to_string(), connection_ref))
+    }
+
+    #[cfg(all(
+        feature = "openai",
+        feature = "openai-realtime",
+        not(target_arch = "wasm32")
+    ))]
+    pub async fn build_openai_realtime_session_factory(
+        &self,
+        config: &Config,
+    ) -> Result<Arc<dyn meerkat_client::RealtimeSessionFactory>, BuildAgentError> {
+        let (realm, binding_id, _connection_ref) =
+            Self::resolve_realm_binding_for_provider(config, Provider::OpenAI, None, None)
+                .map_err(BuildAgentError::ConnectionResolution)?;
+        let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+        if let Some(store) = self.token_store.clone() {
+            env = env.with_token_store(store);
+        }
+        if let Some(coord) = self.refresh_coord.clone() {
+            env = env.with_refresh_coordinator(coord);
+        }
+        for (handle, resolver) in &self.external_auth_resolvers {
+            env = env.with_external_resolver(handle.clone(), resolver.clone());
+        }
+        let connection = self
+            .provider_registry
+            .resolve(&realm, &binding_id, &env)
+            .await
+            .map_err(|e| BuildAgentError::ConnectionResolution(e.to_string()))?;
+        let secret = connection.resolved_secret().ok_or_else(|| {
+            BuildAgentError::ConnectionResolution(
+                "OpenAI realtime sideband requires resolved inline credential material".to_string(),
+            )
+        })?;
+        let live = Arc::new(meerkat_client::OpenAiLiveClient::new(secret))
+            as Arc<dyn meerkat_client::OpenAiLiveSessionFactory>;
+        Ok(
+            Arc::new(meerkat_client::OpenAiRealtimeSessionFactory::new(live))
+                as Arc<dyn meerkat_client::RealtimeSessionFactory>,
+        )
+    }
+
     /// Create a minimal factory for environments without filesystem access (e.g. wasm32).
     ///
     /// All agent resources must be provided via `AgentBuildConfig` overrides
@@ -1114,8 +1220,13 @@ impl AgentFactory {
         }
 
         #[cfg(feature = "comms")]
-        if !self.enable_comms {
-            capabilities.remove(&meerkat_contracts::CapabilityId::Comms);
+        {
+            let build_requests_comms =
+                build_config.is_some_and(|build| build.comms_name.is_some() || build.keep_alive);
+            let has_comms_runtime = self.comms_runtime.is_some();
+            if !(self.enable_comms || build_requests_comms || has_comms_runtime) {
+                capabilities.remove(&meerkat_contracts::CapabilityId::Comms);
+            }
         }
 
         // Project the contract-facing `CapabilityId` enum to the typed
@@ -1322,39 +1433,13 @@ impl AgentFactory {
             return Ok(Arc::new(meerkat_client::TestClient::default()));
         }
 
-        let (realm, binding_id): (meerkat_core::RealmConnectionSet, String) = match identity
-            .connection_ref
-            .as_ref()
-        {
-            Some(conn_ref) => {
-                let section = config.realm.get(conn_ref.realm.as_str()).ok_or_else(|| {
-                    FactoryError::ClientCreationFailed(format!(
-                        "realm '{}' not found in config.realm (hot-swap)",
-                        conn_ref.realm
-                    ))
-                })?;
-                let realm =
-                    meerkat_core::RealmConnectionSet::from_config(conn_ref.realm.as_str(), section)
-                        .map_err(|e| FactoryError::ClientCreationFailed(e.to_string()))?;
-                (realm, conn_ref.binding.to_string())
-            }
-            None => {
-                // Dogma §15/§19 (commit 28e7a51c1): ambient
-                // provider-credential selection is refused. Callers
-                // must supply an explicit `connection_ref`;
-                // synthesizing a realm from env vars or
-                // first-matching-provider is exactly the silent
-                // bypass the deletion targeted.
-                return Err(FactoryError::ClientCreationFailed(
-                    "ambient credential selection refused: \
-                         hot-swap requires an explicit ConnectionRef \
-                         (realm + binding). Env-default realm synthesis \
-                         and first-matching-provider promotion were \
-                         deleted in the wave-c auth-seam cleanup."
-                        .to_string(),
-                ));
-            }
-        };
+        let (realm, binding_id, _connection_ref) = Self::resolve_realm_binding_for_provider(
+            config,
+            identity.provider,
+            identity.connection_ref.as_ref(),
+            None,
+        )
+        .map_err(FactoryError::ClientCreationFailed)?;
 
         #[allow(unused_mut)]
         let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
@@ -1778,41 +1863,15 @@ impl AgentFactory {
                     )
                     .map_err(BuildAgentError::LlmClient)?
                 } else {
-                    // Resolve the target realm from the explicit
-                    // `connection_ref`. Ambient env-default synthesis and
-                    // first-matching-provider promotion were deleted in
-                    // commit 28e7a51c1 (dogma §15/§19): callers must
-                    // now supply a realm + binding.
-                    let (realm, binding_id): (meerkat_core::RealmConnectionSet, String) =
-                        match &build_config.connection_ref {
-                            Some(conn_ref) => {
-                                let section =
-                                    config.realm.get(conn_ref.realm.as_str()).ok_or_else(|| {
-                                        BuildAgentError::ConnectionResolution(format!(
-                                            "realm '{}' not found in config.realm",
-                                            conn_ref.realm
-                                        ))
-                                    })?;
-                                let realm = meerkat_core::RealmConnectionSet::from_config(
-                                    conn_ref.realm.as_str(),
-                                    section,
-                                )
-                                .map_err(|e| {
-                                    BuildAgentError::ConnectionResolution(e.to_string())
-                                })?;
-                                (realm, conn_ref.binding.to_string())
-                            }
-                            None => {
-                                return Err(BuildAgentError::ConnectionResolution(
-                                    "ambient credential selection refused: \
-                                     build_agent requires an explicit ConnectionRef \
-                                     (realm + binding). Env-default realm synthesis \
-                                     and first-matching-provider promotion were \
-                                     deleted in the wave-c auth-seam cleanup."
-                                        .to_string(),
-                                ));
-                            }
-                        };
+                    let (realm, binding_id, resolved_connection_ref) =
+                        Self::resolve_realm_binding_for_provider(
+                            config,
+                            provider,
+                            build_config.connection_ref.as_ref(),
+                            build_config.realm_id.as_deref(),
+                        )
+                        .map_err(BuildAgentError::ConnectionResolution)?;
+                    build_config.connection_ref = Some(resolved_connection_ref);
 
                     // Provider-runtime registry needs the OAuth-backed
                     // TokenStore attached so persisted tokens (written by
@@ -2900,8 +2959,152 @@ impl AgentFactory {
 mod tests {
     use super::*;
     use meerkat_core::{
+        BackendProfileConfig, CredentialSourceSpec, ProviderBindingConfig, RealmConfigSection,
         SelfHostedApiStyle, SelfHostedModelConfig, SelfHostedServerConfig, SelfHostedTransport,
     };
+
+    #[test]
+    fn missing_connection_ref_synthesizes_env_default_binding_for_resolved_provider() {
+        let config = Config::default();
+        let (realm, binding_id, connection_ref) = AgentFactory::resolve_realm_binding_for_provider(
+            &config,
+            Provider::Anthropic,
+            None,
+            None,
+        )
+        .expect("env default binding should synthesize");
+
+        assert_eq!(realm.realm_id, "env_default");
+        assert_eq!(binding_id, "default");
+        assert_eq!(connection_ref.realm.as_str(), "env_default");
+        assert_eq!(connection_ref.binding.as_str(), "default");
+        let (_binding, backend, auth) = realm.lookup_binding("default").unwrap();
+        assert_eq!(backend.provider, Provider::Anthropic);
+        assert!(matches!(
+            &auth.source,
+            CredentialSourceSpec::Env { env, fallback }
+                if env == "ANTHROPIC_API_KEY" && fallback.is_empty()
+        ));
+    }
+
+    #[test]
+    fn persisted_env_default_connection_ref_rehydrates_without_config_realm() {
+        let config = Config::default();
+        let connection_ref = AgentFactory::env_default_connection_ref()
+            .expect("static env_default connection ref should parse");
+        let (realm, binding_id, resolved_ref) = AgentFactory::resolve_realm_binding_for_provider(
+            &config,
+            Provider::OpenAI,
+            Some(&connection_ref),
+            None,
+        )
+        .expect("persisted env_default ref should rehydrate");
+
+        assert_eq!(realm.realm_id, "env_default");
+        assert_eq!(binding_id, "default");
+        assert_eq!(resolved_ref, connection_ref);
+        let (_binding, backend, auth) = realm.lookup_binding("default").unwrap();
+        assert_eq!(backend.provider, Provider::OpenAI);
+        assert!(matches!(
+            &auth.source,
+            CredentialSourceSpec::Env { env, fallback }
+                if env == "OPENAI_API_KEY" && fallback.is_empty()
+        ));
+    }
+
+    #[test]
+    fn realm_default_binding_is_explicit_config_auth_source() {
+        let mut config = Config::default();
+        let mut section = RealmConfigSection {
+            default_binding: Some("default_anthropic".to_string()),
+            ..Default::default()
+        };
+        section.backend.insert(
+            "anthropic_backend".to_string(),
+            BackendProfileConfig {
+                provider: "anthropic".to_string(),
+                backend_kind: "anthropic_api".to_string(),
+                base_url: None,
+                options: serde_json::Value::Null,
+            },
+        );
+        section.auth.insert(
+            "anthropic_env".to_string(),
+            meerkat_core::AuthProfileConfig {
+                provider: "anthropic".to_string(),
+                auth_method: "api_key".to_string(),
+                source: CredentialSourceSpec::Env {
+                    env: "ANTHROPIC_API_KEY".to_string(),
+                    fallback: Vec::new(),
+                },
+                constraints: Default::default(),
+                metadata_defaults: Default::default(),
+            },
+        );
+        section.binding.insert(
+            "default_anthropic".to_string(),
+            ProviderBindingConfig {
+                backend_profile: "anthropic_backend".to_string(),
+                auth_profile: "anthropic_env".to_string(),
+                default_model: None,
+                policy: Default::default(),
+            },
+        );
+        config.realm.insert("dev".to_string(), section);
+
+        let (_realm, binding_id, connection_ref) =
+            AgentFactory::resolve_realm_binding_for_provider(
+                &config,
+                Provider::Anthropic,
+                None,
+                Some("dev"),
+            )
+            .expect("configured default binding should resolve");
+
+        assert_eq!(binding_id, "default_anthropic");
+        assert_eq!(connection_ref.realm.as_str(), "dev");
+        assert_eq!(connection_ref.binding.as_str(), "default_anthropic");
+    }
+
+    #[cfg(feature = "skills")]
+    #[tokio::test]
+    async fn default_skill_runtime_resolves_embedded_mob_communication_skill() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions")).comms(true);
+        let runtime = factory
+            .build_skill_runtime(&Config::default())
+            .await
+            .expect("skills-enabled config should build a runtime");
+        let skill_key = meerkat_core::skills::SkillKey::builtin(
+            meerkat_core::skills::SkillName::parse("mob-communication").unwrap(),
+        );
+
+        let resolved = runtime
+            .resolve_and_render(std::slice::from_ref(&skill_key))
+            .await
+            .expect("embedded mob skill should resolve");
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].key, skill_key);
+        assert_eq!(resolved[0].name, "mob-communication");
+        assert!(resolved[0].rendered_body.contains("Mob Communication"));
+    }
+
+    #[cfg(all(feature = "skills", feature = "comms"))]
+    #[test]
+    fn per_session_comms_build_keeps_comms_skill_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions"));
+        let mut build = AgentBuildConfig::new("gpt-5.4");
+        build.comms_name = Some("mob:test/analyst/a-1".to_string());
+
+        let caps = factory.effective_skill_capabilities(&Config::default(), Some(&build));
+
+        assert!(
+            caps.iter().any(|cap| cap.as_str() == "comms"),
+            "per-session comms identity should expose comms capability to skills"
+        );
+    }
 
     #[test]
     fn resumed_self_hosted_binding_overrides_current_registry_server() {

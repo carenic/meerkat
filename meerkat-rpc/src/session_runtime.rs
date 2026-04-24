@@ -1776,10 +1776,36 @@ impl SessionRuntime {
                     data: None,
                 });
             }
-            let executor = Box::new(crate::session_executor::SessionRuntimeExecutor::new(
-                Arc::clone(self),
-                session_id.clone(),
-            ));
+            #[cfg(feature = "mob")]
+            let executor: Box<dyn meerkat_core::lifecycle::CoreExecutor> =
+                match self.mob_state().as_ref() {
+                    Some(mob_state)
+                        if mob_state.owns_live_bridge_session(session_id).await
+                            || mob_state.owns_persisted_bridge_session(session_id).await =>
+                    {
+                        let sink = self
+                            .notification_sink
+                            .read()
+                            .ok()
+                            .map(|slot| slot.clone())
+                            .unwrap_or_else(crate::router::NotificationSink::noop);
+                        Box::new(crate::session_executor::MobRpcRuntimeExecutor::new(
+                            mob_state.session_service(),
+                            session_id.clone(),
+                            sink,
+                        ))
+                    }
+                    _ => Box::new(crate::session_executor::SessionRuntimeExecutor::new(
+                        Arc::clone(self),
+                        session_id.clone(),
+                    )),
+                };
+            #[cfg(not(feature = "mob"))]
+            let executor: Box<dyn meerkat_core::lifecycle::CoreExecutor> =
+                Box::new(crate::session_executor::SessionRuntimeExecutor::new(
+                    Arc::clone(self),
+                    session_id.clone(),
+                ));
             self.runtime_adapter
                 .ensure_session_with_executor(session_id.clone(), executor)
                 .await;

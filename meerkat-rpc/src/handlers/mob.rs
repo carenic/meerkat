@@ -17,6 +17,7 @@ use meerkat_contracts::{
 };
 use meerkat_core::service::AppendSystemContextRequest;
 use meerkat_core::types::ContentInput;
+use meerkat_mob::runtime::MobMemberSnapshot;
 use meerkat_mob::{
     AgentIdentity, FlowId, MemberRespawnReceipt, MemberState, MobBackendKind, MobId,
     MobMemberStatus, MobRespawnError, MobRuntimeMode, RunId, SpawnMemberSpec, SpawnResult,
@@ -103,6 +104,35 @@ fn member_list_entry_wire(
         error: entry.error.clone(),
         is_final: entry.is_final,
     }
+}
+
+/// Project the deep member-status snapshot into its explicit RPC control
+/// shape. The domain snapshot intentionally skips runtime incarnation atoms in
+/// generic serde so app-facing receipts cannot leak them by accident; this
+/// endpoint owns the diagnostic/control contract and therefore opts in.
+fn member_status_payload(snapshot: &MobMemberSnapshot) -> serde_json::Value {
+    let mut value = match serde_json::to_value(snapshot) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(
+                ?error,
+                "failed to serialize MobMemberSnapshot for mob/member_status"
+            );
+            serde_json::Value::Object(serde_json::Map::new())
+        }
+    };
+    let (agent_runtime_id, fence_token) = snapshot.runtime_identity_fields();
+    if let serde_json::Value::Object(fields) = &mut value {
+        fields.insert(
+            "agent_runtime_id".to_string(),
+            serde_json::to_value(agent_runtime_id).unwrap_or(serde_json::Value::Null),
+        );
+        fields.insert(
+            "fence_token".to_string(),
+            serde_json::json!(fence_token.get()),
+        );
+    }
+    value
 }
 
 pub async fn handle_create(
@@ -201,6 +231,7 @@ pub async fn handle_members(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MobSpawnParams {
     pub mob_id: String,
     pub profile: String,
@@ -1383,7 +1414,7 @@ pub async fn handle_member_status(
         )
         .await
     {
-        Ok(snapshot) => RpcResponse::success(id, serde_json::json!(snapshot)),
+        Ok(snapshot) => RpcResponse::success(id, member_status_payload(&snapshot)),
         Err(err) => invalid_params(id, err.to_string()),
     }
 }
@@ -1623,6 +1654,21 @@ pub async fn handle_mob_turn_start(
         Ok(h) => h,
         Err(err) => return invalid_params(id, err.to_string()),
     };
+    let runtime_mode = handle
+        .list_members()
+        .await
+        .into_iter()
+        .find(|entry| entry.agent_identity == identity)
+        .map(|entry| entry.runtime_mode);
+    if matches!(runtime_mode, Some(MobRuntimeMode::AutonomousHost)) {
+        return invalid_params(
+            id,
+            format!(
+                "mob/turn_start is only valid for turn_driven members; \
+                 autonomous member '{identity}' is driven by mob kickoff and mob/member_send"
+            ),
+        );
+    }
     let session_id = match handle.resolve_bridge_session_id(&identity).await {
         Some(sid) => sid,
         None => {

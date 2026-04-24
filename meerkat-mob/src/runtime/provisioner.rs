@@ -350,6 +350,88 @@ impl SessionBackend {
 
         runtime_completion_to_mob_result(session_id, completion)
     }
+
+    async fn admit_runtime_input(
+        &self,
+        session_id: &SessionId,
+        input: Input,
+        event_tx: Option<TurnEventTx>,
+    ) -> Result<(), MobError> {
+        let adapter = self.runtime_adapter.as_ref().ok_or_else(|| {
+            MobError::Internal(format!(
+                "runtime-backed turn requested without runtime adapter: {session_id}"
+            ))
+        })?;
+        let state = self.runtime_session_state(session_id).await;
+        let adapter_session_id = session_id.clone();
+        let requested_input_id = input.id().clone();
+        let mut context_input_id = requested_input_id.clone();
+
+        let queued_context = if let Some(ref state) = state {
+            state
+                .enqueue_turn_context(requested_input_id.clone(), event_tx)
+                .await
+        } else {
+            false
+        };
+
+        let (outcome, handle) = match adapter
+            .accept_input_with_completion(&adapter_session_id, input)
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                if let Some(state) = state.as_ref()
+                    && queued_context
+                {
+                    let _ = state.discard_turn_context(&requested_input_id).await;
+                }
+                return Err(MobError::Internal(err.to_string()));
+            }
+        };
+
+        if let Some(state) = state.as_ref()
+            && queued_context
+        {
+            let canonical_input_id = match &outcome {
+                meerkat_runtime::AcceptOutcome::Accepted { input_id, .. } => Some(input_id),
+                meerkat_runtime::AcceptOutcome::Deduplicated { existing_id, .. } => {
+                    Some(existing_id)
+                }
+                _ => None,
+            };
+            if let Some(input_id) = canonical_input_id
+                && input_id != &requested_input_id
+            {
+                let rekeyed = state
+                    .rekey_turn_context(&requested_input_id, input_id.clone())
+                    .await;
+                if rekeyed {
+                    context_input_id = input_id.clone();
+                }
+            }
+        }
+
+        let Some(handle) = handle else {
+            if let Some(state) = state.as_ref()
+                && queued_context
+            {
+                let _ = state.discard_turn_context(&context_input_id).await;
+            }
+            return Ok(());
+        };
+
+        if let Some(state) = state
+            && queued_context
+        {
+            tokio::spawn(async move {
+                let _ = handle.wait().await;
+                let _ = state.discard_turn_context(&context_input_id).await;
+            });
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -1030,7 +1112,7 @@ impl MobProvisioner for SessionBackend {
                 ),
             );
             return self
-                .execute_runtime_input(&session_id, input, req.event_tx)
+                .admit_runtime_input(&session_id, input, req.event_tx)
                 .await;
         }
 
