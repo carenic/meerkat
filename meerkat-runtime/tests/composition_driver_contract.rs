@@ -63,8 +63,12 @@ enum SeamEffect {
         work_id: String,
         origin: String,
     },
-    RequestRuntimeRetire,
-    RequestRuntimeDestroy,
+    RequestRuntimeRetire {
+        session_id: String,
+    },
+    RequestRuntimeDestroy {
+        session_id: String,
+    },
 }
 
 impl ProducerEffect for SeamEffect {
@@ -72,8 +76,8 @@ impl ProducerEffect for SeamEffect {
         let slug = match self {
             Self::RequestRuntimeBinding { .. } => "RequestRuntimeBinding",
             Self::RequestRuntimeIngress { .. } => "RequestRuntimeIngress",
-            Self::RequestRuntimeRetire => "RequestRuntimeRetire",
-            Self::RequestRuntimeDestroy => "RequestRuntimeDestroy",
+            Self::RequestRuntimeRetire { .. } => "RequestRuntimeRetire",
+            Self::RequestRuntimeDestroy { .. } => "RequestRuntimeDestroy",
         };
         EffectVariantId::parse(slug).expect("variant slug is well-formed")
     }
@@ -102,7 +106,14 @@ impl ProducerEffect for SeamEffect {
                 "origin" => Some(FieldValue::Str(origin)),
                 _ => None,
             },
-            Self::RequestRuntimeRetire | Self::RequestRuntimeDestroy => None,
+            Self::RequestRuntimeRetire { session_id } => match id.as_str() {
+                "session_id" => Some(FieldValue::Str(session_id)),
+                _ => None,
+            },
+            Self::RequestRuntimeDestroy { session_id } => match id.as_str() {
+                "session_id" => Some(FieldValue::Str(session_id)),
+                _ => None,
+            },
         }
     }
 }
@@ -237,7 +248,9 @@ async fn all_four_catalog_routes_dispatch_to_meerkat_consumer() {
             mob_producer(),
             EffectPayload::Emitted {
                 variant: EffectVariantId::parse("RequestRuntimeRetire").unwrap(),
-                body: SeamEffect::RequestRuntimeRetire,
+                body: SeamEffect::RequestRuntimeRetire {
+                    session_id: "019dbd3d-d7ad-75a1-96d0-8013927e78f8".to_string(),
+                },
             },
         )
         .await
@@ -250,7 +263,9 @@ async fn all_four_catalog_routes_dispatch_to_meerkat_consumer() {
             mob_producer(),
             EffectPayload::Emitted {
                 variant: EffectVariantId::parse("RequestRuntimeDestroy").unwrap(),
-                body: SeamEffect::RequestRuntimeDestroy,
+                body: SeamEffect::RequestRuntimeDestroy {
+                    session_id: "019dbd3d-d7ad-75a1-96d0-8013927e78f8".to_string(),
+                },
             },
         )
         .await
@@ -304,7 +319,9 @@ async fn composition_mismatch_is_typed_refusal() {
             wrong,
             EffectPayload::Emitted {
                 variant: EffectVariantId::parse("RequestRuntimeRetire").unwrap(),
-                body: SeamEffect::RequestRuntimeRetire,
+                body: SeamEffect::RequestRuntimeRetire {
+                    session_id: "019dbd3d-d7ad-75a1-96d0-8013927e78f8".to_string(),
+                },
             },
         )
         .await
@@ -330,7 +347,9 @@ async fn unresolved_route_is_typed_refusal() {
             mob_producer(),
             EffectPayload::Emitted {
                 variant: EffectVariantId::parse("UnknownEffect").unwrap(),
-                body: SeamEffect::RequestRuntimeRetire,
+                body: SeamEffect::RequestRuntimeRetire {
+                    session_id: "019dbd3d-d7ad-75a1-96d0-8013927e78f8".to_string(),
+                },
             },
         )
         .await
@@ -363,7 +382,9 @@ async fn unwired_consumer_is_typed_refusal() {
             mob_producer(),
             EffectPayload::Emitted {
                 variant: EffectVariantId::parse("RequestRuntimeRetire").unwrap(),
-                body: SeamEffect::RequestRuntimeRetire,
+                body: SeamEffect::RequestRuntimeRetire {
+                    session_id: "019dbd3d-d7ad-75a1-96d0-8013927e78f8".to_string(),
+                },
             },
         )
         .await
@@ -392,7 +413,9 @@ async fn consumer_refusal_is_typed_refusal() {
             mob_producer(),
             EffectPayload::Emitted {
                 variant: EffectVariantId::parse("RequestRuntimeRetire").unwrap(),
-                body: SeamEffect::RequestRuntimeRetire,
+                body: SeamEffect::RequestRuntimeRetire {
+                    session_id: "019dbd3d-d7ad-75a1-96d0-8013927e78f8".to_string(),
+                },
             },
         )
         .await
@@ -434,7 +457,9 @@ async fn duplicate_consumer_registration_replaces_prior_entry() {
             mob_producer(),
             EffectPayload::Emitted {
                 variant: EffectVariantId::parse("RequestRuntimeRetire").unwrap(),
-                body: SeamEffect::RequestRuntimeRetire,
+                body: SeamEffect::RequestRuntimeRetire {
+                    session_id: "019dbd3d-d7ad-75a1-96d0-8013927e78f8".to_string(),
+                },
             },
         )
         .await

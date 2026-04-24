@@ -63,7 +63,9 @@ enum MobEffect {
         generation: u64,
         session_id: String,
     },
-    RequestRuntimeRetire,
+    RequestRuntimeRetire {
+        session_id: String,
+    },
 }
 
 impl ProducerEffect for SeamEffect {
@@ -72,7 +74,7 @@ impl ProducerEffect for SeamEffect {
             Self::Mob(MobEffect::RequestRuntimeBinding { .. }) => {
                 EffectVariantId::parse("RequestRuntimeBinding").unwrap()
             }
-            Self::Mob(MobEffect::RequestRuntimeRetire) => {
+            Self::Mob(MobEffect::RequestRuntimeRetire { .. }) => {
                 EffectVariantId::parse("RequestRuntimeRetire").unwrap()
             }
         }
@@ -92,7 +94,10 @@ impl ProducerEffect for SeamEffect {
                 "session_id" => Some(FieldValue::Str(session_id)),
                 _ => None,
             },
-            Self::Mob(MobEffect::RequestRuntimeRetire) => None,
+            Self::Mob(MobEffect::RequestRuntimeRetire { session_id }) => match id.as_str() {
+                "session_id" => Some(FieldValue::Str(session_id)),
+                _ => None,
+            },
         }
     }
 }
@@ -217,7 +222,9 @@ async fn dispatcher_handles_binding_free_route() {
 
     let payload = EffectPayload::Emitted {
         variant: EffectVariantId::parse("RequestRuntimeRetire").unwrap(),
-        body: SeamEffect::Mob(MobEffect::RequestRuntimeRetire),
+        body: SeamEffect::Mob(MobEffect::RequestRuntimeRetire {
+            session_id: "019dbd3d-d7ad-75a1-96d0-8013927e78f8".to_string(),
+        }),
     };
 
     let outcome = dispatcher
@@ -229,7 +236,10 @@ async fn dispatcher_handles_binding_free_route() {
 
     let log = consumer.log.lock().await;
     assert_eq!(log.len(), 1);
-    assert!(log[0].1.is_empty(), "retire route carries no bindings");
+    // Post-Shape-4 extension: retire route now carries `session_id` so the
+    // consumer surface can resolve the target session (54ce31148).
+    assert_eq!(log[0].1.len(), 1);
+    assert_eq!(log[0].1[0].0.as_str(), "session_id");
 }
 
 // ---------------------------------------------------------------------
@@ -245,7 +255,9 @@ async fn refuses_unresolved_route_typed() {
     // Producer variant that the schema does not route.
     let payload = EffectPayload::Emitted {
         variant: EffectVariantId::parse("UnknownEffect").unwrap(),
-        body: SeamEffect::Mob(MobEffect::RequestRuntimeRetire),
+        body: SeamEffect::Mob(MobEffect::RequestRuntimeRetire {
+            session_id: "019dbd3d-d7ad-75a1-96d0-8013927e78f8".to_string(),
+        }),
     };
 
     let err = dispatcher
