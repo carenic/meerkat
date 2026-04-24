@@ -1219,15 +1219,7 @@ impl MultiBackendProvisioner {
                 address,
                 session_id: None,
                 ..
-            } => TrustedPeerDescriptor::test_only_unsigned(
-                address
-                    .strip_prefix("inproc://")
-                    .map(|value| value.split('?').next().unwrap_or(value).to_string())
-                    .unwrap_or_else(|| format!("mob_member/backend_peer/{peer_id}")),
-                peer_id.clone(),
-                address.clone(),
-            )
-            .map_err(|error| MobError::WiringError(format!("invalid peer-only spec: {error}"))),
+            } => Self::peer_only_spec_from_parts(peer_id, address),
             _ => Err(MobError::Internal(
                 "peer-only spec requested for non-peer-only member".to_string(),
             )),
@@ -1238,15 +1230,30 @@ impl MultiBackendProvisioner {
         peer_id: &str,
         address: &str,
     ) -> Result<TrustedPeerDescriptor, MobError> {
-        TrustedPeerDescriptor::test_only_unsigned(
-            address
-                .strip_prefix("inproc://")
-                .map(|value| value.split('?').next().unwrap_or(value).to_string())
-                .unwrap_or_else(|| format!("mob_member/backend_peer/{peer_id}")),
-            peer_id.to_string(),
-            address.to_string(),
-        )
-        .map_err(|error| MobError::WiringError(format!("invalid peer-only spec: {error}")))
+        let peer_name = address
+            .strip_prefix("inproc://")
+            .map(|value| value.split('?').next().unwrap_or(value).to_string())
+            .unwrap_or_else(|| format!("mob_member/backend_peer/{peer_id}"));
+        let pubkey = meerkat_comms::InprocRegistry::global()
+            .get_by_name(&peer_name)
+            .and_then(|(registry_pubkey, _)| {
+                (registry_pubkey.to_peer_id().as_str() == peer_id)
+                    .then(|| *registry_pubkey.as_bytes())
+            });
+        let result = match pubkey {
+            Some(pubkey) => TrustedPeerDescriptor::unsigned_with_pubkey(
+                peer_name,
+                peer_id.to_string(),
+                pubkey,
+                address.to_string(),
+            ),
+            None => TrustedPeerDescriptor::test_only_unsigned(
+                peer_name,
+                peer_id.to_string(),
+                address.to_string(),
+            ),
+        };
+        result.map_err(|error| MobError::WiringError(format!("invalid peer-only spec: {error}")))
     }
 
     fn validated_external_peer_spec(

@@ -165,6 +165,10 @@ impl Router {
         self.private_pubkeys.read().contains(pubkey)
     }
 
+    pub(crate) fn private_pubkeys(&self) -> std::collections::HashSet<crate::identity::PubKey> {
+        self.private_pubkeys.read().clone()
+    }
+
     /// Scope in-process routing to a namespace.
     pub fn with_inproc_namespace(mut self, namespace: Option<String>) -> Self {
         self.inproc_namespace = namespace;

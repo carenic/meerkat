@@ -206,6 +206,10 @@ impl CoreCommsRuntime for MockCommsRuntime {
         Ok(())
     }
 
+    async fn add_private_trusted_peer(&self, peer: TrustedPeerDescriptor) -> Result<(), SendError> {
+        self.add_trusted_peer(peer).await
+    }
+
     async fn remove_trusted_peer(&self, peer_id: &str) -> Result<bool, SendError> {
         if self
             .behavior
@@ -240,6 +244,10 @@ impl CoreCommsRuntime for MockCommsRuntime {
         Ok(matching_peer_id
             .and_then(|stored_peer_id| peers.remove(&stored_peer_id))
             .is_some())
+    }
+
+    async fn remove_private_trusted_peer(&self, peer_id: &str) -> Result<bool, SendError> {
+        self.remove_trusted_peer(peer_id).await
     }
 
     async fn send(&self, cmd: CommsCommand) -> Result<SendReceipt, SendError> {
@@ -4734,19 +4742,28 @@ async fn test_rotate_supervisor_reauthorizes_live_remote_members_and_rejects_sta
         peer_id,
         address,
         bootstrap_token: _,
-        pubkey: _,
+        pubkey,
     } = external.binding()
     else {
         panic!("live external peer must expose external binding");
     };
-    let peer = meerkat_core::comms::TrustedPeerDescriptor::test_only_unsigned(
-        address
-            .strip_prefix("inproc://")
-            .map(|value| value.split('?').next().unwrap_or(value).to_string())
-            .unwrap_or_else(|| format!("mob_member/backend_peer/{peer_id}")),
-        peer_id.clone(),
-        address.clone(),
-    )
+    let peer_name = address
+        .strip_prefix("inproc://")
+        .map(|value| value.split('?').next().unwrap_or(value).to_string())
+        .unwrap_or_else(|| format!("mob_member/backend_peer/{peer_id}"));
+    let peer = match pubkey {
+        Some(pubkey) => meerkat_core::comms::TrustedPeerDescriptor::unsigned_with_pubkey(
+            peer_name,
+            peer_id.clone(),
+            pubkey,
+            address.clone(),
+        ),
+        None => meerkat_core::comms::TrustedPeerDescriptor::test_only_unsigned(
+            peer_name,
+            peer_id.clone(),
+            address.clone(),
+        ),
+    }
     .expect("peer spec");
     let old_bridge = crate::runtime::MobSupervisorBridge::new(&mob_id, original.clone())
         .expect("build old supervisor bridge");
@@ -8341,11 +8358,20 @@ async fn test_resume_reconciles_mixed_topology_without_losing_external_member_re
         } => (peer_id.clone(), address.clone(), session_id.clone()),
         ref other => panic!("expected external backend member ref, got {other:?}"),
     };
-    service
+    let old_sub_comms = service
         .real_comms(&old_sub_sid)
         .await
-        .expect("session-backed member comms")
-        .remove_trusted_peer(&old_ext_peer_id)
+        .expect("session-backed member comms");
+    let old_ext_pubkey = old_sub_comms
+        .trusted_peers_shared()
+        .read()
+        .peers
+        .iter()
+        .find(|peer| peer.pubkey.to_peer_id().as_str() == old_ext_peer_id)
+        .map(|peer| peer.pubkey.to_pubkey_string())
+        .expect("external trust should exist before resume removal");
+    old_sub_comms
+        .remove_trusted_peer(&old_ext_pubkey)
         .await
         .expect("remove external trust before resume");
     if let Some(old_ext_sid) = &old_ext_sid {

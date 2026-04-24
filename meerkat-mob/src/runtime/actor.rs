@@ -337,6 +337,11 @@ impl MobActor {
             .strip_prefix("inproc://")
             .map(|value| value.split('?').next().unwrap_or(value).to_string())
             .unwrap_or_else(|| format!("mob_member/backend_peer/{peer_id}"));
+        let pubkey = pubkey.or_else(|| {
+            let (registry_pubkey, _) =
+                meerkat_comms::InprocRegistry::global().get_by_name(&peer_name)?;
+            (registry_pubkey.to_peer_id().as_str() == peer_id).then(|| *registry_pubkey.as_bytes())
+        });
         let result = match pubkey {
             Some(pubkey) => TrustedPeerDescriptor::unsigned_with_pubkey(
                 peer_name,
@@ -376,6 +381,32 @@ impl MobActor {
 
     fn trusted_peer_pubkey_string(peer: &TrustedPeerDescriptor) -> String {
         meerkat_comms::PubKey::new(peer.pubkey).to_pubkey_string()
+    }
+
+    fn supervisor_spec_for_authority(
+        mob_id: &crate::MobId,
+        authority: &crate::store::SupervisorAuthorityRecord,
+    ) -> Result<TrustedPeerDescriptor, MobError> {
+        let participant_name = format!("{mob_id}/__mob_supervisor__");
+        let public_key = authority.keypair().public_key();
+        TrustedPeerDescriptor::unsigned_with_pubkey(
+            participant_name.clone(),
+            authority.public_peer_id.clone(),
+            *public_key.as_bytes(),
+            format!("inproc://{participant_name}"),
+        )
+        .map_err(|error| MobError::WiringError(format!("invalid supervisor spec: {error}")))
+    }
+
+    async fn install_supervisor_private_trust(
+        &self,
+        comms: &Arc<dyn CoreCommsRuntime>,
+    ) -> Result<(), MobError> {
+        let spec = self.supervisor_bridge.supervisor_spec().await?;
+        comms
+            .add_private_trusted_peer(spec)
+            .await
+            .map_err(MobError::from)
     }
 
     async fn bridge_supervisor_payload(
@@ -539,13 +570,18 @@ impl MobActor {
                     .bind_peer_only_member_for_binding(peer, binding)
                     .await?;
                 let effective_bootstrap_token = Self::bridge_bootstrap_token_from_binding(binding)?;
+                let crate::RuntimeBinding::External { pubkey, .. } = binding else {
+                    return Err(MobError::Internal(
+                        "bind fallback returned for non-external runtime binding".to_string(),
+                    ));
+                };
                 self.persist_rebound_binding(binding, &bind).await?;
                 return Self::peer_only_spec_for_binding(
                     &crate::RuntimeBinding::External {
                         peer_id: bind.peer_id,
                         address: super::bridge_protocol::canonicalize_bridge_address(&bind.address),
                         bootstrap_token: Some(effective_bootstrap_token),
-                        pubkey: None,
+                        pubkey: *pubkey,
                     },
                     "ensure_supervisor_authorized rebound peer",
                 );
@@ -3905,7 +3941,9 @@ impl MobActor {
         // From this point, rollback_failed_spawn handles cleanup via the
         // disposal pipeline.
         let member_ref = provision.commit()?;
-        let _ = self.provisioner_comms(&member_ref).await;
+        if let Some(comms) = self.provisioner_comms(&member_ref).await {
+            self.install_supervisor_private_trust(&comms).await?;
+        }
 
         // Resolve `external_addressable` from the effective profile so we
         // can inform the DSL (see the `MobMachineInput::Spawn` dispatch
@@ -4472,6 +4510,130 @@ impl MobActor {
                         &edge,
                         dsl_added,
                         &["local", "peer"],
+                        local_spec,
+                        peer_spec,
+                    )
+                    .await;
+                    return Err(MobError::from(error));
+                }
+            };
+            self.roster.write().await.apply_event(&stored);
+            return Ok(());
+        }
+        if let (
+            WiringEndpoint::Local {
+                comms: local_comms,
+                spec: local_spec,
+                ..
+            },
+            WiringEndpoint::PeerOnly {
+                spec: peer_spec,
+                binding: peer_binding,
+            },
+        ) = (&local_endpoint, &peer_endpoint)
+        {
+            let dsl_added = self.apply_wire_members_idempotent(&edge)?;
+            if let Err(error) = local_comms.add_trusted_peer(peer_spec.clone()).await {
+                self.rollback_peer_only_wire(&edge, dsl_added, &[], local_spec, peer_spec)
+                    .await;
+                return Err(MobError::from(error));
+            }
+            if let Err(error) = self
+                .wire_peer_only_recipient(
+                    peer_spec,
+                    Some(peer_binding),
+                    local_spec,
+                    std::time::Duration::from_secs(10),
+                )
+                .await
+            {
+                let _ = local_comms
+                    .remove_trusted_peer(&Self::trusted_peer_pubkey_string(peer_spec))
+                    .await;
+                self.rollback_peer_only_wire(&edge, dsl_added, &[], local_spec, peer_spec)
+                    .await;
+                return Err(error);
+            }
+            let event = NewMobEvent {
+                mob_id: self.definition.id.clone(),
+                timestamp: None,
+                kind: MobEventKind::MembersWired {
+                    a: AgentIdentity::from(edge.a.0.as_str()),
+                    b: AgentIdentity::from(edge.b.0.as_str()),
+                },
+            };
+            let stored = match self.events.append(event).await {
+                Ok(stored) => stored,
+                Err(error) => {
+                    let _ = local_comms
+                        .remove_trusted_peer(&Self::trusted_peer_pubkey_string(peer_spec))
+                        .await;
+                    self.rollback_peer_only_wire(
+                        &edge,
+                        dsl_added,
+                        &["peer"],
+                        local_spec,
+                        peer_spec,
+                    )
+                    .await;
+                    return Err(MobError::from(error));
+                }
+            };
+            self.roster.write().await.apply_event(&stored);
+            return Ok(());
+        }
+        if let (
+            WiringEndpoint::PeerOnly {
+                spec: local_spec,
+                binding: local_binding,
+            },
+            WiringEndpoint::Local {
+                comms: peer_comms,
+                spec: peer_spec,
+                ..
+            },
+        ) = (&local_endpoint, &peer_endpoint)
+        {
+            let dsl_added = self.apply_wire_members_idempotent(&edge)?;
+            if let Err(error) = peer_comms.add_trusted_peer(local_spec.clone()).await {
+                self.rollback_peer_only_wire(&edge, dsl_added, &[], local_spec, peer_spec)
+                    .await;
+                return Err(MobError::from(error));
+            }
+            if let Err(error) = self
+                .wire_peer_only_recipient(
+                    local_spec,
+                    Some(local_binding),
+                    peer_spec,
+                    std::time::Duration::from_secs(10),
+                )
+                .await
+            {
+                let _ = peer_comms
+                    .remove_trusted_peer(&Self::trusted_peer_pubkey_string(local_spec))
+                    .await;
+                self.rollback_peer_only_wire(&edge, dsl_added, &[], local_spec, peer_spec)
+                    .await;
+                return Err(error);
+            }
+            let event = NewMobEvent {
+                mob_id: self.definition.id.clone(),
+                timestamp: None,
+                kind: MobEventKind::MembersWired {
+                    a: AgentIdentity::from(edge.a.0.as_str()),
+                    b: AgentIdentity::from(edge.b.0.as_str()),
+                },
+            };
+            let stored = match self.events.append(event).await {
+                Ok(stored) => stored,
+                Err(error) => {
+                    let _ = peer_comms
+                        .remove_trusted_peer(&Self::trusted_peer_pubkey_string(local_spec))
+                        .await;
+                    self.rollback_peer_only_wire(
+                        &edge,
+                        dsl_added,
+                        &["local"],
                         local_spec,
                         peer_spec,
                     )
@@ -6242,12 +6404,13 @@ impl MobActor {
             MemberRef::BackendPeer {
                 peer_id,
                 address,
+                bootstrap_token,
                 session_id,
                 ..
             } => MemberRef::BackendPeer {
                 peer_id: peer_id.clone(),
                 address: super::bridge_protocol::canonicalize_bridge_address(address),
-                bootstrap_token: None,
+                bootstrap_token: bootstrap_token.clone(),
                 session_id: session_id.clone(),
             },
             MemberRef::Session { session_id } => MemberRef::Session {
@@ -6733,7 +6896,12 @@ impl MobActor {
                                                     &bind_response.address,
                                                 ),
                                             bootstrap_token: Some(effective_bootstrap_token),
-                                            pubkey: None,
+                                            pubkey: match &binding {
+                                                crate::RuntimeBinding::External {
+                                                    pubkey, ..
+                                                } => *pubkey,
+                                                crate::RuntimeBinding::Session => None,
+                                            },
                                         };
                                         effective_peer = Self::peer_only_spec_for_binding(
                                             &effective_binding,
@@ -6773,6 +6941,29 @@ impl MobActor {
             .put_supervisor_authority(&self.definition.id, &next)
             .await?;
         self.supervisor_bridge.rotate(next.clone()).await?;
+        let previous_spec = Self::supervisor_spec_for_authority(&self.definition.id, &current)?;
+        let next_spec = self.supervisor_bridge.supervisor_spec().await?;
+        let session_member_refs = {
+            let roster = self.roster.read().await;
+            roster
+                .list_all()
+                .filter_map(|entry| match &entry.member_ref {
+                    MemberRef::Session { .. } => Some(entry.member_ref.clone()),
+                    MemberRef::BackendPeer { .. } => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for member_ref in session_member_refs {
+            if let Some(comms) = self.provisioner_comms(&member_ref).await {
+                let _ = comms
+                    .remove_private_trusted_peer(&Self::trusted_peer_pubkey_string(&previous_spec))
+                    .await;
+                comms
+                    .add_private_trusted_peer(next_spec.clone())
+                    .await
+                    .map_err(MobError::from)?;
+            }
+        }
         Ok(super::handle::SupervisorRotationReport {
             previous_epoch: current.epoch,
             current_epoch: next.epoch,

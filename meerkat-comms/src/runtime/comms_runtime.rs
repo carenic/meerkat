@@ -1830,6 +1830,7 @@ impl CommsRuntime {
                 .map(|p| (p.name.clone(), p.pubkey))
                 .collect();
         let participant_name = self.participant_name().to_string();
+        let private_pubkeys = self.router.private_pubkeys();
         let mut trusted_names = HashSet::new();
         let mut trusted_pubkeys = HashSet::new();
         let mut emitted = 0usize;
@@ -1842,6 +1843,9 @@ impl CommsRuntime {
                 }
                 trusted_names.insert(peer.name.clone());
                 trusted_pubkeys.insert(peer.pubkey);
+                if private_pubkeys.contains(&peer.pubkey) {
+                    continue;
+                }
                 let source = if inproc_by_name
                     .get(&peer.name)
                     .is_some_and(|key| *key == peer.pubkey)
@@ -1877,6 +1881,9 @@ impl CommsRuntime {
         }
 
         for inproc in &inproc_peers {
+            if private_pubkeys.contains(&inproc.pubkey) {
+                continue;
+            }
             let name = match PeerName::new(inproc.name.clone()) {
                 Ok(name) => name,
                 Err(_) => {
