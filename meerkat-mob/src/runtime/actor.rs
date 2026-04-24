@@ -3978,8 +3978,54 @@ impl MobActor {
             "MobActor::finalize_spawn_from_pending roster updated"
         );
 
-        let planned_wiring_targets: Vec<MeerkatId> = Vec::new();
-        let wired_spawn_targets: Vec<MeerkatId> = Vec::new();
+        // Wave-A damage restored: `spawn_wiring_targets` computes the
+        // auto-wire + role-wiring fan-out targets for this spawn, and the
+        // imperative wire-call loop deleted alongside the pre-DSL
+        // `roster.add_member` insert (commit `e77ce8797`) needs to run here
+        // so role-wired profiles actually get wired at spawn time. The
+        // compensating rollback in `rollback_failed_spawn` expects both
+        // `wired_spawn_targets` and `planned_wiring_targets` populated so
+        // partial-wire failures can unwind.
+        let planned_wiring_targets = self
+            .spawn_wiring_targets(profile_name, agent_identity)
+            .await;
+        let mut wired_spawn_targets: Vec<MeerkatId> = Vec::new();
+        for target in &planned_wiring_targets {
+            let target_identity = crate::ids::AgentIdentity::from(target.as_str());
+            let local_meerkat = agent_identity.clone();
+            match self
+                .handle_wire(
+                    local_meerkat,
+                    super::handle::PeerTarget::Local(target_identity),
+                )
+                .await
+            {
+                Ok(()) => wired_spawn_targets.push(target.clone()),
+                Err(wire_error) => {
+                    // Rollback the spawn: the member is in the DSL + roster
+                    // but the role-wiring contract was violated. Surface the
+                    // failure to the caller so they can decide how to
+                    // compensate (tests assert this path at e.g.
+                    // `test_role_wiring_failure_is_returned_to_spawn_caller`).
+                    self.clear_kickoff_state(agent_identity).await;
+                    if let Err(rollback_error) = self
+                        .rollback_failed_spawn(
+                            agent_identity,
+                            profile_name,
+                            &member_ref,
+                            &wired_spawn_targets,
+                            &planned_wiring_targets,
+                        )
+                        .await
+                    {
+                        return Err(MobError::Internal(format!(
+                            "spawn wire fan-out failed for '{agent_identity}': {wire_error}; rollback failed: {rollback_error}"
+                        )));
+                    }
+                    return Err(wire_error);
+                }
+            }
+        }
 
         #[cfg(feature = "runtime-adapter")]
         if runtime_mode == crate::MobRuntimeMode::AutonomousHost {
