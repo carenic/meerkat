@@ -4255,7 +4255,7 @@ async fn mcp_add(
         req.session_id,
         meerkat_contracts::McpLiveOperation::Add,
         Some(req.server_name),
-        req.persisted,
+        rollback.is_some(),
     )))
 }
 
@@ -4299,7 +4299,7 @@ async fn mcp_remove(
         req.session_id,
         meerkat_contracts::McpLiveOperation::Remove,
         Some(req.server_name),
-        req.persisted,
+        rollback.is_some(),
     )))
 }
 

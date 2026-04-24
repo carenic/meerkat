@@ -3628,7 +3628,7 @@ impl SessionRuntime {
                 data: None,
             });
         }
-        Ok(persisted)
+        Ok(rollback.is_some())
     }
 
     #[cfg(feature = "mcp")]
@@ -3689,7 +3689,7 @@ impl SessionRuntime {
                 data: None,
             });
         }
-        Ok(persisted)
+        Ok(rollback.is_some())
     }
 
     #[cfg(feature = "mcp")]

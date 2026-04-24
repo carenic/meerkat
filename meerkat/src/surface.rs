@@ -317,10 +317,13 @@ pub async fn persist_mcp_remove_if_requested(
     if !persisted {
         return Ok(None);
     }
-    meerkat_core::mcp_config::McpConfig::persist_remove_with_rollback(authority, server_name)
+    match meerkat_core::mcp_config::McpConfig::persist_remove_with_rollback(authority, server_name)
         .await
-        .map(Some)
-        .map_err(|err| err.to_string())
+    {
+        Ok(rollback) => Ok(Some(rollback)),
+        Err(meerkat_core::mcp_config::McpConfigError::ServerNotFound(_)) => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 /// Roll back a persisted MCP config mutation after a coupled live-stage failure.
