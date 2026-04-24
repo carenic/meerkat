@@ -275,9 +275,28 @@ impl MeerkatMachine {
         ) = {
             let sessions = self.sessions.read().await;
             let entry = sessions.get(session_id)?;
+            // W6 Class B (`e5c5ecaf3`): the shell-side `control_projection`
+            // is no longer written by the finalize-* paths in the driver
+            // (`machine_retire` / `machine_destroy` / `machine_stop_runtime`
+            // / `machine_reset` used to call `set_control_projection(...)`
+            // pre-finalize, deleted by the shadow-truth cleanup). DSL is
+            // the canonical source for `lifecycle_phase`. Read
+            // `control_projection` for `current_run_id` + `pre_run_phase`
+            // (those are still shell-managed), but override `phase` with
+            // the DSL-authoritative value projected via `write_back_phase`.
+            // Mirrors `existing_session_runtime_state` at traits.rs:292-308.
+            let mut snapshot = entry.control_snapshot();
+            let dsl_phase = {
+                let authority = entry
+                    .dsl_authority
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                authority.state.lifecycle_phase
+            };
+            snapshot.phase = crate::meerkat_machine::dsl_authority::write_back_phase(dsl_phase);
             (
                 Arc::clone(&entry.driver),
-                entry.control_snapshot(),
+                snapshot,
                 Arc::clone(&entry.completions),
                 Arc::clone(&entry.ops_lifecycle),
                 Arc::clone(&entry.cursor_state),
