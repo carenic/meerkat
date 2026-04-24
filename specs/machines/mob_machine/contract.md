@@ -27,7 +27,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `CancelFlow`
 - `FlowStatus`
 - `Spawn`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: Bool, bridge_session_id: SessionId, replacing: Option<SessionId>)
-- `Retire`(agent_runtime_id: AgentRuntimeId, agent_identity: AgentIdentity, releasing: Option<SessionId>)
+- `Retire`(agent_runtime_id: AgentRuntimeId, agent_identity: AgentIdentity, releasing: Option<SessionId>, session_id: SessionId)
 - `Respawn`(agent_runtime_id: AgentRuntimeId)
 - `RetireAll`
 - `WireMembers`(edge: WiringEdge)
@@ -81,11 +81,11 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ## Signals
 - `ObserveRuntimeReady`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
-- `RetireMember`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
+- `RetireMember`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, session_id: SessionId)
 - `ObserveRuntimeRetired`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
 - `ResetMember`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: Bool, session_id: SessionId)
 - `RespawnMember`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: Bool, session_id: SessionId)
-- `DestroyMob`
+- `DestroyMob`(session_id: SessionId)
 - `ObserveRuntimeDestroyed`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
 - `MarkCompleted`
 - `StartRun`
@@ -112,8 +112,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ## Effects
 - `RequestRuntimeBinding`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: SessionId)
 - `RequestRuntimeIngress`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, work_id: WorkId, origin: WorkOrigin)
-- `RequestRuntimeRetire`
-- `RequestRuntimeDestroy`
+- `RequestRuntimeRetire`(session_id: SessionId)
+- `RequestRuntimeDestroy`(session_id: SessionId)
 - `EmitMemberLifecycleNotice`(kind: MemberLifecycleKind)
 - `EmitRunLifecycleNotice`
 - `EmitFlowRunNotice`
@@ -226,7 +226,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RetireMember`
 - From: `Running`
-- On: `RetireMember`(agent_runtime_id, fence_token)
+- On: `RetireMember`(agent_runtime_id, fence_token, session_id)
 - Guards:
   - `current_binding_matches`
 - Emits: `RequestRuntimeRetire`
@@ -262,7 +262,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `DestroyMob`
 - From: `Running`, `Stopped`, `Completed`
-- On: `DestroyMob`()
+- On: `DestroyMob`(session_id)
 - Emits: `RequestRuntimeDestroy`
 - To: `Destroyed`
 
@@ -679,7 +679,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RetireRunningReleasing`
 - From: `Running`
-- On: `Retire`(agent_runtime_id, agent_identity, releasing)
+- On: `Retire`(agent_runtime_id, agent_identity, releasing, session_id)
 - Guards:
   - `active_members_present`
   - `runtime_id_present`
@@ -690,7 +690,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RetireRunningPreservingBinding`
 - From: `Running`
-- On: `Retire`(agent_runtime_id, agent_identity, releasing)
+- On: `Retire`(agent_runtime_id, agent_identity, releasing, session_id)
 - Guards:
   - `active_members_present`
   - `runtime_id_present`
@@ -701,7 +701,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RetireRunningNoBinding`
 - From: `Running`
-- On: `Retire`(agent_runtime_id, agent_identity, releasing)
+- On: `Retire`(agent_runtime_id, agent_identity, releasing, session_id)
 - Guards:
   - `active_members_present`
   - `runtime_id_present`
@@ -712,7 +712,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RetireStoppedReleasing`
 - From: `Stopped`
-- On: `Retire`(agent_runtime_id, agent_identity, releasing)
+- On: `Retire`(agent_runtime_id, agent_identity, releasing, session_id)
 - Guards:
   - `active_members_present`
   - `runtime_id_present`
@@ -723,7 +723,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RetireStoppedPreservingBinding`
 - From: `Stopped`
-- On: `Retire`(agent_runtime_id, agent_identity, releasing)
+- On: `Retire`(agent_runtime_id, agent_identity, releasing, session_id)
 - Guards:
   - `active_members_present`
   - `runtime_id_present`
@@ -734,7 +734,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RetireStoppedNoBinding`
 - From: `Stopped`
-- On: `Retire`(agent_runtime_id, agent_identity, releasing)
+- On: `Retire`(agent_runtime_id, agent_identity, releasing, session_id)
 - Guards:
   - `active_members_present`
   - `runtime_id_present`

@@ -59,10 +59,10 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RequestDeferredTools`(names: Set<String>, witnesses: Map<String, ToolVisibilityWitness>)
 - `PublishCommittedVisibleSet`(active_filter: ToolFilter, staged_filter: ToolFilter, active_requested_deferred_names: Set<String>, staged_requested_deferred_names: Set<String>, active_visibility_revision: u64, staged_visibility_revision: u64)
 - `Recover`
-- `Retire`
+- `Retire`(session_id: SessionId)
 - `Reset`
 - `StopRuntimeExecutor`
-- `Destroy`
+- `Destroy`(session_id: SessionId)
 - `EnsureSessionWithExecutor`(session_id: SessionId)
 - `SetSilentIntents`(session_id: SessionId, intents: Set<String>)
 - `ContainsSession`(session_id: SessionId)
@@ -597,7 +597,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RetireRequestedFromIdle`
 - From: `Idle`, `Attached`, `Running`
-- On: `Retire`()
+- On: `Retire`(session_id)
 - Emits: `RuntimeRetired`
 - To: `Retired`
 
@@ -627,7 +627,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `Destroy`
 - From: `Initializing`, `Idle`, `Attached`, `Running`, `Retired`, `Stopped`
-- On: `Destroy`()
+- On: `Destroy`(session_id)
 - Guards:
   - `runtime_is_bound`
 - Emits: `RuntimeDestroyed`

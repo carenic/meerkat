@@ -1099,8 +1099,8 @@ impl MobActor {
                 // next async boundary via `flush_routed_effects`.
                 mob_dsl::MobMachineEffect::RequestRuntimeBinding { .. }
                 | mob_dsl::MobMachineEffect::RequestRuntimeIngress { .. }
-                | mob_dsl::MobMachineEffect::RequestRuntimeRetire
-                | mob_dsl::MobMachineEffect::RequestRuntimeDestroy => {}
+                | mob_dsl::MobMachineEffect::RequestRuntimeRetire { .. }
+                | mob_dsl::MobMachineEffect::RequestRuntimeDestroy { .. } => {}
                 _ => {}
             }
         }
@@ -5193,11 +5193,22 @@ impl MobActor {
                 .get(&dsl_identity)
                 .cloned()
         };
+        let session_id_for_route = releasing
+            .clone()
+            .or_else(|| {
+                self.dsl_authority
+                    .state
+                    .member_session_bindings
+                    .get(&dsl_identity)
+                    .cloned()
+            })
+            .unwrap_or_else(mob_dsl::SessionId::default);
         self.apply_dsl_input(
             mob_dsl::MobMachineInput::Retire {
                 agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id),
                 agent_identity: dsl_identity,
                 releasing,
+                session_id: session_id_for_route,
             },
             "handle_retire_inner_mark_retiring",
         )?;
@@ -5980,11 +5991,15 @@ impl MobActor {
             .member_session_bindings
             .get(&dsl_identity)
             .cloned();
+        let session_id_for_route = releasing
+            .clone()
+            .unwrap_or_else(mob_dsl::SessionId::default);
         if let Err(e) = self.apply_dsl_input(
             mob_dsl::MobMachineInput::Retire {
                 agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id),
                 agent_identity: dsl_identity,
                 releasing,
+                session_id: session_id_for_route,
             },
             "destroy_remote_member_for_destroy_mark_retiring",
         ) {

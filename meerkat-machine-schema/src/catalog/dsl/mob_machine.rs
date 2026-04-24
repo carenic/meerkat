@@ -79,7 +79,7 @@ machine! {
             CancelFlow,
             FlowStatus,
             Spawn { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: bool, bridge_session_id: SessionId, replacing: Option<SessionId> },
-            Retire { agent_runtime_id: AgentRuntimeId, agent_identity: AgentIdentity, releasing: Option<SessionId> },
+            Retire { agent_runtime_id: AgentRuntimeId, agent_identity: AgentIdentity, releasing: Option<SessionId>, session_id: SessionId },
             Respawn { agent_runtime_id: AgentRuntimeId },
             RetireAll,
             WireMembers { edge: WiringEdge },
@@ -135,11 +135,11 @@ machine! {
 
         signal MobMachineSignal {
             ObserveRuntimeReady { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken },
-            RetireMember { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken },
+            RetireMember { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, session_id: SessionId },
             ObserveRuntimeRetired { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken },
             ResetMember { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: bool, session_id: SessionId },
             RespawnMember { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: bool, session_id: SessionId },
-            DestroyMob,
+            DestroyMob { session_id: SessionId },
             ObserveRuntimeDestroyed { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken },
             MarkCompleted,
             StartRun,
@@ -167,8 +167,8 @@ machine! {
         effect MobMachineEffect {
             RequestRuntimeBinding { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: SessionId },
             RequestRuntimeIngress { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, work_id: WorkId, origin: Enum<WorkOrigin> },
-            RequestRuntimeRetire,
-            RequestRuntimeDestroy,
+            RequestRuntimeRetire { session_id: SessionId },
+            RequestRuntimeDestroy { session_id: SessionId },
             EmitMemberLifecycleNotice { kind: Enum<MemberLifecycleKind> },
             EmitRunLifecycleNotice,
             EmitFlowRunNotice,
@@ -422,14 +422,14 @@ machine! {
         }
 
         transition RetireMember {
-            on signal RetireMember { agent_runtime_id, fence_token }
+            on signal RetireMember { agent_runtime_id, fence_token, session_id }
             guard { self.lifecycle_phase == Phase::Running }
             guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
             update {
                 self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
             }
             to Running
-            emit RequestRuntimeRetire
+            emit RequestRuntimeRetire { session_id: session_id }
         }
 
         transition ObserveRuntimeRetired {
@@ -500,7 +500,7 @@ machine! {
         }
 
         transition DestroyMob {
-            on signal DestroyMob
+            on signal DestroyMob { session_id }
             guard {
                 self.lifecycle_phase == Phase::Running
                 || self.lifecycle_phase == Phase::Stopped
@@ -515,7 +515,7 @@ machine! {
                 self.coordinator_bound = false;
             }
             to Destroyed
-            emit RequestRuntimeDestroy
+            emit RequestRuntimeDestroy { session_id: session_id }
         }
 
         transition ObserveRuntimeDestroyed {
@@ -1161,7 +1161,7 @@ machine! {
         // =====================================================================
 
         transition RetireRunningReleasing {
-            on input Retire { agent_runtime_id, agent_identity, releasing }
+            on input Retire { agent_runtime_id, agent_identity, releasing, session_id }
             guard { self.lifecycle_phase == Phase::Running }
             guard "active_members_present" { self.live_runtime_ids != EmptySet }
             guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
@@ -1172,11 +1172,11 @@ machine! {
                 self.member_session_bindings.remove(agent_identity);
             }
             to Running
-            emit RequestRuntimeRetire
+            emit RequestRuntimeRetire { session_id: session_id }
         }
 
         transition RetireRunningPreservingBinding {
-            on input Retire { agent_runtime_id, agent_identity, releasing }
+            on input Retire { agent_runtime_id, agent_identity, releasing, session_id }
             guard { self.lifecycle_phase == Phase::Running }
             guard "active_members_present" { self.live_runtime_ids != EmptySet }
             guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
@@ -1186,11 +1186,11 @@ machine! {
                 self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
             }
             to Running
-            emit RequestRuntimeRetire
+            emit RequestRuntimeRetire { session_id: session_id }
         }
 
         transition RetireRunningNoBinding {
-            on input Retire { agent_runtime_id, agent_identity, releasing }
+            on input Retire { agent_runtime_id, agent_identity, releasing, session_id }
             guard { self.lifecycle_phase == Phase::Running }
             guard "active_members_present" { self.live_runtime_ids != EmptySet }
             guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
@@ -1200,11 +1200,11 @@ machine! {
                 self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
             }
             to Running
-            emit RequestRuntimeRetire
+            emit RequestRuntimeRetire { session_id: session_id }
         }
 
         transition RetireStoppedReleasing {
-            on input Retire { agent_runtime_id, agent_identity, releasing }
+            on input Retire { agent_runtime_id, agent_identity, releasing, session_id }
             guard { self.lifecycle_phase == Phase::Stopped }
             guard "active_members_present" { self.live_runtime_ids != EmptySet }
             guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
@@ -1215,11 +1215,11 @@ machine! {
                 self.member_session_bindings.remove(agent_identity);
             }
             to Stopped
-            emit RequestRuntimeRetire
+            emit RequestRuntimeRetire { session_id: session_id }
         }
 
         transition RetireStoppedPreservingBinding {
-            on input Retire { agent_runtime_id, agent_identity, releasing }
+            on input Retire { agent_runtime_id, agent_identity, releasing, session_id }
             guard { self.lifecycle_phase == Phase::Stopped }
             guard "active_members_present" { self.live_runtime_ids != EmptySet }
             guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
@@ -1229,11 +1229,11 @@ machine! {
                 self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
             }
             to Stopped
-            emit RequestRuntimeRetire
+            emit RequestRuntimeRetire { session_id: session_id }
         }
 
         transition RetireStoppedNoBinding {
-            on input Retire { agent_runtime_id, agent_identity, releasing }
+            on input Retire { agent_runtime_id, agent_identity, releasing, session_id }
             guard { self.lifecycle_phase == Phase::Stopped }
             guard "active_members_present" { self.live_runtime_ids != EmptySet }
             guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
@@ -1243,7 +1243,7 @@ machine! {
                 self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
             }
             to Stopped
-            emit RequestRuntimeRetire
+            emit RequestRuntimeRetire { session_id: session_id }
         }
 
         transition RetireAllRunning {

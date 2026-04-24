@@ -80,13 +80,19 @@ pub fn route_to_input(effect: &MeerkatMobSeamEffect) -> Option<TypedRoutedInput>
                 instance_id: MachineInstanceId::parse("meerkat")
                     .expect("composition instance slug"),
                 variant: InputVariantId::parse("Retire").expect("composition input slug"),
-                bindings: Vec::new(),
+                bindings: vec![(
+                    FieldId::parse("session_id").expect("route producer field slug"),
+                    FieldId::parse("session_id").expect("route consumer field slug"),
+                )],
             }),
             crate::generated::mob::Effect::RequestRuntimeDestroy(_) => Some(TypedRoutedInput {
                 instance_id: MachineInstanceId::parse("meerkat")
                     .expect("composition instance slug"),
                 variant: InputVariantId::parse("Destroy").expect("composition input slug"),
-                bindings: Vec::new(),
+                bindings: vec![(
+                    FieldId::parse("session_id").expect("route producer field slug"),
+                    FieldId::parse("session_id").expect("route consumer field slug"),
+                )],
             }),
             _ => None,
         },

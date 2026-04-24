@@ -187,7 +187,11 @@ impl MeerkatMachine {
                 }
                 self.stage_session_dsl_input(
                     &session_id,
-                    crate::meerkat_machine::dsl::MeerkatMachineInput::Retire,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::Retire {
+                        session_id: crate::meerkat_machine::dsl::SessionId::from_domain(
+                            &session_id,
+                        ),
+                    },
                     "Retire",
                 )
                 .await
@@ -387,7 +391,11 @@ impl MeerkatMachine {
                 }
                 self.preview_session_dsl_input(
                     &session_id,
-                    crate::meerkat_machine::dsl::MeerkatMachineInput::Destroy,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::Destroy {
+                        session_id: crate::meerkat_machine::dsl::SessionId::from_domain(
+                            &session_id,
+                        ),
+                    },
                     "Destroy",
                 )
                 .await
@@ -402,7 +410,11 @@ impl MeerkatMachine {
 
                 self.apply_session_dsl_input(
                     &session_id,
-                    crate::meerkat_machine::dsl::MeerkatMachineInput::Destroy,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::Destroy {
+                        session_id: crate::meerkat_machine::dsl::SessionId::from_domain(
+                            &session_id,
+                        ),
+                    },
                     "Destroy",
                 )
                 .await

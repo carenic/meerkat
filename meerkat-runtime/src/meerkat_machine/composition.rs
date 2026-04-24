@@ -215,8 +215,18 @@ impl ConsumerSurface for MeerkatConsumerSurface {
                     origin,
                 }
             }
-            "Retire" => mm_dsl::MeerkatMachineInput::Retire,
-            "Destroy" => mm_dsl::MeerkatMachineInput::Destroy,
+            "Retire" => {
+                let sid = project_str(&projected, "session_id")?;
+                mm_dsl::MeerkatMachineInput::Retire {
+                    session_id: mm_dsl::SessionId::from(sid.to_string()),
+                }
+            }
+            "Destroy" => {
+                let sid = project_str(&projected, "session_id")?;
+                mm_dsl::MeerkatMachineInput::Destroy {
+                    session_id: mm_dsl::SessionId::from(sid.to_string()),
+                }
+            }
             other => {
                 return Err(format!(
                     "meerkat consumer surface does not accept routed input `{other}`; \

@@ -138,12 +138,13 @@ pub enum MobProducerEffect {
         origin: mob_dsl::WorkOrigin,
     },
     /// Route `retire_request_reaches_meerkat` — target `meerkat.Retire`.
-    /// Carries no fields (the retire target is implied by the currently
-    /// bound member; the consumer surface resolves it from its own state).
-    RequestRuntimeRetire,
+    /// Carries `session_id` so the consumer surface can resolve the target
+    /// MeerkatMachine (previously relied on surface pinning, which wasn't
+    /// wired for the mob actor's shared consumer surface).
+    RequestRuntimeRetire { session_id: mob_dsl::SessionId },
     /// Route `destroy_request_reaches_meerkat` — target `meerkat.Destroy`.
-    /// Carries no fields (same implicit-target pattern as Retire).
-    RequestRuntimeDestroy,
+    /// Carries `session_id` (same pattern as Retire).
+    RequestRuntimeDestroy { session_id: mob_dsl::SessionId },
 }
 
 impl MobProducerEffect {
@@ -154,8 +155,8 @@ impl MobProducerEffect {
         let slug = match self {
             Self::RequestRuntimeBinding { .. } => "RequestRuntimeBinding",
             Self::RequestRuntimeIngress { .. } => "RequestRuntimeIngress",
-            Self::RequestRuntimeRetire => "RequestRuntimeRetire",
-            Self::RequestRuntimeDestroy => "RequestRuntimeDestroy",
+            Self::RequestRuntimeRetire { .. } => "RequestRuntimeRetire",
+            Self::RequestRuntimeDestroy { .. } => "RequestRuntimeDestroy",
         };
         EffectVariantId::parse(slug).expect("producer effect slug is hand-authored constant")
     }
@@ -196,7 +197,14 @@ impl MobProducerEffect {
                 "origin" => Some(FieldValue::Str(work_origin_slug(origin))),
                 _ => None,
             },
-            Self::RequestRuntimeRetire | Self::RequestRuntimeDestroy => None,
+            Self::RequestRuntimeRetire { session_id } => match id.as_str() {
+                "session_id" => Some(FieldValue::Str(session_id.0.as_str())),
+                _ => None,
+            },
+            Self::RequestRuntimeDestroy { session_id } => match id.as_str() {
+                "session_id" => Some(FieldValue::Str(session_id.0.as_str())),
+                _ => None,
+            },
         }
     }
 }
@@ -260,8 +268,14 @@ pub fn lift_routed_effect(effect: &mob_dsl::MobMachineEffect) -> Option<MobSeamE
             work_id: work_id.clone(),
             origin: *origin,
         },
-        DslEffect::RequestRuntimeRetire => MobProducerEffect::RequestRuntimeRetire,
-        DslEffect::RequestRuntimeDestroy => MobProducerEffect::RequestRuntimeDestroy,
+        DslEffect::RequestRuntimeRetire { session_id } => MobProducerEffect::RequestRuntimeRetire {
+            session_id: session_id.clone(),
+        },
+        DslEffect::RequestRuntimeDestroy { session_id } => {
+            MobProducerEffect::RequestRuntimeDestroy {
+                session_id: session_id.clone(),
+            }
+        }
         _ => return None,
     };
     Some(MobSeamEffect::Mob(body))
@@ -439,8 +453,12 @@ mod tests {
 
     #[test]
     fn retire_and_destroy_have_no_fields() {
-        let retire = MobSeamEffect::Mob(MobProducerEffect::RequestRuntimeRetire);
-        let destroy = MobSeamEffect::Mob(MobProducerEffect::RequestRuntimeDestroy);
+        let retire = MobSeamEffect::Mob(MobProducerEffect::RequestRuntimeRetire {
+            session_id: mob_dsl::SessionId::from("019dbd3d-d7ad-75a1-96d0-8013927e78f8"),
+        });
+        let destroy = MobSeamEffect::Mob(MobProducerEffect::RequestRuntimeDestroy {
+            session_id: mob_dsl::SessionId::from("019dbd3d-d7ad-75a1-96d0-8013927e78f8"),
+        });
         assert_eq!(retire.variant_id(), ev("RequestRuntimeRetire"));
         assert_eq!(destroy.variant_id(), ev("RequestRuntimeDestroy"));
         assert!(retire.field(&fid("agent_runtime_id")).is_none());
@@ -496,10 +514,14 @@ mod tests {
             )),
         ));
 
-        let retire_in = DslEffect::RequestRuntimeRetire;
+        let retire_in = DslEffect::RequestRuntimeRetire {
+            session_id: mob_dsl::SessionId::from("019dbd3d-d7ad-75a1-96d0-8013927e78f8"),
+        };
         assert!(matches!(
             lift_routed_effect(&retire_in),
-            Some(MobSeamEffect::Mob(MobProducerEffect::RequestRuntimeRetire)),
+            Some(MobSeamEffect::Mob(
+                MobProducerEffect::RequestRuntimeRetire { .. }
+            )),
         ));
 
         // Non-routed variant: `PersistKickoffUpdate` stays on the local
@@ -514,7 +536,9 @@ mod tests {
     #[tokio::test]
     async fn standalone_binding_skips_dispatch_without_error() {
         let binding: MobCompositionBinding = CompositionBinding::Standalone;
-        let effect = MobSeamEffect::Mob(MobProducerEffect::RequestRuntimeRetire);
+        let effect = MobSeamEffect::Mob(MobProducerEffect::RequestRuntimeRetire {
+            session_id: mob_dsl::SessionId::from("019dbd3d-d7ad-75a1-96d0-8013927e78f8"),
+        });
         let outcome = dispatch_routed_effect(&binding, effect)
             .await
             .expect("standalone is not an error");

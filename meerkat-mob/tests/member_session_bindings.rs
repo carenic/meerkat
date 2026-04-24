@@ -66,10 +66,12 @@ fn retire_input(
     generation: u64,
     releasing: Option<SessionId>,
 ) -> MobMachineInput {
+    let session_id_for_route = releasing.clone().unwrap_or_else(SessionId::default);
     MobMachineInput::Retire {
         agent_runtime_id: runtime_id(identity_name, generation),
         agent_identity: identity(identity_name),
         releasing,
+        session_id: session_id_for_route,
     }
 }
 

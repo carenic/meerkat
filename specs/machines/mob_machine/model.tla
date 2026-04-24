@@ -163,7 +163,7 @@ SubmitWorkRunningInternal(agent_runtime_id, fence_token, work_id, origin) ==
     /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, member_state_markers, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids, member_session_bindings, topology_epoch >>
 
 
-RetireMember(agent_runtime_id, fence_token) ==
+RetireMember(agent_runtime_id, fence_token, session_id) ==
     /\ phase = "Running"
     /\ (agent_runtime_id \in live_runtime_ids)
     /\ phase' = "Running"
@@ -219,7 +219,7 @@ MarkCompleted ==
     /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, member_state_markers, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids, member_session_bindings, topology_epoch >>
 
 
-DestroyMob ==
+DestroyMob(session_id) ==
     /\ phase = "Running" \/ phase = "Stopped" \/ phase = "Completed"
     /\ phase' = "Destroyed"
     /\ model_step_count' = model_step_count + 1
@@ -757,7 +757,7 @@ FinishRunRunningZero ==
     /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, member_state_markers, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids, member_session_bindings, topology_epoch >>
 
 
-RetireRunningReleasing(agent_runtime_id, agent_identity, releasing) ==
+RetireRunningReleasing(agent_runtime_id, agent_identity, releasing, session_id) ==
     /\ phase = "Running"
     /\ (live_runtime_ids # {})
     /\ (agent_runtime_id \in live_runtime_ids)
@@ -770,7 +770,7 @@ RetireRunningReleasing(agent_runtime_id, agent_identity, releasing) ==
     /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids, topology_epoch >>
 
 
-RetireRunningPreservingBinding(agent_runtime_id, agent_identity, releasing) ==
+RetireRunningPreservingBinding(agent_runtime_id, agent_identity, releasing, session_id) ==
     /\ phase = "Running"
     /\ (live_runtime_ids # {})
     /\ (agent_runtime_id \in live_runtime_ids)
@@ -782,7 +782,7 @@ RetireRunningPreservingBinding(agent_runtime_id, agent_identity, releasing) ==
     /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids, member_session_bindings, topology_epoch >>
 
 
-RetireRunningNoBinding(agent_runtime_id, agent_identity, releasing) ==
+RetireRunningNoBinding(agent_runtime_id, agent_identity, releasing, session_id) ==
     /\ phase = "Running"
     /\ (live_runtime_ids # {})
     /\ (agent_runtime_id \in live_runtime_ids)
@@ -794,7 +794,7 @@ RetireRunningNoBinding(agent_runtime_id, agent_identity, releasing) ==
     /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids, member_session_bindings, topology_epoch >>
 
 
-RetireStoppedReleasing(agent_runtime_id, agent_identity, releasing) ==
+RetireStoppedReleasing(agent_runtime_id, agent_identity, releasing, session_id) ==
     /\ phase = "Stopped"
     /\ (live_runtime_ids # {})
     /\ (agent_runtime_id \in live_runtime_ids)
@@ -807,7 +807,7 @@ RetireStoppedReleasing(agent_runtime_id, agent_identity, releasing) ==
     /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids, topology_epoch >>
 
 
-RetireStoppedPreservingBinding(agent_runtime_id, agent_identity, releasing) ==
+RetireStoppedPreservingBinding(agent_runtime_id, agent_identity, releasing, session_id) ==
     /\ phase = "Stopped"
     /\ (live_runtime_ids # {})
     /\ (agent_runtime_id \in live_runtime_ids)
@@ -819,7 +819,7 @@ RetireStoppedPreservingBinding(agent_runtime_id, agent_identity, releasing) ==
     /\ UNCHANGED << live_runtime_ids, externally_addressable_runtime_ids, runtime_fence_tokens, active_run_count, pending_spawn_count, coordinator_bound, wiring_edges, identity_to_runtime, tasks, in_progress_task_ids, completed_task_ids, member_session_bindings, topology_epoch >>
 
 
-RetireStoppedNoBinding(agent_runtime_id, agent_identity, releasing) ==
+RetireStoppedNoBinding(agent_runtime_id, agent_identity, releasing, session_id) ==
     /\ phase = "Stopped"
     /\ (live_runtime_ids # {})
     /\ (agent_runtime_id \in live_runtime_ids)
@@ -900,12 +900,12 @@ Next ==
     \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : ObserveRuntimeReady(agent_runtime_id, fence_token)
     \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E work_id \in WorkIdValues : \E origin \in WorkOriginValues : SubmitWorkRunningExternal(agent_runtime_id, fence_token, work_id, origin)
     \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E work_id \in WorkIdValues : \E origin \in WorkOriginValues : SubmitWorkRunningInternal(agent_runtime_id, fence_token, work_id, origin)
-    \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : RetireMember(agent_runtime_id, fence_token)
+    \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E session_id \in SessionIdValues : RetireMember(agent_runtime_id, fence_token, session_id)
     \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : ObserveRuntimeRetired(agent_runtime_id, fence_token)
     \/ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E generation \in GenerationValues : \E external_addressable \in BOOLEAN : \E session_id \in SessionIdValues : ResetMember(agent_identity, agent_runtime_id, fence_token, generation, external_addressable, session_id)
     \/ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E generation \in GenerationValues : \E external_addressable \in BOOLEAN : \E session_id \in SessionIdValues : RespawnMember(agent_identity, agent_runtime_id, fence_token, generation, external_addressable, session_id)
     \/ MarkCompleted
-    \/ DestroyMob
+    \/ \E session_id \in SessionIdValues : DestroyMob(session_id)
     \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : ObserveRuntimeDestroyed(agent_runtime_id, fence_token)
     \/ RecordOperatorActionProvenanceRunning
     \/ RecordOperatorActionProvenanceStopped
@@ -971,12 +971,12 @@ Next ==
     \/ CompleteFlowRunningZero
     \/ FinishRunRunning
     \/ FinishRunRunningZero
-    \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E agent_identity \in AgentIdentityValues : \E releasing \in OptionSessionIdValues : RetireRunningReleasing(agent_runtime_id, agent_identity, releasing)
-    \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E agent_identity \in AgentIdentityValues : \E releasing \in OptionSessionIdValues : RetireRunningPreservingBinding(agent_runtime_id, agent_identity, releasing)
-    \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E agent_identity \in AgentIdentityValues : \E releasing \in OptionSessionIdValues : RetireRunningNoBinding(agent_runtime_id, agent_identity, releasing)
-    \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E agent_identity \in AgentIdentityValues : \E releasing \in OptionSessionIdValues : RetireStoppedReleasing(agent_runtime_id, agent_identity, releasing)
-    \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E agent_identity \in AgentIdentityValues : \E releasing \in OptionSessionIdValues : RetireStoppedPreservingBinding(agent_runtime_id, agent_identity, releasing)
-    \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E agent_identity \in AgentIdentityValues : \E releasing \in OptionSessionIdValues : RetireStoppedNoBinding(agent_runtime_id, agent_identity, releasing)
+    \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E agent_identity \in AgentIdentityValues : \E releasing \in OptionSessionIdValues : \E session_id \in SessionIdValues : RetireRunningReleasing(agent_runtime_id, agent_identity, releasing, session_id)
+    \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E agent_identity \in AgentIdentityValues : \E releasing \in OptionSessionIdValues : \E session_id \in SessionIdValues : RetireRunningPreservingBinding(agent_runtime_id, agent_identity, releasing, session_id)
+    \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E agent_identity \in AgentIdentityValues : \E releasing \in OptionSessionIdValues : \E session_id \in SessionIdValues : RetireRunningNoBinding(agent_runtime_id, agent_identity, releasing, session_id)
+    \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E agent_identity \in AgentIdentityValues : \E releasing \in OptionSessionIdValues : \E session_id \in SessionIdValues : RetireStoppedReleasing(agent_runtime_id, agent_identity, releasing, session_id)
+    \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E agent_identity \in AgentIdentityValues : \E releasing \in OptionSessionIdValues : \E session_id \in SessionIdValues : RetireStoppedPreservingBinding(agent_runtime_id, agent_identity, releasing, session_id)
+    \/ \E agent_runtime_id \in AgentRuntimeIdValues : \E agent_identity \in AgentIdentityValues : \E releasing \in OptionSessionIdValues : \E session_id \in SessionIdValues : RetireStoppedNoBinding(agent_runtime_id, agent_identity, releasing, session_id)
     \/ RetireAllRunning
     \/ RetireAllStopped
     \/ CompleteSpawnRunning

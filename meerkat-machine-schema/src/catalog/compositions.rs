@@ -352,7 +352,7 @@ pub fn meerkat_mob_seam_composition() -> CompositionSchema {
                 "meerkat",
                 RouteTargetKind::Input,
                 "Retire",
-                &[],
+                &[bind("session_id", "session_id")],
             ),
             route(
                 "destroy_request_reaches_meerkat",
@@ -361,7 +361,7 @@ pub fn meerkat_mob_seam_composition() -> CompositionSchema {
                 "meerkat",
                 RouteTargetKind::Input,
                 "Destroy",
-                &[],
+                &[bind("session_id", "session_id")],
             ),
             route(
                 "runtime_bound_reaches_mob",

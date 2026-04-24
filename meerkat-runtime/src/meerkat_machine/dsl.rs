@@ -2303,11 +2303,11 @@ machine! {
                 staged_visibility_revision: u64,
             },
             Recover,
-            Retire,
+            Retire { session_id: SessionId },
             Reset,
             StopRuntimeExecutor,
             RuntimeExecutorExited,
-            Destroy,
+            Destroy { session_id: SessionId },
             // Absorbed inputs
             EnsureSessionWithExecutor { session_id: SessionId },
             SetSilentIntents { session_id: SessionId, intents: Set<String> },
@@ -3333,7 +3333,7 @@ machine! {
 
         // 14. Retire: from [Idle, Attached, Running] → Retired
         transition RetireRequestedFromIdle {
-            on input Retire
+            on input Retire { session_id }
             guard {
                 self.lifecycle_phase == Phase::Idle
                 || self.lifecycle_phase == Phase::Attached
@@ -3457,7 +3457,7 @@ machine! {
 
         // 17. Destroy: from all non-Destroyed → Destroyed
         transition Destroy {
-            on input Destroy
+            on input Destroy { session_id }
             guard {
                 self.lifecycle_phase == Phase::Initializing
                 || self.lifecycle_phase == Phase::Idle
