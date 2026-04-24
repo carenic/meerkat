@@ -215,6 +215,9 @@ fn default_consumer_input(producer: &str, effect_variant: &str, consumer: &str) 
             "SupersedePendingOccurrences",
             "OccurrenceLifecycleMachine",
         ) => "Supersede".to_string(),
+        ("OccurrenceLifecycleMachine", "OccurrencesSuperseded", "ScheduleLifecycleMachine") => {
+            "ConfirmOccurrencesSuperseded".to_string()
+        }
         _ => format!("{producer}:{effect_variant}->{consumer}"),
     }
 }
@@ -506,13 +509,19 @@ fn default_forbidden_shell_reads() -> Vec<ForbiddenShellReadRule> {
 fn default_allowed_paths(producer: &str, consumer: &str) -> Vec<&'static str> {
     match (producer, consumer) {
         ("MobMachine", "MeerkatMachine") | ("MeerkatMachine", "MobMachine") => {
+            // Post-wave-c `meerkat_machine.rs` was decomposed into the
+            // `meerkat_machine/` module directory; point at `mod.rs` so
+            // the realization-path existence check resolves.
             vec![
-                "meerkat-runtime/src/meerkat_machine.rs",
+                "meerkat-runtime/src/meerkat_machine/mod.rs",
                 "meerkat-mob/src/runtime/actor.rs",
                 "meerkat-mob/src/runtime/handle.rs",
             ]
         }
-        ("ScheduleLifecycleMachine", "OccurrenceLifecycleMachine") => {
+        ("ScheduleLifecycleMachine", "OccurrenceLifecycleMachine")
+        | ("OccurrenceLifecycleMachine", "ScheduleLifecycleMachine") => {
+            // Both directions of the schedule_bundle seam are realised
+            // via the same service driver path.
             vec!["meerkat-schedule/src/service.rs"]
         }
         _ => vec![],

@@ -490,6 +490,14 @@ fn ensure_active_conversation_run(state: &mut LocalState) -> Result<(), DslTrans
         state.phase,
         TurnPhase::Completed | TurnPhase::Failed | TurnPhase::Cancelled
     );
+    // RMAT-ALLOW(NoGuardedApply): this is a test-only `LocalState` stub
+    // reset, not an authority apply. The conditional resets the stub's
+    // synthetic state to a fresh run; the subsequent `state.apply(...)`
+    // calls in this function ARE unconditional authority submits against
+    // the now-reset stub. The RMAT rule flags `is_terminal`-gated branches
+    // that guard `.apply()` calls — here the guard gates the stub
+    // bootstrap, not the authority, so the flag is a false positive for
+    // test scaffolding.
     if state.fields.active_run.is_none() || is_terminal {
         *state = LocalState::new();
     }
@@ -624,6 +632,11 @@ impl TurnStateHandle for TestTurnStateHandle {
             guard.phase,
             TurnPhase::Completed | TurnPhase::Failed | TurnPhase::Cancelled
         );
+        // RMAT-ALLOW(NoGuardedApply): test-stub bootstrap — the
+        // conditional resets the stub's synthetic state to a fresh run
+        // before unconditionally submitting `StartConversationRun`. See
+        // `ensure_active_conversation_run` above for the same pattern
+        // and rationale.
         if guard.fields.active_run.is_none() || is_terminal {
             *guard = LocalState::new();
             let run_id = RunId(uuid::Uuid::new_v4());
