@@ -581,11 +581,19 @@ fn collect_route_realization_findings(root: &Path, policy: &AuditPolicy) -> Vec<
     // application path has forked from `CompositionDispatcher::dispatch`
     // and `ConsumerSurface::apply_routed_input`.
     // ---------------------------------------------------------------------
-    const BANNED_LEGACY_HELPERS: &[&str] = &[
-        "composition_dispatch",
-        "recompute_mob_peer_overlay",
-        "comms_trust_reconcile",
-    ];
+    // `comms_trust_reconcile` was in this list while the identically-named
+    // wave-a helper was the forbidden pre-composition shell shortcut.
+    // Wave-c (`b0e881535`) re-ported the module as the legitimate
+    // mechanical external-effect handler: `MeerkatMachine`'s DSL declares
+    // `disposition CommsTrustReconcileRequested => external`
+    // (meerkat-machine-schema `dsl/meerkat_machine.rs:732`), so the effect
+    // intentionally lands on shell observers rather than transiting
+    // `CompositionDispatcher`. The banned-name grep no longer applies —
+    // this rule's invariant ("routed-effect dispatch must go through
+    // CompositionDispatcher") only governs effects with a `routed`
+    // disposition. `composition_dispatch` + `recompute_mob_peer_overlay`
+    // remain banned because their dispositions *are* routed.
+    const BANNED_LEGACY_HELPERS: &[&str] = &["composition_dispatch", "recompute_mob_peer_overlay"];
     let scan_roots: [&str; 2] = ["meerkat-runtime/src", "meerkat-mob/src"];
     for root_rel in scan_roots {
         let root_path = root.join(root_rel);
