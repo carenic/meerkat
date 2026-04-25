@@ -21,7 +21,7 @@ use meerkat_runtime::MeerkatMachine;
 pub fn spawn_runtime_backed_schedule_host(
     service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
     runtime_adapter: Arc<MeerkatMachine>,
-    config: Config,
+    _config: Config,
     schedule_service: ScheduleService,
     build_template: SessionBuildOptions,
     owner_id: impl Into<String>,
@@ -31,7 +31,7 @@ pub fn spawn_runtime_backed_schedule_host(
     }
 
     let session_host: Arc<dyn SurfaceScheduleSessionHost> = Arc::new(
-        RuntimeBackedScheduleSessionHost::new(service, runtime_adapter, config, build_template),
+        RuntimeBackedScheduleSessionHost::new(service, runtime_adapter, build_template),
     );
     let mob_host = Arc::new(NoopScheduleMobHost::new(
         "scheduled mob targets are not supported by this runtime host",
@@ -47,8 +47,6 @@ pub fn spawn_runtime_backed_schedule_host(
 struct RuntimeBackedScheduleSessionHost {
     service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
     runtime_adapter: Arc<MeerkatMachine>,
-    #[allow(dead_code)]
-    config: Config,
     build_template: SessionBuildOptions,
 }
 
@@ -56,18 +54,15 @@ impl RuntimeBackedScheduleSessionHost {
     fn new(
         service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
         runtime_adapter: Arc<MeerkatMachine>,
-        config: Config,
         build_template: SessionBuildOptions,
     ) -> Self {
         Self {
             service,
             runtime_adapter,
-            config,
             build_template,
         }
     }
 
-    #[allow(dead_code)]
     async fn ensure_runtime_session_registered(
         &self,
         session_id: &SessionId,
@@ -98,7 +93,6 @@ impl RuntimeBackedScheduleSessionHost {
         Ok(())
     }
 
-    #[allow(dead_code)]
     async fn update_peer_ingress_context(&self, session_id: &SessionId) {
         #[cfg(feature = "comms")]
         {
@@ -224,10 +218,11 @@ impl SurfaceScheduleSessionHost for RuntimeBackedScheduleSessionHost {
 
     async fn deliver_prompt(
         &self,
-        _session_id: &SessionId,
+        session_id: &SessionId,
         _occurrence: &crate::Occurrence,
         _dispatch: ScheduledPromptDispatch,
     ) -> Result<crate::DeliveryDispatch, ScheduleDomainError> {
+        self.ensure_runtime_session_registered(session_id).await?;
         Err(ScheduleDomainError::Internal(
             "runtime-backed deliver_prompt no longer reinterprets runtime terminal classes into schedule-local failure classes; the schedule surface must consume the runtime's typed CompletionOutcome directly".to_string(),
         ))
@@ -235,13 +230,14 @@ impl SurfaceScheduleSessionHost for RuntimeBackedScheduleSessionHost {
 
     async fn deliver_event(
         &self,
-        _session_id: &SessionId,
+        session_id: &SessionId,
         _occurrence: &crate::Occurrence,
         _event_type: String,
         _payload: serde_json::Value,
         _render_metadata: Option<meerkat_core::types::RenderMetadata>,
         _materialized_session_id: Option<SessionId>,
     ) -> Result<crate::DeliveryDispatch, ScheduleDomainError> {
+        self.ensure_runtime_session_registered(session_id).await?;
         Err(ScheduleDomainError::Internal(
             "runtime-backed deliver_event no longer reinterprets runtime terminal classes into schedule-local failure classes; the schedule surface must consume the runtime's typed CompletionOutcome directly".to_string(),
         ))

@@ -49,14 +49,13 @@ fn owner_tests_are_registered_only_for_remaining_canonical_surfaces() {
 }
 
 #[test]
-#[ignore = "Phase 1 red-ok machine workflow E2E"]
 fn machine_workflow_red_ok_detects_missing_and_stale_generated_artifacts() {
     let registry = CanonicalRegistry::load();
     let selection = registry
         .select(&SelectionArgs {
-            all: false,
-            machines: vec!["meerkat_machine".into()],
-            compositions: vec!["meerkat_mob_seam".into()],
+            all: true,
+            machines: vec![],
+            compositions: vec![],
         })
         .expect("selection should resolve canonical workflow artifacts");
     let dir = tempdir().expect("tempdir");
@@ -66,6 +65,7 @@ fn machine_workflow_red_ok_detects_missing_and_stale_generated_artifacts() {
         !missing.is_empty(),
         "fresh temp roots should surface missing machine workflow artifacts"
     );
+    materialize_missing_coverage_anchors(&missing).expect("materialize coverage anchors");
 
     machine_codegen_at_root(dir.path(), &selection).expect("generate workflow artifacts");
 
@@ -91,6 +91,23 @@ fn machine_workflow_red_ok_detects_missing_and_stale_generated_artifacts() {
         !stale.is_empty(),
         "editing a generated artifact should be caught by anti-drift checks"
     );
+}
+
+fn materialize_missing_coverage_anchors(mismatches: &[String]) -> anyhow::Result<()> {
+    for mismatch in mismatches {
+        let Some((_, rest)) = mismatch.split_once("coverage anchor ") else {
+            continue;
+        };
+        let Some((path, _)) = rest.split_once(" for ") else {
+            continue;
+        };
+        let path = std::path::Path::new(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, "// coverage anchor fixture\n")?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "machine-authority")]

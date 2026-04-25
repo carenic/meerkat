@@ -3054,7 +3054,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Phase 1 red-ok comms bridge + parent wait suite"]
     async fn runtime_bridge_red_ok_send_and_stream_reserves_one_interaction_channel() {
         let suffix = Uuid::new_v4().simple().to_string();
         let runtime = CommsRuntime::inproc_only(&format!("phase1-bridge-{suffix}")).unwrap();
@@ -3096,7 +3095,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Phase 1 red-ok comms bridge + parent wait suite"]
     async fn runtime_bridge_red_ok_completed_interaction_terminates_reserved_stream() {
         let suffix = Uuid::new_v4().simple().to_string();
         let runtime = CommsRuntime::inproc_only(&format!("phase1-complete-{suffix}")).unwrap();
