@@ -73,6 +73,7 @@ fn canonical_composition_registry_contains_kernel_seam_and_schedule_perimeter_en
             "schedule_bundle",
             "schedule_runtime_bundle",
             "schedule_mob_bundle",
+            "auth_lease_bundle",
         ]
     );
 }
@@ -1024,8 +1025,8 @@ mod handoff_binding {
         ActorKind, ActorSchema, ClosurePolicy, CompositionSchema, CompositionSchemaError,
         CompositionStateLimits, EffectHandoffProtocol, FeedbackFieldBinding, FeedbackFieldSource,
         FeedbackInputRef, HandleBridgeFeedbackBinding, MachineInstance, ProtocolGenerationMode,
-        ProtocolHelperReturnShape, ProtocolRustBinding, canonical_machine_schemas,
-        compat_composition_schemas,
+        ProtocolHelperReturnShape, ProtocolRustBinding, canonical_composition_schemas,
+        canonical_machine_schemas, compat_composition_schemas,
     };
 
     fn ok_handle_binding() -> ProtocolRustBinding {
@@ -1325,7 +1326,7 @@ mod handoff_binding {
     /// Wave-d D-c: `auth_lease_bundle` composition validates in isolation
     /// and carries the structural seam closure for the AuthMachine
     /// lifecycle-event publication. Asserts:
-    /// - the composition is registered in `compat_composition_schemas()`;
+    /// - the composition is registered in `canonical_composition_schemas()`;
     /// - it validates against the canonical machine registry alone;
     /// - the handoff protocol `auth_lease_lifecycle_publication` is
     ///   declared directly on `AuthMachine::EmitLifecycleEvent`.
@@ -1338,8 +1339,9 @@ mod handoff_binding {
     fn auth_lease_bundle_composition_closes_auth_machine_orphan() {
         let comp = compat_composition_schemas()
             .into_iter()
+            .chain(canonical_composition_schemas())
             .find(|c| c.name.as_str() == "auth_lease_bundle")
-            .expect("auth_lease_bundle must be registered in compat_composition_schemas()");
+            .expect("auth_lease_bundle must be registered as a canonical composition");
 
         let machines = canonical_machine_schemas();
         let refs: Vec<_> = machines.iter().collect();

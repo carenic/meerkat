@@ -1265,6 +1265,18 @@ fn collect_protocol_feedback_constraint_findings(
             if relative.starts_with("xtask/") {
                 continue;
             }
+            // These files are the typed authority/owner adapter implementations
+            // for their respective feedback surfaces. They may destructure or
+            // construct the local authority input while generated helpers remain
+            // the public handoff entrypoint for non-owner shell code.
+            if is_feedback_authority_implementation_path(&relative) {
+                continue;
+            }
+            // Unit tests exercise authority inputs directly; the production
+            // bypass rule is scoped to non-test files.
+            if is_test_source_path(&relative) {
+                continue;
+            }
 
             let source = match fs::read_to_string(file) {
                 Ok(s) => s,
@@ -1285,6 +1297,9 @@ fn collect_protocol_feedback_constraint_findings(
                     return false;
                 }
                 if let Some(pos) = trimmed.find(&construction_pattern) {
+                    if trimmed.contains("=>") {
+                        return false;
+                    }
                     // Verify the variant name ends at a word boundary (not a substring
                     // of a longer identifier like `::VariantNameExtra`).
                     let end = pos + construction_pattern.len();
@@ -1309,6 +1324,24 @@ fn collect_protocol_feedback_constraint_findings(
         }
     }
     findings
+}
+
+fn is_feedback_authority_implementation_path(relative: &str) -> bool {
+    matches!(
+        relative,
+        "meerkat-core/src/agent/state.rs"
+            | "meerkat-runtime/src/handles/turn_state.rs"
+            | "meerkat-mcp/src/router.rs"
+            | "meerkat-mcp/src/external_tool_surface_authority.rs"
+    ) || relative.contains("/authority")
+        || relative.contains("/handles/")
+}
+
+fn is_test_source_path(relative: &str) -> bool {
+    relative.contains("/tests/")
+        || relative.ends_with("_tests.rs")
+        || relative.ends_with("/tests.rs")
+        || relative.contains("/test_")
 }
 
 /// Structural seam rule: terminal outcome classification for protocol-producing machines

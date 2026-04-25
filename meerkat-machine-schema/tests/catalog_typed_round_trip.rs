@@ -91,6 +91,7 @@ fn canonical_composition_slug_snapshot() {
     assert_eq!(
         slugs,
         vec![
+            "auth_lease_bundle".to_string(),
             "meerkat_mob_seam".to_string(),
             "schedule_bundle".to_string(),
             "schedule_mob_bundle".to_string(),

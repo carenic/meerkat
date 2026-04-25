@@ -702,12 +702,13 @@ fn default_ci_limits() -> CompositionStateLimits {
     }
 }
 
-/// Perimeter handoff compositions that are not part of the Mob seam.
-/// Runtime/Mob handoff protocols are hosted directly by
-/// `meerkat_mob_seam_composition`; the auth lease lifecycle is
-/// per-binding and remains a standalone perimeter composition.
+/// Compatibility composition registry.
+///
+/// All remaining handoff protocols are canonical: runtime/Mob protocols are
+/// hosted directly by `meerkat_mob_seam_composition`, and auth lease lifecycle
+/// publication is a canonical AuthMachine perimeter composition.
 pub fn compat_composition_schemas() -> Vec<CompositionSchema> {
-    vec![auth_lease_bundle_composition()]
+    Vec::new()
 }
 
 /// Host composition for the `ops_barrier_satisfaction` handoff protocol.
@@ -1494,7 +1495,7 @@ fn mob_destroy_session_ingress_bundle_composition() -> CompositionSchema {
 /// - `auth_machine_authority` (Machine) — canonical `AuthMachine`.
 /// - `auth_lease_owner` (Owner) — realising actor; corresponds to
 ///   `meerkat-runtime::handles::auth_lease::RuntimeAuthLeaseHandle`.
-fn auth_lease_bundle_composition() -> CompositionSchema {
+pub fn auth_lease_bundle_composition() -> CompositionSchema {
     CompositionSchema {
         name: comp_id("auth_lease_bundle"),
         machines: vec![MachineInstance {
