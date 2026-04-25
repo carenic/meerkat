@@ -15,7 +15,7 @@ use meerkat_machine_schema::catalog::{
 };
 use meerkat_machine_schema::{
     CompositionDriver, CompositionDriverRustBinding, DriverDispatchRoute, RouteTargetKind,
-    WatchedEffect, canonical_machine_schemas, flow_run_machine,
+    WatchedEffect, canonical_machine_schemas,
 };
 
 #[test]
@@ -208,51 +208,6 @@ fn typed_kernel_module_contract_rejects_legacy_kernel_surface() {
 }
 
 #[test]
-fn typed_compat_kernel_module_contract_rejects_legacy_kernel_surface() {
-    let rendered = render_machine_kernel_module(&flow_run_machine());
-
-    for forbidden in [
-        "KernelState",
-        "KernelInput",
-        "KernelSignal",
-        "KernelEffect",
-        "KernelValue",
-        "TransitionOutcome",
-        "evaluate_helper(",
-    ] {
-        assert!(
-            !rendered.contains(forbidden),
-            "typed compat kernel module contract should not mention `{forbidden}`:\n{rendered}"
-        );
-    }
-
-    for required in [
-        "pub struct State",
-        "pub enum Phase",
-        "pub enum Input",
-        "pub enum InputKind",
-        "pub enum Effect",
-        "pub enum EffectKind",
-        "pub enum TransitionId",
-        "pub enum GuardId",
-        "pub enum HelperId",
-        "pub struct Outcome",
-        "pub enum TransitionError",
-        "pub enum TransitionRefusal",
-        "pub enum KernelError",
-        "pub trait Context",
-        "pub struct EmptyContext",
-        "pub fn transition<C: Context>(",
-        "pub mod helpers",
-    ] {
-        assert!(
-            rendered.contains(required),
-            "typed compat kernel module contract should contain `{required}`:\n{rendered}"
-        );
-    }
-}
-
-#[test]
 fn generated_kernel_inventory_contract_lists_all_typed_machine_modules() {
     let schemas = canonical_machine_schemas();
     let rendered = render_generated_kernel_mod(&schemas);
@@ -345,17 +300,21 @@ fn render_composition_driver_emits_typed_seam_effect_and_route_to_input() {
     let rendered =
         render_composition_driver(&composition).expect("driver-bearing composition emits");
 
-    // Typed identity imports + TypedRoutedInput are present; no stringly
+    // Typed identity imports + route descriptors are present; no stringly
     // tuple tables survive.
     assert!(
         rendered.contains(
-            "use meerkat_machine_schema::identity::{FieldId, InputVariantId, MachineInstanceId};"
+            "use meerkat_machine_schema::identity::{FieldId, InputVariantId, MachineInstanceId, SignalVariantId};"
         ),
         "rendered module must import typed identity newtypes:\n{rendered}"
     );
     assert!(
         rendered.contains("pub struct TypedRoutedInput"),
         "rendered module must declare TypedRoutedInput:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("pub struct TypedRoutedSignal"),
+        "rendered module must declare TypedRoutedSignal:\n{rendered}"
     );
     for forbidden in [
         "pub const WATCHED_EFFECTS",
@@ -401,11 +360,16 @@ fn render_composition_driver_emits_typed_seam_effect_and_route_to_input() {
         "route_to_input must target the PrepareBindings input variant:\n{rendered}"
     );
 
-    // Signal-kind routes are excluded from route_to_input — they belong to
-    // the signal surface, not the composition dispatcher.
+    // Signal-kind routes are emitted through the generated signal surface.
     assert!(
-        !rendered.contains("ObserveRuntimeReady"),
-        "signal-kind routes must not surface in route_to_input:\n{rendered}"
+        rendered.contains(
+            "pub fn route_to_signal(effect: &MeerkatMobSeamEffect) -> Option<TypedRoutedSignal>"
+        ),
+        "rendered module must declare route_to_signal:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SignalVariantId::parse(\"ObserveRuntimeReady\")"),
+        "route_to_signal must target the ObserveRuntimeReady signal variant:\n{rendered}"
     );
 
     assert!(

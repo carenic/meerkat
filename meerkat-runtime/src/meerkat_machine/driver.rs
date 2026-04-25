@@ -1262,6 +1262,11 @@ pub(crate) async fn machine_stop_runtime(
         }
     }
 
+    // The session DSL has already accepted `StopRuntimeExecutor` before this
+    // realization path runs. Mirror that machine-owned terminal phase into the
+    // concrete control projection before finalizing so persistent drivers commit
+    // `Stopped`, not the pre-stop shell cache value.
+    driver.set_control_projection(RuntimeState::Stopped, None, None);
     driver.finalize_stop_runtime().await
 }
 
@@ -1307,6 +1312,10 @@ pub(crate) async fn machine_retire(
         }
     }
 
+    // Retire legality and phase ownership live in the session DSL. The driver
+    // projection is the concrete cache used for drain gating and durable
+    // lifecycle commits.
+    driver.set_control_projection(RuntimeState::Retired, None, None);
     driver.finalize_retire().await
 }
 
@@ -1329,6 +1338,9 @@ pub(crate) async fn machine_reset(
         }
     }
 
+    // Reset is machine-owned; mirror the accepted DSL phase into the concrete
+    // projection before cleanup/persistence observes the lifecycle state.
+    driver.set_control_projection(RuntimeState::Idle, None, None);
     driver.finalize_reset().await
 }
 

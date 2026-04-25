@@ -178,7 +178,7 @@ RetireMember(agent_runtime_id, fence_token, session_id) ==
 ObserveRuntimeRetired(agent_runtime_id, fence_token) ==
     /\ phase = "Running"
     /\ (agent_runtime_id \in live_runtime_ids)
-    /\ phase' = "Stopped"
+    /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ live_runtime_ids' = (live_runtime_ids \ {agent_runtime_id})
     /\ externally_addressable_runtime_ids' = (externally_addressable_runtime_ids \ {agent_runtime_id})

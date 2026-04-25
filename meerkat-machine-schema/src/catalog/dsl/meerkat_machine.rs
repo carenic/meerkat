@@ -3240,12 +3240,14 @@ pub enum PostAdmissionSignalKind {
 
 /// Track-B (R5) / wave-c C-6r: typed declarative peer endpoint descriptor.
 ///
-/// Carries the three fields the comms runtime needs to install a
+/// Carries the fields the comms runtime needs to install a
 /// trusted peer: `name` (human-readable display slug), `peer_id`
-/// (Ed25519 pubkey-derived UUIDv5), `address` (transport URL).
+/// (Ed25519 pubkey-derived UUIDv5), `address` (transport URL), and
+/// `signing_key` (Ed25519 public key bytes used for envelope
+/// verification).
 /// Wave-c C-6r retypes the fields from bare `String` to typed
-/// newtypes — `PeerName`, `PeerId`, `PeerAddress` — mirroring the
-/// runtime-side twin at
+/// newtypes — `PeerName`, `PeerId`, `PeerAddress`,
+/// `PeerSigningKey` — mirroring the runtime-side twin at
 /// `meerkat-runtime/src/meerkat_machine/dsl.rs::PeerEndpoint`. The
 /// two copies are required to stay structurally equivalent;
 /// the `peer_endpoint_structural_equivalence` tripwire in this
@@ -3259,6 +3261,7 @@ pub struct PeerEndpoint {
     pub name: PeerName,
     pub peer_id: PeerId,
     pub address: PeerAddress,
+    pub signing_key: PeerSigningKey,
 }
 
 impl PeerEndpoint {
@@ -3266,11 +3269,13 @@ impl PeerEndpoint {
         name: impl Into<PeerName>,
         peer_id: impl Into<PeerId>,
         address: impl Into<PeerAddress>,
+        signing_key: impl Into<PeerSigningKey>,
     ) -> Self {
         Self {
             name: name.into(),
             peer_id: peer_id.into(),
             address: address.into(),
+            signing_key: signing_key.into(),
         }
     }
 }
@@ -3288,7 +3293,20 @@ impl From<&meerkat_core::comms::TrustedPeerDescriptor> for PeerEndpoint {
             name: PeerName(spec.name.as_str().to_owned()),
             peer_id: PeerId(spec.peer_id.to_string()),
             address: PeerAddress(spec.address.to_string()),
+            signing_key: PeerSigningKey(spec.pubkey),
         }
+    }
+}
+
+/// Schema-local carrier for the Ed25519 public signing key that belongs to a
+/// peer endpoint. Mirrors the runtime DSL twin so schema/codegen consumers see
+/// the trust-store key material as part of the machine-owned projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct PeerSigningKey(pub [u8; 32]);
+
+impl From<[u8; 32]> for PeerSigningKey {
+    fn from(key: [u8; 32]) -> Self {
+        Self(key)
     }
 }
 

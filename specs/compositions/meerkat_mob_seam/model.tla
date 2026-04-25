@@ -10204,7 +10204,7 @@ mob_ObserveRuntimeRetired(arg_agent_runtime_id, arg_fence_token) ==
        /\ ~HigherPriorityReady("mob_kernel")
        /\ mob_phase = "Running"
        /\ (packet.payload.agent_runtime_id \in mob_live_runtime_ids)
-       /\ mob_phase' = "Stopped"
+       /\ mob_phase' = "Running"
        /\ mob_live_runtime_ids' = (mob_live_runtime_ids \ {packet.payload.agent_runtime_id})
        /\ mob_externally_addressable_runtime_ids' = (mob_externally_addressable_runtime_ids \ {packet.payload.agent_runtime_id})
        /\ mob_runtime_fence_tokens' = MapRemove(mob_runtime_fence_tokens, packet.payload.agent_runtime_id)
@@ -10216,7 +10216,7 @@ mob_ObserveRuntimeRetired(arg_agent_runtime_id, arg_fence_token) ==
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "mob", variant |-> "EmitMemberLifecycleNotice", payload |-> [kind |-> "Retired"], effect_id |-> (model_step_count + 1), source_transition |-> "ObserveRuntimeRetired"] }
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "mob", transition |-> "ObserveRuntimeRetired", actor |-> "mob_kernel", step |-> (model_step_count + 1), from_phase |-> mob_phase, to_phase |-> "Stopped"]}
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "mob", transition |-> "ObserveRuntimeRetired", actor |-> "mob_kernel", step |-> (model_step_count + 1), from_phase |-> mob_phase, to_phase |-> "Running"]}
        /\ model_step_count' = model_step_count + 1
 
 
