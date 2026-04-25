@@ -241,7 +241,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `current_binding_matches`
 - Emits: `EmitMemberLifecycleNotice`
-- To: `Stopped`
+- To: `Running`
 
 ### `ResetMember`
 - From: `Running`, `Stopped`
