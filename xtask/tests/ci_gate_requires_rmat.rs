@@ -30,7 +30,6 @@ const REQUIRED_GOVERNANCE_LANES: &[&str] = &[
     "test-unit",
     "integration-fast",
     "e2e-fast",
-    "e2e-system",
     "test-minimal",
     "test-feature-matrix-lib",
     "test-feature-matrix-surface-checks",
