@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+workspace_root="$(git rev-parse --show-toplevel)"
+cd "${workspace_root}"
+
+temp_root="${MEERKAT_BUILDBUDDY_OUTPUT_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/meerkat-bb-ci-workspace.XXXXXX")}"
+created_temp=0
+if [[ -z "${MEERKAT_BUILDBUDDY_OUTPUT_ROOT:-}" ]]; then
+  created_temp=1
+fi
+
+cleanup() {
+  if [[ "${created_temp}" == "1" && -d "${temp_root}" ]]; then
+    chmod -R u+w "${temp_root}" 2>/dev/null || true
+    rm -rf "${temp_root}"
+  fi
+}
+trap cleanup EXIT
+
+summarize_log() {
+  local name="$1"
+  local status="$2"
+  local log="$3"
+  if [[ "${status}" == "0" ]]; then
+    printf 'PASS %s\n' "${name}"
+  else
+    printf 'FAIL(%s) %s\n' "${status}" "${name}"
+  fi
+  grep -E 'INFO: Elapsed time:|INFO: Build completed|Executed |ERROR:|FAILED' "${log}" | tail -8 || true
+}
+
+run_lane() {
+  local lane="$1"
+  local command="$2"
+  local log="$3"
+  shift 3
+  (
+    export MEERKAT_BUILDBUDDY_OUTPUT_ROOT="${temp_root}"
+    export BUILDBUDDY_MAX_IDLE_SECS="${BUILDBUDDY_MAX_IDLE_SECS:-5}"
+    export RUST_LANE_ID="${lane}"
+    export BUILDBUDDY_BAZEL_COMMAND="${command}"
+    ./scripts/buildbuddy-bazel-poc "$@"
+  ) >"${log}" 2>&1
+}
+
+test_log="${temp_root}/workspace-test-rbe.log"
+clippy_log="${temp_root}/clippy-rbe.log"
+test_status_file="${temp_root}/workspace-test-rbe.status"
+clippy_status_file="${temp_root}/clippy-rbe.status"
+mkdir -p "${temp_root}"
+
+start_seconds="$(date +%s)"
+
+(
+  set +e
+  run_lane ci-workspace-test-rbe workspace-test-rbe "${test_log}" --jobs=64
+  echo "$?" >"${test_status_file}"
+) &
+test_pid="$!"
+(
+  set +e
+  run_lane ci-workspace-clippy-rbe clippy-rbe "${clippy_log}" --jobs=64 --color=no --curses=no
+  echo "$?" >"${clippy_status_file}"
+) &
+clippy_pid="$!"
+
+wait "${test_pid}" || true
+wait "${clippy_pid}" || true
+
+end_seconds="$(date +%s)"
+test_status="$(cat "${test_status_file}" 2>/dev/null || echo 1)"
+clippy_status="$(cat "${clippy_status_file}" 2>/dev/null || echo 1)"
+
+printf 'BuildBuddy workspace CI wall: %ss\n' "$((end_seconds - start_seconds))"
+summarize_log "workspace-test-rbe" "${test_status}" "${test_log}"
+summarize_log "clippy-rbe" "${clippy_status}" "${clippy_log}"
+
+if [[ "${test_status}" != "0" || "${clippy_status}" != "0" ]]; then
+  exit 1
+fi

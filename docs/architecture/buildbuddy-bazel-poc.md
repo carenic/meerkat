@@ -84,6 +84,10 @@ modes:
 - `ci-workspace`: parallel CI-like `workspace-test-rbe` and `clippy-rbe` on fresh
   output bases.
 
+For an actual remote-compatible CI gate, use `scripts/buildbuddy-ci-workspace`.
+It runs `workspace-test-rbe` and `clippy-rbe` in parallel on isolated fresh
+lanes, prints compact summaries, and cleans up the temporary output roots.
+
 `scripts/buildbuddy-prewarm-lanes` prepares common lanes for a new worktree:
 
 - `dev`: source-owned-build, exact-test, and support-local feedback lanes.
@@ -124,6 +128,7 @@ Representative measurements from the POC environment:
 | CI-like sequential fresh output bases | `25.48s` fast-test + `26.89s` clippy |
 | CI-like parallel fresh output bases | `33.28s` max wall |
 | CI-like workspace-RBE + clippy-RBE, fresh output bases | `26-37.14s` max wall |
+| Dedicated `buildbuddy-ci-workspace` script | `30s` script wall |
 
 The first touch of a new local lane pays Bazel analysis and remote-cache
 materialization cost. Once warmed, the wall-clock floor is mostly the `bb`/Bazel
