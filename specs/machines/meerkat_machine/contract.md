@@ -144,6 +144,9 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `AddDirectPeerEndpoint`(endpoint: PeerEndpoint)
 - `RemoveDirectPeerEndpoint`(endpoint: PeerEndpoint)
 - `ApplyMobPeerOverlay`(epoch: u64, endpoints: Set<PeerEndpoint>)
+- `PendingSucceeded`(surface_id: SurfaceId, pending_task_sequence: u64, staged_intent_sequence: u64)
+- `PendingFailed`(surface_id: SurfaceId, pending_task_sequence: u64, reason: String)
+- `SnapshotAligned`(snapshot_epoch: u64)
 
 ## Surface-only Inputs
 - `ContainsSession`
@@ -170,14 +173,11 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `StageAdd`
 - `StageRemove`
 - `StageReload`
-- `ApplySurfaceBoundary`
-- `PendingSucceeded`
-- `PendingFailed`
+- `ApplySurfaceBoundary`(surface_id: SurfaceId, operation: SurfaceDeltaOperation, pending_task_sequence: u64, staged_intent_sequence: u64, applied_at_turn: TurnNumber)
 - `CallStarted`
 - `CallFinished`
 - `FinalizeRemovalClean`
 - `FinalizeRemovalForced`
-- `SnapshotAligned`
 - `ShutdownSurface`
 
 ## Effects
@@ -211,12 +211,12 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RetainTerminalRecord`
 - `EvictCompletedRecord`
 - `CompletionProduced`(seq: u64, operation_id: OperationId, kind: OperationKind)
-- `WaitAllSatisfied`
+- `WaitAllSatisfied`(wait_request_id: WaitRequestId, operation_ids: Set<OperationId>)
 - `CollectCompletedResult`
 - `EnqueueClassifiedEntry`
 - `SpawnDrainTask`
-- `ScheduleSurfaceCompletion`
-- `RefreshVisibleSurfaceSet`
+- `ScheduleSurfaceCompletion`(surface_id: SurfaceId, operation: SurfaceDeltaOperation, pending_task_sequence: u64, staged_intent_sequence: u64, applied_at_turn: TurnNumber)
+- `RefreshVisibleSurfaceSet`(snapshot_epoch: u64)
 - `EmitExternalToolDelta`
 - `CloseSurfaceConnection`
 - `RejectSurfaceCall`
@@ -238,6 +238,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `LocalEndpointChanged`(endpoint: Option<PeerEndpoint>)
 - `PeerProjectionChanged`(peer_projection_epoch: u64)
 - `CommsTrustReconcileRequested`(peer_projection_epoch: u64)
+- `PublishSupervisorTrustEdge`(peer_id: PeerId, name: String, address: String, signing_public_key: Option<String>, epoch: u64)
+- `RevokeSupervisorTrustEdge`(peer_id: PeerId, epoch: u64)
 
 ## Invariants
 - `fence_requires_bound_runtime`
@@ -1153,7 +1155,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ApplySurfaceBoundaryAttached`
 - From: `Attached`
-- On: `ApplySurfaceBoundary`()
+- On: `ApplySurfaceBoundary`(surface_id, operation, pending_task_sequence, staged_intent_sequence, applied_at_turn)
 - Guards:
   - `session_registered`
 - Emits: `ScheduleSurfaceCompletion`
@@ -1161,7 +1163,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ApplySurfaceBoundaryRunning`
 - From: `Running`
-- On: `ApplySurfaceBoundary`()
+- On: `ApplySurfaceBoundary`(surface_id, operation, pending_task_sequence, staged_intent_sequence, applied_at_turn)
 - Guards:
   - `session_registered`
 - Emits: `ScheduleSurfaceCompletion`
@@ -1169,7 +1171,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `PendingSucceededAttached`
 - From: `Attached`
-- On: `PendingSucceeded`()
+- On: `PendingSucceeded`(surface_id, pending_task_sequence, staged_intent_sequence)
 - Guards:
   - `session_registered`
 - Emits: `EmitExternalToolDelta`
@@ -1177,7 +1179,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `PendingSucceededRunning`
 - From: `Running`
-- On: `PendingSucceeded`()
+- On: `PendingSucceeded`(surface_id, pending_task_sequence, staged_intent_sequence)
 - Guards:
   - `session_registered`
 - Emits: `EmitExternalToolDelta`
@@ -1185,7 +1187,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `PendingFailedAttached`
 - From: `Attached`
-- On: `PendingFailed`()
+- On: `PendingFailed`(surface_id, pending_task_sequence, reason)
 - Guards:
   - `session_registered`
 - Emits: `EmitExternalToolDelta`
@@ -1193,7 +1195,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `PendingFailedRunning`
 - From: `Running`
-- On: `PendingFailed`()
+- On: `PendingFailed`(surface_id, pending_task_sequence, reason)
 - Guards:
   - `session_registered`
 - Emits: `EmitExternalToolDelta`
@@ -1261,7 +1263,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `SnapshotAlignedAttached`
 - From: `Attached`
-- On: `SnapshotAligned`()
+- On: `SnapshotAligned`(snapshot_epoch)
 - Guards:
   - `session_registered`
 - Emits: `EmitExternalToolDelta`
@@ -1269,7 +1271,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `SnapshotAlignedRunning`
 - From: `Running`
-- On: `SnapshotAligned`()
+- On: `SnapshotAligned`(snapshot_epoch)
 - Guards:
   - `session_registered`
 - Emits: `EmitExternalToolDelta`

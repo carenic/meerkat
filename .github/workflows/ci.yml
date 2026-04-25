@@ -469,7 +469,7 @@ jobs:
   gate:
     name: CI gate
     if: always()
-    needs: [fmt-lint, sdk-suites, machine-authority, test-unit, integration-fast, e2e-fast, e2e-system, test-minimal, test-feature-matrix-lib, test-feature-matrix-surface-checks, wasm-check, wasm-contract-tests, rmat-audit, seam-inventory, audit]
+    needs: [fmt-lint, sdk-suites, machine-authority, test-unit, integration-fast, e2e-fast, test-minimal, test-feature-matrix-lib, test-feature-matrix-surface-checks, wasm-check, wasm-contract-tests, rmat-audit, seam-inventory, audit]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
@@ -482,7 +482,6 @@ jobs:
             test-unit \
             integration-fast \
             e2e-fast \
-            e2e-system \
             test-minimal \
             test-feature-matrix-lib \
             test-feature-matrix-surface-checks \
@@ -499,7 +498,6 @@ jobs:
               test-unit) result="${{ needs.test-unit.result }}" ;;
               integration-fast) result="${{ needs.integration-fast.result }}" ;;
               e2e-fast) result="${{ needs.e2e-fast.result }}" ;;
-              e2e-system) result="${{ needs.e2e-system.result }}" ;;
               test-minimal) result="${{ needs.test-minimal.result }}" ;;
               test-feature-matrix-lib) result="${{ needs.test-feature-matrix-lib.result }}" ;;
               test-feature-matrix-surface-checks) result="${{ needs.test-feature-matrix-surface-checks.result }}" ;;

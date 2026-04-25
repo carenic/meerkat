@@ -131,11 +131,22 @@ pub enum FeedbackFieldSource {
     OwnerContext(String),
 }
 
-/// Typed key for per-feedback handle argument accessors.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ProtocolHandleArgKey {
+/// Rust-side HandleBridge metadata for one feedback input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandleBridgeFeedbackBinding {
     pub input_variant: InputVariantId,
-    pub obligation_field: FieldId,
+    pub method_name: String,
+    /// Per-call suffix applied to `obligation.<field>` references when
+    /// constructing handle-method arguments. Keys are typed obligation
+    /// field ids; values are suffixes like `.0`, `.clone()`, `.into()`.
+    /// Absent entries emit bare `obligation.<field>`.
+    pub arg_accessors: BTreeMap<FieldId, String>,
+    /// Positional list of obligation fields forwarded to the handle
+    /// method. `None` falls back to every obligation-sourced feedback
+    /// binding in declaration order. Use `Some(vec![...])` when the
+    /// feedback input carries correlation fields the handle method does
+    /// not accept.
+    pub forwarded_fields: Option<Vec<FieldId>>,
 }
 
 /// Explicit Rust binding metadata for generated protocol helper modules.
@@ -168,27 +179,9 @@ pub struct ProtocolRustBinding {
     /// Handle trait path used by `HandleBridge` helpers. Required when
     /// `generation_mode` or `additional_modes` contains `HandleBridge`.
     pub handle_trait_path: Option<String>,
-    /// Handle trait method name per feedback input. Keys are typed
-    /// `FeedbackInputRef::input_variant` ids, values are the snake_case
-    /// method on `handle_trait_path`. Required for each feedback entry
-    /// emitted through the `HandleBridge` mode.
-    pub handle_method_names: BTreeMap<InputVariantId, String>,
-    /// Per-call suffix applied to `obligation.<field>` references when
-    /// constructing handle-method arguments. Keys are typed
-    /// `(input_variant, obligation_field)` pairs; values are suffixes like
-    /// `.0`, `.clone()`, `.into()`. Absent entries emit bare
-    /// `obligation.<field>`. Lets the schema declare a single newtype
-    /// unwrap without ceding typed-field correctness.
-    pub handle_arg_accessors: BTreeMap<ProtocolHandleArgKey, String>,
-    /// Per-feedback list of obligation field names (in positional order)
-    /// that get forwarded to the handle method. Keys are typed
-    /// `FeedbackInputRef::input_variant` ids. Absent entries fall back to
-    /// "every obligation-sourced field in binding order," which works
-    /// when the handle-method signature mirrors the feedback input. Set
-    /// this when the feedback input carries fields the handle method
-    /// does not accept (e.g., a correlation `wait_request_id` that the
-    /// runtime handle never uses).
-    pub handle_method_forwarded_fields: BTreeMap<InputVariantId, Vec<FieldId>>,
+    /// HandleBridge metadata per feedback input. Required for each
+    /// feedback entry emitted through the `HandleBridge` mode.
+    pub handle_feedback_bindings: Vec<HandleBridgeFeedbackBinding>,
     /// Kernel-codegen-emitted input enums wrap each variant in a named
     /// payload struct under an `inputs` submodule
     /// (`Input::VariantName(inputs::VariantName { ... })`). DSL-emitted
@@ -205,6 +198,17 @@ pub struct ProtocolRustBinding {
     ///
     /// Must not include the primary `generation_mode` — no duplicates.
     pub additional_modes: Vec<ProtocolGenerationMode>,
+}
+
+impl ProtocolRustBinding {
+    pub fn handle_feedback_binding(
+        &self,
+        input_variant: &InputVariantId,
+    ) -> Option<&HandleBridgeFeedbackBinding> {
+        self.handle_feedback_bindings
+            .iter()
+            .find(|binding| binding.input_variant == *input_variant)
+    }
 }
 
 /// Declares the primary generated helper return contract.
@@ -1923,14 +1927,14 @@ fn validate_generation_mode_binding(
             }
             // Every feedback input must have a handle method mapping.
             for feedback in &protocol.allowed_feedback_inputs {
-                if !rust
-                    .handle_method_names
-                    .contains_key(&feedback.input_variant)
+                if rust
+                    .handle_feedback_binding(&feedback.input_variant)
+                    .is_none()
                 {
                     return Err(CompositionSchemaError::InvalidHandoffRustBinding {
                         protocol: protocol.name.as_str().to_owned(),
                         detail: format!(
-                            "HandleBridge protocol missing handle_method_names entry for feedback input `{}`",
+                            "HandleBridge protocol missing handle_feedback_bindings entry for feedback input `{}`",
                             feedback.input_variant
                         ),
                     });

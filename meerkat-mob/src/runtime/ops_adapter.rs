@@ -595,7 +595,6 @@ mod tests {
     use meerkat_core::ops_lifecycle::OperationStatus;
 
     #[tokio::test]
-    #[ignore = "Phase 4 shared lifecycle suite"]
     async fn ops_registry_integration_red_ok_member_adapter_tracks_peer_ready_and_retire() {
         let adapter = MobOpsAdapter::new();
         let session_id = SessionId::new();
@@ -615,7 +614,7 @@ mod tests {
                 "mob-a/orchestrator/member-alpha",
                 TrustedPeerDescriptor::test_only_unsigned(
                     "mob-a/orchestrator/member-alpha",
-                    "peer-member-alpha",
+                    "00000000-0000-4000-8000-000000000002",
                     "inproc://member-alpha",
                 )
                 .expect("trusted peer"),

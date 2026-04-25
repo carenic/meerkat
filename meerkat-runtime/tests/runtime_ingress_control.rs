@@ -203,7 +203,6 @@ async fn runtime_ingress_control_red_ok_reset_preempts_queued_input_once() {
 }
 
 #[tokio::test]
-#[ignore = "Phase 3 runtime input taxonomy closure"]
 async fn runtime_ingress_control_closed_taxonomy_uses_explicit_continuation_and_operation_inputs() {
     let continuation = Input::Continuation(ContinuationInput::detached_background_op_completed());
     let continuation_policy = meerkat_runtime::DefaultPolicyTable::resolve(&continuation, true);
@@ -259,7 +258,6 @@ async fn runtime_ingress_control_closed_taxonomy_uses_explicit_continuation_and_
 }
 
 #[tokio::test]
-#[ignore = "Phase 3 multi-contributor staged-run contract"]
 async fn runtime_ingress_control_batches_same_boundary_contributors_in_runtime_order() {
     let adapter = Arc::new(MeerkatMachine::ephemeral());
     let runtime: &dyn SessionServiceRuntimeExt = &*adapter;

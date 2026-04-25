@@ -2,8 +2,8 @@ use crate::{CompositionSchema, MachineSchema};
 
 use super::{
     compositions::{
-        meerkat_mob_seam_composition, schedule_bundle_composition, schedule_mob_bundle_composition,
-        schedule_runtime_bundle_composition,
+        auth_lease_bundle_composition, meerkat_mob_seam_composition, schedule_bundle_composition,
+        schedule_mob_bundle_composition, schedule_runtime_bundle_composition,
     },
     dsl::{
         dsl_auth_machine, dsl_meerkat_machine, dsl_mob_machine, dsl_occurrence_lifecycle_machine,
@@ -275,6 +275,25 @@ pub fn canonical_composition_coverage_manifests() -> Vec<CompositionCoverageMani
                     "mob-side delivery failure preserves explicit TargetMaterializationFailed classification",
                 ),
             ],
+        ),
+        composition_manifest_from_schema(
+            &auth_lease_bundle_composition(),
+            &[
+                anchor(
+                    "auth_lease_handle",
+                    "meerkat-runtime/src/handles/auth_lease.rs",
+                    "runtime auth lease owner consumes canonical AuthMachine lifecycle publications",
+                ),
+                anchor(
+                    "auth_lease_bundle_schema",
+                    "meerkat-machine-schema/src/catalog/compositions.rs",
+                    "formal AuthMachine lifecycle publication handoff composition",
+                ),
+            ],
+            &[scenario(
+                "auth-lease-lifecycle-publication",
+                "AuthMachine lifecycle transitions publish through the explicit auth lease handoff protocol",
+            )],
         ),
     ]
 }

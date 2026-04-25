@@ -19,16 +19,7 @@ pub fn run_protocol_codegen() -> Result<()> {
     let root = repo_root()?;
     let mut compositions = canonical_composition_schemas();
     compositions.extend(compat_composition_schemas());
-    let mut machines = canonical_machine_schemas();
-    // Compat bridge machines remain discoverable by the same producer-lookup
-    // path as canonical machines while bridge-only compositions are retired.
-    machines.extend([
-        meerkat_machine_schema::ops_barrier_bridge_machine(),
-        meerkat_machine_schema::external_tool_surface_bridge_machine(),
-        meerkat_machine_schema::auth_lease_bridge_machine(),
-        meerkat_machine_schema::supervisor_trust_bridge_machine(),
-        meerkat_machine_schema::mob_destroy_session_ingress_bridge_machine(),
-    ]);
+    let machines = canonical_machine_schemas();
     let machine_by_name: std::collections::BTreeMap<&str, &MachineSchema> =
         machines.iter().map(|m| (m.machine.as_str(), m)).collect();
 
@@ -482,10 +473,9 @@ fn generate_effect_extractor_helpers(
 /// `authority.apply` directly.
 ///
 /// The handle-method mapping is declared on `ProtocolRustBinding`:
-/// `handle_trait_path` names the trait; `handle_method_names` maps each
-/// typed feedback `input_variant` to a method on that trait;
-/// `handle_arg_accessors` optionally rewrites typed obligation-field
-/// access paths (e.g., `surface_id` → `surface_id.0`).
+/// `handle_trait_path` names the trait and `handle_feedback_bindings`
+/// maps each typed feedback `input_variant` to its method, forwarded
+/// fields, and optional typed obligation-field access paths.
 ///
 /// The generator renders positional arguments in field-bindings-declared
 /// order: obligation-sourced fields first, owner-context fields next.
@@ -526,15 +516,15 @@ fn generate_handle_bridge_helpers(
     // Stable ordering: feedback entries as declared, which matches the
     // primary-mode output for dual-mode protocols (bit-for-bit parity).
     for feedback in &protocol.allowed_feedback_inputs {
-        let method_name = rust
-            .handle_method_names
-            .get(&feedback.input_variant)
+        let handle_binding = rust
+            .handle_feedback_binding(&feedback.input_variant)
             .with_context(|| {
                 format!(
-                    "HandleBridge missing handle_method_names entry for `{}`",
+                    "HandleBridge missing handle_feedback_bindings entry for `{}`",
                     feedback.input_variant
                 )
             })?;
+        let method_name = &handle_binding.method_name;
 
         // Dual-mode suffix rule: when HandleBridge is stacked with another
         // mode that *actually* emits an authority-backed `submit_<input>`
@@ -558,15 +548,13 @@ fn generate_handle_bridge_helpers(
             format!("submit_{}", to_snake_case(feedback.input_variant.as_str()))
         };
 
-        // When `handle_method_forwarded_fields` is declared for this
-        // feedback input, treat it as the authoritative positional
-        // argument list — obligation fields not in the list are dropped
-        // (they are correlation-only and never reach the handle).
-        // Otherwise every obligation-sourced binding is forwarded in
-        // declaration order.
-        let forwarded: Option<&Vec<meerkat_machine_schema::identity::FieldId>> = rust
-            .handle_method_forwarded_fields
-            .get(&feedback.input_variant);
+        // When this feedback binding declares `forwarded_fields`, treat
+        // it as the authoritative positional argument list — obligation
+        // fields not in the list are dropped (they are correlation-only
+        // and never reach the handle). Otherwise every obligation-sourced
+        // binding is forwarded in declaration order.
+        let forwarded: Option<&Vec<meerkat_machine_schema::identity::FieldId>> =
+            handle_binding.forwarded_fields.as_ref();
         let mut owner_params: Vec<String> = Vec::new();
         let mut call_args: Vec<String> = Vec::new();
         for binding in &feedback.field_bindings {
@@ -579,13 +567,9 @@ fn generate_handle_bridge_helpers(
                     {
                         continue;
                     }
-                    let accessor_key = meerkat_machine_schema::ProtocolHandleArgKey {
-                        input_variant: feedback.input_variant.clone(),
-                        obligation_field: field.clone(),
-                    };
-                    let suffix = rust
-                        .handle_arg_accessors
-                        .get(&accessor_key)
+                    let suffix = handle_binding
+                        .arg_accessors
+                        .get(field)
                         .cloned()
                         .unwrap_or_default();
                     call_args.push(format!(

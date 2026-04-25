@@ -73,6 +73,7 @@ fn canonical_composition_registry_contains_kernel_seam_and_schedule_perimeter_en
             "schedule_bundle",
             "schedule_runtime_bundle",
             "schedule_mob_bundle",
+            "auth_lease_bundle",
         ]
     );
 }
@@ -196,6 +197,7 @@ fn kernel_seam_retains_coverage_metadata() {
             "schedule_bundle",
             "schedule_runtime_bundle",
             "schedule_mob_bundle",
+            "auth_lease_bundle",
         ]
     );
 }
@@ -237,6 +239,9 @@ fn meerkat_machine_absorbs_runtime_ingress_turn_tool_and_peer_domains() {
         "ReconfigureSessionLlmIdentity",
         "StagePersistentFilter",
         "RequestDeferredTools",
+        "PendingSucceeded",
+        "PendingFailed",
+        "SnapshotAligned",
     ] {
         assert!(
             input_names.iter().any(|name| name == &required),
@@ -252,8 +257,6 @@ fn meerkat_machine_absorbs_runtime_ingress_turn_tool_and_peer_domains() {
         "StageAdd",
         "StageRemove",
         "StageReload",
-        "PendingSucceeded",
-        "SnapshotAligned",
     ] {
         assert!(
             signal_names.iter().any(|name| name == &required),
@@ -1015,8 +1018,6 @@ fn every_canonical_input_variant_has_transition_coverage() {
 
 #[allow(clippy::expect_used, clippy::panic)]
 mod handoff_binding {
-    use std::collections::BTreeMap;
-
     use meerkat_machine_schema::identity::{
         ActorId, CompositionId, EffectVariantId, FieldId, InputVariantId, MachineId,
         MachineInstanceId, ProtocolId,
@@ -1024,16 +1025,12 @@ mod handoff_binding {
     use meerkat_machine_schema::{
         ActorKind, ActorSchema, ClosurePolicy, CompositionSchema, CompositionSchemaError,
         CompositionStateLimits, EffectHandoffProtocol, FeedbackFieldBinding, FeedbackFieldSource,
-        FeedbackInputRef, MachineInstance, ProtocolGenerationMode, ProtocolHelperReturnShape,
-        ProtocolRustBinding, canonical_machine_schemas, compat_composition_schemas,
+        FeedbackInputRef, HandleBridgeFeedbackBinding, MachineInstance, ProtocolGenerationMode,
+        ProtocolHelperReturnShape, ProtocolRustBinding, canonical_composition_schemas,
+        canonical_machine_schemas, compat_composition_schemas,
     };
 
     fn ok_handle_binding() -> ProtocolRustBinding {
-        let mut methods = BTreeMap::new();
-        methods.insert(
-            InputVariantId::parse("Ack").expect("valid input_variant"),
-            "acknowledge".into(),
-        );
         ProtocolRustBinding {
             module_path: "crate-x/src/generated/proto.rs".into(),
             generation_mode: ProtocolGenerationMode::HandleBridge,
@@ -1048,9 +1045,12 @@ mod handoff_binding {
             bridge_source_type_path: None,
             helper_return_shape: ProtocolHelperReturnShape::Effects,
             handle_trait_path: Some("crate::SomeHandle".into()),
-            handle_method_names: methods,
-            handle_arg_accessors: BTreeMap::new(),
-            handle_method_forwarded_fields: BTreeMap::new(),
+            handle_feedback_bindings: vec![HandleBridgeFeedbackBinding {
+                input_variant: InputVariantId::parse("Ack").expect("valid input_variant"),
+                method_name: "acknowledge".into(),
+                arg_accessors: Default::default(),
+                forwarded_fields: None,
+            }],
             input_payload_module_path: None,
             additional_modes: vec![],
         }
@@ -1150,7 +1150,7 @@ mod handoff_binding {
     #[test]
     fn handle_bridge_requires_method_for_every_feedback_input() {
         let mut binding = ok_handle_binding();
-        binding.handle_method_names = BTreeMap::new();
+        binding.handle_feedback_bindings = vec![];
         let composition = composition_with_protocol(handle_bridge_protocol(binding));
 
         let err = composition
@@ -1160,8 +1160,8 @@ mod handoff_binding {
             CompositionSchemaError::InvalidHandoffRustBinding { protocol, detail } => {
                 assert_eq!(protocol, "test_handoff");
                 assert!(
-                    detail.contains("handle_method_names"),
-                    "error detail should mention handle_method_names, got {detail}"
+                    detail.contains("handle_feedback_bindings"),
+                    "error detail should mention handle_feedback_bindings, got {detail}"
                 );
                 assert!(
                     detail.contains("Ack"),
@@ -1197,9 +1197,7 @@ mod handoff_binding {
             bridge_source_type_path: None,
             helper_return_shape: ProtocolHelperReturnShape::Obligations,
             handle_trait_path: None,
-            handle_method_names: BTreeMap::new(),
-            handle_arg_accessors: BTreeMap::new(),
-            handle_method_forwarded_fields: BTreeMap::new(),
+            handle_feedback_bindings: vec![],
             input_payload_module_path: None,
             additional_modes: vec![],
         };
@@ -1297,11 +1295,6 @@ mod handoff_binding {
     fn dual_mode_effect_extractor_plus_handle_bridge_validates() {
         // Minimum valid stacked binding: EffectExtractor primary +
         // HandleBridge secondary, with all required fields for both.
-        let mut methods = BTreeMap::new();
-        methods.insert(
-            InputVariantId::parse("Ack").expect("valid input_variant"),
-            "acknowledge".into(),
-        );
         let binding = ProtocolRustBinding {
             module_path: "crate-x/src/generated/proto.rs".into(),
             generation_mode: ProtocolGenerationMode::EffectExtractor,
@@ -1316,9 +1309,12 @@ mod handoff_binding {
             bridge_source_type_path: None,
             helper_return_shape: ProtocolHelperReturnShape::Effects,
             handle_trait_path: Some("crate::SomeHandle".into()),
-            handle_method_names: methods,
-            handle_arg_accessors: BTreeMap::new(),
-            handle_method_forwarded_fields: BTreeMap::new(),
+            handle_feedback_bindings: vec![HandleBridgeFeedbackBinding {
+                input_variant: InputVariantId::parse("Ack").expect("valid input_variant"),
+                method_name: "acknowledge".into(),
+                arg_accessors: Default::default(),
+                forwarded_fields: None,
+            }],
             input_payload_module_path: None,
             additional_modes: vec![ProtocolGenerationMode::HandleBridge],
         };
@@ -1331,14 +1327,10 @@ mod handoff_binding {
     /// Wave-d D-c: `auth_lease_bundle` composition validates in isolation
     /// and carries the structural seam closure for the AuthMachine
     /// lifecycle-event publication. Asserts:
-    /// - the composition is registered in `compat_composition_schemas()`;
-    /// - it validates against canonical + the `auth_lease_bridge_machine`
-    ///   compat (route type-checking across AuthMachine→bridge mirror);
-    /// - the Route `auth_lifecycle_event_crosses_to_bridge` carries the
-    ///   canonical AuthMachine's `EmitLifecycleEvent` effect into the
-    ///   bridge's `MirrorLifecycleEvent` input;
+    /// - the composition is registered in `canonical_composition_schemas()`;
+    /// - it validates against the canonical machine registry alone;
     /// - the handoff protocol `auth_lease_lifecycle_publication` is
-    ///   declared on the bridge's `PublishLifecycleEvent` effect.
+    ///   declared directly on `AuthMachine::EmitLifecycleEvent`.
     ///
     /// This is the red-test anchor for the orphan-closure contract: if
     /// any of the composition components are removed or renamed, this
@@ -1348,51 +1340,38 @@ mod handoff_binding {
     fn auth_lease_bundle_composition_closes_auth_machine_orphan() {
         let comp = compat_composition_schemas()
             .into_iter()
+            .chain(canonical_composition_schemas())
             .find(|c| c.name.as_str() == "auth_lease_bundle")
-            .expect("auth_lease_bundle must be registered in compat_composition_schemas()");
+            .expect("auth_lease_bundle must be registered as a canonical composition");
 
-        let mut machines = canonical_machine_schemas();
-        machines.push(meerkat_machine_schema::auth_lease_bridge_machine());
+        let machines = canonical_machine_schemas();
         let refs: Vec<_> = machines.iter().collect();
         comp.validate_against(&refs).unwrap_or_else(|err| {
-            panic!("auth_lease_bundle must validate against canonical + auth_lease_bridge: {err:?}")
+            panic!("auth_lease_bundle must validate against canonical machines: {err:?}")
         });
 
-        let route = comp
-            .routes
-            .iter()
-            .find(|r| r.name.as_str() == "auth_lifecycle_event_crosses_to_bridge")
-            .expect("route auth_lifecycle_event_crosses_to_bridge must be present");
-        assert_eq!(route.from_machine.as_str(), "auth_machine");
-        assert_eq!(route.effect_variant.as_str(), "EmitLifecycleEvent");
-        assert_eq!(route.to.machine.as_str(), "auth_lease_bridge");
-        assert_eq!(route.to.input_variant.as_str(), "MirrorLifecycleEvent");
+        assert!(
+            comp.routes.is_empty(),
+            "auth lifecycle publication must not pass through a bridge-only route"
+        );
 
         let protocol = comp
             .handoff_protocols
             .iter()
             .find(|p| p.name.as_str() == "auth_lease_lifecycle_publication")
             .expect("handoff protocol auth_lease_lifecycle_publication must be present");
-        assert_eq!(protocol.producer_instance.as_str(), "auth_lease_bridge");
-        assert_eq!(protocol.effect_variant.as_str(), "PublishLifecycleEvent");
+        assert_eq!(protocol.producer_instance.as_str(), "auth_machine");
+        assert_eq!(protocol.effect_variant.as_str(), "EmitLifecycleEvent");
         assert_eq!(protocol.realizing_actor.as_str(), "auth_lease_owner");
     }
 
     #[test]
     fn compat_composition_schemas_is_accessible_and_validates_each_returned_entry() {
         // `compat_composition_schemas()` is invoked by the codegen iteration
-        // alongside canonical. Every entry it returns must validate against
-        // the canonical + compat machine registries together, since compat
-        // compositions can reference either catalog.
+        // alongside canonical. After bridge demolition, every entry it returns
+        // must validate against the canonical machine registry alone.
         let compositions = compat_composition_schemas();
-        let mut machines = canonical_machine_schemas();
-        machines.extend([
-            meerkat_machine_schema::ops_barrier_bridge_machine(),
-            meerkat_machine_schema::external_tool_surface_bridge_machine(),
-            meerkat_machine_schema::auth_lease_bridge_machine(),
-            meerkat_machine_schema::supervisor_trust_bridge_machine(),
-            meerkat_machine_schema::mob_destroy_session_ingress_bridge_machine(),
-        ]);
+        let machines = canonical_machine_schemas();
         let machine_refs: Vec<_> = machines.iter().collect();
         for composition in &compositions {
             composition
@@ -1407,8 +1386,8 @@ mod handoff_binding {
     }
 
     /// Negative: EffectExtractor with no `authority_type_path` and no
-    /// stacked `HandleBridge` must fail validation. The compat bridge
-    /// pattern relies on this gate to prevent accidental
+    /// stacked `HandleBridge` must fail validation. The handoff binding
+    /// contract relies on this gate to prevent accidental
     /// extract-obligations-only bindings whose feedback surface has
     /// no home.
     #[test]
@@ -1424,16 +1403,13 @@ mod handoff_binding {
             name: CompositionId::parse("test_effect_extractor_without_authority")
                 .expect("valid composition slug"),
             machines: vec![MachineInstance {
-                instance_id: MachineInstanceId::parse("external_tool_surface")
-                    .expect("valid instance_id"),
-                machine_name: MachineId::parse("ExternalToolSurfaceBridgeMachine")
-                    .expect("valid machine_name"),
-                actor: ActorId::parse("external_tool_surface_authority").expect("valid actor"),
+                instance_id: MachineInstanceId::parse("meerkat").expect("valid instance_id"),
+                machine_name: MachineId::parse("MeerkatMachine").expect("valid machine_name"),
+                actor: ActorId::parse("meerkat_authority").expect("valid actor"),
             }],
             actors: vec![
                 ActorSchema {
-                    name: ActorId::parse("external_tool_surface_authority")
-                        .expect("valid actor slug"),
+                    name: ActorId::parse("meerkat_authority").expect("valid actor slug"),
                     kind: ActorKind::Machine,
                 },
                 ActorSchema {
@@ -1443,7 +1419,7 @@ mod handoff_binding {
             ],
             handoff_protocols: vec![EffectHandoffProtocol {
                 name: ProtocolId::parse("no_authority_no_handle").expect("valid protocol slug"),
-                producer_instance: MachineInstanceId::parse("external_tool_surface")
+                producer_instance: MachineInstanceId::parse("meerkat")
                     .expect("valid producer_instance"),
                 effect_variant: EffectVariantId::parse("RefreshVisibleSurfaceSet")
                     .expect("valid effect_variant"),
@@ -1455,7 +1431,7 @@ mod handoff_binding {
                     FieldId::parse("snapshot_epoch").expect("valid field slug"),
                 ],
                 allowed_feedback_inputs: vec![FeedbackInputRef {
-                    machine_instance: MachineInstanceId::parse("external_tool_surface")
+                    machine_instance: MachineInstanceId::parse("meerkat")
                         .expect("valid machine_instance"),
                     input_variant: InputVariantId::parse("SnapshotAligned")
                         .expect("valid input_variant"),
@@ -1484,9 +1460,7 @@ mod handoff_binding {
                     bridge_source_type_path: None,
                     helper_return_shape: ProtocolHelperReturnShape::Obligations,
                     handle_trait_path: None,
-                    handle_method_names: BTreeMap::new(),
-                    handle_arg_accessors: BTreeMap::new(),
-                    handle_method_forwarded_fields: BTreeMap::new(),
+                    handle_feedback_bindings: vec![],
                     input_payload_module_path: None,
                     additional_modes: vec![],
                 },
@@ -1533,51 +1507,45 @@ mod handoff_binding {
 }
 
 // ---------------------------------------------------------------------------
-// Compat bridge parity — guard against silent drift between a compat
-// bridge machine's mirrored effect/input shape and the runtime struct
-// it mirrors. The bridge exists only to host handoff annotations before
-// the producer is moved to the canonical DSL disposition; if canonical
-// types evolve and the bridge doesn't, composition validation keeps
-// passing while the codegen emits stale obligation/input fields.
+// Canonical handoff parity — guard against silent drift between the
+// canonical producer effects and the runtime structs/enums they feed.
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::expect_used, clippy::panic)]
-mod compat_bridge_parity {
+mod canonical_handoff_parity {
     use meerkat_machine_schema::identity::NamedTypeId;
-    use meerkat_machine_schema::{
-        TypeRef, external_tool_surface_bridge_machine, ops_barrier_bridge_machine,
-    };
+    use meerkat_machine_schema::{TypeRef, catalog::dsl::dsl_meerkat_machine};
 
     #[test]
-    fn ops_barrier_bridge_wait_all_satisfied_mirrors_runtime_struct() {
-        // The bridge's `WaitAllSatisfied` effect must name the two
+    fn meerkat_wait_all_satisfied_mirrors_runtime_struct() {
+        // The canonical `WaitAllSatisfied` effect must name the two
         // fields the runtime's hand-written `WaitAllSatisfied` struct
         // in `meerkat-core/src/ops_lifecycle.rs` exposes:
         //   pub wait_request_id: WaitRequestId,
         //   pub operation_ids: Vec<OperationId>,
-        // Drift in either direction silently desyncs the
+        // Drift in either direction silently desyncs the canonical
         // `ops_barrier_satisfaction` handoff obligation.
-        let schema = ops_barrier_bridge_machine();
+        let schema = dsl_meerkat_machine();
         let effect = schema
             .effects
             .variants
             .iter()
             .find(|v| v.name.as_str() == "WaitAllSatisfied")
-            .expect("bridge must declare WaitAllSatisfied effect");
+            .expect("MeerkatMachine must declare WaitAllSatisfied effect");
         let field_names: std::collections::BTreeSet<&str> =
             effect.fields.iter().map(|f| f.name.as_str()).collect();
         assert!(
             field_names.contains("wait_request_id"),
-            "bridge lost `wait_request_id` field — runtime struct has it"
+            "canonical effect lost `wait_request_id` field — runtime struct has it"
         );
         assert!(
             field_names.contains("operation_ids"),
-            "bridge lost `operation_ids` field — runtime struct has it"
+            "canonical effect lost `operation_ids` field — runtime struct has it"
         );
         assert_eq!(
             field_names.len(),
             2,
-            "bridge gained extra fields not present on runtime struct — audit both"
+            "canonical effect gained extra fields not present on runtime struct — audit both"
         );
         // Type-shape parity: operation_ids must render as a sequence
         // of OperationId, wait_request_id as the typed newtype.
@@ -1585,25 +1553,25 @@ mod compat_bridge_parity {
         assert_eq!(
             wait_request.ty,
             TypeRef::Named(NamedTypeId::parse("WaitRequestId").expect("valid NamedTypeId")),
-            "bridge wait_request_id must be `WaitRequestId` typed"
+            "canonical wait_request_id must be `WaitRequestId` typed"
         );
         let operation_ids = effect.field_named("operation_ids").expect("field");
         assert!(
-            matches!(&operation_ids.ty, TypeRef::Seq(inner) if matches!(inner.as_ref(), TypeRef::Named(name) if name.as_str() == "OperationId")),
-            "bridge operation_ids must be Seq<OperationId>, got {:?}",
+            matches!(&operation_ids.ty, TypeRef::Set(inner) if matches!(inner.as_ref(), TypeRef::Named(name) if name.as_str() == "OperationId")),
+            "canonical operation_ids must be Set<OperationId>, got {:?}",
             operation_ids.ty
         );
     }
 
     #[test]
-    fn external_tool_surface_bridge_refresh_visible_surface_set_mirrors_runtime_struct() {
-        let schema = external_tool_surface_bridge_machine();
+    fn meerkat_refresh_visible_surface_set_mirrors_runtime_struct() {
+        let schema = dsl_meerkat_machine();
         let effect = schema
             .effects
             .variants
             .iter()
             .find(|v| v.name.as_str() == "RefreshVisibleSurfaceSet")
-            .expect("bridge must declare RefreshVisibleSurfaceSet effect");
+            .expect("MeerkatMachine must declare RefreshVisibleSurfaceSet effect");
         assert_eq!(
             effect.fields.len(),
             1,
@@ -1614,14 +1582,14 @@ mod compat_bridge_parity {
     }
 
     #[test]
-    fn external_tool_surface_bridge_schedule_surface_completion_mirrors_runtime_struct() {
-        let schema = external_tool_surface_bridge_machine();
+    fn meerkat_schedule_surface_completion_mirrors_runtime_struct() {
+        let schema = dsl_meerkat_machine();
         let effect = schema
             .effects
             .variants
             .iter()
             .find(|v| v.name.as_str() == "ScheduleSurfaceCompletion")
-            .expect("bridge must declare ScheduleSurfaceCompletion effect");
+            .expect("MeerkatMachine must declare ScheduleSurfaceCompletion effect");
         let field_names: std::collections::BTreeSet<&str> =
             effect.fields.iter().map(|f| f.name.as_str()).collect();
         // The runtime struct in `meerkat-mcp/src/external_tool_surface_authority.rs`
@@ -1636,13 +1604,13 @@ mod compat_bridge_parity {
         ] {
             assert!(
                 field_names.contains(required),
-                "bridge ScheduleSurfaceCompletion lost `{required}` — runtime parity violation"
+                "canonical ScheduleSurfaceCompletion lost `{required}` — runtime parity violation"
             );
         }
         assert_eq!(
             field_names.len(),
             5,
-            "bridge ScheduleSurfaceCompletion gained extra fields not on runtime — audit both"
+            "canonical ScheduleSurfaceCompletion gained extra fields not on runtime — audit both"
         );
     }
 }

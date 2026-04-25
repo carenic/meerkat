@@ -318,6 +318,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RequestRuntimeRetire`
   - anchors: `mob_handle_surface`, `mob_actor_authority`
   - scenarios: `spawn-work-terminal`, `retire-respawn-destroy`
+- `RequestSessionIngressDetachForMobDestroy`
+  - anchors: `mob_handle_surface`, `mob_actor_authority`
+  - scenarios: `spawn-work-terminal`, `retire-respawn-destroy`
 - `RequestRuntimeDestroy`
   - anchors: `mob_handle_surface`, `mob_actor_authority`
   - scenarios: `spawn-work-terminal`, `retire-respawn-destroy`

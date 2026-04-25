@@ -310,6 +310,18 @@ fn known_classifications() -> Vec<(&'static str, &'static str, SeamClassificatio
         ),
         (
             "MeerkatMachine",
+            "PublishSupervisorTrustEdge",
+            SeamClassification::OwnerRealizationOnly,
+            "External supervisor trust-edge publication realized by the supervisor bridge",
+        ),
+        (
+            "MeerkatMachine",
+            "RevokeSupervisorTrustEdge",
+            SeamClassification::OwnerRealizationOnly,
+            "External supervisor trust-edge revocation realized by the supervisor bridge",
+        ),
+        (
+            "MeerkatMachine",
             "EmitExternalToolDelta",
             SeamClassification::OwnerRealizationOnly,
             "External tool-delta emission realized by the MCP router without feedback",
@@ -483,6 +495,12 @@ fn known_classifications() -> Vec<(&'static str, &'static str, SeamClassificatio
             "MemberSessionBindingChanged",
             SeamClassification::SurfaceResultAlignment,
             "External member-session binding delta must align with canonical runtime binding truth",
+        ),
+        (
+            "MobMachine",
+            "RequestSessionIngressDetachForMobDestroy",
+            SeamClassification::NoOwnerRealization,
+            "Local mob-destroy ingress detach request consumed by the runtime seam handoff owner",
         ),
         (
             "MobMachine",
@@ -1034,13 +1052,11 @@ fn print_summary(
         }
     }
     println!();
-    // Generated handoff obligation pairs declared in canonical + compat
+    // Generated handoff obligation pairs declared in canonical + perimeter
     // compositions. Each protocol is an obligation pair: producer effect
     // → realising actor → typed feedback input(s) that close the
-    // step-lock (ack / failure). Compat producers (e.g. the
-    // `SupervisorTrustBridgeMachine`) host the annotation for effects
-    // whose authority lives in the runtime shell but whose producer
-    // shape needs a schema-declared `handoff_protocol`.
+    // step-lock (ack / failure). Producers now host the annotation on
+    // their canonical effect rather than through bridge-only schemas.
     let compat = compat_composition_schemas();
     let mut protocol_rows: Vec<(String, String, String, String, String, String)> = Vec::new();
     let all_compositions: Vec<&CompositionSchema> =

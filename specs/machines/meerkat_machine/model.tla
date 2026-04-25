@@ -3,7 +3,7 @@ EXTENDS TLC, Naturals, Sequences, FiniteSets
 
 \* Generated semantic machine model for MeerkatMachine.
 
-CONSTANTS AgentRuntimeIdValues, BooleanValues, CommsRuntimeIdValues, FenceTokenValues, GenerationValues, InboundPeerRequestStateValues, InputIdValues, LiveTopologyPhaseValues, McpServerIdValues, McpServerStateValues, MobIdValues, NatValues, OperationIdValues, OutboundPeerRequestStateValues, PeerCorrelationIdValues, PeerEndpointValues, PeerIngressOwnerKindValues, PeerTerminalDispositionValues, RealtimeBindingStateValues, RealtimeProductTurnPhaseValues, RealtimeProjectionFreshnessValues, RealtimeReconnectPolicyValues, RunIdValues, SessionIdValues, SessionLlmCapabilitySurfaceStatusValues, SessionLlmCapabilitySurfaceValues, SessionLlmIdentityValues, SessionToolVisibilityDeltaValues, SessionToolVisibilityStateValues, SetOfOperationIdValues, SetOfPeerCorrelationIdValues, SetOfPeerEndpointValues, SetOfStringValues, StringValues, SupervisorBindingKindValues, ToolFilterValues, ToolVisibilityWitnessValues, WorkIdValues, WorkOriginValues
+CONSTANTS AgentRuntimeIdValues, BooleanValues, CommsRuntimeIdValues, FenceTokenValues, GenerationValues, InboundPeerRequestStateValues, InputIdValues, LiveTopologyPhaseValues, McpServerIdValues, McpServerStateValues, MobIdValues, NatValues, OperationIdValues, OutboundPeerRequestStateValues, PeerCorrelationIdValues, PeerEndpointValues, PeerIngressOwnerKindValues, PeerTerminalDispositionValues, RealtimeBindingStateValues, RealtimeProductTurnPhaseValues, RealtimeProjectionFreshnessValues, RealtimeReconnectPolicyValues, RunIdValues, SessionIdValues, SessionLlmCapabilitySurfaceStatusValues, SessionLlmCapabilitySurfaceValues, SessionLlmIdentityValues, SessionToolVisibilityDeltaValues, SessionToolVisibilityStateValues, SetOfOperationIdValues, SetOfPeerCorrelationIdValues, SetOfPeerEndpointValues, SetOfStringValues, StringValues, SupervisorBindingKindValues, SurfaceDeltaOperationValues, SurfaceIdValues, ToolFilterValues, ToolVisibilityWitnessValues, TurnNumberValues, WorkIdValues, WorkOriginValues
 
 None == [tag |-> "none", value |-> "none"]
 Some(v) == [tag |-> "some", value |-> v]
@@ -1153,7 +1153,7 @@ StageReloadRunning ==
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, realtime_intent_present, realtime_binding_state, realtime_binding_authority_epoch, realtime_reattach_required, realtime_next_authority_epoch, realtime_reconnect_attempt_count, realtime_reconnect_next_retry_at_ms, realtime_reconnect_deadline_at_ms, live_topology_phase, mcp_server_states, pending_peer_requests, inbound_peer_requests, last_session_context_updated_at_ms, reserved_interaction_streams, attached_interaction_streams, realtime_product_turn_phase, realtime_projection_freshness, realtime_projection_frontier_ms, realtime_reconnect_policy, peer_ingress_owner_kind, peer_ingress_comms_runtime_id, peer_ingress_mob_id, supervisor_binding_kind, supervisor_bound_name, supervisor_bound_peer_id, supervisor_bound_address, supervisor_bound_epoch, local_endpoint, direct_peer_endpoints, mob_overlay_peer_endpoints, peer_projection_epoch, mob_overlay_epoch >>
 
 
-ApplySurfaceBoundaryAttached ==
+ApplySurfaceBoundaryAttached(surface_id, operation, pending_task_sequence, staged_intent_sequence, applied_at_turn) ==
     /\ phase = "Attached"
     /\ (session_id # None)
     /\ phase' = "Attached"
@@ -1161,7 +1161,7 @@ ApplySurfaceBoundaryAttached ==
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, realtime_intent_present, realtime_binding_state, realtime_binding_authority_epoch, realtime_reattach_required, realtime_next_authority_epoch, realtime_reconnect_attempt_count, realtime_reconnect_next_retry_at_ms, realtime_reconnect_deadline_at_ms, live_topology_phase, mcp_server_states, pending_peer_requests, inbound_peer_requests, last_session_context_updated_at_ms, reserved_interaction_streams, attached_interaction_streams, realtime_product_turn_phase, realtime_projection_freshness, realtime_projection_frontier_ms, realtime_reconnect_policy, peer_ingress_owner_kind, peer_ingress_comms_runtime_id, peer_ingress_mob_id, supervisor_binding_kind, supervisor_bound_name, supervisor_bound_peer_id, supervisor_bound_address, supervisor_bound_epoch, local_endpoint, direct_peer_endpoints, mob_overlay_peer_endpoints, peer_projection_epoch, mob_overlay_epoch >>
 
 
-ApplySurfaceBoundaryRunning ==
+ApplySurfaceBoundaryRunning(surface_id, operation, pending_task_sequence, staged_intent_sequence, applied_at_turn) ==
     /\ phase = "Running"
     /\ (session_id # None)
     /\ phase' = "Running"
@@ -1169,7 +1169,7 @@ ApplySurfaceBoundaryRunning ==
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, realtime_intent_present, realtime_binding_state, realtime_binding_authority_epoch, realtime_reattach_required, realtime_next_authority_epoch, realtime_reconnect_attempt_count, realtime_reconnect_next_retry_at_ms, realtime_reconnect_deadline_at_ms, live_topology_phase, mcp_server_states, pending_peer_requests, inbound_peer_requests, last_session_context_updated_at_ms, reserved_interaction_streams, attached_interaction_streams, realtime_product_turn_phase, realtime_projection_freshness, realtime_projection_frontier_ms, realtime_reconnect_policy, peer_ingress_owner_kind, peer_ingress_comms_runtime_id, peer_ingress_mob_id, supervisor_binding_kind, supervisor_bound_name, supervisor_bound_peer_id, supervisor_bound_address, supervisor_bound_epoch, local_endpoint, direct_peer_endpoints, mob_overlay_peer_endpoints, peer_projection_epoch, mob_overlay_epoch >>
 
 
-PendingSucceededAttached ==
+PendingSucceededAttached(surface_id, pending_task_sequence, staged_intent_sequence) ==
     /\ phase = "Attached"
     /\ (session_id # None)
     /\ phase' = "Attached"
@@ -1177,7 +1177,7 @@ PendingSucceededAttached ==
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, realtime_intent_present, realtime_binding_state, realtime_binding_authority_epoch, realtime_reattach_required, realtime_next_authority_epoch, realtime_reconnect_attempt_count, realtime_reconnect_next_retry_at_ms, realtime_reconnect_deadline_at_ms, live_topology_phase, mcp_server_states, pending_peer_requests, inbound_peer_requests, last_session_context_updated_at_ms, reserved_interaction_streams, attached_interaction_streams, realtime_product_turn_phase, realtime_projection_freshness, realtime_projection_frontier_ms, realtime_reconnect_policy, peer_ingress_owner_kind, peer_ingress_comms_runtime_id, peer_ingress_mob_id, supervisor_binding_kind, supervisor_bound_name, supervisor_bound_peer_id, supervisor_bound_address, supervisor_bound_epoch, local_endpoint, direct_peer_endpoints, mob_overlay_peer_endpoints, peer_projection_epoch, mob_overlay_epoch >>
 
 
-PendingSucceededRunning ==
+PendingSucceededRunning(surface_id, pending_task_sequence, staged_intent_sequence) ==
     /\ phase = "Running"
     /\ (session_id # None)
     /\ phase' = "Running"
@@ -1185,7 +1185,7 @@ PendingSucceededRunning ==
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, realtime_intent_present, realtime_binding_state, realtime_binding_authority_epoch, realtime_reattach_required, realtime_next_authority_epoch, realtime_reconnect_attempt_count, realtime_reconnect_next_retry_at_ms, realtime_reconnect_deadline_at_ms, live_topology_phase, mcp_server_states, pending_peer_requests, inbound_peer_requests, last_session_context_updated_at_ms, reserved_interaction_streams, attached_interaction_streams, realtime_product_turn_phase, realtime_projection_freshness, realtime_projection_frontier_ms, realtime_reconnect_policy, peer_ingress_owner_kind, peer_ingress_comms_runtime_id, peer_ingress_mob_id, supervisor_binding_kind, supervisor_bound_name, supervisor_bound_peer_id, supervisor_bound_address, supervisor_bound_epoch, local_endpoint, direct_peer_endpoints, mob_overlay_peer_endpoints, peer_projection_epoch, mob_overlay_epoch >>
 
 
-PendingFailedAttached ==
+PendingFailedAttached(surface_id, pending_task_sequence, reason) ==
     /\ phase = "Attached"
     /\ (session_id # None)
     /\ phase' = "Attached"
@@ -1193,7 +1193,7 @@ PendingFailedAttached ==
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, realtime_intent_present, realtime_binding_state, realtime_binding_authority_epoch, realtime_reattach_required, realtime_next_authority_epoch, realtime_reconnect_attempt_count, realtime_reconnect_next_retry_at_ms, realtime_reconnect_deadline_at_ms, live_topology_phase, mcp_server_states, pending_peer_requests, inbound_peer_requests, last_session_context_updated_at_ms, reserved_interaction_streams, attached_interaction_streams, realtime_product_turn_phase, realtime_projection_freshness, realtime_projection_frontier_ms, realtime_reconnect_policy, peer_ingress_owner_kind, peer_ingress_comms_runtime_id, peer_ingress_mob_id, supervisor_binding_kind, supervisor_bound_name, supervisor_bound_peer_id, supervisor_bound_address, supervisor_bound_epoch, local_endpoint, direct_peer_endpoints, mob_overlay_peer_endpoints, peer_projection_epoch, mob_overlay_epoch >>
 
 
-PendingFailedRunning ==
+PendingFailedRunning(surface_id, pending_task_sequence, reason) ==
     /\ phase = "Running"
     /\ (session_id # None)
     /\ phase' = "Running"
@@ -1265,7 +1265,7 @@ FinalizeRemovalForcedRunning ==
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, realtime_intent_present, realtime_binding_state, realtime_binding_authority_epoch, realtime_reattach_required, realtime_next_authority_epoch, realtime_reconnect_attempt_count, realtime_reconnect_next_retry_at_ms, realtime_reconnect_deadline_at_ms, live_topology_phase, mcp_server_states, pending_peer_requests, inbound_peer_requests, last_session_context_updated_at_ms, reserved_interaction_streams, attached_interaction_streams, realtime_product_turn_phase, realtime_projection_freshness, realtime_projection_frontier_ms, realtime_reconnect_policy, peer_ingress_owner_kind, peer_ingress_comms_runtime_id, peer_ingress_mob_id, supervisor_binding_kind, supervisor_bound_name, supervisor_bound_peer_id, supervisor_bound_address, supervisor_bound_epoch, local_endpoint, direct_peer_endpoints, mob_overlay_peer_endpoints, peer_projection_epoch, mob_overlay_epoch >>
 
 
-SnapshotAlignedAttached ==
+SnapshotAlignedAttached(snapshot_epoch) ==
     /\ phase = "Attached"
     /\ (session_id # None)
     /\ phase' = "Attached"
@@ -1273,7 +1273,7 @@ SnapshotAlignedAttached ==
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, realtime_intent_present, realtime_binding_state, realtime_binding_authority_epoch, realtime_reattach_required, realtime_next_authority_epoch, realtime_reconnect_attempt_count, realtime_reconnect_next_retry_at_ms, realtime_reconnect_deadline_at_ms, live_topology_phase, mcp_server_states, pending_peer_requests, inbound_peer_requests, last_session_context_updated_at_ms, reserved_interaction_streams, attached_interaction_streams, realtime_product_turn_phase, realtime_projection_freshness, realtime_projection_frontier_ms, realtime_reconnect_policy, peer_ingress_owner_kind, peer_ingress_comms_runtime_id, peer_ingress_mob_id, supervisor_binding_kind, supervisor_bound_name, supervisor_bound_peer_id, supervisor_bound_address, supervisor_bound_epoch, local_endpoint, direct_peer_endpoints, mob_overlay_peer_endpoints, peer_projection_epoch, mob_overlay_epoch >>
 
 
-SnapshotAlignedRunning ==
+SnapshotAlignedRunning(snapshot_epoch) ==
     /\ phase = "Running"
     /\ (session_id # None)
     /\ phase' = "Running"
@@ -4734,12 +4734,12 @@ Next ==
     \/ StageRemoveRunning
     \/ StageReloadAttached
     \/ StageReloadRunning
-    \/ ApplySurfaceBoundaryAttached
-    \/ ApplySurfaceBoundaryRunning
-    \/ PendingSucceededAttached
-    \/ PendingSucceededRunning
-    \/ PendingFailedAttached
-    \/ PendingFailedRunning
+    \/ \E surface_id \in SurfaceIdValues : \E operation \in SurfaceDeltaOperationValues : \E pending_task_sequence \in 0..2 : \E staged_intent_sequence \in 0..2 : \E applied_at_turn \in TurnNumberValues : ApplySurfaceBoundaryAttached(surface_id, operation, pending_task_sequence, staged_intent_sequence, applied_at_turn)
+    \/ \E surface_id \in SurfaceIdValues : \E operation \in SurfaceDeltaOperationValues : \E pending_task_sequence \in 0..2 : \E staged_intent_sequence \in 0..2 : \E applied_at_turn \in TurnNumberValues : ApplySurfaceBoundaryRunning(surface_id, operation, pending_task_sequence, staged_intent_sequence, applied_at_turn)
+    \/ \E surface_id \in SurfaceIdValues : \E pending_task_sequence \in 0..2 : \E staged_intent_sequence \in 0..2 : PendingSucceededAttached(surface_id, pending_task_sequence, staged_intent_sequence)
+    \/ \E surface_id \in SurfaceIdValues : \E pending_task_sequence \in 0..2 : \E staged_intent_sequence \in 0..2 : PendingSucceededRunning(surface_id, pending_task_sequence, staged_intent_sequence)
+    \/ \E surface_id \in SurfaceIdValues : \E pending_task_sequence \in 0..2 : \E reason \in StringValues : PendingFailedAttached(surface_id, pending_task_sequence, reason)
+    \/ \E surface_id \in SurfaceIdValues : \E pending_task_sequence \in 0..2 : \E reason \in StringValues : PendingFailedRunning(surface_id, pending_task_sequence, reason)
     \/ CallStartedAttached
     \/ CallStartedRunning
     \/ CallFinishedAttached
@@ -4748,8 +4748,8 @@ Next ==
     \/ FinalizeRemovalCleanRunning
     \/ FinalizeRemovalForcedAttached
     \/ FinalizeRemovalForcedRunning
-    \/ SnapshotAlignedAttached
-    \/ SnapshotAlignedRunning
+    \/ \E snapshot_epoch \in 0..2 : SnapshotAlignedAttached(snapshot_epoch)
+    \/ \E snapshot_epoch \in 0..2 : SnapshotAlignedRunning(snapshot_epoch)
     \/ ShutdownSurfaceAttached
     \/ ShutdownSurfaceRunning
     \/ RecycleFromIdleOrRetired

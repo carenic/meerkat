@@ -1,8 +1,4 @@
 pub mod catalog;
-/// Compatibility-only absorbed machine schemas retained for generated kernel
-/// consumers during the two-kernel collapse. These are intentionally excluded
-/// from the canonical registry.
-pub mod compat;
 mod composition;
 pub mod identity;
 mod machine;
@@ -17,11 +13,6 @@ pub use catalog::{
     canonical_machine_coverage_manifests, canonical_machine_schemas, compat_composition_schemas,
     meerkat_mob_seam_composition,
 };
-pub use compat::{
-    auth_lease_bridge_machine, external_tool_surface_bridge_machine,
-    mob_destroy_session_ingress_bridge_machine, ops_barrier_bridge_machine,
-    supervisor_trust_bridge_machine,
-};
 pub use composition::{
     ActorKind, ActorPriority, ActorSchema, ClosurePolicy, CompositionDriver,
     CompositionDriverRustBinding, CompositionInvariant, CompositionInvariantKind,
@@ -29,9 +20,10 @@ pub use composition::{
     CompositionWitness, CompositionWitnessField, CompositionWitnessInput, CompositionWitnessState,
     CompositionWitnessTransition, CompositionWitnessTransitionOrder, DriverDispatchRoute,
     EffectHandoffProtocol, EntryInput, FeedbackFieldBinding, FeedbackFieldSource, FeedbackInputRef,
-    MachineInstance, ProtocolGenerationMode, ProtocolHandleArgKey, ProtocolHelperReturnShape,
-    ProtocolRustBinding, Route, RouteBindingSource, RouteDelivery, RouteFieldBinding, RouteTarget,
-    RouteTargetKind, RouteTargetSelector, RouteVariantId, SchedulerRule, WatchedEffect,
+    HandleBridgeFeedbackBinding, MachineInstance, ProtocolGenerationMode,
+    ProtocolHelperReturnShape, ProtocolRustBinding, Route, RouteBindingSource, RouteDelivery,
+    RouteFieldBinding, RouteTarget, RouteTargetKind, RouteTargetSelector, RouteVariantId,
+    SchedulerRule, WatchedEffect,
 };
 pub use machine::{
     EffectDisposition, EffectDispositionRule, EffectEmit, EnumSchema, Expr, FieldInit, FieldSchema,
