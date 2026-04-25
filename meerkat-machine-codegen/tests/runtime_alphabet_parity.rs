@@ -128,6 +128,14 @@ fn meerkat_machine_inputs_equal_runtime_manifest_exactly() {
         // `protocol_ops_barrier_satisfaction` handoff helper, not
         // through `MeerkatMachineCommand`.
         "OpsBarrierSatisfied",
+        // Surface handoff feedback is delivered through
+        // `ExternalToolSurfaceHandle` / generated surface protocol helpers,
+        // not through `MeerkatMachineCommand`. Runtime command variants
+        // keep the shell-facing `Surface*` names while the canonical DSL
+        // owns the protocol feedback names.
+        "PendingSucceeded",
+        "PendingFailed",
+        "SnapshotAligned",
         // Round-5 Track-B (PR #340): peer-projection overlay inputs.
         // `ApplyMobPeerOverlay` is dispatched by the
         // `RecomputeMobPeerOverlay` composition driver (see
