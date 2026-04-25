@@ -224,13 +224,29 @@ pub async fn handle_start(
     if runtime_adapter.runtime_mode() == meerkat_runtime::RuntimeMode::V9Compliant
         && !runtime_adapter.session_has_executor(&session_id).await
     {
-        let executor = Box::new(crate::session_executor::SessionRuntimeExecutor::new(
-            runtime.clone(),
-            session_id.clone(),
-        ));
-        runtime_adapter
-            .ensure_session_with_executor(session_id.clone(), executor)
-            .await;
+        #[cfg(feature = "mob")]
+        {
+            if let Err(err) = runtime
+                .ensure_runtime_session_for_rotation(&session_id)
+                .await
+            {
+                return RpcResponse::error(
+                    id,
+                    error::INTERNAL_ERROR,
+                    format!("runtime executor registration failed: {err}"),
+                );
+            }
+        }
+        #[cfg(not(feature = "mob"))]
+        {
+            let executor = Box::new(crate::session_executor::SessionRuntimeExecutor::new(
+                runtime.clone(),
+                session_id.clone(),
+            ));
+            runtime_adapter
+                .ensure_session_with_executor(session_id.clone(), executor)
+                .await;
+        }
     }
 
     let result = match runtime

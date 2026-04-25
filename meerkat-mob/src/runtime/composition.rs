@@ -41,14 +41,18 @@
 
 use crate::error::MobError;
 use crate::machines::mob_machine as mob_dsl;
+#[cfg(target_arch = "wasm32")]
+use crate::tokio;
 use meerkat_machine_schema::identity::{
-    CompositionId, EffectVariantId, FieldId, MachineId, MachineInstanceId,
+    CompositionId, EffectVariantId, FieldId, MachineId, MachineInstanceId, SignalVariantId,
 };
 use meerkat_runtime::composition::{
-    CompositionBinding, CompositionDispatcher, DispatchOutcome, DispatchRefusal, EffectPayload,
-    FieldValue, ProducerEffect, ProducerInstance,
+    CatalogCompositionSignalDispatcher, CompositionBinding, CompositionDispatcher, DispatchOutcome,
+    DispatchRefusal, EffectPayload, FieldValue, OwnedFieldValue, ProducerEffect, ProducerInstance,
+    RouteTable, SignalConsumerSurface,
 };
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// Typed handle to a `meerkat_mob_seam` composition dispatcher.
 ///
@@ -317,6 +321,121 @@ pub fn wired_binding_from_runtime_adapter(
     let dispatcher: CatalogCompositionDispatcher<MobSeamEffect> =
         CatalogCompositionDispatcher::new(schema.name.clone(), table).with_consumer(consumer);
     CompositionBinding::Wired(Arc::new(dispatcher))
+}
+
+/// Attach the MeerkatMachine -> MobMachine typed signal dispatcher to the
+/// shared runtime adapter. This is the reverse direction of
+/// [`wired_binding_from_runtime_adapter`]: MeerkatMachine is the producer
+/// of RuntimeBound/RuntimeRetired/RuntimeDestroyed lifecycle effects and
+/// the mob actor is the signal consumer.
+#[cfg(feature = "runtime-adapter")]
+pub(super) fn attach_signal_dispatcher_to_runtime_adapter(
+    runtime_adapter: &Arc<meerkat_runtime::MeerkatMachine>,
+    command_tx: mpsc::Sender<super::state::MobCommand>,
+) {
+    let schema = meerkat_machine_schema::catalog::meerkat_mob_seam_composition();
+    let table = RouteTable::from_schema(&schema)
+        .expect("meerkat_mob_seam schema is well-formed by construction");
+    let consumer = Arc::new(MobSignalConsumerSurface::new(command_tx));
+    let dispatcher: CatalogCompositionSignalDispatcher<
+        meerkat_runtime::meerkat_machine::composition::MeerkatSeamSignal,
+    > = CatalogCompositionSignalDispatcher::new(schema.name.clone(), table).with_consumer(consumer);
+    runtime_adapter.set_composition_signal_dispatcher(Arc::new(dispatcher));
+}
+
+#[cfg(feature = "runtime-adapter")]
+struct MobSignalConsumerSurface {
+    command_tx: mpsc::Sender<super::state::MobCommand>,
+    instance_id: MachineInstanceId,
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl MobSignalConsumerSurface {
+    fn new(command_tx: mpsc::Sender<super::state::MobCommand>) -> Self {
+        Self {
+            command_tx,
+            instance_id: mob_producer_instance_id(),
+        }
+    }
+}
+
+#[cfg(feature = "runtime-adapter")]
+fn signal_project_str<'a>(
+    fields: &'a [(FieldId, OwnedFieldValue)],
+    name: &str,
+) -> Result<&'a str, String> {
+    fields
+        .iter()
+        .find(|(id, _)| id.as_str() == name)
+        .ok_or_else(|| format!("missing projected signal field `{name}`"))
+        .and_then(|(_, value)| match value {
+            OwnedFieldValue::Str(value) => Ok(value.as_str()),
+            other => Err(format!(
+                "projected signal field `{name}` is not Str: {other:?}"
+            )),
+        })
+}
+
+#[cfg(feature = "runtime-adapter")]
+fn signal_project_u64(fields: &[(FieldId, OwnedFieldValue)], name: &str) -> Result<u64, String> {
+    fields
+        .iter()
+        .find(|(id, _)| id.as_str() == name)
+        .ok_or_else(|| format!("missing projected signal field `{name}`"))
+        .and_then(|(_, value)| match value {
+            OwnedFieldValue::U64(value) => Ok(*value),
+            other => Err(format!(
+                "projected signal field `{name}` is not U64: {other:?}"
+            )),
+        })
+}
+
+#[cfg(feature = "runtime-adapter")]
+fn build_mob_signal(
+    variant: &SignalVariantId,
+    projected: &[(FieldId, OwnedFieldValue)],
+) -> Result<mob_dsl::MobMachineSignal, String> {
+    let runtime_id = mob_dsl::AgentRuntimeId::from(
+        signal_project_str(projected, "agent_runtime_id")?.to_string(),
+    );
+    let fence_token = mob_dsl::FenceToken(signal_project_u64(projected, "fence_token")?);
+    match variant.as_str() {
+        "ObserveRuntimeReady" => Ok(mob_dsl::MobMachineSignal::ObserveRuntimeReady {
+            agent_runtime_id: runtime_id,
+            fence_token,
+        }),
+        "ObserveRuntimeRetired" => Ok(mob_dsl::MobMachineSignal::ObserveRuntimeRetired {
+            agent_runtime_id: runtime_id,
+            fence_token,
+        }),
+        "ObserveRuntimeDestroyed" => Ok(mob_dsl::MobMachineSignal::ObserveRuntimeDestroyed {
+            agent_runtime_id: runtime_id,
+            fence_token,
+        }),
+        other => Err(format!(
+            "mob signal consumer surface does not accept routed signal `{other}`; \
+             only ObserveRuntimeReady/ObserveRuntimeRetired/ObserveRuntimeDestroyed are declared"
+        )),
+    }
+}
+
+#[cfg(feature = "runtime-adapter")]
+#[async_trait::async_trait]
+impl SignalConsumerSurface for MobSignalConsumerSurface {
+    fn instance_id(&self) -> &MachineInstanceId {
+        &self.instance_id
+    }
+
+    async fn receive_signal(
+        &self,
+        variant: SignalVariantId,
+        projected_fields: Vec<(FieldId, OwnedFieldValue)>,
+    ) -> Result<(), String> {
+        let signal = build_mob_signal(&variant, &projected_fields)?;
+        self.command_tx
+            .try_send(super::state::MobCommand::ProjectMachineSignal { signal })
+            .map_err(|error| format!("mob actor refused signal enqueue: {error}"))
+    }
 }
 
 /// Dispatch a single routed seam effect through the mob's composition

@@ -11,13 +11,15 @@
 //!   typed seam-effect sum (the [`ProducerEffect`] trait bound). Route
 //!   resolution returns a typed [`RoutedInputDescriptor`] carrying
 //!   [`MachineInstanceId`] / [`InputVariantId`] / `Vec<(FieldId, FieldId)>`.
+//!   Signal-kind routes travel through the parallel [`SignalPayload<S>`] /
+//!   [`CompositionSignalDispatcher`] surface and resolve to typed
+//!   [`RoutedSignalDescriptor`] values.
 //! * **Mandatory, not optional.** The trait has no fallback surface. Routed
 //!   effects whose route is declared in the composition schema MUST resolve
 //!   through the dispatcher; unresolved routes are a typed
 //!   [`DispatchRefusal::UnresolvedRoute`] error, not a silent drop.
 //!   Signal-kind routes live on a separate index inside [`RouteTable`] and
-//!   never reach the input dispatcher — signals are the signal surface's
-//!   responsibility and are flagged as a wave-b follow-up.
+//!   MUST resolve through [`CompositionSignalDispatcher`].
 //! * **Compile-time presence/absence.** A `MeerkatMachine` either has a
 //!   composition dispatcher attached (via the `with_composition` constructor)
 //!   or it does not (the standalone / single-machine test path). The two
@@ -42,10 +44,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use meerkat_machine_schema::identity::{
     CompositionId, EffectVariantId, FieldId, InputVariantId, MachineId, MachineInstanceId, RouteId,
+    SignalVariantId,
 };
 use thiserror::Error;
 
-pub use route_table::{RouteTable, RouteTableError, RoutedInputDescriptor};
+pub use route_table::{RouteTable, RouteTableError, RoutedInputDescriptor, RoutedSignalDescriptor};
 
 /// Typed identity of the producing machine instance inside a composition.
 ///
@@ -95,6 +98,37 @@ impl<E: ProducerEffect> EffectPayload<E> {
     }
 }
 
+/// Typed signal-route payload. Generic over the producer composition's
+/// seam-signal sum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignalPayload<S> {
+    /// Producer emitted a typed signal-route source variant.
+    Emitted {
+        /// Typed source variant id. In the composition schema this is the
+        /// route's producer-side `effect_variant`; signal-kind routes still
+        /// originate from a producer effect and target a consumer signal.
+        variant: EffectVariantId,
+        /// The typed signal source body.
+        body: S,
+    },
+}
+
+impl<S: ProducerSignal> SignalPayload<S> {
+    /// Borrow the typed source variant id.
+    pub fn variant(&self) -> &EffectVariantId {
+        match self {
+            Self::Emitted { variant, .. } => variant,
+        }
+    }
+
+    /// Borrow the typed body.
+    pub fn body(&self) -> &S {
+        match self {
+            Self::Emitted { body, .. } => body,
+        }
+    }
+}
+
 /// Typed route key: `(composition, route)`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RouteKey {
@@ -122,6 +156,23 @@ pub trait ProducerEffect: fmt::Debug + Send + Sync + 'static {
     /// Returns `None` if the requested field is not present on this
     /// variant. The dispatcher treats that as
     /// [`DispatchRefusal::MissingProducerField`].
+    fn field(&self, id: &FieldId) -> Option<FieldValue<'_>>;
+}
+
+/// Marker trait for the seam-signal source sum consumed by
+/// [`CompositionSignalDispatcher`].
+///
+/// Signal-kind composition routes use the same producer-side
+/// `EffectVariantId` namespace as input routes, but their target is a
+/// consumer [`SignalVariantId`]. This trait mirrors [`ProducerEffect`] so
+/// signal dispatch has the same typed projection discipline without
+/// requiring callers to smuggle signal payloads through the input
+/// dispatcher.
+pub trait ProducerSignal: fmt::Debug + Send + Sync + 'static {
+    /// Typed producer-side variant id for this signal source value.
+    fn variant_id(&self) -> EffectVariantId;
+
+    /// Borrow a producer field by [`FieldId`].
     fn field(&self, id: &FieldId) -> Option<FieldValue<'_>>;
 }
 
@@ -159,6 +210,17 @@ pub struct DispatchOutcome {
     pub consumer: MachineInstanceId,
     /// Typed input variant applied on the consumer.
     pub applied_input: InputVariantId,
+}
+
+/// Outcome when a routed signal is successfully dispatched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalDispatchOutcome {
+    /// Route that was resolved for this signal source.
+    pub route: RouteKey,
+    /// Target consumer instance the typed signal was delivered to.
+    pub consumer: MachineInstanceId,
+    /// Typed signal variant applied on the consumer.
+    pub applied_signal: SignalVariantId,
 }
 
 /// Reasons the dispatcher refuses a routed effect.
@@ -213,6 +275,50 @@ pub enum DispatchRefusal {
     },
 }
 
+/// Reasons the signal dispatcher refuses a routed signal.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum SignalDispatchRefusal {
+    /// The producer is not registered for this dispatcher's composition.
+    #[error("dispatcher composition {expected} does not match producer composition {actual}")]
+    CompositionMismatch {
+        expected: CompositionId,
+        actual: CompositionId,
+    },
+    /// No signal-kind route is declared for `(producer.instance_id, variant)`.
+    #[error(
+        "no signal route declared for producer {instance} variant {variant} in composition {composition}"
+    )]
+    UnresolvedRoute {
+        composition: CompositionId,
+        instance: MachineInstanceId,
+        variant: EffectVariantId,
+    },
+    /// A route-binding references a producer field that the signal body
+    /// did not supply.
+    #[error("route {route} requires producer field {field} on variant {variant}, not provided")]
+    MissingProducerField {
+        route: RouteId,
+        variant: EffectVariantId,
+        field: FieldId,
+    },
+    /// No [`SignalConsumerSurface`] is registered for the resolved target
+    /// instance.
+    #[error(
+        "no signal consumer surface registered for target instance {instance} in composition {composition}"
+    )]
+    UnwiredConsumer {
+        composition: CompositionId,
+        instance: MachineInstanceId,
+    },
+    /// The consumer surface rejected the typed signal.
+    #[error("consumer {instance} refused signal {variant}: {reason}")]
+    ConsumerRefused {
+        instance: MachineInstanceId,
+        variant: SignalVariantId,
+        reason: String,
+    },
+}
+
 /// Delivery surface for one consumer instance inside a composition.
 ///
 /// A consumer (e.g. the `meerkat` machine instance when mob routes
@@ -234,6 +340,20 @@ pub trait ConsumerSurface: Send + Sync {
     async fn apply_routed_input(
         &self,
         variant: InputVariantId,
+        projected_fields: Vec<(FieldId, OwnedFieldValue)>,
+    ) -> Result<(), String>;
+}
+
+/// Delivery surface for one signal-consuming instance inside a composition.
+#[async_trait]
+pub trait SignalConsumerSurface: Send + Sync {
+    /// Instance id this surface serves.
+    fn instance_id(&self) -> &MachineInstanceId;
+
+    /// Receive a typed routed signal.
+    async fn receive_signal(
+        &self,
+        variant: SignalVariantId,
         projected_fields: Vec<(FieldId, OwnedFieldValue)>,
     ) -> Result<(), String>;
 }
@@ -290,6 +410,24 @@ pub trait CompositionDispatcher: Send + Sync {
         producer: ProducerInstance,
         effect: EffectPayload<Self::Effect>,
     ) -> Result<DispatchOutcome, DispatchRefusal>;
+}
+
+/// Composition signal dispatcher trait.
+#[async_trait]
+pub trait CompositionSignalDispatcher: Send + Sync {
+    /// Seam-signal source sum this dispatcher handles.
+    type Signal: ProducerSignal;
+
+    /// Composition id this dispatcher owns.
+    fn composition(&self) -> &CompositionId;
+
+    /// Dispatch a routed signal. Returns [`SignalDispatchOutcome`] on
+    /// success or a typed [`SignalDispatchRefusal`].
+    async fn dispatch_signal(
+        &self,
+        producer: ProducerInstance,
+        signal: SignalPayload<Self::Signal>,
+    ) -> Result<SignalDispatchOutcome, SignalDispatchRefusal>;
 }
 
 /// Typed, owner-supplied context provider for an [`OwnerProvided`][op] binding.
@@ -489,6 +627,28 @@ pub struct CatalogCompositionDispatcher<E: ProducerEffect> {
     _effect: std::marker::PhantomData<fn(E)>,
 }
 
+/// Default catalog-backed signal dispatcher.
+///
+/// This is the signal-kind mirror of [`CatalogCompositionDispatcher`]:
+/// it consumes the same [`RouteTable`] but resolves through the signal
+/// index and delivers to [`SignalConsumerSurface`].
+pub struct CatalogCompositionSignalDispatcher<S: ProducerSignal> {
+    composition: CompositionId,
+    table: RouteTable,
+    consumers: HashMap<MachineInstanceId, Arc<dyn SignalConsumerSurface>>,
+    _signal: std::marker::PhantomData<fn(S)>,
+}
+
+impl<S: ProducerSignal> fmt::Debug for CatalogCompositionSignalDispatcher<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CatalogCompositionSignalDispatcher")
+            .field("composition", &self.composition)
+            .field("signal_routes", &self.table.signal_route_count())
+            .field("consumers", &self.consumers.len())
+            .finish()
+    }
+}
+
 impl<E: ProducerEffect> fmt::Debug for CatalogCompositionDispatcher<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CatalogCompositionDispatcher")
@@ -518,6 +678,25 @@ impl<E: ProducerEffect> CatalogCompositionDispatcher<E> {
     /// wave-b prove registration happens exactly once per instance in the
     /// composition schema.)
     pub fn with_consumer(mut self, surface: Arc<dyn ConsumerSurface>) -> Self {
+        self.consumers
+            .insert(surface.instance_id().clone(), surface);
+        self
+    }
+}
+
+impl<S: ProducerSignal> CatalogCompositionSignalDispatcher<S> {
+    /// Build a new signal dispatcher for `composition`.
+    pub fn new(composition: CompositionId, table: RouteTable) -> Self {
+        Self {
+            composition,
+            table,
+            consumers: HashMap::new(),
+            _signal: std::marker::PhantomData,
+        }
+    }
+
+    /// Register a signal consumer surface for a target instance.
+    pub fn with_consumer(mut self, surface: Arc<dyn SignalConsumerSurface>) -> Self {
         self.consumers
             .insert(surface.instance_id().clone(), surface);
         self
@@ -596,6 +775,78 @@ impl<E: ProducerEffect> CompositionDispatcher for CatalogCompositionDispatcher<E
     }
 }
 
+#[async_trait]
+impl<S: ProducerSignal> CompositionSignalDispatcher for CatalogCompositionSignalDispatcher<S> {
+    type Signal = S;
+
+    fn composition(&self) -> &CompositionId {
+        &self.composition
+    }
+
+    async fn dispatch_signal(
+        &self,
+        producer: ProducerInstance,
+        signal: SignalPayload<Self::Signal>,
+    ) -> Result<SignalDispatchOutcome, SignalDispatchRefusal> {
+        if producer.composition != self.composition {
+            return Err(SignalDispatchRefusal::CompositionMismatch {
+                expected: self.composition.clone(),
+                actual: producer.composition,
+            });
+        }
+
+        let variant = signal.variant().clone();
+        let body = signal.body();
+
+        let descriptor = self
+            .table
+            .resolve_signal(&producer.instance_id, &variant)
+            .ok_or_else(|| SignalDispatchRefusal::UnresolvedRoute {
+                composition: self.composition.clone(),
+                instance: producer.instance_id.clone(),
+                variant: variant.clone(),
+            })?;
+
+        let mut projected: Vec<(FieldId, OwnedFieldValue)> =
+            Vec::with_capacity(descriptor.bindings.len());
+        for (from_field, to_field) in &descriptor.bindings {
+            let value = body.field(from_field).ok_or_else(|| {
+                SignalDispatchRefusal::MissingProducerField {
+                    route: descriptor.route_id.clone(),
+                    variant: variant.clone(),
+                    field: from_field.clone(),
+                }
+            })?;
+            projected.push((to_field.clone(), value.to_owned_value()));
+        }
+
+        let consumer = self.consumers.get(&descriptor.instance_id).ok_or_else(|| {
+            SignalDispatchRefusal::UnwiredConsumer {
+                composition: self.composition.clone(),
+                instance: descriptor.instance_id.clone(),
+            }
+        })?;
+
+        consumer
+            .receive_signal(descriptor.signal_variant.clone(), projected)
+            .await
+            .map_err(|reason| SignalDispatchRefusal::ConsumerRefused {
+                instance: descriptor.instance_id.clone(),
+                variant: descriptor.signal_variant.clone(),
+                reason,
+            })?;
+
+        Ok(SignalDispatchOutcome {
+            route: RouteKey {
+                composition: self.composition.clone(),
+                route_id: descriptor.route_id.clone(),
+            },
+            consumer: descriptor.instance_id.clone(),
+            applied_signal: descriptor.signal_variant.clone(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,6 +899,59 @@ mod tests {
         }
     }
 
+    /// Hand-written stand-in for the codegen-emitted signal source sum.
+    /// These are the MeerkatMachine routed lifecycle effects that the
+    /// `meerkat_mob_seam` schema routes to MobMachine signals.
+    #[allow(clippy::enum_variant_names)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum SeamSignal {
+        RuntimeBound {
+            agent_runtime_id: String,
+            fence_token: u64,
+        },
+        RuntimeRetired {
+            agent_runtime_id: String,
+            fence_token: u64,
+        },
+        RuntimeDestroyed {
+            agent_runtime_id: String,
+            fence_token: u64,
+        },
+    }
+
+    impl ProducerSignal for SeamSignal {
+        fn variant_id(&self) -> EffectVariantId {
+            let slug = match self {
+                Self::RuntimeBound { .. } => "RuntimeBound",
+                Self::RuntimeRetired { .. } => "RuntimeRetired",
+                Self::RuntimeDestroyed { .. } => "RuntimeDestroyed",
+            };
+            EffectVariantId::parse(slug).expect("signal source slug")
+        }
+
+        fn field(&self, id: &FieldId) -> Option<FieldValue<'_>> {
+            let (agent_runtime_id, fence_token) = match self {
+                Self::RuntimeBound {
+                    agent_runtime_id,
+                    fence_token,
+                }
+                | Self::RuntimeRetired {
+                    agent_runtime_id,
+                    fence_token,
+                }
+                | Self::RuntimeDestroyed {
+                    agent_runtime_id,
+                    fence_token,
+                } => (agent_runtime_id, fence_token),
+            };
+            match id.as_str() {
+                "agent_runtime_id" => Some(FieldValue::Str(agent_runtime_id)),
+                "fence_token" => Some(FieldValue::U64(*fence_token)),
+                _ => None,
+            }
+        }
+    }
+
     #[derive(Default)]
     struct RecordingMeerkatSurface {
         log: tokio::sync::Mutex<Vec<(InputVariantId, Vec<(FieldId, OwnedFieldValue)>)>>,
@@ -672,11 +976,41 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingMobSignalSurface {
+        log: tokio::sync::Mutex<Vec<(SignalVariantId, Vec<(FieldId, OwnedFieldValue)>)>>,
+    }
+
+    #[async_trait]
+    impl SignalConsumerSurface for RecordingMobSignalSurface {
+        fn instance_id(&self) -> &MachineInstanceId {
+            static ID: std::sync::OnceLock<MachineInstanceId> = std::sync::OnceLock::new();
+            ID.get_or_init(|| MachineInstanceId::parse("mob").unwrap())
+        }
+
+        async fn receive_signal(
+            &self,
+            variant: SignalVariantId,
+            projected_fields: Vec<(FieldId, OwnedFieldValue)>,
+        ) -> Result<(), String> {
+            self.log.lock().await.push((variant, projected_fields));
+            Ok(())
+        }
+    }
+
     fn mob_producer() -> ProducerInstance {
         ProducerInstance {
             composition: CompositionId::parse("meerkat_mob_seam").unwrap(),
             instance_id: MachineInstanceId::parse("mob").unwrap(),
             machine: MachineId::parse("MobMachine").unwrap(),
+        }
+    }
+
+    fn meerkat_producer() -> ProducerInstance {
+        ProducerInstance {
+            composition: CompositionId::parse("meerkat_mob_seam").unwrap(),
+            instance_id: MachineInstanceId::parse("meerkat").unwrap(),
+            machine: MachineId::parse("MeerkatMachine").unwrap(),
         }
     }
 
@@ -698,6 +1032,25 @@ mod tests {
         let schema = meerkat_mob_seam_composition();
         let table = RouteTable::from_schema(&schema).expect("seam schema routes are well-formed");
         CatalogCompositionDispatcher::new(schema.name.clone(), table).with_consumer(consumer)
+    }
+
+    fn sample_signal() -> SignalPayload<SeamSignal> {
+        let body = SeamSignal::RuntimeBound {
+            agent_runtime_id: "rt-1".into(),
+            fence_token: 7,
+        };
+        SignalPayload::Emitted {
+            variant: body.variant_id(),
+            body,
+        }
+    }
+
+    fn build_signal_dispatcher(
+        consumer: Arc<RecordingMobSignalSurface>,
+    ) -> CatalogCompositionSignalDispatcher<SeamSignal> {
+        let schema = meerkat_mob_seam_composition();
+        let table = RouteTable::from_schema(&schema).expect("seam schema routes are well-formed");
+        CatalogCompositionSignalDispatcher::new(schema.name.clone(), table).with_consumer(consumer)
     }
 
     #[tokio::test]
@@ -751,6 +1104,115 @@ mod tests {
             OwnedFieldValue::Str(s) => assert_eq!(s, "019dbd3d-d7ad-75a1-96d0-8013927e78f8"),
             other => panic!("expected Str for session_id, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn dispatches_meerkat_routed_signal_to_mob_consumer() {
+        let consumer = Arc::new(RecordingMobSignalSurface::default());
+        let dispatcher = build_signal_dispatcher(Arc::clone(&consumer));
+
+        let outcome = dispatcher
+            .dispatch_signal(meerkat_producer(), sample_signal())
+            .await
+            .expect("well-formed routed signal");
+
+        assert_eq!(outcome.consumer.as_str(), "mob");
+        assert_eq!(outcome.applied_signal.as_str(), "ObserveRuntimeReady");
+        assert_eq!(outcome.route.route_id.as_str(), "runtime_bound_reaches_mob");
+
+        let log = consumer.log.lock().await;
+        assert_eq!(
+            log.len(),
+            1,
+            "dispatcher must call the signal consumer exactly once"
+        );
+        let (variant, fields) = &log[0];
+        assert_eq!(variant.as_str(), "ObserveRuntimeReady");
+        let field_names: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(field_names, vec!["agent_runtime_id", "fence_token"]);
+        match &fields[0].1 {
+            OwnedFieldValue::Str(s) => assert_eq!(s, "rt-1"),
+            other => panic!("expected Str, got {other:?}"),
+        }
+        match &fields[1].1 {
+            OwnedFieldValue::U64(v) => assert_eq!(*v, 7),
+            other => panic!("expected U64, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_dispatch_refuses_input_route_typed() {
+        let consumer = Arc::new(RecordingMobSignalSurface::default());
+        let dispatcher = build_signal_dispatcher(consumer);
+
+        let payload = SignalPayload::Emitted {
+            variant: EffectVariantId::parse("RequestRuntimeBinding").unwrap(),
+            body: SeamSignal::RuntimeBound {
+                agent_runtime_id: "rt-1".into(),
+                fence_token: 7,
+            },
+        };
+
+        let err = dispatcher
+            .dispatch_signal(mob_producer(), payload)
+            .await
+            .expect_err("input route is out of the signal surface");
+
+        assert!(matches!(err, SignalDispatchRefusal::UnresolvedRoute { .. }));
+    }
+
+    #[tokio::test]
+    async fn signal_dispatch_refuses_unwired_consumer_typed() {
+        let schema = meerkat_mob_seam_composition();
+        let table = RouteTable::from_schema(&schema).unwrap();
+        let dispatcher: CatalogCompositionSignalDispatcher<SeamSignal> =
+            CatalogCompositionSignalDispatcher::new(schema.name.clone(), table);
+
+        let err = dispatcher
+            .dispatch_signal(meerkat_producer(), sample_signal())
+            .await
+            .expect_err("unwired signal consumer");
+
+        assert!(matches!(err, SignalDispatchRefusal::UnwiredConsumer { .. }));
+    }
+
+    #[tokio::test]
+    async fn signal_dispatch_refuses_missing_field_typed() {
+        #[derive(Debug)]
+        struct BrokenSignal;
+
+        impl ProducerSignal for BrokenSignal {
+            fn variant_id(&self) -> EffectVariantId {
+                EffectVariantId::parse("RuntimeBound").unwrap()
+            }
+
+            fn field(&self, _id: &FieldId) -> Option<FieldValue<'_>> {
+                None
+            }
+        }
+
+        let schema = meerkat_mob_seam_composition();
+        let table = RouteTable::from_schema(&schema).unwrap();
+        let consumer = Arc::new(RecordingMobSignalSurface::default());
+        let dispatcher: CatalogCompositionSignalDispatcher<BrokenSignal> =
+            CatalogCompositionSignalDispatcher::new(schema.name.clone(), table)
+                .with_consumer(consumer);
+
+        let err = dispatcher
+            .dispatch_signal(
+                meerkat_producer(),
+                SignalPayload::Emitted {
+                    variant: EffectVariantId::parse("RuntimeBound").unwrap(),
+                    body: BrokenSignal,
+                },
+            )
+            .await
+            .expect_err("missing producer field");
+
+        assert!(matches!(
+            err,
+            SignalDispatchRefusal::MissingProducerField { .. }
+        ));
     }
 
     #[tokio::test]

@@ -915,7 +915,8 @@ impl<'a> ForbiddenShellReadsVisitor<'a> {
         symbol: String,
         detail: String,
     ) {
-        let suppressed = has_rmat_allow(self.source, span, "ForbiddenShellAuthorityReads");
+        let suppressed =
+            forbidden_shell_authority_read_suppressed(self.relative, self.source, span);
         let hint = rule.hint;
         let relative = self.relative;
         self.findings.push(error_finding(
@@ -1124,6 +1125,23 @@ fn has_rmat_allow(source: &str, span: proc_macro2::Span, rule: &str) -> bool {
     }
 
     false
+}
+
+fn forbidden_shell_authority_read_suppressed(
+    relative: &str,
+    source: &str,
+    span: proc_macro2::Span,
+) -> bool {
+    is_test_fixture_path(relative) && has_rmat_allow(source, span, "ForbiddenShellAuthorityReads")
+}
+
+fn is_test_fixture_path(relative: &str) -> bool {
+    relative.starts_with("rmat-test-fixtures/")
+        || relative.starts_with("test-fixtures/")
+        || relative.starts_with("tests/fixtures/")
+        || relative.contains("/rmat-test-fixtures/")
+        || relative.contains("/test-fixtures/")
+        || relative.contains("/tests/fixtures/")
 }
 
 /// Structural seam rule: every effect with `handoff_protocol: Some(name)` must have

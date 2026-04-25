@@ -243,6 +243,78 @@ impl RealtimeSocketBinding {
 }
 
 #[derive(Debug, Clone)]
+struct MobMemberBindingRotation {
+    previous_session_id: SessionId,
+    current_session_id: SessionId,
+}
+
+#[cfg(feature = "mob")]
+async fn refresh_mob_member_binding_projection(
+    runtime: &SessionRuntime,
+    binding: &mut Option<RealtimeSocketBinding>,
+) -> Result<Option<MobMemberBindingRotation>, RealtimeChannelErrorFrame> {
+    let Some(RealtimeSocketBinding::MobMemberPrimary {
+        mob_id,
+        agent_identity,
+        current_session_id,
+    }) = binding.as_mut()
+    else {
+        return Ok(None);
+    };
+    let mob_state = runtime
+        .mob_state()
+        .ok_or_else(|| RealtimeChannelErrorFrame {
+            code: RealtimeErrorCode::InvalidTarget,
+            message: "mob-member channels require the mob feature to be enabled on this host"
+                .to_string(),
+            details: None,
+        })?;
+    let mob_handle =
+        mob_state
+            .handle_for(mob_id)
+            .await
+            .map_err(|err| RealtimeChannelErrorFrame {
+                code: RealtimeErrorCode::InvalidTarget,
+                message: format!("mob {mob_id:?} not found or handle unavailable: {err}"),
+                details: None,
+            })?;
+    let Some(projected_session_id) = mob_handle
+        .current_realtime_binding(agent_identity.clone())
+        .await
+        .map_err(|err| RealtimeChannelErrorFrame {
+            code: RealtimeErrorCode::RuntimeInternal,
+            message: format!("failed to query current realtime binding: {err}"),
+            details: None,
+        })?
+    else {
+        return Err(RealtimeChannelErrorFrame {
+            code: RealtimeErrorCode::InvalidTarget,
+            message: format!(
+                "mob {mob_id:?} has no realtime binding for identity {agent_identity:?}"
+            ),
+            details: None,
+        });
+    };
+    if projected_session_id == *current_session_id {
+        return Ok(None);
+    }
+    let previous_session_id = current_session_id.clone();
+    *current_session_id = projected_session_id.clone();
+    Ok(Some(MobMemberBindingRotation {
+        previous_session_id,
+        current_session_id: projected_session_id,
+    }))
+}
+
+#[cfg(not(feature = "mob"))]
+async fn refresh_mob_member_binding_projection(
+    _runtime: &SessionRuntime,
+    _binding: &mut Option<RealtimeSocketBinding>,
+) -> Result<Option<MobMemberBindingRotation>, RealtimeChannelErrorFrame> {
+    Ok(None)
+}
+
+#[derive(Debug, Clone)]
 struct RealtimeReconnectOverlay {
     policy: RealtimeReconnectPolicy,
     cycle_started_at: Option<Instant>,
@@ -929,7 +1001,7 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                         }
                     };
                     let opened_status = bound.status;
-                    let binding = bound.binding;
+                    let mut binding = bound.binding;
                     let mut product_session = bound.bridge;
                     let uses_product_session = product_session.is_some();
                     let expected_audio_input_format =
@@ -1018,10 +1090,10 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                     // never lost between the two.
                     let (wake_tx, mut wake_rx) = mpsc::channel::<()>(16);
                     let (
-                        session_context_handle,
-                        product_turn_handle,
-                        _wake_observer_guard,
-                        _bridge_observer_guard,
+                        mut session_context_handle,
+                        mut product_turn_handle,
+                        mut _wake_observer_guard,
+                        mut _bridge_observer_guard,
                     ) = bind_realtime_session_observers(
                         &state.runtime,
                         binding.as_ref(),
@@ -1258,6 +1330,93 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                                 }
                                             }
                                             RealtimeClientFrame::ChannelInput(input_frame) => {
+                                                match refresh_mob_member_binding_projection(
+                                                    &state.runtime,
+                                                    &mut binding,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(Some(rotation)) => {
+                                                        let _ = state
+                                                            .runtime
+                                                            .runtime_adapter()
+                                                            .detach_live(&rotation.previous_session_id)
+                                                            .await;
+                                                        if let Some(session_factory) =
+                                                            state.host.session_factory()
+                                                        {
+                                                            match open_product_session_bridge(
+                                                                &state.runtime,
+                                                                &rotation.current_session_id,
+                                                                turning_mode,
+                                                                session_factory,
+                                                            )
+                                                            .await
+                                                            {
+                                                                Ok((status, bridge)) => {
+                                                                    if let Some(old_product_session) =
+                                                                        product_session.as_mut()
+                                                                    {
+                                                                        let _ = old_product_session
+                                                                            .command_tx
+                                                                            .send(RealtimeProductSessionCommand::Close)
+                                                                            .await;
+                                                                    }
+                                                                    product_session = Some(bridge);
+                                                                    let observers =
+                                                                        bind_realtime_session_observers(
+                                                                            &state.runtime,
+                                                                            binding.as_ref(),
+                                                                            wake_tx.clone(),
+                                                                        )
+                                                                        .await;
+                                                                    session_context_handle = observers.0;
+                                                                    product_turn_handle = observers.1;
+                                                                    _wake_observer_guard = observers.2;
+                                                                    _bridge_observer_guard = observers.3;
+                                                                    let _ = emit_status_update(
+                                                                        &mut socket,
+                                                                        &mut last_visible_status,
+                                                                        status,
+                                                                        false,
+                                                                        Some((state.host.as_ref(), &registered)),
+                                                                    )
+                                                                    .await;
+                                                                }
+                                                                Err(error) => {
+                                                                    let _ = send_server_frame(
+                                                                        &mut socket,
+                                                                        &RealtimeServerFrame::ChannelError(error),
+                                                                    )
+                                                                    .await;
+                                                                    continue;
+                                                                }
+                                                            }
+                                                        } else if let Err(error) = state
+                                                            .runtime
+                                                            .runtime_adapter()
+                                                            .attach_live(&rotation.current_session_id)
+                                                            .await
+                                                            .map_err(|err| runtime_error_frame(err, "attach"))
+                                                        {
+                                                            let _ = send_server_frame(
+                                                                &mut socket,
+                                                                &RealtimeServerFrame::ChannelError(error),
+                                                            )
+                                                            .await;
+                                                            continue;
+                                                        }
+                                                    }
+                                                    Ok(None) => {}
+                                                    Err(error) => {
+                                                        let _ = send_server_frame(
+                                                            &mut socket,
+                                                            &RealtimeServerFrame::ChannelError(error),
+                                                        )
+                                                        .await;
+                                                        continue;
+                                                    }
+                                                }
                                                 if let Err(error) = validate_input_chunk_audio_format(
                                                     &input_frame.chunk,
                                                     &expected_audio_input_format,
@@ -3486,12 +3645,14 @@ fn install_realtime_session_observers(
     else {
         return (None, None);
     };
-    // Install the freshness-wake observer first so the baseline-reset
-    // transition that happens next lands on a live observer (the wake is
-    // idempotent — the loop will read the DSL state on its next poll).
+    // Install the freshness-wake observer first and sample the typed
+    // freshness state in the same DSL critical section. The wake channel is a
+    // shell projection; the DSL-owned freshness discriminant/frontier remain
+    // the source of truth that the socket reads after any wake.
     let wake_observer: ProjectionWakeObserverArc =
         Arc::new(RealtimeSocketFreshnessWake { wake_tx });
-    product_turn.install_projection_freshness_observer(Arc::clone(&wake_observer));
+    let (_initial_freshness, _initial_frontier_ms) = product_turn
+        .install_projection_freshness_observer_with_snapshot(Arc::clone(&wake_observer));
 
     // Install the session-context → product-turn bridge. The atomic baseline
     // is used to seed the DSL frontier to the session's current watermark so a
@@ -3874,6 +4035,10 @@ async fn send_error_and_close(
 mod tests {
     #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
     use std::time::Duration;
 
     use chrono::Utc;
@@ -4747,9 +4912,35 @@ mod tests {
 
     use meerkat_core::handles::{
         RealtimeProductTurnHandle, RealtimeProjectionFreshness,
-        RealtimeReconnectPolicy as CoreReconnectPolicy,
+        RealtimeProjectionFreshnessObserver, RealtimeReconnectPolicy as CoreReconnectPolicy,
     };
     use meerkat_runtime::RuntimeRealtimeProductTurnHandle;
+
+    struct RecordingFreshnessObserver {
+        calls: AtomicU64,
+    }
+
+    impl RecordingFreshnessObserver {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicU64::new(0),
+            })
+        }
+
+        fn calls(&self) -> u64 {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl RealtimeProjectionFreshnessObserver for RecordingFreshnessObserver {
+        fn on_realtime_projection_freshness_changed(
+            &self,
+            _new_freshness: RealtimeProjectionFreshness,
+            _frontier_ms: u64,
+        ) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn projection_freshness_clean_advances_to_stale_immediate_when_idle() {
@@ -4764,6 +4955,29 @@ mod tests {
             RealtimeProjectionFreshness::StaleImmediate
         );
         assert_eq!(handle.projection_frontier_ms(), 200);
+    }
+
+    #[test]
+    fn projection_freshness_observer_install_returns_authority_snapshot() {
+        // Dogma symmetry with `SessionContextHandle::install_observer_with_baseline`:
+        // observer visibility and the socket's initial typed freshness read must
+        // share one DSL ordering point.
+        let handle = RuntimeRealtimeProductTurnHandle::ephemeral();
+        assert!(handle.projection_advance_observed(200).unwrap());
+        let observer = RecordingFreshnessObserver::new();
+        let (freshness, frontier_ms) = handle.install_projection_freshness_observer_with_snapshot(
+            Arc::clone(&observer) as Arc<dyn RealtimeProjectionFreshnessObserver>,
+        );
+
+        assert_eq!(freshness, RealtimeProjectionFreshness::StaleImmediate);
+        assert_eq!(frontier_ms, 200);
+        assert_eq!(
+            observer.calls(),
+            0,
+            "install snapshot is a DSL read, not a replayed shell notification"
+        );
+        assert!(handle.projection_refreshed(200).unwrap());
+        assert_eq!(observer.calls(), 1);
     }
 
     #[test]

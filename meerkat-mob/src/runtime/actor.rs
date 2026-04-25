@@ -395,10 +395,30 @@ impl MobActor {
     }
 
     fn trusted_peer_removal_key(peer: &TrustedPeerDescriptor) -> String {
-        if peer.pubkey == [0u8; 32] {
-            peer.peer_id.to_string()
-        } else {
-            Self::trusted_peer_pubkey_string(peer)
+        Self::trusted_peer_pubkey_string(peer)
+    }
+
+    async fn remove_trusted_peer_by_descriptor(
+        comms: &dyn CoreCommsRuntime,
+        peer: &TrustedPeerDescriptor,
+    ) -> Result<bool, meerkat_core::comms::SendError> {
+        let peer_id = peer.peer_id.to_string();
+        match comms.remove_trusted_peer(&peer_id).await {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                let pubkey_key = Self::trusted_peer_removal_key(peer);
+                comms.remove_trusted_peer(&pubkey_key).await
+            }
+            Err(peer_id_error) => match comms.remove_trusted_peer(&peer_id).await {
+                Ok(removed) => Ok(removed),
+                Err(_) => {
+                    let pubkey_key = Self::trusted_peer_removal_key(peer);
+                    match comms.remove_trusted_peer(&pubkey_key).await {
+                        Ok(removed) => Ok(removed),
+                        Err(_) => Err(peer_id_error),
+                    }
+                }
+            },
         }
     }
 
@@ -2295,6 +2315,14 @@ impl MobActor {
                     let result = self.apply_dsl_input(*input, "project_machine_input");
                     let _ = reply_tx.send(result);
                 }
+                MobCommand::ProjectMachineSignal { signal } => {
+                    if let Err(error) = self.apply_dsl_signal(signal, "project_machine_signal") {
+                        tracing::error!(
+                            error = %error,
+                            "typed composition signal projection failed"
+                        );
+                    }
+                }
                 MobCommand::FlowFinished { run_id } => {
                     if let Err(error) = self
                         .handle_flow_cleanup(run_id, "flow finished cleanup")
@@ -2345,6 +2373,9 @@ impl MobActor {
                         in_progress_task_ids: dsl.in_progress_task_ids.clone(),
                         completed_task_ids: dsl.completed_task_ids.clone(),
                         member_session_bindings: dsl.member_session_bindings.clone(),
+                        pending_session_ingress_detach_runtime_ids: dsl
+                            .pending_session_ingress_detach_runtime_ids
+                            .clone(),
                     });
                 }
                 MobCommand::StartupKickoffSnapshot { reply_tx } => {
@@ -5088,7 +5119,7 @@ impl MobActor {
                                 "unwire external peer has invalid peer name: {error}",
                             ))
                         })?;
-                    return self.handle_unwire_external(local, peer_name).await;
+                    return self.handle_unwire_external(local, peer_name, None).await;
                 }
                 id
             }
@@ -5099,7 +5130,9 @@ impl MobActor {
                             "unwire external peer has invalid peer name: {error}",
                         ))
                     })?;
-                return self.handle_unwire_external(local, peer_name).await;
+                return self
+                    .handle_unwire_external(local, peer_name, Some(descriptor))
+                    .await;
             }
         };
 
@@ -5680,12 +5713,15 @@ impl MobActor {
         &mut self,
         local: MeerkatId,
         peer_name: meerkat_core::comms::PeerName,
+        stale_cleanup_spec: Option<TrustedPeerDescriptor>,
     ) -> Result<(), MobError> {
         let local_identity = AgentIdentity::from(local.as_str());
         let external_identity = AgentIdentity::from(peer_name.as_str());
 
         // Look up the prior descriptor so we can compensate on append
-        // failure. Idempotent: absent spec → no-op success.
+        // failure. Idempotent: absent projection stays success, but a
+        // descriptor-bearing External target still prunes any stale comms
+        // trust that was re-injected after the first unwire.
         let (member_ref, prior_spec) = {
             let roster = self.roster.read().await;
             let entry = roster
@@ -5696,7 +5732,13 @@ impl MobActor {
         };
 
         let Some(prior_spec) = prior_spec else {
-            // Idempotent no-op: nothing to unwire.
+            if let Some(spec) = stale_cleanup_spec
+                && let Some(comms) = self.provisioner_comms(&member_ref).await
+            {
+                let _ = comms
+                    .remove_trusted_peer(&Self::trusted_peer_removal_key(&spec))
+                    .await?;
+            }
             return Ok(());
         };
 
@@ -5884,7 +5926,13 @@ impl MobActor {
             },
             "handle_retire_inner_mark_retiring",
         )?;
-        if let Some(session_id) = detach_session_id {
+        let runtime_id = mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id);
+        let detach_obligation_open = self
+            .dsl_authority
+            .state
+            .pending_session_ingress_detach_runtime_ids
+            .contains(&runtime_id);
+        if let (true, Some(session_id)) = (detach_obligation_open, detach_session_id) {
             self.detach_session_ingress_for_mob_destroy(&entry, &session_id)
                 .await?;
         }
@@ -7270,9 +7318,6 @@ impl MobActor {
             return Err(error);
         }
 
-        // Best-effort Stop before reset — already stopped is fine.
-        let _ = self.apply_dsl_input(mob_dsl::MobMachineInput::Stop, "reset_stop");
-
         // --- Event rewrite phase: append new epoch markers. ---
         // Append-only epoch model: MobCreated (for resume) + MobReset (epoch
         // marker). Projections (roster, task board) clear on MobReset; resume
@@ -7321,63 +7366,16 @@ impl MobActor {
             return Err(error);
         }
 
-        // Wave-c WAR-2: land the mob on Stopped without a shell-side
-        // phase-read guard. We have two DSL entries that can reach
-        // Stopped — `Stop` input (Running → Stopped, also gated by
-        // `active_run_count == 0`) and the `FinishCleanup` signal
-        // (Completed → Stopped). The previous `if phase == Running {
-        // Stop } else if phase == Completed { FinishCleanup }` shape
-        // duplicated the DSL's own per-transition guards in the shell;
-        // the `NoGuardedApply` rule flags that as a second source of
-        // truth.
-        //
-        // Dogma-clean pattern: try `Stop` first; if the authority
-        // accepts, we were Running and the transition completed. If the
-        // authority rejects (meaning we were already past Running), try
-        // `FinishCleanup` to cover the Completed case. Already-Stopped
-        // mobs get rejections from both and fall through as a no-op.
-        // Branching on the *authority's* rejection is not a shell state
-        // read — it's the authority itself reporting "that input does
-        // not apply in my current phase", which is the contract the
-        // rule explicitly endorses ("let the authority reject").
-        let stop_rejected = self
-            .apply_dsl_input(mob_dsl::MobMachineInput::Stop, "stop_reset")
-            .is_err();
-        if stop_rejected
-            && let Err(error) = self.apply_dsl_signal(
-                mob_dsl::MobMachineSignal::FinishCleanup,
-                "finish_cleanup_reset",
-            )
-        {
-            tracing::debug!(
-                error = %error,
-                "reset: FinishCleanup rejected after Stop rejected — mob was already Stopped",
-            );
-        }
-        if self.has_orchestrator {
-            // Check if DSL allows StopOrchestrator
-            {
-                let mut probe =
-                    mob_dsl::MobMachineAuthority::from_state(self.dsl_authority.state.clone());
-                if probe
-                    .apply_signal(mob_dsl::MobMachineSignal::StopOrchestrator)
-                    .is_ok()
-                {
-                    self.apply_dsl_signal(
-                        mob_dsl::MobMachineSignal::StopOrchestrator,
-                        "stop_orchestrator_reset",
-                    )?;
-                }
-            }
-            self.apply_dsl_signal(
-                mob_dsl::MobMachineSignal::ResumeOrchestrator,
-                "resume_orchestrator_reset",
-            )?;
-        }
-        self.apply_dsl_input(mob_dsl::MobMachineInput::Resume, "resume_input_reset")
+        // The command handler already probes Reset before the destructive phase.
+        // Once side effects and epoch events have succeeded, realize that same
+        // typed transition as the single authority-owned lifecycle landing. The
+        // ResetToRunning transition owns active/pending run counters and
+        // coordinator binding, so reset does not need shell Stop/Resume or
+        // orchestrator stop/resume choreography.
+        self.apply_dsl_input(mob_dsl::MobMachineInput::Reset, "reset_to_running")
             .map_err(|error| {
                 MobError::Internal(format!(
-                    "lifecycle Resume transition failed during reset: {error}"
+                    "lifecycle Reset transition failed during reset: {error}"
                 ))
             })?;
         self.ensure_pending_spawn_alignment("handle_reset completion")?;
@@ -8340,9 +8338,8 @@ impl MobActor {
                     WiringEndpoint::PeerOnly { spec, binding } => (spec, None, Some(binding)),
                 };
                 if let Some(spawned_comms) = spawned_comms.as_ref() {
-                    let _ = spawned_comms
-                        .remove_trusted_peer(&Self::trusted_peer_removal_key(&peer_spec))
-                        .await;
+                    let _ =
+                        Self::remove_trusted_peer_by_descriptor(&**spawned_comms, &peer_spec).await;
                 } else if let Some(spawned_binding) = spawned_binding.as_ref() {
                     let _ = self
                         .unwire_peer_only_recipient(
@@ -8354,9 +8351,8 @@ impl MobActor {
                         .await;
                 }
                 if let Some(peer_comms) = peer_comms {
-                    let _ = peer_comms
-                        .remove_trusted_peer(&Self::trusted_peer_removal_key(&spawned_spec))
-                        .await;
+                    let _ =
+                        Self::remove_trusted_peer_by_descriptor(&*peer_comms, &spawned_spec).await;
                 } else if let Some(peer_binding) = peer_binding {
                     let _ = self
                         .unwire_peer_only_recipient(

@@ -121,6 +121,8 @@ pub(crate) struct MobDslT2Snapshot {
         crate::machines::mob_machine::AgentIdentity,
         crate::machines::mob_machine::SessionId,
     >,
+    pub pending_session_ingress_detach_runtime_ids:
+        std::collections::BTreeSet<crate::machines::mob_machine::AgentRuntimeId>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -217,6 +219,9 @@ pub(super) enum MobCommand {
     ProjectMachineInput {
         input: Box<mob_dsl::MobMachineInput>,
         reply_tx: oneshot::Sender<Result<(), MobError>>,
+    },
+    ProjectMachineSignal {
+        signal: mob_dsl::MobMachineSignal,
     },
     FlowFinished {
         run_id: RunId,

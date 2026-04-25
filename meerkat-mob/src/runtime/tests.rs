@@ -1674,8 +1674,8 @@ impl MobRunStore for RecordingRunStore {
     async fn cas_flow_state(
         &self,
         run_id: &RunId,
-        expected: &crate::generated::flow_run::State,
-        next: &crate::generated::flow_run::State,
+        expected: &crate::run::flow_run::State,
+        next: &crate::run::flow_run::State,
     ) -> Result<bool, MobStoreError> {
         self.inner.cas_flow_state(run_id, expected, next).await
     }
@@ -1684,9 +1684,9 @@ impl MobRunStore for RecordingRunStore {
         &self,
         run_id: &RunId,
         expected_status: MobRunStatus,
-        expected_flow_state: &crate::generated::flow_run::State,
+        expected_flow_state: &crate::run::flow_run::State,
         next_status: MobRunStatus,
-        next_flow_state: &crate::generated::flow_run::State,
+        next_flow_state: &crate::run::flow_run::State,
     ) -> Result<bool, MobStoreError> {
         self.snapshot_cas_history.write().await.push((
             run_id.clone(),
@@ -1764,8 +1764,8 @@ impl MobRunStore for RecordingRunStore {
     async fn cas_grant_node_slot(
         &self,
         run_id: &RunId,
-        expected_run_state: &crate::generated::flow_run::State,
-        next_run_state: crate::generated::flow_run::State,
+        expected_run_state: &crate::run::flow_run::State,
+        next_run_state: crate::run::flow_run::State,
         frame_id: &crate::ids::FrameId,
         expected_frame: &crate::run::FrameSnapshot,
         next_frame: crate::run::FrameSnapshot,
@@ -1809,8 +1809,8 @@ impl MobRunStore for RecordingRunStore {
         &self,
         run_id: &RunId,
         loop_instance_id: &crate::ids::LoopInstanceId,
-        expected_run_state: &crate::generated::flow_run::State,
-        next_run_state: crate::generated::flow_run::State,
+        expected_run_state: &crate::run::flow_run::State,
+        next_run_state: crate::run::flow_run::State,
         frame_id: &crate::ids::FrameId,
         expected_frame: &crate::run::FrameSnapshot,
         next_frame: crate::run::FrameSnapshot,
@@ -1836,8 +1836,8 @@ impl MobRunStore for RecordingRunStore {
         loop_instance_id: &crate::ids::LoopInstanceId,
         expected_loop: &crate::run::LoopSnapshot,
         next_loop: crate::run::LoopSnapshot,
-        expected_run_state: &crate::generated::flow_run::State,
-        next_run_state: crate::generated::flow_run::State,
+        expected_run_state: &crate::run::flow_run::State,
+        next_run_state: crate::run::flow_run::State,
     ) -> Result<bool, MobStoreError> {
         self.inner
             .cas_loop_request_body_frame(
@@ -1860,8 +1860,8 @@ impl MobRunStore for RecordingRunStore {
         frame_id: &crate::ids::FrameId,
         initial_frame: crate::run::FrameSnapshot,
         ledger_entry: crate::run::LoopIterationLedgerEntry,
-        expected_run_state: &crate::generated::flow_run::State,
-        next_run_state: crate::generated::flow_run::State,
+        expected_run_state: &crate::run::flow_run::State,
+        next_run_state: crate::run::flow_run::State,
     ) -> Result<bool, MobStoreError> {
         self.inner
             .cas_grant_body_frame_start(
@@ -1887,8 +1887,8 @@ impl MobRunStore for RecordingRunStore {
         frame_id: &crate::ids::FrameId,
         expected_frame: &crate::run::FrameSnapshot,
         next_frame: crate::run::FrameSnapshot,
-        expected_run_state: &crate::generated::flow_run::State,
-        next_run_state: crate::generated::flow_run::State,
+        expected_run_state: &crate::run::flow_run::State,
+        next_run_state: crate::run::flow_run::State,
     ) -> Result<bool, MobStoreError> {
         self.inner
             .cas_complete_body_frame(
@@ -1914,8 +1914,8 @@ impl MobRunStore for RecordingRunStore {
         frame_id: &crate::ids::FrameId,
         expected_frame: &crate::run::FrameSnapshot,
         next_frame: crate::run::FrameSnapshot,
-        expected_run_state: &crate::generated::flow_run::State,
-        next_run_state: crate::generated::flow_run::State,
+        expected_run_state: &crate::run::flow_run::State,
+        next_run_state: crate::run::flow_run::State,
     ) -> Result<bool, MobStoreError> {
         self.inner
             .cas_complete_loop(
@@ -9987,12 +9987,6 @@ async fn test_unwire_external_removes_trust_and_projection() {
     );
 }
 
-// External peer wiring was previously scope-deferred (rejection-assertion
-// tripwires fired `WiringError` containing `"scope-deferred"`). The
-// feature was restored in #31 D-external-peer; the positive-path
-// assertions live in `test_wire_external_adds_trusted_peer_and_tracks_projection`
-// and `test_unwire_external_removes_trust_and_projection` above.
-
 #[tokio::test]
 async fn test_wire_emits_peers_wired_event() {
     let (handle, _service) = create_test_mob(sample_definition()).await;
@@ -17558,24 +17552,7 @@ async fn test_unwire_prunes_stale_local_trust_when_projection_is_already_absent(
     );
 }
 
-// Preserved under #[ignore] because the scenario it covers is unique:
-// the second `handle.unwire(PeerTarget::External)` must idempotently
-// prune stale comms trust AFTER the comms runtime had trust re-injected
-// externally via `CoreCommsRuntime::add_trusted_peer`. That's the
-// "projection-absent but comms-trust-present" edge-case — a contract
-// the #25 Q2 rejection-assertion tripwires (around lines 9816/9849) do
-// NOT cover; they assert the wire/unwire rejection shape, not the
-// comms-side idempotency of stale-trust cleanup.
-//
-// The test body currently panics at setup because
-// `handle.wire(PeerTarget::External)` returns
-// `WiringError("scope-deferred")` per `MobActor::handle_wire`
-// (`actor.rs` ~line 4160): external peer wiring is scope-deferred
-// pending supervisor-owned trust authority. When that authority lands
-// (c.f. `#28 D-obs-audit` follow-up), remove the `#[ignore]` and the
-// body runs against the restored positive path.
 #[tokio::test]
-#[ignore = "external peer wiring scope-deferred; setup uses handle.wire(PeerTarget::External) which returns WiringError(\"scope-deferred\") per MobActor::handle_wire in actor.rs ~line 4160. Pending supervisor-owned trust authority restoration (#28 D-obs-audit follow-up). Unique coverage here: second unwire(External) idempotently prunes stale comms trust after CoreCommsRuntime::add_trusted_peer re-injected it — a contract the #25 Q2 rejection-assertion tripwires don't cover. When external wiring returns, remove this #[ignore] and the body should run against the restored path."]
 async fn test_unwire_external_prunes_stale_trust_when_projection_is_already_absent() {
     let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
     let (handle, service) = create_test_mob_with_real_comms(sample_definition()).await;
@@ -17587,12 +17564,12 @@ async fn test_unwire_external_prunes_stale_trust_when_projection_is_already_abse
         .bridge_session_id()
         .expect("session-backed")
         .clone();
-    let spec = TrustedPeerDescriptor::test_only_unsigned(
+    let external_keypair = meerkat_comms::Keypair::generate();
+    let external_pubkey = external_keypair.public_key();
+    let spec = TrustedPeerDescriptor::unsigned_with_pubkey(
         "remote-mob/worker/agent-x",
-        meerkat_comms::Keypair::generate()
-            .public_key()
-            .to_peer_id()
-            .to_string(),
+        external_pubkey.to_peer_id().to_string(),
+        *external_pubkey.as_bytes(),
         "inproc://remote-mob/worker/agent-x",
     )
     .expect("valid external peer");
@@ -19268,7 +19245,7 @@ async fn test_flow_with_root_frame_spec_executes_frame_nodes() {
     let run = MobRun::pending(
         crate::ids::MobId::from("test-mob"),
         FlowId::from("test-flow"),
-        crate::generated::flow_run::initial_state(),
+        crate::run::flow_run::initial_state(),
         serde_json::json!({}),
     );
     let run_id = run.run_id.clone();
@@ -19351,7 +19328,7 @@ async fn test_flow_with_root_frame_spec_executes_frame_nodes() {
     let frame_snap = run.frames.get(&frame_id).expect("frame snapshot");
     assert_eq!(
         frame_snap.kernel_state.phase,
-        crate::generated::flow_frame::Phase::Completed,
+        crate::run::flow_frame::Phase::Completed,
         "frame should be in Completed phase"
     );
 }
@@ -19700,7 +19677,7 @@ async fn test_resume_running_loop_node_completes_instead_of_failing() {
     let run = MobRun::pending(
         crate::ids::MobId::from("test-mob"),
         FlowId::from("test-flow"),
-        crate::generated::flow_run::initial_state(),
+        crate::run::flow_run::initial_state(),
         serde_json::json!({}),
     );
     let run_id = run.run_id.clone();
@@ -19755,14 +19732,14 @@ async fn test_resume_running_loop_node_completes_instead_of_failing() {
             &run_id,
             &loop_instance_id,
             crate::run::LoopSnapshot {
-                kernel_state: crate::generated::loop_iteration::State {
-                    phase: crate::generated::loop_iteration::Phase::Running,
+                kernel_state: crate::run::loop_iteration::State {
+                    phase: crate::run::loop_iteration::Phase::Running,
                     loop_instance_id: loop_instance_id.clone(),
                     parent_frame_id: frame_id.clone(),
                     parent_node_id: crate::ids::FlowNodeId::from("loop-node"),
                     loop_id: crate::ids::LoopId::from("retry"),
                     depth: 1,
-                    stage: crate::generated::loop_iteration::LoopIterationStage::AwaitingBodyFrame,
+                    stage: crate::run::loop_iteration::LoopIterationStage::AwaitingBodyFrame,
                     current_iteration: 0,
                     last_completed_iteration: 0,
                     max_iterations: 3,
@@ -19801,7 +19778,7 @@ async fn test_resume_running_loop_node_completes_instead_of_failing() {
     assert!(
         matches!(
             node_status.get("loop-node"),
-            Some(variant) if *variant == crate::generated::flow_frame::NodeRunStatus::Completed
+            Some(variant) if *variant == crate::run::flow_frame::NodeRunStatus::Completed
         ),
         "running loop node should resume to completion instead of being failed on restart"
     );
@@ -19837,7 +19814,7 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
     let run = MobRun::pending(
         crate::ids::MobId::from("test-mob"),
         FlowId::from("test-flow"),
-        crate::generated::flow_run::initial_state(),
+        crate::run::flow_run::initial_state(),
         serde_json::json!({}),
     );
     let run_id = run.run_id.clone();
@@ -19893,14 +19870,14 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
             &run_id,
             &loop_instance_id,
             crate::run::LoopSnapshot {
-                kernel_state: crate::generated::loop_iteration::State {
-                    phase: crate::generated::loop_iteration::Phase::Running,
+                kernel_state: crate::run::loop_iteration::State {
+                    phase: crate::run::loop_iteration::Phase::Running,
                     loop_instance_id: loop_instance_id.clone(),
                     parent_frame_id: frame_id.clone(),
                     parent_node_id: crate::ids::FlowNodeId::from("loop-node"),
                     loop_id: crate::ids::LoopId::from("retry"),
                     depth: 1,
-                    stage: crate::generated::loop_iteration::LoopIterationStage::BodyFrameActive,
+                    stage: crate::run::loop_iteration::LoopIterationStage::BodyFrameActive,
                     current_iteration: 0,
                     last_completed_iteration: 0,
                     max_iterations: 3,
@@ -19920,7 +19897,7 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
         .await
         .expect("seed body frame");
     let mut body_frame = root_body_frame.clone();
-    body_frame.kernel_state.frame_scope = crate::generated::flow_frame::FrameScope::Body;
+    body_frame.kernel_state.frame_scope = crate::run::flow_frame::FrameScope::Body;
     body_frame.kernel_state.loop_instance_id = loop_instance_id.clone();
     body_frame.kernel_state.iteration = 0;
     assert!(
@@ -20034,7 +20011,7 @@ async fn test_root_frame_timeout_cleans_up_inflight_node() {
         .get("start-node")
         .expect("start node status");
     assert!(
-        *start_status == crate::generated::flow_frame::NodeRunStatus::Failed,
+        *start_status == crate::run::flow_frame::NodeRunStatus::Failed,
         "timed-out root-frame step should not remain Running after terminalization: {start_status:?}"
     );
 }
@@ -20133,7 +20110,7 @@ async fn test_root_frame_max_active_nodes_limits_nested_body_step_admission() {
         let active_node_count = run.flow_state.active_node_count;
         let ready_frames_len = run.flow_state.ready_frames.len() as u64;
         let has_body_frame = run.frames.values().any(|frame| {
-            frame.kernel_state.frame_scope == crate::generated::flow_frame::FrameScope::Body
+            frame.kernel_state.frame_scope == crate::run::flow_frame::FrameScope::Body
         });
 
         if has_body_frame && active_node_count > 0 && ready_frames_len > 0 {
@@ -20214,7 +20191,7 @@ async fn test_root_frame_cancel_cleans_up_inflight_node() {
         .get("start-node")
         .expect("start node status");
     assert!(
-        *start_status != crate::generated::flow_frame::NodeRunStatus::Running,
+        *start_status != crate::run::flow_frame::NodeRunStatus::Running,
         "canceled root-frame step should not remain Running after terminalization: {start_status:?}"
     );
 }
@@ -20815,6 +20792,7 @@ struct MobRuntimeParitySnapshotSummary {
     // empty BTreeMap for the parity evaluator; full projection through the
     // runtime-parity snapshot is a follow-up to the observer wiring PR.
     member_session_bindings: BTreeMap<String, String>,
+    pending_session_ingress_detach_runtime_ids: BTreeSet<String>,
     // Track-B (R5): monotonically increasing topology epoch. Incremented on
     // every mutation of `wiring_edges` or `member_session_bindings`. Stubbed
     // here as 0 for the parity evaluator; full projection lands with the
@@ -21488,6 +21466,7 @@ async fn mob_runtime_parity_snapshot_summary(
         in_progress_task_ids,
         completed_task_ids,
         member_session_bindings,
+        pending_session_ingress_detach_runtime_ids,
     ) = dsl_t2
         .map(|snap| {
             (
@@ -21519,6 +21498,10 @@ async fn mob_runtime_parity_snapshot_summary(
                     .into_iter()
                     .map(|(k, v)| (format!("{k:?}"), format!("{v:?}")))
                     .collect::<BTreeMap<_, _>>(),
+                snap.pending_session_ingress_detach_runtime_ids
+                    .into_iter()
+                    .map(|id| format!("{id:?}"))
+                    .collect::<BTreeSet<_>>(),
             )
         })
         .unwrap_or_default();
@@ -21557,6 +21540,7 @@ async fn mob_runtime_parity_snapshot_summary(
         in_progress_task_ids,
         completed_task_ids,
         member_session_bindings,
+        pending_session_ingress_detach_runtime_ids,
         // Track-B (R5): stubbed 0 here; full projection lands alongside
         // `member_session_bindings` wiring-through when the observer
         // runtime exposes the field.
@@ -21617,6 +21601,9 @@ fn mob_runtime_parity_field_value(
                 .keys()
                 .map(|k| (k.clone(), 0u64))
                 .collect(),
+        )),
+        "pending_session_ingress_detach_runtime_ids" => Some(MobRuntimeParityExprValue::Set(
+            snapshot.pending_session_ingress_detach_runtime_ids.clone(),
         )),
         "topology_epoch" => Some(MobRuntimeParityExprValue::U64(snapshot.topology_epoch)),
         "externally_addressable_runtime_ids" => Some(MobRuntimeParityExprValue::Set(
@@ -21768,6 +21755,10 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::RunNotFound(_) => "run_not_found".to_string(),
         MobError::RunCanceled(_) => "run_canceled".to_string(),
         MobError::FlowTurnTimedOut => "flow_turn_timed_out".to_string(),
+        MobError::FrameDepthLimitExceeded { .. } => "frame_depth_limit_exceeded".to_string(),
+        MobError::FrameAtomicPersistenceUnavailable { .. } => {
+            "frame_atomic_persistence_unavailable".to_string()
+        }
         MobError::SpecRevisionConflict { .. } => "spec_revision_conflict".to_string(),
         MobError::SchemaValidation { .. } => "schema_validation".to_string(),
         MobError::InsufficientTargets { .. } => "insufficient_targets".to_string(),
@@ -21782,7 +21773,6 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::StaleFenceToken { .. } => "stale_fence_token".to_string(),
         MobError::WorkNotFound(_) => "work_not_found".to_string(),
         MobError::Internal(reason) => format!("internal:{reason}"),
-        MobError::NotYetImplemented(_) => "not_yet_implemented".to_string(),
     }
 }
 

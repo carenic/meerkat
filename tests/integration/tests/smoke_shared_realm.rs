@@ -5629,6 +5629,7 @@ async fn e2e_scenario_71_rust_sdk_realtime_audio_mob_collaboration_roundtrip()
                     "profile": "analyst",
                     "agent_identity": analyst,
                     "runtime_mode": "autonomous_host",
+                    "initial_message": "You are in deterministic fixture mode. The requester peer name for these fixture requests is always `scenario-71-mob/operator/operator-rt`. When you later receive a [SYSTEM NOTICE][PEER_REQUEST] with intent checksum_token, you must reply exactly once with send_response to=`scenario-71-mob/operator/operator-rt`, in_reply_to=<request id>, status=completed, result={\"request_intent\":\"checksum_token\",\"token\":\"birch seventeen\"}. When you later receive intent haiku_token, you must reply exactly once with send_response to=`scenario-71-mob/operator/operator-rt`, in_reply_to=<request id>, status=completed, result={\"request_intent\":\"haiku_token\",\"token\":\"silver harbor\"}. Do not browse, search, or fail those requests. Reply exactly ANALYST_READY.",
                     "additional_instructions": [
                         "You are the analyst peer for a realtime smoke test.",
                         "Correlated peer requests arrive as [SYSTEM NOTICE][PEER_REQUEST] with an intent, a request ID, and JSON params.",
@@ -5642,15 +5643,15 @@ async fn e2e_scenario_71_rust_sdk_realtime_audio_mob_collaboration_roundtrip()
                 180,
             )
             .await?;
-        eprintln!("[scenario 71] seed analyst session");
-        let _analyst_seed = pump
+        eprintln!("[scenario 71] wait analyst kickoff");
+        let _analyst_kickoff = pump
             .call(
                 &mut rpc,
-                "mob/turn_start",
+                "mob/wait_kickoff",
                 json!({
-                "mob_id": mob_id,
-                "agent_identity": analyst,
-                "prompt": "You are in deterministic fixture mode. The requester peer name for these fixture requests is always `scenario-71-mob/operator/operator-rt`. When you later receive a [SYSTEM NOTICE][PEER_REQUEST] with intent checksum_token, you must reply exactly once with send_response to=`scenario-71-mob/operator/operator-rt`, in_reply_to=<request id>, status=completed, result={\"request_intent\":\"checksum_token\",\"token\":\"birch seventeen\"}. When you later receive intent haiku_token, you must reply exactly once with send_response to=`scenario-71-mob/operator/operator-rt`, in_reply_to=<request id>, status=completed, result={\"request_intent\":\"haiku_token\",\"token\":\"silver harbor\"}. Do not browse, search, or fail those requests. Reply exactly ANALYST_READY."
+                    "mob_id": mob_id,
+                    "member_ids": [analyst],
+                    "timeout_ms": 120_000
                 }),
                 180,
             )
@@ -6463,9 +6464,42 @@ turn45_output_text={:?}; turn45_frame_log={:?}; error={err}",
                 .any(|text| text.contains("looping now")),
             "interrupted looping output must not survive into canonical history after recall: {turn6_history}"
         );
-        let _turn6_quiesced =
-            ensure_realtime_session_quiescent(&mut sender, &mut receiver, &turn6_capture, 5)
-                .await?;
+        eprintln!("[scenario 71] reopen realtime channel after barge-in segment");
+        sender.close().await?;
+        drop(receiver);
+        let _post_barge_detached =
+            wait_for_pump_member_status(&mut pump, &mut rpc, mob_id, operator, 30, |status| {
+                status["realtime_attachment_status"].as_str() == Some("unattached")
+            })
+            .await?;
+        let post_barge_open_info_value = pump
+            .call(
+                &mut rpc,
+                "realtime/open_info",
+                json!({
+                    "target": {
+                        "type": "session_target",
+                        "session_id": current_session_id,
+                    },
+                    "role": "primary",
+                    "turning_mode": "provider_managed",
+                }),
+                30,
+            )
+            .await?;
+        let post_barge_open_info: meerkat::contracts::RealtimeOpenInfo =
+            serde_json::from_value(post_barge_open_info_value)?;
+        let post_barge_reconnect = channel.connect(&post_barge_open_info).await?;
+        let (post_barge_sender, post_barge_receiver) = post_barge_reconnect.split();
+        sender = post_barge_sender;
+        receiver = post_barge_receiver;
+        let _post_barge_ready_capture =
+            collect_realtime_frames_until_ready_or_idle(&mut receiver, 5).await?;
+        let _post_barge_binding_ready =
+            wait_for_pump_member_status(&mut pump, &mut rpc, mob_id, operator, 30, |status| {
+                status["realtime_attachment_status"].as_str() == Some("binding_ready")
+            })
+            .await?;
 
         eprintln!("[scenario 71] send turn 7 haiku request");
         let analyst_event_count_before_turn7 = pump.mob_stream_events(&analyst_stream).len();

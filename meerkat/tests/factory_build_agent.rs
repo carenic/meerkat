@@ -323,16 +323,11 @@ async fn build_agent_without_override_fails_missing_api_key() {
     );
 }
 
-/// 2b. Ambient-credential refusal: the wave-c auth-seam cleanup (dogma
-///     §15/§19, commit `28e7a51c1`) deleted env-default realm synthesis
-///     AND first-matching-provider promotion. `build_agent` with no
-///     `connection_ref` refuses to resolve from `config.realm["default"]`
-///     even when it holds a matching provider — the refusal is
-///     intentional; "ambient" resolution was the silent-bypass path
-///     the deletion targeted. This test pins the rejection contract so
-///     future refactors can't silently re-introduce ambient resolution.
+/// 2b. A missing connection_ref resolves through the configured default realm
+///     binding. This is a valid typed auth path, distinct from first-provider
+///     ambient credential search.
 #[tokio::test]
-async fn build_agent_without_connection_ref_rejects_ambient_realm_config_api_key() {
+async fn build_agent_without_connection_ref_uses_default_realm_config_api_key() {
     let temp = tempfile::tempdir().unwrap();
     let factory = temp_factory(&temp);
     let mut config = Config::default();
@@ -342,17 +337,24 @@ async fn build_agent_without_connection_ref_rejects_ambient_realm_config_api_key
 
     let build_config = AgentBuildConfig::new("gpt-5.2");
     assert!(build_config.connection_ref.is_none());
-    match factory.build_agent(build_config, &config).await {
-        Ok(_) => panic!(
-            "build_agent without connection_ref must reject with ambient-credential refusal \
-             per wave-c auth-seam cleanup"
-        ),
-        Err(meerkat::BuildAgentError::ConnectionResolution(msg)) => assert!(
-            msg.contains("ambient credential selection refused"),
-            "expected ambient-credential refusal, got: {msg}"
-        ),
-        Err(other) => panic!("expected BuildAgentError::ConnectionResolution, got: {other:?}"),
-    }
+    let agent = factory
+        .build_agent(build_config, &config)
+        .await
+        .expect("default realm config API key should resolve without explicit connection_ref");
+    let metadata = agent
+        .session()
+        .session_metadata()
+        .expect("session should have metadata");
+    assert_eq!(metadata.provider, Provider::OpenAI);
+    assert_eq!(
+        metadata.connection_ref.as_ref().map(|conn_ref| {
+            (
+                conn_ref.realm.as_str().to_string(),
+                conn_ref.binding.as_str().to_string(),
+            )
+        }),
+        Some(("default".to_string(), "default_openai".to_string()))
+    );
 }
 
 /// 3. `build_agent` with unknown provider model fails.

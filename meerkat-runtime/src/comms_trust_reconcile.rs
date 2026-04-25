@@ -31,13 +31,10 @@
 //! 3-field struct was superseded by
 //! `meerkat_core::comms::TrustedPeerDescriptor` (typed `PeerName` /
 //! `PeerId` / `PeerAddress` atoms + `pubkey: [u8; 32]` signing key).
-//! The DSL `PeerEndpoint` still carries the three slug-string shadows
-//! of the identity atoms; the reconciler parses them to typed atoms
-//! at the trust-store boundary and stamps a zero pubkey (same shape
-//! `TrustedPeerDescriptor::test_only_unsigned` produces — signature
-//! verification will fail closed against the zero key, which is the
-//! correct fail-closed default until the DSL projection also carries
-//! the pubkey).
+//! The DSL `PeerEndpoint` carries typed mirrors of those atoms plus
+//! the peer signing key; the reconciler parses the string-shaped
+//! identity atoms at the trust-store boundary and forwards the
+//! machine-owned key bytes unchanged.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -262,16 +259,12 @@ impl CommsTrustReconciler {
     }
 }
 
-/// Parse a DSL `PeerEndpoint` (string-shadowed identity atoms) into a
-/// core `TrustedPeerDescriptor` with typed atoms.
+/// Parse a DSL `PeerEndpoint` into a core `TrustedPeerDescriptor`.
 ///
-/// The DSL carries slug strings so the schema validator sees opaque
-/// newtype shapes; the trust store requires parsed typed atoms. The
-/// pubkey is zero-filled because the current DSL projection does not
-/// yet carry signing keys — envelope signature verification fails
-/// closed against the zero key, which is the correct default for a
-/// reconciler that has no key material. Real production wiring of
-/// signing keys into the DSL projection is a follow-up seam concern.
+/// The DSL carries string-backed identity atoms so the schema
+/// validator sees opaque newtype shapes; the trust store requires
+/// parsed typed atoms. The signing key is already part of the
+/// MeerkatMachine-owned projection and is forwarded unchanged.
 fn endpoint_to_descriptor(
     endpoint: &PeerEndpoint,
 ) -> Result<TrustedPeerDescriptor, CommsTrustReconcileError> {
@@ -297,7 +290,7 @@ fn endpoint_to_descriptor(
         name,
         peer_id,
         address,
-        pubkey: [0u8; 32],
+        pubkey: endpoint.signing_key.0,
     })
 }
 
@@ -330,6 +323,7 @@ mod tests {
             name: crate::meerkat_machine::dsl::PeerName(format!("ep-{name}")),
             peer_id: crate::meerkat_machine::dsl::PeerId(peer_id_uuid.to_string()),
             address: crate::meerkat_machine::dsl::PeerAddress(format!("inproc://{name}")),
+            signing_key: crate::meerkat_machine::dsl::PeerSigningKey([name.as_bytes()[0]; 32]),
         }
     }
 
@@ -429,8 +423,16 @@ mod tests {
             "add_trusted_peer must be called with the parsed (name, peer_id, address) triple",
         );
         assert!(
-            add_calls.iter().all(|d| d.pubkey == [0u8; 32]),
-            "reconciler stamps a zero pubkey — DSL projection does not yet carry signing keys",
+            add_calls
+                .iter()
+                .any(|d| d.peer_id.to_string() == UUID_A && d.pubkey == [b'A'; 32]),
+            "reconciler must forward the machine-owned signing key for peer A",
+        );
+        assert!(
+            add_calls
+                .iter()
+                .any(|d| d.peer_id.to_string() == UUID_B && d.pubkey == [b'B'; 32]),
+            "reconciler must forward the machine-owned signing key for peer B",
         );
     }
 
@@ -524,6 +526,7 @@ mod tests {
             name: crate::meerkat_machine::dsl::PeerName("ep-bad".into()),
             peer_id: crate::meerkat_machine::dsl::PeerId("not-a-uuid".into()),
             address: crate::meerkat_machine::dsl::PeerAddress("inproc://bad".into()),
+            signing_key: crate::meerkat_machine::dsl::PeerSigningKey([9u8; 32]),
         };
         let err = reconciler
             .reconcile(1, BTreeSet::from([bad]))

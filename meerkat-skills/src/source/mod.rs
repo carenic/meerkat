@@ -11,6 +11,8 @@ pub mod http;
 pub mod memory;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod protocol;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod remote;
 
 use meerkat_core::skills::{
     SkillArtifact, SkillArtifactContent, SkillCollection, SkillDescriptor, SkillDocument,

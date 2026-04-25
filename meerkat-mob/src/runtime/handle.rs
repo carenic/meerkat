@@ -153,6 +153,17 @@ impl MobMemberSnapshot {
     pub fn agent_identity(&self) -> &AgentIdentity {
         &self.agent_runtime_id.identity
     }
+
+    /// Runtime incarnation identity for diagnostic/control projections.
+    ///
+    /// These atoms stay out of generic `Serialize` output so app-facing
+    /// receipts do not couple callers to bridge internals. Surfaces that own a
+    /// control contract, such as `mob/member_status`, must opt in through this
+    /// accessor and project the fields explicitly.
+    #[must_use]
+    pub fn runtime_identity_fields(&self) -> (&AgentRuntimeId, FenceToken) {
+        (&self.agent_runtime_id, self.fence_token)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -519,6 +530,8 @@ pub struct HelperOptions {
     pub backend: Option<MobBackendKind>,
     /// Tool access policy for the helper.
     pub tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
+    /// Explicit auth binding used for the helper member's agent build.
+    pub connection_ref: Option<meerkat_core::ConnectionRef>,
 }
 
 /// Result from a helper spawn-and-wait operation.
@@ -727,13 +740,11 @@ pub struct SpawnMemberSpec {
     /// tooling to specify a different model/skills/tools via inline or
     /// realm-scoped profiles.
     pub override_profile: Option<crate::profile::Profile>,
-    /// Per-member auth binding (deferral §1). When set, this member's
-    /// agent builds with `AgentBuildConfig.connection_ref = Some(this)`
-    /// — scoping credential resolution to the named realm + binding.
-    /// `None` means the member uses env-default / config-realm fallback
-    /// (mob members do NOT currently auto-inherit the spawner's
-    /// binding; that's a separate plumbing concern per dogma §19 —
-    /// we don't add a tri-state until Inherit has real semantics).
+    /// Per-member auth binding. When set, this member's agent builds with
+    /// `AgentBuildConfig.connection_ref = Some(this)`, scoping credential
+    /// resolution to the named realm + binding. `None` means the caller did not
+    /// provide binding authority; build paths that require a binding must reject
+    /// the spawn instead of promoting an ambient fallback.
     pub connection_ref: Option<meerkat_core::ConnectionRef>,
 }
 
@@ -3379,6 +3390,7 @@ impl MobHandle {
         );
         spec.backend = options.backend;
         spec.tool_access_policy = options.tool_access_policy;
+        spec.connection_ref = options.connection_ref;
         spec.auto_wire_parent = true;
 
         self.spawn_spec(spec).await?;
@@ -3418,6 +3430,7 @@ impl MobHandle {
         );
         spec.backend = options.backend;
         spec.tool_access_policy = options.tool_access_policy;
+        spec.connection_ref = options.connection_ref;
         spec.auto_wire_parent = true;
         spec.launch_mode = crate::launch::MemberLaunchMode::Fork {
             source_member_id,
@@ -3560,6 +3573,34 @@ mod tests {
         // (derived from `agent_runtime_id.identity`).
         assert!(snapshot_value.get("agent_runtime_id").is_none());
         assert!(snapshot_value.get("fence_token").is_none());
+    }
+
+    #[test]
+    fn mob_member_snapshot_exposes_runtime_identity_only_by_accessor() {
+        let runtime_id = AgentRuntimeId::new(AgentIdentity::from("worker"), Generation::new(3));
+        let snapshot = MobMemberSnapshot {
+            status: MobMemberStatus::Active,
+            agent_runtime_id: runtime_id.clone(),
+            fence_token: FenceToken::new(9),
+            output_preview: None,
+            error: None,
+            tokens_used: 0,
+            is_final: false,
+            realtime_attachment_status: None,
+            current_session_id: None,
+            current_bridge_session_id: None,
+            peer_connectivity: None,
+            kickoff: None,
+        };
+
+        let snapshot_value =
+            serde_json::to_value(&snapshot).expect("snapshot should serialize to json");
+        assert!(snapshot_value.get("agent_runtime_id").is_none());
+        assert!(snapshot_value.get("fence_token").is_none());
+
+        let (projected_runtime_id, projected_fence_token) = snapshot.runtime_identity_fields();
+        assert_eq!(projected_runtime_id, &runtime_id);
+        assert_eq!(projected_fence_token, FenceToken::new(9));
     }
 
     #[test]
