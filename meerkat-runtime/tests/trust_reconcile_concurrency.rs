@@ -32,7 +32,9 @@ use async_trait::async_trait;
 use meerkat_core::agent::CommsRuntime;
 use meerkat_core::comms::{SendError, TrustedPeerDescriptor};
 use meerkat_runtime::comms_trust_reconcile::{CommsTrustReconciler, ReconcileReport};
-use meerkat_runtime::meerkat_machine::dsl::{PeerAddress, PeerEndpoint, PeerId, PeerName};
+use meerkat_runtime::meerkat_machine::dsl::{
+    PeerAddress, PeerEndpoint, PeerId, PeerName, PeerSigningKey,
+};
 
 const UUID_A: &str = "aaaaaaaa-0000-4000-8000-000000000001";
 const UUID_B: &str = "bbbbbbbb-0000-4000-8000-000000000002";
@@ -42,6 +44,7 @@ fn endpoint(name: &str, peer_id_uuid: &str) -> PeerEndpoint {
         name: PeerName(format!("ep-{name}")),
         peer_id: PeerId(peer_id_uuid.to_string()),
         address: PeerAddress(format!("inproc://{name}")),
+        signing_key: PeerSigningKey([name.as_bytes()[0]; 32]),
     }
 }
 

@@ -11,7 +11,7 @@
 //! `meerkat-machine-schema/src/catalog/dsl/meerkat_machine.rs` and the
 //! runtime-side twin at `meerkat-runtime/src/meerkat_machine/dsl.rs`
 //! must stay in lockstep — identical field set with identical typed
-//! shapes (`PeerName`, `PeerId`, `PeerAddress`) — and both must expose
+//! shapes (`PeerName`, `PeerId`, `PeerAddress`, `PeerSigningKey`) — and both must expose
 //! `From<&meerkat_core::comms::TrustedPeerDescriptor>` so the
 //! runtime/comms seam can project trusted-peer descriptors into either
 //! DSL without per-site coercion. Renames / additions / deletions on
@@ -125,6 +125,7 @@ fn peer_endpoint_schema_and_runtime_fields_are_identical() {
         ("name", "PeerName"),
         ("peer_id", "PeerId"),
         ("address", "PeerAddress"),
+        ("signing_key", "PeerSigningKey"),
     ] {
         let actual = schema_fields
             .get(field)
@@ -170,7 +171,8 @@ fn peer_endpoint_schema_from_trusted_peer_descriptor_round_trip() {
         "11111111-2222-5333-8444-555555555555",
         "inproc://alice",
     )
-    .expect("synthesize a valid trusted peer descriptor");
+    .expect("synthesize a valid trusted peer descriptor")
+    .with_pubkey([42u8; 32]);
 
     let endpoint = PeerEndpoint::from(&descriptor);
 
@@ -188,5 +190,9 @@ fn peer_endpoint_schema_from_trusted_peer_descriptor_round_trip() {
         endpoint.address.as_str(),
         descriptor.address.to_string().as_str(),
         "schema PeerEndpoint.address must mirror descriptor.address"
+    );
+    assert_eq!(
+        endpoint.signing_key.0, descriptor.pubkey,
+        "schema PeerEndpoint.signing_key must mirror descriptor.pubkey"
     );
 }

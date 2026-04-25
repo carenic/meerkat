@@ -1749,8 +1749,8 @@ impl From<crate::HandlingMode> for InputLane {
 }
 
 // Track-B (R5): declarative peer endpoint descriptor for the runtime
-// DSL. Shape mirrors `meerkat_core::comms::TrustedPeerSpec`. The
-// catalog DSL holds an identical type; the two are structurally
+// DSL. Shape mirrors `meerkat_core::comms::TrustedPeerDescriptor`.
+// The catalog DSL holds an identical type; the two are structurally
 // equivalent so the schema validator sees consistent opaque struct
 // shapes.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -1758,6 +1758,7 @@ pub struct PeerEndpoint {
     pub name: PeerName,
     pub peer_id: PeerId,
     pub address: PeerAddress,
+    pub signing_key: PeerSigningKey,
 }
 
 impl PeerEndpoint {
@@ -1765,11 +1766,13 @@ impl PeerEndpoint {
         name: impl Into<PeerName>,
         peer_id: impl Into<PeerId>,
         address: impl Into<PeerAddress>,
+        signing_key: impl Into<PeerSigningKey>,
     ) -> Self {
         Self {
             name: name.into(),
             peer_id: peer_id.into(),
             address: address.into(),
+            signing_key: signing_key.into(),
         }
     }
 }
@@ -1780,7 +1783,21 @@ impl From<&meerkat_core::comms::TrustedPeerDescriptor> for PeerEndpoint {
             name: PeerName(spec.name.as_str().to_owned()),
             peer_id: PeerId(spec.peer_id.to_string()),
             address: PeerAddress(spec.address.to_string()),
+            signing_key: PeerSigningKey(spec.pubkey),
         }
+    }
+}
+
+/// DSL-local carrier for the Ed25519 public signing key associated with a
+/// peer endpoint. The MeerkatMachine owns this projection alongside the
+/// endpoint identity atoms so trust reconciliation can install the exact
+/// key into the comms trust store without shell-side defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct PeerSigningKey(pub [u8; 32]);
+
+impl From<[u8; 32]> for PeerSigningKey {
+    fn from(key: [u8; 32]) -> Self {
+        Self(key)
     }
 }
 
