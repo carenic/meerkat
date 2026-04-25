@@ -4,10 +4,38 @@ set -euo pipefail
 workspace_root="$(git rev-parse --show-toplevel)"
 cd "${workspace_root}"
 
-temp_root="${MEERKAT_BUILDBUDDY_OUTPUT_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/meerkat-bb-ci-workspace.XXXXXX")}"
+mode="fresh"
+case "${1:-}" in
+  "" | --fresh)
+    mode="fresh"
+    ;;
+  --warm)
+    mode="warm"
+    ;;
+  -h | --help)
+    cat <<'EOF'
+usage: buildbuddy-ci-workspace [--fresh|--warm]
+
+Modes:
+  --fresh  Run on temporary output roots and remove them afterwards.
+  --warm   Reuse a stable output root for repeated local/agent gates.
+EOF
+    exit 0
+    ;;
+  *)
+    echo "unknown argument: $1" >&2
+    exit 2
+    ;;
+esac
+
 created_temp=0
-if [[ -z "${MEERKAT_BUILDBUDDY_OUTPUT_ROOT:-}" ]]; then
-  created_temp=1
+if [[ "${mode}" == "warm" ]]; then
+  temp_root="${MEERKAT_BUILDBUDDY_OUTPUT_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-ci-workspace}"
+else
+  temp_root="${MEERKAT_BUILDBUDDY_OUTPUT_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/meerkat-bb-ci-workspace.XXXXXX")}"
+  if [[ -z "${MEERKAT_BUILDBUDDY_OUTPUT_ROOT:-}" ]]; then
+    created_temp=1
+  fi
 fi
 
 cleanup() {
@@ -37,7 +65,11 @@ run_lane() {
   shift 3
   (
     export MEERKAT_BUILDBUDDY_OUTPUT_ROOT="${temp_root}"
-    export BUILDBUDDY_MAX_IDLE_SECS="${BUILDBUDDY_MAX_IDLE_SECS:-5}"
+    if [[ "${mode}" == "warm" ]]; then
+      export BUILDBUDDY_MAX_IDLE_SECS="${BUILDBUDDY_MAX_IDLE_SECS:-600}"
+    else
+      export BUILDBUDDY_MAX_IDLE_SECS="${BUILDBUDDY_MAX_IDLE_SECS:-5}"
+    fi
     export RUST_LANE_ID="${lane}"
     export BUILDBUDDY_BAZEL_COMMAND="${command}"
     ./scripts/buildbuddy-bazel-poc "$@"
@@ -72,7 +104,7 @@ end_seconds="$(date +%s)"
 test_status="$(cat "${test_status_file}" 2>/dev/null || echo 1)"
 clippy_status="$(cat "${clippy_status_file}" 2>/dev/null || echo 1)"
 
-printf 'BuildBuddy workspace CI wall: %ss\n' "$((end_seconds - start_seconds))"
+printf 'BuildBuddy workspace CI (%s) wall: %ss\n' "${mode}" "$((end_seconds - start_seconds))"
 summarize_log "workspace-test-rbe" "${test_status}" "${test_log}"
 summarize_log "clippy-rbe" "${clippy_status}" "${clippy_log}"
 
