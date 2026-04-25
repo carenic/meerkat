@@ -1,0 +1,515 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_macro", "rust_test")
+
+
+
+filegroup(
+
+    name = "cargo_manifest",
+
+    srcs = ["Cargo.toml"],
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+filegroup(
+
+    name = "package_runfiles",
+
+    srcs = glob(["Cargo.toml", "**/*"], exclude = ["BUILD", "BUILD.bazel"], allow_empty = True),
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+rust_library(
+    name = "meerkat_mob",
+    aliases = aliases(package_name = "meerkat-mob"),
+    crate_name = "meerkat_mob",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "runtime-adapter",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    proc_macro_deps = [
+        "//meerkat-machine-derive:meerkat_machine_derive",
+        "//meerkat-machine-dsl:meerkat_machine_dsl",
+    ] + all_crate_deps(
+        package_name = "meerkat-mob",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-machine-kernels:meerkat_machine_kernels",
+        "//meerkat-machine-schema:meerkat_machine_schema",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-session:meerkat_session",
+        "//meerkat-store:meerkat_store",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-mob",
+        normal = True,
+    ),
+)
+
+rust_test(
+    name = "dispatcher_rule_synthetic_injection_test",
+    aliases = aliases(
+        package_name = "meerkat-mob",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "dispatcher_rule_synthetic_injection",
+    crate_root = "tests/dispatcher_rule_synthetic_injection.rs",
+    crate_features = [
+        "runtime-adapter",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/dispatcher_rule_synthetic_injection.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "dispatcher_rule_synthetic_injection",
+        "CARGO_MANIFEST_DIR": "./meerkat-mob",
+    },
+    tags = [
+        "fast",
+    ],
+    data = [
+        ":package_runfiles",
+        "//xtask:package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = [
+        "//meerkat-machine-derive:meerkat_machine_derive",
+        "//meerkat-machine-dsl:meerkat_machine_dsl",
+    ] + all_crate_deps(
+        package_name = "meerkat-mob",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-machine-kernels:meerkat_machine_kernels",
+        "//meerkat-machine-schema:meerkat_machine_schema",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-session:meerkat_session",
+        "//meerkat-store:meerkat_store",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-mob",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "flow_frame_cas_tests_test",
+    aliases = aliases(
+        package_name = "meerkat-mob",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "flow_frame_cas_tests",
+    crate_root = "tests/flow_frame_cas_tests.rs",
+    crate_features = [
+        "runtime-adapter",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/flow_frame_cas_tests.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "flow_frame_cas_tests",
+        "CARGO_MANIFEST_DIR": "./meerkat-mob",
+    },
+    tags = [
+        "fast",
+    ],
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = [
+        "//meerkat-machine-derive:meerkat_machine_derive",
+        "//meerkat-machine-dsl:meerkat_machine_dsl",
+    ] + all_crate_deps(
+        package_name = "meerkat-mob",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-machine-kernels:meerkat_machine_kernels",
+        "//meerkat-machine-schema:meerkat_machine_schema",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-session:meerkat_session",
+        "//meerkat-store:meerkat_store",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-mob",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "flow_frame_e2e_tests_test",
+    aliases = aliases(
+        package_name = "meerkat-mob",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "flow_frame_e2e_tests",
+    crate_root = "tests/flow_frame_e2e_tests.rs",
+    crate_features = [
+        "runtime-adapter",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/flow_frame_e2e_tests.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "flow_frame_e2e_tests",
+        "CARGO_MANIFEST_DIR": "./meerkat-mob",
+    },
+    tags = [
+        "e2e",
+    ],
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = [
+        "//meerkat-machine-derive:meerkat_machine_derive",
+        "//meerkat-machine-dsl:meerkat_machine_dsl",
+    ] + all_crate_deps(
+        package_name = "meerkat-mob",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-machine-kernels:meerkat_machine_kernels",
+        "//meerkat-machine-schema:meerkat_machine_schema",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-session:meerkat_session",
+        "//meerkat-store:meerkat_store",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-mob",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "flow_frame_recovery_tests_test",
+    aliases = aliases(
+        package_name = "meerkat-mob",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "flow_frame_recovery_tests",
+    crate_root = "tests/flow_frame_recovery_tests.rs",
+    crate_features = [
+        "runtime-adapter",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/flow_frame_recovery_tests.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "flow_frame_recovery_tests",
+        "CARGO_MANIFEST_DIR": "./meerkat-mob",
+    },
+    tags = [
+        "fast",
+    ],
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = [
+        "//meerkat-machine-derive:meerkat_machine_derive",
+        "//meerkat-machine-dsl:meerkat_machine_dsl",
+    ] + all_crate_deps(
+        package_name = "meerkat-mob",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-machine-kernels:meerkat_machine_kernels",
+        "//meerkat-machine-schema:meerkat_machine_schema",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-session:meerkat_session",
+        "//meerkat-store:meerkat_store",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-mob",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "member_session_bindings_test",
+    aliases = aliases(
+        package_name = "meerkat-mob",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "member_session_bindings",
+    crate_root = "tests/member_session_bindings.rs",
+    crate_features = [
+        "runtime-adapter",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/member_session_bindings.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "member_session_bindings",
+        "CARGO_MANIFEST_DIR": "./meerkat-mob",
+    },
+    tags = [
+        "fast",
+    ],
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = [
+        "//meerkat-machine-derive:meerkat_machine_derive",
+        "//meerkat-machine-dsl:meerkat_machine_dsl",
+    ] + all_crate_deps(
+        package_name = "meerkat-mob",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-machine-kernels:meerkat_machine_kernels",
+        "//meerkat-machine-schema:meerkat_machine_schema",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-session:meerkat_session",
+        "//meerkat-store:meerkat_store",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-mob",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "mob_orchestrator_kernel_test",
+    aliases = aliases(
+        package_name = "meerkat-mob",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "mob_orchestrator_kernel",
+    crate_root = "tests/mob_orchestrator_kernel.rs",
+    crate_features = [
+        "runtime-adapter",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/mob_orchestrator_kernel.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "mob_orchestrator_kernel",
+        "CARGO_MANIFEST_DIR": "./meerkat-mob",
+    },
+    tags = [
+        "fast",
+    ],
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = [
+        "//meerkat-machine-derive:meerkat_machine_derive",
+        "//meerkat-machine-dsl:meerkat_machine_dsl",
+    ] + all_crate_deps(
+        package_name = "meerkat-mob",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-machine-kernels:meerkat_machine_kernels",
+        "//meerkat-machine-schema:meerkat_machine_schema",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-session:meerkat_session",
+        "//meerkat-store:meerkat_store",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-mob",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "shadow_state_absent_test",
+    aliases = aliases(
+        package_name = "meerkat-mob",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "shadow_state_absent",
+    crate_root = "tests/shadow_state_absent.rs",
+    crate_features = [
+        "runtime-adapter",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/shadow_state_absent.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "shadow_state_absent",
+        "CARGO_MANIFEST_DIR": "./meerkat-mob",
+    },
+    tags = [
+        "fast",
+    ],
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = [
+        "//meerkat-machine-derive:meerkat_machine_derive",
+        "//meerkat-machine-dsl:meerkat_machine_dsl",
+    ] + all_crate_deps(
+        package_name = "meerkat-mob",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-machine-kernels:meerkat_machine_kernels",
+        "//meerkat-machine-schema:meerkat_machine_schema",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-session:meerkat_session",
+        "//meerkat-store:meerkat_store",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-mob",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+test_suite(
+    name = "fast_tests",
+    tests = [
+        ":dispatcher_rule_synthetic_injection_test",
+        ":flow_frame_cas_tests_test",
+        ":flow_frame_recovery_tests_test",
+        ":member_session_bindings_test",
+        ":mob_orchestrator_kernel_test",
+        ":shadow_state_absent_test",
+    ],
+)
+

@@ -1,0 +1,547 @@
+#!/usr/bin/env node
+import { execFileSync } from "node:child_process";
+import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { dirname, relative, resolve } from "node:path";
+
+const root = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+  encoding: "utf8",
+}).trim();
+const metadata = JSON.parse(
+  execFileSync("./scripts/repo-cargo", ["metadata", "--format-version=1"], {
+    cwd: root,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  }),
+);
+
+const workspaceMembers = new Set(metadata.workspace_members);
+const localPackages = new Map(
+  metadata.packages
+    .filter((pkg) => pkg.source === null && workspaceMembers.has(pkg.id))
+    .map((pkg) => [pkg.id, pkg]),
+);
+const byName = new Map(
+  [...localPackages.values()].map((pkg) => [pkg.name, pkg]),
+);
+const packageDir = (pkg) => dirname(pkg.manifest_path);
+const packageKey = (pkg) => {
+  const dir = relative(root, packageDir(pkg));
+  return dir.includes("/") || dir !== pkg.name ? dir : pkg.name;
+};
+const packageLabel = (pkg) => `//${relative(root, packageDir(pkg))}:${crateName(pkg.name)}`;
+const crateName = (name) => name.replaceAll("-", "_");
+const q = (value) => JSON.stringify(value);
+
+function defaultFeatures(pkg) {
+  return pkg.features?.default ?? [];
+}
+
+const activeFeatures = new Map(
+  [...localPackages.values()].map((pkg) => [pkg.id, new Set(defaultFeatures(pkg))]),
+);
+
+function addFeature(pkg, feature) {
+  if (!feature || feature.startsWith("dep:")) return false;
+  const features = activeFeatures.get(pkg.id);
+  const previousSize = features.size;
+  features.add(feature);
+  return features.size !== previousSize;
+}
+
+function localPackageForDependency(pkg, depName) {
+  const dep = pkg.dependencies.find((candidate) => candidate.name === depName && candidate.source === null);
+  return dep ? byName.get(dep.name) : null;
+}
+
+let changed = true;
+while (changed) {
+  changed = false;
+  for (const pkg of localPackages.values()) {
+    for (const dep of pkg.dependencies) {
+      if (dep.source !== null) continue;
+      const local = byName.get(dep.name);
+      if (!local) continue;
+      for (const feature of dep.features ?? []) {
+        changed = addFeature(local, feature) || changed;
+      }
+      if (dep.uses_default_features) {
+        for (const feature of defaultFeatures(local)) {
+          changed = addFeature(local, feature) || changed;
+        }
+      }
+    }
+
+    for (const feature of [...activeFeatures.get(pkg.id)]) {
+      for (const expansion of pkg.features?.[feature] ?? []) {
+        const [depName, depFeature] = expansion.split("/", 2);
+        const local = depFeature ? localPackageForDependency(pkg, depName) : null;
+        if (local) {
+          changed = addFeature(local, depFeature) || changed;
+        } else {
+          changed = addFeature(pkg, expansion) || changed;
+        }
+      }
+    }
+  }
+}
+
+function targetRule(target) {
+  if (target.kind.includes("proc-macro")) return "rust_proc_macro";
+  if (target.kind.includes("test")) return "rust_test";
+  if (target.kind.includes("bin")) return "rust_binary";
+  if (target.kind.includes("lib")) return "rust_library";
+  return null;
+}
+
+function localDeps(pkg, procMacroOnly) {
+  const labels = [];
+  for (const dep of pkg.dependencies) {
+    if (dep.source !== null) continue;
+    const local = byName.get(dep.name);
+    if (!local) continue;
+    const target = local.targets.find((candidate) =>
+      candidate.kind.includes("proc-macro") || candidate.kind.includes("lib")
+    );
+    const isProc = target?.kind.includes("proc-macro") ?? false;
+    if (isProc === procMacroOnly) labels.push(packageLabel(local));
+  }
+  return [...new Set(labels)].sort();
+}
+
+function listExpr(values, indent = 8) {
+  if (values.length === 0) return "[]";
+  const pad = " ".repeat(indent);
+  return `[\n${values.map((v) => `${pad}${q(v)},`).join("\n")}\n${" ".repeat(indent - 4)}]`;
+}
+
+function needsWorkspaceRunfiles(target) {
+  const source = readFileSync(target.src_path, "utf8");
+  return [
+    "workspace_root",
+    "rev-parse",
+    ".github/",
+    "test-fixtures",
+    "scan_for_manual_input_schema_literals",
+    "meerkat-runtime/",
+    "meerkat-machine-schema/",
+    "meerkat-core/",
+    "target-codex",
+  ].some((needle) => source.includes(needle));
+}
+
+function workspaceDataLabels(target) {
+  const source = readFileSync(target.src_path, "utf8");
+  const labels = new Set();
+  if (source.includes("workspace_root") || source.includes("rev-parse")) {
+    labels.add("//:workspace_metadata");
+    labels.add("//:workspace_cargo_manifests");
+  }
+  if (source.includes(".github/")) {
+    labels.add("//:github_workflows");
+  }
+  if (source.includes("test-fixtures")) {
+    labels.add("//:test_fixtures");
+    labels.add("//test-fixtures/machine-dsl-tests:package_runfiles");
+    labels.add("//test-fixtures/mcp-test-server:package_runfiles");
+    labels.add("//test-fixtures/surface-build-fixtures:package_runfiles");
+  }
+  if (target.name === "rmat_audit") {
+    labels.add("//:repo_governance_files");
+  }
+  if (target.name === "protocol_codegen_drift") {
+    for (const label of packageRunfileLabels) labels.add(label);
+  }
+  if (source.includes("scan_for_manual_input_schema_literals")) {
+    labels.add("//:workspace_rust_sources");
+  }
+  for (const pkg of localPackages.values()) {
+    const dir = relative(root, packageDir(pkg));
+    if (!dir) continue;
+    const quotedDir = source.includes(q(dir)) || source.includes(`'${dir}'`) || source.includes(`\`${dir}\``);
+    const pathLikeDir =
+      source.includes(`${dir}/`) ||
+      source.includes(`./${dir}`) ||
+      source.includes(`join(${q(dir)})`);
+    if (source.includes("Cargo.toml") && (quotedDir || pathLikeDir)) {
+      labels.add(`//${dir}:cargo_manifest`);
+    }
+    if (pathLikeDir) {
+      labels.add(`//${dir}:package_runfiles`);
+    }
+  }
+  return [...labels].sort();
+}
+
+function rustSourceFiles(packageRoot, includeTests) {
+  const roots = [resolve(packageRoot, "src")];
+  if (includeTests) roots.push(resolve(packageRoot, "tests"));
+  const files = [];
+  for (const start of roots) {
+    try {
+      const stack = [start];
+      while (stack.length) {
+        const current = stack.pop();
+        const stat = statSync(current);
+        if (stat.isDirectory()) {
+          for (const entry of readdirSync(current)) stack.push(resolve(current, entry));
+        } else if (current.endsWith(".rs")) {
+          files.push(current);
+        }
+      }
+    } catch {
+      // Not every package has every source root.
+    }
+  }
+  return files.sort();
+}
+
+function testSourcePaths(target, packageRoot) {
+  const seen = new Set();
+  const paths = new Set();
+
+  function visit(file) {
+    if (seen.has(file)) return;
+    seen.add(file);
+    if (!file.startsWith(`${packageRoot}/`)) return;
+    const rel = relative(packageRoot, file);
+    if (!rel || rel.startsWith("..")) return;
+    paths.add(rel);
+
+    const source = readFileSync(file, "utf8");
+    const lineRe = /#[ \t]*\[[ \t]*path[ \t]*=[ \t]*"([^"]+)"[ \t]*\][ \t]*|(?:^|\n)[ \t]*(?:pub[ \t]+)?mod[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*;/g;
+    let pendingPath = null;
+    for (const match of source.matchAll(lineRe)) {
+      if (match[1]) {
+        pendingPath = match[1];
+        continue;
+      }
+      const modName = match[2];
+      if (!modName) continue;
+      if (pendingPath) {
+        visit(resolve(dirname(file), pendingPath));
+        pendingPath = null;
+        continue;
+      }
+      const flat = resolve(dirname(file), `${modName}.rs`);
+      const nested = resolve(dirname(file), modName, "mod.rs");
+      try {
+        if (statSync(flat).isFile()) {
+          visit(flat);
+          continue;
+        }
+      } catch {
+        // Try nested module layout below.
+      }
+      try {
+        if (statSync(nested).isFile()) visit(nested);
+      } catch {
+        // Missing modules are reported by rustc during validation.
+      }
+    }
+  }
+
+  visit(target.src_path);
+  return [...paths].sort();
+}
+
+function compileData(target, packageRoot, includeTests) {
+  const paths = new Set(["Cargo.toml"]);
+  const labels = new Set();
+  const includeRe = /\binclude_(?:str|bytes)!\(\s*"([^"]+)"\s*\)|\binclude!\(\s*"([^"]+)"\s*\)/g;
+  const sourceFiles = new Set([target.src_path, ...rustSourceFiles(packageRoot, includeTests)]);
+  for (const sourceFile of sourceFiles) {
+    const source = readFileSync(sourceFile, "utf8");
+    for (const match of source.matchAll(includeRe)) {
+      const includePath = match[1] ?? match[2];
+      if (!includePath) continue;
+      const absolute = resolve(dirname(sourceFile), includePath);
+      if (absolute.startsWith(`${packageRoot}/`)) {
+        const rel = relative(packageRoot, absolute);
+        if (rel && !rel.startsWith("..")) paths.add(rel);
+      }
+    }
+    if (source.includes("../../test-fixtures/live_smoke/support.rs")) {
+      labels.add("//:live_smoke_support");
+    }
+  }
+  return {
+    labels: [...labels].sort(),
+    paths: [...paths].sort(),
+  };
+}
+
+function testTags(pkg, target) {
+  const haystack = `${packageKey(pkg)} ${target.name} ${relative(root, target.src_path)}`.toLowerCase();
+  const tags = [];
+  for (const tag of ["e2e", "system", "live", "integration", "trybuild", "snapshot", "fixture", "slow"]) {
+    if (haystack.includes(tag)) tags.push(tag);
+  }
+  if (!tags.length) tags.push("fast");
+  return [...new Set(tags)].sort();
+}
+
+const packageRunfileLabels = [...localPackages.values()]
+  .map((pkg) => relative(root, packageDir(pkg)))
+  .filter((dir) => dir !== "")
+  .sort()
+  .map((dir) => `//${dir}:package_runfiles`);
+
+function writeRootBuild(fastTestLabels) {
+  const lines = [
+    `# Root package marker for Bazel module extension labels.`,
+    ``,
+    `filegroup(`,
+    `    name = "workspace_metadata",`,
+    `    srcs = [`,
+    `        "Cargo.lock",`,
+    `        "Cargo.toml",`,
+    `        "MODULE.bazel",`,
+    `        "MODULE.bazel.lock",`,
+    `    ],`,
+    `    visibility = ["//visibility:public"],`,
+    `)`,
+    ``,
+    `filegroup(`,
+    `    name = "workspace_cargo_manifests",`,
+    `    srcs = glob(["Cargo.toml", "*/Cargo.toml", "*/*/Cargo.toml"], allow_empty = True),`,
+    `    visibility = ["//visibility:public"],`,
+    `)`,
+    ``,
+    `filegroup(`,
+    `    name = "github_workflows",`,
+    `    srcs = glob([".github/workflows/*"], allow_empty = True),`,
+    `    visibility = ["//visibility:public"],`,
+    `)`,
+    ``,
+    `filegroup(`,
+    `    name = "workspace_rust_sources",`,
+    `    srcs = glob(`,
+    `        ["**/*.rs"],`,
+    `        exclude = [`,
+    `            ".git/**",`,
+    `            "bazel-*",`,
+    `            "bazel-*/**",`,
+    `            "target/**",`,
+    `        ],`,
+    `        allow_empty = True,`,
+    `    ),`,
+    `    visibility = ["//visibility:public"],`,
+    `)`,
+    ``,
+    `filegroup(`,
+    `    name = "live_smoke_support",`,
+    `    srcs = ["test-fixtures/live_smoke/support.rs"],`,
+    `    visibility = ["//visibility:public"],`,
+    `)`,
+    ``,
+    `filegroup(`,
+    `    name = "test_fixtures",`,
+    `    srcs = glob(`,
+    `        ["test-fixtures/**"],`,
+    `        exclude = [`,
+    `            "test-fixtures/**/BUILD",`,
+    `            "test-fixtures/**/BUILD.bazel",`,
+    `        ],`,
+    `        allow_empty = True,`,
+    `    ),`,
+    `    visibility = ["//visibility:public"],`,
+    `)`,
+    ``,
+    `filegroup(`,
+    `    name = "repo_governance_files",`,
+    `    srcs = glob(["Makefile", "scripts/*"], allow_empty = True),`,
+    `    visibility = ["//visibility:public"],`,
+    `)`,
+    ``,
+    `filegroup(`,
+    `    name = "workspace_runfiles",`,
+    `    srcs = glob(`,
+    `        [`,
+    `            ".github/workflows/*",`,
+    `            "**/*",`,
+    `        ],`,
+    `        exclude = [`,
+    `            ".git/**",`,
+    `            "bazel-*",`,
+    `            "bazel-*/**",`,
+    `            "target/**",`,
+    `            "**/BUILD",`,
+    `            "**/BUILD.bazel",`,
+    `        ],`,
+    `        allow_empty = True,`,
+    `    ) + ${listExpr(packageRunfileLabels, 8)},`,
+    `    visibility = ["//visibility:public"],`,
+    `)`,
+    ``,
+  ];
+  if (fastTestLabels.length) {
+    lines.push(
+      `test_suite(`,
+      `    name = "fast_tests",`,
+      `    tests = ${listExpr(fastTestLabels, 8)},`,
+      `)`,
+      ``,
+    );
+  }
+  writeFileSync(resolve(root, "BUILD.bazel"), lines.join("\n"));
+}
+
+const fastTestLabels = [];
+
+for (const pkg of localPackages.values()) {
+  const dir = packageDir(pkg);
+  if (!dir.startsWith(root)) continue;
+
+  const rules = [];
+  const packageFastTests = [];
+  const loads = new Set(["rust_binary", "rust_library", "rust_proc_macro", "rust_test"]);
+  const libOrMacro = pkg.targets.find((target) =>
+    target.kind.includes("proc-macro") || target.kind.includes("lib")
+  );
+
+  for (const target of pkg.targets) {
+    const rule = targetRule(target);
+    if (!rule) continue;
+    if (target.kind.includes("bench") || target.kind.includes("example")) {
+      continue;
+    }
+    if (target["required-features"]?.length) continue;
+
+    const isTest = target.kind.includes("test");
+    const hasLibrary = Boolean(libOrMacro);
+    const name =
+      isTest
+        ? `${crateName(target.name)}_test`
+        :
+      target.kind.includes("bin") && (target.name !== pkg.name || hasLibrary)
+        ? `${crateName(target.name)}_bin`
+        : crateName(pkg.name);
+    const deps = isTest && libOrMacro
+      ? [...new Set([packageLabel(pkg), ...localDeps(pkg, false)])].sort()
+      : target.kind.includes("bin") && libOrMacro
+      ? [...new Set([packageLabel(pkg), ...localDeps(pkg, false)])].sort()
+      : localDeps(pkg, false);
+    const procMacroDeps = localDeps(pkg, true);
+    const key = packageKey(pkg);
+    const externalNormal = `all_crate_deps(\n        package_name = ${q(key)},\n        normal = True,\n    )`;
+    const externalNormalWithDev = `all_crate_deps(\n        package_name = ${q(key)},\n        normal = True,\n        normal_dev = True,\n    )`;
+    const externalProc = `all_crate_deps(\n        package_name = ${q(key)},\n        proc_macro = True,\n    )`;
+    const externalProcWithDev = `all_crate_deps(\n        package_name = ${q(key)},\n        proc_macro = True,\n        proc_macro_dev = True,\n    )`;
+
+    const depsExpr = deps.length
+      ? `${listExpr(deps)} + ${isTest ? externalNormalWithDev : externalNormal}`
+      : isTest ? externalNormalWithDev : externalNormal;
+    const procExpr = procMacroDeps.length
+      ? `${listExpr(procMacroDeps)} + ${isTest ? externalProcWithDev : externalProc}`
+      : isTest ? externalProcWithDev : externalProc;
+    const aliasesExpr = isTest
+      ? `aliases(\n        package_name = ${q(key)},\n        normal = True,\n        normal_dev = True,\n        proc_macro = True,\n        proc_macro_dev = True,\n    )`
+      : `aliases(package_name = ${q(key)})`;
+    const extraData = isTest ? workspaceDataLabels(target) : [];
+    const targetCompileData = compileData(target, dir, isTest);
+    const compileDataExpr = `${listExpr(targetCompileData.paths, 8)}${
+      targetCompileData.labels.length ? ` + ${listExpr(targetCompileData.labels, 8)}` : ""
+    }`;
+    const srcsExpr = isTest
+      ? listExpr(testSourcePaths(target, dir), 8)
+      : `glob(["src/**/*.rs"])`;
+
+    const attrs = [
+      `    name = ${q(name)},`,
+      `    aliases = ${aliasesExpr},`,
+      `    crate_name = ${q(crateName(target.name))},`,
+      `    crate_root = ${q(relative(dir, target.src_path))},`,
+      `    crate_features = ${listExpr([...activeFeatures.get(pkg.id)].sort())},`,
+      `    edition = "2024",`,
+      `    compile_data = ${compileDataExpr},`,
+      `    srcs = ${srcsExpr},`,
+      `    visibility = ["//visibility:public"],`,
+      `    deps = ${depsExpr},`,
+    ];
+    if (rule === "rust_binary" || rule === "rust_test") {
+      const packageRunfilesDir = relative(root, dir) || ".";
+      const cargoManifestDir = isTest && packageRunfilesDir !== "."
+        ? `./${packageRunfilesDir}`
+        : packageRunfilesDir;
+      const rustcEnv = [
+        `        "CARGO_BIN_NAME": ${q(target.name)},`,
+        `        "CARGO_MANIFEST_DIR": ${q(cargoManifestDir)},`,
+      ];
+      if (rule === "rust_test" && key === "meerkat-rpc") {
+        rustcEnv.push(`        "CARGO_BIN_EXE_rkat-rpc": "$(rootpath //meerkat-rpc:rkat_rpc_bin)",`);
+        rustcEnv.push(`        "CARGO_BIN_EXE_rkat-rpc-mini": "$(rootpath //meerkat-rpc:rkat_rpc_mini_bin)",`);
+      }
+      attrs.splice(attrs.length - 1, 0, `    rustc_env = {\n${rustcEnv.join("\n")}\n    },`);
+    }
+    if (rule === "rust_test") {
+      const tags = testTags(pkg, target);
+      if (tags.includes("fast")) {
+        fastTestLabels.push(`//${relative(root, dir)}:${name}`);
+        packageFastTests.push(`:${name}`);
+      }
+      const currentPackageRunfiles = `//${relative(root, dir)}:package_runfiles`;
+      const data = [
+        ":package_runfiles",
+        ...extraData.filter((label) => label !== currentPackageRunfiles),
+      ];
+      const env = [`        "RUST_MIN_STACK": "16777216",`];
+      attrs.splice(attrs.length - 1, 0, `    tags = ${listExpr(tags)},`);
+      if (key === "meerkat-cli") {
+        data.push("//meerkat-cli:rkat", "//meerkat-cli:rkat_mini_bin");
+        env.push(`        "CARGO_BIN_EXE_rkat": "$(rootpath //meerkat-cli:rkat)",`);
+        env.push(`        "CARGO_BIN_EXE_rkat-mini": "$(rootpath //meerkat-cli:rkat_mini_bin)",`);
+      }
+      if (key === "meerkat-rpc") {
+        data.push("//meerkat-rpc:rkat_rpc_bin", "//meerkat-rpc:rkat_rpc_mini_bin");
+        env.push(`        "CARGO_BIN_EXE_rkat-rpc": "$(rootpath //meerkat-rpc:rkat_rpc_bin)",`);
+        env.push(`        "CARGO_BIN_EXE_rkat-rpc-mini": "$(rootpath //meerkat-rpc:rkat_rpc_mini_bin)",`);
+      }
+      if (key === "xtask") {
+        const rustfmt = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin";
+        const rustfmtLib = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib";
+        data.push(rustfmt);
+        data.push(rustfmtLib);
+        env.push(`        "RUSTFMT": "$(rootpath ${rustfmt})",`);
+        if (readFileSync(target.src_path, "utf8").includes("rev-parse")) {
+          env.push(`        "WORKSPACE_ROOT": ".",`);
+        }
+      }
+      attrs.splice(attrs.length - 1, 0, `    data = ${listExpr(data)},`);
+      if (env.length) {
+        attrs.splice(attrs.length - 1, 0, `    env = {\n${env.join("\n")}\n    },`);
+      }
+    }
+    attrs.splice(attrs.length - 1, 0, `    proc_macro_deps = ${procExpr},`);
+    rules.push(`${rule}(\n${attrs.join("\n")}\n)`);
+  }
+
+  if (rules.length === 0) continue;
+  if (packageFastTests.length) {
+    rules.push(`test_suite(\n    name = "fast_tests",\n    tests = ${listExpr(packageFastTests.sort())},\n)`);
+  }
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    resolve(dir, "BUILD.bazel"),
+    [
+      `load("@crates//:defs.bzl", "aliases", "all_crate_deps")`,
+      `load("@rules_rust//rust:defs.bzl", ${[...loads].sort().map(q).join(", ")})`,
+      "",
+      `filegroup(`,
+      `    name = "cargo_manifest",`,
+      `    srcs = ["Cargo.toml"],`,
+      `    visibility = ["//visibility:public"],`,
+      `)`,
+      "",
+      `filegroup(`,
+      `    name = "package_runfiles",`,
+      `    srcs = glob(["Cargo.toml", "**/*"], exclude = ["BUILD", "BUILD.bazel"], allow_empty = True),`,
+      `    visibility = ["//visibility:public"],`,
+      `)`,
+      "",
+      ...rules,
+      "",
+    ].join("\n\n"),
+  );
+}
+
+writeRootBuild([...new Set(fastTestLabels)].sort());

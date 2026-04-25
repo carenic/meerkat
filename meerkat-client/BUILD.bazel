@@ -1,0 +1,194 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_macro", "rust_test")
+
+
+
+filegroup(
+
+    name = "cargo_manifest",
+
+    srcs = ["Cargo.toml"],
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+filegroup(
+
+    name = "package_runfiles",
+
+    srcs = glob(["Cargo.toml", "**/*"], exclude = ["BUILD", "BUILD.bazel"], allow_empty = True),
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+rust_library(
+    name = "meerkat_client",
+    aliases = aliases(package_name = "meerkat-client"),
+    crate_name = "meerkat_client",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "anthropic",
+        "gemini",
+        "native-keyring",
+        "oauth",
+        "openai",
+        "openai-realtime",
+        "refresh-file-lock",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-client",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-anthropic:meerkat_anthropic",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-gemini:meerkat_gemini",
+        "//meerkat-llm-core:meerkat_llm_core",
+        "//meerkat-openai:meerkat_openai",
+    ] + all_crate_deps(
+        package_name = "meerkat-client",
+        normal = True,
+    ),
+)
+
+rust_test(
+    name = "rct_contracts_test",
+    aliases = aliases(
+        package_name = "meerkat-client",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "rct_contracts",
+    crate_root = "tests/rct_contracts.rs",
+    crate_features = [
+        "anthropic",
+        "gemini",
+        "native-keyring",
+        "oauth",
+        "openai",
+        "openai-realtime",
+        "refresh-file-lock",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/rct_contracts.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "rct_contracts",
+        "CARGO_MANIFEST_DIR": "./meerkat-client",
+    },
+    tags = [
+        "fast",
+    ],
+    data = [
+        ":package_runfiles",
+        "//meerkat:package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-client",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-anthropic:meerkat_anthropic",
+        "//meerkat-client:meerkat_client",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-gemini:meerkat_gemini",
+        "//meerkat-llm-core:meerkat_llm_core",
+        "//meerkat-openai:meerkat_openai",
+    ] + all_crate_deps(
+        package_name = "meerkat-client",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "system_client_proxy_test",
+    aliases = aliases(
+        package_name = "meerkat-client",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "system_client_proxy",
+    crate_root = "tests/system_client_proxy.rs",
+    crate_features = [
+        "anthropic",
+        "gemini",
+        "native-keyring",
+        "oauth",
+        "openai",
+        "openai-realtime",
+        "refresh-file-lock",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/system_client_proxy.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "system_client_proxy",
+        "CARGO_MANIFEST_DIR": "./meerkat-client",
+    },
+    tags = [
+        "system",
+    ],
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-client",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-anthropic:meerkat_anthropic",
+        "//meerkat-client:meerkat_client",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-gemini:meerkat_gemini",
+        "//meerkat-llm-core:meerkat_llm_core",
+        "//meerkat-openai:meerkat_openai",
+    ] + all_crate_deps(
+        package_name = "meerkat-client",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+test_suite(
+    name = "fast_tests",
+    tests = [
+        ":rct_contracts_test",
+    ],
+)
+

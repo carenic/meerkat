@@ -1,0 +1,54 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_macro", "rust_test")
+
+
+
+filegroup(
+
+    name = "cargo_manifest",
+
+    srcs = ["Cargo.toml"],
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+filegroup(
+
+    name = "package_runfiles",
+
+    srcs = glob(["Cargo.toml", "**/*"], exclude = ["BUILD", "BUILD.bazel"], allow_empty = True),
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+rust_library(
+    name = "meerkat_mob_pack",
+    aliases = aliases(package_name = "meerkat-mob-pack"),
+    crate_name = "meerkat_mob_pack",
+    crate_root = "src/lib.rs",
+    crate_features = [],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-mob-pack",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-mob:meerkat_mob",
+    ] + all_crate_deps(
+        package_name = "meerkat-mob-pack",
+        normal = True,
+    ),
+)
+

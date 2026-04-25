@@ -1,0 +1,219 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_macro", "rust_test")
+
+
+
+filegroup(
+
+    name = "cargo_manifest",
+
+    srcs = ["Cargo.toml"],
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+filegroup(
+
+    name = "package_runfiles",
+
+    srcs = glob(["Cargo.toml", "**/*"], exclude = ["BUILD", "BUILD.bazel"], allow_empty = True),
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+rust_library(
+    name = "meerkat_comms",
+    aliases = aliases(package_name = "meerkat-comms"),
+    crate_name = "meerkat_comms",
+    crate_root = "src/lib.rs",
+    crate_features = [],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+        "skills/multi-agent-comms/SKILL.md",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-comms",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-skills:meerkat_skills",
+    ] + all_crate_deps(
+        package_name = "meerkat-comms",
+        normal = True,
+    ),
+)
+
+rust_test(
+    name = "inbox_admission_toctou_test",
+    aliases = aliases(
+        package_name = "meerkat-comms",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "inbox_admission_toctou",
+    crate_root = "tests/inbox_admission_toctou.rs",
+    crate_features = [],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+        "skills/multi-agent-comms/SKILL.md",
+    ],
+    srcs = [
+        "tests/inbox_admission_toctou.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "inbox_admission_toctou",
+        "CARGO_MANIFEST_DIR": "./meerkat-comms",
+    },
+    tags = [
+        "fast",
+    ],
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-comms",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-skills:meerkat_skills",
+    ] + all_crate_deps(
+        package_name = "meerkat-comms",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "router_ambiguous_name_typed_error_test",
+    aliases = aliases(
+        package_name = "meerkat-comms",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "router_ambiguous_name_typed_error",
+    crate_root = "tests/router_ambiguous_name_typed_error.rs",
+    crate_features = [],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+        "skills/multi-agent-comms/SKILL.md",
+    ],
+    srcs = [
+        "tests/router_ambiguous_name_typed_error.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "router_ambiguous_name_typed_error",
+        "CARGO_MANIFEST_DIR": "./meerkat-comms",
+    },
+    tags = [
+        "fast",
+    ],
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-comms",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-skills:meerkat_skills",
+    ] + all_crate_deps(
+        package_name = "meerkat-comms",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "trust_duplicate_name_ok_duplicate_id_rejected_test",
+    aliases = aliases(
+        package_name = "meerkat-comms",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "trust_duplicate_name_ok_duplicate_id_rejected",
+    crate_root = "tests/trust_duplicate_name_ok_duplicate_id_rejected.rs",
+    crate_features = [],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+        "skills/multi-agent-comms/SKILL.md",
+    ],
+    srcs = [
+        "tests/trust_duplicate_name_ok_duplicate_id_rejected.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "trust_duplicate_name_ok_duplicate_id_rejected",
+        "CARGO_MANIFEST_DIR": "./meerkat-comms",
+    },
+    tags = [
+        "fast",
+    ],
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-comms",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-skills:meerkat_skills",
+    ] + all_crate_deps(
+        package_name = "meerkat-comms",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+test_suite(
+    name = "fast_tests",
+    tests = [
+        ":inbox_admission_toctou_test",
+        ":router_ambiguous_name_typed_error_test",
+        ":trust_duplicate_name_ok_duplicate_id_rejected_test",
+    ],
+)
+

@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${BUILDBUDDY_API_KEY:-}" && -f "${HOME}/.zshrc" ]]; then
+  BUILDBUDDY_API_KEY="$(zsh -lc 'source ~/.zshrc >/dev/null 2>&1 || true; print -r -- ${BUILDBUDDY_API_KEY-}')"
+  export BUILDBUDDY_API_KEY
+fi
+
+if [[ -z "${BUILDBUDDY_API_KEY:-}" ]]; then
+  echo "error: BUILDBUDDY_API_KEY is not set" >&2
+  exit 1
+fi
+
+workspace_root="$(git rev-parse --show-toplevel)"
+
+if [[ -n "${BUILDBUDDY_BB:-}" ]]; then
+  bb_bin="${BUILDBUDDY_BB}"
+elif command -v bb >/dev/null 2>&1; then
+  bb_bin="bb"
+elif [[ -x /tmp/buildbuddy-poc/bin/bb ]]; then
+  bb_bin="/tmp/buildbuddy-poc/bin/bb"
+else
+  echo "error: bb is not installed; set BUILDBUDDY_BB to the BuildBuddy CLI path" >&2
+  exit 1
+fi
+
+config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy}"
+command="${BUILDBUDDY_BAZEL_COMMAND:-build}"
+requested_command="${command}"
+extra_args=()
+case "${command}" in
+  fast-test)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe-fast}"
+    default_target="//:fast_tests"
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  fast-test-local)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe-fast}"
+    default_target="//:fast_tests"
+    extra_args+=(
+      --spawn_strategy=local
+      --jobs="${BUILDBUDDY_LOCAL_JOBS:-8}"
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  affected-fast-test)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe-fast}"
+    default_target=""
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  affected-fast-test-local)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe-fast}"
+    default_target=""
+    extra_args+=(
+      --spawn_strategy=local
+      --jobs="${BUILDBUDDY_LOCAL_JOBS:-8}"
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  owned-fast-test)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe-fast}"
+    default_target=""
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  owned-fast-test-local)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe-fast}"
+    default_target=""
+    extra_args+=(
+      --spawn_strategy=local
+      --jobs="${BUILDBUDDY_LOCAL_JOBS:-8}"
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  clippy)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//..."
+    extra_args+=(
+      --aspects="@rules_rust//rust:defs.bzl%rust_clippy_aspect"
+      --output_groups="+clippy_checks"
+      --@rules_rust//rust/settings:clippy_flag=-Dwarnings
+    )
+    ;;
+  owned-build)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target=""
+    ;;
+  owned-build-local)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target=""
+    extra_args+=(
+      --spawn_strategy=local
+      --jobs="${BUILDBUDDY_LOCAL_JOBS:-8}"
+    )
+    ;;
+  affected-build)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target=""
+    ;;
+  affected-build-local)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target=""
+    extra_args+=(
+      --spawn_strategy=local
+      --jobs="${BUILDBUDDY_LOCAL_JOBS:-8}"
+    )
+    ;;
+  *)
+    default_target="//meerkat-machine-dsl-core:meerkat_machine_dsl_core"
+    ;;
+esac
+if [[ "${requested_command}" == affected-fast-test || "${requested_command}" == affected-fast-test-local || "${requested_command}" == owned-fast-test || "${requested_command}" == owned-fast-test-local || "${requested_command}" == owned-build || "${requested_command}" == owned-build-local || "${requested_command}" == affected-build || "${requested_command}" == affected-build-local ]]; then
+  selector_args=()
+  if [[ "${requested_command}" == owned-fast-test || "${requested_command}" == owned-fast-test-local || "${requested_command}" == owned-build || "${requested_command}" == owned-build-local ]]; then
+    selector_args+=(--owned)
+  fi
+  if [[ "${requested_command}" == owned-build || "${requested_command}" == owned-build-local || "${requested_command}" == affected-build || "${requested_command}" == affected-build-local ]]; then
+    selector_args+=(--build)
+  fi
+  if [[ $# -gt 0 && "${1}" != -* ]]; then
+    changed_paths=()
+    while [[ $# -gt 0 && "${1}" != -* ]]; do
+      changed_paths+=("${1}")
+      shift
+    done
+    target="$("./scripts/bazel-affected-fast-tests.mjs" "${selector_args[@]}" "${changed_paths[@]}")"
+  else
+    target="$("./scripts/bazel-affected-fast-tests.mjs" "${selector_args[@]}")"
+  fi
+elif [[ $# -gt 0 && "${1}" != -* ]]; then
+  target="${1}"
+  shift
+else
+  target="${default_target}"
+fi
+
+startup_args=()
+if [[ -z "${BUILDBUDDY_NO_DEFAULT_OUTPUT_BASE:-}" ]]; then
+  if [[ -z "${BUILDBUDDY_OUTPUT_BASE:-}" ]]; then
+    cache_root="${MEERKAT_BUILDBUDDY_OUTPUT_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-bazel}"
+    workspace_hash="$(printf '%s' "${workspace_root}" | shasum -a 256 | awk '{print substr($1, 1, 16)}')"
+    lane_key="${BUILDBUDDY_OUTPUT_LANE:-${requested_command}-${config}}"
+    lane_key="$(printf '%s' "${lane_key}" | tr -c 'A-Za-z0-9_.-' '-')"
+    BUILDBUDDY_OUTPUT_BASE="${cache_root}/$(basename "${workspace_root}")-${workspace_hash}-${lane_key}"
+  fi
+fi
+if [[ -n "${BUILDBUDDY_OUTPUT_BASE:-}" ]]; then
+  mkdir -p "$(dirname "${BUILDBUDDY_OUTPUT_BASE}")"
+  startup_args+=(--output_base="${BUILDBUDDY_OUTPUT_BASE}")
+fi
+if [[ -z "${BUILDBUDDY_NO_DEFAULT_MAX_IDLE:-}" ]]; then
+  BUILDBUDDY_MAX_IDLE_SECS="${BUILDBUDDY_MAX_IDLE_SECS:-600}"
+fi
+if [[ -n "${BUILDBUDDY_MAX_IDLE_SECS:-}" ]]; then
+  startup_args+=(--max_idle_secs="${BUILDBUDDY_MAX_IDLE_SECS}")
+fi
+
+exec "${bb_bin}" "${startup_args[@]}" "${command}" \
+  --config="${config}" \
+  --remote_header="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}" \
+  "${extra_args[@]}" \
+  ${target} \
+  "$@"

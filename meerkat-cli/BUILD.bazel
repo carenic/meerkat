@@ -1,0 +1,551 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_macro", "rust_test")
+
+
+
+filegroup(
+
+    name = "cargo_manifest",
+
+    srcs = ["Cargo.toml"],
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+filegroup(
+
+    name = "package_runfiles",
+
+    srcs = glob(["Cargo.toml", "**/*"], exclude = ["BUILD", "BUILD.bazel"], allow_empty = True),
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+rust_binary(
+    name = "rkat",
+    aliases = aliases(package_name = "meerkat-cli"),
+    crate_name = "rkat",
+    crate_root = "src/main.rs",
+    crate_features = [
+        "anthropic",
+        "comms",
+        "gemini",
+        "jsonl-store",
+        "mcp",
+        "mob",
+        "openai",
+        "schedule",
+        "session-store",
+        "skills",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "rkat",
+        "CARGO_MANIFEST_DIR": "meerkat-cli",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-cli",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-anthropic:meerkat_anthropic",
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-gemini:meerkat_gemini",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob-pack:meerkat_mob_pack",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-openai:meerkat_openai",
+        "//meerkat-providers:meerkat_providers",
+        "//meerkat-rpc:meerkat_rpc",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-cli",
+        normal = True,
+    ),
+)
+
+rust_binary(
+    name = "rkat_mini_bin",
+    aliases = aliases(package_name = "meerkat-cli"),
+    crate_name = "rkat_mini",
+    crate_root = "src/main.rs",
+    crate_features = [
+        "anthropic",
+        "comms",
+        "gemini",
+        "jsonl-store",
+        "mcp",
+        "mob",
+        "openai",
+        "schedule",
+        "session-store",
+        "skills",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "rkat-mini",
+        "CARGO_MANIFEST_DIR": "meerkat-cli",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-cli",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-anthropic:meerkat_anthropic",
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-gemini:meerkat_gemini",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob-pack:meerkat_mob_pack",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-openai:meerkat_openai",
+        "//meerkat-providers:meerkat_providers",
+        "//meerkat-rpc:meerkat_rpc",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-cli",
+        normal = True,
+    ),
+)
+
+rust_test(
+    name = "cli_auth_flow_test",
+    aliases = aliases(
+        package_name = "meerkat-cli",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "cli_auth_flow",
+    crate_root = "tests/cli_auth_flow.rs",
+    crate_features = [
+        "anthropic",
+        "comms",
+        "gemini",
+        "jsonl-store",
+        "mcp",
+        "mob",
+        "openai",
+        "schedule",
+        "session-store",
+        "skills",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/cli_auth_flow.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "cli_auth_flow",
+        "CARGO_MANIFEST_DIR": "./meerkat-cli",
+    },
+    tags = [
+        "fast",
+    ],
+    data = [
+        ":package_runfiles",
+        "//:workspace_cargo_manifests",
+        "//:workspace_metadata",
+        "//meerkat-cli:rkat",
+        "//meerkat-cli:rkat_mini_bin",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+        "CARGO_BIN_EXE_rkat": "$(rootpath //meerkat-cli:rkat)",
+        "CARGO_BIN_EXE_rkat-mini": "$(rootpath //meerkat-cli:rkat_mini_bin)",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-cli",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-anthropic:meerkat_anthropic",
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-gemini:meerkat_gemini",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob-pack:meerkat_mob_pack",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-openai:meerkat_openai",
+        "//meerkat-providers:meerkat_providers",
+        "//meerkat-rpc:meerkat_rpc",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-cli",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "connection_ref_single_parser_test",
+    aliases = aliases(
+        package_name = "meerkat-cli",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "connection_ref_single_parser",
+    crate_root = "tests/connection_ref_single_parser.rs",
+    crate_features = [
+        "anthropic",
+        "comms",
+        "gemini",
+        "jsonl-store",
+        "mcp",
+        "mob",
+        "openai",
+        "schedule",
+        "session-store",
+        "skills",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/connection_ref_single_parser.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "connection_ref_single_parser",
+        "CARGO_MANIFEST_DIR": "./meerkat-cli",
+    },
+    tags = [
+        "fast",
+    ],
+    data = [
+        ":package_runfiles",
+        "//:workspace_cargo_manifests",
+        "//:workspace_metadata",
+        "//meerkat-cli:cargo_manifest",
+        "//meerkat-cli:rkat",
+        "//meerkat-cli:rkat_mini_bin",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+        "CARGO_BIN_EXE_rkat": "$(rootpath //meerkat-cli:rkat)",
+        "CARGO_BIN_EXE_rkat-mini": "$(rootpath //meerkat-cli:rkat_mini_bin)",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-cli",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-anthropic:meerkat_anthropic",
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-gemini:meerkat_gemini",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob-pack:meerkat_mob_pack",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-openai:meerkat_openai",
+        "//meerkat-providers:meerkat_providers",
+        "//meerkat-rpc:meerkat_rpc",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-cli",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "runtime_backed_ingress_test",
+    aliases = aliases(
+        package_name = "meerkat-cli",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "runtime_backed_ingress",
+    crate_root = "tests/runtime_backed_ingress.rs",
+    crate_features = [
+        "anthropic",
+        "comms",
+        "gemini",
+        "jsonl-store",
+        "mcp",
+        "mob",
+        "openai",
+        "schedule",
+        "session-store",
+        "skills",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/runtime_backed_ingress.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "runtime_backed_ingress",
+        "CARGO_MANIFEST_DIR": "./meerkat-cli",
+    },
+    tags = [
+        "fast",
+    ],
+    data = [
+        ":package_runfiles",
+        "//:workspace_cargo_manifests",
+        "//:workspace_metadata",
+        "//meerkat-cli:rkat",
+        "//meerkat-cli:rkat_mini_bin",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+        "CARGO_BIN_EXE_rkat": "$(rootpath //meerkat-cli:rkat)",
+        "CARGO_BIN_EXE_rkat-mini": "$(rootpath //meerkat-cli:rkat_mini_bin)",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-cli",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-anthropic:meerkat_anthropic",
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-gemini:meerkat_gemini",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob-pack:meerkat_mob_pack",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-openai:meerkat_openai",
+        "//meerkat-providers:meerkat_providers",
+        "//meerkat-rpc:meerkat_rpc",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-cli",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "sqlite_tools_full_reuse_test",
+    aliases = aliases(
+        package_name = "meerkat-cli",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "sqlite_tools_full_reuse",
+    crate_root = "tests/sqlite_tools_full_reuse.rs",
+    crate_features = [
+        "anthropic",
+        "comms",
+        "gemini",
+        "jsonl-store",
+        "mcp",
+        "mob",
+        "openai",
+        "schedule",
+        "session-store",
+        "skills",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/sqlite_tools_full_reuse.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "sqlite_tools_full_reuse",
+        "CARGO_MANIFEST_DIR": "./meerkat-cli",
+    },
+    tags = [
+        "fast",
+    ],
+    data = [
+        ":package_runfiles",
+        "//:workspace_cargo_manifests",
+        "//:workspace_metadata",
+        "//meerkat-cli:rkat",
+        "//meerkat-cli:rkat_mini_bin",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+        "CARGO_BIN_EXE_rkat": "$(rootpath //meerkat-cli:rkat)",
+        "CARGO_BIN_EXE_rkat-mini": "$(rootpath //meerkat-cli:rkat_mini_bin)",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-cli",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-anthropic:meerkat_anthropic",
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-gemini:meerkat_gemini",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob-pack:meerkat_mob_pack",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-openai:meerkat_openai",
+        "//meerkat-providers:meerkat_providers",
+        "//meerkat-rpc:meerkat_rpc",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-cli",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "system_cli_mini_test",
+    aliases = aliases(
+        package_name = "meerkat-cli",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "system_cli_mini",
+    crate_root = "tests/system_cli_mini.rs",
+    crate_features = [
+        "anthropic",
+        "comms",
+        "gemini",
+        "jsonl-store",
+        "mcp",
+        "mob",
+        "openai",
+        "schedule",
+        "session-store",
+        "skills",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/system_cli_mini.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "system_cli_mini",
+        "CARGO_MANIFEST_DIR": "./meerkat-cli",
+    },
+    tags = [
+        "system",
+    ],
+    data = [
+        ":package_runfiles",
+        "//:workspace_cargo_manifests",
+        "//:workspace_metadata",
+        "//meerkat-cli:rkat",
+        "//meerkat-cli:rkat_mini_bin",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+        "CARGO_BIN_EXE_rkat": "$(rootpath //meerkat-cli:rkat)",
+        "CARGO_BIN_EXE_rkat-mini": "$(rootpath //meerkat-cli:rkat_mini_bin)",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-cli",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-anthropic:meerkat_anthropic",
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-gemini:meerkat_gemini",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob-pack:meerkat_mob_pack",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-openai:meerkat_openai",
+        "//meerkat-providers:meerkat_providers",
+        "//meerkat-rpc:meerkat_rpc",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-cli",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+test_suite(
+    name = "fast_tests",
+    tests = [
+        ":cli_auth_flow_test",
+        ":connection_ref_single_parser_test",
+        ":runtime_backed_ingress_test",
+        ":sqlite_tools_full_reuse_test",
+    ],
+)
+

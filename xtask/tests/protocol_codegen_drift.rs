@@ -12,6 +12,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn repo_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("WORKSPACE_ROOT") {
+        return PathBuf::from(root);
+    }
     let out = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
@@ -23,7 +26,11 @@ fn repo_root() -> PathBuf {
 fn rustfmt(source: &str) -> String {
     use std::io::Write;
     use std::process::Stdio;
-    let mut child = Command::new("rustfmt")
+    let rustfmt = std::env::var_os("RUSTFMT")
+        .map(PathBuf::from)
+        .and_then(|path| path.canonicalize().ok().or(Some(path)))
+        .unwrap_or_else(|| PathBuf::from("rustfmt"));
+    let mut child = Command::new(rustfmt)
         .args(["--edition", "2024", "--emit", "stdout"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

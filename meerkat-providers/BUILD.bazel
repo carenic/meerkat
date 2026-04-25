@@ -1,0 +1,60 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_macro", "rust_test")
+
+
+
+filegroup(
+
+    name = "cargo_manifest",
+
+    srcs = ["Cargo.toml"],
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+filegroup(
+
+    name = "package_runfiles",
+
+    srcs = glob(["Cargo.toml", "**/*"], exclude = ["BUILD", "BUILD.bazel"], allow_empty = True),
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+rust_library(
+    name = "meerkat_providers",
+    aliases = aliases(package_name = "meerkat-providers"),
+    crate_name = "meerkat_providers",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "anthropic",
+        "gemini",
+        "oauth",
+        "openai",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-providers",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-auth-core:meerkat_auth_core",
+        "//meerkat-llm-core:meerkat_llm_core",
+    ] + all_crate_deps(
+        package_name = "meerkat-providers",
+        normal = True,
+    ),
+)
+

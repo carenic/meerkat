@@ -19,7 +19,7 @@ fn rkat_binary() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_rkat") {
         let p = PathBuf::from(path);
         if p.exists() {
-            return Some(p);
+            return Some(p.canonicalize().unwrap_or(p));
         }
     }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

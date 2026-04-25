@@ -1,0 +1,117 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_macro", "rust_test")
+
+
+
+filegroup(
+
+    name = "cargo_manifest",
+
+    srcs = ["Cargo.toml"],
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+filegroup(
+
+    name = "package_runfiles",
+
+    srcs = glob(["Cargo.toml", "**/*"], exclude = ["BUILD", "BUILD.bazel"], allow_empty = True),
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+rust_library(
+    name = "meerkat_anthropic",
+    aliases = aliases(package_name = "meerkat-anthropic"),
+    crate_name = "meerkat_anthropic",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "oauth",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-anthropic",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-auth-core:meerkat_auth_core",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-llm-core:meerkat_llm_core",
+    ] + all_crate_deps(
+        package_name = "meerkat-anthropic",
+        normal = True,
+    ),
+)
+
+rust_test(
+    name = "oauth_resolve_test",
+    aliases = aliases(
+        package_name = "meerkat-anthropic",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "oauth_resolve",
+    crate_root = "tests/oauth_resolve.rs",
+    crate_features = [
+        "oauth",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/oauth_resolve.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "oauth_resolve",
+        "CARGO_MANIFEST_DIR": "./meerkat-anthropic",
+    },
+    tags = [
+        "fast",
+    ],
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-anthropic",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-anthropic:meerkat_anthropic",
+        "//meerkat-auth-core:meerkat_auth_core",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-llm-core:meerkat_llm_core",
+    ] + all_crate_deps(
+        package_name = "meerkat-anthropic",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+test_suite(
+    name = "fast_tests",
+    tests = [
+        ":oauth_resolve_test",
+    ],
+)
+

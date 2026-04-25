@@ -1,0 +1,119 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_macro", "rust_test")
+
+
+
+filegroup(
+
+    name = "cargo_manifest",
+
+    srcs = ["Cargo.toml"],
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+filegroup(
+
+    name = "package_runfiles",
+
+    srcs = glob(["Cargo.toml", "**/*"], exclude = ["BUILD", "BUILD.bazel"], allow_empty = True),
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+rust_library(
+    name = "meerkat_machine_kernels",
+    aliases = aliases(package_name = "meerkat-machine-kernels"),
+    crate_name = "meerkat_machine_kernels",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "test-oracle",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    proc_macro_deps = [
+        "//meerkat-machine-dsl:meerkat_machine_dsl",
+    ] + all_crate_deps(
+        package_name = "meerkat-machine-kernels",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-core:meerkat_core",
+        "//meerkat-machine-schema:meerkat_machine_schema",
+    ] + all_crate_deps(
+        package_name = "meerkat-machine-kernels",
+        normal = True,
+    ),
+)
+
+rust_test(
+    name = "kernel_typed_round_trip_test",
+    aliases = aliases(
+        package_name = "meerkat-machine-kernels",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "kernel_typed_round_trip",
+    crate_root = "tests/kernel_typed_round_trip.rs",
+    crate_features = [
+        "test-oracle",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/kernel_typed_round_trip.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "kernel_typed_round_trip",
+        "CARGO_MANIFEST_DIR": "./meerkat-machine-kernels",
+    },
+    tags = [
+        "fast",
+    ],
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = [
+        "//meerkat-machine-dsl:meerkat_machine_dsl",
+    ] + all_crate_deps(
+        package_name = "meerkat-machine-kernels",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-core:meerkat_core",
+        "//meerkat-machine-kernels:meerkat_machine_kernels",
+        "//meerkat-machine-schema:meerkat_machine_schema",
+    ] + all_crate_deps(
+        package_name = "meerkat-machine-kernels",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+test_suite(
+    name = "fast_tests",
+    tests = [
+        ":kernel_typed_round_trip_test",
+    ],
+)
+

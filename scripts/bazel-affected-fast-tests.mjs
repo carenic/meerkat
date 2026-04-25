@@ -1,0 +1,197 @@
+#!/usr/bin/env node
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, relative, resolve } from "node:path";
+
+const root = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+  encoding: "utf8",
+}).trim();
+
+function gitLines(args) {
+  return execFileSync("git", args, { cwd: root, encoding: "utf8" })
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function parseArgs() {
+  const paths = [];
+  let mode = "affected";
+  let kind = "test";
+  for (const arg of process.argv.slice(2)) {
+    if (arg === "--owned") {
+      mode = "owned";
+    } else if (arg === "--affected") {
+      mode = "affected";
+    } else if (arg === "--build") {
+      kind = "build";
+    } else if (arg === "--test") {
+      kind = "test";
+    } else if (arg === "--help" || arg === "-h") {
+      console.log("usage: bazel-affected-fast-tests.mjs [--owned|--affected] [--test|--build] [changed-path ...]");
+      process.exit(0);
+    } else {
+      paths.push(arg);
+    }
+  }
+  return { kind, mode, paths };
+}
+
+const args = parseArgs();
+
+function changedFiles() {
+  if (args.paths.length) return args.paths;
+
+  const files = new Set([
+    ...gitLines(["diff", "--name-only", "HEAD", "--"]),
+    ...gitLines(["diff", "--name-only", "--cached", "--"]),
+  ]);
+  return [...files].sort();
+}
+
+const metadata = JSON.parse(
+  execFileSync("./scripts/repo-cargo", ["metadata", "--format-version=1"], {
+    cwd: root,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  }),
+);
+
+const workspaceMembers = new Set(metadata.workspace_members);
+const packages = metadata.packages.filter(
+  (pkg) => pkg.source === null && workspaceMembers.has(pkg.id),
+);
+const byId = new Map(packages.map((pkg) => [pkg.id, pkg]));
+const byName = new Map(packages.map((pkg) => [pkg.name, pkg]));
+const packageDir = (pkg) => relative(root, dirname(pkg.manifest_path)) || ".";
+const packageDirs = packages
+  .map((pkg) => [packageDir(pkg), pkg])
+  .sort((a, b) => b[0].length - a[0].length);
+
+const reverseDeps = new Map(packages.map((pkg) => [pkg.id, new Set()]));
+for (const pkg of packages) {
+  for (const dep of pkg.dependencies) {
+    if (dep.source !== null) continue;
+    const depPkg = byName.get(dep.name);
+    if (depPkg) reverseDeps.get(depPkg.id)?.add(pkg.id);
+  }
+}
+
+function packageForFile(file) {
+  const normalized = file.replaceAll("\\", "/").replace(/^\.\//, "");
+  for (const [dir, pkg] of packageDirs) {
+    if (dir === ".") continue;
+    if (normalized === `${dir}/Cargo.toml` || normalized.startsWith(`${dir}/`)) {
+      return pkg;
+    }
+  }
+  return null;
+}
+
+function hasFastSuite(pkg) {
+  const buildFile = resolve(root, packageDir(pkg), "BUILD.bazel");
+  return existsSync(buildFile) && readFileSync(buildFile, "utf8").includes('name = "fast_tests"');
+}
+
+function crateName(name) {
+  return name.replaceAll("-", "_");
+}
+
+function isFastTest(pkg, target) {
+  const haystack = `${packageDir(pkg)} ${target.name} ${relative(root, target.src_path)}`.toLowerCase();
+  return !["e2e", "system", "live", "integration", "trybuild", "snapshot", "fixture", "slow"]
+    .some((tag) => haystack.includes(tag));
+}
+
+function exactFastTestLabelForFile(file, pkg) {
+  const normalized = file.replaceAll("\\", "/").replace(/^\.\//, "");
+  for (const target of pkg.targets) {
+    if (!target.kind.includes("test")) continue;
+    if (!isFastTest(pkg, target)) continue;
+    if (normalized === relative(root, target.src_path)) {
+      return `//${packageDir(pkg)}:${crateName(target.name)}_test`;
+    }
+  }
+  return null;
+}
+
+function buildLabels(pkg) {
+  const dir = packageDir(pkg);
+  const libOrMacro = pkg.targets.find((target) =>
+    target.kind.includes("proc-macro") || target.kind.includes("lib")
+  );
+  const labels = [];
+  for (const target of pkg.targets) {
+    if (target.kind.includes("bench") || target.kind.includes("example") || target.kind.includes("test")) {
+      continue;
+    }
+    if (target["required-features"]?.length) continue;
+    if (target.kind.includes("proc-macro") || target.kind.includes("lib")) {
+      labels.push(`//${dir}:${crateName(pkg.name)}`);
+    } else if (target.kind.includes("bin")) {
+      const name = target.name !== pkg.name || libOrMacro ? `${crateName(target.name)}_bin` : crateName(pkg.name);
+      labels.push(`//${dir}:${name}`);
+    }
+  }
+  return [...new Set(labels)].sort();
+}
+
+function affectedClosure(seedIds) {
+  const seen = new Set(seedIds);
+  const queue = [...seedIds];
+  for (let i = 0; i < queue.length; i += 1) {
+    for (const dep of reverseDeps.get(queue[i]) ?? []) {
+      if (!seen.has(dep)) {
+        seen.add(dep);
+        queue.push(dep);
+      }
+    }
+  }
+  return seen;
+}
+
+const files = changedFiles();
+if (files.length === 0) {
+  console.log(args.kind === "build" ? "//..." : "//:fast_tests");
+  process.exit(0);
+}
+
+const seedIds = new Set();
+const exactLabels = new Set();
+const unmapped = [];
+for (const file of files) {
+  if (file.endsWith("BUILD.bazel") || file === "BUILD.bazel") continue;
+  const pkg = packageForFile(file);
+  if (pkg) {
+    const exactLabel = args.kind === "test" && args.mode === "owned"
+      ? exactFastTestLabelForFile(file, pkg)
+      : null;
+    if (exactLabel) {
+      exactLabels.add(exactLabel);
+    } else {
+      seedIds.add(pkg.id);
+    }
+  } else {
+    unmapped.push(file);
+  }
+}
+
+if (unmapped.length || (seedIds.size === 0 && exactLabels.size === 0)) {
+  console.log(args.kind === "build" ? "//..." : "//:fast_tests");
+  process.exit(0);
+}
+
+const selectedIds = args.mode === "owned" ? seedIds : affectedClosure(seedIds);
+const selectedPackages = [...selectedIds]
+  .map((id) => byId.get(id))
+  .filter(Boolean);
+const labels = args.kind === "build"
+  ? selectedPackages.flatMap(buildLabels).sort()
+  : [
+    ...exactLabels,
+    ...selectedPackages
+    .filter(hasFastSuite)
+      .map((pkg) => `//${packageDir(pkg)}:fast_tests`),
+  ].sort();
+
+console.log(labels.length ? labels.join(" ") : args.kind === "build" ? "//..." : "//:fast_tests");
