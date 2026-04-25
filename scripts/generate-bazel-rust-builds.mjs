@@ -438,6 +438,9 @@ for (const pkg of localPackages.values()) {
       ? `aliases(\n        package_name = ${q(key)},\n        normal = True,\n        normal_dev = True,\n        proc_macro = True,\n        proc_macro_dev = True,\n    )`
       : `aliases(package_name = ${q(key)})`;
     const extraData = isTest ? workspaceDataLabels(target) : [];
+    const targetSourceText = isTest ? readFileSync(target.src_path, "utf8") : "";
+    const usesTrybuild = targetSourceText.includes("trybuild::");
+    const scansWorkspaceRustSources = targetSourceText.includes("walk_rust_sources(&root)");
     const targetCompileData = compileData(target, dir, isTest);
     const compileDataExpr = `${listExpr(targetCompileData.paths, 8)}${
       targetCompileData.labels.length ? ` + ${listExpr(targetCompileData.labels, 8)}` : ""
@@ -475,6 +478,7 @@ for (const pkg of localPackages.values()) {
     }
     if (rule === "rust_test") {
       const tags = testTags(pkg, target);
+      if (usesTrybuild) tags.push("local");
       if (tags.includes("fast")) {
         fastTestLabels.push(`//${relative(root, dir)}:${name}`);
         packageFastTests.push(`:${name}`);
@@ -485,7 +489,18 @@ for (const pkg of localPackages.values()) {
         ...extraData.filter((label) => label !== currentPackageRunfiles),
       ];
       const env = [`        "RUST_MIN_STACK": "16777216",`];
-      attrs.splice(attrs.length - 1, 0, `    tags = ${listExpr(tags)},`);
+      attrs.splice(attrs.length - 1, 0, `    tags = ${listExpr([...new Set(tags)].sort())},`);
+      if (usesTrybuild) {
+        data.push("//:workspace_runfiles");
+        data.push("@rules_rust//rust/toolchain:current_cargo_files");
+        data.push("@rules_rust//rust/toolchain:current_rust_stdlib_files");
+        data.push("@rules_rust//rust/toolchain:current_rustc_files");
+        data.push("@rules_rust//rust/toolchain:current_rustc_lib_files");
+        env.push(`        "CARGO_TARGET_DIR": "trybuild-target",`);
+      }
+      if (scansWorkspaceRustSources) {
+        data.push("//:workspace_rust_sources");
+      }
       if (key === "meerkat-cli") {
         data.push("//meerkat-cli:rkat", "//meerkat-cli:rkat_mini_bin");
         env.push(`        "CARGO_BIN_EXE_rkat": "$(rootpath //meerkat-cli:rkat)",`);

@@ -18,6 +18,8 @@ Initial POC commit: `a58e2613f1a5f3cfb952b4035e8f0d38c0c35a71`
 
 Use `scripts/buildbuddy-bazel-poc` with `BUILDBUDDY_BAZEL_COMMAND`:
 
+- `workspace-test`: run the full Bazel workspace test suite.
+- `workspace-test-local`: run the full workspace test suite with local spawns.
 - `owned-build <path>`: build the owning package target for a changed path.
 - `affected-build <path>`: build the reverse-dependency closure for a changed path.
 - `owned-fast-test <path>`: run the owning fast suite, or the exact test target
@@ -54,6 +56,8 @@ local Bazel output bases.
 `scripts/buildbuddy-simulate-scenarios.mjs` exercises the expected operating
 modes:
 
+- `workspace-test`: full Bazel workspace test suite.
+- `workspace-test-local`: full Bazel workspace test suite with local spawns.
 - `warm-noop`: warm full fast-test and clippy checks.
 - `same-worktree`: two same-checkout agents using distinct lanes.
 - `same-command`: two same-checkout agents running the same command with
@@ -86,6 +90,10 @@ Representative measurements from the POC environment:
 
 | Scenario | Result |
 | --- | ---: |
+| Full workspace test lane (`152` tests), remote/cache | `23.25s` wall |
+| Full workspace test lane (`152` tests), warm remote/cache | `3.96s` wall |
+| Full workspace test lane (`152` tests), local-spawn first pass | `67.01s` wall |
+| Full workspace test lane (`152` tests), warm local-spawn | `4.75s` wall |
 | Warm root fast suite (`117` tests) | `3.99s` wall |
 | Warm full clippy aspect (`288` targets) | `4.99s` wall |
 | Same-worktree, two different warmed lanes | `6.42s` / `6.70s` wall |
@@ -109,6 +117,10 @@ Representative measurements from the POC environment:
 The first touch of a new local lane pays Bazel analysis and remote-cache
 materialization cost. Once warmed, the wall-clock floor is mostly the `bb`/Bazel
 client startup path rather than Rust compilation.
+
+The full workspace lane runs the trybuild compile-fail fixture locally because
+trybuild shells out to Cargo in offline mode and expects a host Cargo registry
+cache. The rest of the suite remains eligible for remote execution/cache hits.
 
 For new agent worktrees, prewarming the small set of expected lanes is worth it:
 the edit-probe harness showed first edit feedback dropping from tens of seconds

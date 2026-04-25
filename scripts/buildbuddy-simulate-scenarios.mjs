@@ -8,6 +8,9 @@ function usage() {
   console.log(`usage: buildbuddy-simulate-scenarios.mjs [scenario ...]
 
 Scenarios:
+  workspace-test     Run the full Bazel workspace test lane.
+  workspace-test-local
+                     Run the full workspace test lane with local spawns.
   warm-noop          Run warm fast-test and clippy no-op checks.
   same-worktree      Run two same-checkout agents in parallel with distinct lanes.
   same-command       Run two same-checkout agents using the same command in parallel.
@@ -19,7 +22,7 @@ Scenarios:
   multi-worktree     Create two temporary git worktrees and run parallel agents.
   ci-cold            Run CI-like checks with fresh output bases.
   ci-parallel        Run CI-like fast-test and clippy checks in parallel.
-  all                Run every scenario.
+  all                Run the default scenario set.
 `);
 }
 
@@ -100,6 +103,20 @@ async function warmNoop(root) {
     if (result.code !== 0) return result.code;
   }
   return 0;
+}
+
+async function workspaceTest(root, { local = false } = {}) {
+  console.log(`\n== workspace-test${local ? "-local" : ""} ==`);
+  const command = local ? "workspace-test-local" : "workspace-test";
+  const result = await repoCommand(
+    root,
+    { RUST_LANE_ID: command },
+    command,
+    [],
+    local ? [] : ["--jobs=64"],
+  );
+  printResult(result);
+  return result.code;
 }
 
 async function sameWorktree(root) {
@@ -342,6 +359,7 @@ if (requested.includes("--help") || requested.includes("-h")) {
 }
 const scenarios = requested.length === 0 || requested.includes("all")
   ? [
+      "workspace-test",
       "warm-noop",
       "same-worktree",
       "same-command",
@@ -357,6 +375,8 @@ const scenarios = requested.length === 0 || requested.includes("all")
   : requested;
 
 const runners = new Map([
+  ["workspace-test", workspaceTest],
+  ["workspace-test-local", (root) => workspaceTest(root, { local: true })],
   ["warm-noop", warmNoop],
   ["same-worktree", sameWorktree],
   ["same-command", sameCommand],

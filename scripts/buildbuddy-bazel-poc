@@ -29,6 +29,34 @@ command="${BUILDBUDDY_BAZEL_COMMAND:-build}"
 requested_command="${command}"
 extra_args=()
 case "${command}" in
+  workspace-test)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//..."
+    host_cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
+    extra_args+=(
+      --test_env="MEERKAT_HOST_CARGO_HOME=${host_cargo_home}"
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  workspace-test-local)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//..."
+    host_cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
+    extra_args+=(
+      --test_env="MEERKAT_HOST_CARGO_HOME=${host_cargo_home}"
+      --spawn_strategy=local
+      --jobs="${BUILDBUDDY_LOCAL_JOBS:-8}"
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
   fast-test)
     command="test"
     config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe-fast}"

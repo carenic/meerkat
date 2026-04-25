@@ -82,12 +82,22 @@ rust_test(
     },
     tags = [
         "fixture",
+        "local",
     ],
     data = [
         ":package_runfiles",
+        "//:test_fixtures",
+        "//test-fixtures/mcp-test-server:package_runfiles",
+        "//test-fixtures/surface-build-fixtures:package_runfiles",
+        "//:workspace_runfiles",
+        "@rules_rust//rust/toolchain:current_cargo_files",
+        "@rules_rust//rust/toolchain:current_rust_stdlib_files",
+        "@rules_rust//rust/toolchain:current_rustc_files",
+        "@rules_rust//rust/toolchain:current_rustc_lib_files",
     ],
     env = {
         "RUST_MIN_STACK": "16777216",
+        "CARGO_TARGET_DIR": "trybuild-target",
     },
     proc_macro_deps = [
         "//meerkat-machine-dsl:meerkat_machine_dsl",

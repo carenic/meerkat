@@ -717,6 +717,7 @@ rust_test(
     data = [
         ":package_runfiles",
         "//meerkat:package_runfiles",
+        "//:workspace_rust_sources",
     ],
     env = {
         "RUST_MIN_STACK": "16777216",
