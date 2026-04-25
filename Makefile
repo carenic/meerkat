@@ -13,7 +13,7 @@ YELLOW := \033[0;33m
 RED := \033[0;31m
 NC := \033[0m
 
-.PHONY: all build test test-unit test-int e2e-fast e2e-build e2e-system e2e-live e2e-smoke test-int-real test-e2e test-all test-minimal test-feature-matrix-lib test-feature-matrix-surface test-feature-matrix test-surface-modularity test-sdk-python test-sdk-typescript test-sdk-suites lint lint-feature-matrix fmt fmt-check audit ci ci-smoke release-preflight release-preflight-smoke publish-dry-run publish-dry-run-python publish-dry-run-typescript release-dry-run release-dry-run-smoke clean doc release install-hooks coverage check help legacy-surface-gate legacy-surface-inventory session-control-gate deprecated-backend-gate deprecated-backend-inventory verify-version-parity verify-schema-freshness verify-rpc-surface-alignment verify-sdk-wrapper-freshness check-rust-release-packaging check-mini-skill-size bump-sdk-versions smoke-sdk-python-artifact smoke-sdk-typescript-artifact xtask-build machine-codegen machine-verify machine-check-drift seam-inventory rmat-audit audit-generated-headers
+.PHONY: all build test test-unit test-int e2e-fast e2e-build e2e-system e2e-live e2e-smoke test-int-real test-e2e test-all test-minimal test-feature-matrix-lib test-feature-matrix-surface test-feature-matrix test-surface-modularity test-sdk-python test-sdk-typescript test-sdk-suites lint lint-feature-matrix fmt fmt-check audit buildbuddy-ci buildbuddy-ci-warm ci ci-smoke release-preflight release-preflight-smoke publish-dry-run publish-dry-run-python publish-dry-run-typescript release-dry-run release-dry-run-smoke clean doc release install-hooks coverage check help legacy-surface-gate legacy-surface-inventory session-control-gate deprecated-backend-gate deprecated-backend-inventory verify-version-parity verify-schema-freshness verify-rpc-surface-alignment verify-sdk-wrapper-freshness check-rust-release-packaging check-mini-skill-size bump-sdk-versions smoke-sdk-python-artifact smoke-sdk-typescript-artifact xtask-build machine-codegen machine-verify machine-check-drift seam-inventory rmat-audit audit-generated-headers
 
 # Default target
 all: ci
@@ -207,6 +207,15 @@ audit:
 audit-alt:
 	@echo "$(GREEN)Running cargo-audit...$(NC)"
 	$(CARGO) audit
+
+# BuildBuddy remote-compatible workspace gate.
+buildbuddy-ci:
+	@echo "$(GREEN)Running BuildBuddy workspace CI gate...$(NC)"
+	@scripts/buildbuddy-ci-workspace --fresh
+
+buildbuddy-ci-warm:
+	@echo "$(GREEN)Running warmed BuildBuddy workspace CI gate...$(NC)"
+	@scripts/buildbuddy-ci-workspace --warm
 
 # Full CI pipeline - runs the required deterministic lanes plus build policy checks
 ci: fmt-check legacy-surface-gate session-control-gate deprecated-backend-gate bridge-no-responsestatus-gate verify-version-parity verify-rpc-surface-alignment verify-sdk-wrapper-freshness check-rust-release-packaging lint lint-feature-matrix test-unit test-int e2e-fast e2e-system test-minimal test-feature-matrix test-surface-modularity seam-inventory rmat-audit audit-generated-headers audit
@@ -538,6 +547,8 @@ help:
 	@echo "  $(GREEN)fmt$(NC)           - Fix code formatting"
 	@echo "  $(GREEN)fmt-check$(NC)     - Check code formatting"
 	@echo "  $(GREEN)audit$(NC)         - Run security audit (cargo-deny)"
+	@echo "  $(GREEN)buildbuddy-ci$(NC) - Run BuildBuddy workspace CI gate"
+	@echo "  $(GREEN)buildbuddy-ci-warm$(NC) - Run warmed BuildBuddy workspace CI gate"
 	@echo "  $(GREEN)ci$(NC)            - Run full CI pipeline"
 	@echo "  $(GREEN)check$(NC)         - Quick compilation check"
 	@echo "  $(GREEN)doc$(NC)           - Generate documentation"

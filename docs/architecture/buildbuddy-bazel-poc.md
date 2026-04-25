@@ -131,7 +131,7 @@ Representative measurements from the POC environment:
 | CI-like parallel fresh output bases | `33.28s` max wall |
 | CI-like workspace-RBE + clippy-RBE, fresh output bases | `26-37.14s` max wall |
 | Dedicated `buildbuddy-ci-workspace` script | `30s` script wall |
-| Dedicated `buildbuddy-ci-workspace --warm`, warm | `6s` script wall |
+| Dedicated `buildbuddy-ci-workspace --warm`, warm | `6-8s` script wall |
 
 The first touch of a new local lane pays Bazel analysis and remote-cache
 materialization cost. Once warmed, the wall-clock floor is mostly the `bb`/Bazel
@@ -157,7 +157,8 @@ to roughly `4-6s` once those lanes were prepared.
   for this shape.
 - For deeper shared crates, use `affected-*` when you need reverse-dependency
   confidence, and expect broad closures for high-fanout crates.
-- For CI, run fast-test and clippy in parallel with separate `RUST_LANE_ID`s.
+- For the remote-compatible BuildBuddy gate, run `make buildbuddy-ci`, or
+  `make buildbuddy-ci-warm` when repeated agents can reuse a stable output root.
 - For same-checkout multi-agent work, always set a distinct `RUST_LANE_ID` per
   agent unless the commands are known to use different lanes already.
 
