@@ -12,10 +12,10 @@ use crate::{
     ActorKind, ActorSchema, ClosurePolicy, CompositionDriver, CompositionDriverRustBinding,
     CompositionInvariant, CompositionInvariantKind, CompositionSchema, CompositionStateLimits,
     CompositionTransactionPlan, CompositionWitness, DriverDispatchRoute, EffectHandoffProtocol,
-    EntryInput, FeedbackFieldBinding, FeedbackFieldSource, FeedbackInputRef, MachineInstance,
-    ProtocolGenerationMode, ProtocolHandleArgKey, ProtocolHelperReturnShape, ProtocolRustBinding,
-    Route, RouteBindingSource, RouteDelivery, RouteFieldBinding, RouteTarget, RouteTargetKind,
-    RouteVariantId, WatchedEffect,
+    EntryInput, FeedbackFieldBinding, FeedbackFieldSource, FeedbackInputRef,
+    HandleBridgeFeedbackBinding, MachineInstance, ProtocolGenerationMode,
+    ProtocolHelperReturnShape, ProtocolRustBinding, Route, RouteBindingSource, RouteDelivery,
+    RouteFieldBinding, RouteTarget, RouteTargetKind, RouteVariantId, WatchedEffect,
 };
 
 // Short-named typed-identity constructors used throughout this module.
@@ -723,25 +723,18 @@ pub fn compat_composition_schemas() -> Vec<CompositionSchema> {
 /// Modes: primary `ShellBridge` (accept + authority.apply submitters),
 /// secondary `HandleBridge` (handle-driven submitter suffixed `_handle`).
 fn mob_bundle_composition() -> CompositionSchema {
-    let mut handle_methods = BTreeMap::new();
-    handle_methods.insert(iv_id("OpsBarrierSatisfied"), "ops_barrier_satisfied".into());
     // Handle method takes `operation_ids: BTreeSet<String>` — the obligation
     // field is `Set<OperationId>` which renders as `Vec<OperationId>`. The
     // accessor rewrites the reference to stringify each operation id.
     let mut handle_accessors = BTreeMap::new();
     handle_accessors.insert(
-        ProtocolHandleArgKey {
-            input_variant: iv_id("OpsBarrierSatisfied"),
-            obligation_field: fld_id("operation_ids"),
-        },
+        fld_id("operation_ids"),
         ".iter().map(ToString::to_string).collect()".into(),
     );
     // Handle method takes only `operation_ids`; the obligation carries
     // a `wait_request_id` correlation token that the turn-state handle
     // never consumes (the ops-lifecycle owner matches on it internally,
     // not through the handle).
-    let mut handle_forwarded_fields = BTreeMap::new();
-    handle_forwarded_fields.insert(iv_id("OpsBarrierSatisfied"), vec![fld_id("operation_ids")]);
 
     CompositionSchema {
         name: comp_id("mob_bundle"),
@@ -798,9 +791,12 @@ fn mob_bundle_composition() -> CompositionSchema {
                 bridge_source_type_path: Some("crate::ops_lifecycle::WaitAllSatisfied".into()),
                 helper_return_shape: ProtocolHelperReturnShape::Obligations,
                 handle_trait_path: Some("meerkat_core::handles::TurnStateHandle".into()),
-                handle_method_names: handle_methods,
-                handle_arg_accessors: handle_accessors,
-                handle_method_forwarded_fields: handle_forwarded_fields,
+                handle_feedback_bindings: vec![HandleBridgeFeedbackBinding {
+                    input_variant: iv_id("OpsBarrierSatisfied"),
+                    method_name: "ops_barrier_satisfied".into(),
+                    arg_accessors: handle_accessors,
+                    forwarded_fields: Some(vec![fld_id("operation_ids")]),
+                }],
                 input_payload_module_path: None,
                 additional_modes: vec![],
             },
@@ -850,45 +846,9 @@ fn mob_bundle_composition() -> CompositionSchema {
 /// - `surface_snapshot_alignment` — EffectExtractor + HandleBridge
 ///   (`snapshot_aligned`). Same shape, single field.
 fn external_tool_bundle_composition() -> CompositionSchema {
-    let mut completion_methods = BTreeMap::new();
-    completion_methods.insert(iv_id("PendingSucceeded"), "mark_pending_succeeded".into());
-    completion_methods.insert(iv_id("PendingFailed"), "mark_pending_failed".into());
-    let mut completion_accessors = BTreeMap::new();
     // Handle takes `String` surface_id; obligation carries typed SurfaceId.
-    completion_accessors.insert(
-        ProtocolHandleArgKey {
-            input_variant: iv_id("PendingSucceeded"),
-            obligation_field: fld_id("surface_id"),
-        },
-        ".0".into(),
-    );
-    completion_accessors.insert(
-        ProtocolHandleArgKey {
-            input_variant: iv_id("PendingFailed"),
-            obligation_field: fld_id("surface_id"),
-        },
-        ".0".into(),
-    );
-    let mut completion_forwarded = BTreeMap::new();
-    // `mark_pending_succeeded(surface_id, pending_task_sequence, staged_intent_sequence)`.
-    completion_forwarded.insert(
-        iv_id("PendingSucceeded"),
-        vec![
-            fld_id("surface_id"),
-            fld_id("pending_task_sequence"),
-            fld_id("staged_intent_sequence"),
-        ],
-    );
-    // `mark_pending_failed(surface_id, reason)` — `reason` is owner-context.
-    completion_forwarded.insert(
-        iv_id("PendingFailed"),
-        vec![fld_id("surface_id"), fld_id("reason")],
-    );
-
-    let mut snapshot_methods = BTreeMap::new();
-    snapshot_methods.insert(iv_id("SnapshotAligned"), "snapshot_aligned".into());
-    let mut snapshot_forwarded = BTreeMap::new();
-    snapshot_forwarded.insert(iv_id("SnapshotAligned"), vec![fld_id("snapshot_epoch")]);
+    let mut surface_id_accessor = BTreeMap::new();
+    surface_id_accessor.insert(fld_id("surface_id"), ".0".into());
 
     CompositionSchema {
         name: comp_id("external_tool_bundle"),
@@ -983,9 +943,24 @@ fn external_tool_bundle_composition() -> CompositionSchema {
                     handle_trait_path: Some(
                         "meerkat_core::handles::ExternalToolSurfaceHandle".into(),
                     ),
-                    handle_method_names: completion_methods,
-                    handle_arg_accessors: completion_accessors,
-                    handle_method_forwarded_fields: completion_forwarded,
+                    handle_feedback_bindings: vec![
+                        HandleBridgeFeedbackBinding {
+                            input_variant: iv_id("PendingSucceeded"),
+                            method_name: "mark_pending_succeeded".into(),
+                            arg_accessors: surface_id_accessor.clone(),
+                            forwarded_fields: Some(vec![
+                                fld_id("surface_id"),
+                                fld_id("pending_task_sequence"),
+                                fld_id("staged_intent_sequence"),
+                            ]),
+                        },
+                        HandleBridgeFeedbackBinding {
+                            input_variant: iv_id("PendingFailed"),
+                            method_name: "mark_pending_failed".into(),
+                            arg_accessors: surface_id_accessor,
+                            forwarded_fields: Some(vec![fld_id("surface_id"), fld_id("reason")]),
+                        },
+                    ],
                     input_payload_module_path: None,
                     additional_modes: vec![ProtocolGenerationMode::HandleBridge],
                 },
@@ -1032,9 +1007,12 @@ fn external_tool_bundle_composition() -> CompositionSchema {
                     handle_trait_path: Some(
                         "meerkat_core::handles::ExternalToolSurfaceHandle".into(),
                     ),
-                    handle_method_names: snapshot_methods,
-                    handle_arg_accessors: BTreeMap::new(),
-                    handle_method_forwarded_fields: snapshot_forwarded,
+                    handle_feedback_bindings: vec![HandleBridgeFeedbackBinding {
+                        input_variant: iv_id("SnapshotAligned"),
+                        method_name: "snapshot_aligned".into(),
+                        arg_accessors: BTreeMap::new(),
+                        forwarded_fields: Some(vec![fld_id("snapshot_epoch")]),
+                    }],
                     input_payload_module_path: None,
                     additional_modes: vec![ProtocolGenerationMode::HandleBridge],
                 },
@@ -1207,9 +1185,7 @@ fn supervisor_trust_bundle_composition() -> CompositionSchema {
                     ),
                     helper_return_shape: ProtocolHelperReturnShape::Obligations,
                     handle_trait_path: None,
-                    handle_method_names: BTreeMap::new(),
-                    handle_arg_accessors: BTreeMap::new(),
-                    handle_method_forwarded_fields: BTreeMap::new(),
+                    handle_feedback_bindings: vec![],
                     input_payload_module_path: None,
                     additional_modes: vec![],
                 },
@@ -1257,9 +1233,7 @@ fn supervisor_trust_bundle_composition() -> CompositionSchema {
                     ),
                     helper_return_shape: ProtocolHelperReturnShape::Obligations,
                     handle_trait_path: None,
-                    handle_method_names: BTreeMap::new(),
-                    handle_arg_accessors: BTreeMap::new(),
-                    handle_method_forwarded_fields: BTreeMap::new(),
+                    handle_feedback_bindings: vec![],
                     input_payload_module_path: None,
                     additional_modes: vec![],
                 },
@@ -1455,9 +1429,7 @@ fn mob_destroy_session_ingress_bundle_composition() -> CompositionSchema {
                 ),
                 helper_return_shape: ProtocolHelperReturnShape::Obligations,
                 handle_trait_path: None,
-                handle_method_names: BTreeMap::new(),
-                handle_arg_accessors: BTreeMap::new(),
-                handle_method_forwarded_fields: BTreeMap::new(),
+                handle_feedback_bindings: vec![],
                 input_payload_module_path: None,
                 additional_modes: vec![],
             },
@@ -1567,9 +1539,7 @@ fn auth_lease_bundle_composition() -> CompositionSchema {
                 bridge_source_type_path: None,
                 helper_return_shape: ProtocolHelperReturnShape::Obligations,
                 handle_trait_path: None,
-                handle_method_names: BTreeMap::new(),
-                handle_arg_accessors: BTreeMap::new(),
-                handle_method_forwarded_fields: BTreeMap::new(),
+                handle_feedback_bindings: vec![],
                 input_payload_module_path: None,
                 additional_modes: vec![],
             },

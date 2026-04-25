@@ -1016,8 +1016,6 @@ fn every_canonical_input_variant_has_transition_coverage() {
 
 #[allow(clippy::expect_used, clippy::panic)]
 mod handoff_binding {
-    use std::collections::BTreeMap;
-
     use meerkat_machine_schema::identity::{
         ActorId, CompositionId, EffectVariantId, FieldId, InputVariantId, MachineId,
         MachineInstanceId, ProtocolId,
@@ -1025,16 +1023,12 @@ mod handoff_binding {
     use meerkat_machine_schema::{
         ActorKind, ActorSchema, ClosurePolicy, CompositionSchema, CompositionSchemaError,
         CompositionStateLimits, EffectHandoffProtocol, FeedbackFieldBinding, FeedbackFieldSource,
-        FeedbackInputRef, MachineInstance, ProtocolGenerationMode, ProtocolHelperReturnShape,
-        ProtocolRustBinding, canonical_machine_schemas, compat_composition_schemas,
+        FeedbackInputRef, HandleBridgeFeedbackBinding, MachineInstance, ProtocolGenerationMode,
+        ProtocolHelperReturnShape, ProtocolRustBinding, canonical_machine_schemas,
+        compat_composition_schemas,
     };
 
     fn ok_handle_binding() -> ProtocolRustBinding {
-        let mut methods = BTreeMap::new();
-        methods.insert(
-            InputVariantId::parse("Ack").expect("valid input_variant"),
-            "acknowledge".into(),
-        );
         ProtocolRustBinding {
             module_path: "crate-x/src/generated/proto.rs".into(),
             generation_mode: ProtocolGenerationMode::HandleBridge,
@@ -1049,9 +1043,12 @@ mod handoff_binding {
             bridge_source_type_path: None,
             helper_return_shape: ProtocolHelperReturnShape::Effects,
             handle_trait_path: Some("crate::SomeHandle".into()),
-            handle_method_names: methods,
-            handle_arg_accessors: BTreeMap::new(),
-            handle_method_forwarded_fields: BTreeMap::new(),
+            handle_feedback_bindings: vec![HandleBridgeFeedbackBinding {
+                input_variant: InputVariantId::parse("Ack").expect("valid input_variant"),
+                method_name: "acknowledge".into(),
+                arg_accessors: Default::default(),
+                forwarded_fields: None,
+            }],
             input_payload_module_path: None,
             additional_modes: vec![],
         }
@@ -1151,7 +1148,7 @@ mod handoff_binding {
     #[test]
     fn handle_bridge_requires_method_for_every_feedback_input() {
         let mut binding = ok_handle_binding();
-        binding.handle_method_names = BTreeMap::new();
+        binding.handle_feedback_bindings = vec![];
         let composition = composition_with_protocol(handle_bridge_protocol(binding));
 
         let err = composition
@@ -1161,8 +1158,8 @@ mod handoff_binding {
             CompositionSchemaError::InvalidHandoffRustBinding { protocol, detail } => {
                 assert_eq!(protocol, "test_handoff");
                 assert!(
-                    detail.contains("handle_method_names"),
-                    "error detail should mention handle_method_names, got {detail}"
+                    detail.contains("handle_feedback_bindings"),
+                    "error detail should mention handle_feedback_bindings, got {detail}"
                 );
                 assert!(
                     detail.contains("Ack"),
@@ -1198,9 +1195,7 @@ mod handoff_binding {
             bridge_source_type_path: None,
             helper_return_shape: ProtocolHelperReturnShape::Obligations,
             handle_trait_path: None,
-            handle_method_names: BTreeMap::new(),
-            handle_arg_accessors: BTreeMap::new(),
-            handle_method_forwarded_fields: BTreeMap::new(),
+            handle_feedback_bindings: vec![],
             input_payload_module_path: None,
             additional_modes: vec![],
         };
@@ -1298,11 +1293,6 @@ mod handoff_binding {
     fn dual_mode_effect_extractor_plus_handle_bridge_validates() {
         // Minimum valid stacked binding: EffectExtractor primary +
         // HandleBridge secondary, with all required fields for both.
-        let mut methods = BTreeMap::new();
-        methods.insert(
-            InputVariantId::parse("Ack").expect("valid input_variant"),
-            "acknowledge".into(),
-        );
         let binding = ProtocolRustBinding {
             module_path: "crate-x/src/generated/proto.rs".into(),
             generation_mode: ProtocolGenerationMode::EffectExtractor,
@@ -1317,9 +1307,12 @@ mod handoff_binding {
             bridge_source_type_path: None,
             helper_return_shape: ProtocolHelperReturnShape::Effects,
             handle_trait_path: Some("crate::SomeHandle".into()),
-            handle_method_names: methods,
-            handle_arg_accessors: BTreeMap::new(),
-            handle_method_forwarded_fields: BTreeMap::new(),
+            handle_feedback_bindings: vec![HandleBridgeFeedbackBinding {
+                input_variant: InputVariantId::parse("Ack").expect("valid input_variant"),
+                method_name: "acknowledge".into(),
+                arg_accessors: Default::default(),
+                forwarded_fields: None,
+            }],
             input_payload_module_path: None,
             additional_modes: vec![ProtocolGenerationMode::HandleBridge],
         };
@@ -1464,9 +1457,7 @@ mod handoff_binding {
                     bridge_source_type_path: None,
                     helper_return_shape: ProtocolHelperReturnShape::Obligations,
                     handle_trait_path: None,
-                    handle_method_names: BTreeMap::new(),
-                    handle_arg_accessors: BTreeMap::new(),
-                    handle_method_forwarded_fields: BTreeMap::new(),
+                    handle_feedback_bindings: vec![],
                     input_payload_module_path: None,
                     additional_modes: vec![],
                 },

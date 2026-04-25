@@ -20,9 +20,10 @@ pub use composition::{
     CompositionWitness, CompositionWitnessField, CompositionWitnessInput, CompositionWitnessState,
     CompositionWitnessTransition, CompositionWitnessTransitionOrder, DriverDispatchRoute,
     EffectHandoffProtocol, EntryInput, FeedbackFieldBinding, FeedbackFieldSource, FeedbackInputRef,
-    MachineInstance, ProtocolGenerationMode, ProtocolHandleArgKey, ProtocolHelperReturnShape,
-    ProtocolRustBinding, Route, RouteBindingSource, RouteDelivery, RouteFieldBinding, RouteTarget,
-    RouteTargetKind, RouteTargetSelector, RouteVariantId, SchedulerRule, WatchedEffect,
+    HandleBridgeFeedbackBinding, MachineInstance, ProtocolGenerationMode,
+    ProtocolHelperReturnShape, ProtocolRustBinding, Route, RouteBindingSource, RouteDelivery,
+    RouteFieldBinding, RouteTarget, RouteTargetKind, RouteTargetSelector, RouteVariantId,
+    SchedulerRule, WatchedEffect,
 };
 pub use machine::{
     EffectDisposition, EffectDispositionRule, EffectEmit, EnumSchema, Expr, FieldInit, FieldSchema,
