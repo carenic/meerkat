@@ -7,14 +7,13 @@
 use super::{ModelCapabilities, ThinkingSupport};
 use crate::model_profile::catalog::ModelTier;
 
-/// Reasoning-effort levels accepted by GPT-5.4.
+/// Reasoning-effort levels accepted by recent GPT-5.x models (5.4, 5.5, 5.5-pro).
 ///
 /// Verified against the live API: `minimal` is rejected with
 /// "Supported values are: 'none', 'low', 'medium', 'high', and 'xhigh'."
 /// Earlier docs implying `minimal` support appear to apply only to older
-/// GPT-5.x models, not 5.4.
-/// Default is `none` — opt-in reasoning on 5.4.
-const GPT5_4_EFFORT: &[&str] = &["none", "low", "medium", "high", "xhigh"];
+/// GPT-5.x models. Default is `none` — opt-in reasoning.
+const GPT5_RECENT_EFFORT: &[&str] = &["none", "low", "medium", "high", "xhigh"];
 
 /// Reasoning-effort levels accepted by GPT-5.3 Codex.
 ///
@@ -28,6 +27,75 @@ const REALTIME_NO_EFFORT: &[&str] = &[];
 
 /// Capability rows for OpenAI catalog models.
 pub const CAPABILITIES: &[ModelCapabilities] = &[
+    // GPT-5.5
+    //
+    // Successor to GPT-5.4. Capability shape is modeled on the 5.4 family
+    // pending authoritative source documentation; family heuristics
+    // (`gpt-5` prefix, no `-pro` suffix) match.
+    ModelCapabilities {
+        id: "gpt-5.5",
+        provider: "openai",
+        display_name: "GPT-5.5",
+        tier: ModelTier::Recommended,
+        model_family: "gpt-5",
+        context_window: 1_050_000,
+        max_output_tokens: 128_000,
+        context_window_beta: None,
+        max_output_tokens_beta: None,
+        vision: true,
+        image_tool_results: false,
+        inline_video: false,
+        realtime: false,
+        supports_temperature: false,
+        supports_top_p: false,
+        supports_top_k: false,
+        thinking: ThinkingSupport::None,
+        supports_reasoning: true,
+        effort_levels: GPT5_RECENT_EFFORT,
+        supports_web_search: true,
+        supports_inference_geo: false,
+        supports_compaction: false,
+        supports_structured_output: true,
+        supports_legacy_penalties: true,
+        supports_thinking_budget_legacy: false,
+        beta_headers: &[],
+        call_timeout_secs: Some(600),
+    },
+    // GPT-5.5 Pro
+    //
+    // Pro tier of GPT-5.5. Mirrors the 5.5 capability shape; the `-pro`
+    // suffix is recognized by `model_profile::openai` heuristics for the
+    // long-running timeout (7200s) consistent with other gpt-5 pro
+    // variants.
+    ModelCapabilities {
+        id: "gpt-5.5-pro",
+        provider: "openai",
+        display_name: "GPT-5.5 Pro",
+        tier: ModelTier::Recommended,
+        model_family: "gpt-5",
+        context_window: 1_050_000,
+        max_output_tokens: 128_000,
+        context_window_beta: None,
+        max_output_tokens_beta: None,
+        vision: true,
+        image_tool_results: false,
+        inline_video: false,
+        realtime: false,
+        supports_temperature: false,
+        supports_top_p: false,
+        supports_top_k: false,
+        thinking: ThinkingSupport::None,
+        supports_reasoning: true,
+        effort_levels: GPT5_RECENT_EFFORT,
+        supports_web_search: true,
+        supports_inference_geo: false,
+        supports_compaction: false,
+        supports_structured_output: true,
+        supports_legacy_penalties: true,
+        supports_thinking_budget_legacy: false,
+        beta_headers: &[],
+        call_timeout_secs: Some(7200),
+    },
     // GPT-5.4
     //
     // Sources:
@@ -36,11 +104,14 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
     //     (context 1,050,000; max output 128,000; reasoning opt-in default none)
     //   - Reasoning guide:
     //     https://developers.openai.com/api/docs/guides/reasoning
+    //
+    // Demoted to Supported with the GPT-5.5 release; remains a fully
+    // supported choice but the catalog default points at 5.5.
     ModelCapabilities {
         id: "gpt-5.4",
         provider: "openai",
         display_name: "GPT-5.4",
-        tier: ModelTier::Recommended,
+        tier: ModelTier::Supported,
         model_family: "gpt-5",
         context_window: 1_050_000,
         max_output_tokens: 128_000,
@@ -58,7 +129,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_k: false,
         thinking: ThinkingSupport::None,
         supports_reasoning: true,
-        effort_levels: GPT5_4_EFFORT,
+        effort_levels: GPT5_RECENT_EFFORT,
         supports_web_search: true,
         supports_inference_geo: false,
         supports_compaction: false,
