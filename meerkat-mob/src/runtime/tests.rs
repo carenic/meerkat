@@ -9987,12 +9987,6 @@ async fn test_unwire_external_removes_trust_and_projection() {
     );
 }
 
-// External peer wiring was previously scope-deferred (rejection-assertion
-// tripwires fired `WiringError` containing `"scope-deferred"`). The
-// feature was restored in #31 D-external-peer; the positive-path
-// assertions live in `test_wire_external_adds_trusted_peer_and_tracks_projection`
-// and `test_unwire_external_removes_trust_and_projection` above.
-
 #[tokio::test]
 async fn test_wire_emits_peers_wired_event() {
     let (handle, _service) = create_test_mob(sample_definition()).await;
@@ -17558,24 +17552,7 @@ async fn test_unwire_prunes_stale_local_trust_when_projection_is_already_absent(
     );
 }
 
-// Preserved under #[ignore] because the scenario it covers is unique:
-// the second `handle.unwire(PeerTarget::External)` must idempotently
-// prune stale comms trust AFTER the comms runtime had trust re-injected
-// externally via `CoreCommsRuntime::add_trusted_peer`. That's the
-// "projection-absent but comms-trust-present" edge-case — a contract
-// the #25 Q2 rejection-assertion tripwires (around lines 9816/9849) do
-// NOT cover; they assert the wire/unwire rejection shape, not the
-// comms-side idempotency of stale-trust cleanup.
-//
-// The test body currently panics at setup because
-// `handle.wire(PeerTarget::External)` returns
-// `WiringError("scope-deferred")` per `MobActor::handle_wire`
-// (`actor.rs` ~line 4160): external peer wiring is scope-deferred
-// pending supervisor-owned trust authority. When that authority lands
-// (c.f. `#28 D-obs-audit` follow-up), remove the `#[ignore]` and the
-// body runs against the restored positive path.
 #[tokio::test]
-#[ignore = "external peer wiring scope-deferred; setup uses handle.wire(PeerTarget::External) which returns WiringError(\"scope-deferred\") per MobActor::handle_wire in actor.rs ~line 4160. Pending supervisor-owned trust authority restoration (#28 D-obs-audit follow-up). Unique coverage here: second unwire(External) idempotently prunes stale comms trust after CoreCommsRuntime::add_trusted_peer re-injected it — a contract the #25 Q2 rejection-assertion tripwires don't cover. When external wiring returns, remove this #[ignore] and the body should run against the restored path."]
 async fn test_unwire_external_prunes_stale_trust_when_projection_is_already_absent() {
     let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
     let (handle, service) = create_test_mob_with_real_comms(sample_definition()).await;
@@ -17587,12 +17564,12 @@ async fn test_unwire_external_prunes_stale_trust_when_projection_is_already_abse
         .bridge_session_id()
         .expect("session-backed")
         .clone();
-    let spec = TrustedPeerDescriptor::test_only_unsigned(
+    let external_keypair = meerkat_comms::Keypair::generate();
+    let external_pubkey = external_keypair.public_key();
+    let spec = TrustedPeerDescriptor::unsigned_with_pubkey(
         "remote-mob/worker/agent-x",
-        meerkat_comms::Keypair::generate()
-            .public_key()
-            .to_peer_id()
-            .to_string(),
+        external_pubkey.to_peer_id().to_string(),
+        *external_pubkey.as_bytes(),
         "inproc://remote-mob/worker/agent-x",
     )
     .expect("valid external peer");

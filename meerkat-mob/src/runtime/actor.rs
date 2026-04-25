@@ -395,11 +395,7 @@ impl MobActor {
     }
 
     fn trusted_peer_removal_key(peer: &TrustedPeerDescriptor) -> String {
-        if peer.pubkey == [0u8; 32] {
-            peer.peer_id.to_string()
-        } else {
-            Self::trusted_peer_pubkey_string(peer)
-        }
+        Self::trusted_peer_pubkey_string(peer)
     }
 
     fn supervisor_spec_for_authority(
@@ -5099,7 +5095,7 @@ impl MobActor {
                                 "unwire external peer has invalid peer name: {error}",
                             ))
                         })?;
-                    return self.handle_unwire_external(local, peer_name).await;
+                    return self.handle_unwire_external(local, peer_name, None).await;
                 }
                 id
             }
@@ -5110,7 +5106,9 @@ impl MobActor {
                             "unwire external peer has invalid peer name: {error}",
                         ))
                     })?;
-                return self.handle_unwire_external(local, peer_name).await;
+                return self
+                    .handle_unwire_external(local, peer_name, Some(descriptor))
+                    .await;
             }
         };
 
@@ -5691,12 +5689,15 @@ impl MobActor {
         &mut self,
         local: MeerkatId,
         peer_name: meerkat_core::comms::PeerName,
+        stale_cleanup_spec: Option<TrustedPeerDescriptor>,
     ) -> Result<(), MobError> {
         let local_identity = AgentIdentity::from(local.as_str());
         let external_identity = AgentIdentity::from(peer_name.as_str());
 
         // Look up the prior descriptor so we can compensate on append
-        // failure. Idempotent: absent spec → no-op success.
+        // failure. Idempotent: absent projection stays success, but a
+        // descriptor-bearing External target still prunes any stale comms
+        // trust that was re-injected after the first unwire.
         let (member_ref, prior_spec) = {
             let roster = self.roster.read().await;
             let entry = roster
@@ -5707,7 +5708,13 @@ impl MobActor {
         };
 
         let Some(prior_spec) = prior_spec else {
-            // Idempotent no-op: nothing to unwire.
+            if let Some(spec) = stale_cleanup_spec
+                && let Some(comms) = self.provisioner_comms(&member_ref).await
+            {
+                let _ = comms
+                    .remove_trusted_peer(&Self::trusted_peer_removal_key(&spec))
+                    .await?;
+            }
             return Ok(());
         };
 
