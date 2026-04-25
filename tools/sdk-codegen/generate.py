@@ -63,6 +63,22 @@ def _schema_root_with_local_defs(root_schema: dict[str, Any], schema: dict[str, 
     return schema_root
 
 
+def _runtime_state_result_root(wire_schema: dict[str, Any]) -> dict[str, Any]:
+    root = dict(wire_schema)
+    root["RuntimeStateResult"] = {
+        "description": "Response payload for session/status.",
+        "properties": {
+            "state": {
+                "$ref": "#/$defs/WireRuntimeState",
+            },
+        },
+        "required": ["state"],
+        "title": "RuntimeStateResult",
+        "type": "object",
+    }
+    return root
+
+
 def _variant_type_prefix(name: str) -> str:
     return name.removesuffix("Request")
 
@@ -395,6 +411,7 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
 
     params_schema = schemas.get("params", {})
     wire_schema = schemas.get("wire-types", {})
+    runtime_state_result_root = _runtime_state_result_root(wire_schema)
 
     def append_python_dataclass(name: str, root_schema: dict[str, Any], default_doc: str) -> None:
         nonlocal types_content
@@ -500,7 +517,11 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
     append_python_dataclass("WireTrustedPeerSpec", wire_schema, "Minimal trusted peer spec for mob wiring.")
     append_python_dataclass("MobWireResult", wire_schema, "Response payload for mob/wire.")
     append_python_dataclass("MobUnwireResult", wire_schema, "Response payload for mob/unwire.")
-    append_python_dataclass("RuntimeStateResult", wire_schema, "Response payload for session/status.")
+    append_python_dataclass(
+        "RuntimeStateResult",
+        runtime_state_result_root,
+        "Response payload for session/status.",
+    )
     append_python_dataclass(
         "RuntimeRealtimeAttachmentStatusResult",
         wire_schema,
@@ -720,6 +741,7 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
 
     params_schema = schemas.get("params", {})
     wire_schema = schemas.get("wire-types", {})
+    runtime_state_result_root = _runtime_state_result_root(wire_schema)
 
     def append_typescript_interface(name: str, root_schema: dict[str, Any]) -> None:
         nonlocal types_content
@@ -825,7 +847,7 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
     append_typescript_interface("WireTrustedPeerSpec", wire_schema)
     append_typescript_interface("MobWireResult", wire_schema)
     append_typescript_interface("MobUnwireResult", wire_schema)
-    append_typescript_interface("RuntimeStateResult", wire_schema)
+    append_typescript_interface("RuntimeStateResult", runtime_state_result_root)
     append_typescript_interface("RuntimeRealtimeAttachmentStatusResult", wire_schema)
     append_typescript_interface("RealtimeReconnectPolicy", wire_schema)
     append_typescript_interface("RealtimeCapabilities", wire_schema)

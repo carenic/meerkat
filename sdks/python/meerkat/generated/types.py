@@ -315,6 +315,7 @@ class MobUnwireResult:
 @dataclass
 class RuntimeStateResult:
     """Response payload for session/status."""
+    state: WireRuntimeState
 
 
 @dataclass

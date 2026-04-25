@@ -86,6 +86,7 @@ from meerkat.generated.types import (
     RealtimeCapabilities as GeneratedRealtimeCapabilities,
     RealtimeChannelOpenFrame as GeneratedRealtimeChannelOpenFrame,
     RealtimeOpenInfo as GeneratedRealtimeOpenInfo,
+    RuntimeStateResult as GeneratedRuntimeStateResult,
 )
 
 
@@ -137,6 +138,12 @@ def test_generated_realtime_types_include_open_info_shape():
         turning_mode="provider_managed",
     )
     assert frame.protocol_version == "1"
+
+
+def test_generated_runtime_state_result_carries_state():
+    result = GeneratedRuntimeStateResult(state="idle")
+
+    assert result.state == "idle"
 
 
 # ---------------------------------------------------------------------------

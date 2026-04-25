@@ -500,6 +500,7 @@ export interface MobUnwireResult {
 }
 
 export interface RuntimeStateResult {
+  state: WireRuntimeState;
 }
 
 export interface RuntimeRealtimeAttachmentStatusResult {

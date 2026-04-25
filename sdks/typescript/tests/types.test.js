@@ -69,6 +69,7 @@ describe("Contract Version", () => {
     assert.match(generated, /default_protocol_version: string/);
     assert.match(generated, /export interface RealtimeChannelOpenFrame/);
     assert.match(generated, /protocol_version: string/);
+    assert.match(generated, /export interface RuntimeStateResult \{\n  state: WireRuntimeState;\n\}/);
   });
 });
 
