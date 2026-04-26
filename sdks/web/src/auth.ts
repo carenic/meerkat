@@ -24,6 +24,9 @@
 
 import type { ConnectionRef, SessionConfig } from './types.js';
 
+/** Canonical WASM external-auth resolver handle for host-owned browser auth. */
+export const WASM_EXTERNAL_AUTH_RESOLVER_HANDLE = 'wasm_host' as const;
+
 /** Host-page resolver callback that the WASM runtime invokes when the
  * selected binding's credential source is `external_resolver`. Takes a
  * structural connection reference, returns a bearer token string (or a promise). */

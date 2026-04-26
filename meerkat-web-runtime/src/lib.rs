@@ -422,11 +422,11 @@ fn build_service_infrastructure(
     // the provider runtime registry. The resolver itself handles the
     // "no callback registered" case by returning `MissingSecret`; we
     // always register the bridge so realm bindings configured with
-    // `CredentialSourceSpec::ExternalResolver { handle: "wasm_host" }`
+    // `CredentialSourceSpec::ExternalResolver { handle: WASM_EXTERNAL_AUTH_RESOLVER_HANDLE }`
     // work whether or not the host page has (yet) installed a callback.
     #[cfg(target_arch = "wasm32")]
     let factory = meerkat::AgentFactory::minimal().with_external_auth_resolver(
-        "wasm_host",
+        crate::external_auth::WASM_EXTERNAL_AUTH_RESOLVER_HANDLE,
         std::sync::Arc::new(crate::external_auth::WasmExternalAuthResolver),
     );
     #[cfg(not(target_arch = "wasm32"))]

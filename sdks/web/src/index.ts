@@ -7,6 +7,7 @@ export { isKnownEvent, KNOWN_AGENT_EVENT_TYPES } from './types.js';
 export type * from './types.js';
 export {
   Auth,
+  WASM_EXTERNAL_AUTH_RESOLVER_HANDLE,
   registerExternalAuthResolver,
   clearExternalAuthResolver,
   withConnectionRef,

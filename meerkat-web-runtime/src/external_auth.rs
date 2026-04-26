@@ -47,6 +47,11 @@ thread_local! {
     static EXTERNAL_AUTH_RESOLVER: RefCell<Option<Function>> = const { RefCell::new(None) };
 }
 
+/// Canonical external-auth resolver handle installed by the WASM runtime.
+/// Realm configs that want host-owned browser auth use
+/// `CredentialSourceSpec::ExternalResolver { handle: "wasm_host" }`.
+pub const WASM_EXTERNAL_AUTH_RESOLVER_HANDLE: &str = "wasm_host";
+
 /// Register a JS-side external-auth resolver. The callback receives a
 /// structural connection reference argument (`{ realm, binding, profile? }`)
 /// and must return a Promise that resolves to a bearer-token string.
@@ -133,7 +138,7 @@ fn connection_ref_js_value(connection_ref: &meerkat_core::ConnectionRef) -> JsVa
 /// Rust-side bridge that implements `ExternalAuthResolverHandle` by
 /// delegating to the JS callback registered via
 /// `register_external_auth_resolver`. Registered on `AgentFactory` with
-/// the well-known handle `"wasm_host"` during WASM runtime init. Realm
+/// [`WASM_EXTERNAL_AUTH_RESOLVER_HANDLE`] during WASM runtime init. Realm
 /// bindings configured with
 /// `CredentialSourceSpec::ExternalResolver { handle: "wasm_host" }`
 /// therefore delegate credential resolution to the JS host's OAuth
@@ -149,20 +154,26 @@ impl meerkat_providers::ExternalAuthResolverHandle for WasmExternalAuthResolver 
         binding: &meerkat_providers::ValidatedBinding,
     ) -> Result<meerkat_core::ResolvedAuthEnvelope, meerkat_core::AuthError> {
         let promise = invoke_external_auth_resolver(&binding.connection_ref).map_err(|e| {
-            meerkat_core::AuthError::Other(format!("wasm_host resolver: {}", js_value_display(&e),))
+            meerkat_core::AuthError::Other(format!(
+                "{} resolver: {}",
+                WASM_EXTERNAL_AUTH_RESOLVER_HANDLE,
+                js_value_display(&e),
+            ))
         })?;
         let js_value = wasm_bindgen_futures::JsFuture::from(promise)
             .await
             .map_err(|e| {
                 meerkat_core::AuthError::Other(format!(
-                    "wasm_host resolver rejected: {}",
+                    "{} resolver rejected: {}",
+                    WASM_EXTERNAL_AUTH_RESOLVER_HANDLE,
                     js_value_display(&e),
                 ))
             })?;
         let token = js_value.as_string().ok_or_else(|| {
-            meerkat_core::AuthError::Other(
-                "wasm_host resolver must resolve its Promise to a string bearer token".into(),
-            )
+            meerkat_core::AuthError::Other(format!(
+                "{} resolver must resolve its Promise to a string bearer token",
+                WASM_EXTERNAL_AUTH_RESOLVER_HANDLE,
+            ))
         })?;
         if token.trim().is_empty() {
             return Err(meerkat_core::AuthError::MissingSecret);

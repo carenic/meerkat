@@ -20,7 +20,7 @@ use crate::AgentToolDispatcher;
 use crate::agent::{DetachedOpCompletion, ExternalToolUpdate};
 use crate::error::ToolError;
 use crate::event::ExternalToolDelta;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", test))]
 use crate::tokio;
 use crate::tool_catalog::{ToolCatalogCapabilities, ToolCatalogEntry};
 use crate::types::{ToolCallView, ToolDef, ToolName};

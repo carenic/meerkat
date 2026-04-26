@@ -68,12 +68,18 @@ pub enum RuntimeBindingsError {
     SessionNotFound(SessionId),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 type MeerkatMachineCommandFuture<'a> = Pin<
     Box<
         dyn Future<Output = Result<MeerkatMachineCommandResult, MeerkatMachineCommandError>>
             + Send
             + 'a,
     >,
+>;
+
+#[cfg(target_arch = "wasm32")]
+type MeerkatMachineCommandFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<MeerkatMachineCommandResult, MeerkatMachineCommandError>> + 'a>,
 >;
 
 pub(crate) use driver::{

@@ -12,11 +12,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+#[cfg(not(target_arch = "wasm32"))]
+use meerkat_core::auth::{PersistedAuthMode, TokenKey};
 use meerkat_core::{
     AnthropicAuthMetadata, AuthError, AuthLease, AuthMetadata, AuthMetadataDefaults,
     AuthRouteHints, CredentialSourceSpec, GoogleAuthMetadata, HttpAuthorizationRequest,
     HttpAuthorizer, OpenAiAuthMetadata, ProviderAuthMetadata, ResolvedAuthEnvelope,
-    auth::{PersistedAuthMode, TokenKey},
 };
 
 use meerkat_llm_core::provider_runtime::binding::{DynamicLease, StaticLease, ValidatedBinding};
@@ -156,6 +157,7 @@ async fn resolve_managed_store_secret(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn managed_store_auth_mode(auth_method: &str) -> Result<PersistedAuthMode, ProviderAuthError> {
     match auth_method {
         "api_key" | "api_key_express" | "foundry_api_key" => Ok(PersistedAuthMode::ApiKey),
