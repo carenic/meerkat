@@ -81,4 +81,13 @@ jobs:
           MEERKAT_BUILDBUDDY_CHANGED_MODE: ${{ inputs.changed_mode }}
           MEERKAT_BUILDBUDDY_BASE: ${{ inputs.base }}
           MEERKAT_BUILDBUDDY_CHANGED_PATHS: ${{ inputs.paths }}
+          MEERKAT_BUILDBUDDY_LOG_ROOT: ${{ runner.temp }}/buildbuddy-logs
         run: scripts/buildbuddy-ci-dispatch
+
+      - name: Upload BuildBuddy logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildbuddy-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/buildbuddy-logs
+          if-no-files-found: ignore

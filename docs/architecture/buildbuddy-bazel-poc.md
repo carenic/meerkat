@@ -146,12 +146,13 @@ modes:
 
 For an actual remote-compatible CI gate, use `scripts/buildbuddy-ci-workspace`.
 It runs `workspace-fast-clippy-rbe` and `workspace-build-clippy-rbe` in parallel
-on isolated fresh lanes, prints compact summaries, and cleans up the temporary
-output roots. Use `--warm` to reuse a stable output root for repeated local or
-agent gates. The optional `.github/workflows/buildbuddy.yml` workflow is
-manual-only, requires a `BUILDBUDDY_API_KEY` secret, installs the pinned `bb`
-binary, and dispatches through `scripts/buildbuddy-ci-dispatch`. Normal GitHub
-CI remains Cargo-based.
+on isolated fresh lanes, writes compact summaries and per-lane logs outside the
+Bazel output root, and cleans up the temporary output roots. Use `--warm` to
+reuse a stable output root for repeated local or agent gates. The optional
+`.github/workflows/buildbuddy.yml` workflow is manual-only, requires a
+`BUILDBUDDY_API_KEY` secret, installs the pinned `bb` binary, dispatches through
+`scripts/buildbuddy-ci-dispatch`, and uploads the BuildBuddy log directory as a
+workflow artifact. Normal GitHub CI remains Cargo-based.
 
 The dispatch modes are:
 
@@ -198,6 +199,7 @@ lane wrappers from both systems:
 | --- | ---: | ---: |
 | Fast deterministic tests, compile/no-run first pass | `122.71s` | `30.47s` first new Bazel lane run |
 | Fast deterministic tests, warm execution | `47.96s` (`5112` tests) | `4.36s` (now `117` Bazel fast test targets, `0` executed when cached) |
+| Fast deterministic tests, latest artifacted warm run | `29s` (`5114` tests) | `4s` (`117` Bazel fast targets, `0` executed when cached) |
 | Workspace clippy, warm after fix | `48.13s` | `4s` split fast-test-clippy + build-clippy gate |
 
 The Cargo fast lane is now `./scripts/repo-cargo fast`, `cargo rct`, or
@@ -263,6 +265,7 @@ profile so `cargo fast`, `cargo rct`, `cargo int`, and
 | Dedicated `buildbuddy-ci-workspace` script, first after script/doc edits | `45s` script wall |
 | Dedicated `buildbuddy-ci-workspace` script, remote cache warm | `28-30s` script wall |
 | Dedicated `buildbuddy-ci-workspace --warm`, warm | `6-8s` script wall |
+| Dedicated `buildbuddy-ci-workspace --warm` with external CI logs, warm | `5s` script wall; both split lanes cached |
 | Split fast workspace CI after lane change, first warm-root run | `51s` script wall |
 | Split fast workspace CI after lane change, warm | `4s` script wall |
 | Warm workspace CI after dispatch/test-speed hardening | `9s` script wall, `140` tests pass |
