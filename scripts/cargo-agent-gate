@@ -300,6 +300,13 @@ else
   sorted_exact_tests=()
 fi
 
+clippy_flags=("${pkg_flags[@]}")
+clippy_target_args=("--all-targets" "--all-features")
+if [[ "${#sorted_exact_tests[@]}" -gt 0 ]]; then
+  clippy_flags=("${test_flags[@]}")
+  clippy_target_args=("--all-features")
+fi
+
 printf 'Cargo agent gate packages:\n'
 printf '  %s\n' "${sorted_packages[@]}"
 if [[ "${#sorted_exact_tests[@]}" -gt 0 ]]; then
@@ -310,8 +317,9 @@ fi
 if [[ "${dry_run}" -eq 1 ]]; then
   if [[ "${run_clippy}" -eq 1 ]]; then
     printf 'DRY-RUN %s clippy' "$CARGO"
-    printf ' %q' "${pkg_flags[@]}"
-    printf ' --all-targets --all-features -- -D warnings\n'
+    printf ' %q' "${clippy_flags[@]}"
+    printf ' %q' "${clippy_target_args[@]}"
+    printf ' -- -D warnings\n'
   fi
   if [[ "${run_tests}" -eq 1 ]]; then
     printf 'DRY-RUN %s nextest run' "$CARGO"
@@ -322,7 +330,7 @@ if [[ "${dry_run}" -eq 1 ]]; then
 fi
 
 if [[ "${run_clippy}" -eq 1 ]]; then
-  "$CARGO" clippy "${pkg_flags[@]}" --all-targets --all-features -- -D warnings
+  "$CARGO" clippy "${clippy_flags[@]}" "${clippy_target_args[@]}" -- -D warnings
 fi
 if [[ "${run_tests}" -eq 1 ]]; then
   "$CARGO" nextest run "${test_flags[@]}" --profile fast --no-tests=pass \
