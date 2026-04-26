@@ -212,9 +212,6 @@ if [[ "${global}" -eq 1 ]]; then
 fi
 
 declare -A package_names=()
-declare -A exact_test_names=()
-exact_test_possible=1
-exact_test_package=""
 for path in "${relevant[@]}"; do
   if [[ "${path}" == */* ]]; then
     dir="${path%/*}"
@@ -226,26 +223,6 @@ for path in "${relevant[@]}"; do
       pkg="$(package_name_for_dir "${dir}")"
       if [[ -n "${pkg}" ]]; then
         package_names["${pkg}"]=1
-        test_dir="${dir}/tests"
-        if [[ "${dir}" == "." ]]; then
-          test_dir="tests"
-        fi
-        if [[ "${path}" == "${test_dir}/"*.rs ]]; then
-          test_name="${path#"${test_dir}/"}"
-          if [[ "${test_name}" == *.rs && "${test_name}" != */* ]]; then
-            test_name="${test_name%.rs}"
-            exact_test_names["${test_name}"]=1
-            if [[ -z "${exact_test_package}" ]]; then
-              exact_test_package="${pkg}"
-            elif [[ "${exact_test_package}" != "${pkg}" ]]; then
-              exact_test_possible=0
-            fi
-          else
-            exact_test_possible=0
-          fi
-        else
-          exact_test_possible=0
-        fi
       fi
       break
     fi
@@ -287,12 +264,6 @@ fi
 if [[ -n "${exact_selector_package}" && "${#sorted_packages[@]}" -eq 1 && "${#exact_selector_tests[@]}" -gt 0 ]]; then
   test_flags=("-p" "${exact_selector_package}")
   mapfile -t sorted_exact_tests < <(printf '%s\n' "${!exact_selector_tests[@]}" | sort)
-  for test_name in "${sorted_exact_tests[@]}"; do
-    test_flags+=("--test" "${test_name}")
-  done
-elif [[ "${exact_test_possible}" -eq 1 && "${#sorted_packages[@]}" -eq 1 && "${#exact_test_names[@]}" -gt 0 ]]; then
-  test_flags=("-p" "${exact_test_package}")
-  mapfile -t sorted_exact_tests < <(printf '%s\n' "${!exact_test_names[@]}" | sort)
   for test_name in "${sorted_exact_tests[@]}"; do
     test_flags+=("--test" "${test_name}")
   done
