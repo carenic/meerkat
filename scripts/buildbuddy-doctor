@@ -81,6 +81,15 @@ else
   bad "Bazel selector did not enumerate build labels"
 fi
 
+support_test_labels="$(./scripts/bazel-affected-fast-tests.mjs --owned --test meerkat/tests/support/test_session_store.rs)"
+if [[ "${support_test_labels}" == *"//meerkat:sdk_agentfactory_test"* ]] &&
+  [[ "${support_test_labels}" == *"//meerkat:sdk_structured_output_test"* ]]; then
+  pass "Bazel selector narrows integration support edits to importing tests"
+else
+  bad "Bazel selector did not select exact importing integration tests"
+  printf '%s\n' "${support_test_labels}" >&2
+fi
+
 fast_profile_filter="$(./scripts/repo-cargo nextest show-config test-groups --profile fast 2>&1 || true)"
 if grep -q '\[profile.fast\]' .config/nextest.toml &&
   grep -q 'default-filter' .config/nextest.toml &&

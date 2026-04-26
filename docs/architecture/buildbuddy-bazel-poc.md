@@ -317,8 +317,9 @@ to roughly `4-6s` once those lanes were prepared.
   edits.
 - To check whether a machine is ready for the optional BuildBuddy lanes, run
   `make buildbuddy-doctor`. It runs the Rust lane doctor first, then checks
-  credentials, `bb`, Bazel config, selector health, and BuildBuddy lane
-  isolation without running a build or printing secrets.
+  credentials, `bb`, Bazel config, selector health, exact support-file test
+  routing, and BuildBuddy lane isolation without running a build or printing
+  secrets.
 - To compare the apples-to-apples fast lanes, run `make buildbuddy-benchmark`.
   It times Cargo fast tests and the equivalent BuildBuddy fast lane, then keeps
   compact logs under the benchmark cache directory.
@@ -328,8 +329,11 @@ to roughly `4-6s` once those lanes were prepared.
   `scripts/buildbuddy-ci-dispatch --mode workspace-fresh`,
   `scripts/buildbuddy-ci-dispatch --mode changed-committed --base origin/main`,
   or `scripts/buildbuddy-ci-dispatch --mode changed-paths --paths '<paths>'`.
-- For same-checkout multi-agent work, always set a distinct `RUST_LANE_ID` per
-  agent unless the commands are known to use different lanes already.
+- For same-checkout multi-agent work, prefer a distinct `RUST_LANE_ID` per
+  agent for stable warm lanes. `scripts/repo-cargo` also falls back to
+  `MEERKAT_AGENT_LANE` and `CODEX_AGENT_ID`, so Codex-style agent processes get
+  isolated Cargo target dirs even when they do not set `RUST_LANE_ID`
+  explicitly.
 
 ## Known Annoyance
 
