@@ -119,6 +119,8 @@ jobs:
 
       - name: Setup BuildBuddy CI
         uses: ./.github/actions/setup-buildbuddy-ci
+        with:
+          profile: doctor
 
       - name: BuildBuddy doctor
         run: make buildbuddy-doctor
@@ -151,6 +153,8 @@ jobs:
 
       - name: Setup BuildBuddy CI
         uses: ./.github/actions/setup-buildbuddy-ci
+        with:
+          profile: native
 
       - name: Run ${{ matrix.label }}
         env:
@@ -232,6 +236,8 @@ jobs:
 
       - name: Setup BuildBuddy CI
         uses: ./.github/actions/setup-buildbuddy-ci
+        with:
+          profile: full
 
       - name: Run ${{ matrix.label }}
         env:
@@ -265,6 +271,8 @@ jobs:
 
       - name: Setup BuildBuddy CI
         uses: ./.github/actions/setup-buildbuddy-ci
+        with:
+          profile: native
 
       - name: Changed-path gate
         env:
