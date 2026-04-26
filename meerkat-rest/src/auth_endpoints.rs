@@ -338,7 +338,7 @@ pub async fn create_auth_profile(
         account_id: None,
         metadata: serde_json::Value::Null,
     };
-    let key = TokenKey::new(connection_ref.realm.clone(), connection_ref.binding.clone());
+    let key = TokenKey::from_connection_ref(&connection_ref);
     match state.token_store.save(&key, &tokens).await {
         Ok(()) => {
             tracing::info!(
@@ -401,7 +401,7 @@ pub async fn delete_auth_profile(
                 return (status, Json(serde_json::json!({ "error": msg }))).into_response();
             }
         };
-    let key = TokenKey::new(connection_ref.realm.clone(), connection_ref.binding.clone());
+    let key = TokenKey::from_connection_ref(&connection_ref);
     match state.token_store.clear(&key).await {
         Ok(()) => {
             tracing::info!(
@@ -703,7 +703,7 @@ pub async fn complete_login(
         metadata: serde_json::Value::Null,
     };
 
-    let key = TokenKey::new(connection_ref.realm.clone(), connection_ref.binding.clone());
+    let key = TokenKey::from_connection_ref(&connection_ref);
     if let Err(e) = state.token_store.save(&key, &tokens).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -909,7 +909,7 @@ pub async fn complete_device_login(
                 account_id: None,
                 metadata: serde_json::Value::Null,
             };
-            let key = TokenKey::new(connection_ref.realm.clone(), connection_ref.binding.clone());
+            let key = TokenKey::from_connection_ref(&connection_ref);
             if let Err(e) = state.token_store.save(&key, &tokens).await {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -956,7 +956,7 @@ pub async fn get_auth_status(
                 return (status, Json(serde_json::json!({ "error": msg }))).into_response();
             }
         };
-    let key = TokenKey::new(connection_ref.realm.clone(), connection_ref.binding.clone());
+    let key = TokenKey::from_connection_ref(&connection_ref);
     let stored = match state.token_store.load(&key).await {
         Ok(v) => v,
         Err(e) => {
@@ -1019,7 +1019,7 @@ pub async fn logout(
                 return (status, Json(serde_json::json!({ "error": msg }))).into_response();
             }
         };
-    let key = TokenKey::new(connection_ref.realm.clone(), connection_ref.binding.clone());
+    let key = TokenKey::from_connection_ref(&connection_ref);
     match state.token_store.clear(&key).await {
         Ok(()) => {
             tracing::info!(

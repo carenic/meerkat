@@ -124,10 +124,7 @@ async fn resolve_managed_store_secret(
             .token_store
             .as_ref()
             .ok_or(ProviderAuthError::Auth(AuthError::MissingSecret))?;
-        let key = TokenKey::new(
-            binding.connection_ref.realm.clone(),
-            binding.connection_ref.binding.clone(),
-        );
+        let key = TokenKey::from_connection_ref(&binding.connection_ref);
         let tokens = store
             .load(&key)
             .await
@@ -581,10 +578,7 @@ mod tests {
     async fn managed_store_source_reads_binding_scoped_token_store() {
         let store = Arc::new(EphemeralTokenStore::new());
         let binding = simple_secret_binding(CredentialSourceSpec::ManagedStore, "api_key");
-        let key = TokenKey::new(
-            binding.connection_ref.realm.clone(),
-            binding.connection_ref.binding.clone(),
-        );
+        let key = TokenKey::from_connection_ref(&binding.connection_ref);
         store
             .save(&key, &PersistedTokens::api_key("sk-managed"))
             .await
@@ -603,10 +597,7 @@ mod tests {
     async fn managed_store_source_rejects_wrong_token_mode() {
         let store = Arc::new(EphemeralTokenStore::new());
         let binding = simple_secret_binding(CredentialSourceSpec::ManagedStore, "api_key");
-        let key = TokenKey::new(
-            binding.connection_ref.realm.clone(),
-            binding.connection_ref.binding.clone(),
-        );
+        let key = TokenKey::from_connection_ref(&binding.connection_ref);
         store
             .save(&key, &PersistedTokens::static_bearer("bearer"))
             .await

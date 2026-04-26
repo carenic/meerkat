@@ -417,7 +417,7 @@ pub async fn handle_auth_profile_create(
         account_id: None,
         metadata: serde_json::Value::Null,
     };
-    let key = TokenKey::new(connection_ref.realm.clone(), connection_ref.binding.clone());
+    let key = TokenKey::from_connection_ref(&connection_ref);
     match store.save(&key, &tokens).await {
         Ok(()) => {
             tracing::info!(
@@ -467,7 +467,7 @@ pub async fn handle_auth_profile_delete(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let key = TokenKey::new(connection_ref.realm.clone(), connection_ref.binding.clone());
+    let key = TokenKey::from_connection_ref(&connection_ref);
     match store.clear(&key).await {
         Ok(()) => {
             tracing::info!(
@@ -675,7 +675,7 @@ pub async fn handle_auth_login_complete(
         account_id: None,
         metadata: serde_json::Value::Null,
     };
-    let key = TokenKey::new(connection_ref.realm.clone(), connection_ref.binding.clone());
+    let key = TokenKey::from_connection_ref(&connection_ref);
     if let Err(e) = store.save(&key, &tokens).await {
         return RpcResponse::error(
             id,
@@ -871,7 +871,7 @@ pub async fn handle_auth_login_device_complete(
                 account_id: None,
                 metadata: serde_json::Value::Null,
             };
-            let key = TokenKey::new(connection_ref.realm.clone(), connection_ref.binding.clone());
+            let key = TokenKey::from_connection_ref(&connection_ref);
             if let Err(e) = store.save(&key, &tokens).await {
                 return RpcResponse::error(
                     id,
@@ -951,19 +951,7 @@ pub async fn handle_auth_login_provision_api_key(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let key = match TokenKey::parse(
-        connection_ref.realm.as_str(),
-        connection_ref.binding.as_str(),
-    ) {
-        Ok(k) => k,
-        Err(err) => {
-            return RpcResponse::error(
-                id,
-                error::INVALID_PARAMS,
-                format!("invalid realm/binding: {err}"),
-            );
-        }
-    };
+    let key = TokenKey::from_connection_ref(&connection_ref);
     // Console endpoints drive `scope = org:create_api_key user:profile`.
     // The runtime wrapper's `provision_api_key` POSTs to
     // API_KEY_CREATE_URL with `Authorization: Bearer <access_token>`
@@ -1009,10 +997,7 @@ pub async fn handle_auth_status_get(
         };
     let stored = if let Some(store) = runtime.token_store() {
         store
-            .load(&TokenKey::new(
-                connection_ref.realm.clone(),
-                connection_ref.binding.clone(),
-            ))
+            .load(&TokenKey::from_connection_ref(&connection_ref))
             .await
             .unwrap_or(None)
     } else {
@@ -1062,7 +1047,7 @@ pub async fn handle_auth_logout(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let key = TokenKey::new(connection_ref.realm.clone(), connection_ref.binding.clone());
+    let key = TokenKey::from_connection_ref(&connection_ref);
     match store.clear(&key).await {
         Ok(()) => {
             tracing::info!(
