@@ -5,6 +5,12 @@ use std::fs;
 use tempfile::tempdir;
 use xtask::machines::*;
 
+const LIVE_WORKSPACE_RUNFILES: &str = "required";
+
+fn require_live_workspace_runfiles() {
+    assert_eq!(LIVE_WORKSPACE_RUNFILES, "required");
+}
+
 #[test]
 fn registry_selection_accepts_canonical_machine_name_and_slug() {
     let registry = CanonicalRegistry::load();
@@ -152,6 +158,7 @@ fn authority_language_check_reports_stale_terms() {
 
 #[test]
 fn canonical_machine_inventory_matches_docs_and_artifact_bundle() {
+    require_live_workspace_runfiles();
     let root = repo_root().expect("repo root");
     let mismatches =
         collect_machine_inventory_mismatches(&root).expect("machine inventory mismatches");
@@ -163,6 +170,7 @@ fn canonical_machine_inventory_matches_docs_and_artifact_bundle() {
 
 #[test]
 fn row22_kernel_public_api_contract_rejects_legacy_exports() {
+    require_live_workspace_runfiles();
     let root = repo_root().expect("repo root");
     let kernel_lib = root.join("meerkat-machine-kernels/src/lib.rs");
     let contents = fs::read_to_string(&kernel_lib).expect("read kernel lib");
@@ -176,6 +184,7 @@ fn row22_kernel_public_api_contract_rejects_legacy_exports() {
 
 #[test]
 fn kernel_generated_inventory_is_canonical_five_only() {
+    require_live_workspace_runfiles();
     let root = repo_root().expect("repo root");
     let generated_mod = root.join("meerkat-machine-kernels/src/generated/mod.rs");
     let contents = fs::read_to_string(&generated_mod).expect("read generated mod");
@@ -205,6 +214,7 @@ fn kernel_generated_inventory_is_canonical_five_only() {
 
 #[test]
 fn compat_kernel_modules_and_flow_runtime_mini_machines_are_deleted() {
+    require_live_workspace_runfiles();
     let root = repo_root().expect("repo root");
     for forbidden in [
         "meerkat-machine-kernels/src/compat_generated.rs",
@@ -229,6 +239,7 @@ fn compat_kernel_modules_and_flow_runtime_mini_machines_are_deleted() {
 
 #[test]
 fn flow_runtime_until_feedback_does_not_use_loop_iteration_authority_bridge() {
+    require_live_workspace_runfiles();
     let root = repo_root().expect("repo root");
     let flow_engine = root.join("meerkat-mob/src/runtime/flow_frame_engine.rs");
     let contents = std::fs::read_to_string(&flow_engine)

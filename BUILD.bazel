@@ -274,6 +274,7 @@ test_suite(
         "//meerkat:sdk_structured_output_test",
         "//test-fixtures/machine-dsl-tests:machine_dsl_tests_unit_test",
         "//tests/integration:meerkat_integration_tests_unit_test",
+        "//xtask:buildbuddy_static_lanes_test",
         "//xtask:ci_gate_requires_rmat_test",
         "//xtask:protocol_codegen_drift_test",
         "//xtask:rmat_audit_test",

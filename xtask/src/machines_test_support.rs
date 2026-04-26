@@ -175,11 +175,28 @@ fn select_compositions(
 }
 
 pub fn repo_root() -> Result<PathBuf> {
+    if let Some(root) = bazel_runfiles_workspace_root() {
+        return Ok(root);
+    }
     if let Some(root) = env::var_os("MEERKAT_MACHINE_ROOT") {
         return Ok(PathBuf::from(root));
     }
 
     workspace_root()
+}
+
+fn bazel_runfiles_workspace_root() -> Option<PathBuf> {
+    let workspace = env::var("TEST_WORKSPACE").ok()?;
+    for base in [env::var_os("TEST_SRCDIR"), env::var_os("RUNFILES_DIR")] {
+        let Some(base) = base else {
+            continue;
+        };
+        let candidate = PathBuf::from(base).join(&workspace);
+        if candidate.join("Cargo.toml").exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 pub fn machine_model_path(root: &Path, slug: &str) -> PathBuf {

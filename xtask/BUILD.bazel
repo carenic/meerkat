@@ -145,6 +145,84 @@ rust_binary(
 )
 
 rust_test(
+    name = "buildbuddy_static_lanes_test",
+    aliases = aliases(
+        package_name = "xtask",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "buildbuddy_static_lanes",
+    crate_root = "tests/buildbuddy_static_lanes.rs",
+    crate_features = [
+        "machine-authority",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/buildbuddy_static_lanes.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "buildbuddy_static_lanes",
+        "CARGO_MANIFEST_DIR": "./xtask",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
+    data = [
+        ":package_runfiles",
+        "//meerkat-cli:cargo_manifest",
+        "//meerkat-cli:package_runfiles",
+        "//meerkat-comms:cargo_manifest",
+        "//meerkat-comms:package_runfiles",
+        "//meerkat-contracts:cargo_manifest",
+        "//meerkat-contracts:package_runfiles",
+        "//meerkat-core:cargo_manifest",
+        "//meerkat-core:package_runfiles",
+        "//meerkat-mob:cargo_manifest",
+        "//meerkat-mob:package_runfiles",
+        "//meerkat-rest:cargo_manifest",
+        "//meerkat-rest:package_runfiles",
+        "//meerkat-rpc:cargo_manifest",
+        "//meerkat-rpc:package_runfiles",
+        "//meerkat-session:cargo_manifest",
+        "//meerkat-session:package_runfiles",
+        "//meerkat-tools:cargo_manifest",
+        "//meerkat-tools:package_runfiles",
+        "//meerkat:cargo_manifest",
+        "//meerkat:package_runfiles",
+        "//:workspace_runfiles",
+        "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin",
+        "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+        "WORKSPACE_ROOT": ".",
+        "RUSTFMT": "$(rootpath @@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin)",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "xtask",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-machine-codegen:meerkat_machine_codegen",
+        "//meerkat-machine-schema:meerkat_machine_schema",
+        "//xtask:xtask",
+        "@crates//:which-7.0.3",
+    ] + all_crate_deps(
+        package_name = "xtask",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "ci_gate_requires_rmat_test",
     aliases = aliases(
         package_name = "xtask",
@@ -235,11 +313,13 @@ rust_test(
         "//meerkat-machine-kernels:package_runfiles",
         "//meerkat-machine-schema:package_runfiles",
         "//meerkat-mob:package_runfiles",
+        "//:workspace_runfiles",
         "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin",
         "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib",
     ],
     env = {
         "RUST_MIN_STACK": "16777216",
+        "WORKSPACE_ROOT": ".",
         "RUSTFMT": "$(rootpath @@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin)",
     },
     proc_macro_deps = all_crate_deps(
@@ -541,6 +621,7 @@ rust_test(
 test_suite(
     name = "fast_tests",
     tests = [
+        ":buildbuddy_static_lanes_test",
         ":ci_gate_requires_rmat_test",
         ":protocol_codegen_drift_test",
         ":rmat_audit_test",

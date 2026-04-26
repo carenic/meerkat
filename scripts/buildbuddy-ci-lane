@@ -5,10 +5,9 @@ usage() {
   cat <<'EOF'
 usage: buildbuddy-ci-lane <lane> [--mode <mode>] [--dry-run]
 
-Runs one visible optional BuildBuddy CI lane. Bazel/RBE-native lanes use
-BuildBuddy directly; compatibility lanes use the normal repo entrypoints with a
-distinct RUST_LANE_ID so GitHub can show the same failure boundaries as Cargo CI
-while the remaining lanes are migrated to Bazel.
+Runs one visible optional BuildBuddy CI lane. Standard BuildBuddy CI lanes use
+Bazel/BuildBuddy directly and keep the same visible failure boundaries as Cargo
+CI.
 
 Modes:
   full-fresh, full       Run every lane on fresh local output roots.
@@ -210,13 +209,13 @@ case "${lane}" in
     run_bazel_lane e2e-system-rbe --jobs=64
     ;;
   fmt-lint)
-    run_compat_lane --name fmt-static bash -lc 'make fmt-check legacy-surface-gate bridge-no-responsestatus-gate verify-version-parity verify-rpc-surface-alignment verify-sdk-wrapper-freshness'
+    run_bazel_lane --name fmt-static fmt-static-rbe --jobs=64
     run_bazel_lane --name native-build-clippy workspace-build-clippy-rbe --jobs=64 --color=no --curses=no
     run_compat_lane --name feature-clippy make lint-feature-matrix
     run_compat_lane --name unused-deps ./scripts/repo-cargo machete --with-metadata
     ;;
   fmt-static)
-    run_compat_lane bash -lc 'make fmt-check legacy-surface-gate bridge-no-responsestatus-gate verify-version-parity verify-rpc-surface-alignment verify-sdk-wrapper-freshness'
+    run_bazel_lane fmt-static-rbe --jobs=64
     ;;
   cargo-all-features-clippy)
     run_compat_lane make lint

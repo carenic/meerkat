@@ -25,6 +25,7 @@ Common commands:
   machine-authority-rbe    Bazel-native machine authority lane.
   rmat-audit-rbe           Bazel-native RMAT + ownership audit lane.
   seam-inventory-rbe       Bazel-native strict seam inventory lane.
+  fmt-static-rbe           Bazel-native formatting and static source gates.
   fast-test                  Root //:fast_tests suite.
   owned-fast-test <path>     Owning fast suite or exact fast test for a path.
   owned-build <path>         Owning build label for a path.
@@ -284,6 +285,17 @@ case "${command}" in
     command="test"
     config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
     default_target="//xtask:seam_inventory_strict_test"
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  fmt-static-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//xtask:buildbuddy_static_lanes_test"
     extra_args+=(
       --test_output=errors
       --test_summary=terse
