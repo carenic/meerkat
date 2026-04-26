@@ -168,6 +168,9 @@ The Cargo fast lane is now `./scripts/repo-cargo fast`, `cargo rct`, or
 `cargo e2e-models`, and `cargo e2e-auth`. The BuildBuddy equivalent is
 `make buildbuddy-fast` or
 `BUILDBUDDY_BAZEL_COMMAND=workspace-fast-rbe scripts/buildbuddy-bazel-poc`.
+The Cargo exclusion filter lives in `.config/nextest.toml` as the `fast`
+profile so `cargo fast`, `cargo rct`, `cargo int`, and
+`scripts/cargo-fast-nextest` do not maintain separate copies.
 
 | Scenario | Result |
 | --- | ---: |
@@ -249,6 +252,9 @@ to roughly `4-6s` once those lanes were prepared.
 - For deeper shared crates, use `affected-*` when you need reverse-dependency
   confidence, and expect broad closures for high-fanout crates.
 - For an opt-in BuildBuddy fast test pass, run `make buildbuddy-fast`.
+- To check whether a machine is ready for the optional BuildBuddy lanes, run
+  `make buildbuddy-doctor`. It checks credentials, `bb`, Bazel config, selector
+  health, and lane isolation without running a build or printing secrets.
 - For the remote-compatible BuildBuddy gate, run `make buildbuddy-ci`, or
   `make buildbuddy-ci-warm` when repeated agents can reuse a stable output root.
 - For same-checkout multi-agent work, always set a distinct `RUST_LANE_ID` per

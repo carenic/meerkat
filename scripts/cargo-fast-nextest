@@ -6,7 +6,7 @@ repo_cargo="${script_dir}/repo-cargo"
 
 exec "${repo_cargo}" nextest run \
   --workspace \
-  -E 'not binary(e2e_auth_lane) and not binary(e2e_build_lane) and not binary(e2e_fast_lane) and not binary(e2e_system_lane) and not binary(e2e_live_lane) and not binary(e2e_smoke_lane) and not binary(e2e_models_lane)' \
+  --profile fast \
   --show-progress none \
   --status-level none \
   --final-status-level fail \

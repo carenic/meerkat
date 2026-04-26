@@ -3,6 +3,11 @@
 # Retry policy is scoped narrowly: the two known pre-existing flakes are
 # retried once, everything else runs to completion without retries.
 
+[profile.fast]
+# Cargo's default fast lane: unit + integration-fast, with dedicated e2e lane
+# wrappers left behind explicit `cargo e2e-*` aliases.
+default-filter = 'not binary(e2e_auth_lane) and not binary(e2e_build_lane) and not binary(e2e_fast_lane) and not binary(e2e_system_lane) and not binary(e2e_live_lane) and not binary(e2e_smoke_lane) and not binary(e2e_models_lane)'
+
 [[profile.default.overrides]]
 # System-lane tests spawn nested cargo invocations and copy binaries into
 # scenario-specific target directories. Running them concurrently under a broad

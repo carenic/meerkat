@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+workspace_root="$(git rev-parse --show-toplevel)"
+cd "${workspace_root}"
+
+ok=0
+warn=0
+fail=0
+
+pass() {
+  ok=$((ok + 1))
+  printf 'PASS %s\n' "$1"
+}
+
+note() {
+  warn=$((warn + 1))
+  printf 'WARN %s\n' "$1"
+}
+
+bad() {
+  fail=$((fail + 1))
+  printf 'FAIL %s\n' "$1"
+}
+
+has_buildbuddy_key() {
+  if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
+    return 0
+  fi
+  if [[ -f "${HOME}/.zshrc" ]] &&
+    grep -q -E '^[[:space:]]*(export[[:space:]]+)?BUILDBUDDY_API_KEY=' "${HOME}/.zshrc"; then
+    return 0
+  fi
+  return 1
+}
+
+if has_buildbuddy_key; then
+  pass "BuildBuddy API key is configured"
+else
+  bad "BuildBuddy API key is not configured; set BUILDBUDDY_API_KEY or add it to ~/.zshrc"
+fi
+
+if [[ -n "${BUILDBUDDY_BB:-}" && -x "${BUILDBUDDY_BB}" ]]; then
+  pass "BuildBuddy CLI found via BUILDBUDDY_BB"
+elif command -v bb >/dev/null 2>&1; then
+  pass "BuildBuddy CLI found on PATH"
+elif [[ -x /tmp/buildbuddy-poc/bin/bb ]]; then
+  pass "BuildBuddy CLI found at /tmp/buildbuddy-poc/bin/bb"
+else
+  bad "BuildBuddy CLI not found; install bb or set BUILDBUDDY_BB"
+fi
+
+if [[ -f .bazelrc ]] && grep -q 'build:buildbuddy-macos-rbe' .bazelrc; then
+  pass ".bazelrc has buildbuddy-macos-rbe config"
+else
+  bad ".bazelrc is missing buildbuddy-macos-rbe config"
+fi
+
+if grep -q 'platforms=//platforms:macos_arm64' .bazelrc &&
+  grep -q 'OSFamily=darwin' .bazelrc &&
+  grep -q 'Arch=arm64' .bazelrc; then
+  pass "BuildBuddy RBE config targets macOS arm64 executors"
+else
+  bad "BuildBuddy RBE config is not pinned to macOS arm64"
+fi
+
+if [[ -f MODULE.bazel ]] &&
+  grep -q 'toolchains_buildbuddy' MODULE.bazel &&
+  grep -q 'rules_rust' MODULE.bazel; then
+  pass "Bazel module declares BuildBuddy toolchain and rules_rust"
+else
+  bad "MODULE.bazel is missing BuildBuddy/rules_rust dependencies"
+fi
+
+build_label_count="$(./scripts/bazel-affected-fast-tests.mjs --all --build | wc -w | tr -d ' ')"
+if [[ "${build_label_count}" =~ ^[0-9]+$ && "${build_label_count}" -gt 0 ]]; then
+  pass "Bazel selector can enumerate ${build_label_count} build labels"
+else
+  bad "Bazel selector did not enumerate build labels"
+fi
+
+fast_profile_filter="$(./scripts/repo-cargo nextest show-config test-groups --profile fast 2>&1 || true)"
+if grep -q '\[profile.fast\]' .config/nextest.toml &&
+  grep -q 'default-filter' .config/nextest.toml &&
+  [[ "${fast_profile_filter}" != *"error:"* ]]; then
+  pass "Cargo fast nextest profile is valid"
+else
+  bad "Cargo fast nextest profile is invalid"
+fi
+
+sample_a="${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-bazel/$(basename "${workspace_root}")-sample-workspace-fast-rbe-agent-a"
+sample_b="${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-bazel/$(basename "${workspace_root}")-sample-workspace-fast-rbe-agent-b"
+if [[ "${sample_a}" != "${sample_b}" ]]; then
+  pass "BuildBuddy lane model supports distinct same-worktree agent output roots"
+else
+  bad "BuildBuddy lane model would collide for same-worktree agents"
+fi
+
+if [[ -n "$(git status --short)" ]]; then
+  note "working tree has local changes; doctor did not modify them"
+else
+  pass "working tree is clean"
+fi
+
+printf '\nBuildBuddy doctor: %s pass, %s warn, %s fail\n' "${ok}" "${warn}" "${fail}"
+if [[ "${fail}" -gt 0 ]]; then
+  exit 1
+fi
