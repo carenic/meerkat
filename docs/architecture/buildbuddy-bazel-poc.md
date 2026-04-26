@@ -175,8 +175,9 @@ Representative measurements from the POC environment:
 | Multi-worktree first-touch lanes | `38.35s` / `44.00s` wall |
 | CI-like sequential fresh output bases | `25.48s` fast-test + `26.89s` clippy |
 | CI-like parallel fresh output bases | `33.28s` max wall |
-| CI-like workspace-RBE + clippy-RBE, fresh output bases | `26-37.14s` max wall |
-| Dedicated `buildbuddy-ci-workspace` script | `28-30s` script wall |
+| CI-like workspace-RBE + clippy-RBE, fresh output bases | `26-44.33s` max wall |
+| Dedicated `buildbuddy-ci-workspace` script, first after script/doc edits | `45s` script wall |
+| Dedicated `buildbuddy-ci-workspace` script, remote cache warm | `28-30s` script wall |
 | Dedicated `buildbuddy-ci-workspace --warm`, warm | `6-8s` script wall |
 
 The first touch of a new local lane pays Bazel analysis and remote-cache
