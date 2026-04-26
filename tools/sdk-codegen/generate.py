@@ -63,6 +63,33 @@ def _schema_root_with_local_defs(root_schema: dict[str, Any], schema: dict[str, 
     return schema_root
 
 
+def _schema_root_with_nested_defs(root_schema: dict[str, Any]) -> dict[str, Any]:
+    """Promote schema-local $defs into the lookup root.
+
+    The Rust schema generator emits many realtime contract types as local
+    `$defs` on request/result schemas. SDK generation still needs those names
+    to remain authoritative public types instead of erasing them to maps.
+    """
+    schema_root = dict(root_schema)
+    defs = dict(root_schema.get("$defs", {}))
+    for schema in root_schema.values():
+        if isinstance(schema, dict):
+            defs.update(
+                {
+                    name: nested
+                    for name, nested in schema.get("$defs", {}).items()
+                    if _promote_nested_schema_def(name)
+                }
+            )
+    schema_root["$defs"] = defs
+    schema_root["__promoted_defs"] = set(defs)
+    return schema_root
+
+
+def _promote_nested_schema_def(name: str) -> bool:
+    return name.startswith("Realtime") or name == "AudioFormatMismatchContext"
+
+
 def _runtime_state_result_root(wire_schema: dict[str, Any]) -> dict[str, Any]:
     root = dict(wire_schema)
     root["RuntimeStateResult"] = {
@@ -98,13 +125,46 @@ def _const_variants(variants: list[Any]) -> list[Any] | None:
     return values
 
 
-def _one_of_typed_dict_variants(schema: Any) -> tuple[str, list[tuple[str, dict[str, Any]]]] | None:
+def _merge_ref_variant(root: dict[str, Any], variant: dict[str, Any]) -> dict[str, Any]:
+    ref = variant.get("$ref")
+    if not isinstance(ref, str):
+        return variant
+    base = _resolve_schema_ref(root, ref)
+    if not base:
+        ref_name = _resolve_schema_ref_name(ref)
+        base = _lookup_named_schema(root, ref_name) if ref_name else {}
+    if not isinstance(base, dict) or base.get("type") != "object":
+        return variant
+
+    merged = dict(base)
+    merged["properties"] = {
+        **(base.get("properties", {}) if isinstance(base.get("properties"), dict) else {}),
+        **(variant.get("properties", {}) if isinstance(variant.get("properties"), dict) else {}),
+    }
+    required: list[str] = []
+    for candidate in [base.get("required", []), variant.get("required", [])]:
+        if isinstance(candidate, list):
+            for field_name in candidate:
+                if field_name not in required:
+                    required.append(field_name)
+    if required:
+        merged["required"] = required
+    merged["type"] = "object"
+    return merged
+
+
+def _one_of_typed_dict_variants(
+    root: dict[str, Any],
+    schema: Any,
+) -> tuple[str, list[tuple[str, dict[str, Any]]]] | None:
     if not isinstance(schema, dict) or not isinstance(schema.get("oneOf"), list):
         return None
 
     discriminator: str | None = None
     variants: list[tuple[str, dict[str, Any]]] = []
     for variant in schema["oneOf"]:
+        if isinstance(variant, dict):
+            variant = _merge_ref_variant(root, variant)
         if not isinstance(variant, dict) or variant.get("type") != "object":
             return None
         properties = variant.get("properties")
@@ -167,7 +227,9 @@ def _python_type_from_schema(
         resolved = _resolve_schema_ref(root, str(field_schema["$ref"]))
         if not resolved and ref_name:
             resolved = _lookup_named_schema(root, ref_name)
-        if ref_name and resolved and ref_name not in (local_defs or set()):
+        if ref_name and resolved and (
+            ref_name not in (local_defs or set()) or ref_name in root.get("__promoted_defs", set())
+        ):
             return (ref_name, False)
         return _python_type_from_schema(root, resolved, local_defs)
 
@@ -249,7 +311,9 @@ def _typescript_type_from_schema(
         resolved = _resolve_schema_ref(root, str(field_schema["$ref"]))
         if not resolved and ref_name:
             resolved = _lookup_named_schema(root, ref_name)
-        if ref_name and resolved and ref_name not in (local_defs or set()):
+        if ref_name and resolved and (
+            ref_name not in (local_defs or set()) or ref_name in root.get("__promoted_defs", set())
+        ):
             return (ref_name, False)
         return _typescript_type_from_schema(root, resolved, local_defs)
 
@@ -280,6 +344,8 @@ def _typescript_type_from_schema(
             item_type, _ = _typescript_type_from_schema(root, item_schema, local_defs)
             if item_type == "unknown":
                 return ("unknown[]", optional)
+            if "|" in item_type and not item_type.strip().startswith(("(", "{")):
+                item_type = f"({item_type})"
             return (f"{item_type}[]", optional)
         case "object":
             properties = field_schema.get("properties")
@@ -409,8 +475,8 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
         types_content += "    skills_enabled: bool = False\n"
         types_content += "    skill_refs: list[dict[str, str]] = field(default_factory=list)\n\n"
 
-    params_schema = schemas.get("params", {})
-    wire_schema = schemas.get("wire-types", {})
+    params_schema = _schema_root_with_nested_defs(schemas.get("params", {}))
+    wire_schema = _schema_root_with_nested_defs(schemas.get("wire-types", {}))
     runtime_state_result_root = _runtime_state_result_root(wire_schema)
 
     def append_python_dataclass(name: str, root_schema: dict[str, Any], default_doc: str) -> None:
@@ -454,7 +520,7 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
         schema = _lookup_named_schema(root_schema, name)
         local_defs = set(schema.get("$defs", {}).keys()) if isinstance(schema, dict) else set()
         schema_root = _schema_root_with_local_defs(root_schema, schema)
-        typed_dict_variants = _one_of_typed_dict_variants(schema)
+        typed_dict_variants = _one_of_typed_dict_variants(schema_root, schema)
         if typed_dict_variants is not None:
             doc = schema.get("description", default_doc)
             doc_lines = str(doc).splitlines() or [""]
@@ -528,6 +594,8 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
         "Response payload for session/realtime_attachment_status.",
     )
     append_python_dataclass("RealtimeReconnectPolicy", wire_schema, "Reconnect policy for realtime channels.")
+    append_python_dataclass("RealtimeChannelConfig", params_schema, "Runtime knobs for a realtime channel.")
+    append_python_dataclass("RealtimeAudioFormat", wire_schema, "Realtime audio format descriptor.")
     append_python_dataclass("RealtimeCapabilities", wire_schema, "Capability set for a realtime channel.")
     append_python_dataclass("RealtimeChannelStatus", wire_schema, "Public realtime channel status projection.")
     append_python_dataclass("RealtimeOpenInfo", wire_schema, "Response payload for realtime/open_info.")
@@ -537,6 +605,8 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
     append_python_dataclass("RealtimeTextDelta", wire_schema, "Text delta for realtime output.")
     append_python_dataclass("RealtimeAudioChunk", wire_schema, "Opaque realtime audio chunk.")
     append_python_dataclass("RealtimeVideoChunk", wire_schema, "Opaque realtime video chunk.")
+    append_python_dataclass("RealtimeBargeInTruncateFrame", wire_schema, "Payload for channel.barge_in_truncate.")
+    append_python_dataclass("AudioFormatMismatchContext", wire_schema, "Typed context for audio format mismatch errors.")
     append_python_dataclass("RealtimeChannelOpenFrame", wire_schema, "Payload for channel.open.")
     append_python_dataclass("RealtimeChannelInputFrame", wire_schema, "Payload for channel.input.")
     append_python_dataclass("RealtimeChannelOpenedFrame", wire_schema, "Payload for channel.opened.")
@@ -591,6 +661,8 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
     append_python_alias("RealtimeInputKind", wire_schema, "Realtime input kind.")
     append_python_alias("RealtimeOutputKind", wire_schema, "Realtime output kind.")
     append_python_alias("RealtimeChannelState", wire_schema, "Realtime channel lifecycle state.")
+    append_python_alias("RealtimeErrorCode", wire_schema, "Realtime error code.")
+    append_python_alias("RealtimeErrorDetails", wire_schema, "Realtime error details.")
     append_python_alias("RealtimeInputChunk", wire_schema, "Realtime input chunk union.")
     append_python_alias("RealtimeOutputChunk", wire_schema, "Realtime output chunk union.")
     append_python_alias("RealtimeEvent", wire_schema, "Realtime event union.")
@@ -739,8 +811,8 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
         types_content += "  skill_refs: Array<{ source_uuid: string; skill_name: string }>;\n"
         types_content += "}\n"
 
-    params_schema = schemas.get("params", {})
-    wire_schema = schemas.get("wire-types", {})
+    params_schema = _schema_root_with_nested_defs(schemas.get("params", {}))
+    wire_schema = _schema_root_with_nested_defs(schemas.get("wire-types", {}))
     runtime_state_result_root = _runtime_state_result_root(wire_schema)
 
     def append_typescript_interface(name: str, root_schema: dict[str, Any]) -> None:
@@ -770,7 +842,7 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
         schema = _lookup_named_schema(root_schema, name)
         local_defs = set(schema.get("$defs", {}).keys()) if isinstance(schema, dict) else set()
         schema_root = _schema_root_with_local_defs(root_schema, schema)
-        typed_dict_variants = _one_of_typed_dict_variants(schema)
+        typed_dict_variants = _one_of_typed_dict_variants(schema_root, schema)
         if typed_dict_variants is not None:
             variant_names: list[str] = []
             for discriminator_value, variant in typed_dict_variants[1]:
@@ -832,6 +904,8 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
     append_typescript_alias("RealtimeInputKind", wire_schema)
     append_typescript_alias("RealtimeOutputKind", wire_schema)
     append_typescript_alias("RealtimeChannelState", wire_schema)
+    append_typescript_alias("RealtimeErrorCode", wire_schema)
+    append_typescript_alias("RealtimeErrorDetails", wire_schema)
     append_typescript_alias("RealtimeInputChunk", wire_schema)
     append_typescript_alias("RealtimeOutputChunk", wire_schema)
     append_typescript_alias("RealtimeEvent", wire_schema)
@@ -850,6 +924,8 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
     append_typescript_interface("RuntimeStateResult", runtime_state_result_root)
     append_typescript_interface("RuntimeRealtimeAttachmentStatusResult", wire_schema)
     append_typescript_interface("RealtimeReconnectPolicy", wire_schema)
+    append_typescript_interface("RealtimeChannelConfig", params_schema)
+    append_typescript_interface("RealtimeAudioFormat", wire_schema)
     append_typescript_interface("RealtimeCapabilities", wire_schema)
     append_typescript_interface("RealtimeChannelStatus", wire_schema)
     append_typescript_interface("RealtimeOpenInfo", wire_schema)
@@ -859,6 +935,8 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
     append_typescript_interface("RealtimeTextDelta", wire_schema)
     append_typescript_interface("RealtimeAudioChunk", wire_schema)
     append_typescript_interface("RealtimeVideoChunk", wire_schema)
+    append_typescript_interface("RealtimeBargeInTruncateFrame", wire_schema)
+    append_typescript_interface("AudioFormatMismatchContext", wire_schema)
     append_typescript_interface("RealtimeChannelOpenFrame", wire_schema)
     append_typescript_interface("RealtimeChannelInputFrame", wire_schema)
     append_typescript_interface("RealtimeChannelOpenedFrame", wire_schema)

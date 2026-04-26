@@ -1,6 +1,10 @@
 import type {
   RealtimeCapabilitiesResult,
+  RealtimeChannelTarget,
+  RealtimeChannelTargetMobMember,
+  RealtimeChannelTargetSessionTarget,
   RealtimeClientFrame,
+  RealtimeInputChunk,
   RealtimeOpenInfo,
   RealtimeOpenRequest,
   RealtimeReconnectPolicy,
@@ -12,27 +16,17 @@ import { MeerkatError } from "./generated/errors.js";
 import { AsyncQueue } from "./streaming.js";
 import WebSocket, { type RawData } from "ws";
 
-export interface RealtimeSessionTarget {
-  readonly type: "session_target";
-  readonly session_id: string;
-}
-
-export interface RealtimeMobMemberTarget {
-  readonly type: "mob_member";
-  readonly mob_id: string;
-  readonly agent_identity: string;
-}
+export type { RealtimeChannelTarget };
+export type RealtimeSessionTarget = RealtimeChannelTargetSessionTarget;
+export type RealtimeMobMemberTarget = RealtimeChannelTargetMobMember;
 
 // W3-H: `RealtimeChannelTarget` carries identity as a first-class wire
 // fact for mob-member channels via the `mob_member` variant. The server
 // resolves `(mob_id, agent_identity)` against the MobMachine's
-// canonical `member_realtime_bindings` map on every tick, so respawn
+// canonical `member_session_bindings` map on every tick, so respawn
 // atomically rotates the bound session without any SDK round-trip and
 // without any client-side session-id pin. A terminal retire surfaces
 // as `RealtimeErrorCode::BindingReleased`.
-export type RealtimeChannelTarget =
-  | RealtimeSessionTarget
-  | RealtimeMobMemberTarget;
 
 export interface RealtimeChannelOptions {
   readonly role?: "primary" | "observer";
@@ -115,11 +109,11 @@ export class RealtimeConnection {
     });
   }
 
-  async sendInput(chunk: Record<string, unknown>): Promise<void> {
+  async sendInput(chunk: RealtimeInputChunk): Promise<void> {
     await this.sendFrame({
       type: "channel.input",
       chunk,
-    } as RealtimeClientFrame);
+    });
   }
 
   async commitTurn(): Promise<void> {
@@ -192,7 +186,7 @@ export class RealtimeChannel {
     );
   }
 
-  private wireReconnectPolicy(): Record<string, unknown> | undefined {
+  private wireReconnectPolicy(): RealtimeReconnectPolicy | undefined {
     if (!this.reconnectPolicy) {
       return undefined;
     }
