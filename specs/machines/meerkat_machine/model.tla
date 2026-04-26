@@ -1650,6 +1650,71 @@ RequireRealtimeReattachStopped ==
     /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, realtime_intent_present, realtime_reconnect_attempt_count, realtime_reconnect_next_retry_at_ms, realtime_reconnect_deadline_at_ms, live_topology_phase, mcp_server_states, pending_peer_requests, inbound_peer_requests, last_session_context_updated_at_ms, reserved_interaction_streams, attached_interaction_streams, realtime_product_turn_phase, realtime_projection_freshness, realtime_projection_frontier_ms, realtime_reconnect_policy, peer_ingress_owner_kind, peer_ingress_comms_runtime_id, peer_ingress_mob_id, supervisor_binding_kind, supervisor_bound_name, supervisor_bound_peer_id, supervisor_bound_address, supervisor_bound_epoch, local_endpoint, direct_peer_endpoints, mob_overlay_peer_endpoints, peer_projection_epoch, mob_overlay_epoch >>
 
 
+RequireRealtimeReattachForAuthorityIdle(authority_epoch) ==
+    /\ phase = "Idle"
+    /\ (session_id # None)
+    /\ (realtime_binding_authority_epoch = Some(authority_epoch))
+    /\ phase' = "Idle"
+    /\ model_step_count' = model_step_count + 1
+    /\ realtime_binding_state' = "Unbound"
+    /\ realtime_binding_authority_epoch' = None
+    /\ realtime_reattach_required' = TRUE
+    /\ realtime_next_authority_epoch' = (realtime_next_authority_epoch + 1)
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, realtime_intent_present, realtime_reconnect_attempt_count, realtime_reconnect_next_retry_at_ms, realtime_reconnect_deadline_at_ms, live_topology_phase, mcp_server_states, pending_peer_requests, inbound_peer_requests, last_session_context_updated_at_ms, reserved_interaction_streams, attached_interaction_streams, realtime_product_turn_phase, realtime_projection_freshness, realtime_projection_frontier_ms, realtime_reconnect_policy, peer_ingress_owner_kind, peer_ingress_comms_runtime_id, peer_ingress_mob_id, supervisor_binding_kind, supervisor_bound_name, supervisor_bound_peer_id, supervisor_bound_address, supervisor_bound_epoch, local_endpoint, direct_peer_endpoints, mob_overlay_peer_endpoints, peer_projection_epoch, mob_overlay_epoch >>
+
+
+RequireRealtimeReattachForAuthorityAttached(authority_epoch) ==
+    /\ phase = "Attached"
+    /\ (session_id # None)
+    /\ (realtime_binding_authority_epoch = Some(authority_epoch))
+    /\ phase' = "Attached"
+    /\ model_step_count' = model_step_count + 1
+    /\ realtime_binding_state' = "Unbound"
+    /\ realtime_binding_authority_epoch' = None
+    /\ realtime_reattach_required' = TRUE
+    /\ realtime_next_authority_epoch' = (realtime_next_authority_epoch + 1)
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, realtime_intent_present, realtime_reconnect_attempt_count, realtime_reconnect_next_retry_at_ms, realtime_reconnect_deadline_at_ms, live_topology_phase, mcp_server_states, pending_peer_requests, inbound_peer_requests, last_session_context_updated_at_ms, reserved_interaction_streams, attached_interaction_streams, realtime_product_turn_phase, realtime_projection_freshness, realtime_projection_frontier_ms, realtime_reconnect_policy, peer_ingress_owner_kind, peer_ingress_comms_runtime_id, peer_ingress_mob_id, supervisor_binding_kind, supervisor_bound_name, supervisor_bound_peer_id, supervisor_bound_address, supervisor_bound_epoch, local_endpoint, direct_peer_endpoints, mob_overlay_peer_endpoints, peer_projection_epoch, mob_overlay_epoch >>
+
+
+RequireRealtimeReattachForAuthorityRunning(authority_epoch) ==
+    /\ phase = "Running"
+    /\ (session_id # None)
+    /\ (realtime_binding_authority_epoch = Some(authority_epoch))
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ realtime_binding_state' = "Unbound"
+    /\ realtime_binding_authority_epoch' = None
+    /\ realtime_reattach_required' = TRUE
+    /\ realtime_next_authority_epoch' = (realtime_next_authority_epoch + 1)
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, realtime_intent_present, realtime_reconnect_attempt_count, realtime_reconnect_next_retry_at_ms, realtime_reconnect_deadline_at_ms, live_topology_phase, mcp_server_states, pending_peer_requests, inbound_peer_requests, last_session_context_updated_at_ms, reserved_interaction_streams, attached_interaction_streams, realtime_product_turn_phase, realtime_projection_freshness, realtime_projection_frontier_ms, realtime_reconnect_policy, peer_ingress_owner_kind, peer_ingress_comms_runtime_id, peer_ingress_mob_id, supervisor_binding_kind, supervisor_bound_name, supervisor_bound_peer_id, supervisor_bound_address, supervisor_bound_epoch, local_endpoint, direct_peer_endpoints, mob_overlay_peer_endpoints, peer_projection_epoch, mob_overlay_epoch >>
+
+
+RequireRealtimeReattachForAuthorityRetired(authority_epoch) ==
+    /\ phase = "Retired"
+    /\ (session_id # None)
+    /\ (realtime_binding_authority_epoch = Some(authority_epoch))
+    /\ phase' = "Retired"
+    /\ model_step_count' = model_step_count + 1
+    /\ realtime_binding_state' = "Unbound"
+    /\ realtime_binding_authority_epoch' = None
+    /\ realtime_reattach_required' = TRUE
+    /\ realtime_next_authority_epoch' = (realtime_next_authority_epoch + 1)
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, realtime_intent_present, realtime_reconnect_attempt_count, realtime_reconnect_next_retry_at_ms, realtime_reconnect_deadline_at_ms, live_topology_phase, mcp_server_states, pending_peer_requests, inbound_peer_requests, last_session_context_updated_at_ms, reserved_interaction_streams, attached_interaction_streams, realtime_product_turn_phase, realtime_projection_freshness, realtime_projection_frontier_ms, realtime_reconnect_policy, peer_ingress_owner_kind, peer_ingress_comms_runtime_id, peer_ingress_mob_id, supervisor_binding_kind, supervisor_bound_name, supervisor_bound_peer_id, supervisor_bound_address, supervisor_bound_epoch, local_endpoint, direct_peer_endpoints, mob_overlay_peer_endpoints, peer_projection_epoch, mob_overlay_epoch >>
+
+
+RequireRealtimeReattachForAuthorityStopped(authority_epoch) ==
+    /\ phase = "Stopped"
+    /\ (session_id # None)
+    /\ (realtime_binding_authority_epoch = Some(authority_epoch))
+    /\ phase' = "Stopped"
+    /\ model_step_count' = model_step_count + 1
+    /\ realtime_binding_state' = "Unbound"
+    /\ realtime_binding_authority_epoch' = None
+    /\ realtime_reattach_required' = TRUE
+    /\ realtime_next_authority_epoch' = (realtime_next_authority_epoch + 1)
+    /\ UNCHANGED << session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, silent_intent_overrides, realtime_intent_present, realtime_reconnect_attempt_count, realtime_reconnect_next_retry_at_ms, realtime_reconnect_deadline_at_ms, live_topology_phase, mcp_server_states, pending_peer_requests, inbound_peer_requests, last_session_context_updated_at_ms, reserved_interaction_streams, attached_interaction_streams, realtime_product_turn_phase, realtime_projection_freshness, realtime_projection_frontier_ms, realtime_reconnect_policy, peer_ingress_owner_kind, peer_ingress_comms_runtime_id, peer_ingress_mob_id, supervisor_binding_kind, supervisor_bound_name, supervisor_bound_peer_id, supervisor_bound_address, supervisor_bound_epoch, local_endpoint, direct_peer_endpoints, mob_overlay_peer_endpoints, peer_projection_epoch, mob_overlay_epoch >>
+
+
 PublishRealtimeSignalIdle(authority_epoch, next_binding_state) ==
     /\ phase = "Idle"
     /\ (realtime_binding_authority_epoch = Some(authority_epoch))
@@ -4817,6 +4882,11 @@ Next ==
     \/ RequireRealtimeReattachRunning
     \/ RequireRealtimeReattachRetired
     \/ RequireRealtimeReattachStopped
+    \/ \E authority_epoch \in 0..2 : RequireRealtimeReattachForAuthorityIdle(authority_epoch)
+    \/ \E authority_epoch \in 0..2 : RequireRealtimeReattachForAuthorityAttached(authority_epoch)
+    \/ \E authority_epoch \in 0..2 : RequireRealtimeReattachForAuthorityRunning(authority_epoch)
+    \/ \E authority_epoch \in 0..2 : RequireRealtimeReattachForAuthorityRetired(authority_epoch)
+    \/ \E authority_epoch \in 0..2 : RequireRealtimeReattachForAuthorityStopped(authority_epoch)
     \/ \E authority_epoch \in 0..2 : \E next_binding_state \in RealtimeBindingStateValues : PublishRealtimeSignalIdle(authority_epoch, next_binding_state)
     \/ \E authority_epoch \in 0..2 : \E next_binding_state \in RealtimeBindingStateValues : PublishRealtimeSignalAttached(authority_epoch, next_binding_state)
     \/ \E authority_epoch \in 0..2 : \E next_binding_state \in RealtimeBindingStateValues : PublishRealtimeSignalRunning(authority_epoch, next_binding_state)

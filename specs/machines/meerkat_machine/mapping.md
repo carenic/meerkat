@@ -546,6 +546,21 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RequireRealtimeReattachStopped`
   - anchors: `meerkat_machine`
   - scenarios: `realtime_connection_projection`
+- `RequireRealtimeReattachForAuthorityIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`
+- `RequireRealtimeReattachForAuthorityAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`
+- `RequireRealtimeReattachForAuthorityRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`
+- `RequireRealtimeReattachForAuthorityRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`
+- `RequireRealtimeReattachForAuthorityStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`
 - `PublishRealtimeSignalIdle`
   - anchors: `meerkat_machine`
   - scenarios: `realtime_connection_projection`

@@ -91,6 +91,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ReplaceRealtimeBinding`
 - `DetachRealtimeBinding`
 - `RequireRealtimeReattach`
+- `RequireRealtimeReattachForAuthority`(authority_epoch: u64)
 - `PublishRealtimeSignal`(authority_epoch: u64, next_binding_state: RealtimeBindingState)
 - `ProjectRealtimeReconnectProgress`(attempt_count: u64, next_retry_at_ms: Option<u64>, deadline_at_ms: Option<u64>)
 - `ClearRealtimeReconnectProgress`
@@ -1538,6 +1539,46 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `RequireRealtimeReattach`()
 - Guards:
   - `session_registered`
+- To: `Stopped`
+
+### `RequireRealtimeReattachForAuthorityIdle`
+- From: `Idle`
+- On: `RequireRealtimeReattachForAuthority`(authority_epoch)
+- Guards:
+  - `session_registered`
+  - `authority_matches_current`
+- To: `Idle`
+
+### `RequireRealtimeReattachForAuthorityAttached`
+- From: `Attached`
+- On: `RequireRealtimeReattachForAuthority`(authority_epoch)
+- Guards:
+  - `session_registered`
+  - `authority_matches_current`
+- To: `Attached`
+
+### `RequireRealtimeReattachForAuthorityRunning`
+- From: `Running`
+- On: `RequireRealtimeReattachForAuthority`(authority_epoch)
+- Guards:
+  - `session_registered`
+  - `authority_matches_current`
+- To: `Running`
+
+### `RequireRealtimeReattachForAuthorityRetired`
+- From: `Retired`
+- On: `RequireRealtimeReattachForAuthority`(authority_epoch)
+- Guards:
+  - `session_registered`
+  - `authority_matches_current`
+- To: `Retired`
+
+### `RequireRealtimeReattachForAuthorityStopped`
+- From: `Stopped`
+- On: `RequireRealtimeReattachForAuthority`(authority_epoch)
+- Guards:
+  - `session_registered`
+  - `authority_matches_current`
 - To: `Stopped`
 
 ### `PublishRealtimeSignalIdle`

@@ -926,26 +926,16 @@ impl MeerkatMachine {
         &self,
         authority: crate::meerkat_machine_types::RealtimeAttachmentSignalAuthority,
     ) -> Result<(), RuntimeDriverError> {
-        // Phase-guarded: we use PublishRealtimeSignal with the
-        // next_binding_state the authority already represents, and the DSL
-        // guard enforces authority epoch match. We piggy-back on the existing
-        // DSL input because adding a dedicated "reattach-if-authority" input
-        // would duplicate the epoch check.
-        //
-        // Actually simpler: rely on the shell to read current epoch, compare,
-        // then apply RequireRealtimeReattach. Keep it as a direct apply.
-        let current = self
-            .read_session_realtime_authority_if_any(&authority.session_id)
-            .await?;
-        match current {
-            Some(live) if live.authority_epoch == authority.authority_epoch => {
-                self.require_realtime_attachment_reattach(&authority.session_id)
-                    .await
-            }
-            _ => Err(RuntimeDriverError::ValidationFailed {
-                reason: "stale realtime attachment authority".to_string(),
-            }),
-        }
+        self.stage_session_dsl_input(
+            &authority.session_id,
+            dsl::MeerkatMachineInput::RequireRealtimeReattachForAuthority {
+                authority_epoch: authority.authority_epoch,
+            },
+            "RequireRealtimeReattachForAuthority",
+        )
+        .await
+        .map(|_| ())
+        .map_err(|reason| RuntimeDriverError::ValidationFailed { reason })
     }
 
     /// Apply a provider-callback realtime signal through the DSL's authority-

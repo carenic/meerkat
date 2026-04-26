@@ -625,6 +625,64 @@ async fn realtime_attachment_signal_rejects_stale_authority() {
 }
 
 #[tokio::test]
+async fn realtime_reattach_for_authority_rejects_stale_authority_without_mutation() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+
+    adapter
+        .register_session_with_executor(session_id.clone(), Box::new(RuntimeParityNoopExecutor))
+        .await;
+    adapter
+        .project_realtime_attachment_intent(&session_id, true)
+        .await
+        .expect("intent projection should succeed");
+
+    let stale_authority = adapter
+        .attach_live(&session_id)
+        .await
+        .expect("attach should mint authority");
+    adapter
+        .publish_realtime_attachment_signal(
+            stale_authority.clone(),
+            crate::RealtimeAttachmentStatus::BindingReady,
+        )
+        .await
+        .expect("binding-ready signal should be accepted");
+    let live_authority = adapter
+        .replace_realtime_attachment(&session_id)
+        .await
+        .expect("replacement should mint fresh authority");
+
+    let stale_err = adapter
+        .require_realtime_attachment_reattach_for_authority(stale_authority)
+        .await
+        .expect_err("stale authority should be rejected by DSL guard");
+    assert!(
+        matches!(stale_err, RuntimeDriverError::ValidationFailed { .. }),
+        "expected ValidationFailed, got {stale_err:?}"
+    );
+    let status = <MeerkatMachine as SessionServiceRuntimeExt>::realtime_attachment_status(
+        &adapter,
+        &session_id,
+    )
+    .await
+    .expect("registered session should expose live attachment status");
+    assert_eq!(status, crate::RealtimeAttachmentStatus::ReplacementPending);
+
+    adapter
+        .require_realtime_attachment_reattach_for_authority(live_authority)
+        .await
+        .expect("current authority should require reattach");
+    let status = <MeerkatMachine as SessionServiceRuntimeExt>::realtime_attachment_status(
+        &adapter,
+        &session_id,
+    )
+    .await
+    .expect("registered session should expose live attachment status");
+    assert_eq!(status, crate::RealtimeAttachmentStatus::ReattachRequired);
+}
+
+#[tokio::test]
 async fn attach_live_rejects_sessions_without_executor_and_preserves_unbound_status() {
     let adapter = Arc::new(MeerkatMachine::ephemeral());
     let session_id = SessionId::new();

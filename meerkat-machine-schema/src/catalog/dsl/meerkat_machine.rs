@@ -350,6 +350,7 @@ machine! {
             ReplaceRealtimeBinding,
             DetachRealtimeBinding,
             RequireRealtimeReattach,
+            RequireRealtimeReattachForAuthority { authority_epoch: u64 },
             PublishRealtimeSignal { authority_epoch: u64, next_binding_state: Enum<RealtimeBindingState> },
             ProjectRealtimeReconnectProgress {
                 attempt_count: u64,
@@ -2057,6 +2058,20 @@ machine! {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input RequireRealtimeReattach
             guard "session_registered" { self.session_id != None }
+            update {
+                self.realtime_binding_state = RealtimeBindingState::Unbound;
+                self.realtime_binding_authority_epoch = None;
+                self.realtime_reattach_required = true;
+                self.realtime_next_authority_epoch = self.realtime_next_authority_epoch + 1;
+            }
+            to Idle
+        }
+
+        transition RequireRealtimeReattachForAuthority {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RequireRealtimeReattachForAuthority { authority_epoch }
+            guard "session_registered" { self.session_id != None }
+            guard "authority_matches_current" { self.realtime_binding_authority_epoch == Some(authority_epoch) }
             update {
                 self.realtime_binding_state = RealtimeBindingState::Unbound;
                 self.realtime_binding_authority_epoch = None;
