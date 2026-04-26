@@ -146,7 +146,9 @@ For local multi-agent edits without BuildBuddy access, use
 `make cargo-agent-gate`. It derives build-relevant changed files and runs a
 package-scoped Cargo clippy + nextest gate, escalating only global Rust lane
 changes to a workspace Cargo gate. Use `scripts/cargo-agent-gate --dry-run`
-to inspect the selected packages before paying the build cost.
+to inspect the selected packages before paying the build cost. Both
+`scripts/cargo-agent-gate` and `scripts/buildbuddy-agent-gate` accept
+`--staged`, `--committed`, and `--working-tree` for hook and CI routing.
 
 Default CI requires `unit`, `int`, `e2e-fast`, and `e2e-system`. Live-provider lanes stay opt-in.
 

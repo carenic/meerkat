@@ -3,17 +3,21 @@ set -euo pipefail
 
 base_ref="${CARGO_AGENT_BASE:-}"
 dry_run=0
+scope="all"
+run_clippy=1
+run_tests=1
 paths=()
 
 usage() {
   cat <<'EOF'
-usage: cargo-agent-gate [--base <rev>] [--dry-run] [path ...]
+usage: cargo-agent-gate [--base <rev>] [--staged|--committed|--working-tree] [--clippy-only|--tests-only] [--dry-run] [path ...]
 
 Runs the default Cargo gate most useful for local agent edits. If paths are not
 provided, the script derives changed files from branch, staged, unstaged, and
-untracked changes. Crate-local Rust/TOML edits run package-scoped clippy and
-nextest. Global Cargo/nextest lane changes escalate to workspace clippy and a
-fast compile check.
+untracked changes. Use --staged for pre-commit hooks, --committed for pre-push
+hooks, and --working-tree for unstaged/untracked local probes. Crate-local
+Rust/TOML edits run package-scoped clippy and nextest by default. Global
+Cargo/nextest lane changes escalate to workspace Cargo gates.
 EOF
 }
 
@@ -31,6 +35,28 @@ while [[ $# -gt 0 ]]; do
     -h | --help)
       usage
       exit 0
+      ;;
+    --staged)
+      scope="staged"
+      shift
+      ;;
+    --committed)
+      scope="committed"
+      shift
+      ;;
+    --working-tree)
+      scope="working-tree"
+      shift
+      ;;
+    --clippy-only)
+      run_clippy=1
+      run_tests=0
+      shift
+      ;;
+    --tests-only)
+      run_clippy=0
+      run_tests=1
+      shift
       ;;
     --dry-run)
       dry_run=1
@@ -58,6 +84,7 @@ done
 workspace_root="$(git rev-parse --show-toplevel)"
 cd "${workspace_root}"
 CARGO="${CARGO:-./scripts/repo-cargo}"
+metadata_json=""
 
 resolve_base() {
   if [[ -n "${base_ref}" ]]; then
@@ -83,14 +110,26 @@ collect_changed_paths() {
 
   local base
   base="$(resolve_base)"
-  if git merge-base "${base}" HEAD >/dev/null 2>&1; then
-    local merge_base
-    merge_base="$(git merge-base "${base}" HEAD)"
-    git diff --name-only --diff-filter=ACMR "${merge_base}..HEAD" --
-  fi
-  git diff --name-only --diff-filter=ACMR --
-  git diff --cached --name-only --diff-filter=ACMR --
-  git ls-files --others --exclude-standard
+  case "${scope}" in
+    all|committed)
+      if git merge-base "${base}" HEAD >/dev/null 2>&1; then
+        local merge_base
+        merge_base="$(git merge-base "${base}" HEAD)"
+        git diff --name-only --diff-filter=ACMR "${merge_base}..HEAD" --
+      fi
+      ;;
+  esac
+  case "${scope}" in
+    all|working-tree)
+      git diff --name-only --diff-filter=ACMR --
+      git ls-files --others --exclude-standard
+      ;;
+  esac
+  case "${scope}" in
+    all|staged)
+      git diff --cached --name-only --diff-filter=ACMR --
+      ;;
+  esac
 }
 
 is_rust_relevant_path() {
@@ -117,7 +156,10 @@ is_global_path() {
 
 package_name_for_dir() {
   local dir="$1"
-  "$CARGO" metadata --format-version=1 --no-deps |
+  if [[ -z "${metadata_json}" ]]; then
+    metadata_json="$("$CARGO" metadata --format-version=1 --no-deps)"
+  fi
+  printf '%s' "${metadata_json}" |
     node -e '
       const fs = require("fs");
       const path = require("path");
@@ -152,12 +194,20 @@ printf '  %s\n' "${relevant[@]}"
 if [[ "${global}" -eq 1 ]]; then
   echo "Global Rust build/test configuration changed; running workspace Cargo gate."
   if [[ "${dry_run}" -eq 1 ]]; then
-    echo "DRY-RUN $CARGO fast --no-run"
-    echo "DRY-RUN $CARGO clippy --workspace --all-targets --all-features -- -D warnings"
+    if [[ "${run_tests}" -eq 1 ]]; then
+      echo "DRY-RUN $CARGO fast --no-run"
+    fi
+    if [[ "${run_clippy}" -eq 1 ]]; then
+      echo "DRY-RUN $CARGO clippy --workspace --all-targets --all-features -- -D warnings"
+    fi
     exit 0
   fi
-  "$CARGO" fast --no-run
-  "$CARGO" clippy --workspace --all-targets --all-features -- -D warnings
+  if [[ "${run_tests}" -eq 1 ]]; then
+    "$CARGO" fast --no-run
+  fi
+  if [[ "${run_clippy}" -eq 1 ]]; then
+    "$CARGO" clippy --workspace --all-targets --all-features -- -D warnings
+  fi
   exit 0
 fi
 
@@ -189,23 +239,32 @@ if [[ "${#package_names[@]}" -eq 0 ]]; then
 fi
 
 pkg_flags=()
-for pkg in "${!package_names[@]}"; do
+mapfile -t sorted_packages < <(printf '%s\n' "${!package_names[@]}" | sort)
+for pkg in "${sorted_packages[@]}"; do
   pkg_flags+=("-p" "${pkg}")
 done
 
 printf 'Cargo agent gate packages:\n'
-printf '  %s\n' "${!package_names[@]}"
+printf '  %s\n' "${sorted_packages[@]}"
 
 if [[ "${dry_run}" -eq 1 ]]; then
-  printf 'DRY-RUN %s clippy' "$CARGO"
-  printf ' %q' "${pkg_flags[@]}"
-  printf ' --all-targets --all-features -- -D warnings\n'
-  printf 'DRY-RUN %s nextest run' "$CARGO"
-  printf ' %q' "${pkg_flags[@]}"
-  printf ' --profile fast --no-tests=pass --show-progress none --status-level none --final-status-level fail\n'
+  if [[ "${run_clippy}" -eq 1 ]]; then
+    printf 'DRY-RUN %s clippy' "$CARGO"
+    printf ' %q' "${pkg_flags[@]}"
+    printf ' --all-targets --all-features -- -D warnings\n'
+  fi
+  if [[ "${run_tests}" -eq 1 ]]; then
+    printf 'DRY-RUN %s nextest run' "$CARGO"
+    printf ' %q' "${pkg_flags[@]}"
+    printf ' --profile fast --no-tests=pass --show-progress none --status-level none --final-status-level fail\n'
+  fi
   exit 0
 fi
 
-"$CARGO" clippy "${pkg_flags[@]}" --all-targets --all-features -- -D warnings
-"$CARGO" nextest run "${pkg_flags[@]}" --profile fast --no-tests=pass \
-  --show-progress none --status-level none --final-status-level fail
+if [[ "${run_clippy}" -eq 1 ]]; then
+  "$CARGO" clippy "${pkg_flags[@]}" --all-targets --all-features -- -D warnings
+fi
+if [[ "${run_tests}" -eq 1 ]]; then
+  "$CARGO" nextest run "${pkg_flags[@]}" --profile fast --no-tests=pass \
+    --show-progress none --status-level none --final-status-level fail
+fi

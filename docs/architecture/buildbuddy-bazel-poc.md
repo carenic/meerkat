@@ -269,7 +269,9 @@ to roughly `4-6s` once those lanes were prepared.
   needs the right check, use `make buildbuddy-agent-gate`. It includes
   committed branch changes, staged changes, unstaged changes, and untracked
   build-relevant files. Use `scripts/buildbuddy-agent-gate --dry-run` to
-  inspect the selected changed-path or workspace gate without running it.
+  inspect the selected changed-path or workspace gate without running it. Use
+  `--committed`, `--staged`, or `--working-tree` when a hook or CI lane should
+  restrict the diff scope.
 - For deeper shared crates, use `affected-*` when you need reverse-dependency
   confidence, and expect broad closures for high-fanout crates.
 - For an opt-in BuildBuddy fast test pass, run `make buildbuddy-fast`.

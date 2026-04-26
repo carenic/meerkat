@@ -5,11 +5,12 @@ mode="owned"
 base_ref="${BUILDBUDDY_AGENT_BASE:-}"
 local_test=0
 dry_run=0
+scope="all"
 paths=()
 
 usage() {
   cat <<'EOF'
-usage: buildbuddy-agent-gate [--owned|--affected] [--base <rev>] [--local-test] [--dry-run] [path ...]
+usage: buildbuddy-agent-gate [--owned|--affected] [--base <rev>] [--staged|--committed|--working-tree] [--local-test] [--dry-run] [path ...]
 
 Runs the opt-in BuildBuddy gate most useful for agent edits. If paths are not
 provided, the script derives changed files from:
@@ -19,9 +20,11 @@ provided, the script derives changed files from:
   - staged edits
   - untracked files
 
-Docs-only and other non-build changes are ignored. Global build/test files
-escalate to the warmed workspace BuildBuddy CI gate; crate-local changes run the
-changed-path test/build + clippy gate.
+Docs-only and other non-build changes are ignored. Use --staged for pre-commit
+experiments, --committed for pre-push/CI branch probes, and --working-tree for
+unstaged/untracked local probes. Global build/test files escalate to the warmed
+workspace BuildBuddy CI gate; crate-local changes run the changed-path
+test/build + clippy gate.
 EOF
 }
 
@@ -46,6 +49,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --local-test)
       local_test=1
+      shift
+      ;;
+    --staged)
+      scope="staged"
+      shift
+      ;;
+    --committed)
+      scope="committed"
+      shift
+      ;;
+    --working-tree)
+      scope="working-tree"
       shift
       ;;
     --dry-run)
@@ -102,14 +117,26 @@ collect_changed_paths() {
 
   local base
   base="$(resolve_base)"
-  if git merge-base "${base}" HEAD >/dev/null 2>&1; then
-    local merge_base
-    merge_base="$(git merge-base "${base}" HEAD)"
-    git diff --name-only --diff-filter=ACMR "${merge_base}..HEAD" --
-  fi
-  git diff --name-only --diff-filter=ACMR --
-  git diff --cached --name-only --diff-filter=ACMR --
-  git ls-files --others --exclude-standard
+  case "${scope}" in
+    all|committed)
+      if git merge-base "${base}" HEAD >/dev/null 2>&1; then
+        local merge_base
+        merge_base="$(git merge-base "${base}" HEAD)"
+        git diff --name-only --diff-filter=ACMR "${merge_base}..HEAD" --
+      fi
+      ;;
+  esac
+  case "${scope}" in
+    all|working-tree)
+      git diff --name-only --diff-filter=ACMR --
+      git ls-files --others --exclude-standard
+      ;;
+  esac
+  case "${scope}" in
+    all|staged)
+      git diff --cached --name-only --diff-filter=ACMR --
+      ;;
+  esac
 }
 
 is_relevant_path() {
