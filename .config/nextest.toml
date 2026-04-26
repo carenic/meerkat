@@ -12,7 +12,7 @@ default-filter = 'not binary(e2e_auth_lane) and not binary(e2e_build_lane) and n
 # System-lane tests spawn nested cargo invocations and copy binaries into
 # scenario-specific target directories. Running them concurrently under a broad
 # workspace nextest run causes cargo lock contention and 300s wrapper timeouts;
-# the dedicated `cargo e2e-system` alias already passes `--test-threads=1`.
+# the wrapper binary serializes scenarios through a process-local lock.
 filter = 'binary(e2e_system_lane)'
 threads-required = "num-cpus"
 
