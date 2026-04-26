@@ -83,6 +83,14 @@ else
 fi
 rm -f "${generate_check_log}"
 
+fast_parity_output="$(node scripts/buildbuddy-fast-parity.mjs 2>&1 || true)"
+if [[ "${fast_parity_output}" == "BuildBuddy fast parity ok:"* ]]; then
+  pass "${fast_parity_output}"
+else
+  bad "BuildBuddy fast parity check failed"
+  printf '%s\n' "${fast_parity_output}" >&2
+fi
+
 build_label_count="$(./scripts/bazel-affected-fast-tests.mjs --all --build | wc -w | tr -d ' ')"
 if [[ "${build_label_count}" =~ ^[0-9]+$ && "${build_label_count}" -gt 0 ]]; then
   pass "Bazel selector can enumerate ${build_label_count} build labels"

@@ -330,7 +330,8 @@ to roughly `4-6s` once those lanes were prepared.
 - To refresh the checked-in optional Bazel BUILD files after Cargo metadata or
   generator changes, run `make buildbuddy-generate`. To verify freshness without
   mutating the worktree, run `make buildbuddy-generate-check`; `make
-  buildbuddy-doctor` runs the same check.
+  buildbuddy-doctor` runs the same check and verifies that Cargo fast test
+  targets map into the generated Bazel `//:fast_tests` suite.
 - To check the Cargo/default side of the lane contract, run
   `make rust-lane-doctor`. It verifies that `repo-cargo` keeps caches outside
   the checkout, `RUST_LANE_ID` and `CODEX_AGENT_ID` create distinct
