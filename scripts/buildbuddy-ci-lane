@@ -136,7 +136,7 @@ run_logged() {
   local name="$1"
   shift
   local log="${lane_log_root}/${name}.log"
-  local start end status
+  local start end status attempt max_fetch_retries
   start="$(date +%s)"
   if [[ "${dry_run}" == "1" ]]; then
     {
@@ -146,19 +146,24 @@ run_logged() {
     } | tee "${log}"
     status=0
   else
+    attempt=0
+    max_fetch_retries="${MEERKAT_BUILDBUDDY_FETCH_RETRIES:-4}"
     set +e
     "$@" >"${log}" 2>&1
     status="$?"
     set -e
-    if [[ "${status}" != "0" ]] &&
-      grep -Eq 'GET returned 5[0-9][0-9]|Bad Gateway|Proxy Error|Error downloading' "${log}"; then
-      printf 'Retrying %s after transient external repository fetch failure...\n' "${name}" | tee -a "${log}"
-      sleep 5
+    while [[ "${status}" != "0" &&
+      "${attempt}" -lt "${max_fetch_retries}" ]] &&
+      grep -Eq 'GET returned 5[0-9][0-9]|Bad Gateway|Proxy Error|Error downloading' "${log}"; do
+      attempt="$((attempt + 1))"
+      printf 'Retrying %s after transient external repository fetch failure (%s/%s)...\n' \
+        "${name}" "${attempt}" "${max_fetch_retries}" | tee -a "${log}"
+      sleep "$((attempt * 5))"
       set +e
       "$@" >>"${log}" 2>&1
       status="$?"
       set -e
-    fi
+    done
   fi
   end="$(date +%s)"
   printf '%s\t%s\t%s\t%s\t' "${name}" "${status}" "$((end - start))" "${log}" >>"${summary_path}"
