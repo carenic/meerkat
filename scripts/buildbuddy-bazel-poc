@@ -165,6 +165,26 @@ case "${command}" in
       --@rules_rust//rust/settings:clippy_flag=-Dwarnings
     )
     ;;
+  affected-clippy | owned-clippy)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target=""
+    extra_args+=(
+      --aspects="@rules_rust//rust:defs.bzl%rust_clippy_aspect"
+      --output_groups="+clippy_checks"
+      --@rules_rust//rust/settings:clippy_flag=-Dwarnings
+    )
+    ;;
+  affected-clippy-rbe | owned-clippy-rbe)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target=""
+    extra_args+=(
+      --aspects="@rules_rust//rust:defs.bzl%rust_clippy_aspect"
+      --output_groups="+clippy_checks"
+      --@rules_rust//rust/settings:clippy_flag=-Dwarnings
+    )
+    ;;
   owned-build)
     command="build"
     config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
@@ -197,13 +217,16 @@ case "${command}" in
     default_target="//meerkat-machine-dsl-core:meerkat_machine_dsl_core"
     ;;
 esac
-if [[ "${requested_command}" == affected-fast-test || "${requested_command}" == affected-fast-test-local || "${requested_command}" == owned-fast-test || "${requested_command}" == owned-fast-test-local || "${requested_command}" == owned-build || "${requested_command}" == owned-build-local || "${requested_command}" == affected-build || "${requested_command}" == affected-build-local ]]; then
+if [[ "${requested_command}" == affected-fast-test || "${requested_command}" == affected-fast-test-local || "${requested_command}" == owned-fast-test || "${requested_command}" == owned-fast-test-local || "${requested_command}" == owned-build || "${requested_command}" == owned-build-local || "${requested_command}" == affected-build || "${requested_command}" == affected-build-local || "${requested_command}" == affected-clippy || "${requested_command}" == affected-clippy-rbe || "${requested_command}" == owned-clippy || "${requested_command}" == owned-clippy-rbe ]]; then
   selector_args=()
-  if [[ "${requested_command}" == owned-fast-test || "${requested_command}" == owned-fast-test-local || "${requested_command}" == owned-build || "${requested_command}" == owned-build-local ]]; then
+  if [[ "${requested_command}" == owned-fast-test || "${requested_command}" == owned-fast-test-local || "${requested_command}" == owned-build || "${requested_command}" == owned-build-local || "${requested_command}" == owned-clippy || "${requested_command}" == owned-clippy-rbe ]]; then
     selector_args+=(--owned)
   fi
   if [[ "${requested_command}" == owned-build || "${requested_command}" == owned-build-local || "${requested_command}" == affected-build || "${requested_command}" == affected-build-local ]]; then
     selector_args+=(--build)
+  fi
+  if [[ "${requested_command}" == owned-clippy || "${requested_command}" == owned-clippy-rbe || "${requested_command}" == affected-clippy || "${requested_command}" == affected-clippy-rbe ]]; then
+    selector_args+=(--clippy)
   fi
   if [[ $# -gt 0 && "${1}" != -* ]]; then
     changed_paths=()

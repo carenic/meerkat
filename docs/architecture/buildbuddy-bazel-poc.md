@@ -24,6 +24,10 @@ Use `scripts/buildbuddy-bazel-poc` with `BUILDBUDDY_BAZEL_COMMAND`:
 - `workspace-test-local`: run the full workspace test suite with local spawns.
 - `clippy-rbe`: run the rules_rust clippy aspect with `-D warnings`,
   excluding local-only, manual, and `noclippy` targets.
+- `owned-clippy-rbe <path>`: run clippy for the owning build/test labels for a
+  changed path, excluding local-only trybuild compile-fail tests.
+- `affected-clippy-rbe <path>`: run clippy for the reverse-dependency closure of
+  a changed path.
 - `owned-build <path>`: build the owning package target for a changed path.
 - `affected-build <path>`: build the reverse-dependency closure for a changed path.
 - `owned-fast-test <path>`: run the owning fast suite, or the exact test target
@@ -70,6 +74,8 @@ modes:
   distinct lanes.
 - `support-file`: exact selector behavior for a shared integration-test support
   file, measured with remote and local-spawn execution.
+- `changed-clippy`: changed-scope clippy for representative source and shared
+  support-file edits.
 - `edit-probes`: creates a temporary detached worktree, makes harmless real
   edits to representative source/test/support files, runs the matching lanes,
   and removes the worktree.
@@ -91,12 +97,17 @@ Use `--warm` to reuse a stable output root for repeated local/agent gates.
 
 `scripts/buildbuddy-prewarm-lanes` prepares common lanes for a new worktree:
 
-- `dev`: source-owned-build, exact-test, and support-local feedback lanes.
+- `dev`: source-owned-build, changed-clippy, exact-test, and support-local
+  feedback lanes.
 - `ci`: remote-compatible workspace-test and clippy lanes in parallel.
 - `ci-fast`: fast-test and clippy-RBE lanes in parallel.
 
 The prewarm helper uses direct Bazel labels instead of path selectors so several
 startup lanes do not contend on Cargo metadata/package-cache locks.
+Path selectors cache `cargo metadata` under
+`${XDG_CACHE_HOME:-$HOME/.cache}/meerkat/bazel-selector-metadata` and use a
+small first-populator lock, so simultaneous agents do not serialize on Cargo
+metadata after the cache is warm.
 
 ## Observed Results
 
@@ -116,6 +127,11 @@ Representative measurements from the POC environment:
 | Same-worktree, same command, warmed lanes | `4.44s` / `4.34s` wall |
 | Shared test-support edit, exact remote selector | `19.10s` wall |
 | Shared test-support edit, exact local-spawn selector | `8.25s` wall |
+| Changed source clippy, owned selector, first touch | `16.95s` wall |
+| Changed source clippy, owned selector, warm | `0.50s` wall |
+| Shared support clippy, exact owned selector, first touch | `21.77s` wall |
+| Shared support clippy, exact owned selector, warm | `0.91s` wall |
+| Three cold parallel selectors with metadata cache lock | `0` Cargo lock waits |
 | Fresh temp worktree source edit probe | `23.98s` wall |
 | Fresh temp worktree exact-test edit probe | `48.31s` wall |
 | Fresh temp worktree support-local edit probe | `49.99s` wall |
@@ -155,6 +171,9 @@ to roughly `4-6s` once those lanes were prepared.
   `owned-fast-test`; the selector targets only the fast tests that import it.
   If the local lane is warm, `owned-fast-test-local` can beat remote execution
   for this shape.
+- For clippy during inner-loop work, use `owned-clippy-rbe <path>` first. Warm
+  changed-scope clippy is currently sub-second for a leaf source edit and around
+  one second for the representative shared support-file case.
 - For deeper shared crates, use `affected-*` when you need reverse-dependency
   confidence, and expect broad closures for high-fanout crates.
 - For the remote-compatible BuildBuddy gate, run `make buildbuddy-ci`, or

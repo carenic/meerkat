@@ -16,6 +16,7 @@ Scenarios:
   same-worktree      Run two same-checkout agents in parallel with distinct lanes.
   same-command       Run two same-checkout agents using the same command in parallel.
   support-file       Run exact selectors for a shared integration-test support file.
+  changed-clippy     Run changed-scope clippy lanes for source and support edits.
   edit-probes        Make real edits in a temporary worktree and time edit lanes.
   edit-probes-warmed Prewarm lanes in a temporary worktree before timing edits.
   prewarm-dev        Run the shared dev-lane prewarm helper.
@@ -192,6 +193,28 @@ async function supportFile(root) {
     await repoCommand(root, {}, "owned-fast-test", [path], ["--jobs=64"]),
     await repoCommand(root, {}, "owned-fast-test-local", [path], ["--color=no", "--curses=no"]),
   ];
+  for (const result of results) printResult(result);
+  return results.some((result) => result.code !== 0) ? 1 : 0;
+}
+
+async function changedClippy(root) {
+  console.log("\n== changed-clippy ==");
+  const results = await Promise.all([
+    repoCommand(
+      root,
+      { RUST_LANE_ID: "changed-clippy-source" },
+      "owned-clippy-rbe",
+      ["meerkat-machine-dsl-core/src/lib.rs"],
+      ["--jobs=64", "--color=no", "--curses=no"],
+    ),
+    repoCommand(
+      root,
+      { RUST_LANE_ID: "changed-clippy-support" },
+      "owned-clippy-rbe",
+      ["meerkat/tests/support/test_session_store.rs"],
+      ["--jobs=64", "--color=no", "--curses=no"],
+    ),
+  ]);
   for (const result of results) printResult(result);
   return results.some((result) => result.code !== 0) ? 1 : 0;
 }
@@ -416,6 +439,7 @@ const scenarios = requested.length === 0 || requested.includes("all")
       "same-worktree",
       "same-command",
       "support-file",
+      "changed-clippy",
       "edit-probes",
       "edit-probes-warmed",
       "prewarm-dev",
@@ -435,6 +459,7 @@ const runners = new Map([
   ["same-worktree", sameWorktree],
   ["same-command", sameCommand],
   ["support-file", supportFile],
+  ["changed-clippy", changedClippy],
   ["edit-probes", editProbes],
   ["edit-probes-warmed", (root) => editProbes(root, { prewarm: true })],
   ["prewarm-dev", (root) => prewarmProfile(root, "dev")],

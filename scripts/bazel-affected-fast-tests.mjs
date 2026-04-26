@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
 
 const root = execFileSync("git", ["rev-parse", "--show-toplevel"], {
@@ -25,10 +26,12 @@ function parseArgs() {
       mode = "affected";
     } else if (arg === "--build") {
       kind = "build";
+    } else if (arg === "--clippy") {
+      kind = "clippy";
     } else if (arg === "--test") {
       kind = "test";
     } else if (arg === "--help" || arg === "-h") {
-      console.log("usage: bazel-affected-fast-tests.mjs [--owned|--affected] [--test|--build] [changed-path ...]");
+      console.log("usage: bazel-affected-fast-tests.mjs [--owned|--affected] [--test|--build|--clippy] [changed-path ...]");
       process.exit(0);
     } else {
       paths.push(arg);
@@ -38,6 +41,78 @@ function parseArgs() {
 }
 
 const args = parseArgs();
+
+function cargoManifestFiles() {
+  return gitLines(["ls-files", "Cargo.lock", ":(glob)**/Cargo.toml"]);
+}
+
+function metadataFingerprint() {
+  const hash = createHash("sha256");
+  hash.update(root);
+  for (const file of cargoManifestFiles().sort()) {
+    const stat = statSync(resolve(root, file));
+    hash.update("\0");
+    hash.update(file);
+    hash.update("\0");
+    hash.update(String(stat.size));
+    hash.update("\0");
+    hash.update(String(stat.mtimeMs));
+  }
+  return hash.digest("hex");
+}
+
+function readMetadata() {
+  const cacheRoot = resolve(
+    process.env.XDG_CACHE_HOME || resolve(process.env.HOME || root, ".cache"),
+    "meerkat",
+    "bazel-selector-metadata",
+  );
+  const fingerprint = metadataFingerprint();
+  const cachePath = resolve(cacheRoot, `${fingerprint}.json`);
+  try {
+    return JSON.parse(readFileSync(cachePath, "utf8"));
+  } catch {
+    // Refresh below.
+  }
+
+  mkdirSync(cacheRoot, { recursive: true });
+  const lockPath = resolve(cacheRoot, `${fingerprint}.lock`);
+  try {
+    mkdirSync(lockPath);
+    try {
+      const metadata = JSON.parse(
+        execFileSync("./scripts/repo-cargo", ["metadata", "--format-version=1"], {
+          cwd: root,
+          encoding: "utf8",
+          maxBuffer: 64 * 1024 * 1024,
+        }),
+      );
+      const tmpPath = resolve(cacheRoot, `${fingerprint}.${process.pid}.tmp`);
+      writeFileSync(tmpPath, JSON.stringify(metadata));
+      renameSync(tmpPath, cachePath);
+      return metadata;
+    } finally {
+      rmSync(lockPath, { force: true, recursive: true });
+    }
+  } catch {
+    const sleepBuffer = new SharedArrayBuffer(4);
+    const sleepArray = new Int32Array(sleepBuffer);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        return JSON.parse(readFileSync(cachePath, "utf8"));
+      } catch {
+        Atomics.wait(sleepArray, 0, 0, 100);
+      }
+    }
+    return JSON.parse(
+      execFileSync("./scripts/repo-cargo", ["metadata", "--format-version=1"], {
+        cwd: root,
+        encoding: "utf8",
+        maxBuffer: 64 * 1024 * 1024,
+      }),
+    );
+  }
+}
 
 function changedFiles() {
   if (args.paths.length) return args.paths;
@@ -49,13 +124,7 @@ function changedFiles() {
   return [...files].sort();
 }
 
-const metadata = JSON.parse(
-  execFileSync("./scripts/repo-cargo", ["metadata", "--format-version=1"], {
-    cwd: root,
-    encoding: "utf8",
-    maxBuffer: 64 * 1024 * 1024,
-  }),
-);
+const metadata = readMetadata();
 
 const workspaceMembers = new Set(metadata.workspace_members);
 const packages = metadata.packages.filter(
@@ -188,6 +257,23 @@ function buildLabels(pkg) {
   return [...new Set(labels)].sort();
 }
 
+function testLabels(pkg) {
+  const dir = packageDir(pkg);
+  const labels = [];
+  for (const target of pkg.targets) {
+    if (!target.kind.includes("test")) continue;
+    if (target["required-features"]?.length) continue;
+    const source = readFileSync(target.src_path, "utf8");
+    if (source.includes("trybuild::")) continue;
+    labels.push(`//${dir}:${crateName(target.name)}_test`);
+  }
+  return [...new Set(labels)].sort();
+}
+
+function clippyLabels(pkg) {
+  return [...new Set([...buildLabels(pkg), ...testLabels(pkg)])].sort();
+}
+
 function affectedClosure(seedIds) {
   const seen = new Set(seedIds);
   const queue = [...seedIds];
@@ -204,7 +290,7 @@ function affectedClosure(seedIds) {
 
 const files = changedFiles();
 if (files.length === 0) {
-  console.log(args.kind === "build" ? "//..." : "//:fast_tests");
+  console.log(args.kind === "test" ? "//:fast_tests" : "//...");
   process.exit(0);
 }
 
@@ -215,7 +301,7 @@ for (const file of files) {
   if (file.endsWith("BUILD.bazel") || file === "BUILD.bazel") continue;
   const pkg = packageForFile(file);
   if (pkg) {
-    const exactLabel = args.kind === "test" && args.mode === "owned"
+    const exactLabel = (args.kind === "test" || args.kind === "clippy") && args.mode === "owned"
       ? exactFastTestLabelForFile(file, pkg)
       : null;
     if (exactLabel?.length) {
@@ -229,7 +315,7 @@ for (const file of files) {
 }
 
 if (unmapped.length || (seedIds.size === 0 && exactLabels.size === 0)) {
-  console.log(args.kind === "build" ? "//..." : "//:fast_tests");
+  console.log(args.kind === "test" ? "//:fast_tests" : "//...");
   process.exit(0);
 }
 
@@ -239,6 +325,11 @@ const selectedPackages = [...selectedIds]
   .filter(Boolean);
 const labels = args.kind === "build"
   ? selectedPackages.flatMap(buildLabels).sort()
+  : args.kind === "clippy"
+  ? [
+    ...exactLabels,
+    ...selectedPackages.flatMap(clippyLabels),
+  ].sort()
   : [
     ...exactLabels,
     ...selectedPackages
@@ -246,4 +337,4 @@ const labels = args.kind === "build"
       .map((pkg) => `//${packageDir(pkg)}:fast_tests`),
   ].sort();
 
-console.log(labels.length ? labels.join(" ") : args.kind === "build" ? "//..." : "//:fast_tests");
+console.log(labels.length ? labels.join(" ") : args.kind === "test" ? "//:fast_tests" : "//...");
