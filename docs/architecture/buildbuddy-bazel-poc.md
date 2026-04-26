@@ -51,6 +51,9 @@ Use `scripts/buildbuddy-bazel-poc` with `BUILDBUDDY_BAZEL_COMMAND`:
 - `make buildbuddy-agent-gate`: derive build-relevant changed files from the
   current branch and working tree, then run the changed-path gate. Global
   Cargo/Bazel/nextest configuration changes escalate to `make buildbuddy-ci-warm`.
+- `scripts/buildbuddy-agent-gate --dry-run ...`: print the selected paths,
+  Bazel labels, and whether the changed gate will run combined test+clippy,
+  combined build+clippy, or split lanes.
 
 For local-spawn variants, append `-local` to the command name where available.
 Remote execution remains the default because local-spawn often spends time
@@ -64,6 +67,8 @@ gate into one `bb test` invocation with the clippy aspect attached. Use
 `--local-test` when the selected test lane is already warm locally. For source
 edits whose owning package has no fast tests, the gate runs the owning build and
 owning clippy labels instead of falling back to the full root fast suite.
+Use `--dry-run` to inspect the exact labels and plan before spending remote
+execution, especially when several agents are changing the same checkout.
 
 ## Lane Isolation
 

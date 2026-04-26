@@ -198,9 +198,6 @@ if [[ "${local_test}" -eq 1 ]]; then
   args+=("--local-test")
 fi
 if [[ "${dry_run}" -eq 1 ]]; then
-  printf 'DRY-RUN ./scripts/buildbuddy-changed-gate'
-  printf ' %q' "${args[@]}" "${relevant[@]}"
-  printf '\n'
-  exit 0
+  exec ./scripts/buildbuddy-changed-gate --dry-run "${args[@]}" "${relevant[@]}"
 fi
 exec ./scripts/buildbuddy-changed-gate "${args[@]}" "${relevant[@]}"

@@ -5,15 +5,17 @@ mode="owned"
 test_command="owned-fast-test"
 clippy_command="owned-clippy-rbe"
 build_command="owned-build"
+dry_run=0
 paths=()
 
 usage() {
   cat <<'EOF'
-usage: buildbuddy-changed-gate [--owned|--affected] [--local-test] <changed-path>...
+usage: buildbuddy-changed-gate [--owned|--affected] [--local-test] [--dry-run] <changed-path>...
 
 Runs the selected BuildBuddy test and clippy lanes in parallel for the supplied
 changed paths. Use --affected for reverse-dependency confidence and --local-test
-when the selected test lane is already warm locally.
+when the selected test lane is already warm locally. Use --dry-run to print
+the selected Bazel targets without running Bazel.
 EOF
 }
 
@@ -33,6 +35,10 @@ while [[ $# -gt 0 ]]; do
       else
         test_command="affected-fast-test-local"
       fi
+      shift
+      ;;
+    --dry-run)
+      dry_run=1
       shift
       ;;
     -h | --help)
@@ -126,6 +132,28 @@ fi
 test_targets="$(./scripts/bazel-affected-fast-tests.mjs "${selector_mode_args[@]}" --test --empty-if-no-labels "${paths[@]}")"
 build_targets="$(./scripts/bazel-affected-fast-tests.mjs "${selector_mode_args[@]}" --build "${paths[@]}")"
 clippy_targets="$(./scripts/bazel-affected-fast-tests.mjs "${selector_mode_args[@]}" --clippy "${paths[@]}")"
+
+if [[ "${dry_run}" -eq 1 ]]; then
+  printf 'BuildBuddy changed gate dry-run (%s)\n' "${mode}"
+  printf 'paths:\n'
+  printf '  %s\n' "${paths[@]}"
+  printf 'test-command: %s\n' "${test_command}"
+  printf 'build-command: %s\n' "${build_command}"
+  printf 'clippy-command: %s\n' "${clippy_command}"
+  printf 'test-targets: %s\n' "${test_targets:-<none>}"
+  printf 'build-targets: %s\n' "${build_targets:-<none>}"
+  printf 'clippy-targets: %s\n' "${clippy_targets:-<none>}"
+  if [[ -n "${test_targets}" && "${test_command}" != *-local && "${test_targets}" == "${clippy_targets}" ]]; then
+    printf 'plan: combined test+clippy\n'
+  elif [[ -z "${test_targets}" && "${build_targets}" == "${clippy_targets}" ]]; then
+    printf 'plan: combined build+clippy\n'
+  elif [[ -z "${test_targets}" ]]; then
+    printf 'plan: split build + clippy\n'
+  else
+    printf 'plan: split test + clippy\n'
+  fi
+  exit 0
+fi
 
 start_seconds="$(date +%s)"
 

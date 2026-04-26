@@ -127,6 +127,16 @@ else
   printf 'build: %s\nclippy: %s\n' "${optional_required_feature_build_labels}" "${optional_required_feature_clippy_labels}" >&2
 fi
 
+changed_gate_dry_run="$(./scripts/buildbuddy-agent-gate --dry-run --working-tree xtask/tests/machines_contracts.rs 2>&1 || true)"
+if [[ "${changed_gate_dry_run}" == *"build-targets: //xtask:machines_contracts_test"* ]] &&
+  [[ "${changed_gate_dry_run}" == *"clippy-targets: //xtask:machines_contracts_test"* ]] &&
+  [[ "${changed_gate_dry_run}" == *"plan: combined build+clippy"* ]]; then
+  pass "BuildBuddy dry-run explains required-feature exact target routing"
+else
+  bad "BuildBuddy dry-run did not explain required-feature exact routing"
+  printf '%s\n' "${changed_gate_dry_run}" >&2
+fi
+
 fast_profile_filter="$(./scripts/repo-cargo nextest show-config test-groups --profile fast 2>&1 || true)"
 if grep -q '\[profile.fast\]' .config/nextest.toml &&
   grep -q 'default-filter' .config/nextest.toml &&
