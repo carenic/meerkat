@@ -139,8 +139,10 @@ Inside the repo, prefer the wrapped form:
 
 Use `make rust-lane-doctor` when changing build/test entrypoints. It verifies
 that wrapped Cargo caches stay outside the repository, same-checkout agents can
-select distinct `RUST_LANE_ID` target dirs, and the fast test profile still
-excludes dedicated e2e wrappers.
+select distinct target dirs, and the fast test profile still excludes dedicated
+e2e wrappers. `scripts/repo-cargo` uses `RUST_LANE_ID` first, then
+`MEERKAT_AGENT_LANE`, then `CODEX_AGENT_ID`; without any of those it derives a
+lane from the current worktree path.
 
 For local multi-agent edits, use `make agent-gate` or `scripts/agent-gate`.
 Cargo is the default backend, so the command works without BuildBuddy access.

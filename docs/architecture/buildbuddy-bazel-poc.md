@@ -310,10 +310,10 @@ to roughly `4-6s` once those lanes were prepared.
   when `bb` is not already on `PATH`.
 - To check the Cargo/default side of the lane contract, run
   `make rust-lane-doctor`. It verifies that `repo-cargo` keeps caches outside
-  the checkout, `RUST_LANE_ID` creates distinct same-checkout target dirs, and
-  broad fast lanes still use the filtered nextest profile. It also guards the
-  Cargo agent gate's exact integration-test routing for direct `tests/*.rs`
-  edits.
+  the checkout, `RUST_LANE_ID` and `CODEX_AGENT_ID` create distinct
+  same-checkout target dirs, CI Rust entrypoints use the wrapper, and broad fast
+  lanes still use the filtered nextest profile. It also guards the Cargo agent
+  gate's exact integration-test routing for direct `tests/*.rs` edits.
 - To check whether a machine is ready for the optional BuildBuddy lanes, run
   `make buildbuddy-doctor`. It runs the Rust lane doctor first, then checks
   credentials, `bb`, Bazel config, selector health, and BuildBuddy lane

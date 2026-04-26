@@ -58,6 +58,14 @@ else
   bad "RUST_LANE_ID target directories collide"
 fi
 
+codex_agent_env="$(CODEX_AGENT_ID=doctor-codex-agent ./scripts/repo-cargo --print-env)"
+codex_agent_lane="$(value_from_env lane_key <<<"${codex_agent_env}")"
+if [[ "${codex_agent_lane}" == "doctor-codex-agent" ]]; then
+  pass "CODEX_AGENT_ID creates a distinct same-worktree Cargo lane"
+else
+  bad "CODEX_AGENT_ID was not used as the default Cargo lane"
+fi
+
 if [[ "${lane_a_home}" == "${lane_b_home}" ]]; then
   pass "Cargo home stays shared per repository"
 else
