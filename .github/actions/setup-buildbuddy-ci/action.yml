@@ -3,28 +3,30 @@ description: Install the toolchain needed by optional BuildBuddy CI lanes.
 
 inputs:
   profile:
-    description: "Setup profile: full, native, or doctor."
+    description: "Setup profile: native, doctor, lint, sdk, rust, wasm, audit, or full."
     required: false
-    default: full
+    default: native
 
 runs:
   using: composite
   steps:
     - name: Install Rust
+      if: ${{ inputs.profile == 'doctor' || inputs.profile == 'lint' || inputs.profile == 'sdk' || inputs.profile == 'rust' || inputs.profile == 'wasm' || inputs.profile == 'audit' || inputs.profile == 'full' }}
       uses: dtolnay/rust-toolchain@stable
 
     - name: Add wasm32 target
-      if: ${{ inputs.profile == 'full' }}
+      if: ${{ inputs.profile == 'wasm' || inputs.profile == 'full' }}
       shell: bash
       run: rustup target add wasm32-unknown-unknown
 
     - name: Setup Python
-      if: ${{ inputs.profile == 'full' }}
+      if: ${{ inputs.profile == 'sdk' || inputs.profile == 'full' }}
       uses: actions/setup-python@v5
       with:
         python-version: "3.14"
 
     - name: Setup Node
+      if: ${{ inputs.profile == 'doctor' || inputs.profile == 'lint' || inputs.profile == 'sdk' || inputs.profile == 'native' || inputs.profile == 'full' }}
       uses: actions/setup-node@v4
       with:
         node-version: "22"
@@ -37,9 +39,28 @@ runs:
         java-version: 21
 
     - name: Cache cargo registry
+      if: ${{ inputs.profile == 'lint' || inputs.profile == 'sdk' || inputs.profile == 'rust' || inputs.profile == 'wasm' || inputs.profile == 'audit' || inputs.profile == 'full' }}
       uses: Swatinem/rust-cache@v2
       with:
         prefix-key: buildbuddy
+
+    - name: Install lint tools
+      if: ${{ inputs.profile == 'lint' }}
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-machete
+
+    - name: Install wasm tools
+      if: ${{ inputs.profile == 'wasm' }}
+      uses: taiki-e/install-action@v2
+      with:
+        tool: wasm-pack
+
+    - name: Install audit tools
+      if: ${{ inputs.profile == 'audit' }}
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-deny
 
     - name: Install full Rust CI tools
       if: ${{ inputs.profile == 'full' }}

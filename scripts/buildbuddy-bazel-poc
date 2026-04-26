@@ -22,6 +22,9 @@ Common commands:
   e2e-fast-rbe             Bazel-native fast e2e lane.
   e2e-live-rbe             Bazel-native live e2e lane.
   e2e-smoke-rbe            Bazel-native smoke e2e lane.
+  machine-authority-rbe    Bazel-native machine authority lane.
+  rmat-audit-rbe           Bazel-native RMAT + ownership audit lane.
+  seam-inventory-rbe       Bazel-native strict seam inventory lane.
   fast-test                  Root //:fast_tests suite.
   owned-fast-test <path>     Owning fast suite or exact fast test for a path.
   owned-build <path>         Owning build label for a path.
@@ -89,6 +92,20 @@ command="${BUILDBUDDY_BAZEL_COMMAND:-build}"
 requested_command="${command}"
 extra_args=()
 fast_test_tag_filters="-local,-e2e,-system,-live,-integration,-slow,-required-feature,-trybuild,-snapshot,-fixture"
+e2e_test_env=(
+  --test_env=ANTHROPIC_API_KEY
+  --test_env=RKAT_ANTHROPIC_API_KEY
+  --test_env=OPENAI_API_KEY
+  --test_env=RKAT_OPENAI_API_KEY
+  --test_env=GEMINI_API_KEY
+  --test_env=RKAT_GEMINI_API_KEY
+  --test_env=GOOGLE_API_KEY
+  --test_env=PATH
+  --test_env=HOME
+  --test_env=CARGO_HOME
+  --test_env=MEERKAT_CLEAN_E2E_SCENARIO_TARGETS
+  --test_env=MEERKAT_STRICT_E2E_PREREQS=1
+)
 case "${command}" in
   workspace-test)
     command="test"
@@ -193,6 +210,7 @@ case "${command}" in
     config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
     default_target="//:e2e_system_tests"
     extra_args+=(
+      "${e2e_test_env[@]}"
       --build_tests_only
       --test_output=errors
       --test_summary=terse
@@ -205,6 +223,7 @@ case "${command}" in
     config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
     default_target="//tests/integration:e2e_fast_lane_test"
     extra_args+=(
+      "${e2e_test_env[@]}"
       --test_output=errors
       --test_summary=terse
       --color=no
@@ -216,6 +235,7 @@ case "${command}" in
     config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
     default_target="//tests/integration:e2e_live_lane_test"
     extra_args+=(
+      "${e2e_test_env[@]}"
       --test_arg=--ignored
       --test_arg=--test-threads=1
       --test_output=errors
@@ -229,8 +249,42 @@ case "${command}" in
     config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
     default_target="//tests/integration:e2e_smoke_lane_test"
     extra_args+=(
+      "${e2e_test_env[@]}"
       --test_arg=--ignored
       --test_arg=--test-threads=1
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  machine-authority-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//xtask:machines_contracts_test //xtask:protocol_codegen_drift_test"
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  rmat-audit-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//xtask:rmat_audit_test //xtask:rmat_strict_test"
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  seam-inventory-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//xtask:seam_inventory_strict_test"
+    extra_args+=(
       --test_output=errors
       --test_summary=terse
       --color=no

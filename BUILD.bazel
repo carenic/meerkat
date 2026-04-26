@@ -277,6 +277,8 @@ test_suite(
         "//xtask:ci_gate_requires_rmat_test",
         "//xtask:protocol_codegen_drift_test",
         "//xtask:rmat_audit_test",
+        "//xtask:rmat_strict_test",
+        "//xtask:seam_inventory_strict_test",
         "//xtask:xtask_unit_test",
     ],
 )

@@ -239,6 +239,9 @@ if grep -Fq 'full-fresh' .github/workflows/buildbuddy.yml &&
   grep -Fq 'e2e-fast-rbe' scripts/buildbuddy-bazel-poc &&
   grep -Fq 'e2e-live-rbe' scripts/buildbuddy-bazel-poc &&
   grep -Fq 'e2e-smoke-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'machine-authority-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'rmat-audit-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'seam-inventory-rbe' scripts/buildbuddy-bazel-poc &&
   grep -Fq 'buildbuddy-ci-full:' Makefile &&
   grep -Fq 'cargo-deny check' scripts/buildbuddy-ci-lane &&
   grep -Fq 'e2e-live' scripts/buildbuddy-ci-lane &&
@@ -252,10 +255,11 @@ if grep -Fq 'rust-release-packaging' .github/workflows/ci.yml &&
   grep -Fq 'e2e-system' .github/workflows/ci.yml &&
   grep -Fq 'e2e-live' .github/workflows/ci.yml &&
   grep -Fq 'e2e-smoke' .github/workflows/ci.yml &&
-  grep -Fq 'needs: [fmt-lint, sdk-suites, rust-release-packaging, machine-authority, test-unit, integration-fast, e2e-fast, e2e-system, e2e-live, e2e-smoke' .github/workflows/ci.yml; then
-  pass "Cargo CI gate depends on every Cargo CI lane"
+  grep -Fq "if: \${{ github.event_name == 'workflow_dispatch' }}" .github/workflows/ci.yml &&
+  grep -Fq 'needs: [fmt-lint, sdk-suites, rust-release-packaging, machine-authority, test-unit, integration-fast, e2e-fast, e2e-system, test-minimal' .github/workflows/ci.yml; then
+  pass "Cargo CI gate depends on every standard Cargo CI lane"
 else
-  bad "Cargo CI gate does not depend on every Cargo CI lane"
+  bad "Cargo CI gate does not match the standard/nightly lane split"
 fi
 
 if grep -Fq 'name = "e2e_system_tests"' BUILD.bazel &&
@@ -264,6 +268,9 @@ if grep -Fq 'name = "e2e_system_tests"' BUILD.bazel &&
   grep -Fq 'e2e-fast-rbe' scripts/buildbuddy-ci-lane &&
   grep -Fq 'e2e-live-rbe' scripts/buildbuddy-ci-lane &&
   grep -Fq 'e2e-smoke-rbe' scripts/buildbuddy-ci-lane &&
+  grep -Fq 'machine-authority-rbe' scripts/buildbuddy-ci-lane &&
+  grep -Fq 'rmat-audit-rbe' scripts/buildbuddy-ci-lane &&
+  grep -Fq 'seam-inventory-rbe' scripts/buildbuddy-ci-lane &&
   grep -Fq 'system_e2e_command="e2e-system-rbe"' scripts/buildbuddy-ci-workspace &&
   grep -Fq 'RKAT_TEST_BIN_RKAT_RPC' tests/integration/BUILD.bazel &&
   grep -Fq 'CARGO_BIN_EXE_rkat' meerkat-cli/BUILD.bazel; then

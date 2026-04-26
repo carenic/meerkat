@@ -598,6 +598,8 @@ for (const pkg of localPackages.values()) {
     const targetSourceText = isTest ? readFileSync(target.src_path, "utf8") : "";
     const usesTrybuild = targetSourceText.includes("trybuild::");
     const scansWorkspaceRustSources = targetSourceText.includes("walk_rust_sources(&root)");
+    const needsLiveWorkspaceRunfiles = targetSourceText.includes("LIVE_WORKSPACE_RUNFILES");
+    const isE2eLaneHarness = target.name.startsWith("e2e_") && target.name.endsWith("_lane");
     const targetCompileData = compileData(target, dir, isTest);
     const compileDataExpr = `${listExpr(targetCompileData.paths, 8)}${
       targetCompileData.labels.length ? ` + ${listExpr(targetCompileData.labels, 8)}` : ""
@@ -665,6 +667,10 @@ for (const pkg of localPackages.values()) {
       }
       if (scansWorkspaceRustSources) {
         data.push("//:workspace_rust_sources");
+      }
+      if (needsLiveWorkspaceRunfiles || isE2eLaneHarness) {
+        data.push("//:workspace_runfiles");
+        env.push(`        "WORKSPACE_ROOT": ".",`);
       }
       if (key === "meerkat-cli") {
         data.push("//meerkat-cli:rkat", "//meerkat-cli:rkat_mini_bin");

@@ -68,6 +68,9 @@ fn starts_with_any(path: &str, prefixes: &[&str]) -> bool {
 }
 
 pub fn repo_root() -> Result<PathBuf> {
+    if let Some(root) = std::env::var_os("WORKSPACE_ROOT") {
+        return Ok(PathBuf::from(root));
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .map(Path::to_path_buf)

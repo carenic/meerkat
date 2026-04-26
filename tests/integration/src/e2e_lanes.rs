@@ -715,6 +715,9 @@ async fn ensure_binary_signatures_fresh(spec: &Spec, env_overrides: &[(String, S
 }
 
 fn workspace_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("WORKSPACE_ROOT") {
+        return PathBuf::from(root);
+    }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
         .parent()
