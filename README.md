@@ -114,6 +114,7 @@ Meerkat’s repo-wide test lanes are intentionally named by execution model:
 - `cargo unit` for unit tests
 - `cargo int` for integration-fast tests
 - `cargo e2e-fast` for deterministic end-to-end coverage
+- `cargo e2e-build` for build-composition end-to-end coverage
 - `cargo e2e-system` for real binaries / real local resources, but no live providers
 - `cargo e2e-live` for targeted live-provider integration checks
 - `cargo e2e-smoke` for compound live-provider smoke scenarios
@@ -130,10 +131,16 @@ Inside the repo, prefer the wrapped form:
 ./scripts/repo-cargo unit
 ./scripts/repo-cargo int
 ./scripts/repo-cargo e2e-fast
+./scripts/repo-cargo e2e-build
 ./scripts/repo-cargo e2e-system
 ./scripts/repo-cargo e2e-live
 ./scripts/repo-cargo e2e-smoke
 ```
+
+Use `make rust-lane-doctor` when changing build/test entrypoints. It verifies
+that wrapped Cargo caches stay outside the repository, same-checkout agents can
+select distinct `RUST_LANE_ID` target dirs, and the fast test profile still
+excludes dedicated e2e wrappers.
 
 Default CI requires `unit`, `int`, `e2e-fast`, and `e2e-system`. Live-provider lanes stay opt-in.
 

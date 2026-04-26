@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+workspace_root="$(git rev-parse --show-toplevel)"
+cd "${workspace_root}"
+
+ok=0
+warn=0
+fail=0
+
+pass() {
+  ok=$((ok + 1))
+  printf 'PASS %s\n' "$1"
+}
+
+note() {
+  warn=$((warn + 1))
+  printf 'WARN %s\n' "$1"
+}
+
+bad() {
+  fail=$((fail + 1))
+  printf 'FAIL %s\n' "$1"
+}
+
+value_from_env() {
+  local key="$1"
+  awk -F= -v key="${key}" '$1 == key { print substr($0, length(key) + 2) }'
+}
+
+doctor_output="$(./scripts/repo-cargo --doctor 2>&1 || true)"
+if grep -q '^doctor=ok$' <<<"${doctor_output}"; then
+  pass "repo-cargo doctor passes"
+else
+  bad "repo-cargo doctor failed"
+  printf '%s\n' "${doctor_output}" >&2
+fi
+
+default_env="$(./scripts/repo-cargo --print-env)"
+default_target="$(value_from_env CARGO_TARGET_DIR <<<"${default_env}")"
+default_home="$(value_from_env CARGO_HOME <<<"${default_env}")"
+if [[ "${default_target}" == "${workspace_root}"* || "${default_home}" == "${workspace_root}"* ]]; then
+  bad "Cargo cache paths resolve inside the repository"
+else
+  pass "Cargo cache paths are outside the repository"
+fi
+
+lane_a_env="$(RUST_LANE_ID=doctor-a ./scripts/repo-cargo --print-env)"
+lane_b_env="$(RUST_LANE_ID=doctor-b ./scripts/repo-cargo --print-env)"
+lane_a_target="$(value_from_env CARGO_TARGET_DIR <<<"${lane_a_env}")"
+lane_b_target="$(value_from_env CARGO_TARGET_DIR <<<"${lane_b_env}")"
+lane_a_home="$(value_from_env CARGO_HOME <<<"${lane_a_env}")"
+lane_b_home="$(value_from_env CARGO_HOME <<<"${lane_b_env}")"
+
+if [[ "${lane_a_target}" != "${lane_b_target}" ]]; then
+  pass "RUST_LANE_ID creates distinct target directories"
+else
+  bad "RUST_LANE_ID target directories collide"
+fi
+
+if [[ "${lane_a_home}" == "${lane_b_home}" ]]; then
+  pass "Cargo home stays shared per repository"
+else
+  bad "Cargo home changes across same-repo lanes"
+fi
+
+fast_profile_output="$(./scripts/repo-cargo nextest show-config test-groups --profile fast 2>&1 || true)"
+if grep -q '\[profile.fast\]' .config/nextest.toml &&
+  grep -q 'default-filter' .config/nextest.toml &&
+  [[ "${fast_profile_output}" != *"error:"* ]]; then
+  pass "nextest fast profile is valid"
+else
+  bad "nextest fast profile is invalid"
+fi
+
+if grep -q '^e2e-build = ' .cargo/config.toml &&
+  grep -q -- '--test e2e_build_lane' .cargo/config.toml &&
+  grep -q -- '--run-ignored ignored-only' .cargo/config.toml; then
+  pass "e2e-build is an explicit nextest ignored lane"
+else
+  bad "e2e-build is not configured as an explicit ignored nextest lane"
+fi
+
+if awk '/^test-all:/ { in_target=1; next } /^[[:alnum:]_.-]+:/ { in_target=0 } in_target && /nextest run --workspace/ { found=1 } END { exit found ? 0 : 1 }' Makefile; then
+  bad "Makefile test-all runs a broad workspace nextest command"
+else
+  pass "Makefile test-all delegates to the filtered fast profile"
+fi
+
+if [[ -n "$(git status --short)" ]]; then
+  note "working tree has local changes; doctor did not modify them"
+else
+  pass "working tree is clean"
+fi
+
+printf '\nRust lane doctor: %s pass, %s warn, %s fail\n' "${ok}" "${warn}" "${fail}"
+if [[ "${fail}" -gt 0 ]]; then
+  exit 1
+fi

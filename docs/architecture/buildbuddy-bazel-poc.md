@@ -252,9 +252,14 @@ to roughly `4-6s` once those lanes were prepared.
 - For deeper shared crates, use `affected-*` when you need reverse-dependency
   confidence, and expect broad closures for high-fanout crates.
 - For an opt-in BuildBuddy fast test pass, run `make buildbuddy-fast`.
+- To check the Cargo/default side of the lane contract, run
+  `make rust-lane-doctor`. It verifies that `repo-cargo` keeps caches outside
+  the checkout, `RUST_LANE_ID` creates distinct same-checkout target dirs, and
+  broad fast lanes still use the filtered nextest profile.
 - To check whether a machine is ready for the optional BuildBuddy lanes, run
-  `make buildbuddy-doctor`. It checks credentials, `bb`, Bazel config, selector
-  health, and lane isolation without running a build or printing secrets.
+  `make buildbuddy-doctor`. It runs the Rust lane doctor first, then checks
+  credentials, `bb`, Bazel config, selector health, and BuildBuddy lane
+  isolation without running a build or printing secrets.
 - To compare the apples-to-apples fast lanes, run `make buildbuddy-benchmark`.
   It times Cargo fast tests and the equivalent BuildBuddy fast lane, then keeps
   compact logs under the benchmark cache directory.

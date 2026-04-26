@@ -13,7 +13,7 @@ YELLOW := \033[0;33m
 RED := \033[0;31m
 NC := \033[0m
 
-.PHONY: all build test test-unit test-int e2e-fast e2e-build e2e-system e2e-live e2e-smoke test-int-real test-e2e test-all test-minimal test-feature-matrix-lib test-feature-matrix-surface test-feature-matrix test-surface-modularity test-sdk-python test-sdk-typescript test-sdk-suites lint lint-feature-matrix fmt fmt-check audit buildbuddy-doctor buildbuddy-fast buildbuddy-benchmark buildbuddy-ci buildbuddy-ci-warm ci ci-smoke release-preflight release-preflight-smoke publish-dry-run publish-dry-run-python publish-dry-run-typescript release-dry-run release-dry-run-smoke clean doc release install-hooks coverage check help legacy-surface-gate legacy-surface-inventory session-control-gate deprecated-backend-gate deprecated-backend-inventory verify-version-parity verify-schema-freshness verify-rpc-surface-alignment verify-sdk-wrapper-freshness check-rust-release-packaging check-mini-skill-size bump-sdk-versions smoke-sdk-python-artifact smoke-sdk-typescript-artifact xtask-build machine-codegen machine-verify machine-check-drift seam-inventory rmat-audit audit-generated-headers
+.PHONY: all build test test-unit test-int e2e-fast e2e-build e2e-system e2e-live e2e-smoke test-int-real test-e2e test-all test-minimal test-feature-matrix-lib test-feature-matrix-surface test-feature-matrix test-surface-modularity test-sdk-python test-sdk-typescript test-sdk-suites lint lint-feature-matrix fmt fmt-check audit rust-lane-doctor buildbuddy-doctor buildbuddy-fast buildbuddy-benchmark buildbuddy-ci buildbuddy-ci-warm ci ci-smoke release-preflight release-preflight-smoke publish-dry-run publish-dry-run-python publish-dry-run-typescript release-dry-run release-dry-run-smoke clean doc release install-hooks coverage check help legacy-surface-gate legacy-surface-inventory session-control-gate deprecated-backend-gate deprecated-backend-inventory verify-version-parity verify-schema-freshness verify-rpc-surface-alignment verify-sdk-wrapper-freshness check-rust-release-packaging check-mini-skill-size bump-sdk-versions smoke-sdk-python-artifact smoke-sdk-typescript-artifact xtask-build machine-codegen machine-verify machine-check-drift seam-inventory rmat-audit audit-generated-headers
 
 # Default target
 all: ci
@@ -53,7 +53,7 @@ e2e-fast:
 
 e2e-build:
 	@echo "$(YELLOW)Running e2e-build lane (ignored by default)...$(NC)"
-	$(CARGO) test -p meerkat-integration-tests --test e2e_build_lane -- --ignored
+	$(CARGO) e2e-build
 
 # Real local resources only (binaries, sockets, filesystems; no live providers)
 e2e-system:
@@ -83,11 +83,12 @@ test-e2e:
 	@$(MAKE) e2e-live
 	@$(MAKE) e2e-smoke
 
-# Full test suite (for CI)
-# Includes all tests with all features
+# Full deterministic fast suite with all features. Dedicated e2e lanes remain
+# explicit so broad workspace commands do not accidentally run local-resource or
+# live-provider wrappers.
 test-all:
-	@echo "$(GREEN)Running full test suite...$(NC)"
-	$(CARGO) nextest run --workspace --all-features
+	@echo "$(GREEN)Running all-feature fast suite...$(NC)"
+	$(CARGO) fast --all-features
 
 # Python SDK test suite
 test-sdk-python:
@@ -205,8 +206,12 @@ audit-alt:
 	@echo "$(GREEN)Running cargo-audit...$(NC)"
 	$(CARGO) audit
 
+rust-lane-doctor:
+	@echo "$(GREEN)Checking Rust lane isolation and test-lane shape...$(NC)"
+	@scripts/rust-lane-doctor
+
 # Optional BuildBuddy/remote-cache lanes. Cargo remains the default path.
-buildbuddy-doctor:
+buildbuddy-doctor: rust-lane-doctor
 	@echo "$(GREEN)Checking optional BuildBuddy setup...$(NC)"
 	@scripts/buildbuddy-doctor
 
@@ -541,12 +546,13 @@ help:
 	@echo "  $(GREEN)test-unit$(NC)     - Run unit tests only"
 	@echo "  $(GREEN)test-int$(NC)      - Run integration-fast tests only"
 	@echo "  $(GREEN)e2e-fast$(NC)      - Run deterministic end-to-end lane"
+	@echo "  $(GREEN)e2e-build$(NC)     - Run build-composition e2e lane (ignored)"
 	@echo "  $(GREEN)e2e-system$(NC)    - Run real-binary / real-local-resource lane"
 	@echo "  $(GREEN)e2e-live$(NC)      - Run targeted live-provider lane (ignored)"
 	@echo "  $(GREEN)e2e-smoke$(NC)     - Run kitchen-sink live smoke lane (ignored)"
 	@echo "  $(GREEN)test-int-real$(NC) - Legacy alias for e2e-system"
 	@echo "  $(GREEN)test-e2e$(NC)      - Legacy alias for e2e-live + e2e-smoke"
-	@echo "  $(GREEN)test-all$(NC)      - Run full test suite (CI)"
+	@echo "  $(GREEN)test-all$(NC)      - Run all-feature fast suite"
 	@echo "  $(GREEN)test-sdk-python$(NC)- Run Python SDK test suite"
 	@echo "  $(GREEN)test-sdk-typescript$(NC)- Run TypeScript SDK test suite"
 	@echo "  $(GREEN)test-sdk-suites$(NC)- Run both SDK suites"
@@ -556,6 +562,7 @@ help:
 	@echo "  $(GREEN)fmt$(NC)           - Fix code formatting"
 	@echo "  $(GREEN)fmt-check$(NC)     - Check code formatting"
 	@echo "  $(GREEN)audit$(NC)         - Run security audit (cargo-deny)"
+	@echo "  $(GREEN)rust-lane-doctor$(NC)- Check Rust lane isolation and filtered test lanes"
 	@echo "  $(GREEN)buildbuddy-doctor$(NC)- Check optional BuildBuddy setup"
 	@echo "  $(GREEN)buildbuddy-fast$(NC)- Run optional BuildBuddy fast test lane"
 	@echo "  $(GREEN)buildbuddy-benchmark$(NC)- Compare Cargo and BuildBuddy fast lanes"
