@@ -251,6 +251,9 @@ profile so `cargo fast`, `cargo rct`, `cargo int`, and
 | Dedicated `buildbuddy-ci-workspace --warm`, warm | `6-8s` script wall |
 | Split fast workspace CI after lane change, first warm-root run | `51s` script wall |
 | Split fast workspace CI after lane change, warm | `4s` script wall |
+| Warm workspace CI after dispatch/test-speed hardening | `9s` script wall, `140` tests pass |
+| Exact BuildBuddy gate for `meerkat_machine` test edit | `32s` wall, `1` exact test + clippy |
+| Cargo `meerkat_machine` fast test binary after sleep removal | `0.246s` test runtime, `37` tests pass |
 
 The first touch of a new local lane pays Bazel analysis and remote-cache
 materialization cost. Once warmed, the wall-clock floor is mostly the `bb`/Bazel
