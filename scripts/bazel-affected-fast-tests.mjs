@@ -108,6 +108,13 @@ function exactTestLabelForFile(file, pkg, { fastOnly = false } = {}) {
   return labels;
 }
 
+function hasAnyTestTargetForFile(file, pkg) {
+  const normalized = normalizePath(file);
+  return pkg.targets.some((target) =>
+    target.kind.includes("test") && testSourcePaths(target, pkg).has(normalized)
+  );
+}
+
 function buildLabels(pkg) {
   const dir = packageDir(pkg);
   const libOrMacro = pkg.targets.find((target) =>
@@ -181,6 +188,7 @@ if (files.length === 0) {
 const seedIds = new Set();
 const exactLabels = new Set();
 const unmapped = [];
+let suppressedOwnedTestTarget = false;
 for (const file of files) {
   if (file.endsWith("BUILD.bazel") || file === "BUILD.bazel") continue;
   const pkg = packageForFile(file, dirs);
@@ -193,11 +201,12 @@ for (const file of files) {
     } else if (
       args.mode === "owned" &&
       args.kind === "test" &&
-      exactTestLabelForFile(file, pkg).length
+      hasAnyTestTargetForFile(file, pkg)
     ) {
-      // Non-fast tests are still compiled and linted by the build/clippy
-      // selectors, but the fast test selector should not broaden to the whole
-      // package just because an e2e/system/live test source changed.
+      // Non-fast or not-yet-Bazlified test targets are still handled by the
+      // build/clippy selectors, but the fast test selector should not broaden
+      // to unrelated package fast tests just because one test source changed.
+      suppressedOwnedTestTarget = true;
     } else {
       seedIds.add(pkg.id);
     }
@@ -207,6 +216,10 @@ for (const file of files) {
 }
 
 if (unmapped.length || (seedIds.size === 0 && exactLabels.size === 0)) {
+  if (suppressedOwnedTestTarget && args.emptyIfNoLabels) {
+    console.log("");
+    process.exit(0);
+  }
   console.log(args.kind === "test" ? "//:fast_tests" : "//...");
   process.exit(0);
 }

@@ -90,6 +90,14 @@ else
   printf '%s\n' "${support_test_labels}" >&2
 fi
 
+required_feature_test_labels="$(./scripts/bazel-affected-fast-tests.mjs --owned --test --empty-if-no-labels meerkat-cli/tests/cli_mobpack_live_smoke.rs)"
+if [[ -z "${required_feature_test_labels}" ]]; then
+  pass "Bazel selector avoids broad fast tests for required-feature test edits"
+else
+  bad "Bazel selector broadened required-feature test edits to unrelated tests"
+  printf '%s\n' "${required_feature_test_labels}" >&2
+fi
+
 fast_profile_filter="$(./scripts/repo-cargo nextest show-config test-groups --profile fast 2>&1 || true)"
 if grep -q '\[profile.fast\]' .config/nextest.toml &&
   grep -q 'default-filter' .config/nextest.toml &&
