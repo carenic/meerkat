@@ -236,6 +236,9 @@ if grep -Fq 'full-fresh' .github/workflows/buildbuddy.yml &&
   grep -Fq 'scripts/buildbuddy-ci-lane' .github/actions/run-buildbuddy-ci-lane/action.yml &&
   grep -Fq 'workspace-unit-rbe' scripts/buildbuddy-bazel-poc &&
   grep -Fq 'workspace-integration-fast-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'e2e-fast-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'e2e-live-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'e2e-smoke-rbe' scripts/buildbuddy-bazel-poc &&
   grep -Fq 'buildbuddy-ci-full:' Makefile &&
   grep -Fq 'cargo-deny check' scripts/buildbuddy-ci-lane &&
   grep -Fq 'e2e-live' scripts/buildbuddy-ci-lane &&
@@ -258,11 +261,13 @@ fi
 if grep -Fq 'name = "e2e_system_tests"' BUILD.bazel &&
   grep -Fq 'workspace-unit-rbe' scripts/buildbuddy-bazel-poc &&
   grep -Fq 'workspace-integration-fast-rbe' scripts/buildbuddy-bazel-poc &&
-  grep -Fq 'native-e2e-system' scripts/buildbuddy-ci-lane &&
+  grep -Fq 'e2e-fast-rbe' scripts/buildbuddy-ci-lane &&
+  grep -Fq 'e2e-live-rbe' scripts/buildbuddy-ci-lane &&
+  grep -Fq 'e2e-smoke-rbe' scripts/buildbuddy-ci-lane &&
   grep -Fq 'system_e2e_command="e2e-system-rbe"' scripts/buildbuddy-ci-workspace &&
   grep -Fq 'RKAT_TEST_BIN_RKAT_RPC' tests/integration/BUILD.bazel &&
   grep -Fq 'CARGO_BIN_EXE_rkat' meerkat-cli/BUILD.bazel; then
-  pass "BuildBuddy CI has native unit, integration-fast, and system e2e lanes"
+  pass "BuildBuddy CI has native unit, integration-fast, and e2e lanes"
 else
   bad "BuildBuddy CI is missing native test lane wiring"
 fi

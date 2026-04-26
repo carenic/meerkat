@@ -255,16 +255,16 @@ case "${lane}" in
     run_bazel_lane workspace-integration-fast-rbe --jobs=64
     ;;
   e2e-fast)
-    run_compat_lane ./scripts/repo-cargo e2e-fast
+    run_bazel_lane e2e-fast-rbe --jobs=64
     ;;
   e2e-system)
     run_bazel_lane e2e-system-rbe --jobs=64
     ;;
   e2e-live)
-    run_compat_lane ./scripts/repo-cargo e2e-live
+    run_bazel_lane e2e-live-rbe --jobs=64
     ;;
   e2e-smoke)
-    run_compat_lane ./scripts/repo-cargo e2e-smoke
+    run_bazel_lane e2e-smoke-rbe --jobs=64
     ;;
   minimal-feature-builds)
     run_compat_lane make test-minimal

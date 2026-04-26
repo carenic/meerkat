@@ -19,6 +19,9 @@ Common commands:
   workspace-fast-clippy-rbe  Fast tests plus clippy aspect.
   workspace-build-clippy-rbe Build/clippy labels for the workspace build set.
   e2e-system-rbe           Bazel-native system e2e suite with runfile binaries.
+  e2e-fast-rbe             Bazel-native fast e2e lane.
+  e2e-live-rbe             Bazel-native live e2e lane.
+  e2e-smoke-rbe            Bazel-native smoke e2e lane.
   fast-test                  Root //:fast_tests suite.
   owned-fast-test <path>     Owning fast suite or exact fast test for a path.
   owned-build <path>         Owning build label for a path.
@@ -191,6 +194,43 @@ case "${command}" in
     default_target="//:e2e_system_tests"
     extra_args+=(
       --build_tests_only
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  e2e-fast-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//tests/integration:e2e_fast_lane_test"
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  e2e-live-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//tests/integration:e2e_live_lane_test"
+    extra_args+=(
+      --test_arg=--ignored
+      --test_arg=--test-threads=1
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  e2e-smoke-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//tests/integration:e2e_smoke_lane_test"
+    extra_args+=(
+      --test_arg=--ignored
+      --test_arg=--test-threads=1
       --test_output=errors
       --test_summary=terse
       --color=no
