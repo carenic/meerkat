@@ -1,6 +1,14 @@
-name: BuildBuddy
+name: BuildBuddy CI
 
 on:
+  push:
+    branches:
+      - main
+      - ci/**
+      - feat/**
+      - feature/**
+      - codex/**
+  pull_request:
   workflow_call:
     inputs:
       mode:
@@ -81,7 +89,8 @@ env:
 
 jobs:
   macos-arm64-rbe:
-    name: macOS arm64 RBE gate
+    name: macOS arm64 RBE CI
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     env:
       BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
@@ -157,13 +166,14 @@ jobs:
       - name: Remote gate
         env:
           MEERKAT_BUILDBUDDY_CI_MODE: ${{ inputs.mode }}
-          MEERKAT_BUILDBUDDY_CHANGED_MODE: ${{ inputs.changed_mode }}
-          MEERKAT_BUILDBUDDY_BASE: ${{ inputs.base }}
-          MEERKAT_BUILDBUDDY_CHANGED_PATHS: ${{ inputs.paths }}
+          MEERKAT_BUILDBUDDY_CHANGED_MODE: ${{ inputs.changed_mode || vars.MEERKAT_BUILDBUDDY_CHANGED_MODE || 'owned' }}
+          MEERKAT_BUILDBUDDY_BASE: ${{ inputs.base || vars.MEERKAT_BUILDBUDDY_BASE || 'origin/main' }}
+          MEERKAT_BUILDBUDDY_CHANGED_PATHS: ${{ inputs.paths || vars.MEERKAT_BUILDBUDDY_CHANGED_PATHS || '' }}
           MEERKAT_BUILDBUDDY_LOG_ROOT: ${{ runner.temp }}/buildbuddy-logs
         run: |
           set -o pipefail
           mkdir -p "${MEERKAT_BUILDBUDDY_LOG_ROOT}"
+          export MEERKAT_BUILDBUDDY_CI_MODE="${MEERKAT_BUILDBUDDY_CI_MODE:-${{ vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}}"
           scripts/buildbuddy-ci-dispatch 2>&1 | tee "${MEERKAT_BUILDBUDDY_LOG_ROOT}/dispatch.log"
 
       - name: Upload BuildBuddy logs

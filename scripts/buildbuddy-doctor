@@ -211,14 +211,15 @@ else
 fi
 rm -rf "${dispatch_log_root}"
 
-if grep -Fq 'workflow_call:' .github/workflows/buildbuddy.yml &&
-  grep -Fq 'uses: ./.github/workflows/buildbuddy.yml' .github/workflows/ci.yml &&
-  grep -Fq 'MEERKAT_BUILDBUDDY_CI' .github/workflows/ci.yml &&
-  grep -Fq 'MEERKAT_BUILDBUDDY_CI_MODE' .github/workflows/ci.yml &&
-  grep -Fq 'full-fresh' .github/workflows/ci.yml; then
-  pass "GitHub CI wires the optional BuildBuddy workflow behind an opt-in variable"
+if grep -Fq 'name: CI' .github/workflows/ci.yml &&
+  ! grep -Fq 'uses: ./.github/workflows/buildbuddy.yml' .github/workflows/ci.yml &&
+  grep -Fq 'name: BuildBuddy CI' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'pull_request:' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'MEERKAT_BUILDBUDDY_CI' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'full-fresh' .github/workflows/buildbuddy.yml; then
+  pass "Cargo CI and BuildBuddy CI are separate workflows"
 else
-  bad "GitHub CI is missing the optional reusable BuildBuddy workflow wiring"
+  bad "Cargo CI and BuildBuddy CI are not separated cleanly"
 fi
 
 if grep -Fq 'full-fresh' .github/workflows/buildbuddy.yml &&
