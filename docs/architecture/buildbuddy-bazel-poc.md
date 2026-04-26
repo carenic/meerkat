@@ -143,6 +143,8 @@ modes:
 - `ci-parallel`: parallel CI-like fast-test and clippy on fresh output bases.
 - `ci-workspace`: parallel CI-like `workspace-fast-clippy-rbe` and
   `workspace-build-clippy-rbe` on fresh output bases.
+- `ci-dispatch-artifacts`: changed-path CI dispatch dry-run with log-root
+  context artifact verification.
 
 For an actual remote-compatible CI gate, use `scripts/buildbuddy-ci-workspace`.
 It runs `workspace-fast-clippy-rbe` and `workspace-build-clippy-rbe` in parallel

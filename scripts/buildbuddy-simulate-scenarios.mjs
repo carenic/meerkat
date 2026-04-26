@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -39,6 +39,8 @@ Scenarios:
   ci-cold            Run CI-like checks with fresh output bases.
   ci-parallel        Run CI-like fast-test and clippy checks in parallel.
   ci-workspace       Run split workspace fast test+clippy and build-clippy in parallel.
+  ci-dispatch-artifacts
+                     Check CI dispatch context artifacts for changed-path mode.
   all                Run the default scenario set.
 `);
 }
@@ -590,6 +592,49 @@ async function ciWorkspace(root) {
   }
 }
 
+async function ciDispatchArtifacts(root) {
+  console.log("\n== ci-dispatch-artifacts ==");
+  const temp = mkdtempSync(join(tmpdir(), "meerkat-bb-ci-dispatch-"));
+  try {
+    const result = await run(
+      "./scripts/buildbuddy-ci-dispatch",
+      ["--mode", "changed-paths", "--paths", "meerkat-runtime/src/input_ledger.rs", "--dry-run"],
+      {
+        cwd: root,
+        env: { MEERKAT_BUILDBUDDY_LOG_ROOT: temp },
+        label: "buildbuddy-ci-dispatch changed-paths artifacts",
+      },
+    );
+    printResult(result);
+    if (result.code !== 0) return result.code;
+
+    const contextPath = join(temp, "dispatch-context.txt");
+    const inputsPath = join(temp, "dispatch-inputs.txt");
+    if (!existsSync(contextPath) || !existsSync(inputsPath)) {
+      console.error(`missing dispatch artifacts under ${temp}`);
+      return 1;
+    }
+
+    const inputs = readFileSync(inputsPath, "utf8");
+    const context = readFileSync(contextPath, "utf8");
+    if (
+      !inputs.includes("mode=changed-paths\n") ||
+      !inputs.includes("dry_run=1\n") ||
+      !context.includes("mode=changed-paths\n")
+    ) {
+      console.error("dispatch artifacts did not record changed-path dry-run context");
+      console.error(inputs);
+      console.error(context);
+      return 1;
+    }
+
+    console.log(`PASS dispatch artifacts ${temp}`);
+    return 0;
+  } finally {
+    await removeTempTree(temp);
+  }
+}
+
 const rootResult = await run("git", ["rev-parse", "--show-toplevel"], {
   cwd: process.cwd(),
   label: "workspace-root",
@@ -632,6 +677,7 @@ const scenarios = requested.length === 0 || requested.includes("all")
       "ci-cold",
       "ci-parallel",
       "ci-workspace",
+      "ci-dispatch-artifacts",
     ]
   : requested;
 
@@ -662,6 +708,7 @@ const runners = new Map([
   ["ci-cold", ciCold],
   ["ci-parallel", ciParallel],
   ["ci-workspace", ciWorkspace],
+  ["ci-dispatch-artifacts", ciDispatchArtifacts],
 ]);
 
 for (const scenario of scenarios) {
