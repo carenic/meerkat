@@ -82,6 +82,8 @@ modes:
 - `changed-clippy`: changed-scope clippy for representative source and shared
   support-file edits.
 - `changed-gate`: combined changed-path test and clippy gate.
+- `parallel-gates`: two same-worktree agents running changed-path gates in
+  parallel with distinct lanes.
 - `edit-probes`: creates a temporary detached worktree, makes harmless real
   edits to representative source/test/support files, runs the matching lanes,
   and removes the worktree.
@@ -139,6 +141,8 @@ Representative measurements from the POC environment:
 | Shared support clippy, exact owned selector, warm | `0.91s` wall |
 | Changed support gate, exact tests + exact clippy, first touch | `25s` script wall |
 | Changed support gate, exact tests + exact clippy, warm | `4s` script wall |
+| Two same-worktree changed gates, first touch | `26.44s` / `26.35s` wall |
+| Two same-worktree changed gates, warm | `5.12s` / `5.12s` wall |
 | Three cold parallel selectors with metadata cache lock | `0` Cargo lock waits |
 | Fresh temp worktree source edit probe | `23.98s` wall |
 | Fresh temp worktree exact-test edit probe | `48.31s` wall |
