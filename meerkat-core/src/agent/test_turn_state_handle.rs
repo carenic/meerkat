@@ -38,6 +38,7 @@ use crate::ops::OperationId;
 use crate::retry::LlmRetrySchedule;
 use crate::turn_execution_authority::{
     ContentShape, TurnExecutionInput, TurnPhase, TurnPrimitiveKind, TurnTerminalOutcome,
+    terminal_outcome_for_budget_exceeded,
 };
 
 #[derive(Debug, Clone)]
@@ -123,12 +124,12 @@ impl LocalState {
     fn apply(&mut self, input: TurnExecutionInput) -> Result<(), DslTransitionError> {
         use TurnExecutionInput::{
             AcknowledgeTerminal, BoundaryComplete, BoundaryContinue, BudgetExhausted,
-            CancelAfterBoundary, CancelNow, CancellationObserved, EnterExtraction, ExtractionStart,
-            ExtractionValidationFailed, ExtractionValidationPassed, FatalFailure, ForceCancelNoRun,
-            LlmReturnedTerminal, LlmReturnedToolCalls, OpsBarrierSatisfied, PrimitiveApplied,
-            RecoverableFailure, RegisterPendingOps, RetryRequested, StartConversationRun,
-            StartImmediateAppend, StartImmediateContext, TimeBudgetExceeded, ToolCallsResolved,
-            TurnLimitReached,
+            BudgetLimitExceeded, CancelAfterBoundary, CancelNow, CancellationObserved,
+            EnterExtraction, ExtractionStart, ExtractionValidationFailed,
+            ExtractionValidationPassed, FatalFailure, ForceCancelNoRun, LlmReturnedTerminal,
+            LlmReturnedToolCalls, OpsBarrierSatisfied, PrimitiveApplied, RecoverableFailure,
+            RegisterPendingOps, RetryRequested, StartConversationRun, StartImmediateAppend,
+            StartImmediateContext, TimeBudgetExceeded, ToolCallsResolved, TurnLimitReached,
         };
         use TurnPhase::{
             ApplyingPrimitive, CallingLlm, Cancelled, Cancelling, Completed, DrainingBoundary,
@@ -456,6 +457,24 @@ impl LocalState {
                 }
                 fields.boundary_count += 1;
                 fields.terminal_outcome = TurnTerminalOutcome::TimeBudgetExceeded;
+                Completed
+            }
+            (
+                ApplyingPrimitive | CallingLlm | WaitingForOps | DrainingBoundary | Extracting
+                | ErrorRecovery,
+                BudgetLimitExceeded { run_id, exceeded },
+            ) => {
+                if !self.guard_run_matches(run_id) {
+                    return Err(invalid(phase, &input));
+                }
+                if matches!(phase, WaitingForOps) {
+                    fields.pending_op_ids.clear();
+                    fields.barrier_operation_ids.clear();
+                    fields.has_barrier_ops = false;
+                    fields.barrier_satisfied = true;
+                }
+                fields.boundary_count += 1;
+                fields.terminal_outcome = terminal_outcome_for_budget_exceeded(*exceeded);
                 Completed
             }
             (

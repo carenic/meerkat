@@ -1,5 +1,6 @@
 //! Agent state machine internals.
 
+use crate::budget::{BudgetDimension, BudgetExceeded};
 use crate::error::AgentError;
 use crate::event::{
     AgentEvent, BudgetType, DeferredCatalogDelta, ToolConfigChangeDomain,
@@ -16,7 +17,7 @@ use crate::tokio;
 use crate::tool_catalog::{ToolCatalogDeferredEligibility, ToolCatalogMode, ToolPlaneClass};
 use crate::turn_execution_authority::{
     ContentShape, TurnExecutionEffect, TurnExecutionInput, TurnExecutionTransition, TurnPhase,
-    TurnPrimitiveKind, TurnTerminalOutcome,
+    TurnPrimitiveKind, TurnTerminalOutcome, terminal_outcome_for_budget_exceeded,
 };
 use crate::types::{
     AssistantBlock, BlockAssistantMessage, Message, RunResult, SystemNoticeKind,
@@ -79,11 +80,26 @@ fn turn_input_run_id(input: &TurnExecutionInput) -> Option<RunId> {
         | TurnExecutionInput::TurnLimitReached { run_id }
         | TurnExecutionInput::BudgetExhausted { run_id }
         | TurnExecutionInput::TimeBudgetExceeded { run_id }
+        | TurnExecutionInput::BudgetLimitExceeded { run_id, .. }
         | TurnExecutionInput::EnterExtraction { run_id, .. }
         | TurnExecutionInput::ExtractionValidationPassed { run_id }
         | TurnExecutionInput::ExtractionValidationFailed { run_id, .. }
         | TurnExecutionInput::ExtractionStart { run_id } => Some(run_id.clone()),
         TurnExecutionInput::ForceCancelNoRun => None,
+    }
+}
+
+fn budget_warning_event(exceeded: BudgetExceeded) -> AgentEvent {
+    let budget_type = match exceeded.dimension {
+        BudgetDimension::Tokens => BudgetType::Tokens,
+        BudgetDimension::Time => BudgetType::Time,
+        BudgetDimension::ToolCalls => BudgetType::ToolCalls,
+    };
+    AgentEvent::BudgetWarning {
+        budget_type,
+        used: exceeded.used,
+        limit: exceeded.limit,
+        percent: 1.0,
     }
 }
 
@@ -317,16 +333,19 @@ where
 
         loop {
             // 1. Budget gate at loop entry
-            self.budget.check()?;
+            if let Some(exceeded) = self.budget.observe().exceeded() {
+                return Err(exceeded.to_agent_error());
+            }
 
             // 2. Compute effective timeout for this call
             let effective_call_timeout = self.resolve_effective_call_timeout();
             let remaining_turn = self.budget.remaining_duration();
 
             // If remaining turn budget is zero, surface immediately
-            if remaining_turn == Some(std::time::Duration::ZERO) {
-                self.budget.check()?;
-                // check() should have returned Err; unreachable, but be safe
+            if remaining_turn == Some(std::time::Duration::ZERO)
+                && let Some(exceeded) = self.budget.observe().exceeded()
+            {
+                return Err(exceeded.to_agent_error());
             }
 
             // 4. Determine whether to wrap the call and select timeout source
@@ -381,20 +400,20 @@ where
                                     ),
                                 }),
                                 CallTimeoutSource::TurnBudget => {
-                                    let limit = self
-                                        .budget
-                                        .time_usage()
-                                        .map(|(_, l)| l / 1000)
-                                        .unwrap_or(0);
-                                    let elapsed = self
-                                        .budget
-                                        .time_usage()
-                                        .map(|(e, _)| e / 1000)
-                                        .unwrap_or(0);
-                                    return Err(AgentError::TimeBudgetExceeded {
-                                        elapsed_secs: elapsed,
-                                        limit_secs: limit,
-                                    });
+                                    let exceeded =
+                                        self.budget.observe().exceeded().unwrap_or_else(|| {
+                                            let timeout_ms = effective_timeout.as_millis() as u64;
+                                            let (elapsed_ms, limit_ms) = self
+                                                .budget
+                                                .time_usage()
+                                                .unwrap_or((timeout_ms, timeout_ms));
+                                            BudgetExceeded {
+                                                dimension: BudgetDimension::Time,
+                                                used: elapsed_ms / 1000,
+                                                limit: limit_ms / 1000,
+                                            }
+                                        });
+                                    return Err(exceeded.to_agent_error());
                                 }
                             }
                         }
@@ -438,7 +457,9 @@ where
                         .await;
                         attempt += 1;
                         tokio::time::sleep(retry_schedule.plan.selected_delay()).await;
-                        self.budget.check()?;
+                        if let Some(exceeded) = self.budget.observe().exceeded() {
+                            return Err(exceeded.to_agent_error());
+                        }
                         let retry = self.apply_turn_input(TurnExecutionInput::RetryRequested {
                             run_id: run_id.clone(),
                             retry_attempt: retry_schedule.plan.attempt,
@@ -588,6 +609,13 @@ where
             TurnExecutionInput::TurnLimitReached { .. } => handle.turn_limit_reached(),
             TurnExecutionInput::BudgetExhausted { .. } => handle.budget_exhausted(),
             TurnExecutionInput::TimeBudgetExceeded { .. } => handle.time_budget_exceeded(),
+            TurnExecutionInput::BudgetLimitExceeded { exceeded, .. } => {
+                match terminal_outcome_for_budget_exceeded(*exceeded) {
+                    TurnTerminalOutcome::TimeBudgetExceeded => handle.time_budget_exceeded(),
+                    TurnTerminalOutcome::BudgetExhausted => handle.budget_exhausted(),
+                    _ => unreachable!("budget exceeded maps only to budget terminal outcomes"),
+                }
+            }
             TurnExecutionInput::EnterExtraction { max_retries, .. } => {
                 handle.enter_extraction(*max_retries)
             }
@@ -858,51 +886,15 @@ where
                 return self.build_result(turn_count, tool_call_count).await;
             }
 
-            // Check budget — typed routing per budget kind
-            if let Err(budget_err) = self.budget.check() {
-                match budget_err {
-                    AgentError::TimeBudgetExceeded {
-                        elapsed_secs,
-                        limit_secs,
-                    } => {
-                        emit_event!(AgentEvent::BudgetWarning {
-                            budget_type: BudgetType::Time,
-                            used: elapsed_secs,
-                            limit: limit_secs,
-                            percent: 1.0,
-                        });
-                        self.pending_fatal_diagnostic = Some(AgentError::TimeBudgetExceeded {
-                            elapsed_secs,
-                            limit_secs,
-                        });
-                        self.apply_turn_input(TurnExecutionInput::TimeBudgetExceeded {
-                            run_id: run_id.clone(),
-                        })?;
-                    }
-                    AgentError::TokenBudgetExceeded { used, limit } => {
-                        emit_event!(AgentEvent::BudgetWarning {
-                            budget_type: BudgetType::Tokens,
-                            used,
-                            limit,
-                            percent: 1.0,
-                        });
-                        self.apply_turn_input(TurnExecutionInput::BudgetExhausted {
-                            run_id: run_id.clone(),
-                        })?;
-                    }
-                    AgentError::ToolCallBudgetExceeded { count, limit } => {
-                        emit_event!(AgentEvent::BudgetWarning {
-                            budget_type: BudgetType::ToolCalls,
-                            used: count as u64,
-                            limit: limit as u64,
-                            percent: 1.0,
-                        });
-                        self.apply_turn_input(TurnExecutionInput::BudgetExhausted {
-                            run_id: run_id.clone(),
-                        })?;
-                    }
-                    other => return Err(other),
+            if let Some(exceeded) = self.budget.observe().exceeded() {
+                emit_event!(budget_warning_event(exceeded));
+                if matches!(exceeded.dimension, BudgetDimension::Time) {
+                    self.pending_fatal_diagnostic = Some(exceeded.to_agent_error());
                 }
+                self.apply_turn_input(TurnExecutionInput::BudgetLimitExceeded {
+                    run_id: run_id.clone(),
+                    exceeded,
+                })?;
                 return self.build_result(turn_count, tool_call_count).await;
             }
 
@@ -1415,80 +1407,40 @@ where
                         .await
                     {
                         Ok(r) => r,
-                        Err(
-                            e @ AgentError::TimeBudgetExceeded {
-                                elapsed_secs,
-                                limit_secs,
-                            },
-                        ) => {
-                            // Dedicated time-budget terminal path — same as loop-top
-                            emit_event!(AgentEvent::BudgetWarning {
-                                budget_type: BudgetType::Time,
-                                used: elapsed_secs,
-                                limit: limit_secs,
-                                percent: 1.0,
-                            });
-                            self.pending_fatal_diagnostic = Some(e);
-                            self.apply_turn_input(TurnExecutionInput::TimeBudgetExceeded {
-                                run_id: run_id.clone(),
-                            })?;
-                            return self.build_result(turn_count, tool_call_count).await;
+                        Err(e) => {
+                            if let Some(exceeded) = BudgetExceeded::from_agent_error(&e) {
+                                emit_event!(budget_warning_event(exceeded));
+                                if matches!(exceeded.dimension, BudgetDimension::Time) {
+                                    self.pending_fatal_diagnostic = Some(e);
+                                }
+                                self.apply_turn_input(TurnExecutionInput::BudgetLimitExceeded {
+                                    run_id: run_id.clone(),
+                                    exceeded,
+                                })?;
+                                return self.build_result(turn_count, tool_call_count).await;
+                            }
+                            if matches!(&e, AgentError::Llm { .. }) {
+                                // Exhausted hard LLM-call failure — route through
+                                // machine-owned FatalFailure and preserve diagnostics.
+                                self.pending_fatal_diagnostic = Some(e);
+                                self.apply_turn_input(TurnExecutionInput::FatalFailure {
+                                    run_id: run_id.clone(),
+                                })?;
+                                return self.build_result(turn_count, tool_call_count).await;
+                            }
+                            return Err(e);
                         }
-                        Err(AgentError::TokenBudgetExceeded { used, limit }) => {
-                            // Token budget exhausted during LLM call — same
-                            // terminal path as loop-top budget check.
-                            emit_event!(AgentEvent::BudgetWarning {
-                                budget_type: BudgetType::Tokens,
-                                used,
-                                limit,
-                                percent: 1.0,
-                            });
-                            self.apply_turn_input(TurnExecutionInput::BudgetExhausted {
-                                run_id: run_id.clone(),
-                            })?;
-                            return self.build_result(turn_count, tool_call_count).await;
-                        }
-                        Err(AgentError::ToolCallBudgetExceeded { count, limit }) => {
-                            // Tool-call budget exhausted during LLM call — same
-                            // terminal path as loop-top budget check.
-                            emit_event!(AgentEvent::BudgetWarning {
-                                budget_type: BudgetType::ToolCalls,
-                                used: count as u64,
-                                limit: limit as u64,
-                                percent: 1.0,
-                            });
-                            self.apply_turn_input(TurnExecutionInput::BudgetExhausted {
-                                run_id: run_id.clone(),
-                            })?;
-                            return self.build_result(turn_count, tool_call_count).await;
-                        }
-                        Err(e @ AgentError::Llm { .. }) => {
-                            // Exhausted hard LLM-call failure — route through
-                            // machine-owned FatalFailure and preserve diagnostics.
-                            self.pending_fatal_diagnostic = Some(e);
-                            self.apply_turn_input(TurnExecutionInput::FatalFailure {
-                                run_id: run_id.clone(),
-                            })?;
-                            return self.build_result(turn_count, tool_call_count).await;
-                        }
-                        Err(e) => return Err(e),
                     };
 
                     // Update budget + session usage
                     self.budget.record_usage(&result.usage);
                     self.last_input_tokens = result.usage.input_tokens;
                     self.session.record_usage(result.usage.clone());
-                    if let Err(AgentError::TokenBudgetExceeded { used, limit }) =
-                        self.budget.check()
-                    {
-                        emit_event!(AgentEvent::BudgetWarning {
-                            budget_type: BudgetType::Tokens,
-                            used,
-                            limit,
-                            percent: 1.0,
-                        });
-                        self.apply_turn_input(TurnExecutionInput::BudgetExhausted {
+                    if let Some(exceeded) = self.budget.observe().exceeded() {
+                        emit_event!(budget_warning_event(exceeded));
+                        self.apply_turn_input(TurnExecutionInput::BudgetLimitExceeded {
                             run_id: run_id.clone(),
+                            exceeded,
                         })?;
                         return self.build_result(turn_count, tool_call_count).await;
                     }
@@ -4459,8 +4411,8 @@ mod tests {
     async fn token_budget_exhausted_after_llm_call_routes_through_authority() {
         // Budget allows exactly 100 tokens — the first LLM call reports 1000,
         // so usage recording at the call site pushes the budget over the limit.
-        // The next loop-top budget.check() fires TokenBudgetExceeded, which
-        // must be routed to BudgetExhausted -> Success, not raw Err.
+        // The next budget observation reports token exhaustion as evidence,
+        // then the turn authority maps it to BudgetExhausted -> Success.
         let mut agent = build_agent(Arc::new(HighUsageLlmClient)).await;
         agent.config.max_turns = Some(10);
         agent.budget = Budget::new(BudgetLimits {
@@ -4684,8 +4636,8 @@ mod tests {
             .await;
 
         // Set a 100ms time budget — the 30s rate-limit floor will be
-        // capped to 100ms by remaining_duration, then budget.check()
-        // fires TimeBudgetExceeded after the sleep.
+        // capped to 100ms by remaining_duration, then the next budget
+        // observation reports TimeBudgetExceeded after the sleep.
         agent.budget = Budget::new(BudgetLimits {
             max_tokens: None,
             max_duration: Some(Duration::from_millis(100)),

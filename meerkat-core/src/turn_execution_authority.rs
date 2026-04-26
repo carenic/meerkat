@@ -4,6 +4,7 @@
 //! authority/state-machine surface. It holds the stable enums and transition
 //! payloads shared by the standalone core fallback and runtime-backed handles.
 
+use crate::budget::{BudgetDimension, BudgetExceeded};
 use crate::lifecycle::RunId;
 use crate::ops::{AsyncOpRef, OperationId};
 use crate::retry::LlmRetrySchedule;
@@ -167,6 +168,10 @@ pub enum TurnExecutionInput {
     TimeBudgetExceeded {
         run_id: RunId,
     },
+    BudgetLimitExceeded {
+        run_id: RunId,
+        exceeded: BudgetExceeded,
+    },
     EnterExtraction {
         run_id: RunId,
         max_retries: u32,
@@ -212,4 +217,42 @@ pub struct TurnExecutionTransition {
     pub prev_phase: TurnPhase,
     pub next_phase: TurnPhase,
     pub effects: Vec<TurnExecutionEffect>,
+}
+
+pub fn terminal_outcome_for_budget_exceeded(exceeded: BudgetExceeded) -> TurnTerminalOutcome {
+    match exceeded.dimension {
+        BudgetDimension::Time => TurnTerminalOutcome::TimeBudgetExceeded,
+        BudgetDimension::Tokens | BudgetDimension::ToolCalls => {
+            TurnTerminalOutcome::BudgetExhausted
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exceeded(dimension: BudgetDimension) -> BudgetExceeded {
+        BudgetExceeded {
+            dimension,
+            used: 1,
+            limit: 1,
+        }
+    }
+
+    #[test]
+    fn budget_terminal_classification_is_turn_authority_owned() {
+        assert_eq!(
+            terminal_outcome_for_budget_exceeded(exceeded(BudgetDimension::Tokens)),
+            TurnTerminalOutcome::BudgetExhausted
+        );
+        assert_eq!(
+            terminal_outcome_for_budget_exceeded(exceeded(BudgetDimension::ToolCalls)),
+            TurnTerminalOutcome::BudgetExhausted
+        );
+        assert_eq!(
+            terminal_outcome_for_budget_exceeded(exceeded(BudgetDimension::Time)),
+            TurnTerminalOutcome::TimeBudgetExceeded
+        );
+    }
 }

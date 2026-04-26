@@ -98,7 +98,9 @@ pub use auth::{
     metadata_grants_no_visibility,
 };
 pub use blob::{BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError};
-pub use budget::{Budget, BudgetLimits, BudgetPool};
+pub use budget::{
+    Budget, BudgetDimension, BudgetExceeded, BudgetLimits, BudgetObservation, BudgetPool,
+};
 pub use checkpoint::SessionCheckpointer;
 pub use comms::{
     CommsCommand, EventStream, InputSource, InputStreamMode, PeerDirectoryEntry,
