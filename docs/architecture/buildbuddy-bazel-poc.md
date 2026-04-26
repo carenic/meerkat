@@ -255,6 +255,9 @@ profile so `cargo fast`, `cargo rct`, `cargo int`, and
 | Exact BuildBuddy gate for `meerkat_machine` test edit | `21s` wall, `1` exact test + clippy combined |
 | Cargo agent gate for `meerkat_machine` test edit, tests only | `0.10s` Cargo work, `0.258s` nextest runtime, `37` tests pass |
 | Cargo agent gate for `meerkat_machine` test edit, clippy only | `0.20s` Cargo work |
+| Cargo agent gate for shared `test_session_store` support edit, first touch | `25.39s` Cargo work, `0.031s` nextest runtime, `6` tests pass |
+| Cargo agent gate for shared `test_session_store` support edit, warm | `0.12s` Cargo work, `0.023s` nextest runtime, `6` tests pass |
+| Cargo agent gate for shared `test_session_store` support edit, exact clippy warm | `0.18s` Cargo work |
 
 The first touch of a new local lane pays Bazel analysis and remote-cache
 materialization cost. Once warmed, the wall-clock floor is mostly the `bb`/Bazel
@@ -288,7 +291,10 @@ to roughly `4-6s` once those lanes were prepared.
   --owned <path>`; it overlaps the selected fast tests and selected clippy.
 - For the default developer entrypoint, use `scripts/agent-gate`. It runs the
   Cargo changed-path gate unless `--buildbuddy` or
-  `MEERKAT_AGENT_GATE_BACKEND=buildbuddy` opts into BuildBuddy.
+  `MEERKAT_AGENT_GATE_BACKEND=buildbuddy` opts into BuildBuddy. Direct
+  integration test files and importable `tests/support` modules are narrowed to
+  exact Cargo test binaries for both nextest and clippy when the mapping is
+  unambiguous.
 - For the common multi-agent case where the agent has local edits and just
   needs the right check, use `make buildbuddy-agent-gate`. It includes
   committed branch changes, staged changes, unstaged changes, and untracked
