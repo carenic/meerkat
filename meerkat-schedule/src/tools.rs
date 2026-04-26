@@ -653,6 +653,18 @@ fn scheduled_session_action_schema() -> Value {
     })
 }
 
+fn skill_key_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "source_uuid": { "type": "string" },
+            "skill_name": { "type": "string" }
+        },
+        "required": ["source_uuid", "skill_name"],
+        "additionalProperties": false
+    })
+}
+
 fn session_materialization_spec_schema() -> Value {
     json!({
         "type": "object",
@@ -672,7 +684,7 @@ fn session_materialization_spec_schema() -> Value {
             },
             "preload_skills": {
                 "type": "array",
-                "items": { "type": "string" }
+                "items": skill_key_schema()
             },
             "additional_instructions": {
                 "type": "array",

@@ -1057,7 +1057,6 @@ async fn contract_mob_001_keep_alive_session_stays_alive() {
                 skill_references: None,
                 flow_tool_overlay: None,
                 turn_metadata: None,
-                execution_kind: None,
             },
         )
         .await
@@ -1132,7 +1131,6 @@ async fn contract_mob_007_session_archive_removes_from_active_list() {
                 skill_references: None,
                 flow_tool_overlay: None,
                 turn_metadata: None,
-                execution_kind: None,
             },
         )
         .await;

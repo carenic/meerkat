@@ -10,7 +10,7 @@
  *   - `registerExternalAuthResolver` — wraps the WASM-bundled
  *     `register_external_auth_resolver` binding so a browser host page
  *     can install an OAuth-backed resolver callback that hands Meerkat
- *     a resolved bearer token per `realm:binding` request.
+ *     a resolved bearer token per structural connection reference.
  *   - `withConnectionRef` — convenience helper that wires an existing
  *     session config with a connection reference for `createSession`.
  *
@@ -22,16 +22,13 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-import type { SessionConfig } from './types.js';
-
-/** Realm-qualified auth binding reference: `realm:binding[:profile]`. */
-export type ConnectionRef = string;
+import type { ConnectionRef, SessionConfig } from './types.js';
 
 /** Host-page resolver callback that the WASM runtime invokes when the
  * selected binding's credential source is `external_resolver`. Takes a
- * `realm:binding` key, returns a bearer token string (or a promise). */
+ * structural connection reference, returns a bearer token string (or a promise). */
 export type ExternalAuthResolver = (
-  bindingKey: string,
+  connectionRef: ConnectionRef,
 ) => string | Promise<string>;
 
 /** JSON-RPC-style transport used by the `Auth` class. Minimal: just
@@ -248,8 +245,8 @@ export function registerExternalAuthResolver(
   wasm: { register_external_auth_resolver: (cb: unknown) => void },
   resolver: ExternalAuthResolver,
 ): void {
-  const adapter = (bindingKey: string): Promise<string> =>
-    Promise.resolve(resolver(bindingKey));
+  const adapter = (connectionRef: ConnectionRef): Promise<string> =>
+    Promise.resolve(resolver(connectionRef));
   wasm.register_external_auth_resolver(adapter);
 }
 

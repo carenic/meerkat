@@ -4572,7 +4572,7 @@ async fn rpc_rest_explicit_mob_registry_restores_without_live_api()
     // alone doesn't wire a default binding. The spawn therefore fails
     // with `"ambient credential selection refused: build_agent requires
     // an explicit ConnectionRef"`. Preserved with an early skip so the
-    // intent (RPC-persisted mob restores via REST with session/status
+    // intent (RPC-persisted mob restores via REST with runtime/session_status
     // without a live API call) is retained for the eventual harness
     // update that threads an explicit ConnectionRef through the mob
     // definition or realm config.

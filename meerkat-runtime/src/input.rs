@@ -6,7 +6,10 @@
 
 use chrono::{DateTime, Utc};
 use meerkat_core::lifecycle::InputId;
-use meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata;
+use meerkat_core::lifecycle::run_primitive::{
+    ConversationAppend, ConversationAppendRole, ConversationContextAppend, CoreRenderable,
+    RuntimeTurnMetadata,
+};
 use meerkat_core::ops::{OpEvent, OperationId};
 use meerkat_core::types::HandlingMode;
 use meerkat_core::{
@@ -577,25 +580,111 @@ pub(crate) fn peer_block_prefix_text(peer: &PeerInput) -> Option<String> {
     peer_projection_from_peer_input(peer).and_then(|projection| projection.block_prefix_text())
 }
 
-/// Classify an input's typed execution intent for the runtime loop.
-///
-/// `Input::Continuation` is the only variant that resumes a pending
-/// `CallbackPending`-style turn; every other variant carries fresh
-/// content and is a full `ContentTurn`. Terminal peer responses, even
-/// when carrying `HandlingMode::Steer`, always classify as
-/// `ContentTurn` — the steer discriminator gates the run boundary
-/// (`RunCheckpoint` vs `RunStart`), not the execution kind.
-///
-/// This function is the single classification site consulted by
-/// `runtime_loop::inputs_to_primitive_with_boundary` when it computes
-/// the `execution_kind` for a staged batch (any `ContentTurn` in the
-/// batch wins).
-pub(crate) fn classify_execution_kind(
-    input: &Input,
-) -> meerkat_core::lifecycle::RuntimeExecutionKind {
+pub(crate) fn input_prompt_text(input: &Input) -> String {
     match input {
-        Input::Continuation(_) => meerkat_core::lifecycle::RuntimeExecutionKind::ResumePending,
-        _ => meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
+        Input::Prompt(p) => p.text.clone(),
+        Input::Peer(p) => peer_prompt_text(p),
+        Input::FlowStep(f) => f.instructions.clone(),
+        Input::ExternalEvent(e) => external_event_projection_text(e),
+        Input::Continuation(continuation) => format!("[Continuation] {}", continuation.reason),
+        Input::Operation(operation) => {
+            format!(
+                "[Operation {}] {:?}",
+                operation.operation_id, operation.event
+            )
+        }
+    }
+}
+
+fn external_event_projection_text(event: &ExternalEventInput) -> String {
+    let source_name = match &event.header.source {
+        InputOrigin::External { source_name } if !source_name.trim().is_empty() => {
+            source_name.as_str()
+        }
+        _ => event.event_type.as_str(),
+    };
+    let body = event
+        .payload
+        .get("body")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim);
+
+    meerkat_core::interaction::format_external_event_projection(source_name, body)
+}
+
+fn input_to_append(input: &Input) -> Option<ConversationAppend> {
+    if matches!(
+        input,
+        Input::Peer(PeerInput {
+            convention: Some(PeerConvention::ResponseTerminal { .. }),
+            ..
+        })
+    ) {
+        return None;
+    }
+
+    let content = match input {
+        Input::Prompt(p) if p.blocks.is_some() => CoreRenderable::Blocks {
+            blocks: p.blocks.clone().unwrap_or_default(),
+        },
+        Input::Peer(p) if p.blocks.is_some() => {
+            let raw_blocks = p.blocks.clone().unwrap_or_default();
+            if let Some(prefix) = peer_block_prefix_text(p) {
+                let mut blocks = vec![meerkat_core::types::ContentBlock::Text { text: prefix }];
+                blocks.extend(raw_blocks);
+                CoreRenderable::Blocks { blocks }
+            } else {
+                let body_already_in_blocks = raw_blocks.first().is_some_and(|b| {
+                    matches!(b, meerkat_core::types::ContentBlock::Text { text } if text == &p.body)
+                });
+                if p.body.is_empty() || body_already_in_blocks {
+                    CoreRenderable::Blocks { blocks: raw_blocks }
+                } else {
+                    let mut blocks = vec![meerkat_core::types::ContentBlock::Text {
+                        text: p.body.clone(),
+                    }];
+                    blocks.extend(raw_blocks);
+                    CoreRenderable::Blocks { blocks }
+                }
+            }
+        }
+        Input::FlowStep(f) if f.blocks.is_some() => CoreRenderable::Blocks {
+            blocks: f.blocks.clone().unwrap_or_default(),
+        },
+        Input::ExternalEvent(e) if e.blocks.is_some() => CoreRenderable::Blocks {
+            blocks: e.blocks.clone().unwrap_or_default(),
+        },
+        Input::Prompt(_) | Input::Peer(_) | Input::FlowStep(_) | Input::ExternalEvent(_) => {
+            CoreRenderable::Text {
+                text: input_prompt_text(input),
+            }
+        }
+        Input::Continuation(_) | Input::Operation(_) => return None,
+    };
+
+    Some(ConversationAppend {
+        role: ConversationAppendRole::User,
+        content,
+    })
+}
+
+fn input_to_context_append(input: &Input) -> Option<ConversationContextAppend> {
+    let projection = peer_projection(input)?;
+
+    Some(ConversationContextAppend {
+        key: projection.context_key()?,
+        content: CoreRenderable::Text {
+            text: projection.prompt_text(),
+        },
+    })
+}
+
+pub(crate) fn runtime_input_projection(
+    input: &Input,
+) -> crate::ingress_types::RuntimeInputProjection {
+    crate::ingress_types::RuntimeInputProjection {
+        append: input_to_append(input),
+        context_append: input_to_context_append(input),
     }
 }
 
@@ -1004,100 +1093,5 @@ mod tests {
         });
         let json = serde_json::to_value(&input).unwrap();
         assert!(json.get("handling_mode").is_none());
-    }
-
-    // --- classify_execution_kind tests ---
-
-    #[test]
-    fn classify_prompt_is_content_turn() {
-        let input = Input::Prompt(PromptInput {
-            header: make_header(),
-            text: "hello".into(),
-            blocks: None,
-            turn_metadata: None,
-        });
-        assert_eq!(
-            classify_execution_kind(&input),
-            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn
-        );
-    }
-
-    #[test]
-    fn classify_peer_terminal_is_content_turn() {
-        let input = Input::Peer(PeerInput {
-            header: make_header(),
-            convention: Some(PeerConvention::ResponseTerminal {
-                request_id: "r".into(),
-                status: ResponseTerminalStatus::Completed,
-            }),
-            body: "done".into(),
-            payload: Some(serde_json::json!({"ok": true})),
-            blocks: None,
-            handling_mode: None,
-        });
-        assert_eq!(
-            classify_execution_kind(&input),
-            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn
-        );
-    }
-
-    #[test]
-    fn classify_peer_terminal_with_steer_is_content_turn() {
-        let input = Input::Peer(PeerInput {
-            header: make_header(),
-            convention: Some(PeerConvention::ResponseTerminal {
-                request_id: "r".into(),
-                status: ResponseTerminalStatus::Completed,
-            }),
-            body: "done".into(),
-            payload: Some(serde_json::json!({"ok": true})),
-            blocks: None,
-            handling_mode: Some(HandlingMode::Steer),
-        });
-        assert_eq!(
-            classify_execution_kind(&input),
-            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn
-        );
-    }
-
-    #[test]
-    fn classify_continuation_is_resume_pending() {
-        let input = Input::Continuation(ContinuationInput::detached_background_op_completed());
-        assert_eq!(
-            classify_execution_kind(&input),
-            meerkat_core::lifecycle::RuntimeExecutionKind::ResumePending
-        );
-    }
-
-    #[test]
-    fn classify_peer_message_is_content_turn() {
-        let input = Input::Peer(PeerInput {
-            header: make_header(),
-            convention: Some(PeerConvention::Message),
-            body: "hi".into(),
-            payload: None,
-            blocks: None,
-            handling_mode: None,
-        });
-        assert_eq!(
-            classify_execution_kind(&input),
-            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn
-        );
-    }
-
-    #[test]
-    fn classify_operation_is_content_turn() {
-        let input = Input::Operation(OperationInput {
-            header: make_header(),
-            operation_id: OperationId::new(),
-            event: OpEvent::Started {
-                id: OperationId::new(),
-                kind: meerkat_core::ops::WorkKind::ToolCall,
-            },
-        });
-        assert_eq!(
-            classify_execution_kind(&input),
-            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn
-        );
     }
 }

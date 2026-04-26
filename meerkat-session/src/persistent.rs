@@ -538,9 +538,10 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         id: &SessionId,
         client: std::sync::Arc<dyn meerkat_core::AgentLlmClient>,
         identity: meerkat_core::SessionLlmIdentity,
+        request_policy: meerkat_core::SessionLlmRequestPolicy,
     ) -> Result<(), SessionError> {
         self.inner
-            .hot_swap_session_llm_identity(id, client, identity)
+            .hot_swap_session_llm_identity(id, client, identity, request_policy)
             .await?;
         self.persist_full_session(id).await.map(|_| ())
     }
@@ -617,11 +618,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                         "failed to restore session metadata from durable session-store snapshot onto newer runtime snapshot"
                     );
                 }
-                if runtime_session.updated_at() >= store_session.updated_at() {
-                    Some(runtime_session)
-                } else {
-                    Some(store_session)
-                }
+                Some(runtime_session)
             }
             (Some(store_session), None) => Some(store_session),
             (None, Some(runtime_session)) => Some(runtime_session),
@@ -1364,6 +1361,7 @@ impl<B: SessionAgentBuilder + 'static> SessionService for PersistentSessionServi
         _id: &SessionId,
         _client: std::sync::Arc<dyn meerkat_core::AgentLlmClient>,
         _identity: meerkat_core::SessionLlmIdentity,
+        _request_policy: meerkat_core::SessionLlmRequestPolicy,
     ) -> Result<(), SessionError> {
         Err(SessionError::Unsupported(
             "hot_swap_session_llm_identity is a bespoke metadata seam that bypasses the canonical RuntimeTurnMetadata carrier; model/provider/provider_params must travel through the single runtime-backed turn seam instead".to_string(),
@@ -2094,8 +2092,34 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// `last_saved_len` without a second export round-trip.
     async fn persist_full_session(&self, id: &SessionId) -> Result<usize, SessionError> {
         let session = self.export_session_with_labels(id).await?;
-        let message_count = session.messages().len();
-        let _ = self.save_normalized_session(session).await?;
+        let persisted = self.normalized_session_for_persistence(session).await?;
+        let message_count = persisted.messages().len();
+        if let Some(runtime_store) = self.runtime_store.as_ref() {
+            let session_snapshot = serde_json::to_vec(&persisted).map_err(|err| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+                    "failed to serialize session snapshot for runtime persistence: {err}"
+                )))
+            })?;
+            runtime_store
+                .commit_session_boundary(
+                    &Self::runtime_id_for_session(id),
+                    SessionDelta { session_snapshot },
+                    RunId::new(),
+                    RunApplyBoundary::Immediate,
+                    vec![],
+                    vec![],
+                )
+                .await
+                .map_err(|err| {
+                    SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+                        "runtime snapshot persistence failed: {err}"
+                    )))
+                })?;
+        }
+        self.store
+            .save(&persisted)
+            .await
+            .map_err(|e| SessionError::Store(Box::new(e)))?;
 
         Ok(message_count)
     }
@@ -2350,6 +2374,7 @@ mod tests {
             &mut self,
             _client: Arc<dyn meerkat_core::AgentLlmClient>,
             identity: meerkat_core::SessionLlmIdentity,
+            _request_policy: meerkat_core::SessionLlmRequestPolicy,
         ) -> Result<(), meerkat_core::error::AgentError> {
             let mut session = match self.session.lock() {
                 Ok(guard) => guard,
@@ -2559,8 +2584,10 @@ mod tests {
             &mut self,
             client: Arc<dyn meerkat_core::AgentLlmClient>,
             identity: meerkat_core::SessionLlmIdentity,
+            request_policy: meerkat_core::SessionLlmRequestPolicy,
         ) -> Result<(), meerkat_core::error::AgentError> {
-            self.inner.hot_swap_llm_identity(client, identity)
+            self.inner
+                .hot_swap_llm_identity(client, identity, request_policy)
         }
 
         fn stage_external_tool_filter(
@@ -2759,6 +2786,7 @@ mod tests {
             &mut self,
             _client: Arc<dyn meerkat_core::AgentLlmClient>,
             identity: meerkat_core::SessionLlmIdentity,
+            _request_policy: meerkat_core::SessionLlmRequestPolicy,
         ) -> Result<(), meerkat_core::error::AgentError> {
             let mut session = match self.session.lock() {
                 Ok(guard) => guard,
@@ -2988,6 +3016,7 @@ mod tests {
             &mut self,
             _client: Arc<dyn meerkat_core::AgentLlmClient>,
             identity: meerkat_core::SessionLlmIdentity,
+            _request_policy: meerkat_core::SessionLlmRequestPolicy,
         ) -> Result<(), meerkat_core::error::AgentError> {
             let mut session = match self.session.lock() {
                 Ok(guard) => guard,
@@ -3177,7 +3206,6 @@ mod tests {
             skill_references: None,
             flow_tool_overlay: None,
             turn_metadata: None,
-            execution_kind: None,
         }
     }
 
@@ -3194,7 +3222,6 @@ mod tests {
             skill_references: None,
             flow_tool_overlay: None,
             turn_metadata: None,
-            execution_kind: None,
         }
     }
 

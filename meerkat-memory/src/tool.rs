@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use meerkat_core::AgentToolDispatcher;
 use meerkat_core::error::ToolError;
-use meerkat_core::memory::MemoryStore;
+use meerkat_core::memory::{MemorySearchScope, MemoryStore};
 use meerkat_core::types::{ToolCallView, ToolDef, ToolProvenance, ToolResult, ToolSourceKind};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -51,12 +51,13 @@ fn input_schema() -> Value {
 /// feature is enabled.
 pub struct MemorySearchDispatcher {
     store: Arc<dyn MemoryStore>,
+    scope: MemorySearchScope,
     tool_defs: Arc<[Arc<ToolDef>]>,
 }
 
 impl MemorySearchDispatcher {
     /// Create a new memory search dispatcher backed by the given store.
-    pub fn new(store: Arc<dyn MemoryStore>) -> Self {
+    pub fn new(store: Arc<dyn MemoryStore>, session_id: meerkat_core::types::SessionId) -> Self {
         let tool_def = Arc::new(ToolDef {
             name: TOOL_NAME.to_string(),
             description: "Search semantic memory for past conversation content. \
@@ -73,6 +74,7 @@ impl MemorySearchDispatcher {
 
         Self {
             store,
+            scope: MemorySearchScope::for_session(session_id),
             tool_defs: Arc::from(vec![tool_def]),
         }
     }
@@ -107,18 +109,19 @@ impl AgentToolDispatcher for MemorySearchDispatcher {
                 reason: e.to_string(),
             })?;
         let limit = input.limit.unwrap_or(DEFAULT_LIMIT).min(20);
-        let results = self.store.search(&input.query, limit).await.map_err(|e| {
-            ToolError::ExecutionFailed {
+        let results = self
+            .store
+            .search(&self.scope, &input.query, limit)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed {
                 message: e.to_string(),
-            }
-        })?;
+            })?;
         let items: Vec<Value> = results
             .into_iter()
             .map(|r| {
                 json!({
                     "content": r.content,
                     "score": r.score,
-                    "session_id": r.metadata.session_id.to_string(),
                     "turn": r.metadata.turn,
                 })
             })
@@ -162,20 +165,25 @@ mod tests {
         }
     }
 
-    fn meta() -> MemoryMetadata {
+    fn meta(session_id: &SessionId) -> MemoryMetadata {
         MemoryMetadata {
-            session_id: SessionId::new(),
+            session_id: session_id.clone(),
             turn: Some(1),
             indexed_at: SystemTime::now(),
         }
+    }
+
+    fn dispatcher(store: Arc<dyn MemoryStore>, session_id: &SessionId) -> MemorySearchDispatcher {
+        MemorySearchDispatcher::new(store, session_id.clone())
     }
 
     // ==================== Tool Definition Tests ====================
 
     #[test]
     fn test_tool_name() {
-        let store = Arc::new(crate::SimpleMemoryStore::new());
-        let dispatcher = MemorySearchDispatcher::new(store);
+        let store: Arc<dyn MemoryStore> = Arc::new(crate::SimpleMemoryStore::new());
+        let session_id = SessionId::new();
+        let dispatcher = dispatcher(store, &session_id);
         let tools = dispatcher.tools();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "memory_search");
@@ -183,8 +191,9 @@ mod tests {
 
     #[test]
     fn test_tool_schema_has_required_query() {
-        let store = Arc::new(crate::SimpleMemoryStore::new());
-        let dispatcher = MemorySearchDispatcher::new(store);
+        let store: Arc<dyn MemoryStore> = Arc::new(crate::SimpleMemoryStore::new());
+        let session_id = SessionId::new();
+        let dispatcher = dispatcher(store, &session_id);
         let tools = dispatcher.tools();
         let schema = &tools[0].input_schema;
 
@@ -199,8 +208,9 @@ mod tests {
 
     #[test]
     fn test_tool_schema_has_optional_limit() {
-        let store = Arc::new(crate::SimpleMemoryStore::new());
-        let dispatcher = MemorySearchDispatcher::new(store);
+        let store: Arc<dyn MemoryStore> = Arc::new(crate::SimpleMemoryStore::new());
+        let session_id = SessionId::new();
+        let dispatcher = dispatcher(store, &session_id);
         let tools = dispatcher.tools();
         let schema = &tools[0].input_schema;
 
@@ -216,21 +226,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_returns_results() {
-        let store = Arc::new(crate::SimpleMemoryStore::new());
+        let store: Arc<dyn MemoryStore> = Arc::new(crate::SimpleMemoryStore::new());
+        let session_id = SessionId::new();
         store
-            .index("The project codename is AURORA-7", meta())
+            .index("The project codename is AURORA-7", meta(&session_id))
             .await
             .unwrap();
         store
-            .index("The budget was set at $42,000", meta())
+            .index("The budget was set at $42,000", meta(&session_id))
             .await
             .unwrap();
         store
-            .index("Meeting scheduled for next Tuesday", meta())
+            .index(
+                "Meeting scheduled for next Tuesday",
+                meta(&SessionId::new()),
+            )
             .await
             .unwrap();
 
-        let dispatcher = MemorySearchDispatcher::new(store);
+        let dispatcher = dispatcher(store, &session_id);
         let (id, raw, name) = make_call(r#"{"query": "project codename"}"#);
         let view = call_view(&id, &raw, &name);
 
@@ -241,13 +255,17 @@ mod tests {
         assert!(!parsed.is_empty());
         assert!(parsed[0]["content"].as_str().unwrap().contains("AURORA"));
         assert!(parsed[0]["score"].as_f64().unwrap() > 0.0);
-        assert!(parsed[0]["session_id"].is_string());
+        assert!(
+            parsed[0].get("session_id").is_none(),
+            "memory tool must not leak raw source session ids"
+        );
     }
 
     #[tokio::test]
     async fn test_search_empty_store_returns_empty() {
-        let store = Arc::new(crate::SimpleMemoryStore::new());
-        let dispatcher = MemorySearchDispatcher::new(store);
+        let store: Arc<dyn MemoryStore> = Arc::new(crate::SimpleMemoryStore::new());
+        let session_id = SessionId::new();
+        let dispatcher = dispatcher(store, &session_id);
 
         let (id, raw, name) = make_call(r#"{"query": "anything"}"#);
         let view = call_view(&id, &raw, &name);
@@ -261,15 +279,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_with_limit() {
-        let store = Arc::new(crate::SimpleMemoryStore::new());
+        let store: Arc<dyn MemoryStore> = Arc::new(crate::SimpleMemoryStore::new());
+        let session_id = SessionId::new();
         for i in 0..10 {
             store
-                .index(&format!("Memory entry {i} about testing"), meta())
+                .index(
+                    &format!("Memory entry {i} about testing"),
+                    meta(&session_id),
+                )
                 .await
                 .unwrap();
         }
 
-        let dispatcher = MemorySearchDispatcher::new(store);
+        let dispatcher = dispatcher(store, &session_id);
         let (id, raw, name) = make_call(r#"{"query": "testing", "limit": 3}"#);
         let view = call_view(&id, &raw, &name);
 
@@ -280,15 +302,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_default_limit() {
-        let store = Arc::new(crate::SimpleMemoryStore::new());
+        let store: Arc<dyn MemoryStore> = Arc::new(crate::SimpleMemoryStore::new());
+        let session_id = SessionId::new();
         for i in 0..10 {
             store
-                .index(&format!("Entry {i} about Rust programming"), meta())
+                .index(
+                    &format!("Entry {i} about Rust programming"),
+                    meta(&session_id),
+                )
                 .await
                 .unwrap();
         }
 
-        let dispatcher = MemorySearchDispatcher::new(store);
+        let dispatcher = dispatcher(store, &session_id);
         let (id, raw, name) = make_call(r#"{"query": "Rust"}"#);
         let view = call_view(&id, &raw, &name);
 
@@ -299,13 +325,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_no_match_returns_empty() {
-        let store = Arc::new(crate::SimpleMemoryStore::new());
+        let store: Arc<dyn MemoryStore> = Arc::new(crate::SimpleMemoryStore::new());
+        let session_id = SessionId::new();
         store
-            .index("The weather is sunny today", meta())
+            .index("The weather is sunny today", meta(&session_id))
             .await
             .unwrap();
 
-        let dispatcher = MemorySearchDispatcher::new(store);
+        let dispatcher = dispatcher(store, &session_id);
         let (id, raw, name) = make_call(r#"{"query": "quantum physics"}"#);
         let view = call_view(&id, &raw, &name);
 
@@ -316,8 +343,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_wrong_tool_name() {
-        let store = Arc::new(crate::SimpleMemoryStore::new());
-        let dispatcher = MemorySearchDispatcher::new(store);
+        let store: Arc<dyn MemoryStore> = Arc::new(crate::SimpleMemoryStore::new());
+        let session_id = SessionId::new();
+        let dispatcher = dispatcher(store, &session_id);
 
         let id = "test-1".to_string();
         let raw = RawValue::from_string(r#"{"query": "test"}"#.to_string()).unwrap();
@@ -334,8 +362,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_invalid_args() {
-        let store = Arc::new(crate::SimpleMemoryStore::new());
-        let dispatcher = MemorySearchDispatcher::new(store);
+        let store: Arc<dyn MemoryStore> = Arc::new(crate::SimpleMemoryStore::new());
+        let session_id = SessionId::new();
+        let dispatcher = dispatcher(store, &session_id);
 
         let (id, raw, name) = make_call(r#"{"not_query": "test"}"#);
         let view = call_view(&id, &raw, &name);
@@ -346,15 +375,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_limit_capped_at_20() {
-        let store = Arc::new(crate::SimpleMemoryStore::new());
+        let store: Arc<dyn MemoryStore> = Arc::new(crate::SimpleMemoryStore::new());
+        let session_id = SessionId::new();
         for i in 0..30 {
             store
-                .index(&format!("Data point {i} about science"), meta())
+                .index(&format!("Data point {i} about science"), meta(&session_id))
                 .await
                 .unwrap();
         }
 
-        let dispatcher = MemorySearchDispatcher::new(store);
+        let dispatcher = dispatcher(store, &session_id);
         let (id, raw, name) = make_call(r#"{"query": "science", "limit": 100}"#);
         let view = call_view(&id, &raw, &name);
 
@@ -373,7 +403,8 @@ mod tests {
     #[test]
     fn memory_tools_have_memory_provenance() {
         let store: Arc<dyn MemoryStore> = Arc::new(crate::simple::SimpleMemoryStore::new());
-        let dispatcher = MemorySearchDispatcher::new(store);
+        let session_id = SessionId::new();
+        let dispatcher = dispatcher(store, &session_id);
         let tools = dispatcher.tools();
         assert_eq!(tools.len(), 1);
         let prov = tools[0]

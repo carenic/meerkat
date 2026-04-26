@@ -170,6 +170,9 @@ pub struct AppState {
     /// AgentFactory so both read and write paths (login, resolve,
     /// logout) see the same credentials.
     pub token_store: Arc<dyn meerkat_providers::auth_store::TokenStore>,
+    /// Provider-runtime registry shared with the AgentFactory's auth
+    /// resolution path.
+    pub provider_registry: Arc<meerkat_providers::ProviderRuntimeRegistry>,
 }
 
 #[derive(Debug, Clone)]
@@ -328,7 +331,8 @@ impl AppState {
             factory = factory.user_config_root(user_root);
         }
 
-        let skill_runtime = factory.build_skill_runtime(&config).await;
+        let skill_runtime = factory.build_skill_runtime(&config).await?;
+        let provider_registry = factory.provider_runtime_registry();
 
         let builder =
             FactoryAgentBuilder::new_with_config_store(factory, config, Arc::clone(&config_store));
@@ -395,6 +399,7 @@ impl AppState {
                 std::time::Duration::from_secs(5),
             )),
             token_store,
+            provider_registry,
         })
     }
 
@@ -430,6 +435,24 @@ async fn ensure_rest_session_runtime_executor(state: &AppState, session_id: &Ses
         .runtime_adapter
         .ensure_session_with_executor(session_id.clone(), executor)
         .await;
+}
+
+async fn require_rest_session_exists_for_read(
+    state: &AppState,
+    session_id: &SessionId,
+) -> Result<(), Response> {
+    state
+        .session_service
+        .read(session_id)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response()
+        })
 }
 
 fn render_context_append_text(content: &CoreRenderable) -> String {
@@ -599,9 +622,6 @@ async fn apply_runtime_turn(
             .turn_metadata()
             .and_then(|meta| meta.flow_tool_overlay.clone()),
         turn_metadata: primitive.turn_metadata().cloned(),
-        execution_kind: primitive
-            .turn_metadata()
-            .and_then(|meta| meta.execution_kind),
     };
 
     let session_identity = context
@@ -716,9 +736,6 @@ async fn apply_runtime_turn(
                             .turn_metadata()
                             .and_then(|meta| meta.flow_tool_overlay.clone()),
                         turn_metadata: primitive.turn_metadata().cloned(),
-                        execution_kind: primitive
-                            .turn_metadata()
-                            .and_then(|meta| meta.execution_kind),
                     },
                     boundary,
                     contributing_input_ids,
@@ -1173,13 +1190,13 @@ pub fn router(state: AppState) -> Router {
                 .post(crate::auth_endpoints::create_auth_profile),
         )
         .route(
-            "/auth/profiles/{id}",
+            "/auth/bindings/{binding_id}",
             get(crate::auth_endpoints::get_auth_profile)
                 .delete(crate::auth_endpoints::delete_auth_profile),
         )
         .route(
-            "/auth/profiles/{id}/test",
-            post(crate::auth_endpoints::test_auth_profile),
+            "/auth/bindings/{binding_id}/test",
+            post(crate::auth_endpoints::test_auth_binding),
         )
         .route(
             "/auth/login/start",
@@ -1198,10 +1215,13 @@ pub fn router(state: AppState) -> Router {
             post(crate::auth_endpoints::complete_device_login),
         )
         .route(
-            "/auth/status/{id}",
+            "/auth/bindings/{binding_id}/status",
             get(crate::auth_endpoints::get_auth_status),
         )
-        .route("/auth/logout/{id}", post(crate::auth_endpoints::logout))
+        .route(
+            "/auth/bindings/{binding_id}/logout",
+            post(crate::auth_endpoints::logout),
+        )
         .route("/realms", get(crate::auth_endpoints::list_realms))
         .route("/realms/{id}", get(crate::auth_endpoints::get_realm));
 
@@ -1318,7 +1338,6 @@ async fn get_runtime_status(
 ) -> Result<Json<Value>, Response> {
     let session_id =
         resolve_session_id_for_state(&id, &state).map_err(IntoResponse::into_response)?;
-    ensure_rest_session_runtime_executor(&state, &session_id).await;
     let adapter = get_runtime_adapter(&state);
     let runtime_state = adapter.runtime_state(&session_id).await.map_err(|err| {
         (
@@ -1338,7 +1357,6 @@ async fn get_realtime_attachment_status(
 ) -> Result<Json<Value>, Response> {
     let session_id =
         resolve_session_id_for_state(&id, &state).map_err(IntoResponse::into_response)?;
-    ensure_rest_session_runtime_executor(&state, &session_id).await;
     let adapter = get_runtime_adapter(&state);
     let status = adapter
         .realtime_attachment_status(&session_id)
@@ -1385,7 +1403,6 @@ async fn realtime_status(
     // the MobMcpState resolver. SessionTarget parses directly; MobMember
     // reads the canonical binding map on the MobMachine.
     let sid = resolve_realtime_target_session_rest(&state, &body.target).await?;
-    ensure_rest_session_runtime_executor(&state, &sid).await;
     let adapter = get_runtime_adapter(&state);
     let live_status = adapter
         .realtime_attachment_status(&sid)
@@ -1427,18 +1444,7 @@ async fn realtime_capabilities(
     Json(body): Json<RealtimeCapabilitiesParams>,
 ) -> Result<Json<RealtimeCapabilitiesResult>, Response> {
     let sid = resolve_realtime_target_session_rest(&state, &body.target).await?;
-    ensure_rest_session_runtime_executor(&state, &sid).await;
-    let adapter = get_runtime_adapter(&state);
-    adapter
-        .realtime_attachment_status(&sid)
-        .await
-        .map_err(|err| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": err.to_string()})),
-            )
-                .into_response()
-        })?;
+    require_rest_session_exists_for_read(&state, &sid).await?;
     Ok(Json(RealtimeCapabilitiesResult {
         capabilities: conservative_realtime_capabilities(),
     }))
@@ -1449,18 +1455,7 @@ async fn realtime_open_info(
     Json(body): Json<RealtimeOpenRequest>,
 ) -> Result<Json<Value>, Response> {
     let sid = resolve_realtime_target_session_rest(&state, &body.target).await?;
-    ensure_rest_session_runtime_executor(&state, &sid).await;
-    let adapter = get_runtime_adapter(&state);
-    adapter
-        .realtime_attachment_status(&sid)
-        .await
-        .map_err(|err| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": err.to_string()})),
-            )
-                .into_response()
-        })?;
+    require_rest_session_exists_for_read(&state, &sid).await?;
 
     let Some(addr) = state.realtime_rpc_tcp_addr.as_deref() else {
         return Err((
@@ -1895,7 +1890,7 @@ fn is_transport_internal(message: &str) -> bool {
 #[derive(Debug, Deserialize)]
 struct InspectSkillQuery {
     #[serde(default)]
-    source: Option<String>,
+    source_uuid: Option<String>,
 }
 
 /// POST /comms/send — dispatch a canonical comms command.
@@ -2306,19 +2301,31 @@ async fn list_skills(
     let wire: Vec<meerkat_contracts::SkillEntry> = entries
         .iter()
         .map(|e| meerkat_contracts::SkillEntry {
-            id: format!(
-                "{}/{}",
-                e.descriptor.key.source_uuid, e.descriptor.key.skill_name
-            ),
+            key: e.descriptor.key.clone(),
             name: e.descriptor.name.clone(),
             description: e.descriptor.description.clone(),
             scope: e.descriptor.scope.to_string(),
-            source: e.descriptor.source_name.clone(),
+            source: skill_source_provenance(
+                e.descriptor.key.source_uuid.clone(),
+                e.descriptor.source_name.clone(),
+            ),
             is_active: e.is_active,
-            shadowed_by: e.shadowed_by.clone(),
+            shadowed_by: e.shadowed_by_source_uuid.clone().map(|source_uuid| {
+                skill_source_provenance(source_uuid, e.shadowed_by.clone().unwrap_or_default())
+            }),
         })
         .collect();
     Ok(Json(meerkat_contracts::SkillListResponse { skills: wire }))
+}
+
+fn skill_source_provenance(
+    source_uuid: meerkat_core::skills::SourceUuid,
+    display_name: impl Into<String>,
+) -> meerkat_contracts::SkillSourceProvenance {
+    meerkat_contracts::SkillSourceProvenance {
+        source_uuid,
+        display_name: display_name.into(),
+    }
 }
 
 /// Inspect a skill by ID.
@@ -2332,24 +2339,34 @@ async fn inspect_skill(
         .as_ref()
         .ok_or_else(|| ApiError::NotFound("skills not enabled".into()))?;
 
+    let source_uuid = query
+        .source_uuid
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest("source_uuid query parameter is required".into()))
+        .and_then(|raw| {
+            meerkat_core::skills::SourceUuid::parse(raw)
+                .map_err(|e| ApiError::BadRequest(format!("invalid source_uuid `{raw}`: {e}")))
+        })?;
     let skill_name = meerkat_core::skills::SkillName::parse(id.as_str())
-        .map_err(|e| ApiError::BadRequest(format!("invalid skill id `{id}`: {e}")))?;
-    let key = meerkat_core::skills::SkillKey::builtin(skill_name);
+        .map_err(|e| ApiError::BadRequest(format!("invalid skill name `{id}`: {e}")))?;
+    let key = meerkat_core::skills::SkillKey::new(source_uuid, skill_name);
     let doc = runtime
-        .load_from_source(&key, query.source.as_deref())
+        .load_from_source(&key, None)
         .await
         .map_err(|e| ApiError::NotFound(format!("skill inspect failed: {e}")))?;
 
     Ok(Json(meerkat_contracts::SkillInspectResponse {
-        id: doc.descriptor.key.to_string(),
+        key: doc.descriptor.key.clone(),
         name: doc.descriptor.name.clone(),
         description: doc.descriptor.description.clone(),
         scope: doc.descriptor.scope.to_string(),
-        source: doc.descriptor.source_name.clone(),
+        source: skill_source_provenance(
+            doc.descriptor.key.source_uuid.clone(),
+            doc.descriptor.source_name.clone(),
+        ),
         body: doc.body,
     }))
 }
-
 /// Get runtime capabilities with status resolved against config.
 async fn get_capabilities(
     State(state): State<AppState>,
@@ -2824,7 +2841,7 @@ async fn create_session_inner(
 
     // Early cancel check — before any stateful work.
     if let Some(ctx) = req_ctx.as_ref()
-        && ctx.phase() == meerkat::surface::SurfaceRequestPhase::Cancelled
+        && ctx.cancel_already_requested()
     {
         return RequestTerminal::RespondWithoutPublish(Err(ApiError::RequestCancelled {
             details: None,
@@ -2904,7 +2921,7 @@ async fn create_session_inner(
         let cancel_svc = state.session_service.clone();
         let cancel_sid = session_id.clone();
         let phase = ctx
-            .install_cancel_action(request_action(move || {
+            .install_cancel_action_or_cancelled(request_action(move || {
                 let svc = cancel_svc.clone();
                 let sid = cancel_sid.clone();
                 async move {
@@ -2913,7 +2930,7 @@ async fn create_session_inner(
             }))
             .await;
 
-        if phase == meerkat::surface::SurfaceRequestPhase::Cancelled {
+        if phase == meerkat::surface::CancelActionInstallOutcome::AlreadyCancelled {
             drop(caller_event_tx);
             drain_event_forwarder(&session_id, forward_task).await;
             return RequestTerminal::RespondWithoutPublish(Err(ApiError::RequestCancelled {
@@ -3062,7 +3079,7 @@ async fn create_session_inner(
     // when no turn is running, so cancel between the last recheck and here
     // would be lost without this gate.
     if let Some(ctx) = req_ctx.as_ref()
-        && ctx.phase() == meerkat::surface::SurfaceRequestPhase::Cancelled
+        && ctx.cancel_already_requested()
     {
         drop(caller_event_tx);
         drain_event_forwarder(&session_id, forward_task).await;
@@ -3558,7 +3575,7 @@ async fn continue_session_inner(
 
     // Early cancel check — before any stateful work.
     if let Some(ctx) = req_ctx.as_ref()
-        && ctx.phase() == meerkat::surface::SurfaceRequestPhase::Cancelled
+        && ctx.cancel_already_requested()
     {
         return RequestTerminal::RespondWithoutPublish(Err(ApiError::RequestCancelled {
             details: None,
@@ -3794,7 +3811,7 @@ async fn continue_session_inner(
             let cancel_svc = state.session_service.clone();
             let cancel_sid = session_id.clone();
             let phase = ctx
-                .install_cancel_action(request_action(move || {
+                .install_cancel_action_or_cancelled(request_action(move || {
                     let svc = cancel_svc.clone();
                     let sid = cancel_sid.clone();
                     async move {
@@ -3805,7 +3822,7 @@ async fn continue_session_inner(
 
             // If cancel raced with install, install_cancel_action already ran
             // the newly installed action; bail out with a cancelled terminal.
-            if phase == meerkat::surface::SurfaceRequestPhase::Cancelled {
+            if phase == meerkat::surface::CancelActionInstallOutcome::AlreadyCancelled {
                 drop(caller_event_tx);
                 drain_event_forwarder(&session_id, forward_task).await;
                 return RequestTerminal::RespondWithoutPublish(Err(ApiError::RequestCancelled {
@@ -3839,7 +3856,7 @@ async fn continue_session_inner(
             ));
         // Final cancel recheck before submitting input.
         if let Some(ctx) = req_ctx.as_ref()
-            && ctx.phase() == meerkat::surface::SurfaceRequestPhase::Cancelled
+            && ctx.cancel_already_requested()
         {
             drop(caller_event_tx);
             drain_event_forwarder(&session_id, forward_task).await;
@@ -3920,7 +3937,7 @@ async fn continue_session_inner(
             let cancel_svc = state.session_service.clone();
             let cancel_sid = session_id.clone();
             let phase = ctx
-                .install_cancel_action(request_action(move || {
+                .install_cancel_action_or_cancelled(request_action(move || {
                     let svc = cancel_svc.clone();
                     let sid = cancel_sid.clone();
                     async move {
@@ -3931,7 +3948,7 @@ async fn continue_session_inner(
 
             // If cancel raced with install, install_cancel_action already ran
             // the newly installed action; bail out with a cancelled terminal.
-            if phase == meerkat::surface::SurfaceRequestPhase::Cancelled {
+            if phase == meerkat::surface::CancelActionInstallOutcome::AlreadyCancelled {
                 drop(caller_event_tx);
                 drain_event_forwarder(&session_id, forward_task).await;
                 return RequestTerminal::RespondWithoutPublish(Err(ApiError::RequestCancelled {
@@ -3957,7 +3974,7 @@ async fn continue_session_inner(
             ));
         // Final cancel recheck before submitting input.
         if let Some(ctx) = req_ctx.as_ref()
-            && ctx.phase() == meerkat::surface::SurfaceRequestPhase::Cancelled
+            && ctx.cancel_already_requested()
         {
             drop(caller_event_tx);
             drain_event_forwarder(&session_id, forward_task).await;
@@ -5204,6 +5221,12 @@ mod tests {
             .unwrap();
         state.llm_client_override = Some(Arc::new(MockLlmClient));
         let session_service = state.session_service.clone();
+        let pre_session = Session::new();
+        let bindings = state
+            .runtime_adapter
+            .prepare_bindings(pre_session.id().clone())
+            .await
+            .expect("runtime bindings should prepare");
         let create_result = session_service
             .create_session(SvcCreateSessionRequest {
                 model: state.default_model.to_string(),
@@ -5217,10 +5240,12 @@ mod tests {
                 initial_turn: InitialTurnPolicy::Defer,
                 deferred_prompt_policy: DeferredPromptPolicy::Discard,
                 build: Some(SessionBuildOptions {
+                    resume_session: Some(pre_session),
                     llm_client_override: state
                         .llm_client_override
                         .clone()
                         .map(encode_llm_client_override_for_service),
+                    runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
                     ..Default::default()
                 }),
                 labels: None,
@@ -5273,6 +5298,12 @@ mod tests {
             .unwrap();
         state.llm_client_override = Some(Arc::new(MockLlmClient));
         let session_service = state.session_service.clone();
+        let pre_session = Session::new();
+        let bindings = state
+            .runtime_adapter
+            .prepare_bindings(pre_session.id().clone())
+            .await
+            .expect("runtime bindings should prepare");
         let create_result = session_service
             .create_session(SvcCreateSessionRequest {
                 model: state.default_model.to_string(),
@@ -5286,10 +5317,12 @@ mod tests {
                 initial_turn: InitialTurnPolicy::Defer,
                 deferred_prompt_policy: DeferredPromptPolicy::Discard,
                 build: Some(SessionBuildOptions {
+                    resume_session: Some(pre_session),
                     llm_client_override: state
                         .llm_client_override
                         .clone()
                         .map(encode_llm_client_override_for_service),
+                    runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
                     ..Default::default()
                 }),
                 labels: None,
@@ -5730,7 +5763,6 @@ mod tests {
                     skill_references: None,
                     flow_tool_overlay: None,
                     turn_metadata: None,
-                    execution_kind: None,
                 },
             )
             .await

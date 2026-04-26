@@ -211,22 +211,7 @@ impl SkillsConfig {
 impl SkillsConfig {
     /// Build a source identity registry from repository config + governance overlays.
     pub fn build_source_identity_registry(&self) -> Result<SourceIdentityRegistry, SkillError> {
-        let mut records: Vec<SourceIdentityRecord> = vec![
-            SourceIdentityRecord {
-                source_uuid: SourceUuid::builtin(),
-                display_name: "embedded".to_string(),
-                transport_kind: SourceTransportKind::Embedded,
-                fingerprint: "embedded:inventory".to_string(),
-                status: SourceIdentityStatus::Active,
-            },
-            SourceIdentityRecord {
-                source_uuid: SourceUuid::project_local(),
-                display_name: "project".to_string(),
-                transport_kind: SourceTransportKind::Filesystem,
-                fingerprint: "filesystem:.rkat/skills".to_string(),
-                status: SourceIdentityStatus::Active,
-            },
-        ];
+        let mut records = default_source_identity_records();
         records.extend(self.repositories.iter().map(repository_to_identity_record));
         SourceIdentityRegistry::build(
             records,
@@ -235,6 +220,27 @@ impl SkillsConfig {
             self.identity.aliases.clone(),
         )
     }
+}
+
+/// Canonical source identity records for the built-in and project-local
+/// sources that exist independently of user repository configuration.
+pub fn default_source_identity_records() -> Vec<SourceIdentityRecord> {
+    vec![
+        SourceIdentityRecord {
+            source_uuid: SourceUuid::builtin(),
+            display_name: "embedded".to_string(),
+            transport_kind: SourceTransportKind::Embedded,
+            fingerprint: "embedded:inventory".to_string(),
+            status: SourceIdentityStatus::Active,
+        },
+        SourceIdentityRecord {
+            source_uuid: SourceUuid::project_local(),
+            display_name: "project".to_string(),
+            transport_kind: SourceTransportKind::Filesystem,
+            fingerprint: "filesystem:.rkat/skills".to_string(),
+            status: SourceIdentityStatus::Active,
+        },
+    ]
 }
 
 fn repository_to_identity_record(repo: &SkillRepositoryConfig) -> SourceIdentityRecord {

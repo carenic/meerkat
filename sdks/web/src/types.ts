@@ -37,6 +37,13 @@ export interface InitResult {
 
 // ─── Session config ─────────────────────────────────────────────
 
+/** Structural reference to a realm binding. */
+export interface ConnectionRef {
+  realm: string;
+  binding: string;
+  profile?: string;
+}
+
 /** Configuration for creating a direct (non-mob) session.
  *
  * Plan §4d.wasm.2 + §6.13: per-session api_key / base_url fields are
@@ -47,8 +54,8 @@ export interface InitResult {
 export interface SessionConfig {
   /** LLM model identifier. */
   model: string;
-  /** Optional realm-qualified auth binding reference (`realm:binding[:profile]`). */
-  connectionRef?: string;
+  /** Optional structural auth binding reference. */
+  connectionRef?: ConnectionRef;
   /** System prompt. */
   systemPrompt?: string;
   /** Max tokens per response. Default: 4096. */

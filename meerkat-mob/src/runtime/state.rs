@@ -261,6 +261,14 @@ pub(super) enum MobCommand {
     StartupKickoffSnapshot {
         reply_tx: oneshot::Sender<MobStartupKickoffSnapshot>,
     },
+    ProjectMemberList {
+        include_retiring: bool,
+        reply_tx: oneshot::Sender<Vec<super::MobMemberListEntry>>,
+    },
+    ProjectMemberStatus {
+        agent_identity: crate::ids::AgentIdentity,
+        reply_tx: oneshot::Sender<super::MobMemberSnapshot>,
+    },
     MemberMachineProjection {
         agent_identity: crate::ids::AgentIdentity,
         reply_tx: oneshot::Sender<MobMemberMachineProjection>,

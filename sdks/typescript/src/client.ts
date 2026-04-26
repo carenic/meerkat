@@ -668,14 +668,8 @@ export class MeerkatClient {
     return (result.skills as Array<Record<string, unknown>>) ?? [];
   }
 
-  async inspectSkill(
-    id: string,
-    options?: { source?: string },
-  ): Promise<Record<string, unknown>> {
-    const params: Record<string, unknown> = { id };
-    if (options?.source !== undefined) {
-      params.source = options.source;
-    }
+  async inspectSkill(ref: SkillRef): Promise<Record<string, unknown>> {
+    const params: Record<string, unknown> = { key: normalizeSkillRef(ref) };
     return this.request("skills/inspect", params);
   }
 
@@ -1888,32 +1882,32 @@ export class MeerkatClient {
    * @internal
    */
   async _runtimeStatus(params: Record<string, unknown>): Promise<unknown> {
-    return this.request("session/status", params);
+    return this.request("runtime/session_status", params);
   }
 
   /** @internal */
   async _runtimeSubmit(params: Record<string, unknown>): Promise<unknown> {
-    return this.request("session/submit", params);
+    return this.request("runtime/session_submit", params);
   }
 
   /** @internal */
   async _runtimeSubmission(params: Record<string, unknown>): Promise<unknown> {
-    return this.request("session/submission", params);
+    return this.request("runtime/session_submission", params);
   }
 
   /** @internal */
   async _runtimeSubmissions(params: Record<string, unknown>): Promise<unknown> {
-    return this.request("session/submissions", params);
+    return this.request("runtime/session_submissions", params);
   }
 
   /** @internal */
   async _runtimeRetire(params: Record<string, unknown>): Promise<unknown> {
-    return this.request("session/retire", params);
+    return this.request("runtime/session_retire", params);
   }
 
   /** @internal */
   async _runtimeReset(params: Record<string, unknown>): Promise<unknown> {
-    return this.request("session/reset", params);
+    return this.request("runtime/session_reset", params);
   }
 
   /** @internal */

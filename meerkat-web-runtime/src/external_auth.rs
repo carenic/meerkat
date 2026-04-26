@@ -25,14 +25,12 @@
 //!
 //! ```js
 //! // Host-page registration:
-//! meerkat.register_external_auth_resolver(async (bindingKey) => {
+//! meerkat.register_external_auth_resolver(async (connectionRef) => {
 //!   // host-owned OAuth flow; returns a bearer string
-//!   const token = await my_oauth_client.fresh_token_for(bindingKey);
+//!   const token = await my_oauth_client.fresh_token_for(connectionRef);
 //!   return token; // plain string; meerkat wraps as envelope internally
 //! });
 //! ```
-//!
-//! The returned `bindingKey` is `"<realm_id>:<binding_id>"`.
 
 #[cfg(target_arch = "wasm32")]
 use js_sys::{Function, Promise};
@@ -50,8 +48,8 @@ thread_local! {
 }
 
 /// Register a JS-side external-auth resolver. The callback receives a
-/// single string argument (`"<realm_id>:<binding_id>"`) and must return
-/// a Promise that resolves to a bearer-token string.
+/// structural connection reference argument (`{ realm, binding, profile? }`)
+/// and must return a Promise that resolves to a bearer-token string.
 ///
 /// Subsequent registrations overwrite the previous one. Passing
 /// `undefined` clears the registration.
@@ -80,7 +78,7 @@ pub fn has_external_auth_resolver() -> bool {
     EXTERNAL_AUTH_RESOLVER.with(|slot| slot.borrow().is_some())
 }
 
-/// Invoke the registered external-auth resolver for a binding key.
+/// Invoke the registered external-auth resolver for a connection reference.
 /// Returns the JS Promise the callback produced, or an error if no
 /// resolver is registered.
 ///
@@ -88,7 +86,9 @@ pub fn has_external_auth_resolver() -> bool {
 /// bearer token string.
 #[cfg(target_arch = "wasm32")]
 #[allow(dead_code)] // wired in when the provider-runtime-registry WASM path consumes it
-pub(crate) fn invoke_external_auth_resolver(binding_key: &str) -> Result<Promise, JsValue> {
+pub(crate) fn invoke_external_auth_resolver(
+    connection_ref: &meerkat_core::ConnectionRef,
+) -> Result<Promise, JsValue> {
     EXTERNAL_AUTH_RESOLVER.with(|slot| {
         let slot = slot.borrow();
         let callback = slot.as_ref().ok_or_else(|| {
@@ -97,11 +97,37 @@ pub(crate) fn invoke_external_auth_resolver(binding_key: &str) -> Result<Promise
             )
         })?;
         let this = JsValue::NULL;
-        let result = callback.call1(&this, &JsValue::from_str(binding_key))?;
+        let result = callback.call1(&this, &connection_ref_js_value(connection_ref))?;
         result
             .dyn_into::<Promise>()
             .map_err(|_| JsValue::from_str("external_auth: callback must return a Promise"))
     })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn connection_ref_js_value(connection_ref: &meerkat_core::ConnectionRef) -> JsValue {
+    let object = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("realm"),
+        &JsValue::from_str(connection_ref.realm.as_str()),
+    )
+    .expect("setting property on fresh object should succeed");
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("binding"),
+        &JsValue::from_str(connection_ref.binding.as_str()),
+    )
+    .expect("setting property on fresh object should succeed");
+    if let Some(profile) = &connection_ref.profile {
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("profile"),
+            &JsValue::from_str(profile.as_str()),
+        )
+        .expect("setting property on fresh object should succeed");
+    }
+    object.into()
 }
 
 /// Rust-side bridge that implements `ExternalAuthResolverHandle` by
@@ -122,11 +148,7 @@ impl meerkat_providers::ExternalAuthResolverHandle for WasmExternalAuthResolver 
         &self,
         binding: &meerkat_providers::ValidatedBinding,
     ) -> Result<meerkat_core::ResolvedAuthEnvelope, meerkat_core::AuthError> {
-        let binding_key = format!(
-            "{}:{}",
-            binding.connection_ref.realm, binding.connection_ref.binding,
-        );
-        let promise = invoke_external_auth_resolver(&binding_key).map_err(|e| {
+        let promise = invoke_external_auth_resolver(&binding.connection_ref).map_err(|e| {
             meerkat_core::AuthError::Other(format!("wasm_host resolver: {}", js_value_display(&e),))
         })?;
         let js_value = wasm_bindgen_futures::JsFuture::from(promise)

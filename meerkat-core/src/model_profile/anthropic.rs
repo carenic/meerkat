@@ -2,9 +2,8 @@
 //!
 //! All capability data for catalog models lives in
 //! [`crate::capabilities::anthropic`]. This module is retained only to
-//! synthesize a [`ModelCapabilities`] for model IDs that aren't in the static
-//! catalog (e.g., dated snapshots such as `claude-haiku-4-5-20251001` or
-//! future prefixes that haven't been added yet).
+//! synthesize a [`ModelCapabilities`] for provider-explicit model IDs that
+//! aren't in the static catalog yet.
 
 use crate::model_profile::capabilities::{
     BetaHeader, ModelCapabilities, ThinkingSupport, capabilities_for,
@@ -228,7 +227,7 @@ mod tests {
 
     #[test]
     fn fallback_standard_shape_for_older_prefixes() {
-        let caps = fallback_caps("claude-haiku-4-5-20251001").unwrap();
+        let caps = fallback_caps("claude-haiku-4-5-20261001").unwrap();
         assert_eq!(caps.thinking, ThinkingSupport::AnthropicEnabledOnly);
         assert!(caps.effort_levels.is_empty());
         assert!(!caps.supports_inference_geo);

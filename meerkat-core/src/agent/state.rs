@@ -11,7 +11,6 @@ use crate::hooks::{
 };
 use crate::image_content::{MissingBlobBehavior, hydrate_messages_for_execution};
 use crate::lifecycle::RunId;
-use crate::state::LoopState;
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
 use crate::tool_catalog::{ToolCatalogDeferredEligibility, ToolCatalogMode, ToolPlaneClass};
@@ -902,8 +901,8 @@ where
                 return self.build_result(turn_count, tool_call_count).await;
             }
 
-            match self.turn_phase()?.to_loop_state() {
-                LoopState::CallingLlm => {
+            match self.turn_phase()? {
+                TurnPhase::Ready | TurnPhase::ApplyingPrimitive | TurnPhase::CallingLlm => {
                     // 0. Auth lease refresh loop (Phase 1.5-rev).
                     //    The canonical auth-state owner is the MeerkatMachine
                     //    DSL (see meerkat-machine-schema/src/catalog/dsl/
@@ -2108,7 +2107,7 @@ where
                         });
                     }
                 }
-                LoopState::WaitingForOps => {
+                TurnPhase::WaitingForOps => {
                     // Await completion of all pending barrier operations via
                     // the machine-owned turn-local wait-set. Only barrier ops
                     // block the turn; detached ops run independently.
@@ -2155,28 +2154,28 @@ where
                     self.execute_turn_effects(&t, turn_count, &event_tx).await;
                     turn_count += 1;
                 }
-                LoopState::DrainingEvents => {
+                TurnPhase::DrainingBoundary | TurnPhase::Extracting => {
                     // Wait for any pending events to be processed
                     let t = self.apply_turn_input(TurnExecutionInput::BoundaryComplete {
                         run_id: run_id.clone(),
                     })?;
                     self.execute_turn_effects(&t, turn_count, &event_tx).await;
                 }
-                LoopState::Cancelling => {
+                TurnPhase::Cancelling => {
                     // Handle cancellation
                     self.apply_turn_input(TurnExecutionInput::CancellationObserved {
                         run_id: run_id.clone(),
                     })?;
                     return self.build_result(turn_count, tool_call_count).await;
                 }
-                LoopState::ErrorRecovery => {
+                TurnPhase::ErrorRecovery => {
                     // Attempt recovery
                     let t = self.apply_turn_input(TurnExecutionInput::RetryRequested {
                         run_id: run_id.clone(),
                     })?;
                     self.execute_turn_effects(&t, turn_count, &event_tx).await;
                 }
-                LoopState::Completed => {
+                TurnPhase::Completed | TurnPhase::Failed | TurnPhase::Cancelled => {
                     return self.build_result(turn_count, tool_call_count).await;
                 }
             }
@@ -2445,17 +2444,23 @@ mod tests {
 
     struct RecordingLlmClient {
         seen_user_messages: Mutex<Vec<String>>,
+        seen_provider_params: Mutex<Vec<Option<Value>>>,
     }
 
     impl RecordingLlmClient {
         fn new() -> Self {
             Self {
                 seen_user_messages: Mutex::new(Vec::new()),
+                seen_provider_params: Mutex::new(Vec::new()),
             }
         }
 
         fn seen(&self) -> Vec<String> {
             self.seen_user_messages.lock().unwrap().clone()
+        }
+
+        fn seen_params(&self) -> Vec<Option<Value>> {
+            self.seen_provider_params.lock().unwrap().clone()
         }
     }
 
@@ -2588,7 +2593,7 @@ mod tests {
             _tools: &[Arc<ToolDef>],
             _max_tokens: u32,
             _temperature: Option<f32>,
-            _provider_params: Option<&Value>,
+            provider_params: Option<&Value>,
         ) -> Result<super::LlmStreamResult, AgentError> {
             let mut seen = self.seen_user_messages.lock().unwrap();
             for msg in messages {
@@ -2597,6 +2602,10 @@ mod tests {
                 }
             }
             drop(seen);
+            self.seen_provider_params
+                .lock()
+                .unwrap()
+                .push(provider_params.cloned());
 
             Ok(super::LlmStreamResult::new(
                 vec![AssistantBlock::Text {
@@ -3817,6 +3826,44 @@ mod tests {
         }
         assert!(saw_run_started, "tap should receive RunStarted");
         assert!(saw_run_completed, "tap should receive RunCompleted");
+    }
+
+    #[tokio::test]
+    async fn hot_swap_request_policy_updates_next_turn_provider_params() {
+        let client = Arc::new(RecordingLlmClient::new());
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .provider_params(serde_json::json!({"old": true}))
+            .provider_tool_defaults(serde_json::json!({"stale_tool": {"type": "old"}}))
+            .build(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+        agent.config.max_turns = Some(1);
+
+        agent.replace_client_with_request_policy(
+            client.clone(),
+            crate::SessionLlmRequestPolicy {
+                model: "new-model".to_string(),
+                provider_params: Some(serde_json::json!({"temperature": 0.2})),
+                provider_tool_defaults: Some(serde_json::json!({
+                    "web_search": {"type": "web_search"}
+                })),
+            },
+        );
+
+        let result = agent
+            .run("policy follows identity".to_string().into())
+            .await
+            .expect("run should use swapped request policy");
+        assert_eq!(result.turns, 1);
+
+        let seen_params = client.seen_params();
+        assert_eq!(
+            seen_params.last(),
+            Some(&Some(serde_json::json!({
+                "web_search": {"type": "web_search"},
+                "temperature": 0.2
+            }))),
+            "next LLM request must use the hot-swapped provider params/defaults, not the build-time policy",
+        );
     }
 
     #[tokio::test]

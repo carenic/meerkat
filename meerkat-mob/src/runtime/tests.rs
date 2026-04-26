@@ -3413,6 +3413,7 @@ impl SessionAgent for PersistentMockAgent {
         &mut self,
         _client: std::sync::Arc<dyn meerkat_core::AgentLlmClient>,
         _identity: meerkat_core::SessionLlmIdentity,
+        _request_policy: meerkat_core::SessionLlmRequestPolicy,
     ) -> Result<(), meerkat_core::error::AgentError> {
         Ok(())
     }
@@ -3968,6 +3969,7 @@ impl SessionAgent for OverlayProbeSessionAgent {
         &mut self,
         _client: std::sync::Arc<dyn meerkat_core::AgentLlmClient>,
         _identity: meerkat_core::SessionLlmIdentity,
+        _request_policy: meerkat_core::SessionLlmRequestPolicy,
     ) -> Result<(), meerkat_core::error::AgentError> {
         Ok(())
     }
@@ -4863,6 +4865,10 @@ async fn test_rotate_supervisor_reauthorizes_live_remote_members_and_rejects_sta
     .expect("peer spec");
     let old_bridge = crate::runtime::MobSupervisorBridge::new(&mob_id, original.clone())
         .expect("build old supervisor bridge");
+    old_bridge
+        .trust_recipient(&peer)
+        .await
+        .expect("old supervisor bridge should explicitly trust peer for stale-epoch probe");
     let stale_command = super::bridge_protocol::BridgeCommand::DeliverMemberInput(
         super::bridge_protocol::BridgeDeliveryPayload {
             supervisor: old_bridge
@@ -6410,7 +6416,6 @@ async fn test_flow_step_tool_overlay_is_step_scoped() {
                 skill_references: None,
                 flow_tool_overlay: None,
                 turn_metadata: None,
-                execution_kind: None,
             },
         )
         .await
@@ -16082,6 +16087,7 @@ struct RealCommsSessionService {
     keep_alive_notifiers: RwLock<HashMap<SessionId, Arc<tokio::sync::Notify>>>,
     session_comms_names: RwLock<HashMap<SessionId, String>>,
     session_counter: AtomicU64,
+    runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
 }
 
 impl RealCommsSessionService {
@@ -16091,6 +16097,7 @@ impl RealCommsSessionService {
             keep_alive_notifiers: RwLock::new(HashMap::new()),
             session_comms_names: RwLock::new(HashMap::new()),
             session_counter: AtomicU64::new(0),
+            runtime_adapter: Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
         }
     }
 }
@@ -16124,6 +16131,9 @@ impl SessionService for RealCommsSessionService {
             .write()
             .await
             .insert(session_id.clone(), comms_name);
+        self.runtime_adapter
+            .register_session(session_id.clone())
+            .await;
 
         Ok(mock_run_result(session_id, "Session created".to_string()))
     }
@@ -16264,6 +16274,10 @@ impl SessionServiceControlExt for RealCommsSessionService {
 impl MobSessionService for RealCommsSessionService {
     fn supports_persistent_sessions(&self) -> bool {
         true
+    }
+
+    fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::MeerkatMachine>> {
+        Some(Arc::clone(&self.runtime_adapter))
     }
 
     async fn session_belongs_to_mob(&self, session_id: &SessionId, mob_id: &MobId) -> bool {
@@ -18867,6 +18881,53 @@ async fn test_supervisor_trust_does_not_leak_into_member_peer_directory() {
         supervisor_entry.is_none(),
         "supervisor must NOT appear in the session-backed member's public \
          peer directory; the private-trust seam is the whole point. Got: {directory:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_supervisor_private_trust_failure_does_not_commit_spawn() {
+    let definition = with_unique_mob_id(sample_definition(), "supervisor-trust-failure");
+    let mob_id = definition.id.clone();
+    let (handle, service) = create_test_mob(definition).await;
+    service
+        .set_comms_behavior(
+            &format!("{mob_id}/worker/w-trust-fail"),
+            MockCommsBehavior {
+                fail_add_trust: true,
+                ..MockCommsBehavior::default()
+            },
+        )
+        .await;
+
+    let error = handle
+        .spawn(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-trust-fail"),
+            None,
+        )
+        .await
+        .expect_err("supervisor private trust failure should fail spawn");
+    assert!(
+        error
+            .to_string()
+            .contains("supervisor private trust publication failed"),
+        "spawn should surface the authority-gated trust failure, got: {error}"
+    );
+    assert!(
+        handle.list_members().await.is_empty(),
+        "failed supervisor trust publication must not commit roster membership"
+    );
+    assert_eq!(
+        service.active_session_count().await,
+        0,
+        "failed supervisor trust publication must roll back the provisioned session"
+    );
+    let events = handle.events().replay_all().await.expect("replay events");
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event.kind, MobEventKind::MemberSpawned(_))),
+        "failed supervisor trust publication must not append MemberSpawned"
     );
 }
 

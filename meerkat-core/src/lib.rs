@@ -109,7 +109,7 @@ pub use compact::{
     CompactionConfig, CompactionContext, CompactionResult, Compactor,
     SESSION_COMPACTION_CADENCE_KEY, SessionCompactionCadence,
 };
-pub use memory::{MemoryMetadata, MemoryResult, MemoryStore, MemoryStoreError};
+pub use memory::{MemoryMetadata, MemoryResult, MemorySearchScope, MemoryStore, MemoryStoreError};
 pub use model_registry::{ModelRegistry, ModelRegistryEntry, SelfHostedServerRef};
 pub use peer_correlation::{
     InboundPeerRequestState, InteractionStreamState, OutboundPeerRequestState, PeerCorrelationId,
@@ -227,9 +227,9 @@ pub use session::{
     SESSION_METADATA_SCHEMA_VERSION, SESSION_SYSTEM_CONTEXT_STATE_KEY,
     SESSION_TOOL_VISIBILITY_STATE_KEY, SESSION_VERSION, SYSTEM_CONTEXT_SEPARATOR,
     SeenSystemContextKey, SeenSystemContextState, Session, SessionBuildState,
-    SessionDeferredTurnState, SessionLlmIdentity, SessionMeta, SessionMetadata,
-    SessionSystemContextState, SessionToolVisibilityState, SessionTooling, SystemContextStageError,
-    ToolCategoryOverride, ToolVisibilityWitness, VIEW_IMAGE_TOOL_NAME,
+    SessionDeferredTurnState, SessionLlmIdentity, SessionLlmRequestPolicy, SessionMeta,
+    SessionMetadata, SessionSystemContextState, SessionToolVisibilityState, SessionTooling,
+    SystemContextStageError, ToolCategoryOverride, ToolVisibilityWitness, VIEW_IMAGE_TOOL_NAME,
     capability_base_filter_for_image_tool_results,
 };
 pub use session_recovery::{

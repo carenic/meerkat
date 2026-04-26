@@ -10,6 +10,7 @@ use meerkat_core::skills::{
     SkillKey, SkillQuarantineDiagnostic, SkillRef, SkillSource, SourceHealthSnapshot,
     SourceIdentityRegistry,
 };
+use meerkat_core::skills_config::default_source_identity_records;
 
 use crate::renderer;
 
@@ -22,13 +23,9 @@ where
     available_capabilities: HashSet<CapabilityId>,
     inventory_threshold: usize,
     max_injection_bytes: usize,
-    /// Optional source-identity registry used to apply lineage remap
-    /// chains on incoming `SkillKey`s. When absent (tests, minimal
-    /// embeddings), `canonical_skill_key` is the identity function; the
-    /// pre-V4 behavior is preserved. When present (facade-constructed
-    /// engines), the builtin skill tools get lineage-aware key
-    /// resolution.
-    registry: Option<Arc<SourceIdentityRegistry>>,
+    /// Source-identity registry used to apply lineage remap chains and source
+    /// lifecycle gates on incoming `SkillKey`s.
+    registry: Arc<SourceIdentityRegistry>,
 }
 
 impl<S> DefaultSkillEngine<S>
@@ -41,7 +38,7 @@ where
             available_capabilities: available_capabilities.into_iter().collect(),
             inventory_threshold: renderer::DEFAULT_INVENTORY_THRESHOLD,
             max_injection_bytes: renderer::MAX_INJECTION_BYTES,
-            registry: None,
+            registry: Arc::new(default_source_identity_registry()),
         }
     }
 
@@ -55,24 +52,30 @@ where
         self
     }
 
-    /// Attach a `SourceIdentityRegistry` so `canonical_skill_key`
-    /// applies the lineage remap chain. Without one, the engine falls
-    /// back to the identity projection.
     pub fn with_source_identity_registry(mut self, registry: Arc<SourceIdentityRegistry>) -> Self {
-        self.registry = Some(registry);
+        self.registry = registry;
         self
     }
 
     fn resolve_key(&self, key: &SkillKey) -> Result<SkillKey, SkillError> {
-        let Some(registry) = &self.registry else {
-            return Ok(key.clone());
-        };
-        registry
+        self.registry
             .resolve(key)
             .map(|resolved| resolved.key)
             .map_err(|e| {
                 SkillError::Load(format!("source identity resolution failed for {key}: {e}").into())
             })
+    }
+}
+
+fn default_source_identity_registry() -> SourceIdentityRegistry {
+    match SourceIdentityRegistry::build(
+        default_source_identity_records(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ) {
+        Ok(registry) => registry,
+        Err(err) => unreachable!("builtin/project source identity records are invalid: {err}"),
     }
 }
 
@@ -257,12 +260,7 @@ where
     ) -> impl Future<Output = Result<SkillKey, SkillError>> + Send {
         let registry = self.registry.clone();
         let reference = SkillRef::from(key.clone());
-        async move {
-            match registry {
-                Some(reg) => reg.canonical_skill_key(&reference),
-                None => Ok(reference.into_key()),
-            }
-        }
+        async move { registry.canonical_skill_key(&reference) }
     }
 }
 

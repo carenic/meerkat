@@ -249,7 +249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         factory = factory.user_config_root(user_root);
     }
 
-    let skill_runtime = factory.build_skill_runtime(&config).await;
+    let skill_runtime = factory.build_skill_runtime(&config).await?;
 
     let realtime_openai_factory = match factory.build_openai_realtime_session_factory(&config).await
     {

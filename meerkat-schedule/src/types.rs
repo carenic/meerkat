@@ -1,6 +1,6 @@
 use chrono::{DateTime, Duration, Utc};
 use meerkat_core::ops::ToolAccessPolicy;
-use meerkat_core::skills::SkillRef;
+use meerkat_core::skills::{SkillKey, SkillRef};
 use meerkat_core::types::RenderMetadata;
 use meerkat_core::{ContentInput, OutputSchema, PeerMeta, Provider, SessionId};
 use serde::{Deserialize, Serialize};
@@ -447,7 +447,7 @@ pub struct SessionMaterializationSpec {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub preload_skills: Vec<String>,
+    pub preload_skills: Vec<SkillKey>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_instructions: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1157,7 +1157,12 @@ pub fn default_planning_horizon_occurrences() -> u32 {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use meerkat_core::skills::{SkillName, SourceUuid};
     use std::collections::HashSet;
+
+    fn fixture_skill_key(name: &str) -> SkillKey {
+        SkillKey::new(SourceUuid::builtin(), SkillName::parse(name).unwrap())
+    }
 
     // -----------------------------------------------------------------------
     // ScheduleSpawnTooling serde roundtrip
@@ -1376,6 +1381,37 @@ mod tests {
         let err = serde_json::from_str::<HelperOptionsSpec>(json).unwrap_err();
         assert!(
             err.to_string().contains("profile_name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn session_materialization_preload_skills_are_canonical_skill_keys() {
+        let key = fixture_skill_key("email");
+        let json = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "preload_skills": [
+                {
+                    "source_uuid": key.source_uuid.to_string(),
+                    "skill_name": key.skill_name.to_string()
+                }
+            ]
+        });
+
+        let parsed: SessionMaterializationSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.preload_skills, vec![key]);
+    }
+
+    #[test]
+    fn session_materialization_rejects_legacy_string_preload_skills() {
+        let json = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "preload_skills": ["email"]
+        });
+
+        let err = serde_json::from_value::<SessionMaterializationSpec>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid type"),
             "unexpected error: {err}"
         );
     }

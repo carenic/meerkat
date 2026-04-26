@@ -376,30 +376,30 @@ pub async fn delete_auth_profile(
 #[derive(serde::Deserialize)]
 pub struct TestBindingBody {
     pub realm_id: RealmId,
-    pub binding_id: BindingId,
 }
 
-pub async fn test_auth_profile(
+pub async fn test_auth_binding(
     State(state): State<AppState>,
-    Path(_profile_id): Path<String>,
+    Path(binding_id): Path<BindingId>,
     Json(body): Json<TestBindingBody>,
 ) -> impl IntoResponse {
     match resolve_realm(&state, &body.realm_id).await {
         Ok(realm) => {
-            let registry = meerkat_providers::ProviderRuntimeRegistry::empty();
             let env = meerkat_providers::ResolverEnvironment::with_process_env()
                 .with_token_store(Arc::clone(&state.token_store));
             let connection_ref = ConnectionRef {
                 realm: body.realm_id.clone(),
-                binding: body.binding_id.clone(),
+                binding: binding_id.clone(),
                 profile: None,
             };
-            match registry.resolve(&realm, &connection_ref, &env).await {
+            match state
+                .provider_registry
+                .resolve(&realm, &connection_ref, &env)
+                .await
+            {
                 Ok(conn) => {
                     let (connection_ref, binding, auth_profile) =
-                        match resolve_binding_identity(&state, &body.realm_id, &body.binding_id)
-                            .await
-                        {
+                        match resolve_binding_identity(&state, &body.realm_id, &binding_id).await {
                             Ok(v) => v,
                             Err((status, msg)) => {
                                 return (status, Json(serde_json::json!({ "error": msg })))

@@ -124,6 +124,7 @@ export interface MobUnwireParams {
 }
 
 export interface RuntimeStateParams {
+  session_id: string;
 }
 
 export interface RuntimeRealtimeAttachmentStatusParams {
@@ -147,18 +148,25 @@ export interface RealtimeCapabilitiesParams {
 }
 
 export interface RuntimeAcceptParams {
+  input: unknown;
+  session_id: string;
 }
 
 export interface RuntimeRetireParams {
+  session_id: string;
 }
 
 export interface RuntimeResetParams {
+  session_id: string;
 }
 
 export interface InputStateParams {
+  input_id: string;
+  session_id: string;
 }
 
 export interface InputListParams {
+  session_id: string;
 }
 
 export interface ScheduleIdParams {
@@ -618,9 +626,12 @@ export interface RuntimeAcceptResult {
 }
 
 export interface RuntimeRetireResult {
+  inputs_abandoned: number;
+  inputs_pending_drain?: number;
 }
 
 export interface RuntimeResetResult {
+  inputs_abandoned: number;
 }
 
 export interface WireInputStateHistoryEntry {
@@ -649,6 +660,7 @@ export interface WireInputState {
 }
 
 export interface InputListResult {
+  inputs: Record<string, unknown>[];
 }
 
 export interface ScheduleListResult {

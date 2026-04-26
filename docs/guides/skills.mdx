@@ -348,7 +348,7 @@ let config = Config::load().await?;
 let factory = AgentFactory::new(store_path);
 
 // Build a SkillRuntime (requires "skills" feature)
-if let Some(runtime) = factory.build_skill_runtime(&config).await {
+if let Some(runtime) = factory.build_skill_runtime(&config).await? {
     // List all skills with provenance
     let entries = runtime.list_all_with_provenance(&SkillFilter::default()).await?;
     for entry in &entries {

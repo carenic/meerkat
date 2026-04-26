@@ -46,7 +46,7 @@ const fullConfig: RuntimeConfig = {
 
 const sessionConfig: SessionConfig = {
   model: 'claude-sonnet-4-5',
-  connectionRef: 'default:anthropic',
+  connectionRef: { realm: 'default', binding: 'anthropic' },
   systemPrompt: 'You are helpful.',
   maxTokens: 1024,
   labels: { env: 'test' },
@@ -117,7 +117,9 @@ function handleEvent(event: AgentEvent): string {
     case 'run_started':
       return typeof event.prompt === 'string'
         ? event.prompt
-        : event.prompt.map((block) => (block.type === 'text' ? block.text : '')).join('');
+        : event.prompt
+            .map((block) => ('type' in block && block.type === 'text' ? block.text : ''))
+            .join('');
     case 'hook_started':
       return `${event.hook_id}:${event.point}`;
     case 'hook_completed':
@@ -204,9 +206,14 @@ declare const mob: Mob;
 const memberSendResult: Promise<MemberDeliveryReceipt> = mob.member('worker-1').send('hello');
 const memberStatusResult: Promise<MobMemberSnapshot> = mob.memberStatus('worker-1');
 const helperResult: Promise<MobHelperResult> = mob.spawnHelper('Summarize the latest findings.');
+const helperWithConnectionResult: Promise<MobHelperResult> = mob.spawnHelper(
+  'Summarize using the OpenAI binding.',
+  { connectionRef: { realm: 'default', binding: 'openai', profile: 'work' } },
+);
 const forkedHelperResult: Promise<MobHelperResult> = mob.forkHelper(
   'worker-1',
   'Review the draft and suggest one improvement.',
+  { connectionRef: { realm: 'default', binding: 'anthropic' } },
 );
 const memberSubscription = mob.member('worker-1').subscribe();
 const mobSubscription = mob.subscribeEvents();
@@ -228,6 +235,7 @@ void actions;
 void memberSendResult;
 void memberStatusResult;
 void helperResult;
+void helperWithConnectionResult;
 void forkedHelperResult;
 void memberSubscription;
 void mobSubscription;

@@ -12,7 +12,6 @@ export {
   withConnectionRef,
 } from './auth.js';
 export type {
-  ConnectionRef,
   ExternalAuthResolver,
   AuthTransport,
   AuthProfile,

@@ -2385,6 +2385,19 @@ machine! {
             RunFailed { run_id: RunId, error: String },
             RunCancelled { run_id: RunId },
             // Input lifecycle inputs
+            RecoverInputLifecycle {
+                input_id: String,
+                phase: Enum<InputPhase>,
+                terminal_kind: Option<Enum<InputTerminalKind>>,
+                superseded_by: Option<String>,
+                aggregate_id: Option<String>,
+                abandon_reason: Option<Enum<InputAbandonReason>>,
+                abandon_attempt_count: u64,
+                attempt_count: u64,
+                run_id: Option<String>,
+                boundary_sequence: Option<u64>,
+                lane: Option<Enum<InputLane>>,
+            },
             QueueAccepted { input_id: String },
             SteerAccepted { input_id: String },
             ChangeLane { input_id: String, new_lane: Enum<InputLane> },
@@ -4916,6 +4929,84 @@ machine! {
         // Absorbed substate transitions — Input Lifecycle
         // =====================================================================
 
+        // RecoverInputLifecycle: restore persisted input lifecycle facts
+        // through machine authority. Store recovery may present an input at
+        // any lifecycle phase, so this transition deliberately owns the
+        // whole recovered projection instead of replaying admit/stage/apply
+        // transitions whose preconditions may no longer hold after restart.
+        transition RecoverInputLifecycle {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RecoverInputLifecycle {
+                input_id,
+                phase,
+                terminal_kind,
+                superseded_by,
+                aggregate_id,
+                abandon_reason,
+                abandon_attempt_count,
+                attempt_count,
+                run_id,
+                boundary_sequence,
+                lane
+            }
+            update {
+                self.input_phases.insert(input_id, phase);
+
+                if terminal_kind != None {
+                    self.input_terminal_kind.insert(input_id, terminal_kind.get("value"));
+                } else {
+                    self.input_terminal_kind.remove(input_id);
+                }
+
+                if superseded_by != None {
+                    self.input_superseded_by.insert(input_id, superseded_by.get("value"));
+                } else {
+                    self.input_superseded_by.remove(input_id);
+                }
+
+                if aggregate_id != None {
+                    self.input_aggregate_id.insert(input_id, aggregate_id.get("value"));
+                } else {
+                    self.input_aggregate_id.remove(input_id);
+                }
+
+                if abandon_reason != None {
+                    self.input_abandon_reason.insert(input_id, abandon_reason.get("value"));
+                    self.input_abandon_attempt_count.insert(input_id, abandon_attempt_count);
+                } else {
+                    self.input_abandon_reason.remove(input_id);
+                    self.input_abandon_attempt_count.remove(input_id);
+                }
+
+                self.input_attempt_counts.insert(input_id, attempt_count);
+
+                if run_id != None {
+                    self.input_run_associations.insert(input_id, run_id.get("value"));
+                } else {
+                    self.input_run_associations.remove(input_id);
+                }
+
+                if boundary_sequence != None {
+                    self.input_boundary_sequences.insert(input_id, boundary_sequence.get("value"));
+                } else {
+                    self.input_boundary_sequences.remove(input_id);
+                }
+
+                if !self.input_admission_seq.contains_key(input_id) {
+                    self.input_admission_seq.insert(input_id, self.next_admission_seq);
+                    self.next_admission_seq += 1;
+                }
+
+                if lane != None {
+                    self.input_lane.insert(input_id, lane.get("value"));
+                } else {
+                    self.input_lane.remove(input_id);
+                }
+            }
+            to Idle
+            emit InputLifecycleNotice
+        }
+
         // QueueAccepted: admit a new input into the queue lane
         transition QueueAccepted {
             per_phase [Idle, Attached, Running, Retired, Stopped]
@@ -6402,14 +6493,21 @@ machine! {
         // Peer-ingress transport capability ownership (W2-G / issue #264)
         // =====================================================================
 
-        // AttachSessionIngress: only valid from `Unattached`. Rejects
-        // `MobOwned` → `SessionOwned` silent downgrades by construction.
+        // AttachSessionIngress: valid from `Unattached`, or as an exact
+        // idempotent re-assertion of the already-owned session runtime.
+        // Rejects `MobOwned` → `SessionOwned` silent downgrades by
+        // construction.
         transition AttachSessionIngress {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input AttachSessionIngress { comms_runtime_id }
             guard "session_registered" { self.session_id != None }
-            guard "owner_is_unattached" {
+            guard "owner_allows_session_attach" {
                 self.peer_ingress_owner_kind == PeerIngressOwnerKind::Unattached
+                || (
+                    self.peer_ingress_owner_kind == PeerIngressOwnerKind::SessionOwned
+                    && self.peer_ingress_comms_runtime_id == Some(comms_runtime_id)
+                    && self.peer_ingress_mob_id == None
+                )
             }
             update {
                 self.peer_ingress_owner_kind = PeerIngressOwnerKind::SessionOwned;
@@ -6419,7 +6517,8 @@ machine! {
             to Idle
         }
 
-        // AttachMobIngress: valid from `Unattached` or `SessionOwned`.
+        // AttachMobIngress: valid from `Unattached`, `SessionOwned`, or as
+        // an exact idempotent re-assertion of the same mob-owned runtime.
         // Mob provisioning is allowed to take over a session-owned drain
         // (the spec's promotion case).
         transition AttachMobIngress {
@@ -6429,6 +6528,11 @@ machine! {
             guard "owner_allows_mob_attach" {
                 self.peer_ingress_owner_kind == PeerIngressOwnerKind::Unattached
                 || self.peer_ingress_owner_kind == PeerIngressOwnerKind::SessionOwned
+                || (
+                    self.peer_ingress_owner_kind == PeerIngressOwnerKind::MobOwned
+                    && self.peer_ingress_comms_runtime_id == Some(comms_runtime_id)
+                    && self.peer_ingress_mob_id == Some(mob_id)
+                )
             }
             update {
                 self.peer_ingress_owner_kind = PeerIngressOwnerKind::MobOwned;
@@ -6438,14 +6542,12 @@ machine! {
             to Idle
         }
 
-        // DetachIngress: clear any active ownership back to `Unattached`.
+        // DetachIngress: clear any active ownership back to `Unattached`;
+        // exact no-op detach is accepted as idempotence by the DSL itself.
         transition DetachIngress {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input DetachIngress
             guard "session_registered" { self.session_id != None }
-            guard "owner_is_attached" {
-                self.peer_ingress_owner_kind != PeerIngressOwnerKind::Unattached
-            }
             update {
                 self.peer_ingress_owner_kind = PeerIngressOwnerKind::Unattached;
                 self.peer_ingress_comms_runtime_id = None;

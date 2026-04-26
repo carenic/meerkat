@@ -20,9 +20,27 @@
         "summary": "Begin OAuth login (loopback flow)"
       }
     },
-    "/auth/logout/{id}": {
+    "/auth/bindings/{binding_id}": {
+      "delete": {
+        "summary": "Delete binding-scoped credentials"
+      },
+      "get": {
+        "summary": "Get one binding-scoped auth profile"
+      }
+    },
+    "/auth/bindings/{binding_id}/logout": {
       "post": {
-        "summary": "Revoke + remove persisted credentials"
+        "summary": "Revoke + remove persisted credentials for a binding"
+      }
+    },
+    "/auth/bindings/{binding_id}/status": {
+      "get": {
+        "summary": "Get binding auth status"
+      }
+    },
+    "/auth/bindings/{binding_id}/test": {
+      "post": {
+        "summary": "Dry-run the binding resolve path"
       }
     },
     "/auth/profiles": {
@@ -31,24 +49,6 @@
       },
       "post": {
         "summary": "Create an auth profile"
-      }
-    },
-    "/auth/profiles/{id}": {
-      "delete": {
-        "summary": "Delete an auth profile"
-      },
-      "get": {
-        "summary": "Get one auth profile"
-      }
-    },
-    "/auth/profiles/{id}/test": {
-      "post": {
-        "summary": "Dry-run the profile's resolve path"
-      }
-    },
-    "/auth/status/{id}": {
-      "get": {
-        "summary": "Get auth status"
       }
     },
     "/capabilities": {

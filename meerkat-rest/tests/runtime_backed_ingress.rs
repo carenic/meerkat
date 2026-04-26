@@ -150,6 +150,7 @@ async fn runtime_backed_external_events_stay_queued_without_waking_idle_sessions
             std::time::Duration::from_secs(5),
         )),
         token_store: Arc::new(meerkat_providers::auth_store::EphemeralTokenStore::new()),
+        provider_registry: Arc::new(meerkat_providers::ProviderRuntimeRegistry::empty()),
         #[cfg(feature = "mob")]
         mob_state,
         #[cfg(feature = "mcp")]

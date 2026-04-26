@@ -223,4 +223,17 @@ mod tests {
             assert_eq!(caps.tier, entry.tier, "tier mismatch for {}", caps.id);
         }
     }
+
+    #[test]
+    fn claude_haiku_45_is_cataloged_with_official_limits() {
+        for model in ["claude-haiku-4-5-20251001", "claude-haiku-4-5"] {
+            let caps = capabilities_for("anthropic", model)
+                .unwrap_or_else(|| panic!("{model} must be in the Anthropic catalog"));
+            assert_eq!(caps.model_family, "claude-haiku-4");
+            assert_eq!(caps.context_window, 200_000);
+            assert_eq!(caps.max_output_tokens, 64_000);
+            assert_eq!(caps.thinking, ThinkingSupport::AnthropicEnabledOnly);
+            assert!(!caps.supports_compaction);
+        }
+    }
 }

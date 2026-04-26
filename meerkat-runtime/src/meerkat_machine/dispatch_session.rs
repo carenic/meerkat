@@ -312,15 +312,19 @@ impl MeerkatMachine {
                     None => None,
                 };
 
-                self.stage_session_dsl_input(
-                    &session_id,
-                    crate::meerkat_machine::dsl::MeerkatMachineInput::StopRuntimeExecutor,
-                    "StopRuntimeExecutor",
-                )
-                .await
-                .map_err(|reason| RuntimeDriverError::ValidationFailed { reason })?;
-                self.stop_runtime_executor_inner(&session_id, command)
-                    .await?;
+                let previous_dsl_state = self
+                    .stage_session_dsl_input(
+                        &session_id,
+                        crate::meerkat_machine::dsl::MeerkatMachineInput::StopRuntimeExecutor,
+                        "StopRuntimeExecutor",
+                    )
+                    .await
+                    .map_err(|reason| RuntimeDriverError::ValidationFailed { reason })?;
+                if let Err(err) = self.stop_runtime_executor_inner(&session_id, command).await {
+                    self.restore_session_dsl_state(&session_id, previous_dsl_state)
+                        .await;
+                    return Err(err);
+                }
                 Ok(MeerkatMachineCommandResult::Unit)
             }
             MeerkatMachineCommand::ContainsSession { session_id } => {

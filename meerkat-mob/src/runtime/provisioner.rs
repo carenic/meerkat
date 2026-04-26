@@ -751,9 +751,6 @@ impl CoreExecutor for MobSessionRuntimeExecutor {
                 .turn_metadata()
                 .and_then(|meta| meta.flow_tool_overlay.clone()),
             turn_metadata: primitive.turn_metadata().cloned(),
-            execution_kind: primitive
-                .turn_metadata()
-                .and_then(|meta| meta.execution_kind),
         };
 
         self.session_service
@@ -1432,6 +1429,7 @@ impl MultiBackendProvisioner {
     ) -> Result<TrustedPeerDescriptor, MobError> {
         let payload = self.bridge_supervisor_payload().await?;
         let command = super::bridge_protocol::BridgeCommand::AuthorizeSupervisor(payload);
+        self.supervisor_bridge.trust_recipient(peer).await?;
         let value = self
             .supervisor_bridge
             .send_bridge_command(peer, &command, Duration::from_secs(30))
@@ -1464,6 +1462,7 @@ impl MultiBackendProvisioner {
         command: &super::bridge_protocol::BridgeCommand,
         timeout: Duration,
     ) -> Result<R, MobError> {
+        self.supervisor_bridge.trust_recipient(peer).await?;
         let value = self
             .supervisor_bridge
             .send_bridge_command(peer, command, timeout)
@@ -1714,6 +1713,7 @@ impl MobProvisioner for MultiBackendProvisioner {
                     .await?;
                 let payload = self.bridge_supervisor_payload().await?;
                 let command = super::bridge_protocol::BridgeCommand::RetireMember(payload);
+                self.supervisor_bridge.trust_recipient(&peer).await?;
                 let _ = self
                     .supervisor_bridge
                     .send_bridge_command(&peer, &command, Duration::from_secs(10))
@@ -1751,6 +1751,7 @@ impl MobProvisioner for MultiBackendProvisioner {
                     .await?;
                 let payload = self.bridge_supervisor_payload().await?;
                 let command = super::bridge_protocol::BridgeCommand::InterruptMember(payload);
+                self.supervisor_bridge.trust_recipient(&peer).await?;
                 let _ = self
                     .supervisor_bridge
                     .send_bridge_command(&peer, &command, Duration::from_secs(5))

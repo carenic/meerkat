@@ -306,6 +306,23 @@ where
         self.client = client;
     }
 
+    /// Apply the live LLM request policy paired with an identity hot-swap.
+    pub fn apply_llm_request_policy(&mut self, policy: crate::SessionLlmRequestPolicy) {
+        self.config.model = policy.model;
+        self.config.provider_params = policy.provider_params;
+        self.config.provider_tool_defaults = policy.provider_tool_defaults;
+    }
+
+    /// Replace the LLM client and its next-turn request policy together.
+    pub fn replace_client_with_request_policy(
+        &mut self,
+        client: Arc<C>,
+        policy: crate::SessionLlmRequestPolicy,
+    ) {
+        self.replace_client(client);
+        self.apply_llm_request_policy(policy);
+    }
+
     /// Rotate runtime auth-lease tracking alongside a live LLM identity swap.
     pub fn rotate_auth_lease_connection_ref(
         &self,

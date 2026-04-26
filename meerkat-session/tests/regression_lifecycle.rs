@@ -141,6 +141,7 @@ impl SessionAgent for MockAgent {
         &mut self,
         _client: Arc<dyn meerkat_core::AgentLlmClient>,
         _identity: meerkat_core::SessionLlmIdentity,
+        _request_policy: meerkat_core::SessionLlmRequestPolicy,
     ) -> Result<(), meerkat_core::error::AgentError> {
         Ok(())
     }
@@ -228,6 +229,7 @@ impl SessionAgent for SnapshotAgent {
         &mut self,
         _client: Arc<dyn meerkat_core::AgentLlmClient>,
         _identity: meerkat_core::SessionLlmIdentity,
+        _request_policy: meerkat_core::SessionLlmRequestPolicy,
     ) -> Result<(), meerkat_core::error::AgentError> {
         Ok(())
     }
@@ -469,6 +471,7 @@ impl SessionAgent for RecordingTurnAgent {
         &mut self,
         _client: Arc<dyn meerkat_core::AgentLlmClient>,
         _identity: meerkat_core::SessionLlmIdentity,
+        _request_policy: meerkat_core::SessionLlmRequestPolicy,
     ) -> Result<(), meerkat_core::error::AgentError> {
         Ok(())
     }
@@ -599,7 +602,6 @@ fn turn_req(prompt: &str) -> StartTurnRequest {
         skill_references: None,
         flow_tool_overlay: None,
         turn_metadata: None,
-        execution_kind: None,
     }
 }
 
@@ -1178,7 +1180,6 @@ async fn start_turn_forwards_handling_mode_and_render_metadata() {
                 skill_references: None,
                 flow_tool_overlay: None,
                 turn_metadata: None,
-                execution_kind: None,
             },
         )
         .await

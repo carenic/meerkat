@@ -171,7 +171,8 @@ class MobUnwireParams:
 
 @dataclass
 class RuntimeStateParams:
-    """Request payload for session/status."""
+    """Request payload for `runtime/session_status`."""
+    session_id: str
 
 
 @dataclass
@@ -204,27 +205,39 @@ class RealtimeCapabilitiesParams:
 
 @dataclass
 class RuntimeAcceptParams:
-    """Request payload for session/submit."""
+    """Request payload for `runtime/session_submit`.
+
+The runtime input body is owned by `meerkat-runtime`; contracts cannot
+depend on the runtime crate without inverting the dependency graph. The
+envelope is canonical here and the runtime crate remains the typed
+authority over the `input` discriminator and variant body."""
+    input: Any
+    session_id: str
 
 
 @dataclass
 class RuntimeRetireParams:
-    """Request payload for session/retire."""
+    """Request payload for `runtime/session_retire`."""
+    session_id: str
 
 
 @dataclass
 class RuntimeResetParams:
-    """Request payload for session/reset."""
+    """Request payload for `runtime/session_reset`."""
+    session_id: str
 
 
 @dataclass
 class InputStateParams:
-    """Request payload for session/submission."""
+    """Request payload for `runtime/session_submission`."""
+    input_id: str
+    session_id: str
 
 
 @dataclass
 class InputListParams:
-    """Request payload for session/submissions."""
+    """Request payload for `runtime/session_submissions`."""
+    session_id: str
 
 
 @dataclass
@@ -314,7 +327,7 @@ class MobUnwireResult:
 
 @dataclass
 class RuntimeStateResult:
-    """Response payload for session/status."""
+    """Response payload for runtime/session_status."""
     state: WireRuntimeState
 
 
@@ -466,7 +479,7 @@ class RealtimeChannelClosedFrame:
 
 @dataclass
 class RuntimeAcceptResult:
-    """Response payload for `session/submit`."""
+    """Response payload for `runtime/session_submit`."""
     outcome_type: Literal['accepted', 'deduplicated', 'rejected']
     existing_id: Optional[str] = None
     input_id: Optional[str] = None
@@ -477,12 +490,15 @@ class RuntimeAcceptResult:
 
 @dataclass
 class RuntimeRetireResult:
-    """Response payload for session/retire."""
+    """Response payload for `runtime/session_retire`."""
+    inputs_abandoned: int
+    inputs_pending_drain: Optional[int] = None
 
 
 @dataclass
 class RuntimeResetResult:
-    """Response payload for session/reset."""
+    """Response payload for `runtime/session_reset`."""
+    inputs_abandoned: int
 
 
 @dataclass
@@ -519,7 +535,8 @@ fields with typed projections so the wire carries no untyped carriers."""
 
 @dataclass
 class InputListResult:
-    """Response payload for session/submissions."""
+    """Response payload for `runtime/session_submissions`."""
+    inputs: list[dict[str, Any]]
 
 
 @dataclass
@@ -939,7 +956,7 @@ class RealtimeServerFrameChannelClosed(TypedDict, total=False):
 
 RealtimeServerFrame = RealtimeServerFrameChannelOpened | RealtimeServerFrameChannelStatus | RealtimeServerFrameChannelEvent | RealtimeServerFrameChannelError | RealtimeServerFrameChannelClosed
 
-# Discriminator for `session/submit` responses.
+# Discriminator for `runtime/session_submit` responses.
 RuntimeAcceptOutcomeType = Literal['accepted', 'deduplicated', 'rejected']
 
 # Public input lifecycle state projection used by RPC surfaces.
@@ -1005,5 +1022,5 @@ class CommsCommandPeerResponse(TypedDict, total=False):
 
 CommsCommandRequest = CommsCommandInput | CommsCommandPeerMessage | CommsCommandPeerLifecycle | CommsCommandPeerRequest | CommsCommandPeerResponse
 
-# Response payload for `session/submission`.
+# Response payload for `runtime/session_submission`.
 InputStateResult = Optional[WireInputState]

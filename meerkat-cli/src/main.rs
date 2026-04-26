@@ -1039,7 +1039,7 @@ enum Commands {
         #[arg(long, short = 'm', help_heading = "Common options")]
         model: Option<String>,
 
-        /// LLM provider (anthropic, openai, gemini). Inferred from model name if not specified.
+        /// LLM provider (anthropic, openai, gemini). Inferred from the model registry when omitted.
         #[arg(
             long,
             short = 'p',
@@ -1692,11 +1692,11 @@ enum SkillsCommands {
     },
     /// Inspect a skill's full content
     Inspect {
-        /// Skill ID (e.g. "extraction/email")
-        id: String,
-        /// Load from a specific source (bypasses first-wins resolution)
+        /// Skill name (for example "email-extractor")
+        skill_name: String,
+        /// Canonical source UUID for the skill source
         #[arg(long)]
-        source: Option<String>,
+        source_uuid: String,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -2216,7 +2216,7 @@ async fn handle_run_command(
 
     let model = model.unwrap_or_else(|| config.agent.model.clone());
     let max_tokens = max_tokens.unwrap_or(config.agent.max_tokens_per_turn);
-    let resolved_provider = resolve_cli_provider(&config, &model, provider);
+    let resolved_provider = resolve_cli_provider(&config, &model, provider)?;
 
     let duration = max_duration.map(|s| parse_duration(&s)).transpose();
     let provider_params = parse_provider_params(&params);
@@ -4564,9 +4564,6 @@ impl meerkat_core::lifecycle::CoreExecutor for CliRuntimeExecutor {
                 .turn_metadata()
                 .and_then(|meta| meta.flow_tool_overlay.clone()),
             turn_metadata: primitive.turn_metadata().cloned(),
-            execution_kind: primitive
-                .turn_metadata()
-                .and_then(|meta| meta.execution_kind),
         };
 
         // Persistent path: use apply_runtime_turn_with_result for real receipt + snapshot.
@@ -5800,10 +5797,11 @@ async fn resume_session_with_llm_override(
             .as_ref()
             .map_or(config.agent.max_tokens_per_turn, |meta| meta.max_tokens);
 
-        let provider_core = stored_metadata
-            .as_ref()
-            .map(|meta| meta.provider)
-            .unwrap_or_else(|| resolve_cli_provider(&config, &model, None).as_core());
+        let provider_core = if let Some(meta) = stored_metadata.as_ref() {
+            meta.provider
+        } else {
+            resolve_cli_provider(&config, &model, None)?.as_core()
+        };
 
         tracing::info!(
             "Resuming session {} with {} messages (provider: {:?}, model: {})",
@@ -7336,7 +7334,36 @@ async fn handle_skills_command(
 ) -> anyhow::Result<()> {
     // Wave-c C-12: the canonical runtime identity for a skill is
     // `SkillKey { source_uuid, skill_name }` (C-1 / C-4 upstream retype).
-    use meerkat_core::skills::{SkillFilter, SkillKey, SkillName};
+    use meerkat_core::skills::{
+        SkillFilter, SkillIntrospectionEntry, SkillKey, SkillName, SourceUuid,
+    };
+
+    fn skill_source_provenance(
+        source_uuid: SourceUuid,
+        display_name: impl Into<String>,
+    ) -> meerkat_contracts::SkillSourceProvenance {
+        meerkat_contracts::SkillSourceProvenance {
+            source_uuid,
+            display_name: display_name.into(),
+        }
+    }
+
+    fn skill_entry(entry: &SkillIntrospectionEntry) -> meerkat_contracts::SkillEntry {
+        meerkat_contracts::SkillEntry {
+            key: entry.descriptor.key.clone(),
+            name: entry.descriptor.name.clone(),
+            description: entry.descriptor.description.clone(),
+            scope: entry.descriptor.scope.to_string(),
+            source: skill_source_provenance(
+                entry.descriptor.key.source_uuid.clone(),
+                entry.descriptor.source_name.clone(),
+            ),
+            is_active: entry.is_active,
+            shadowed_by: entry.shadowed_by_source_uuid.clone().map(|source_uuid| {
+                skill_source_provenance(source_uuid, entry.shadowed_by.clone().unwrap_or_default())
+            }),
+        }
+    }
 
     // Load config from the active realm (not global defaults)
     let (config, realm_root) = load_config(scope).await?;
@@ -7432,7 +7459,7 @@ async fn handle_skills_command(
         f
     };
 
-    let skill_runtime = factory.build_skill_runtime(&config).await;
+    let skill_runtime = factory.build_skill_runtime(&config).await?;
 
     let skill_runtime = match skill_runtime {
         Some(rt) => rt,
@@ -7450,22 +7477,15 @@ async fn handle_skills_command(
                 .map_err(|e| anyhow::anyhow!("Failed to list skills: {e}"))?;
 
             if json {
-                let wire: Vec<meerkat_contracts::SkillEntry> = entries
-                    .iter()
-                    .map(|e| meerkat_contracts::SkillEntry {
-                        id: e.descriptor.key.skill_name.as_str().to_owned(),
-                        name: e.descriptor.name.clone(),
-                        description: e.descriptor.description.clone(),
-                        scope: e.descriptor.scope.to_string(),
-                        source: e.descriptor.source_name.clone(),
-                        is_active: e.is_active,
-                        shadowed_by: e.shadowed_by.clone(),
-                    })
-                    .collect();
+                let wire: Vec<meerkat_contracts::SkillEntry> =
+                    entries.iter().map(skill_entry).collect();
                 println!("{}", serde_json::to_string_pretty(&wire)?);
             } else {
-                // Fixed-width table: ID, SOURCE, SCOPE, STATUS
-                println!("{:<40} {:<15} {:<10} STATUS", "ID", "SOURCE", "SCOPE");
+                // Fixed-width table: NAME, SOURCE_UUID, SCOPE, STATUS
+                println!(
+                    "{:<40} {:<36} {:<10} STATUS",
+                    "NAME", "SOURCE_UUID", "SCOPE"
+                );
                 println!("{}", "-".repeat(80));
                 for entry in &entries {
                     let status = if entry.is_active {
@@ -7477,9 +7497,9 @@ async fn handle_skills_command(
                         )
                     };
                     println!(
-                        "{:<40} {:<15} {:<10} {}",
+                        "{:<40} {:<36} {:<10} {}",
                         entry.descriptor.key.skill_name.as_str(),
-                        entry.descriptor.source_name,
+                        entry.descriptor.key.source_uuid,
                         entry.descriptor.scope,
                         status,
                     );
@@ -7487,31 +7507,37 @@ async fn handle_skills_command(
                 println!("\n{} skill(s) total", entries.len());
             }
         }
-        SkillsCommands::Inspect { id, source, json } => {
-            // Wave-c C-12: parse the user-supplied slug into a typed
-            // `SkillName` and build a builtin-source `SkillKey`. Explicit
-            // source-scoped selection comes through the `source` flag
-            // forwarded as the second arg to `load_from_source`.
-            let skill_name = SkillName::parse(id.as_str())
-                .map_err(|e| anyhow::anyhow!("invalid skill id `{id}`: {e}"))?;
-            let key = SkillKey::builtin(skill_name);
+        SkillsCommands::Inspect {
+            skill_name,
+            source_uuid,
+            json,
+        } => {
+            let skill_name = SkillName::parse(skill_name.as_str())
+                .map_err(|e| anyhow::anyhow!("invalid skill name `{skill_name}`: {e}"))?;
+            let source_uuid = SourceUuid::parse(source_uuid.as_str())
+                .map_err(|e| anyhow::anyhow!("invalid source UUID `{source_uuid}`: {e}"))?;
+            let key = SkillKey::new(source_uuid, skill_name);
             let doc = skill_runtime
-                .load_from_source(&key, source.as_deref())
+                .load_from_source(&key, None)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to inspect skill: {e}"))?;
 
             if json {
                 let wire = meerkat_contracts::SkillInspectResponse {
-                    id: doc.descriptor.key.skill_name.as_str().to_owned(),
+                    key: doc.descriptor.key.clone(),
                     name: doc.descriptor.name.clone(),
                     description: doc.descriptor.description.clone(),
                     scope: doc.descriptor.scope.to_string(),
-                    source: doc.descriptor.source_name.clone(),
+                    source: skill_source_provenance(
+                        doc.descriptor.key.source_uuid.clone(),
+                        doc.descriptor.source_name.clone(),
+                    ),
                     body: doc.body,
                 };
                 println!("{}", serde_json::to_string_pretty(&wire)?);
             } else {
-                println!("ID:          {}", doc.descriptor.key.skill_name);
+                println!("Source UUID: {}", doc.descriptor.key.source_uuid);
+                println!("Skill Name:  {}", doc.descriptor.key.skill_name);
                 println!("Name:        {}", doc.descriptor.name);
                 println!("Description: {}", doc.descriptor.description);
                 println!("Scope:       {}", doc.descriptor.scope);
@@ -8934,7 +8960,7 @@ where
         factory = factory.user_config_root(user_root);
     }
 
-    let skill_runtime = factory.build_skill_runtime(&config).await;
+    let skill_runtime = factory.build_skill_runtime(&config).await?;
     let config_runtime = Arc::new(meerkat_core::ConfigRuntime::new(
         Arc::clone(&config_store),
         paths.root.join("config_state.json"),
@@ -9095,31 +9121,11 @@ pub enum Provider {
 }
 
 impl Provider {
-    /// Infer provider from model name prefix.
-    /// Returns None if the model name doesn't match any known pattern.
+    /// Infer provider from the built-in model catalog.
+    /// Returns None for uncatalogued models; self-hosted aliases resolve
+    /// through `Config::model_registry()` in `resolve_cli_provider`.
     pub fn infer_from_model(model: &str) -> Option<Self> {
-        let model_lower = model.to_lowercase();
-
-        // OpenAI patterns: gpt-*, o1-*, o3-*, chatgpt-*
-        if model_lower.starts_with("gpt-")
-            || model_lower.starts_with("o1-")
-            || model_lower.starts_with("o3-")
-            || model_lower.starts_with("chatgpt-")
-        {
-            return Some(Provider::Openai);
-        }
-
-        // Anthropic patterns: claude-*
-        if model_lower.starts_with("claude-") {
-            return Some(Provider::Anthropic);
-        }
-
-        // Gemini patterns: gemini-*
-        if model_lower.starts_with("gemini-") {
-            return Some(Provider::Gemini);
-        }
-
-        None
+        meerkat_core::Provider::infer_from_model(model).and_then(Provider::from_core)
     }
 
     /// Convert to string for storage in session metadata
@@ -9164,17 +9170,28 @@ impl Provider {
     }
 }
 
-fn resolve_cli_provider(config: &Config, model: &str, explicit: Option<Provider>) -> Provider {
-    explicit
-        .or_else(|| {
-            config
-                .model_registry()
-                .ok()
-                .and_then(|registry| registry.entry(model).map(|entry| entry.provider))
-                .and_then(Provider::from_core)
-        })
+fn resolve_cli_provider(
+    config: &Config,
+    model: &str,
+    explicit: Option<Provider>,
+) -> anyhow::Result<Provider> {
+    if let Some(provider) = explicit {
+        return Ok(provider);
+    }
+
+    if let Some(provider) = config
+        .model_registry()
+        .ok()
+        .and_then(|registry| registry.entry(model).map(|entry| entry.provider))
+        .and_then(Provider::from_core)
         .or_else(|| Provider::infer_from_model(model))
-        .unwrap_or_default()
+    {
+        return Ok(provider);
+    }
+
+    Err(anyhow::anyhow!(
+        "Cannot infer provider from model '{model}'. Use --provider or register a self-hosted model alias."
+    ))
 }
 
 #[cfg(test)]
@@ -12640,81 +12657,62 @@ capabilities = ["definitely_missing_capability"]
     #[test]
     fn test_infer_provider_anthropic() {
         assert_eq!(
-            Provider::infer_from_model("claude-3-opus"),
+            Provider::infer_from_model("claude-opus-4-7"),
             Some(Provider::Anthropic)
         );
         assert_eq!(
-            Provider::infer_from_model("claude-sonnet-4"),
+            Provider::infer_from_model("claude-sonnet-4-6"),
             Some(Provider::Anthropic)
         );
         assert_eq!(
-            Provider::infer_from_model("claude-sonnet-4-20250514"),
+            Provider::infer_from_model("claude-haiku-4-5-20251001"),
             Some(Provider::Anthropic)
         );
         assert_eq!(
-            Provider::infer_from_model("claude-opus-4-5"),
+            Provider::infer_from_model("claude-haiku-4-5"),
             Some(Provider::Anthropic)
         );
-        assert_eq!(
-            Provider::infer_from_model("Claude-3-Opus"),
-            Some(Provider::Anthropic)
-        ); // case insensitive
+        assert_eq!(Provider::infer_from_model("Claude-3-Opus"), None);
     }
 
     #[test]
     fn test_infer_provider_openai() {
-        assert_eq!(Provider::infer_from_model("gpt-4"), Some(Provider::Openai));
-        assert_eq!(Provider::infer_from_model("gpt-4o"), Some(Provider::Openai));
         assert_eq!(
-            Provider::infer_from_model("gpt-4-turbo"),
+            Provider::infer_from_model("gpt-5.5"),
             Some(Provider::Openai)
         );
         assert_eq!(
-            Provider::infer_from_model("gpt-5.2"),
+            Provider::infer_from_model("gpt-5.4"),
             Some(Provider::Openai)
         );
         assert_eq!(
-            Provider::infer_from_model("o1-preview"),
+            Provider::infer_from_model("gpt-5.3-codex"),
             Some(Provider::Openai)
         );
         assert_eq!(
-            Provider::infer_from_model("o1-mini"),
+            Provider::infer_from_model("gpt-realtime"),
             Some(Provider::Openai)
         );
-        assert_eq!(
-            Provider::infer_from_model("o3-mini"),
-            Some(Provider::Openai)
-        );
-        assert_eq!(
-            Provider::infer_from_model("chatgpt-4o-latest"),
-            Some(Provider::Openai)
-        );
-        assert_eq!(Provider::infer_from_model("GPT-4"), Some(Provider::Openai));
-        // case insensitive
+        assert_eq!(Provider::infer_from_model("gpt-4"), None);
+        assert_eq!(Provider::infer_from_model("GPT-4"), None);
     }
 
     #[test]
     fn test_infer_provider_gemini() {
         assert_eq!(
-            Provider::infer_from_model("gemini-pro"),
+            Provider::infer_from_model("gemini-3-flash-preview"),
             Some(Provider::Gemini)
         );
         assert_eq!(
-            Provider::infer_from_model("gemini-1.5-pro"),
+            Provider::infer_from_model("gemini-3.1-pro-preview"),
             Some(Provider::Gemini)
         );
         assert_eq!(
-            Provider::infer_from_model("gemini-2.0-flash"),
+            Provider::infer_from_model("gemini-3.1-flash-lite-preview"),
             Some(Provider::Gemini)
         );
-        assert_eq!(
-            Provider::infer_from_model("gemini-2.0-flash-exp"),
-            Some(Provider::Gemini)
-        );
-        assert_eq!(
-            Provider::infer_from_model("Gemini-Pro"),
-            Some(Provider::Gemini)
-        ); // case insensitive
+        assert_eq!(Provider::infer_from_model("gemini-pro"), None);
+        assert_eq!(Provider::infer_from_model("Gemini-Pro"), None);
     }
 
     #[test]
@@ -12755,9 +12753,17 @@ supports_reasoning = true
             .expect("valid self-hosted config");
 
         assert_eq!(
-            resolve_cli_provider(&config, "gemma-4-e2b", None),
+            resolve_cli_provider(&config, "gemma-4-e2b", None).expect("self-hosted alias resolves"),
             Provider::SelfHosted
         );
+    }
+
+    #[test]
+    fn test_resolve_cli_provider_rejects_uncatalogued_model_without_provider() {
+        let config = Config::default();
+        let error = resolve_cli_provider(&config, "gpt-4", None)
+            .expect_err("uncatalogued model must not silently choose a provider");
+        assert!(error.to_string().contains("Cannot infer provider"));
     }
 
     #[cfg(feature = "comms")]

@@ -122,6 +122,7 @@ async fn inner_test_rest_resume_metadata() {
         #[cfg(feature = "mcp")]
         mcp_sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         token_store: Arc::new(meerkat_providers::auth_store::EphemeralTokenStore::new()),
+        provider_registry: Arc::new(meerkat_providers::ProviderRuntimeRegistry::empty()),
     };
 
     let app = router(state_run);
@@ -251,6 +252,7 @@ async fn inner_test_rest_resume_metadata() {
         #[cfg(feature = "mcp")]
         mcp_sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         token_store: Arc::new(meerkat_providers::auth_store::EphemeralTokenStore::new()),
+        provider_registry: Arc::new(meerkat_providers::ProviderRuntimeRegistry::empty()),
     };
 
     let app = router(state_resume);

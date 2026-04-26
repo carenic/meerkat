@@ -94,9 +94,9 @@ impl From<&BetaHeader> for ModelBetaHeader {
 ///
 /// - Catalog models project directly from their capability row.
 /// - Non-catalog models (e.g., dated snapshots) fall back to a per-provider
-///   heuristic that synthesizes a capability record matching the pre-refactor
-///   shape for that family. This keeps the runtime workable for model IDs that
-///   the user passes in before a new catalog entry is added.
+///   heuristic that synthesizes a capability record matching the nearest known
+///   family. This keeps profile projection workable for provider-explicit model
+///   IDs while provider inference remains registry-owned.
 ///
 /// Returns `None` if the provider is unknown or the model doesn't match any
 /// recognized family.

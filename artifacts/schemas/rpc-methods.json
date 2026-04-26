@@ -279,27 +279,39 @@
     },
     {
       "description": "Get a session's current runtime state",
-      "name": "session/status"
+      "name": "runtime/session_status",
+      "params_type": "RuntimeStateParams",
+      "result_type": "RuntimeStateResult"
     },
     {
       "description": "Accept a runtime input for a session",
-      "name": "session/submit"
+      "name": "runtime/session_submit",
+      "params_type": "RuntimeAcceptParams",
+      "result_type": "RuntimeAcceptResult"
     },
     {
       "description": "Retire a session runtime",
-      "name": "session/retire"
+      "name": "runtime/session_retire",
+      "params_type": "RuntimeRetireParams",
+      "result_type": "RuntimeRetireResult"
     },
     {
       "description": "Reset a session runtime",
-      "name": "session/reset"
+      "name": "runtime/session_reset",
+      "params_type": "RuntimeResetParams",
+      "result_type": "RuntimeResetResult"
     },
     {
       "description": "Get a runtime input state",
-      "name": "session/submission"
+      "name": "runtime/session_submission",
+      "params_type": "InputStateParams",
+      "result_type": "InputStateResult"
     },
     {
       "description": "List active runtime inputs",
-      "name": "session/submissions"
+      "name": "runtime/session_submissions",
+      "params_type": "InputListParams",
+      "result_type": "InputListResult"
     },
     {
       "description": "Get bootstrap metadata for opening a realtime channel",

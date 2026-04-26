@@ -1057,13 +1057,15 @@ class MeerkatClient:
 
     async def inspect_skill(
         self,
-        skill_id: str,
-        *,
-        source: str | None = None,
+        skill: SkillRef,
     ) -> dict[str, Any]:
-        params: dict[str, Any] = {"id": skill_id}
-        if source is not None:
-            params["source"] = source
+        normalized = _normalize_skill_ref(skill)
+        params: dict[str, Any] = {
+            "key": {
+                "source_uuid": normalized.source_uuid,
+                "skill_name": normalized.skill_name,
+            }
+        }
         return await self._request("skills/inspect", params)
 
     async def subscribe_session_events(self, session_id: str) -> EventSubscription:
@@ -2097,34 +2099,34 @@ class MeerkatClient:
     async def peers(self, session_id: str) -> dict[str, Any]:
         return await self._request("comms/peers", {"session_id": session_id})
 
-    async def status(self, session_id: str) -> RuntimeStateResult:
-        raw = await self._request("session/status", {"session_id": session_id})
+    async def runtime_status(self, session_id: str) -> RuntimeStateResult:
+        raw = await self._request("runtime/session_status", {"session_id": session_id})
         result = RuntimeStateResult()
         for key, value in raw.items():
             setattr(result, key, value)
         return result
 
-    async def submit(
+    async def runtime_submit(
         self, session_id: str, input: dict[str, Any] | ContentInput
     ) -> RuntimeAcceptResult:
         raw = await self._request(
-            "session/submit",
+            "runtime/session_submit",
             {"session_id": session_id, "input": input},
         )
         return RuntimeAcceptResult(**raw)
 
-    async def submission(self, session_id: str, input_id: str) -> WireInputState:
+    async def runtime_submission(self, session_id: str, input_id: str) -> WireInputState:
         raw = await self._request(
-            "session/submission",
+            "runtime/session_submission",
             {"session_id": session_id, "input_id": input_id},
         )
         return self._parse_wire_input_state(raw)
 
-    async def submissions(self, session_id: str) -> dict[str, list[WireInputState]]:
-        raw = await self._request("session/submissions", {"session_id": session_id})
+    async def runtime_submissions(self, session_id: str) -> dict[str, list[WireInputState]]:
+        raw = await self._request("runtime/session_submissions", {"session_id": session_id})
         inputs = raw.get("inputs", [])
         if not isinstance(inputs, list):
-            raise MeerkatError("INVALID_RESPONSE", "Invalid session/submissions response")
+            raise MeerkatError("INVALID_RESPONSE", "Invalid runtime/session_submissions response")
         return {
             "inputs": [
                 self._parse_wire_input_state(item)
@@ -2133,15 +2135,15 @@ class MeerkatClient:
             ]
         }
 
-    async def retire(self, session_id: str) -> RuntimeRetireResult:
-        raw = await self._request("session/retire", {"session_id": session_id})
+    async def runtime_retire(self, session_id: str) -> RuntimeRetireResult:
+        raw = await self._request("runtime/session_retire", {"session_id": session_id})
         result = RuntimeRetireResult()
         for key, value in raw.items():
             setattr(result, key, value)
         return result
 
-    async def reset(self, session_id: str) -> RuntimeResetResult:
-        raw = await self._request("session/reset", {"session_id": session_id})
+    async def runtime_reset(self, session_id: str) -> RuntimeResetResult:
+        raw = await self._request("runtime/session_reset", {"session_id": session_id})
         result = RuntimeResetResult()
         for key, value in raw.items():
             setattr(result, key, value)
@@ -2192,27 +2194,27 @@ class MeerkatClient:
             {"mob_id": mob_id, "filter": filter},
         )
 
-    async def status(self, session_id: str) -> RuntimeStateResult:
-        """Return the runtime state for a session via `session/status`."""
-        raw = await self._request("session/status", {"session_id": session_id})
+    async def runtime_status(self, session_id: str) -> RuntimeStateResult:
+        """Return the runtime state for a session via `runtime/session_status`."""
+        raw = await self._request("runtime/session_status", {"session_id": session_id})
         return RuntimeStateResult(**raw)
 
-    async def submit(
+    async def runtime_submit(
         self, session_id: str, input: dict[str, Any]
     ) -> RuntimeAcceptResult:
-        """Submit a runtime input via `session/submit`."""
+        """Submit a runtime input via `runtime/session_submit`."""
         raw = await self._request(
-            "session/submit",
+            "runtime/session_submit",
             {"session_id": session_id, "input": input},
         )
         return RuntimeAcceptResult(**raw)
 
-    async def submission(
+    async def runtime_submission(
         self, session_id: str, input_id: str
     ) -> WireInputState | None:
-        """Read one runtime input state via `session/submission`."""
+        """Read one runtime input state via `runtime/session_submission`."""
         raw = await self._request(
-            "session/submission",
+            "runtime/session_submission",
             {"session_id": session_id, "input_id": input_id},
         )
         if raw is None:

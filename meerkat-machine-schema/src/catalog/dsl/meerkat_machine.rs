@@ -308,6 +308,19 @@ machine! {
             Reset,
             StopRuntimeExecutor,
             Destroy { session_id: SessionId },
+            RecoverInputLifecycle {
+                input_id: String,
+                phase: Enum<InputPhase>,
+                terminal_kind: Option<Enum<InputTerminalKind>>,
+                superseded_by: Option<String>,
+                aggregate_id: Option<String>,
+                abandon_reason: Option<Enum<InputAbandonReason>>,
+                abandon_attempt_count: u64,
+                attempt_count: u64,
+                run_id: Option<String>,
+                boundary_sequence: Option<u64>,
+                lane: Option<Enum<InputLane>>,
+            },
             // Absorbed inputs
             EnsureSessionWithExecutor { session_id: SessionId },
             SetSilentIntents { session_id: SessionId, intents: Set<String> },
@@ -2684,14 +2697,21 @@ machine! {
         // Peer-ingress transport capability ownership (W2-G)
         // =====================================================================
 
-        // AttachSessionIngress: only valid from `Unattached`. Rejects
-        // `MobOwned` → `SessionOwned` silent downgrades by construction.
+        // AttachSessionIngress: valid from `Unattached`, or as an exact
+        // idempotent re-assertion of the already-owned session runtime.
+        // Rejects `MobOwned` → `SessionOwned` silent downgrades by
+        // construction.
         transition AttachSessionIngress {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input AttachSessionIngress { comms_runtime_id }
             guard "session_registered" { self.session_id != None }
-            guard "owner_is_unattached" {
+            guard "owner_allows_session_attach" {
                 self.peer_ingress_owner_kind == PeerIngressOwnerKind::Unattached
+                || (
+                    self.peer_ingress_owner_kind == PeerIngressOwnerKind::SessionOwned
+                    && self.peer_ingress_comms_runtime_id == Some(comms_runtime_id)
+                    && self.peer_ingress_mob_id == None
+                )
             }
             update {
                 self.peer_ingress_owner_kind = PeerIngressOwnerKind::SessionOwned;
@@ -2701,7 +2721,8 @@ machine! {
             to Idle
         }
 
-        // AttachMobIngress: valid from `Unattached` or `SessionOwned`.
+        // AttachMobIngress: valid from `Unattached`, `SessionOwned`, or as
+        // an exact idempotent re-assertion of the same mob-owned runtime.
         // Mob provisioning is allowed to take over a session-owned drain
         // (the spec's promotion case).
         transition AttachMobIngress {
@@ -2711,6 +2732,11 @@ machine! {
             guard "owner_allows_mob_attach" {
                 self.peer_ingress_owner_kind == PeerIngressOwnerKind::Unattached
                 || self.peer_ingress_owner_kind == PeerIngressOwnerKind::SessionOwned
+                || (
+                    self.peer_ingress_owner_kind == PeerIngressOwnerKind::MobOwned
+                    && self.peer_ingress_comms_runtime_id == Some(comms_runtime_id)
+                    && self.peer_ingress_mob_id == Some(mob_id)
+                )
             }
             update {
                 self.peer_ingress_owner_kind = PeerIngressOwnerKind::MobOwned;
@@ -2720,14 +2746,12 @@ machine! {
             to Idle
         }
 
-        // DetachIngress: clear any active ownership back to `Unattached`.
+        // DetachIngress: clear any active ownership back to `Unattached`;
+        // exact no-op detach is accepted as idempotence by the DSL itself.
         transition DetachIngress {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input DetachIngress
             guard "session_registered" { self.session_id != None }
-            guard "owner_is_attached" {
-                self.peer_ingress_owner_kind != PeerIngressOwnerKind::Unattached
-            }
             update {
                 self.peer_ingress_owner_kind = PeerIngressOwnerKind::Unattached;
                 self.peer_ingress_comms_runtime_id = None;
@@ -3227,6 +3251,51 @@ pub enum OperationKind {
     #[default]
     ToolCall,
     Completion,
+}
+
+/// Typed input-lifecycle phase (catalog DSL twin). Closed set of lifecycle
+/// phases written by input authority transitions and recovered through the
+/// machine-owned `RecoverInputLifecycle` input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum InputPhase {
+    #[default]
+    Queued,
+    Staged,
+    Applied,
+    AppliedPendingConsumption,
+    Consumed,
+    Superseded,
+    Coalesced,
+    Abandoned,
+}
+
+/// Typed input terminal kind (catalog DSL twin). Variant-specific payloads
+/// live in companion fields so the discriminant remains a closed set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum InputTerminalKind {
+    #[default]
+    Consumed,
+    Superseded,
+    Coalesced,
+    Abandoned,
+}
+
+/// Typed input abandon reason (catalog DSL twin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum InputAbandonReason {
+    #[default]
+    StageAttemptsExceeded,
+    ReplacedByNewer,
+    RuntimeReset,
+    RuntimeRetired,
+}
+
+/// Typed work-lane membership for admitted inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum InputLane {
+    #[default]
+    Queue,
+    Steer,
 }
 
 /// Live-topology reconfigure phase (catalog DSL twin of the runtime

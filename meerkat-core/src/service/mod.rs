@@ -7,7 +7,6 @@ pub mod transport;
 
 use crate::event::AgentEvent;
 use crate::event::EventEnvelope;
-use crate::lifecycle::RuntimeExecutionKind;
 use crate::lifecycle::run_primitive::RuntimeTurnMetadata;
 use crate::session::SystemContextStageError;
 use crate::time_compat::SystemTime;
@@ -751,12 +750,6 @@ pub struct StartTurnRequest {
     /// the session layer derives per-turn policy from this typed carrier
     /// instead of re-inferring or dropping fields.
     pub turn_metadata: Option<RuntimeTurnMetadata>,
-    /// Runtime-authored execution intent for the session task.
-    ///
-    /// This is intentionally duplicated out of `turn_metadata` as the narrow
-    /// session dispatch key so non-runtime callers can remain explicit without
-    /// constructing a full metadata carrier.
-    pub execution_kind: Option<RuntimeExecutionKind>,
 }
 
 /// Request to append runtime system context to an existing session.
@@ -973,6 +966,7 @@ pub trait SessionService: Send + Sync {
         _id: &SessionId,
         _client: std::sync::Arc<dyn crate::AgentLlmClient>,
         _identity: SessionLlmIdentity,
+        _request_policy: crate::SessionLlmRequestPolicy,
     ) -> Result<(), SessionError> {
         Err(SessionError::Unsupported(
             "hot_swap_session_llm_identity".to_string(),

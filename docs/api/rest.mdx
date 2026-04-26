@@ -81,15 +81,15 @@ If `--realm` is omitted, the server creates a new isolated opaque realm (`realm-
 | `POST` | `/realtime/status` | Read product-layer realtime status |
 | `GET` | `/auth/profiles` | List auth profiles |
 | `POST` | `/auth/profiles` | Create an auth profile |
-| `GET` | `/auth/profiles/{id}` | Read an auth profile |
-| `DELETE` | `/auth/profiles/{id}` | Delete an auth profile |
-| `POST` | `/auth/profiles/{id}/test` | Test an auth profile binding |
+| `GET` | `/auth/bindings/{binding_id}` | Read a binding-scoped auth profile |
+| `DELETE` | `/auth/bindings/{binding_id}` | Delete binding-scoped credentials |
+| `POST` | `/auth/bindings/{binding_id}/test` | Test a binding resolve path |
 | `POST` | `/auth/login/start` | Start interactive auth login |
 | `POST` | `/auth/login/complete` | Complete interactive auth login |
 | `POST` | `/auth/login/device/start` | Start device-code login |
 | `POST` | `/auth/login/device/complete` | Complete device-code login |
-| `GET` | `/auth/status/{id}` | Read auth status |
-| `POST` | `/auth/logout/{id}` | Log out an auth profile |
+| `GET` | `/auth/bindings/{binding_id}/status` | Read binding auth status |
+| `POST` | `/auth/bindings/{binding_id}/logout` | Log out a binding |
 | `GET` | `/realms` | List configured realms |
 | `GET` | `/realms/{id}` | Read one realm |
 | `GET` | `/mob/{id}/events` | Mob event SSE stream (mob feature) |

@@ -1,5 +1,6 @@
 import { EventSubscription } from './events.js';
 import type {
+  ConnectionRef,
   ContentInput,
   HandlingMode,
   SpawnSpec,
@@ -380,7 +381,13 @@ export class Mob {
   /** Spawn a short-lived helper and return its terminal result. */
   async spawnHelper(
     prompt: string,
-    options?: { agentIdentity?: string; profileName?: string; runtimeMode?: string; backend?: string },
+    options?: {
+      agentIdentity?: string;
+      profileName?: string;
+      connectionRef?: ConnectionRef;
+      runtimeMode?: string;
+      backend?: string;
+    },
   ): Promise<MobHelperResult> {
     const json = await this.bindings.mob_spawn_helper(
       this.mobId,
@@ -388,6 +395,7 @@ export class Mob {
           prompt,
           agent_identity: options?.agentIdentity,
           profile_name: options?.profileName,
+          connection_ref: options?.connectionRef,
           runtime_mode: options?.runtimeMode,
           backend: options?.backend,
         }),
@@ -418,6 +426,7 @@ export class Mob {
     options?: {
       agentIdentity?: string;
       profileName?: string;
+      connectionRef?: ConnectionRef;
       forkContext?: Record<string, unknown>;
       runtimeMode?: string;
       backend?: string;
@@ -430,6 +439,7 @@ export class Mob {
           prompt,
           agent_identity: options?.agentIdentity,
           profile_name: options?.profileName,
+          connection_ref: options?.connectionRef,
           fork_context: options?.forkContext,
           runtime_mode: options?.runtimeMode,
           backend: options?.backend,

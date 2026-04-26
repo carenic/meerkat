@@ -125,6 +125,7 @@ impl SessionAgent for MockAgent {
         &mut self,
         _client: std::sync::Arc<dyn meerkat_core::AgentLlmClient>,
         _identity: meerkat_core::SessionLlmIdentity,
+        _request_policy: meerkat_core::SessionLlmRequestPolicy,
     ) -> Result<(), meerkat_core::error::AgentError> {
         Ok(())
     }
@@ -476,6 +477,7 @@ impl SessionAgent for RealSessionAgent {
         &mut self,
         _client: std::sync::Arc<dyn meerkat_core::AgentLlmClient>,
         _identity: meerkat_core::SessionLlmIdentity,
+        _request_policy: meerkat_core::SessionLlmRequestPolicy,
     ) -> Result<(), meerkat_core::error::AgentError> {
         Ok(())
     }
@@ -555,6 +557,7 @@ impl SessionAgent for CompactionSessionAgent {
         &mut self,
         _client: std::sync::Arc<dyn meerkat_core::AgentLlmClient>,
         _identity: meerkat_core::SessionLlmIdentity,
+        _request_policy: meerkat_core::SessionLlmRequestPolicy,
     ) -> Result<(), meerkat_core::error::AgentError> {
         Ok(())
     }
@@ -809,7 +812,6 @@ fn turn_req(prompt: &str) -> StartTurnRequest {
         skill_references: None,
         flow_tool_overlay: None,
         turn_metadata: None,
-        execution_kind: None,
     }
 }
 
@@ -1464,7 +1466,12 @@ async fn test_apply_runtime_turn_resume_pending_no_boundary_is_typed_terminal() 
     let run_id = meerkat_core::lifecycle::RunId::new();
     let contributing_input_ids = vec![meerkat_core::lifecycle::InputId::new()];
     let mut req = turn_req("");
-    req.execution_kind = Some(meerkat_core::lifecycle::RuntimeExecutionKind::ResumePending);
+    req.turn_metadata = Some(
+        meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+            execution_kind: Some(meerkat_core::lifecycle::RuntimeExecutionKind::ResumePending),
+            ..Default::default()
+        },
+    );
 
     let output = service
         .apply_runtime_turn(

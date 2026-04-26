@@ -1,6 +1,10 @@
 use super::disposal::{
     BulkBestEffort, DisposalContext, DisposalReport, DisposalStep, ErrorPolicy, WarnAndContinue,
 };
+use super::mob_member_lifecycle_authority::{
+    CanonicalMemberSnapshotMaterial, CanonicalMemberStatus, CanonicalSessionObservation,
+    MobMemberLifecycleInput, MobMemberLifecycleProjection,
+};
 use super::mob_runtime_bridge_authority::{MobRuntimeBridgeAuthority, MobRuntimeBridgeEffect};
 use super::provision_guard::PendingProvision;
 use super::transaction::LifecycleRollback;
@@ -57,6 +61,12 @@ enum WiringEndpoint {
         spec: TrustedPeerDescriptor,
         binding: crate::RuntimeBinding,
     },
+}
+
+struct SupervisorPrivateTrustInstall {
+    peer_id: String,
+    epoch: u64,
+    removal_key: String,
 }
 
 /// Resolve the runtime binding for a spawn request.
@@ -398,6 +408,14 @@ impl MobActor {
         Self::trusted_peer_pubkey_string(peer)
     }
 
+    fn supervisor_peer_removal_key(peer_id: &str) -> String {
+        if peer_id.starts_with("ed25519:") {
+            peer_id.to_string()
+        } else {
+            format!("ed25519:{peer_id}")
+        }
+    }
+
     async fn remove_trusted_peer_by_descriptor(
         comms: &dyn CoreCommsRuntime,
         peer: &TrustedPeerDescriptor,
@@ -437,15 +455,236 @@ impl MobActor {
         .map_err(|error| MobError::WiringError(format!("invalid supervisor spec: {error}")))
     }
 
-    async fn install_supervisor_private_trust(
+    async fn install_supervisor_private_trust_for_session(
         &self,
+        session_id: &SessionId,
         comms: &Arc<dyn CoreCommsRuntime>,
-    ) -> Result<(), MobError> {
+        previous_private_trust_removal_key: Option<&str>,
+    ) -> Result<SupervisorPrivateTrustInstall, MobError> {
         let spec = self.supervisor_bridge.supervisor_spec().await?;
-        comms
-            .add_private_trusted_peer(spec)
+        let authority = self.supervisor_bridge.authority().await;
+        #[cfg(feature = "runtime-adapter")]
+        let Some(adapter) = self.runtime_adapter.as_ref() else {
+            return Err(MobError::Internal(format!(
+                "cannot publish supervisor private trust for session '{session_id}': runtime adapter unavailable"
+            )));
+        };
+        #[cfg(not(feature = "runtime-adapter"))]
+        let _ = session_id;
+        #[cfg(not(feature = "runtime-adapter"))]
+        {
+            return Err(MobError::Internal(
+                "cannot publish supervisor private trust without runtime adapter".to_string(),
+            ));
+        }
+
+        #[cfg(feature = "runtime-adapter")]
+        {
+            let next_name = spec.name.as_str().to_owned();
+            let next_peer_id = spec.peer_id.as_str().to_owned();
+            let next_address = spec.address.to_string();
+            let next_epoch = authority.epoch;
+            let previous = adapter.supervisor_binding(session_id).await;
+            let already_bound = matches!(
+                &previous,
+                meerkat_runtime::meerkat_machine::SupervisorBinding::Bound {
+                    name,
+                    peer_id,
+                    address,
+                    epoch,
+                } if name == &next_name
+                    && peer_id == &next_peer_id
+                    && address == &next_address
+                    && *epoch == next_epoch
+            );
+
+            if !already_bound {
+                match &previous {
+                    meerkat_runtime::meerkat_machine::SupervisorBinding::Unbound => {
+                        adapter
+                            .stage_supervisor_bind(
+                                session_id,
+                                next_name.clone(),
+                                next_peer_id.clone(),
+                                next_address.clone(),
+                                next_epoch,
+                            )
+                            .await
+                            .map_err(|error| {
+                                MobError::WiringError(format!(
+                                    "supervisor private trust bind rejected for session '{session_id}': {error}"
+                                ))
+                            })?;
+                    }
+                    meerkat_runtime::meerkat_machine::SupervisorBinding::Bound { .. } => {
+                        adapter
+                            .stage_supervisor_authorize(
+                                session_id,
+                                next_name.clone(),
+                                next_peer_id.clone(),
+                                next_address.clone(),
+                                next_epoch,
+                            )
+                            .await
+                            .map_err(|error| {
+                                MobError::WiringError(format!(
+                                    "supervisor private trust rotation rejected for session '{session_id}': {error}"
+                                ))
+                            })?;
+                    }
+                    _ => {
+                        return Err(MobError::WiringError(format!(
+                            "supervisor private trust publication for session '{session_id}' saw an unknown supervisor binding variant"
+                        )));
+                    }
+                }
+            }
+
+            if let Err(error) = comms.add_private_trusted_peer(spec.clone()).await {
+                let _ = adapter
+                    .stage_supervisor_trust_publish_failed(
+                        session_id,
+                        next_peer_id.clone(),
+                        next_epoch,
+                        error.to_string(),
+                    )
+                    .await;
+                let rollback = self
+                    .rollback_supervisor_private_trust_binding(
+                        adapter,
+                        session_id,
+                        &previous,
+                        &next_peer_id,
+                        next_epoch,
+                    )
+                    .await;
+                let mut reason = format!(
+                    "supervisor private trust publication failed for session '{session_id}': {error}"
+                );
+                if let Err(rollback_error) = rollback {
+                    reason.push_str(&format!("; rollback failed: {rollback_error}"));
+                }
+                return Err(MobError::WiringError(reason));
+            }
+
+            adapter
+                .stage_supervisor_trust_published(session_id, next_peer_id.clone(), next_epoch)
+                .await
+                .map_err(|error| {
+                    MobError::WiringError(format!(
+                        "supervisor private trust publication ack rejected for session '{session_id}': {error}"
+                    ))
+                })?;
+
+            if let meerkat_runtime::meerkat_machine::SupervisorBinding::Bound {
+                peer_id: previous_peer_id,
+                ..
+            } = &previous
+                && previous_peer_id != &next_peer_id
+            {
+                let previous_removal_key = previous_private_trust_removal_key
+                    .map(str::to_string)
+                    .unwrap_or_else(|| Self::supervisor_peer_removal_key(previous_peer_id));
+                if let Err(error) = comms
+                    .remove_private_trusted_peer(&previous_removal_key)
+                    .await
+                {
+                    let rollback = self
+                        .rollback_supervisor_private_trust_binding(
+                            adapter,
+                            session_id,
+                            &previous,
+                            &next_peer_id,
+                            next_epoch,
+                        )
+                        .await;
+                    let next_removal_key = Self::trusted_peer_pubkey_string(&spec);
+                    let cleanup = comms.remove_private_trusted_peer(&next_removal_key).await;
+                    let mut reason = format!(
+                        "previous supervisor private trust removal failed for session '{session_id}': {error}"
+                    );
+                    if let Err(rollback_error) = rollback {
+                        reason.push_str(&format!("; rollback failed: {rollback_error}"));
+                    }
+                    if let Err(cleanup_error) = cleanup {
+                        reason.push_str(&format!(
+                            "; cleanup failed while removing new supervisor trust: {cleanup_error}"
+                        ));
+                    }
+                    return Err(MobError::WiringError(reason));
+                }
+            }
+
+            Ok(SupervisorPrivateTrustInstall {
+                peer_id: next_peer_id,
+                epoch: next_epoch,
+                removal_key: Self::trusted_peer_pubkey_string(&spec),
+            })
+        }
+    }
+
+    async fn cleanup_supervisor_private_trust_for_session(
+        &self,
+        session_id: &SessionId,
+        comms: &Arc<dyn CoreCommsRuntime>,
+        install: &SupervisorPrivateTrustInstall,
+    ) {
+        if let Err(error) = comms
+            .remove_private_trusted_peer(&install.removal_key)
             .await
-            .map_err(MobError::from)
+        {
+            tracing::warn!(
+                %session_id,
+                peer_id = %install.peer_id,
+                epoch = install.epoch,
+                %error,
+                "failed to clean up supervisor private trust"
+            );
+        }
+        #[cfg(feature = "runtime-adapter")]
+        if let Some(adapter) = self.runtime_adapter.as_ref() {
+            let _ = adapter
+                .stage_supervisor_trust_revoked(session_id, install.peer_id.clone(), install.epoch)
+                .await;
+            let _ = adapter
+                .stage_supervisor_revoke(session_id, install.peer_id.clone(), install.epoch)
+                .await;
+        }
+    }
+
+    #[cfg(feature = "runtime-adapter")]
+    async fn rollback_supervisor_private_trust_binding(
+        &self,
+        adapter: &Arc<meerkat_runtime::MeerkatMachine>,
+        session_id: &SessionId,
+        previous: &meerkat_runtime::meerkat_machine::SupervisorBinding,
+        current_peer_id: &str,
+        current_epoch: u64,
+    ) -> Result<(), MobError> {
+        match previous {
+            meerkat_runtime::meerkat_machine::SupervisorBinding::Unbound => adapter
+                .stage_supervisor_revoke(session_id, current_peer_id.to_string(), current_epoch)
+                .await
+                .map_err(|error| MobError::WiringError(error.to_string())),
+            meerkat_runtime::meerkat_machine::SupervisorBinding::Bound {
+                name,
+                peer_id,
+                address,
+                epoch,
+            } => adapter
+                .stage_supervisor_authorize(
+                    session_id,
+                    name.clone(),
+                    peer_id.clone(),
+                    address.clone(),
+                    *epoch,
+                )
+                .await
+                .map_err(|error| MobError::WiringError(error.to_string())),
+            _ => Err(MobError::WiringError(
+                "unknown supervisor binding variant during rollback".to_string(),
+            )),
+        }
     }
 
     async fn bridge_supervisor_payload(
@@ -597,6 +836,7 @@ impl MobActor {
     ) -> Result<TrustedPeerDescriptor, MobError> {
         let payload = self.bridge_supervisor_payload().await?;
         let command = super::bridge_protocol::BridgeCommand::AuthorizeSupervisor(payload);
+        self.supervisor_bridge.trust_recipient(peer).await?;
         let value = self
             .supervisor_bridge
             .send_bridge_command(peer, &command, std::time::Duration::from_secs(30))
@@ -642,6 +882,7 @@ impl MobActor {
         command: &super::bridge_protocol::BridgeCommand,
         timeout: std::time::Duration,
     ) -> Result<R, MobError> {
+        self.supervisor_bridge.trust_recipient(peer).await?;
         let value = self
             .supervisor_bridge
             .send_bridge_command(peer, command, timeout)
@@ -960,6 +1201,200 @@ impl MobActor {
             .chain(self.dsl_authority.state.member_startup_ready.iter())
             .map(|runtime_id| runtime_id.0.clone())
             .collect()
+    }
+
+    fn machine_projection_for_identity(
+        &self,
+        agent_identity: &crate::ids::AgentIdentity,
+    ) -> super::state::MobMemberMachineProjection {
+        let dsl_identity = mob_dsl::AgentIdentity::from_domain(agent_identity);
+        let dsl = &self.dsl_authority.state;
+        let runtime_id = dsl.identity_to_runtime.get(&dsl_identity).cloned();
+        let state_marker = runtime_id
+            .as_ref()
+            .and_then(|runtime_id| dsl.member_state_markers.get(runtime_id).copied());
+        let live_runtime = runtime_id
+            .as_ref()
+            .is_some_and(|runtime_id| dsl.live_runtime_ids.contains(runtime_id));
+        let bound_session_id = dsl.member_session_bindings.get(&dsl_identity).cloned();
+        super::state::MobMemberMachineProjection {
+            runtime_id,
+            state_marker,
+            live_runtime,
+            bound_session_id,
+        }
+    }
+
+    async fn machine_member_material(
+        &self,
+        agent_identity: &MeerkatId,
+        include_session_details: bool,
+    ) -> CanonicalMemberSnapshotMaterial {
+        let (roster_entry, current_bridge_session_id) = {
+            let roster = self.roster.read().await;
+            match roster.get(agent_identity) {
+                Some(entry) => (
+                    Some(entry.clone()),
+                    entry.member_ref.bridge_session_id().cloned(),
+                ),
+                None => (None, None),
+            }
+        };
+        let domain_identity = crate::ids::AgentIdentity::from(agent_identity.as_str());
+        let machine_projection = self.machine_projection_for_identity(&domain_identity);
+        let machine_bridge_session_id = machine_projection
+            .bound_session_id
+            .as_ref()
+            .and_then(|dsl_session_id| SessionId::parse(&dsl_session_id.0).ok());
+        let current_bridge_session_id = current_bridge_session_id.or(machine_bridge_session_id);
+        let member_present = roster_entry.is_some();
+        let mut machine_status = MobMemberLifecycleProjection::machine_status(
+            member_present,
+            machine_projection.runtime_id.is_some(),
+            machine_projection.state_marker,
+            machine_projection.live_runtime,
+        );
+        if roster_entry
+            .as_ref()
+            .is_some_and(|entry| entry.state == crate::roster::MemberState::Retiring)
+        {
+            machine_status = CanonicalMemberStatus::Retiring;
+        }
+
+        let restore_failure = {
+            self.restore_diagnostics
+                .read()
+                .await
+                .get(agent_identity)
+                .cloned()
+        };
+        if let Some(diag) = restore_failure {
+            return MobMemberLifecycleProjection::materialize(MobMemberLifecycleInput {
+                member_present,
+                machine_status,
+                session_observation: CanonicalSessionObservation::Missing,
+                restore_failure: Some(diag.reason),
+                output_preview: None,
+                tokens_used: 0,
+                agent_runtime_id: roster_entry
+                    .as_ref()
+                    .map(|entry| entry.agent_runtime_id.clone())
+                    .unwrap_or_else(|| {
+                        crate::ids::AgentRuntimeId::initial(crate::ids::AgentIdentity::from(
+                            agent_identity.as_str(),
+                        ))
+                    }),
+                fence_token: roster_entry
+                    .as_ref()
+                    .map(|entry| entry.fence_token)
+                    .unwrap_or(crate::ids::FenceToken::new(0)),
+                current_bridge_session_id: diag.bridge_session_id,
+                peer_connectivity: None,
+                kickoff: roster_entry
+                    .as_ref()
+                    .and_then(|entry| entry.kickoff.clone()),
+            });
+        }
+
+        let (output_preview, tokens_used, session_observation) =
+            match current_bridge_session_id.as_ref() {
+                None => {
+                    let session_observation =
+                        match roster_entry.as_ref().map(|entry| &entry.member_ref) {
+                            Some(MemberRef::BackendPeer {
+                                session_id: None, ..
+                            }) => CanonicalSessionObservation::Unknown,
+                            _ => CanonicalSessionObservation::Missing,
+                        };
+                    (None, 0, session_observation)
+                }
+                Some(bridge_session_id) if include_session_details => {
+                    match self.session_service.read(bridge_session_id).await {
+                        Ok(view) => (
+                            view.state.last_assistant_text.clone(),
+                            view.billing.total_tokens,
+                            if view.state.is_active {
+                                CanonicalSessionObservation::Active
+                            } else {
+                                CanonicalSessionObservation::Inactive
+                            },
+                        ),
+                        Err(meerkat_core::service::SessionError::NotFound { .. }) => {
+                            (None, 0, CanonicalSessionObservation::Missing)
+                        }
+                        Err(_) => (None, 0, CanonicalSessionObservation::Unknown),
+                    }
+                }
+                Some(_) => (None, 0, CanonicalSessionObservation::Unknown),
+            };
+
+        MobMemberLifecycleProjection::materialize(MobMemberLifecycleInput {
+            member_present,
+            machine_status,
+            session_observation,
+            restore_failure: None,
+            output_preview,
+            tokens_used,
+            agent_runtime_id: roster_entry
+                .as_ref()
+                .map(|entry| entry.agent_runtime_id.clone())
+                .unwrap_or_else(|| {
+                    crate::ids::AgentRuntimeId::initial(crate::ids::AgentIdentity::from(
+                        agent_identity.as_str(),
+                    ))
+                }),
+            fence_token: roster_entry
+                .as_ref()
+                .map(|entry| entry.fence_token)
+                .unwrap_or(crate::ids::FenceToken::new(0)),
+            current_bridge_session_id,
+            peer_connectivity: None,
+            kickoff: roster_entry.and_then(|entry| entry.kickoff),
+        })
+    }
+
+    async fn project_member_list_from_machine(
+        &self,
+        include_retiring: bool,
+    ) -> Vec<MobMemberListEntry> {
+        let entries: Vec<_> = {
+            let roster = self.roster.read().await;
+            if include_retiring {
+                roster.list_all().cloned().collect()
+            } else {
+                roster.list().cloned().collect()
+            }
+        };
+        let mut projected = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let snapshot = self
+                .machine_member_material(&entry.agent_identity, false)
+                .await
+                .to_snapshot();
+            let current_bridge_session_id = snapshot.current_bridge_session_id().cloned();
+            projected.push(
+                MobMemberListEntry {
+                    agent_identity: entry.agent_identity,
+                    agent_runtime_id: entry.agent_runtime_id,
+                    fence_token: entry.fence_token,
+                    role: entry.role,
+                    runtime_mode: entry.runtime_mode,
+                    peer_id: entry.peer_id,
+                    state: entry.state,
+                    wired_to: entry.wired_to,
+                    external_peer_specs: entry.external_peer_specs,
+                    labels: entry.labels,
+                    status: snapshot.status,
+                    error: snapshot.error,
+                    is_final: snapshot.is_final,
+                    current_session_id: None,
+                    current_bridge_session_id: None,
+                    kickoff: snapshot.kickoff,
+                }
+                .with_current_bridge_session_id(current_bridge_session_id),
+            );
+        }
+        projected
     }
 
     fn mob_handle_for_tools(&self) -> MobHandle {
@@ -1384,7 +1819,7 @@ impl MobActor {
                                 skill_references: None,
                                 flow_tool_overlay: None,
                                 turn_metadata: None,
-                                execution_kind: None,
+
                             },
                         )
                         .await
@@ -2392,26 +2827,30 @@ impl MobActor {
                         ready_runtime_ids: self.ready_runtime_ids_from_dsl(),
                     });
                 }
+                MobCommand::ProjectMemberList {
+                    include_retiring,
+                    reply_tx,
+                } => {
+                    let _ = reply_tx.send(
+                        self.project_member_list_from_machine(include_retiring)
+                            .await,
+                    );
+                }
+                MobCommand::ProjectMemberStatus {
+                    agent_identity,
+                    reply_tx,
+                } => {
+                    let _ = reply_tx.send(
+                        self.machine_member_material(&MeerkatId::from(&agent_identity), true)
+                            .await
+                            .to_snapshot(),
+                    );
+                }
                 MobCommand::MemberMachineProjection {
                     agent_identity,
                     reply_tx,
                 } => {
-                    let dsl_identity = mob_dsl::AgentIdentity::from_domain(&agent_identity);
-                    let dsl = &self.dsl_authority.state;
-                    let runtime_id = dsl.identity_to_runtime.get(&dsl_identity).cloned();
-                    let state_marker = runtime_id
-                        .as_ref()
-                        .and_then(|runtime_id| dsl.member_state_markers.get(runtime_id).copied());
-                    let live_runtime = runtime_id
-                        .as_ref()
-                        .is_some_and(|runtime_id| dsl.live_runtime_ids.contains(runtime_id));
-                    let bound_session_id = dsl.member_session_bindings.get(&dsl_identity).cloned();
-                    let _ = reply_tx.send(super::state::MobMemberMachineProjection {
-                        runtime_id,
-                        state_marker,
-                        live_runtime,
-                        bound_session_id,
-                    });
+                    let _ = reply_tx.send(self.machine_projection_for_identity(&agent_identity));
                 }
                 MobCommand::CurrentRealtimeBinding {
                     agent_identity,
@@ -2603,27 +3042,6 @@ impl MobActor {
                     ) {
                         let _ = reply_tx.send(Err(super::handle::MobDestroyError::Mob(error)));
                         continue;
-                    }
-                    // Reject before side effects like pending-spawn failure if the
-                    // DSL authority would not accept Destroy in the current phase.
-                    {
-                        let mut probe = mob_dsl::MobMachineAuthority::from_state(
-                            self.dsl_authority.state.clone(),
-                        );
-                        if mob_dsl::MobMachineMutator::apply(
-                            &mut probe,
-                            mob_dsl::MobMachineInput::Destroy,
-                        )
-                        .is_err()
-                        {
-                            let _ = reply_tx.send(Err(super::handle::MobDestroyError::Mob(
-                                MobError::InvalidTransition {
-                                    from: self.state(),
-                                    to: MobState::Destroyed,
-                                },
-                            )));
-                            continue;
-                        }
                     }
                     self.fail_all_pending_spawns("mob is destroying").await;
                     let result = self.handle_destroy().await;
@@ -4035,12 +4453,65 @@ impl MobActor {
             "finalize_spawn_from_pending_dsl_spawn",
         )?;
 
+        let supervisor_private_trust_install = if let (Some(session_id), Some(comms)) = (
+            provision.member_ref().bridge_session_id().cloned(),
+            self.provisioner_comms(provision.member_ref()).await,
+        ) {
+            match self
+                .install_supervisor_private_trust_for_session(&session_id, &comms, None)
+                .await
+            {
+                Ok(install) => Some((session_id, comms, install)),
+                Err(error) => {
+                    let _ = self.apply_dsl_input(
+                        mob_dsl::MobMachineInput::Retire {
+                            agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(
+                                &agent_runtime_id,
+                            ),
+                            agent_identity: dsl_identity.clone(),
+                            releasing: self
+                                .dsl_authority
+                                .state
+                                .member_session_bindings
+                                .get(&dsl_identity)
+                                .cloned(),
+                            session_id: self
+                                .dsl_authority
+                                .state
+                                .member_session_bindings
+                                .get(&dsl_identity)
+                                .cloned()
+                                .unwrap_or_else(mob_dsl::SessionId::default),
+                        },
+                        "finalize_spawn_supervisor_trust_failed_retire_dsl",
+                    );
+                    if let Some(session_id) = provision.member_ref().bridge_session_id() {
+                        self.discard_pending_routed_effects_for_session(session_id);
+                    }
+                    if let Err(rollback_error) = provision.rollback().await {
+                        return Err(MobError::Internal(format!(
+                            "spawn supervisor private trust failed for '{agent_identity}': {error}; archive compensation failed: {rollback_error}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+
         if let Some(overlay_record) = overlay_record.as_ref() {
             if let Err(error) = self
                 .runtime_metadata
                 .upsert_external_binding_overlay(&self.definition.id, overlay_record)
                 .await
             {
+                if let Some((session_id, comms, install)) =
+                    supervisor_private_trust_install.as_ref()
+                {
+                    self.cleanup_supervisor_private_trust_for_session(session_id, comms, install)
+                        .await;
+                }
                 let _ = self.apply_dsl_input(
                     mob_dsl::MobMachineInput::Retire {
                         agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&agent_runtime_id),
@@ -4100,6 +4571,10 @@ impl MobActor {
                     .delete_external_binding_overlay_for_member(&identity, generation)
                     .await;
             }
+            if let Some((session_id, comms, install)) = supervisor_private_trust_install.as_ref() {
+                self.cleanup_supervisor_private_trust_for_session(session_id, comms, install)
+                    .await;
+            }
             let _ = self.apply_dsl_input(
                 mob_dsl::MobMachineInput::Retire {
                     agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&agent_runtime_id),
@@ -4135,9 +4610,6 @@ impl MobActor {
         // From this point, rollback_failed_spawn handles cleanup via the
         // disposal pipeline.
         let member_ref = provision.commit()?;
-        if let Some(comms) = self.provisioner_comms(&member_ref).await {
-            self.install_supervisor_private_trust(&comms).await?;
-        }
         self.restore_diagnostics
             .write()
             .await
@@ -7113,6 +7585,56 @@ impl MobActor {
         }
     }
 
+    async fn dispose_local_member_after_destroy_admission(
+        &mut self,
+        entry: RosterEntry,
+        report: &mut super::handle::MobDestroyReport,
+    ) -> Result<(), super::handle::MobDestroyError> {
+        {
+            let mut roster = self.roster.write().await;
+            roster.mark_retiring_by_identity(&entry.agent_identity);
+        }
+        let ctx = self
+            .disposal_context_from_entry(&entry.agent_identity, &entry)
+            .await;
+        let mut policy = BulkBestEffort;
+        let disposal_report = self.dispose_member(&ctx, &mut policy).await;
+        if let Some((_, error)) = disposal_report
+            .skipped
+            .iter()
+            .find(|(step, _)| *step == DisposalStep::ArchiveSession)
+        {
+            report.push_error(format!(
+                "{}: disposal completed but ArchiveSession failed: {error}",
+                entry.agent_identity
+            ));
+            return Err(super::handle::MobDestroyError::Incomplete {
+                report: report.clone(),
+            });
+        }
+        if let Some((step, error)) = &disposal_report.aborted_at
+            && *step == DisposalStep::ArchiveSession
+        {
+            report.push_error(format!(
+                "{}: disposal aborted at ArchiveSession: {error}",
+                entry.agent_identity
+            ));
+            return Err(super::handle::MobDestroyError::Incomplete {
+                report: report.clone(),
+            });
+        }
+        if let Err(error) = self
+            .delete_external_binding_overlay_for_member(&entry.agent_identity, entry.generation)
+            .await
+        {
+            report.push_error(error.to_string());
+            return Err(super::handle::MobDestroyError::Incomplete {
+                report: report.clone(),
+            });
+        }
+        Ok(())
+    }
+
     async fn handle_destroy(
         &mut self,
     ) -> Result<super::handle::MobDestroyReport, super::handle::MobDestroyError> {
@@ -7125,39 +7647,49 @@ impl MobActor {
         self.ensure_flow_tracker_alignment("handle_destroy preflight")
             .await
             .map_err(MobDestroyError::from)?;
-        {
-            let mut probe =
-                mob_dsl::MobMachineAuthority::from_state(self.dsl_authority.state.clone());
-            if mob_dsl::MobMachineMutator::apply(&mut probe, mob_dsl::MobMachineInput::Destroy)
-                .is_err()
-            {
-                return Err(MobDestroyError::from(MobError::InvalidTransition {
-                    from: self.state(),
-                    to: MobState::Destroyed,
-                }));
-            }
-        }
-        self.cancel_all_flow_tasks()
-            .await
-            .map_err(MobDestroyError::from)?;
-        self.notify_orchestrator_lifecycle(format!("Mob '{}' is destroying.", self.definition.id))
-            .await;
         let entries = {
             let roster = self.roster.read().await;
             roster.list_all().cloned().collect::<Vec<_>>()
         };
+        if self.has_orchestrator {
+            let mut probe =
+                mob_dsl::MobMachineAuthority::from_state(self.dsl_authority.state.clone());
+            if probe
+                .apply_signal(mob_dsl::MobMachineSignal::StopOrchestrator)
+                .is_ok()
+                && let Err(error) = self.apply_dsl_signal(
+                    mob_dsl::MobMachineSignal::StopOrchestrator,
+                    "stop_orchestrator_destroy",
+                )
+            {
+                return Err(MobError::Internal(format!(
+                    "orchestrator StopOrchestrator transition failed during destroy: {error}"
+                ))
+                .into());
+            }
+            self.apply_dsl_signal(
+                mob_dsl::MobMachineSignal::DestroyOrchestrator,
+                "destroy_orchestrator",
+            )
+            .map_err(MobDestroyError::from)?;
+        }
+        self.apply_dsl_input(mob_dsl::MobMachineInput::Destroy, "destroy_input")
+            .map_err(MobDestroyError::from)?;
+        self.flush_routed_effects()
+            .await
+            .map_err(MobDestroyError::from)?;
+        self.cancel_all_flow_tasks_after_destroy()
+            .await
+            .map_err(MobDestroyError::from)?;
+        self.notify_orchestrator_lifecycle(format!("Mob '{}' is destroying.", self.definition.id))
+            .await;
         let (remote_entries, local_entries): (Vec<_>, Vec<_>) = entries
             .into_iter()
             .partition(|entry| Self::runtime_binding_for_entry(entry).is_some());
 
         for entry in local_entries {
-            if let Err(error) = self
-                .handle_retire_inner(&entry.agent_identity, true, false)
-                .await
-            {
-                report.push_error(error.to_string());
-                return Err(MobDestroyError::Incomplete { report });
-            }
+            self.dispose_local_member_after_destroy_admission(entry, &mut report)
+                .await?;
         }
         self.destroy_remote_members_for_destroy(remote_entries, &mut report)
             .await;
@@ -7193,34 +7725,6 @@ impl MobActor {
         }
         report.namespace_cleaned = true;
         self.edge_locks.clear().await;
-        // Transition through StopOrchestrator then Destroy.
-        if self.has_orchestrator {
-            // Check if DSL allows StopOrchestrator
-            {
-                let mut probe =
-                    mob_dsl::MobMachineAuthority::from_state(self.dsl_authority.state.clone());
-                if probe
-                    .apply_signal(mob_dsl::MobMachineSignal::StopOrchestrator)
-                    .is_ok()
-                    && let Err(error) = self.apply_dsl_signal(
-                        mob_dsl::MobMachineSignal::StopOrchestrator,
-                        "stop_orchestrator_destroy",
-                    )
-                {
-                    return Err(MobError::Internal(format!(
-                        "orchestrator StopOrchestrator transition failed during destroy: {error}"
-                    ))
-                    .into());
-                }
-            }
-            self.apply_dsl_signal(
-                mob_dsl::MobMachineSignal::DestroyOrchestrator,
-                "destroy_orchestrator",
-            )
-            .map_err(MobDestroyError::from)?;
-        }
-        self.apply_dsl_input(mob_dsl::MobMachineInput::Destroy, "destroy_input")
-            .map_err(MobDestroyError::from)?;
         self.ensure_pending_spawn_alignment("handle_destroy completion")
             .map_err(|error| {
                 let mut report = report.clone();
@@ -7290,6 +7794,7 @@ impl MobActor {
                 let peer = Self::peer_only_spec_for_binding(&binding, "handle_rotate_supervisor")?;
                 let mut effective_peer = peer.clone();
                 let mut effective_binding = binding.clone();
+                self.supervisor_bridge.trust_recipient(&peer).await?;
                 let authorize_result = self
                     .supervisor_bridge
                     .send_bridge_command(&peer, &next_command, std::time::Duration::from_secs(5))
@@ -7422,8 +7927,7 @@ impl MobActor {
             .put_supervisor_authority(&self.definition.id, next)
             .await?;
         self.supervisor_bridge.rotate(next.clone()).await?;
-        let previous_spec = Self::supervisor_spec_for_authority(&self.definition.id, current)?;
-        let next_spec = self.supervisor_bridge.supervisor_spec().await?;
+        let previous_private_trust_removal_key = current.keypair().public_key().to_pubkey_string();
         let session_member_refs = {
             let roster = self.roster.read().await;
             roster
@@ -7435,14 +7939,16 @@ impl MobActor {
                 .collect::<Vec<_>>()
         };
         for member_ref in session_member_refs {
-            if let Some(comms) = self.provisioner_comms(&member_ref).await {
-                let _ = comms
-                    .remove_private_trusted_peer(&Self::trusted_peer_pubkey_string(&previous_spec))
-                    .await;
-                comms
-                    .add_private_trusted_peer(next_spec.clone())
-                    .await
-                    .map_err(MobError::from)?;
+            if let (Some(session_id), Some(comms)) = (
+                member_ref.bridge_session_id().cloned(),
+                self.provisioner_comms(&member_ref).await,
+            ) {
+                self.install_supervisor_private_trust_for_session(
+                    &session_id,
+                    &comms,
+                    Some(&previous_private_trust_removal_key),
+                )
+                .await?;
             }
         }
         Ok(())
@@ -7923,7 +8429,6 @@ impl MobActor {
                     skill_references: None,
                     flow_tool_overlay: None,
                     turn_metadata: None,
-                    execution_kind: None,
                 };
                 self.provisioner.start_turn(&entry.member_ref, req).await?;
                 Ok(())
@@ -8352,6 +8857,35 @@ impl MobActor {
             let _ = self.run_cancel_tokens.remove(&run_id);
         }
         self.ensure_flow_tracker_alignment("cancel_all_flow_tasks completion")
+            .await?;
+        Ok(())
+    }
+
+    async fn cancel_all_flow_tasks_after_destroy(&mut self) -> Result<(), MobError> {
+        self.ensure_pending_spawn_alignment("cancel_all_flow_tasks_after_destroy preflight")?;
+        let tracked_run_ids = self.run_cancel_tokens.keys().cloned().collect::<Vec<_>>();
+        for run_id in tracked_run_ids {
+            let Some((token, flow_id)) = self
+                .run_cancel_tokens
+                .get(&run_id)
+                .map(|(token, flow_id)| (token.clone(), flow_id.clone()))
+            else {
+                continue;
+            };
+
+            token.cancel();
+            if let Some(handle) = self.run_tasks.remove(&run_id) {
+                handle.abort();
+            }
+            self.flow_streams.lock().await.remove(&run_id);
+
+            self.flow_engine.cancel_dispatched_steps(&run_id).await?;
+            self.flow_engine
+                .terminalize_canceled(run_id.clone(), flow_id)
+                .await?;
+            let _ = self.run_cancel_tokens.remove(&run_id);
+        }
+        self.ensure_flow_tracker_alignment("cancel_all_flow_tasks_after_destroy completion")
             .await?;
         Ok(())
     }

@@ -27,6 +27,23 @@ pub struct MemoryResult {
     pub score: f32,
 }
 
+/// Typed owner/scope for semantic memory retrieval.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemorySearchScope {
+    /// The session whose indexed memory is visible to this search.
+    pub session_id: crate::types::SessionId,
+}
+
+impl MemorySearchScope {
+    pub fn for_session(session_id: crate::types::SessionId) -> Self {
+        Self { session_id }
+    }
+
+    pub fn includes(&self, metadata: &MemoryMetadata) -> bool {
+        metadata.session_id == self.session_id
+    }
+}
+
 /// Semantic memory store for indexing and searching conversation history.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -37,6 +54,7 @@ pub trait MemoryStore: Send + Sync {
     /// Semantic search: return up to `limit` results ordered by relevance.
     async fn search(
         &self,
+        scope: &MemorySearchScope,
         query: &str,
         limit: usize,
     ) -> Result<Vec<MemoryResult>, MemoryStoreError>;
