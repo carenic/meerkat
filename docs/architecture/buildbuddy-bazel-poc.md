@@ -256,6 +256,9 @@ to roughly `4-6s` once those lanes were prepared.
   `owned-fast-test`.
 - For an integration test file edit, pass the test file path to
   `owned-fast-test`; the selector targets the exact Bazel test when it is fast.
+  Non-fast e2e/system/live test edits stay honest by compiling and linting the
+  exact Bazel test target when one exists, without broadening the run lane to
+  unrelated package fast tests.
 - For a shared integration-test support file edit, pass the support path to
   `owned-fast-test`; the selector targets only the fast tests that import it.
   If the local lane is warm, `owned-fast-test-local` can beat remote execution

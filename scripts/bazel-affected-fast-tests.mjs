@@ -168,6 +168,19 @@ function hasFastSuite(pkg) {
   return existsSync(buildFile) && readFileSync(buildFile, "utf8").includes('name = "fast_tests"');
 }
 
+const buildFileContents = new Map();
+
+function hasBazelTarget(pkg, name) {
+  const buildFile = resolve(root, packageDir(pkg), "BUILD.bazel");
+  if (!existsSync(buildFile)) return false;
+  let contents = buildFileContents.get(buildFile);
+  if (contents === undefined) {
+    contents = readFileSync(buildFile, "utf8");
+    buildFileContents.set(buildFile, contents);
+  }
+  return contents.includes(`name = "${name}"`);
+}
+
 function crateName(name) {
   return name.replaceAll("-", "_");
 }
@@ -229,14 +242,17 @@ function isFastTest(pkg, target) {
     .some((tag) => haystack.includes(tag));
 }
 
-function exactFastTestLabelForFile(file, pkg) {
+function exactTestLabelForFile(file, pkg, { fastOnly = false } = {}) {
   const normalized = file.replaceAll("\\", "/").replace(/^\.\//, "");
   const labels = [];
   for (const target of pkg.targets) {
     if (!target.kind.includes("test")) continue;
-    if (!isFastTest(pkg, target)) continue;
+    if (target["required-features"]?.length) continue;
+    if (fastOnly && !isFastTest(pkg, target)) continue;
+    const targetName = `${crateName(target.name)}_test`;
+    if (!hasBazelTarget(pkg, targetName)) continue;
     if (testSourcePaths(target, pkg).has(normalized)) {
-      labels.push(`//${packageDir(pkg)}:${crateName(target.name)}_test`);
+      labels.push(`//${packageDir(pkg)}:${targetName}`);
     }
   }
   return labels;
@@ -319,11 +335,19 @@ for (const file of files) {
   if (file.endsWith("BUILD.bazel") || file === "BUILD.bazel") continue;
   const pkg = packageForFile(file);
   if (pkg) {
-    const exactLabel = (args.kind === "test" || args.kind === "clippy") && args.mode === "owned"
-      ? exactFastTestLabelForFile(file, pkg)
-      : null;
-    if (exactLabel?.length) {
-      for (const label of exactLabel) exactLabels.add(label);
+    const exactTestLabels = args.mode === "owned"
+      ? exactTestLabelForFile(file, pkg, { fastOnly: args.kind === "test" })
+      : [];
+    if (exactTestLabels.length) {
+      for (const label of exactTestLabels) exactLabels.add(label);
+    } else if (
+      args.mode === "owned" &&
+      args.kind === "test" &&
+      exactTestLabelForFile(file, pkg).length
+    ) {
+      // Non-fast tests are still compiled and linted by the build/clippy
+      // selectors, but the fast test selector should not broaden to the whole
+      // package just because an e2e/system/live test source changed.
     } else {
       seedIds.add(pkg.id);
     }
@@ -342,7 +366,10 @@ const selectedPackages = [...selectedIds]
   .map((id) => byId.get(id))
   .filter(Boolean);
 const labels = args.kind === "build"
-  ? selectedPackages.flatMap(buildLabels).sort()
+  ? [
+    ...exactLabels,
+    ...selectedPackages.flatMap(buildLabels),
+  ].sort()
   : args.kind === "clippy"
   ? [
     ...exactLabels,
@@ -355,8 +382,10 @@ const labels = args.kind === "build"
       .map((pkg) => `//${packageDir(pkg)}:fast_tests`),
   ].sort();
 
-if (labels.length) {
-  console.log(labels.join(" "));
+const uniqueLabels = [...new Set(labels)].sort();
+
+if (uniqueLabels.length) {
+  console.log(uniqueLabels.join(" "));
 } else if (args.emptyIfNoLabels) {
   console.log("");
 } else {
