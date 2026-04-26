@@ -2,11 +2,12 @@
 set -euo pipefail
 
 base_ref="${CARGO_AGENT_BASE:-}"
+dry_run=0
 paths=()
 
 usage() {
   cat <<'EOF'
-usage: cargo-agent-gate [--base <rev>] [path ...]
+usage: cargo-agent-gate [--base <rev>] [--dry-run] [path ...]
 
 Runs the default Cargo gate most useful for local agent edits. If paths are not
 provided, the script derives changed files from branch, staged, unstaged, and
@@ -30,6 +31,10 @@ while [[ $# -gt 0 ]]; do
     -h | --help)
       usage
       exit 0
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
       ;;
     --)
       shift
@@ -146,6 +151,11 @@ printf '  %s\n' "${relevant[@]}"
 
 if [[ "${global}" -eq 1 ]]; then
   echo "Global Rust build/test configuration changed; running workspace Cargo gate."
+  if [[ "${dry_run}" -eq 1 ]]; then
+    echo "DRY-RUN $CARGO fast --no-run"
+    echo "DRY-RUN $CARGO clippy --workspace --all-targets --all-features -- -D warnings"
+    exit 0
+  fi
   "$CARGO" fast --no-run
   "$CARGO" clippy --workspace --all-targets --all-features -- -D warnings
   exit 0
@@ -185,6 +195,16 @@ done
 
 printf 'Cargo agent gate packages:\n'
 printf '  %s\n' "${!package_names[@]}"
+
+if [[ "${dry_run}" -eq 1 ]]; then
+  printf 'DRY-RUN %s clippy' "$CARGO"
+  printf ' %q' "${pkg_flags[@]}"
+  printf ' --all-targets --all-features -- -D warnings\n'
+  printf 'DRY-RUN %s nextest run' "$CARGO"
+  printf ' %q' "${pkg_flags[@]}"
+  printf ' --profile fast --no-tests=pass --show-progress none --status-level none --final-status-level fail\n'
+  exit 0
+fi
 
 "$CARGO" clippy "${pkg_flags[@]}" --all-targets --all-features -- -D warnings
 "$CARGO" nextest run "${pkg_flags[@]}" --profile fast --no-tests=pass \

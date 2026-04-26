@@ -4,11 +4,12 @@ set -euo pipefail
 mode="owned"
 base_ref="${BUILDBUDDY_AGENT_BASE:-}"
 local_test=0
+dry_run=0
 paths=()
 
 usage() {
   cat <<'EOF'
-usage: buildbuddy-agent-gate [--owned|--affected] [--base <rev>] [--local-test] [path ...]
+usage: buildbuddy-agent-gate [--owned|--affected] [--base <rev>] [--local-test] [--dry-run] [path ...]
 
 Runs the opt-in BuildBuddy gate most useful for agent edits. If paths are not
 provided, the script derives changed files from:
@@ -45,6 +46,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --local-test)
       local_test=1
+      shift
+      ;;
+    --dry-run)
+      dry_run=1
       shift
       ;;
     -h | --help)
@@ -154,11 +159,21 @@ printf '  %s\n' "${relevant[@]}"
 
 if [[ "${global}" -eq 1 ]]; then
   echo "Global build/test configuration changed; running warmed workspace gate."
+  if [[ "${dry_run}" -eq 1 ]]; then
+    echo "DRY-RUN make buildbuddy-ci-warm"
+    exit 0
+  fi
   exec make buildbuddy-ci-warm
 fi
 
 args=("--${mode}")
 if [[ "${local_test}" -eq 1 ]]; then
   args+=("--local-test")
+fi
+if [[ "${dry_run}" -eq 1 ]]; then
+  printf 'DRY-RUN ./scripts/buildbuddy-changed-gate'
+  printf ' %q' "${args[@]}" "${relevant[@]}"
+  printf '\n'
+  exit 0
 fi
 exec ./scripts/buildbuddy-changed-gate "${args[@]}" "${relevant[@]}"
