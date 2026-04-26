@@ -149,9 +149,8 @@ pub enum ThinkingSupport {
 /// Lookup a model's capabilities by provider + id.
 ///
 /// Returns `None` when the provider/model pair has no capability row.
-/// Callers that still need a `ModelProfile` should route through
-/// [`crate::profile::profile_for`], which handles legacy fallback for
-/// models without a capability row.
+/// Callers must treat `None` as unknown capability truth; uncatalogued model
+/// IDs must not synthesize semantic facts from model-name folklore.
 pub fn capabilities_for(provider: &str, model_id: &str) -> Option<&'static ModelCapabilities> {
     let table: &'static [ModelCapabilities] = match provider {
         "anthropic" => anthropic::CAPABILITIES,
