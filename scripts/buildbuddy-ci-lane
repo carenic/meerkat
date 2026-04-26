@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: buildbuddy-ci-lane <lane> [--mode <mode>] [--dry-run]
+
+Runs one visible optional BuildBuddy CI lane. Bazel/RBE-native lanes use
+BuildBuddy directly; compatibility lanes use the normal repo entrypoints with a
+distinct RUST_LANE_ID so GitHub can show the same failure boundaries as Cargo CI
+while the remaining lanes are migrated to Bazel.
+
+Modes:
+  full-fresh, full       Run every lane on fresh local output roots.
+  full-warm             Run every lane on warm local output roots.
+  workspace-fresh       Run only native workspace lanes on fresh roots.
+  workspace-warm        Run only native workspace lanes on warm roots.
+  e2e-system            Run only the native system e2e lane.
+  <lane>                Run only the named lane.
+EOF
+}
+
+mode="${MEERKAT_BUILDBUDDY_CI_MODE:-full-fresh}"
+dry_run=0
+lane=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --mode requires a value" >&2
+        usage >&2
+        exit 2
+      fi
+      mode="$2"
+      shift 2
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      if [[ -n "${lane}" ]]; then
+        echo "error: only one lane may be specified" >&2
+        usage >&2
+        exit 2
+      fi
+      lane="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "${lane}" ]]; then
+  echo "error: lane is required" >&2
+  usage >&2
+  exit 2
+fi
+
+workspace_root="$(git rev-parse --show-toplevel)"
+cd "${workspace_root}"
+
+is_native_lane=0
+case "${lane}" in
+  native-build-clippy|native-unit-tests|native-integration-fast|native-e2e-system)
+    is_native_lane=1
+    ;;
+esac
+
+should_run=0
+root_mode="fresh"
+case "${mode}" in
+  full|full-fresh)
+    should_run=1
+    root_mode="fresh"
+    ;;
+  full-warm)
+    should_run=1
+    root_mode="warm"
+    ;;
+  workspace-fresh)
+    if [[ "${is_native_lane}" == "1" ]]; then
+      should_run=1
+    fi
+    root_mode="fresh"
+    ;;
+  workspace-warm)
+    if [[ "${is_native_lane}" == "1" ]]; then
+      should_run=1
+    fi
+    root_mode="warm"
+    ;;
+  e2e-system)
+    if [[ "${lane}" == "native-e2e-system" ]]; then
+      should_run=1
+    fi
+    root_mode="fresh"
+    ;;
+  changed|changed-committed|changed-paths|paths)
+    should_run=0
+    ;;
+  "${lane}")
+    should_run=1
+    root_mode="fresh"
+    ;;
+  *)
+    should_run=0
+    ;;
+esac
+
+if [[ "${should_run}" != "1" ]]; then
+  printf 'SKIP %s for BuildBuddy mode %s\n' "${lane}" "${mode}"
+  exit 0
+fi
+
+run_id="${GITHUB_RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
+attempt="${GITHUB_RUN_ATTEMPT:-0}"
+log_root="${MEERKAT_BUILDBUDDY_LOG_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-ci-lane-logs/${run_id}-${attempt}}"
+lane_log_root="${log_root}/${lane}"
+summary_path="${lane_log_root}/summary.tsv"
+context_path="${lane_log_root}/context.txt"
+mkdir -p "${lane_log_root}"
+
+scripts/buildbuddy-write-context --mode "${mode}-${lane}" >"${context_path}"
+printf 'name\tstatus\twall_seconds\tlog\tcommand\n' >"${summary_path}"
+
+run_logged() {
+  local name="$1"
+  shift
+  local log="${lane_log_root}/${name}.log"
+  local start end status
+  start="$(date +%s)"
+  if [[ "${dry_run}" == "1" ]]; then
+    {
+      printf 'DRY-RUN '
+      printf '%q ' "$@"
+      printf '\n'
+    } | tee "${log}"
+    status=0
+  else
+    set +e
+    "$@" >"${log}" 2>&1
+    status="$?"
+    set -e
+  fi
+  end="$(date +%s)"
+  printf '%s\t%s\t%s\t%s\t' "${name}" "${status}" "$((end - start))" "${log}" >>"${summary_path}"
+  printf '%q ' "$@" >>"${summary_path}"
+  printf '\n' >>"${summary_path}"
+  if [[ "${status}" == "0" ]]; then
+    printf 'PASS %s (%ss)\n' "${name}" "$((end - start))"
+  else
+    printf 'FAIL(%s) %s (%ss)\n' "${status}" "${name}" "$((end - start))"
+    tail -120 "${log}" || true
+    exit "${status}"
+  fi
+}
+
+run_bazel_lane() {
+  local bazel_command="$1"
+  shift
+  local output_root
+  if [[ "${root_mode}" == "warm" ]]; then
+    output_root="${MEERKAT_BUILDBUDDY_OUTPUT_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-ci-lanes}"
+  else
+    output_root="${MEERKAT_BUILDBUDDY_OUTPUT_ROOT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/meerkat-buildbuddy-ci-lanes}"
+  fi
+  run_logged "${lane}" env \
+    MEERKAT_BUILDBUDDY_OUTPUT_ROOT="${output_root}" \
+    RUST_LANE_ID="buildbuddy-ci-${lane}" \
+    BUILDBUDDY_OUTPUT_LANE="${lane}" \
+    BUILDBUDDY_BAZEL_COMMAND="${bazel_command}" \
+    ./scripts/buildbuddy-bazel-poc "$@"
+}
+
+run_compat_lane() {
+  run_logged "${lane}" env RUST_LANE_ID="buildbuddy-ci-${lane}" "$@"
+}
+
+case "${lane}" in
+  native-build-clippy)
+    run_bazel_lane workspace-build-clippy-rbe --jobs=64 --color=no --curses=no
+    ;;
+  native-unit-tests)
+    run_bazel_lane workspace-unit-rbe --jobs=64
+    ;;
+  native-integration-fast)
+    run_bazel_lane workspace-integration-fast-rbe --jobs=64
+    ;;
+  native-e2e-system)
+    run_bazel_lane e2e-system-rbe --jobs=64
+    ;;
+  fmt-static)
+    run_compat_lane bash -lc 'make fmt-check legacy-surface-gate bridge-no-responsestatus-gate verify-version-parity verify-rpc-surface-alignment verify-sdk-wrapper-freshness'
+    ;;
+  cargo-all-features-clippy)
+    run_compat_lane make lint
+    ;;
+  feature-clippy)
+    run_compat_lane make lint-feature-matrix
+    ;;
+  unused-deps)
+    run_compat_lane ./scripts/repo-cargo machete --with-metadata
+    ;;
+  sdk-suites)
+    run_compat_lane bash -lc './scripts/repo-cargo build -p meerkat-rpc && make test-sdk-python test-sdk-typescript verify-sdk-wrapper-freshness'
+    ;;
+  rust-release-packaging)
+    run_compat_lane make check-rust-release-packaging
+    ;;
+  machine-authority)
+    run_compat_lane bash -lc './scripts/repo-cargo xtask machine-codegen --all && git diff --exit-code && ./scripts/repo-cargo xtask machine-check-drift --all && ./scripts/repo-cargo xtask machine-verify --all && ./scripts/repo-cargo xtask protocol-codegen && git diff --exit-code && ./scripts/repo-cargo xtask audit-generated-headers'
+    ;;
+  rmat-audit)
+    run_compat_lane bash -lc './scripts/repo-cargo run -p xtask -- ownership-ledger --check-drift && ./scripts/repo-cargo run -p xtask -- rmat-audit --strict'
+    ;;
+  seam-inventory)
+    run_compat_lane ./scripts/repo-cargo run -p xtask -- seam-inventory --strict
+    ;;
+  wasm-contract)
+    run_compat_lane bash -lc 'RUSTFLAGS='\''--cfg getrandom_backend="wasm_js"'\'' ./scripts/repo-cargo test -p meerkat-web-runtime --target wasm32-unknown-unknown --test browser_contract --no-run && RUSTFLAGS='\''--cfg getrandom_backend="wasm_js"'\'' ./scripts/repo-cargo test -p meerkat-web-runtime --target wasm32-unknown-unknown --test release_targets --no-run && RUSTFLAGS='\''--cfg getrandom_backend="wasm_js"'\'' wasm-pack test --headless --chrome meerkat-web-runtime --test browser_contract && RUSTFLAGS='\''--cfg getrandom_backend="wasm_js"'\'' wasm-pack test --headless --chrome meerkat-web-runtime --test release_targets'
+    ;;
+  e2e-fast)
+    run_compat_lane ./scripts/repo-cargo e2e-fast
+    ;;
+  e2e-live)
+    run_compat_lane ./scripts/repo-cargo e2e-live
+    ;;
+  e2e-smoke)
+    run_compat_lane ./scripts/repo-cargo e2e-smoke
+    ;;
+  minimal-feature-builds)
+    run_compat_lane make test-minimal
+    ;;
+  feature-matrix-lib)
+    run_compat_lane make test-feature-matrix-lib
+    ;;
+  feature-matrix-surface)
+    run_compat_lane make test-feature-matrix-surface
+    ;;
+  wasm-check)
+    run_compat_lane bash -lc 'RUSTFLAGS='\''--cfg getrandom_backend="wasm_js"'\'' ./scripts/repo-cargo check -p meerkat-web-runtime --target wasm32-unknown-unknown && RUSTFLAGS='\''--cfg getrandom_backend="wasm_js"'\'' ./scripts/repo-cargo clippy -p meerkat-web-runtime --target wasm32-unknown-unknown -- -D warnings'
+    ;;
+  security-audit)
+    run_compat_lane cargo-deny check
+    ;;
+  *)
+    echo "unknown BuildBuddy CI lane: ${lane}" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+printf 'logs: %s\n' "${lane_log_root}"
+printf 'summary: %s\n' "${summary_path}"

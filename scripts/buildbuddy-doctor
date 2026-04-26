@@ -216,23 +216,28 @@ if grep -Fq 'name: Cargo CI' .github/workflows/ci.yml &&
   grep -Fq 'name: BuildBuddy CI' .github/workflows/buildbuddy.yml &&
   grep -Fq 'pull_request:' .github/workflows/buildbuddy.yml &&
   grep -Fq 'MEERKAT_BUILDBUDDY_CI' .github/workflows/buildbuddy.yml &&
-  grep -Fq 'full-fresh' .github/workflows/buildbuddy.yml; then
+  grep -Fq 'BuildBuddy CI gate' .github/workflows/buildbuddy.yml; then
   pass "Cargo CI and BuildBuddy CI are separate workflows"
 else
   bad "Cargo CI and BuildBuddy CI are not separated cleanly"
 fi
 
 if grep -Fq 'full-fresh' .github/workflows/buildbuddy.yml &&
-  grep -Fq 'scripts/buildbuddy-ci-full --fresh' scripts/buildbuddy-ci-dispatch &&
+  grep -Fq 'Build + clippy (Bazel/RBE)' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'Unit tests (Bazel/RBE)' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'Integration-fast lane (Bazel/RBE)' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'E2E system lane (Bazel/RBE)' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'SDK suites + parity gates (compat)' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'scripts/buildbuddy-ci-lane' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'workspace-unit-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'workspace-integration-fast-rbe' scripts/buildbuddy-bazel-poc &&
   grep -Fq 'buildbuddy-ci-full:' Makefile &&
-  grep -Fq 'buildbuddy-ci-workspace' scripts/buildbuddy-ci-full &&
-  grep -Fq 'make lint' scripts/buildbuddy-ci-full &&
-  grep -Fq 'cargo-deny check' scripts/buildbuddy-ci-full &&
-  grep -Fq 'e2e-live' scripts/buildbuddy-ci-full &&
-  grep -Fq 'wasm-pack test --headless --chrome' scripts/buildbuddy-ci-full; then
-  pass "BuildBuddy workflow has a full-CI mode covering native and compatibility lanes"
+  grep -Fq 'cargo-deny check' scripts/buildbuddy-ci-lane &&
+  grep -Fq 'e2e-live' scripts/buildbuddy-ci-lane &&
+  grep -Fq 'wasm-pack test --headless --chrome' scripts/buildbuddy-ci-lane; then
+  pass "BuildBuddy workflow exposes full CI as visible native and compatibility lanes"
 else
-  bad "BuildBuddy workflow is missing the full-CI mode coverage"
+  bad "BuildBuddy workflow is missing visible full-CI lane coverage"
 fi
 
 if grep -Fq 'rust-release-packaging' .github/workflows/ci.yml &&
@@ -246,13 +251,15 @@ else
 fi
 
 if grep -Fq 'name = "e2e_system_tests"' BUILD.bazel &&
-  grep -Fq 'BUILDBUDDY_BAZEL_COMMAND=e2e-system-rbe' scripts/buildbuddy-ci-dispatch &&
+  grep -Fq 'workspace-unit-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'workspace-integration-fast-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'native-e2e-system' scripts/buildbuddy-ci-lane &&
   grep -Fq 'system_e2e_command="e2e-system-rbe"' scripts/buildbuddy-ci-workspace &&
   grep -Fq 'RKAT_TEST_BIN_RKAT_RPC' tests/integration/BUILD.bazel &&
   grep -Fq 'CARGO_BIN_EXE_rkat' meerkat-cli/BUILD.bazel; then
-  pass "BuildBuddy CI has a native system e2e suite with runfile binary wiring"
+  pass "BuildBuddy CI has native unit, integration-fast, and system e2e lanes"
 else
-  bad "BuildBuddy CI is missing the native system e2e runfile suite"
+  bad "BuildBuddy CI is missing native test lane wiring"
 fi
 
 ci_workflow_gate_dry_run="$(./scripts/buildbuddy-agent-gate --dry-run .github/workflows/ci.yml 2>&1 || true)"
