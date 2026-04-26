@@ -74,6 +74,15 @@ else
   bad "MODULE.bazel is missing BuildBuddy/rules_rust dependencies"
 fi
 
+generate_check_log="${TMPDIR:-/tmp}/meerkat-buildbuddy-generate-check.$$"
+if node scripts/generate-bazel-rust-builds.mjs --check >"${generate_check_log}" 2>&1; then
+  pass "Generated Bazel BUILD files are up to date"
+else
+  bad "Generated Bazel BUILD files are stale"
+  cat "${generate_check_log}" >&2
+fi
+rm -f "${generate_check_log}"
+
 build_label_count="$(./scripts/bazel-affected-fast-tests.mjs --all --build | wc -w | tr -d ' ')"
 if [[ "${build_label_count}" =~ ^[0-9]+$ && "${build_label_count}" -gt 0 ]]; then
   pass "Bazel selector can enumerate ${build_label_count} build labels"

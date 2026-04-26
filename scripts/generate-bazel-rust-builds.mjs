@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
 import { testSourcePaths as sharedTestSourcePaths } from "./rust-test-selector.mjs";
+
+const checkOnly = process.argv.includes("--check");
 
 const root = execFileSync("git", ["rev-parse", "--show-toplevel"], {
   encoding: "utf8",
@@ -168,6 +170,20 @@ function listExpr(values, indent = 8) {
   if (values.length === 0) return "[]";
   const pad = " ".repeat(indent);
   return `[\n${values.map((v) => `${pad}${q(v)},`).join("\n")}\n${" ".repeat(indent - 4)}]`;
+}
+
+let staleFileCount = 0;
+
+function writeGenerated(path, contents) {
+  if (!checkOnly) {
+    writeFileSync(path, contents);
+    return;
+  }
+  const existing = existsSync(path) ? readFileSync(path, "utf8") : null;
+  if (existing !== contents) {
+    staleFileCount += 1;
+    console.error(`stale generated Bazel file: ${relative(root, path)}`);
+  }
 }
 
 function needsWorkspaceRunfiles(target) {
@@ -427,7 +443,7 @@ function writeRootBuild(fastTestLabels) {
       ``,
     );
   }
-  writeFileSync(resolve(root, "BUILD.bazel"), lines.join("\n"));
+  writeGenerated(resolve(root, "BUILD.bazel"), lines.join("\n"));
 }
 
 const fastTestLabels = [];
@@ -581,8 +597,8 @@ for (const pkg of localPackages.values()) {
   if (packageFastTests.length) {
     rules.push(`test_suite(\n    name = "fast_tests",\n    tests = ${listExpr(packageFastTests.sort())},\n)`);
   }
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(
+  if (!checkOnly) mkdirSync(dir, { recursive: true });
+  writeGenerated(
     resolve(dir, "BUILD.bazel"),
     [
       `load("@crates//:defs.bzl", "aliases", "all_crate_deps")`,
@@ -607,3 +623,7 @@ for (const pkg of localPackages.values()) {
 }
 
 writeRootBuild([...new Set(fastTestLabels)].sort());
+if (checkOnly && staleFileCount > 0) {
+  console.error(`${staleFileCount} generated Bazel file(s) are stale; run node scripts/generate-bazel-rust-builds.mjs`);
+  process.exit(1);
+}
