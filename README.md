@@ -142,6 +142,11 @@ that wrapped Cargo caches stay outside the repository, same-checkout agents can
 select distinct `RUST_LANE_ID` target dirs, and the fast test profile still
 excludes dedicated e2e wrappers.
 
+For local multi-agent edits without BuildBuddy access, use
+`make cargo-agent-gate`. It derives build-relevant changed files and runs a
+package-scoped Cargo clippy + nextest gate, escalating only global Rust lane
+changes to a workspace Cargo gate.
+
 Default CI requires `unit`, `int`, `e2e-fast`, and `e2e-system`. Live-provider lanes stay opt-in.
 
 ## Capabilities
