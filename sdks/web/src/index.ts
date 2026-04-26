@@ -15,6 +15,12 @@ export type {
   ExternalAuthResolver,
   AuthTransport,
   AuthProfile,
+  AuthBindingIdentity,
+  AuthProfilesList,
+  AuthProfileDetail,
+  AuthProfileCreated,
+  AuthCredentialsCleared,
+  AuthLoginReady,
   AuthStatus,
   OAuthLoginStart,
 } from './auth.js';

@@ -7,6 +7,14 @@
 
 import type {
   Mob,
+  AuthBindingIdentity,
+  AuthCredentialsCleared,
+  AuthProfileCreated,
+  AuthProfileDetail,
+  AuthProfilesList,
+  AuthLoginReady,
+  AuthStatus,
+  AuthTransport,
   RuntimeConfig,
   SessionConfig,
   SessionState,
@@ -22,6 +30,7 @@ import type {
   MobMemberSnapshot,
   MobHelperResult,
 } from '../src/index.js';
+import { Auth } from '../src/index.js';
 
 // ─── RuntimeConfig ──────────────────────────────────────────────
 
@@ -51,6 +60,43 @@ const sessionConfig: SessionConfig = {
   maxTokens: 1024,
   labels: { env: 'test' },
   additionalInstructions: ['Be concise.'],
+};
+
+// ─── Auth RPC helpers ───────────────────────────────────────────
+
+const authTransport: AuthTransport = {
+  async request<P, R>(_method: string, _params?: P): Promise<R> {
+    return {} as R;
+  },
+};
+const auth = new Auth(authTransport);
+const authList: Promise<AuthProfilesList> = auth.listProfiles('default');
+const authGet: Promise<AuthProfileDetail> = auth.getProfile('default', 'openai');
+const authCreate: Promise<AuthProfileCreated> = auth.createProfile({
+  realm_id: 'default',
+  binding_id: 'openai',
+  auth_method: 'api_key',
+  secret: 'sk-test',
+});
+const authDelete: Promise<AuthCredentialsCleared> = auth.deleteProfile(
+  'default',
+  'openai',
+);
+const authLogin: Promise<AuthLoginReady> = auth.loginComplete({
+  provider: 'openai',
+  code: 'oauth-code',
+  state: 'oauth-state',
+  redirect_uri: 'http://localhost:1455/callback',
+  realm_id: 'default',
+  binding_id: 'openai',
+});
+const authStatus: Promise<AuthStatus> = auth.status('default', 'openai');
+const authLogout: Promise<AuthCredentialsCleared> = auth.logout('default', 'openai');
+const authBinding: AuthBindingIdentity = {
+  realm_id: 'default',
+  binding_id: 'openai',
+  connection_ref: { realm: 'default', binding: 'openai' },
+  profile_id: 'openai_apikey',
 };
 
 const appendSystemContextOptions: AppendSystemContextOptions = {
@@ -223,6 +269,14 @@ const mobSubscription = mob.subscribeEvents();
 void minimalConfig;
 void fullConfig;
 void sessionConfig;
+void authList;
+void authGet;
+void authCreate;
+void authDelete;
+void authLogin;
+void authStatus;
+void authLogout;
+void authBinding;
 void sessionState;
 void appendSystemContextOptions;
 void appendSystemContextResult;

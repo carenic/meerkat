@@ -946,6 +946,7 @@ pub async fn handle_auth_login_provision_api_key(
         Err(r) => return r.with_id(id),
     };
     let connection_ref = target.connection_ref;
+    let binding = target.binding;
     let store = match require_token_store(runtime, id.clone()) {
         Ok(s) => s,
         Err(r) => return r,
@@ -976,10 +977,8 @@ pub async fn handle_auth_login_provision_api_key(
             serde_json::json!({
                 "realm_id": connection_ref.realm.as_str(),
                 "binding_id": connection_ref.binding.as_str(),
-                "connection_ref": {
-                    "realm_id": connection_ref.realm.as_str(),
-                    "binding_id": connection_ref.binding.as_str(),
-                },
+                "connection_ref": &connection_ref,
+                "profile_id": &binding.auth_profile,
                 "provider": "anthropic",
                 "auth_mode": "oauth_to_api_key",
                 "has_api_key": tokens.primary_secret.is_some(),
