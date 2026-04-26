@@ -128,6 +128,14 @@ impl InputLedger {
     }
 
     fn prune_terminal_dedup(&mut self, now: chrono::DateTime<Utc>) {
+        self.prune_terminal_dedup_with_limit(now, TERMINAL_DEDUP_RETENTION_LIMIT);
+    }
+
+    fn prune_terminal_dedup_with_limit(
+        &mut self,
+        now: chrono::DateTime<Utc>,
+        retention_limit: usize,
+    ) {
         let cutoff = now - Duration::hours(TERMINAL_DEDUP_RETENTION_TTL_HOURS);
         let expired_keys = self
             .idempotency_index
@@ -151,9 +159,7 @@ impl InputLedger {
             })
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
-        let overflow = terminal_keys
-            .len()
-            .saturating_sub(TERMINAL_DEDUP_RETENTION_LIMIT);
+        let overflow = terminal_keys.len().saturating_sub(retention_limit);
         for key in terminal_keys.into_iter().take(overflow) {
             self.idempotency_index.shift_remove(&key);
         }
@@ -270,28 +276,34 @@ mod tests {
     fn terminal_dedup_retention_evicts_oldest_key_after_limit() {
         let mut ledger = InputLedger::new();
         let oldest_key = IdempotencyKey::new("oldest-terminal-key");
+        let retained_keys = [
+            IdempotencyKey::new("terminal-key-1"),
+            IdempotencyKey::new("terminal-key-2"),
+            IdempotencyKey::new("terminal-key-3"),
+        ];
 
-        for index in 0..=TERMINAL_DEDUP_RETENTION_LIMIT {
-            let key = if index == 0 {
-                oldest_key.clone()
-            } else {
-                IdempotencyKey::new(format!("terminal-key-{index}"))
-            };
+        for key in std::iter::once(oldest_key.clone()).chain(retained_keys.iter().cloned()) {
             let mut state = InputState::new_accepted(InputId::new());
             // InputLifecycle was absorbed into MeerkatMachine DSL; tests
             // construct terminal state directly instead of simulating the
             // authority apply that used to live in a standalone machine.
             state.terminal_outcome = Some(crate::input_state::InputTerminalOutcome::Consumed);
-            let duplicate = ledger.accept_with_idempotency(state, key);
-            assert!(duplicate.is_none(), "fresh terminal key should insert");
+            let input_id = state.input_id.clone();
+            ledger.states.insert(input_id.clone(), state);
+            ledger.idempotency_index.insert(key, input_id);
         }
 
-        let replacement = InputState::new_accepted(InputId::new());
-        let result = ledger.accept_with_idempotency(replacement, oldest_key);
+        ledger.prune_terminal_dedup_with_limit(Utc::now(), retained_keys.len());
         assert!(
-            result.is_none(),
+            ledger.input_id_for_idempotency_key(&oldest_key).is_none(),
             "the oldest terminal dedup key should be evicted once the retention cap is exceeded"
         );
+        for key in retained_keys {
+            assert!(
+                ledger.input_id_for_idempotency_key(&key).is_some(),
+                "newer terminal dedup key should be retained"
+            );
+        }
     }
 
     #[test]
