@@ -123,7 +123,13 @@ export function crateName(name) {
 }
 
 export function isFastTest(pkg, target) {
-  const haystack = `${packageDir(pkg)} ${target.name} ${normalizePath(relative(root, target.src_path))}`.toLowerCase();
+  if (target["required-features"]?.length) return false;
+  const haystack = [
+    packageDir(pkg),
+    target.name,
+    normalizePath(relative(root, target.src_path)),
+    ...(target["required-features"] ?? []),
+  ].join(" ").toLowerCase();
   return !["e2e", "system", "live", "integration", "trybuild", "snapshot", "fixture", "slow"].some(
     (tag) => haystack.includes(tag),
   );

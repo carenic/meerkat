@@ -33,7 +33,9 @@ rust_library(
     aliases = aliases(package_name = "xtask"),
     crate_name = "xtask",
     crate_root = "src/lib.rs",
-    crate_features = [],
+    crate_features = [
+        "machine-authority",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -47,6 +49,7 @@ rust_library(
     deps = [
         "//meerkat-machine-codegen:meerkat_machine_codegen",
         "//meerkat-machine-schema:meerkat_machine_schema",
+        "@crates//:which-7.0.3",
     ] + all_crate_deps(
         package_name = "xtask",
         normal = True,
@@ -58,7 +61,9 @@ rust_binary(
     aliases = aliases(package_name = "xtask"),
     crate_name = "xtask",
     crate_root = "src/main.rs",
-    crate_features = [],
+    crate_features = [
+        "machine-authority",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -77,6 +82,7 @@ rust_binary(
         "//meerkat-machine-codegen:meerkat_machine_codegen",
         "//meerkat-machine-schema:meerkat_machine_schema",
         "//xtask:xtask",
+        "@crates//:which-7.0.3",
     ] + all_crate_deps(
         package_name = "xtask",
         normal = True,
@@ -94,7 +100,9 @@ rust_test(
     ),
     crate_name = "ci_gate_requires_rmat",
     crate_root = "tests/ci_gate_requires_rmat.rs",
-    crate_features = [],
+    crate_features = [
+        "machine-authority",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -129,6 +137,65 @@ rust_test(
         "//meerkat-machine-codegen:meerkat_machine_codegen",
         "//meerkat-machine-schema:meerkat_machine_schema",
         "//xtask:xtask",
+        "@crates//:which-7.0.3",
+    ] + all_crate_deps(
+        package_name = "xtask",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "machines_contracts_test",
+    aliases = aliases(
+        package_name = "xtask",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "machines_contracts",
+    crate_root = "tests/machines_contracts.rs",
+    crate_features = [
+        "machine-authority",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/machines_contracts.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "machines_contracts",
+        "CARGO_MANIFEST_DIR": "./xtask",
+    },
+    tags = [
+        "required-feature",
+    ],
+    data = [
+        ":package_runfiles",
+        "//meerkat-machine-kernels:package_runfiles",
+        "//meerkat-machine-schema:package_runfiles",
+        "//meerkat-mob:package_runfiles",
+        "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin",
+        "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+        "RUSTFMT": "$(rootpath @@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin)",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "xtask",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-machine-codegen:meerkat_machine_codegen",
+        "//meerkat-machine-schema:meerkat_machine_schema",
+        "//xtask:xtask",
+        "@crates//:which-7.0.3",
     ] + all_crate_deps(
         package_name = "xtask",
         normal = True,
@@ -147,7 +214,9 @@ rust_test(
     ),
     crate_name = "protocol_codegen_drift",
     crate_root = "tests/protocol_codegen_drift.rs",
-    crate_features = [],
+    crate_features = [
+        "machine-authority",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -224,6 +293,7 @@ rust_test(
         "//meerkat-machine-codegen:meerkat_machine_codegen",
         "//meerkat-machine-schema:meerkat_machine_schema",
         "//xtask:xtask",
+        "@crates//:which-7.0.3",
     ] + all_crate_deps(
         package_name = "xtask",
         normal = True,
@@ -242,7 +312,9 @@ rust_test(
     ),
     crate_name = "rmat_audit",
     crate_root = "tests/rmat_audit.rs",
-    crate_features = [],
+    crate_features = [
+        "machine-authority",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -286,6 +358,7 @@ rust_test(
         "//meerkat-machine-codegen:meerkat_machine_codegen",
         "//meerkat-machine-schema:meerkat_machine_schema",
         "//xtask:xtask",
+        "@crates//:which-7.0.3",
     ] + all_crate_deps(
         package_name = "xtask",
         normal = True,

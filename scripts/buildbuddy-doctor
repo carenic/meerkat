@@ -98,6 +98,26 @@ else
   printf '%s\n' "${required_feature_test_labels}" >&2
 fi
 
+required_feature_build_labels="$(./scripts/bazel-affected-fast-tests.mjs --owned --build meerkat-cli/tests/cli_mobpack_live_smoke.rs)"
+required_feature_clippy_labels="$(./scripts/bazel-affected-fast-tests.mjs --owned --clippy meerkat-cli/tests/cli_mobpack_live_smoke.rs)"
+if [[ "${required_feature_build_labels}" == "//meerkat-cli:cli_mobpack_live_smoke_test" ]] &&
+  [[ "${required_feature_clippy_labels}" == "//meerkat-cli:cli_mobpack_live_smoke_test" ]]; then
+  pass "Bazel selector narrows required-feature build/clippy edits to the exact test target"
+else
+  bad "Bazel selector did not narrow required-feature build/clippy edits"
+  printf 'build: %s\nclippy: %s\n' "${required_feature_build_labels}" "${required_feature_clippy_labels}" >&2
+fi
+
+optional_required_feature_build_labels="$(./scripts/bazel-affected-fast-tests.mjs --owned --build xtask/tests/machines_contracts.rs)"
+optional_required_feature_clippy_labels="$(./scripts/bazel-affected-fast-tests.mjs --owned --clippy xtask/tests/machines_contracts.rs)"
+if [[ "${optional_required_feature_build_labels}" == "//xtask:machines_contracts_test" ]] &&
+  [[ "${optional_required_feature_clippy_labels}" == "//xtask:machines_contracts_test" ]]; then
+  pass "Bazel selector narrows optional-dependency required-feature edits"
+else
+  bad "Bazel selector did not narrow optional-dependency required-feature edits"
+  printf 'build: %s\nclippy: %s\n' "${optional_required_feature_build_labels}" "${optional_required_feature_clippy_labels}" >&2
+fi
+
 fast_profile_filter="$(./scripts/repo-cargo nextest show-config test-groups --profile fast 2>&1 || true)"
 if grep -q '\[profile.fast\]' .config/nextest.toml &&
   grep -q 'default-filter' .config/nextest.toml &&

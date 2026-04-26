@@ -55,6 +55,38 @@ rust_library(
     ),
 )
 
+rust_binary(
+    name = "emit_schemas_bin",
+    aliases = aliases(package_name = "meerkat-contracts"),
+    crate_name = "emit_schemas",
+    crate_root = "src/bin/emit-schemas.rs",
+    crate_features = [
+        "schema",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "emit-schemas",
+        "CARGO_MANIFEST_DIR": "meerkat-contracts",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-contracts",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-schedule:meerkat_schedule",
+    ] + all_crate_deps(
+        package_name = "meerkat-contracts",
+        normal = True,
+    ),
+)
+
 rust_test(
     name = "connection_ref_wire_test",
     aliases = aliases(

@@ -33,7 +33,9 @@ rust_library(
     aliases = aliases(package_name = "meerkat-comms"),
     crate_name = "meerkat_comms",
     crate_root = "src/lib.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -56,6 +58,59 @@ rust_library(
 )
 
 rust_test(
+    name = "e2e_test",
+    aliases = aliases(
+        package_name = "meerkat-comms",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "e2e",
+    crate_root = "tests/e2e.rs",
+    crate_features = [
+        "integration-real-tests",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+        "skills/multi-agent-comms/SKILL.md",
+    ],
+    srcs = [
+        "tests/e2e.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "e2e",
+        "CARGO_MANIFEST_DIR": "./meerkat-comms",
+    },
+    tags = [
+        "e2e",
+        "integration",
+        "required-feature",
+    ],
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-comms",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-skills:meerkat_skills",
+    ] + all_crate_deps(
+        package_name = "meerkat-comms",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "inbox_admission_toctou_test",
     aliases = aliases(
         package_name = "meerkat-comms",
@@ -66,7 +121,9 @@ rust_test(
     ),
     crate_name = "inbox_admission_toctou",
     crate_root = "tests/inbox_admission_toctou.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -115,7 +172,9 @@ rust_test(
     ),
     crate_name = "router_ambiguous_name_typed_error",
     crate_root = "tests/router_ambiguous_name_typed_error.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -154,6 +213,58 @@ rust_test(
 )
 
 rust_test(
+    name = "router_integration_test",
+    aliases = aliases(
+        package_name = "meerkat-comms",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "router_integration",
+    crate_root = "tests/router_integration.rs",
+    crate_features = [
+        "integration-real-tests",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+        "skills/multi-agent-comms/SKILL.md",
+    ],
+    srcs = [
+        "tests/router_integration.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "router_integration",
+        "CARGO_MANIFEST_DIR": "./meerkat-comms",
+    },
+    tags = [
+        "integration",
+        "required-feature",
+    ],
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-comms",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-skills:meerkat_skills",
+    ] + all_crate_deps(
+        package_name = "meerkat-comms",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "trust_duplicate_name_ok_duplicate_id_rejected_test",
     aliases = aliases(
         package_name = "meerkat-comms",
@@ -164,7 +275,9 @@ rust_test(
     ),
     crate_name = "trust_duplicate_name_ok_duplicate_id_rejected",
     crate_root = "tests/trust_duplicate_name_ok_duplicate_id_rejected.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",

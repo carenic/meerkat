@@ -24,6 +24,11 @@ const localPackages = new Map(
 const byName = new Map(
   [...localPackages.values()].map((pkg) => [pkg.name, pkg]),
 );
+const externalByName = new Map();
+for (const pkg of metadata.packages.filter((pkg) => pkg.source !== null)) {
+  if (!externalByName.has(pkg.name)) externalByName.set(pkg.name, []);
+  externalByName.get(pkg.name).push(pkg);
+}
 const packageDir = (pkg) => dirname(pkg.manifest_path);
 const packageKey = (pkg) => {
   const dir = relative(root, packageDir(pkg));
@@ -40,6 +45,12 @@ function defaultFeatures(pkg) {
 const activeFeatures = new Map(
   [...localPackages.values()].map((pkg) => [pkg.id, new Set(defaultFeatures(pkg))]),
 );
+const requiredTargetFeatures = new Map(
+  [...localPackages.values()].map((pkg) => [pkg.id, new Set()]),
+);
+const resolvedFeatures = new Map(
+  (metadata.resolve?.nodes ?? []).map((node) => [node.id, new Set(node.features ?? [])]),
+);
 
 function addFeature(pkg, feature) {
   if (!feature || feature.startsWith("dep:")) return false;
@@ -52,6 +63,16 @@ function addFeature(pkg, feature) {
 function localPackageForDependency(pkg, depName) {
   const dep = pkg.dependencies.find((candidate) => candidate.name === depName && candidate.source === null);
   return dep ? byName.get(dep.name) : null;
+}
+
+for (const pkg of localPackages.values()) {
+  for (const target of pkg.targets) {
+    if (target.kind.includes("bench") || target.kind.includes("example")) continue;
+    for (const feature of target["required-features"] ?? []) {
+      requiredTargetFeatures.get(pkg.id).add(feature);
+      addFeature(pkg, feature);
+    }
+  }
 }
 
 let changed = true;
@@ -107,6 +128,40 @@ function localDeps(pkg, procMacroOnly) {
     if (isProc === procMacroOnly) labels.push(packageLabel(local));
   }
   return [...new Set(labels)].sort();
+}
+
+function externalCrateLabel(dep) {
+  const candidates = externalByName.get(dep.name) ?? [];
+  let pkg = candidates.length === 1 ? candidates[0] : null;
+  if (!pkg && dep.req?.startsWith("^")) {
+    const requested = dep.req.slice(1).split(".");
+    pkg = candidates.find((candidate) => {
+      const version = candidate.version.split("+", 1)[0].split(".");
+      if (requested[0] === "0" && requested[1]) {
+        return version[0] === requested[0] && version[1] === requested[1];
+      }
+      return version[0] === requested[0];
+    }) ?? null;
+  }
+  if (!pkg) return null;
+  return `@crates//:${pkg.name}-${pkg.version}`;
+}
+
+function optionalExternalDeps(pkg) {
+  const labels = new Set();
+  const features = requiredTargetFeatures.get(pkg.id) ?? new Set();
+  const alreadyResolved = resolvedFeatures.get(pkg.id) ?? new Set();
+  for (const feature of features) {
+    if (alreadyResolved.has(feature)) continue;
+    for (const expansion of pkg.features?.[feature] ?? []) {
+      const depName = expansion.startsWith("dep:") ? expansion.slice(4) : null;
+      if (!depName) continue;
+      const dep = pkg.dependencies.find((candidate) => candidate.name === depName && candidate.source !== null);
+      const label = dep ? externalCrateLabel(dep) : null;
+      if (label) labels.add(label);
+    }
+  }
+  return [...labels].sort();
 }
 
 function listExpr(values, indent = 8) {
@@ -254,11 +309,17 @@ function compileData(target, packageRoot, includeTests) {
 }
 
 function testTags(pkg, target) {
-  const haystack = `${packageKey(pkg)} ${target.name} ${relative(root, target.src_path)}`.toLowerCase();
+  const haystack = [
+    packageKey(pkg),
+    target.name,
+    relative(root, target.src_path),
+    ...(target["required-features"] ?? []),
+  ].join(" ").toLowerCase();
   const tags = [];
   for (const tag of ["e2e", "system", "live", "integration", "trybuild", "snapshot", "fixture", "slow"]) {
     if (haystack.includes(tag)) tags.push(tag);
   }
+  if (target["required-features"]?.length) tags.push("required-feature");
   if (!tags.length) tags.push("fast");
   return [...new Set(tags)].sort();
 }
@@ -388,7 +449,6 @@ for (const pkg of localPackages.values()) {
     if (target.kind.includes("bench") || target.kind.includes("example")) {
       continue;
     }
-    if (target["required-features"]?.length) continue;
 
     const isTest = target.kind.includes("test");
     const hasLibrary = Boolean(libOrMacro);
@@ -399,6 +459,7 @@ for (const pkg of localPackages.values()) {
       target.kind.includes("bin") && (target.name !== pkg.name || hasLibrary)
         ? `${crateName(target.name)}_bin`
         : crateName(pkg.name);
+    const optionalExternal = optionalExternalDeps(pkg);
     const deps = isTest && libOrMacro
       ? [...new Set([packageLabel(pkg), ...localDeps(pkg, false)])].sort()
       : target.kind.includes("bin") && libOrMacro
@@ -411,8 +472,9 @@ for (const pkg of localPackages.values()) {
     const externalProc = `all_crate_deps(\n        package_name = ${q(key)},\n        proc_macro = True,\n    )`;
     const externalProcWithDev = `all_crate_deps(\n        package_name = ${q(key)},\n        proc_macro = True,\n        proc_macro_dev = True,\n    )`;
 
-    const depsExpr = deps.length
-      ? `${listExpr(deps)} + ${isTest ? externalNormalWithDev : externalNormal}`
+    const depsWithOptionalExternal = [...new Set([...deps, ...optionalExternal])].sort();
+    const depsExpr = depsWithOptionalExternal.length
+      ? `${listExpr(depsWithOptionalExternal)} + ${isTest ? externalNormalWithDev : externalNormal}`
       : isTest ? externalNormalWithDev : externalNormal;
     const procExpr = procMacroDeps.length
       ? `${listExpr(procMacroDeps)} + ${isTest ? externalProcWithDev : externalProc}`

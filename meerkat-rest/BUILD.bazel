@@ -35,6 +35,7 @@ rust_library(
     crate_root = "src/lib.rs",
     crate_features = [
         "comms",
+        "integration-real-tests",
         "mcp",
         "mob",
         "schedule",
@@ -78,6 +79,7 @@ rust_binary(
     crate_root = "src/main.rs",
     crate_features = [
         "comms",
+        "integration-real-tests",
         "mcp",
         "mob",
         "schedule",
@@ -132,6 +134,7 @@ rust_test(
     crate_root = "tests/binary_http_e2e.rs",
     crate_features = [
         "comms",
+        "integration-real-tests",
         "mcp",
         "mob",
         "schedule",
@@ -191,6 +194,222 @@ rust_test(
 )
 
 rust_test(
+    name = "live_continue_tmp_test",
+    aliases = aliases(
+        package_name = "meerkat-rest",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "live_continue_tmp",
+    crate_root = "tests/live_continue_tmp.rs",
+    crate_features = [
+        "comms",
+        "integration-real-tests",
+        "mcp",
+        "mob",
+        "schedule",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ] + [
+        "//:live_smoke_support",
+    ],
+    srcs = [
+        "tests/live_continue_tmp.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "live_continue_tmp",
+        "CARGO_MANIFEST_DIR": "./meerkat-rest",
+    },
+    tags = [
+        "integration",
+        "live",
+        "required-feature",
+    ],
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-rest",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-anthropic:meerkat_anthropic",
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-gemini:meerkat_gemini",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-openai:meerkat_openai",
+        "//meerkat-providers:meerkat_providers",
+        "//meerkat-rest:meerkat_rest",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-rest",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "live_rest_matrix_test",
+    aliases = aliases(
+        package_name = "meerkat-rest",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "live_rest_matrix",
+    crate_root = "tests/live_rest_matrix.rs",
+    crate_features = [
+        "comms",
+        "integration-real-tests",
+        "mcp",
+        "mob",
+        "schedule",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ] + [
+        "//:live_smoke_support",
+    ],
+    srcs = [
+        "tests/live_rest_matrix.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "live_rest_matrix",
+        "CARGO_MANIFEST_DIR": "./meerkat-rest",
+    },
+    tags = [
+        "integration",
+        "live",
+        "required-feature",
+    ],
+    data = [
+        ":package_runfiles",
+        "//:test_fixtures",
+        "//test-fixtures/machine-dsl-tests:package_runfiles",
+        "//test-fixtures/mcp-test-server:package_runfiles",
+        "//test-fixtures/surface-build-fixtures:package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-rest",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-anthropic:meerkat_anthropic",
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-gemini:meerkat_gemini",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-openai:meerkat_openai",
+        "//meerkat-providers:meerkat_providers",
+        "//meerkat-rest:meerkat_rest",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-rest",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "live_rest_regression_test",
+    aliases = aliases(
+        package_name = "meerkat-rest",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "live_rest_regression",
+    crate_root = "tests/live_rest_regression.rs",
+    crate_features = [
+        "comms",
+        "integration-real-tests",
+        "mcp",
+        "mob",
+        "schedule",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ] + [
+        "//:live_smoke_support",
+    ],
+    srcs = [
+        "tests/live_rest_regression.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "live_rest_regression",
+        "CARGO_MANIFEST_DIR": "./meerkat-rest",
+    },
+    tags = [
+        "integration",
+        "live",
+        "required-feature",
+    ],
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-rest",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-anthropic:meerkat_anthropic",
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-gemini:meerkat_gemini",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-openai:meerkat_openai",
+        "//meerkat-providers:meerkat_providers",
+        "//meerkat-rest:meerkat_rest",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-rest",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "regression_persistent_test",
     aliases = aliases(
         package_name = "meerkat-rest",
@@ -203,6 +422,7 @@ rust_test(
     crate_root = "tests/regression_persistent.rs",
     crate_features = [
         "comms",
+        "integration-real-tests",
         "mcp",
         "mob",
         "schedule",
@@ -270,6 +490,7 @@ rust_test(
     crate_root = "tests/rest_auth_endpoints.rs",
     crate_features = [
         "comms",
+        "integration-real-tests",
         "mcp",
         "mob",
         "schedule",
@@ -337,6 +558,7 @@ rust_test(
     crate_root = "tests/rest_catalog_regression.rs",
     crate_features = [
         "comms",
+        "integration-real-tests",
         "mcp",
         "mob",
         "schedule",
@@ -404,6 +626,7 @@ rust_test(
     crate_root = "tests/runtime_backed_ingress.rs",
     crate_features = [
         "comms",
+        "integration-real-tests",
         "mcp",
         "mob",
         "schedule",
@@ -428,6 +651,76 @@ rust_test(
     data = [
         ":package_runfiles",
     ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-rest",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-anthropic:meerkat_anthropic",
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-gemini:meerkat_gemini",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-openai:meerkat_openai",
+        "//meerkat-providers:meerkat_providers",
+        "//meerkat-rest:meerkat_rest",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-rest",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "system_rest_resume_test",
+    aliases = aliases(
+        package_name = "meerkat-rest",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "system_rest_resume",
+    crate_root = "tests/system_rest_resume.rs",
+    crate_features = [
+        "comms",
+        "integration-real-tests",
+        "mcp",
+        "mob",
+        "schedule",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ] + [
+        "//:live_smoke_support",
+    ],
+    srcs = [
+        "tests/system_rest_resume.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "system_rest_resume",
+        "CARGO_MANIFEST_DIR": "./meerkat-rest",
+    },
+    tags = [
+        "integration",
+        "required-feature",
+        "system",
+    ],
+    data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
     },

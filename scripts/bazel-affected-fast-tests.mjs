@@ -97,7 +97,6 @@ function exactTestLabelForFile(file, pkg, { fastOnly = false } = {}) {
   const labels = [];
   for (const target of pkg.targets) {
     if (!target.kind.includes("test")) continue;
-    if (target["required-features"]?.length) continue;
     if (fastOnly && !isFastTest(pkg, target)) continue;
     const targetName = `${crateName(target.name)}_test`;
     if (!hasBazelTarget(pkg, targetName)) continue;
@@ -125,7 +124,6 @@ function buildLabels(pkg) {
     if (target.kind.includes("bench") || target.kind.includes("example") || target.kind.includes("test")) {
       continue;
     }
-    if (target["required-features"]?.length) continue;
     if (target.kind.includes("proc-macro") || target.kind.includes("lib")) {
       labels.push(`//${dir}:${crateName(pkg.name)}`);
     } else if (target.kind.includes("bin")) {
@@ -141,7 +139,6 @@ function testLabels(pkg) {
   const labels = [];
   for (const target of pkg.targets) {
     if (!target.kind.includes("test")) continue;
-    if (target["required-features"]?.length) continue;
     const source = readFileSync(target.src_path, "utf8");
     if (source.includes("trybuild::")) continue;
     labels.push(`//${dir}:${crateName(target.name)}_test`);

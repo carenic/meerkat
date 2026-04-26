@@ -33,7 +33,9 @@ rust_library(
     aliases = aliases(package_name = "tests/integration"),
     crate_name = "meerkat_integration_tests",
     crate_root = "src/lib.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -76,7 +78,9 @@ rust_test(
     ),
     crate_name = "e2e_auth_lane",
     crate_root = "tests/e2e_auth_lane.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -138,7 +142,9 @@ rust_test(
     ),
     crate_name = "e2e_build_lane",
     crate_root = "tests/e2e_build_lane.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -198,7 +204,9 @@ rust_test(
     ),
     crate_name = "e2e_fast_lane",
     crate_root = "tests/e2e_fast_lane.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -261,7 +269,9 @@ rust_test(
     ),
     crate_name = "e2e_live_lane",
     crate_root = "tests/e2e_live_lane.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -322,7 +332,9 @@ rust_test(
     ),
     crate_name = "e2e_models_lane",
     crate_root = "tests/e2e_models_lane.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -384,7 +396,9 @@ rust_test(
     ),
     crate_name = "e2e_smoke_lane",
     crate_root = "tests/e2e_smoke_lane.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -444,7 +458,9 @@ rust_test(
     ),
     crate_name = "e2e_system_lane",
     crate_root = "tests/e2e_system_lane.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -495,6 +511,69 @@ rust_test(
 )
 
 rust_test(
+    name = "live_mob_tools_test",
+    aliases = aliases(
+        package_name = "tests/integration",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "live_mob_tools",
+    crate_root = "tests/live_mob_tools.rs",
+    crate_features = [
+        "integration-real-tests",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/live_mob_tools.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "live_mob_tools",
+        "CARGO_MANIFEST_DIR": "./tests/integration",
+    },
+    tags = [
+        "integration",
+        "live",
+        "required-feature",
+    ],
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "tests/integration",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-machine-kernels:meerkat_machine_kernels",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-models:meerkat_models",
+        "//meerkat-providers:meerkat_providers",
+        "//meerkat-rpc:meerkat_rpc",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-session:meerkat_session",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+        "//tests/integration:meerkat_integration_tests",
+    ] + all_crate_deps(
+        package_name = "tests/integration",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "peer_directory_reachability_kernel_test",
     aliases = aliases(
         package_name = "tests/integration",
@@ -505,7 +584,9 @@ rust_test(
     ),
     crate_name = "peer_directory_reachability_kernel",
     crate_root = "tests/peer_directory_reachability_kernel.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -564,7 +645,9 @@ rust_test(
     ),
     crate_name = "phase1_wiring",
     crate_root = "tests/phase1_wiring.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -623,7 +706,9 @@ rust_test(
     ),
     crate_name = "phase2_mode_routing",
     crate_root = "tests/phase2_mode_routing.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -682,7 +767,9 @@ rust_test(
     ),
     crate_name = "phase6_cleanup_sweep",
     crate_root = "tests/phase6_cleanup_sweep.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -745,7 +832,9 @@ rust_test(
     ),
     crate_name = "reserve_interaction_subscriber_fires",
     crate_root = "tests/reserve_interaction_subscriber_fires.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -804,7 +893,9 @@ rust_test(
     ),
     crate_name = "session_tool_visibility_kernel",
     crate_root = "tests/session_tool_visibility_kernel.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -863,7 +954,9 @@ rust_test(
     ),
     crate_name = "session_turn_admission_kernel",
     crate_root = "tests/session_turn_admission_kernel.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -922,7 +1015,9 @@ rust_test(
     ),
     crate_name = "smoke_shared_realm",
     crate_root = "tests/smoke_shared_realm.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",
@@ -985,7 +1080,9 @@ rust_test(
     ),
     crate_name = "system_shared_realm",
     crate_root = "tests/system_shared_realm.rs",
-    crate_features = [],
+    crate_features = [
+        "integration-real-tests",
+    ],
     edition = "2024",
     compile_data = [
         "Cargo.toml",

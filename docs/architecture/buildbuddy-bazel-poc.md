@@ -259,7 +259,9 @@ profile so `cargo fast`, `cargo rct`, `cargo int`, and
 | Cargo agent gate for shared `test_session_store` support edit, warm after shared selector extraction | `0.15s` Cargo work, `0.045s` nextest runtime, `6` tests pass |
 | Cargo agent gate for shared `test_session_store` support edit, exact clippy warm | `0.18s` Cargo work |
 | BuildBuddy changed gate for shared `test_session_store` support edit after shared selector extraction | `27s` wall, `2` exact Bazel tests + clippy combined |
-| BuildBuddy changed gate for required-feature `cli_mobpack_live_smoke` edit | `25s` wall, build + clippy only, no unrelated fast tests |
+| BuildBuddy changed gate for required-feature `cli_mobpack_live_smoke` edit before Bazel required-feature test generation | `25s` wall, package build + clippy only, no unrelated fast tests |
+| BuildBuddy changed gate for required-feature `cli_mobpack_live_smoke` edit after Bazel required-feature test generation | `130s` first touch after graph change, `21-23s` warm; exact test target build + clippy, no live test execution |
+| BuildBuddy changed gate for required-feature `machines_contracts` edit with optional external deps | `39s` first successful exact build + clippy, `22s` warm |
 
 The first touch of a new local lane pays Bazel analysis and remote-cache
 materialization cost. Once warmed, the wall-clock floor is mostly the `bb`/Bazel
@@ -299,9 +301,10 @@ to roughly `4-6s` once those lanes were prepared.
   unambiguous. Cargo and BuildBuddy selectors share the same Cargo metadata and
   test-module import traversal logic in `scripts/rust-test-selector.mjs`.
   Required-feature Cargo test edits are narrowed to the exact test binary with
-  the needed features; BuildBuddy does not yet generate those Bazel test
-  targets, so its changed gate avoids unrelated fast tests and runs build +
-  clippy for the owning package instead.
+  the needed features. BuildBuddy also generates those Bazel test targets, but
+  keeps e2e/system/live tests out of the fast test lane; the changed gate
+  compiles and clippies the exact required-feature test target without running
+  the live test or broadening to unrelated package tests.
 - For the common multi-agent case where the agent has local edits and just
   needs the right check, use `make buildbuddy-agent-gate`. It includes
   committed branch changes, staged changes, unstaged changes, and untracked

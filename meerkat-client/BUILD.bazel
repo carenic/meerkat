@@ -36,6 +36,7 @@ rust_library(
     crate_features = [
         "anthropic",
         "gemini",
+        "integration-real-tests",
         "native-keyring",
         "oauth",
         "openai",
@@ -65,6 +66,67 @@ rust_library(
 )
 
 rust_test(
+    name = "live_client_provider_matrix_test",
+    aliases = aliases(
+        package_name = "meerkat-client",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "live_client_provider_matrix",
+    crate_root = "tests/live_client_provider_matrix.rs",
+    crate_features = [
+        "anthropic",
+        "gemini",
+        "integration-real-tests",
+        "native-keyring",
+        "oauth",
+        "openai",
+        "openai-realtime",
+        "refresh-file-lock",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/live_client_provider_matrix.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "live_client_provider_matrix",
+        "CARGO_MANIFEST_DIR": "./meerkat-client",
+    },
+    tags = [
+        "integration",
+        "live",
+        "required-feature",
+    ],
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-client",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-anthropic:meerkat_anthropic",
+        "//meerkat-client:meerkat_client",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-gemini:meerkat_gemini",
+        "//meerkat-llm-core:meerkat_llm_core",
+        "//meerkat-openai:meerkat_openai",
+    ] + all_crate_deps(
+        package_name = "meerkat-client",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "rct_contracts_test",
     aliases = aliases(
         package_name = "meerkat-client",
@@ -78,6 +140,7 @@ rust_test(
     crate_features = [
         "anthropic",
         "gemini",
+        "integration-real-tests",
         "native-keyring",
         "oauth",
         "openai",
@@ -138,6 +201,7 @@ rust_test(
     crate_features = [
         "anthropic",
         "gemini",
+        "integration-real-tests",
         "native-keyring",
         "oauth",
         "openai",
