@@ -274,10 +274,6 @@
       "name": "skills/list"
     },
     {
-      "description": "Inspect one skill",
-      "name": "skills/inspect"
-    },
-    {
       "description": "Get a session's current runtime state",
       "name": "runtime/session_status",
       "params_type": "RuntimeStateParams",

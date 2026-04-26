@@ -161,7 +161,6 @@ rkat-rpc [--realm <id>] [--isolated] [--instance <id>] [--realm-backend <sqlite|
 | `comms/send` | Comms | Dispatch a comms command to a session |
 | `comms/peers` | Comms | List discoverable peers (comms feature) |
 | `skills/list` | Skills | List skills with provenance |
-| `skills/inspect` | Skills | Inspect a skill's full content |
 | `mcp/add` | MCP | Stage live MCP server addition (mcp feature) |
 | `mcp/remove` | MCP | Stage live MCP server removal (mcp feature) |
 | `mcp/reload` | MCP | Reload one or all MCP servers (mcp feature) |
@@ -259,7 +258,7 @@ Handshake. Returns server capabilities.
       "turn/start", "turn/interrupt",
       "config/get", "config/set", "config/patch",
       "capabilities/get", "models/catalog",
-      "skills/list", "skills/inspect",
+      "skills/list",
       "realtime/open_info", "realtime/status", "realtime/capabilities",
       "session/realtime_attachment_status",
       "session/stream_open", "session/stream_close",
@@ -809,47 +808,6 @@ List all skills with provenance information, including active and shadowed entri
 </ResponseField>
 
 Returns error `-32603` if skills are not enabled.
-
-### skills/inspect
-
-Inspect a skill's full content (body).
-
-<CodeGroup>
-```json Request
-{
-  "jsonrpc": "2.0",
-  "id": 13,
-  "method": "skills/inspect",
-  "params": {
-    "id": "task-workflow",
-    "source": null
-  }
-}
-```
-
-```json Response
-{
-  "jsonrpc": "2.0",
-  "id": 13,
-  "result": {
-    "id": "task-workflow",
-    "name": "Task Workflow",
-    "description": "How to use task tools",
-    "scope": "builtin",
-    "source": "embedded",
-    "body": "# Task Workflow\n\nUse task_create to..."
-  }
-}
-```
-</CodeGroup>
-
-<ParamField body="id" type="string" required>
-  Skill ID to inspect (e.g. `"task-workflow"`, `"extraction/email"`).
-</ParamField>
-
-<ParamField body="source" type="string | null" default="null">
-  Load from a specific named source, bypassing first-wins resolution. Useful for inspecting shadowed skills.
-</ParamField>
 
 ## Realtime attachment methods
 

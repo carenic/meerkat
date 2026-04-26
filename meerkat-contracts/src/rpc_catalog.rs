@@ -320,10 +320,10 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
     }
 
     if options.skills_enabled {
-        methods.extend([
-            RpcMethodDescriptor::basic("skills/list", "List available skills"),
-            RpcMethodDescriptor::basic("skills/inspect", "Inspect one skill"),
-        ]);
+        methods.extend([RpcMethodDescriptor::basic(
+            "skills/list",
+            "List available skills",
+        )]);
     }
 
     if options.runtime_available {

@@ -32,7 +32,6 @@ CANONICAL_APP_RPC_METHODS = {
     "turn/interrupt",
     "blob/get",
     "skills/list",
-    "skills/inspect",
     "mcp/add",
     "mcp/remove",
     "mcp/reload",
@@ -103,7 +102,6 @@ RPC_PUBLIC_WRAPPERS: dict[str, tuple[type, str]] = {
     "turn/interrupt": (Session, "interrupt"),
     "blob/get": (MeerkatClient, "get_blob"),
     "skills/list": (MeerkatClient, "list_skills"),
-    "skills/inspect": (MeerkatClient, "inspect_skill"),
     "mcp/add": (MeerkatClient, "mcp_add"),
     "mcp/remove": (MeerkatClient, "mcp_remove"),
     "mcp/reload": (MeerkatClient, "mcp_reload"),
@@ -457,6 +455,7 @@ def test_sdk_never_uses_retired_public_method_strings():
     retired_methods = [
         '"auth/profile/test"',
         '"session/realtime_attachment_statuses"',
+        '"skills/inspect"',
     ]
     sdk_roots = [
         pathlib.Path(__file__).parent.parent / "meerkat",
@@ -473,38 +472,14 @@ def test_sdk_never_uses_retired_public_method_strings():
                 )
 
 
-def test_encode_agent_runtime_ref_is_opaque_and_strict():
-    """Row 31 regression gate: the SDK must emit an opaque
-    ``AgentRuntimeRef`` handle, not a parseable ``"identity:generation"``
-    string. The canonical wire shape is ``{"identity": "...", "generation": N}``;
-    anything else is a protocol error that must surface as a typed
-    ``MeerkatError``.
+def test_mob_public_types_do_not_expose_incarnation_atoms():
+    """Public mob SDK types use ``member_ref`` or ``current_session_id``;
+    binding-era incarnation atoms stay out of the Python surface.
     """
-    import base64
-    import json as _json
 
-    from meerkat.client import MeerkatError, _encode_agent_runtime_ref
+    from meerkat.mob import MobMemberSnapshot, MobSpawnResult
 
-    # Non-canonical shapes are typed errors.
-    with pytest.raises(MeerkatError):
-        _encode_agent_runtime_ref("worker:1")
-    with pytest.raises(MeerkatError):
-        _encode_agent_runtime_ref({"agent_identity": "worker", "generation": 1})
-    with pytest.raises(MeerkatError):
-        _encode_agent_runtime_ref({"identity": "worker"})
-
-    # Canonical form yields a deterministic opaque token whose internals
-    # decode to the short ``{i, g}`` key schema — so equality comparison
-    # works across SDKs and callers cannot sniff the display string.
-    token = _encode_agent_runtime_ref({"identity": "worker", "generation": 2})
-    assert isinstance(token, str) and token
-    # Token must NOT carry the parseable display form.
-    assert ":" not in token
-    # Decoding is an SDK-internal detail for testing; callers must not
-    # reach for it.
-    padded = token + "=" * (-len(token) % 4)
-    decoded = _json.loads(base64.urlsafe_b64decode(padded))
-    assert decoded == {"i": "worker", "g": 2}
-
-    # Absence threads through as None.
-    assert _encode_agent_runtime_ref(None) is None
+    for typed_dict in (MobMemberSnapshot, MobSpawnResult):
+        fields = set(typed_dict.__annotations__)
+        assert "agent_runtime_id" not in fields
+        assert "fence_token" not in fields

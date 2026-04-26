@@ -1017,19 +1017,6 @@ class MeerkatClient:
         result = await self._request("skills/list", {})
         return result.get("skills", [])
 
-    async def inspect_skill(
-        self,
-        skill: SkillRef,
-    ) -> dict[str, Any]:
-        normalized = _normalize_skill_ref(skill)
-        params: dict[str, Any] = {
-            "key": {
-                "source_uuid": normalized.source_uuid,
-                "skill_name": normalized.skill_name,
-            }
-        }
-        return await self._request("skills/inspect", params)
-
     async def subscribe_session_events(self, session_id: str) -> EventSubscription:
         return await self._open_event_subscription(
             "session/stream_open",

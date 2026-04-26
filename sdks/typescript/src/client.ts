@@ -621,11 +621,6 @@ export class MeerkatClient {
     return (result.skills as Array<Record<string, unknown>>) ?? [];
   }
 
-  async inspectSkill(ref: SkillRef): Promise<Record<string, unknown>> {
-    const params: Record<string, unknown> = { key: normalizeSkillRef(ref) };
-    return this.request("skills/inspect", params);
-  }
-
   async getBlob(blobId: string): Promise<BlobPayload> {
     const result = await this.request("blob/get", { blob_id: blobId });
     return {
