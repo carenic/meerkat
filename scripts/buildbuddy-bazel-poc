@@ -2,6 +2,21 @@
 set -euo pipefail
 
 if [[ -z "${BUILDBUDDY_API_KEY:-}" && -f "${HOME}/.zshrc" ]]; then
+  key_line="$(grep -m1 -E '^[[:space:]]*(export[[:space:]]+)?BUILDBUDDY_API_KEY=' "${HOME}/.zshrc" || true)"
+  if [[ -n "${key_line}" ]]; then
+    key_value="${key_line#*=}"
+    key_value="${key_value%%[[:space:]]#*}"
+    key_value="${key_value%\"}"
+    key_value="${key_value#\"}"
+    key_value="${key_value%\'}"
+    key_value="${key_value#\'}"
+    if [[ -n "${key_value}" && "${key_value}" != *'$'* && "${key_value}" != *'`'* ]]; then
+      BUILDBUDDY_API_KEY="${key_value}"
+      export BUILDBUDDY_API_KEY
+    fi
+  fi
+fi
+if [[ -z "${BUILDBUDDY_API_KEY:-}" && -f "${HOME}/.zshrc" ]]; then
   BUILDBUDDY_API_KEY="$(zsh -lc 'source ~/.zshrc >/dev/null 2>&1 || true; print -r -- ${BUILDBUDDY_API_KEY-}')"
   export BUILDBUDDY_API_KEY
 fi
