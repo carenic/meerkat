@@ -212,7 +212,7 @@ rust-lane-doctor:
 
 cargo-agent-gate: rust-lane-doctor
 	@echo "$(GREEN)Running Cargo agent changed-path gate...$(NC)"
-	@scripts/cargo-agent-gate
+	@scripts/cargo-agent-gate $(AGENT_GATE_ARGS)
 
 agent-gate:
 	@if [ "$${MEERKAT_AGENT_GATE_BACKEND:-cargo}" = "buildbuddy" ]; then \
@@ -221,7 +221,7 @@ agent-gate:
 		$(MAKE) rust-lane-doctor; \
 	fi
 	@echo "$(GREEN)Running agent changed-path gate...$(NC)"
-	@scripts/agent-gate
+	@scripts/agent-gate $(AGENT_GATE_ARGS)
 
 buildbuddy-install:
 	@echo "$(GREEN)Installing pinned BuildBuddy CLI...$(NC)"
@@ -234,11 +234,11 @@ buildbuddy-doctor: rust-lane-doctor
 
 buildbuddy-agent-gate: buildbuddy-doctor
 	@echo "$(GREEN)Running BuildBuddy agent changed-path gate...$(NC)"
-	@scripts/buildbuddy-agent-gate
+	@scripts/buildbuddy-agent-gate $(AGENT_GATE_ARGS)
 
 buildbuddy-ci-dispatch: buildbuddy-doctor
 	@echo "$(GREEN)Dispatching optional BuildBuddy CI gate...$(NC)"
-	@scripts/buildbuddy-ci-dispatch
+	@scripts/buildbuddy-ci-dispatch $(BUILDBUDDY_CI_ARGS)
 
 buildbuddy-fast: buildbuddy-doctor
 	@echo "$(GREEN)Running BuildBuddy fast workspace test lane...$(NC)"
@@ -588,12 +588,12 @@ help:
 	@echo "  $(GREEN)fmt-check$(NC)     - Check code formatting"
 	@echo "  $(GREEN)audit$(NC)         - Run security audit (cargo-deny)"
 	@echo "  $(GREEN)rust-lane-doctor$(NC)- Check Rust lane isolation and filtered test lanes"
-	@echo "  $(GREEN)agent-gate$(NC)    - Run default Cargo or opt-in BuildBuddy changed gate"
+	@echo "  $(GREEN)agent-gate$(NC)    - Run default Cargo or opt-in BuildBuddy changed gate (AGENT_GATE_ARGS=...)"
 	@echo "  $(GREEN)cargo-agent-gate$(NC)- Run Cargo gate for changed agent files"
 	@echo "  $(GREEN)buildbuddy-install$(NC)- Install pinned optional BuildBuddy CLI"
 	@echo "  $(GREEN)buildbuddy-doctor$(NC)- Check optional BuildBuddy setup"
-	@echo "  $(GREEN)buildbuddy-agent-gate$(NC)- Run BuildBuddy gate for changed agent files"
-	@echo "  $(GREEN)buildbuddy-ci-dispatch$(NC)- Dispatch optional BuildBuddy CI mode"
+	@echo "  $(GREEN)buildbuddy-agent-gate$(NC)- Run BuildBuddy gate for changed agent files (AGENT_GATE_ARGS=...)"
+	@echo "  $(GREEN)buildbuddy-ci-dispatch$(NC)- Dispatch optional BuildBuddy CI mode (BUILDBUDDY_CI_ARGS=...)"
 	@echo "  $(GREEN)buildbuddy-fast$(NC)- Run optional BuildBuddy fast test lane"
 	@echo "  $(GREEN)buildbuddy-benchmark$(NC)- Compare Cargo and BuildBuddy fast lanes"
 	@echo "  $(GREEN)buildbuddy-ci$(NC) - Run optional BuildBuddy workspace CI gate"

@@ -150,6 +150,7 @@ gate. Set `MEERKAT_AGENT_GATE_BACKEND=buildbuddy` or pass `--buildbuddy` to opt
 into the BuildBuddy changed-path gate. Use `--dry-run` to inspect the selected
 packages or paths before paying the build cost. The Cargo and BuildBuddy gates
 accept `--staged`, `--committed`, and `--working-tree` for hook and CI routing.
+When using Make, pass gate flags with `AGENT_GATE_ARGS='--dry-run --working-tree'`.
 The optional manual BuildBuddy workflow remains opt-in and uses
 `scripts/buildbuddy-ci-dispatch` to choose a full workspace gate or a changed
 branch/path gate.
