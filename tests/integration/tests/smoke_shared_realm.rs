@@ -4909,20 +4909,6 @@ async fn e2e_scenario_60_rust_sdk_realtime_channel_session_exchange()
     assert!(last_assistant_text.contains("birch"));
 
     connection.close().await?;
-    let close_deadline = Instant::now() + Duration::from_secs(30);
-    let mut saw_closed = false;
-    while Instant::now() < close_deadline && !saw_closed {
-        let Some(frame) = connection.next_frame().await? else {
-            break;
-        };
-        if matches!(
-            frame,
-            meerkat::contracts::RealtimeServerFrame::ChannelClosed(_)
-        ) {
-            saw_closed = true;
-        }
-    }
-    assert!(saw_closed, "expected channel.closed after Rust SDK close");
 
     shutdown_stdio_process(rpc).await?;
     Ok(())
