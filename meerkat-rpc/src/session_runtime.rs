@@ -2215,11 +2215,6 @@ impl SessionRuntime {
         status: meerkat_contracts::PeerResponseTerminalStatusWire,
         result: serde_json::Value,
     ) -> Result<meerkat_runtime::AcceptOutcome, RpcError> {
-        use meerkat_runtime::input::{
-            Input, InputDurability, InputHeader, InputOrigin, InputVisibility, PeerConvention,
-            PeerInput, ResponseTerminalStatus,
-        };
-
         if self.live_session_is_stale(session_id).await? {
             let _ = self.service.discard_live_session(session_id).await;
             self.runtime_adapter.unregister_session(session_id).await;
@@ -2234,47 +2229,13 @@ impl SessionRuntime {
                 data: None,
             })?;
 
-        if request_id.trim().is_empty() {
-            return Err(RpcError {
+        let input =
+            meerkat_runtime::peer_response_terminal_input(&peer_name, request_id, status, result)
+                .map_err(|err| RpcError {
                 code: error::INVALID_PARAMS,
-                message: "request_id cannot be empty".to_string(),
+                message: err.to_string(),
                 data: None,
-            });
-        }
-
-        let input = Input::Peer(PeerInput {
-            header: InputHeader {
-                id: meerkat_core::lifecycle::InputId::new(),
-                timestamp: chrono::Utc::now(),
-                source: InputOrigin::Peer {
-                    peer_id: peer_name.as_string(),
-                    runtime_id: None,
-                },
-                durability: InputDurability::Durable,
-                visibility: InputVisibility::default(),
-                idempotency_key: None,
-                supersession_key: None,
-                correlation_id: None,
-            },
-            convention: Some(PeerConvention::ResponseTerminal {
-                request_id,
-                status: match status {
-                    meerkat_contracts::PeerResponseTerminalStatusWire::Completed => {
-                        ResponseTerminalStatus::Completed
-                    }
-                    meerkat_contracts::PeerResponseTerminalStatusWire::Failed => {
-                        ResponseTerminalStatus::Failed
-                    }
-                    meerkat_contracts::PeerResponseTerminalStatusWire::Cancelled => {
-                        ResponseTerminalStatus::Cancelled
-                    }
-                },
-            }),
-            body: String::new(),
-            payload: Some(result),
-            blocks: None,
-            handling_mode: None,
-        });
+            })?;
 
         self.runtime_adapter
             .accept_input(session_id, input)

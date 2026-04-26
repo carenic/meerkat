@@ -2191,46 +2191,16 @@ async fn post_peer_response_terminal(
         .map_err(ApiError::BadRequest)
         .map_err(IntoResponse::into_response)?;
 
-    if body.request_id.trim().is_empty() {
-        return Err(ApiError::BadRequest("request_id cannot be empty".to_string()).into_response());
-    }
-
     let session_id =
         resolve_session_id_for_state(&id, &state).map_err(IntoResponse::into_response)?;
 
-    let input = meerkat_runtime::Input::Peer(meerkat_runtime::PeerInput {
-        header: meerkat_runtime::InputHeader {
-            id: meerkat_core::lifecycle::InputId::new(),
-            timestamp: chrono::Utc::now(),
-            source: meerkat_runtime::InputOrigin::Peer {
-                peer_id: peer_name.as_string(),
-                runtime_id: None,
-            },
-            durability: meerkat_runtime::InputDurability::Durable,
-            visibility: meerkat_runtime::InputVisibility::default(),
-            idempotency_key: None,
-            supersession_key: None,
-            correlation_id: None,
-        },
-        convention: Some(meerkat_runtime::PeerConvention::ResponseTerminal {
-            request_id: body.request_id,
-            status: match body.status {
-                meerkat_contracts::PeerResponseTerminalStatusWire::Completed => {
-                    meerkat_runtime::ResponseTerminalStatus::Completed
-                }
-                meerkat_contracts::PeerResponseTerminalStatusWire::Failed => {
-                    meerkat_runtime::ResponseTerminalStatus::Failed
-                }
-                meerkat_contracts::PeerResponseTerminalStatusWire::Cancelled => {
-                    meerkat_runtime::ResponseTerminalStatus::Cancelled
-                }
-            },
-        }),
-        body: String::new(),
-        payload: Some(body.result),
-        blocks: None,
-        handling_mode: None,
-    });
+    let input = meerkat_runtime::peer_response_terminal_input(
+        &peer_name,
+        body.request_id,
+        body.status,
+        body.result,
+    )
+    .map_err(|err| ApiError::BadRequest(err.to_string()).into_response())?;
 
     admit_runtime_input_via_webhook(&state, &session_id, input, WebhookAdmissionMode::Wakeful).await
 }

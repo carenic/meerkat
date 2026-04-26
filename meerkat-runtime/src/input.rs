@@ -396,6 +396,62 @@ pub enum ResponseTerminalStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PeerResponseTerminalInputError {
+    #[error("request_id cannot be empty")]
+    EmptyRequestId,
+}
+
+pub fn response_terminal_status_from_wire(
+    status: meerkat_contracts::PeerResponseTerminalStatusWire,
+) -> ResponseTerminalStatus {
+    match status {
+        meerkat_contracts::PeerResponseTerminalStatusWire::Completed => {
+            ResponseTerminalStatus::Completed
+        }
+        meerkat_contracts::PeerResponseTerminalStatusWire::Failed => ResponseTerminalStatus::Failed,
+        meerkat_contracts::PeerResponseTerminalStatusWire::Cancelled => {
+            ResponseTerminalStatus::Cancelled
+        }
+    }
+}
+
+pub fn peer_response_terminal_input(
+    peer_name: &meerkat_core::comms::PeerName,
+    request_id: impl Into<String>,
+    status: meerkat_contracts::PeerResponseTerminalStatusWire,
+    result: serde_json::Value,
+) -> Result<Input, PeerResponseTerminalInputError> {
+    let request_id = request_id.into();
+    if request_id.trim().is_empty() {
+        return Err(PeerResponseTerminalInputError::EmptyRequestId);
+    }
+
+    Ok(Input::Peer(PeerInput {
+        header: InputHeader {
+            id: InputId::new(),
+            timestamp: Utc::now(),
+            source: InputOrigin::Peer {
+                peer_id: peer_name.as_string(),
+                runtime_id: None,
+            },
+            durability: InputDurability::Durable,
+            visibility: InputVisibility::default(),
+            idempotency_key: None,
+            supersession_key: None,
+            correlation_id: None,
+        },
+        convention: Some(PeerConvention::ResponseTerminal {
+            request_id,
+            status: response_terminal_status_from_wire(status),
+        }),
+        body: String::new(),
+        payload: Some(result),
+        blocks: None,
+        handling_mode: None,
+    }))
+}
+
 /// Flow step input from mob orchestration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowStepInput {
@@ -1060,6 +1116,53 @@ mod tests {
             Input::Peer(p) => assert_eq!(p.handling_mode, Some(HandlingMode::Queue)),
             other => panic!("Expected Peer, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn peer_response_terminal_input_owns_wire_status_mapping() {
+        let peer_name = meerkat_core::comms::PeerName::new("analyst").unwrap();
+        let input = peer_response_terminal_input(
+            &peer_name,
+            "req-1",
+            meerkat_contracts::PeerResponseTerminalStatusWire::Cancelled,
+            serde_json::json!({"ok": false}),
+        )
+        .unwrap();
+
+        match input {
+            Input::Peer(PeerInput {
+                header:
+                    InputHeader {
+                        source: InputOrigin::Peer { peer_id, .. },
+                        durability: InputDurability::Durable,
+                        ..
+                    },
+                convention: Some(PeerConvention::ResponseTerminal { request_id, status }),
+                payload: Some(payload),
+                handling_mode: None,
+                ..
+            }) => {
+                assert_eq!(peer_id, "analyst");
+                assert_eq!(request_id, "req-1");
+                assert_eq!(status, ResponseTerminalStatus::Cancelled);
+                assert_eq!(payload["ok"], false);
+            }
+            other => panic!("expected terminal peer input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_response_terminal_input_rejects_empty_request_id() {
+        let peer_name = meerkat_core::comms::PeerName::new("analyst").unwrap();
+        let err = peer_response_terminal_input(
+            &peer_name,
+            " ",
+            meerkat_contracts::PeerResponseTerminalStatusWire::Completed,
+            serde_json::json!({}),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, PeerResponseTerminalInputError::EmptyRequestId);
     }
 
     #[test]
