@@ -34,6 +34,9 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_HOME: /tmp/meerkat-cargo-home
+
 jobs:
   macos-arm64-rbe:
     name: macOS arm64 RBE gate

@@ -119,6 +119,13 @@ else
   pass "GitHub workflow Rust entrypoints use the repo Cargo wrapper"
 fi
 
+if grep -q 'CARGO_HOME: /tmp/meerkat-cargo-home' .github/workflows/ci.yml &&
+  grep -q 'CARGO_HOME: /tmp/meerkat-cargo-home' .github/workflows/buildbuddy.yml; then
+  pass "CI and BuildBuddy workflows keep repo-cargo Cargo home cacheable"
+else
+  bad "CI or BuildBuddy workflow is missing a stable repo-cargo CARGO_HOME"
+fi
+
 agent_gate_probe="$(./scripts/agent-gate --dry-run --working-tree meerkat-runtime/src/input_ledger.rs 2>&1 || true)"
 if [[ -x scripts/agent-gate ]] &&
   grep -q 'Cargo agent gate packages:' <<<"${agent_gate_probe}" &&
