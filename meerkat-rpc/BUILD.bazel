@@ -70,6 +70,70 @@ rust_library(
     ),
 )
 
+rust_test(
+    name = "meerkat_rpc_unit_test",
+    aliases = aliases(
+        package_name = "meerkat-rpc",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "meerkat_rpc",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "comms",
+        "mcp",
+        "mob",
+        "schedule",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "./meerkat-rpc",
+    },
+    tags = [
+        "fast",
+        "unit",
+    ],
+    size = "small",
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-rpc",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-anthropic:meerkat_anthropic",
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-gemini:meerkat_gemini",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-models:meerkat_models",
+        "//meerkat-openai:meerkat_openai",
+        "//meerkat-providers:meerkat_providers",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-rpc",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 rust_binary(
     name = "rkat_rpc_bin",
     aliases = aliases(package_name = "meerkat-rpc"),
@@ -765,6 +829,7 @@ rust_test(
 test_suite(
     name = "fast_tests",
     tests = [
+        ":meerkat_rpc_unit_test",
         ":realtime_ws_protocol_test",
         ":regression_rpc_test",
         ":rpc_auth_methods_test",

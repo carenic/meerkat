@@ -14,6 +14,7 @@ const metadata = readMetadata();
 const rootBuild = readFileSync(resolve(root, "BUILD.bazel"), "utf8");
 const missing = [];
 const expected = [];
+const expectedUnit = [];
 
 function hasTarget(pkg, name) {
   const buildPath = resolve(root, packageDir(pkg), "BUILD.bazel");
@@ -27,6 +28,18 @@ function rootSuiteIncludes(label) {
 
 for (const pkg of workspacePackages(metadata)) {
   for (const target of pkg.targets) {
+    if (target.kind.includes("lib") && !target.kind.includes("proc-macro")) {
+      const targetName = `${crateName(target.name)}_unit_test`;
+      const label = `//${packageDir(pkg)}:${targetName}`;
+      expectedUnit.push(label);
+
+      if (!hasTarget(pkg, targetName)) {
+        missing.push(`${label} missing generated unit target`);
+      } else if (!rootSuiteIncludes(label)) {
+        missing.push(`${label} missing from //:fast_tests`);
+      }
+    }
+
     if (!target.kind.includes("test")) continue;
     if (!isFastTest(pkg, target)) continue;
 
@@ -48,4 +61,6 @@ if (missing.length) {
   process.exit(1);
 }
 
-console.log(`BuildBuddy fast parity ok: ${expected.length} fast Cargo test target(s) mapped`);
+console.log(
+  `BuildBuddy fast parity ok: ${expected.length} fast Cargo test target(s) and ${expectedUnit.length} lib unit target(s) mapped`,
+);

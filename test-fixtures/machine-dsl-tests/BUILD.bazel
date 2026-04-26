@@ -57,6 +57,56 @@ rust_library(
 )
 
 rust_test(
+    name = "machine_dsl_tests_unit_test",
+    aliases = aliases(
+        package_name = "test-fixtures/machine-dsl-tests",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "machine_dsl_tests",
+    crate_root = "src/lib.rs",
+    crate_features = [],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "./test-fixtures/machine-dsl-tests",
+    },
+    tags = [
+        "fast",
+        "unit",
+    ],
+    size = "small",
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = [
+        "//meerkat-machine-dsl:meerkat_machine_dsl",
+    ] + all_crate_deps(
+        package_name = "test-fixtures/machine-dsl-tests",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-machine-codegen:meerkat_machine_codegen",
+        "//meerkat-machine-kernels:meerkat_machine_kernels",
+        "//meerkat-machine-schema:meerkat_machine_schema",
+    ] + all_crate_deps(
+        package_name = "test-fixtures/machine-dsl-tests",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "compile_fail_tests_test",
     aliases = aliases(
         package_name = "test-fixtures/machine-dsl-tests",
@@ -116,4 +166,11 @@ rust_test(
         normal = True,
         normal_dev = True,
     ),
+)
+
+test_suite(
+    name = "fast_tests",
+    tests = [
+        ":machine_dsl_tests_unit_test",
+    ],
 )

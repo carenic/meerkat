@@ -65,6 +65,64 @@ rust_library(
 )
 
 rust_test(
+    name = "meerkat_tools_unit_test",
+    aliases = aliases(
+        package_name = "meerkat-tools",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "meerkat_tools",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "comms",
+        "mcp",
+        "skills",
+        "sqlite",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+        "skills/shell-patterns/SKILL.md",
+        "skills/task-workflow/SKILL.md",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "./meerkat-tools",
+    },
+    tags = [
+        "fast",
+        "unit",
+    ],
+    size = "small",
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-tools",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-skills:meerkat_skills",
+    ] + all_crate_deps(
+        package_name = "meerkat-tools",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "browse_load_surface_test",
     aliases = aliases(
         package_name = "meerkat-tools",
@@ -433,6 +491,7 @@ test_suite(
         ":browse_load_surface_test",
         ":builtin_skill_canonical_key_test",
         ":dispatcher_access_denied_distinct_test",
+        ":meerkat_tools_unit_test",
         ":rct_contracts_test",
     ],
 )

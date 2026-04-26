@@ -55,6 +55,54 @@ rust_library(
 )
 
 rust_test(
+    name = "meerkat_machine_codegen_unit_test",
+    aliases = aliases(
+        package_name = "meerkat-machine-codegen",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "meerkat_machine_codegen",
+    crate_root = "src/lib.rs",
+    crate_features = [],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "./meerkat-machine-codegen",
+    },
+    tags = [
+        "fast",
+        "unit",
+    ],
+    size = "small",
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-machine-codegen",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-machine-schema:meerkat_machine_schema",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+    ] + all_crate_deps(
+        package_name = "meerkat-machine-codegen",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "artifacts_semantic_model_test",
     aliases = aliases(
         package_name = "meerkat-machine-codegen",
@@ -307,6 +355,7 @@ test_suite(
     name = "fast_tests",
     tests = [
         ":artifacts_semantic_model_test",
+        ":meerkat_machine_codegen_unit_test",
         ":named_type_binding_respected_test",
         ":render_contracts_test",
         ":routed_effect_module_shape_test",

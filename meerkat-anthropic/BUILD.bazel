@@ -57,6 +57,56 @@ rust_library(
 )
 
 rust_test(
+    name = "meerkat_anthropic_unit_test",
+    aliases = aliases(
+        package_name = "meerkat-anthropic",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "meerkat_anthropic",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "oauth",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "./meerkat-anthropic",
+    },
+    tags = [
+        "fast",
+        "unit",
+    ],
+    size = "small",
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-anthropic",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-auth-core:meerkat_auth_core",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-llm-core:meerkat_llm_core",
+    ] + all_crate_deps(
+        package_name = "meerkat-anthropic",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "oauth_resolve_test",
     aliases = aliases(
         package_name = "meerkat-anthropic",
@@ -110,6 +160,7 @@ rust_test(
 test_suite(
     name = "fast_tests",
     tests = [
+        ":meerkat_anthropic_unit_test",
         ":oauth_resolve_test",
     ],
 )

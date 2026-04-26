@@ -84,7 +84,8 @@ pub fn run_protocol_codegen() -> Result<()> {
 }
 
 fn rustfmt_source(source: &str) -> Result<String> {
-    let mut child = Command::new("rustfmt")
+    let rustfmt = std::env::var_os("RUSTFMT").unwrap_or_else(|| "rustfmt".into());
+    let mut child = Command::new(rustfmt)
         .args(["--edition", "2024", "--emit", "stdout"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

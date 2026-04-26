@@ -65,6 +65,69 @@ rust_library(
     ),
 )
 
+rust_test(
+    name = "meerkat_mcp_server_unit_test",
+    aliases = aliases(
+        package_name = "meerkat-mcp-server",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "meerkat_mcp_server",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "comms",
+        "schedule",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "./meerkat-mcp-server",
+    },
+    tags = [
+        "fast",
+        "unit",
+    ],
+    size = "small",
+    data = [
+        "//:test_fixtures",
+        "//test-fixtures/machine-dsl-tests:package_runfiles",
+        "//test-fixtures/mcp-test-server:package_runfiles",
+        "//test-fixtures/surface-build-fixtures:package_runfiles",
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 rust_binary(
     name = "rkat_mcp_bin",
     aliases = aliases(package_name = "meerkat-mcp-server"),
@@ -367,6 +430,7 @@ test_suite(
     name = "fast_tests",
     tests = [
         ":mcp_binding_input_test",
+        ":meerkat_mcp_server_unit_test",
         ":runtime_backed_ingress_test",
     ],
 )

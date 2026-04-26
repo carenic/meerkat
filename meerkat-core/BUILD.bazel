@@ -55,6 +55,54 @@ rust_library(
 )
 
 rust_test(
+    name = "meerkat_core_unit_test",
+    aliases = aliases(
+        package_name = "meerkat-core",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "meerkat_core",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "jsonschema",
+        "schema",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+        "src/config_template.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "./meerkat-core",
+    },
+    tags = [
+        "fast",
+        "unit",
+    ],
+    size = "small",
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-core",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        package_name = "meerkat-core",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "connection_ref_no_string_form_test",
     aliases = aliases(
         package_name = "meerkat-core",
@@ -571,6 +619,7 @@ test_suite(
         ":fork_at_rotates_session_id_test",
         ":hooks_behavior_test",
         ":hooks_contracts_test",
+        ":meerkat_core_unit_test",
         ":rct_contracts_test",
         ":realm_connection_config_test",
         ":runtime_turn_metadata_typed_round_trip_test",

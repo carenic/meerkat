@@ -56,6 +56,55 @@ rust_library(
 )
 
 rust_test(
+    name = "meerkat_skills_unit_test",
+    aliases = aliases(
+        package_name = "meerkat-skills",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "meerkat_skills",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "skills-http",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "./meerkat-skills",
+    },
+    tags = [
+        "fast",
+        "unit",
+    ],
+    size = "small",
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-skills",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+    ] + all_crate_deps(
+        package_name = "meerkat-skills",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "filesystem_source_test",
     aliases = aliases(
         package_name = "meerkat-skills",
@@ -226,6 +275,7 @@ rust_test(
 test_suite(
     name = "fast_tests",
     tests = [
+        ":meerkat_skills_unit_test",
         ":resolver_precedence_test",
         ":transport_sources_test",
     ],

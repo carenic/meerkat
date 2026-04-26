@@ -56,6 +56,56 @@ rust_library(
     ),
 )
 
+rust_test(
+    name = "meerkat_mob_mcp_unit_test",
+    aliases = aliases(
+        package_name = "meerkat-mob-mcp",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "meerkat_mob_mcp",
+    crate_root = "src/lib.rs",
+    crate_features = [],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "./meerkat-mob-mcp",
+    },
+    tags = [
+        "fast",
+        "unit",
+    ],
+    size = "small",
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-mob-mcp",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+    ] + all_crate_deps(
+        package_name = "meerkat-mob-mcp",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 rust_binary(
     name = "rkat_mob_mcp_bin",
     aliases = aliases(package_name = "meerkat-mob-mcp"),
@@ -87,4 +137,11 @@ rust_binary(
         package_name = "meerkat-mob-mcp",
         normal = True,
     ),
+)
+
+test_suite(
+    name = "fast_tests",
+    tests = [
+        ":meerkat_mob_mcp_unit_test",
+    ],
 )

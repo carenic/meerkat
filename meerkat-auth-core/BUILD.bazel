@@ -59,6 +59,58 @@ rust_library(
 )
 
 rust_test(
+    name = "meerkat_auth_core_unit_test",
+    aliases = aliases(
+        package_name = "meerkat-auth-core",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "meerkat_auth_core",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "file-lock",
+        "gcp-auth",
+        "keyring",
+        "oauth",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "./meerkat-auth-core",
+    },
+    tags = [
+        "fast",
+        "unit",
+    ],
+    size = "small",
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-auth-core",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-core:meerkat_core",
+        "//meerkat-llm-core:meerkat_llm_core",
+    ] + all_crate_deps(
+        package_name = "meerkat-auth-core",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "aws_sts_authorizer_test",
     aliases = aliases(
         package_name = "meerkat-auth-core",
@@ -444,6 +496,7 @@ test_suite(
         ":aws_sts_authorizer_test",
         ":azure_ad_authorizer_test",
         ":google_auth_authorizer_test",
+        ":meerkat_auth_core_unit_test",
         ":oauth_flow_test",
         ":refresh_coordinator_crossproc_test",
         ":refresh_coordinator_inproc_test",

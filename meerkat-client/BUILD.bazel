@@ -66,6 +66,65 @@ rust_library(
 )
 
 rust_test(
+    name = "meerkat_client_unit_test",
+    aliases = aliases(
+        package_name = "meerkat-client",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "meerkat_client",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "anthropic",
+        "gemini",
+        "integration-real-tests",
+        "native-keyring",
+        "oauth",
+        "openai",
+        "openai-realtime",
+        "refresh-file-lock",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "./meerkat-client",
+    },
+    tags = [
+        "fast",
+        "unit",
+    ],
+    size = "small",
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-client",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-anthropic:meerkat_anthropic",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-gemini:meerkat_gemini",
+        "//meerkat-llm-core:meerkat_llm_core",
+        "//meerkat-openai:meerkat_openai",
+    ] + all_crate_deps(
+        package_name = "meerkat-client",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "live_client_provider_matrix_test",
     aliases = aliases(
         package_name = "meerkat-client",
@@ -250,6 +309,7 @@ rust_test(
 test_suite(
     name = "fast_tests",
     tests = [
+        ":meerkat_client_unit_test",
         ":rct_contracts_test",
     ],
 )

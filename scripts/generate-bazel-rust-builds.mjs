@@ -699,6 +699,55 @@ for (const pkg of localPackages.values()) {
     }
     attrs.splice(attrs.length - 1, 0, `    proc_macro_deps = ${procExpr},`);
     rules.push(`${rule}(\n${attrs.join("\n")}\n)`);
+    if (rule === "rust_library") {
+      const unitName = `${crateName(target.name)}_unit_test`;
+      const packageRunfilesDir = relative(root, dir) || ".";
+      const cargoManifestDir = packageRunfilesDir !== "."
+        ? `./${packageRunfilesDir}`
+        : packageRunfilesDir;
+      const unitDepsExpr = depsWithOptionalExternal.length
+        ? `${listExpr(depsWithOptionalExternal)} + ${externalNormalWithDev}`
+        : externalNormalWithDev;
+      const unitProcExpr = procMacroDeps.length
+        ? `${listExpr(procMacroDeps)} + ${externalProcWithDev}`
+        : externalProcWithDev;
+      const currentPackageRunfiles = `//${relative(root, dir)}:package_runfiles`;
+      const unitData = [
+        ":package_runfiles",
+        ...workspaceDataLabels(target).filter((label) => label !== currentPackageRunfiles),
+      ];
+      const unitEnv = [`        "RUST_MIN_STACK": "16777216",`];
+      if (key === "xtask") {
+        const rustfmt = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin";
+        const rustfmtLib = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib";
+        unitData.push("//:workspace_runfiles");
+        unitData.push(rustfmt);
+        unitData.push(rustfmtLib);
+        unitEnv.push(`        "RUSTFMT": "$(rootpath ${rustfmt})",`);
+        unitEnv.push(`        "WORKSPACE_ROOT": ".",`);
+      }
+      const unitAttrs = [
+        `    name = ${q(unitName)},`,
+        `    aliases = ${aliasesExpr.replace(`aliases(package_name = ${q(key)})`, `aliases(\n        package_name = ${q(key)},\n        normal = True,\n        normal_dev = True,\n        proc_macro = True,\n        proc_macro_dev = True,\n    )`)},`,
+        `    crate_name = ${q(crateName(target.name))},`,
+        `    crate_root = ${q(relative(dir, target.src_path))},`,
+        `    crate_features = ${listExpr([...activeFeatures.get(pkg.id)].sort())},`,
+        `    edition = "2024",`,
+        `    compile_data = ${compileDataExpr},`,
+        `    srcs = ${srcsExpr},`,
+        `    visibility = ["//visibility:public"],`,
+        `    rustc_env = {\n        "CARGO_MANIFEST_DIR": ${q(cargoManifestDir)},\n    },`,
+        `    tags = ${listExpr(["fast", "unit"])},`,
+        `    size = "small",`,
+        `    data = ${listExpr([...new Set(unitData)].sort())},`,
+        `    env = {\n${unitEnv.join("\n")}\n    },`,
+        `    proc_macro_deps = ${unitProcExpr},`,
+        `    deps = ${unitDepsExpr},`,
+      ];
+      rules.push(`rust_test(\n${unitAttrs.join("\n")}\n)`);
+      fastTestLabels.push(`//${relative(root, dir)}:${unitName}`);
+      packageFastTests.push(`:${unitName}`);
+    }
     for (const spec of filteredNativeTests) {
       const filteredAttrs = [...rustTestBaseAttrs];
       filteredAttrs[0] = `    name = ${q(spec.name)},`;
