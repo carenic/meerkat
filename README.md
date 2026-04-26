@@ -142,13 +142,14 @@ that wrapped Cargo caches stay outside the repository, same-checkout agents can
 select distinct `RUST_LANE_ID` target dirs, and the fast test profile still
 excludes dedicated e2e wrappers.
 
-For local multi-agent edits without BuildBuddy access, use
-`make cargo-agent-gate`. It derives build-relevant changed files and runs a
-package-scoped Cargo clippy + nextest gate, escalating only global Rust lane
-changes to a workspace Cargo gate. Use `scripts/cargo-agent-gate --dry-run`
-to inspect the selected packages before paying the build cost. Both
-`scripts/cargo-agent-gate` and `scripts/buildbuddy-agent-gate` accept
-`--staged`, `--committed`, and `--working-tree` for hook and CI routing.
+For local multi-agent edits, use `make agent-gate` or `scripts/agent-gate`.
+Cargo is the default backend, so the command works without BuildBuddy access.
+It derives build-relevant changed files and runs a package-scoped Cargo clippy
++ nextest gate, escalating only global Rust lane changes to a workspace Cargo
+gate. Set `MEERKAT_AGENT_GATE_BACKEND=buildbuddy` or pass `--buildbuddy` to opt
+into the BuildBuddy changed-path gate. Use `--dry-run` to inspect the selected
+packages or paths before paying the build cost. The Cargo and BuildBuddy gates
+accept `--staged`, `--committed`, and `--working-tree` for hook and CI routing.
 The optional manual BuildBuddy workflow remains opt-in and uses
 `scripts/buildbuddy-ci-dispatch` to choose a full workspace gate or a changed
 branch/path gate.

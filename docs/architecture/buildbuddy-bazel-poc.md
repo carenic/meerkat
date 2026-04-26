@@ -282,6 +282,9 @@ to roughly `4-6s` once those lanes were prepared.
   one second for the representative shared support-file case.
 - For a normal post-edit agent gate, use `scripts/buildbuddy-changed-gate
   --owned <path>`; it overlaps the selected fast tests and selected clippy.
+- For the default developer entrypoint, use `scripts/agent-gate`. It runs the
+  Cargo changed-path gate unless `--buildbuddy` or
+  `MEERKAT_AGENT_GATE_BACKEND=buildbuddy` opts into BuildBuddy.
 - For the common multi-agent case where the agent has local edits and just
   needs the right check, use `make buildbuddy-agent-gate`. It includes
   committed branch changes, staged changes, unstaged changes, and untracked

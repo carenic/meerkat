@@ -134,7 +134,7 @@ collect_changed_paths() {
 
 is_rust_relevant_path() {
   case "$1" in
-    *.rs|Cargo.toml|Cargo.lock|.cargo/config.toml|.config/nextest.toml|scripts/repo-cargo|scripts/cargo-*|scripts/rust-lane-doctor|scripts/test-rct.sh|Makefile)
+    *.rs|Cargo.toml|Cargo.lock|.cargo/config.toml|.config/nextest.toml|scripts/repo-cargo|scripts/agent-gate|scripts/cargo-*|scripts/rust-lane-doctor|scripts/test-rct.sh|Makefile)
       return 0
       ;;
     *)
@@ -145,7 +145,7 @@ is_rust_relevant_path() {
 
 is_global_path() {
   case "$1" in
-    Cargo.toml|Cargo.lock|.cargo/config.toml|.config/nextest.toml|scripts/repo-cargo|scripts/cargo-*|scripts/rust-lane-doctor|scripts/test-rct.sh|Makefile)
+    Cargo.toml|Cargo.lock|.cargo/config.toml|.config/nextest.toml|scripts/repo-cargo|scripts/agent-gate|scripts/cargo-*|scripts/rust-lane-doctor|scripts/test-rct.sh|Makefile)
       return 0
       ;;
     *)
