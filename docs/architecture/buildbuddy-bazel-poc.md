@@ -278,6 +278,7 @@ profile so `cargo fast`, `cargo rct`, `cargo int`, and
 | BuildBuddy changed gate for required-feature `machines_contracts` edit with optional external deps | `39s` first successful exact build + clippy, `22s` warm |
 | BuildBuddy fast lane after non-fast tag hardening | `32.387s` first run after graph/filter changes; `117` fast targets pass, `7` executed |
 | BuildBuddy fast lane after marking generated fast tests `small` | `11.219s`; `117` fast targets executed and passed, no oversized-test warning |
+| BuildBuddy fast lane with benchmark context artifacts | `8s` script wall; Bazel elapsed `4.726s`; `117` fast targets pass, `1` executed |
 
 The first touch of a new local lane pays Bazel analysis and remote-cache
 materialization cost. Once warmed, the wall-clock floor is mostly the `bb`/Bazel
@@ -353,7 +354,9 @@ to roughly `4-6s` once those lanes were prepared.
   secrets.
 - To compare the apples-to-apples fast lanes, run `make buildbuddy-benchmark`.
   It times Cargo fast tests and the equivalent BuildBuddy fast lane, then keeps
-  compact logs under the benchmark cache directory.
+  compact logs, `benchmark-context.txt`, and `summary.tsv` under the benchmark
+  cache directory. Use `scripts/buildbuddy-benchmark-fast-lanes --cargo` or
+  `--buildbuddy` to refresh one side without rerunning the other.
 - For the remote-compatible BuildBuddy gate, run `make buildbuddy-ci`, or
   `make buildbuddy-ci-warm` when repeated agents can reuse a stable output root.
 - To mirror the manual GitHub workflow locally, run

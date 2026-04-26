@@ -23,8 +23,12 @@ Runs the apples-to-apples fast deterministic test lanes:
   Cargo:      ./scripts/repo-cargo fast
   BuildBuddy: BUILDBUDDY_BAZEL_COMMAND=workspace-fast-rbe scripts/buildbuddy-bazel-poc
 
-The lanes both exclude dedicated e2e wrappers. BuildBuddy is opt-in and is
-preflighted with make buildbuddy-doctor before timing.
+The lanes both exclude non-fast/e2e/system/live/integration/required-feature
+tests. BuildBuddy is opt-in and is preflighted with make buildbuddy-doctor
+before timing.
+
+Writes benchmark-context.txt, summary.tsv, and per-lane logs under:
+  ${MEERKAT_BENCHMARK_LOG_ROOT:-$XDG_CACHE_HOME/meerkat/benchmarks/fast-lanes/<timestamp>}
 EOF
     exit 0
     ;;
@@ -36,6 +40,36 @@ esac
 
 temp_root="${MEERKAT_BENCHMARK_LOG_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/benchmarks/fast-lanes/$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "${temp_root}"
+summary_path="${temp_root}/summary.tsv"
+context_path="${temp_root}/benchmark-context.txt"
+
+buildbuddy_cli_version() {
+  local bb_bin=""
+  if command -v bb >/dev/null 2>&1; then
+    bb_bin="$(command -v bb)"
+  elif [[ -x "${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-cli/5.0.350/bin/bb" ]]; then
+    bb_bin="${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-cli/5.0.350/bin/bb"
+  fi
+
+  if [[ -n "${bb_bin}" ]]; then
+    "${bb_bin}" version 2>/dev/null | head -1 || true
+  fi
+}
+
+write_context() {
+  {
+    printf 'timestamp=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'repo=%s\n' "${workspace_root}"
+    printf 'head=%s\n' "$(git rev-parse HEAD)"
+    printf 'origin_main=%s\n' "$(git rev-parse origin/main 2>/dev/null || true)"
+    printf 'branch=%s\n' "$(git branch --show-current || true)"
+    printf 'uname=%s\n' "$(uname -a)"
+    printf 'rustc=%s\n' "$(rustc --version 2>/dev/null || true)"
+    printf 'cargo=%s\n' "$(./scripts/repo-cargo --version 2>/dev/null || true)"
+    printf 'bb=%s\n' "$(buildbuddy_cli_version)"
+  } >"${context_path}"
+  printf 'name\tstatus\twall_seconds\tlog\tcommand\n' >"${summary_path}"
+}
 
 summarize_log() {
   local log="$1"
@@ -46,17 +80,22 @@ run_timed() {
   local name="$1"
   shift
   local log="${temp_root}/${name//[^A-Za-z0-9_.-]/_}.log"
-  local start_seconds end_seconds status
+  local start_seconds end_seconds status wall command
+  printf -v command '%q ' "$@"
+  command="${command% }"
   start_seconds="$(date +%s)"
   set +e
   "$@" >"${log}" 2>&1
   status="$?"
   set -e
   end_seconds="$(date +%s)"
+  wall="$((end_seconds - start_seconds))"
+  printf '%s\t%s\t%s\t%s\t%s\n' "${name}" "${status}" "${wall}" "${log}" "${command}" >>"${summary_path}"
 
   printf '\n== %s ==\n' "${name}"
   printf 'status: %s\n' "${status}"
-  printf 'wall: %ss\n' "$((end_seconds - start_seconds))"
+  printf 'wall: %ss\n' "${wall}"
+  printf 'command: %s\n' "${command}"
   summarize_log "${log}"
   printf 'log: %s\n' "${log}"
 
@@ -64,6 +103,8 @@ run_timed() {
     return "${status}"
   fi
 }
+
+write_context
 
 if [[ "${mode}" == "all" || "${mode}" == "cargo" ]]; then
   run_timed "cargo-fast" ./scripts/repo-cargo fast
@@ -75,3 +116,5 @@ if [[ "${mode}" == "all" || "${mode}" == "buildbuddy" ]]; then
 fi
 
 printf '\nlogs kept under: %s\n' "${temp_root}"
+printf 'summary: %s\n' "${summary_path}"
+printf 'context: %s\n' "${context_path}"
