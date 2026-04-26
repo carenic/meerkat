@@ -238,6 +238,20 @@ fn rpc_catalog_router_docs_and_sdk_wrappers_are_aligned() {
     }
     router_methods.remove("initialized");
 
+    // Router-only compatibility shims intentionally remain absent from the public
+    // catalog and docs. Keep this in sync with scripts/verify-rpc-surface-alignment.sh.
+    for method in [
+        "runtime/session_status",
+        "runtime/session_submit",
+        "runtime/session_retire",
+        "runtime/session_reset",
+        "runtime/session_submission",
+        "runtime/session_submissions",
+        "skills/inspect",
+    ] {
+        router_methods.remove(method);
+    }
+
     let mut catalog_methods = BTreeSet::new();
     for needle in [
         "RpcMethodDescriptor::basic(",

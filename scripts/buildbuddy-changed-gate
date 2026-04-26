@@ -153,11 +153,12 @@ build_targets="$(./scripts/bazel-affected-fast-tests.mjs "${selector_mode_args[@
 clippy_targets="$(./scripts/bazel-affected-fast-tests.mjs "${selector_mode_args[@]}" --clippy "${paths[@]}")"
 
 target_count() {
-  if [[ -z "$1" ]]; then
-    printf '0\n'
-  else
-    wc -w <<<"$1" | tr -d ' '
-  fi
+  local count=0
+  local target
+  for target in $1; do
+    count=$((count + 1))
+  done
+  printf '%s\n' "${count}"
 }
 
 split_execution="parallel"
