@@ -143,8 +143,8 @@ Representative measurements from the POC environment:
 | Shared support clippy, exact owned selector, warm | `0.91s` wall |
 | Changed support gate, combined exact tests + exact clippy, first touch | `20-20.88s` script wall |
 | Changed support gate, combined exact tests + exact clippy, warm | `3.85-3.856s` script wall |
-| Two same-worktree changed gates, first touch | `26.44s` / `26.35s` wall |
-| Two same-worktree changed gates, warm | `5.12s` / `5.12s` wall |
+| Two same-worktree changed gates, combined first touch | `24.91s` / `25.10s` wall |
+| Two same-worktree changed gates, combined warm | `4.47s` / `4.63s` wall |
 | Three cold parallel selectors with metadata cache lock | `0` Cargo lock waits |
 | Fresh temp worktree source edit probe | `23.98s` wall |
 | Fresh temp worktree exact-test edit probe | `48.31s` wall |
