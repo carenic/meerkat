@@ -343,8 +343,7 @@ to roughly `4-6s` once those lanes were prepared.
   override that auto choice while benchmarking.
 - For the default developer entrypoint, use `scripts/agent-gate`. It runs the
   Cargo changed-path gate unless `--buildbuddy` or
-  `MEERKAT_BUILDBUDDY=1` opts into BuildBuddy. The legacy
-  `MEERKAT_AGENT_GATE_BACKEND=buildbuddy` switch still works. Direct integration
+  `MEERKAT_BUILDBUDDY=1` opts into BuildBuddy. Direct integration
   test files and importable `tests/support` modules are narrowed to exact Cargo
   test binaries for both nextest and clippy when the mapping is unambiguous.
   Cargo and BuildBuddy selectors share the same Cargo metadata and test-module

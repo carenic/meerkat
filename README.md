@@ -149,10 +149,8 @@ Cargo is the default backend, so the command works without BuildBuddy access.
 It derives build-relevant changed files and runs a package-scoped Cargo clippy
 + nextest gate, escalating only global Rust lane changes to a workspace Cargo
 gate. Set `MEERKAT_BUILDBUDDY=1` or pass `--buildbuddy` to opt into the
-BuildBuddy changed-path gate; the legacy
-`MEERKAT_AGENT_GATE_BACKEND=buildbuddy` switch still works. That same
-`MEERKAT_BUILDBUDDY=1` switch makes the standard pre-push Rust hooks choose
-BuildBuddy automatically.
+BuildBuddy changed-path gate. That same `MEERKAT_BUILDBUDDY=1` switch makes
+the standard pre-push Rust hooks choose BuildBuddy automatically.
 Use `--dry-run` to inspect the selected packages or paths before paying the
 build cost. The Cargo and BuildBuddy gates accept `--staged`, `--committed`,
 and `--working-tree` for hook and CI routing. When using Make, pass gate flags

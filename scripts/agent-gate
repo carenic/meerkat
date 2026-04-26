@@ -15,7 +15,6 @@ command works for every developer. BuildBuddy remains opt-in:
 
   scripts/agent-gate --buildbuddy --working-tree
   MEERKAT_BUILDBUDDY=1 scripts/agent-gate --committed
-  MEERKAT_AGENT_GATE_BACKEND=buildbuddy scripts/agent-gate --committed
 
 All remaining arguments are passed through to scripts/cargo-agent-gate or
 scripts/buildbuddy-agent-gate.

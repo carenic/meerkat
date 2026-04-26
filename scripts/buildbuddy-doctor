@@ -235,6 +235,9 @@ if grep -Fq 'vars.MEERKAT_BUILDBUDDY == '"'"'true'"'"'' .github/workflows/buildb
   grep -Fq 'MEERKAT_BUILDBUDDY: ${{ vars.MEERKAT_BUILDBUDDY' .github/workflows/buildbuddy.yml &&
   grep -Fq 'MEERKAT_BUILDBUDDY=1' README.md &&
   grep -Fq 'MEERKAT_BUILDBUDDY=1' scripts/agent-gate &&
+  ! grep -Fq 'MEERKAT_AGENT_GATE_BACKEND' scripts/build-backend-env &&
+  ! grep -Fq 'MEERKAT_AGENT_GATE_BACKEND=buildbuddy' README.md &&
+  ! grep -Fq 'MEERKAT_AGENT_GATE_BACKEND=buildbuddy' docs/architecture/buildbuddy-bazel-poc.md &&
   grep -Fq '. ./scripts/build-backend-env' Makefile &&
   grep -Fq 'source "${ROOT}/scripts/build-backend-env"' scripts/pre-push-unit.sh &&
   grep -Fq 'scripts/agent-gate" --staged' scripts/test-changed-crates.sh &&
