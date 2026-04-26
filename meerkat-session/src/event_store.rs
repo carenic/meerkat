@@ -137,6 +137,7 @@ impl EventStore for FileEventStore {
             .open(path)
             .await?;
         file.write_all(lines.as_bytes()).await?;
+        file.flush().await?;
         Ok(next_seq - 1)
     }
 
