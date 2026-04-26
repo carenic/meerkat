@@ -17,6 +17,7 @@ Scenarios:
   same-command       Run two same-checkout agents using the same command in parallel.
   support-file       Run exact selectors for a shared integration-test support file.
   changed-clippy     Run changed-scope clippy lanes for source and support edits.
+  changed-gate       Run the combined changed-path test+clippy gate.
   edit-probes        Make real edits in a temporary worktree and time edit lanes.
   edit-probes-warmed Prewarm lanes in a temporary worktree before timing edits.
   prewarm-dev        Run the shared dev-lane prewarm helper.
@@ -217,6 +218,17 @@ async function changedClippy(root) {
   ]);
   for (const result of results) printResult(result);
   return results.some((result) => result.code !== 0) ? 1 : 0;
+}
+
+async function changedGate(root) {
+  console.log("\n== changed-gate ==");
+  const result = await run(
+    "./scripts/buildbuddy-changed-gate",
+    ["--owned", "meerkat/tests/support/test_session_store.rs"],
+    { cwd: root, env: { RUST_LANE_ID: "scenario-changed-gate" }, label: "buildbuddy-changed-gate support" },
+  );
+  printResult(result);
+  return result.code;
 }
 
 function editProbeCases() {
@@ -440,6 +452,7 @@ const scenarios = requested.length === 0 || requested.includes("all")
       "same-command",
       "support-file",
       "changed-clippy",
+      "changed-gate",
       "edit-probes",
       "edit-probes-warmed",
       "prewarm-dev",
@@ -460,6 +473,7 @@ const runners = new Map([
   ["same-command", sameCommand],
   ["support-file", supportFile],
   ["changed-clippy", changedClippy],
+  ["changed-gate", changedGate],
   ["edit-probes", editProbes],
   ["edit-probes-warmed", (root) => editProbes(root, { prewarm: true })],
   ["prewarm-dev", (root) => prewarmProfile(root, "dev")],

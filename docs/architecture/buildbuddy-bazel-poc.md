@@ -40,6 +40,11 @@ For local-spawn variants, append `-local` to the command name where available.
 Remote execution remains the default because local-spawn often spends time
 downloading large remote-cache inputs before rustc can run.
 
+For a one-shot edit feedback gate, use `scripts/buildbuddy-changed-gate
+--owned <path>`. It runs the selected fast test lane and selected clippy lane in
+parallel. Use `--affected` when the edit needs reverse-dependency confidence,
+and `--local-test` when the selected test lane is already warm locally.
+
 ## Lane Isolation
 
 The wrapper assigns a default Bazel `--output_base` outside the repo:
@@ -76,6 +81,7 @@ modes:
   file, measured with remote and local-spawn execution.
 - `changed-clippy`: changed-scope clippy for representative source and shared
   support-file edits.
+- `changed-gate`: combined changed-path test and clippy gate.
 - `edit-probes`: creates a temporary detached worktree, makes harmless real
   edits to representative source/test/support files, runs the matching lanes,
   and removes the worktree.
@@ -131,6 +137,8 @@ Representative measurements from the POC environment:
 | Changed source clippy, owned selector, warm | `0.50s` wall |
 | Shared support clippy, exact owned selector, first touch | `21.77s` wall |
 | Shared support clippy, exact owned selector, warm | `0.91s` wall |
+| Changed support gate, exact tests + exact clippy, first touch | `25s` script wall |
+| Changed support gate, exact tests + exact clippy, warm | `4s` script wall |
 | Three cold parallel selectors with metadata cache lock | `0` Cargo lock waits |
 | Fresh temp worktree source edit probe | `23.98s` wall |
 | Fresh temp worktree exact-test edit probe | `48.31s` wall |
@@ -174,6 +182,8 @@ to roughly `4-6s` once those lanes were prepared.
 - For clippy during inner-loop work, use `owned-clippy-rbe <path>` first. Warm
   changed-scope clippy is currently sub-second for a leaf source edit and around
   one second for the representative shared support-file case.
+- For a normal post-edit agent gate, use `scripts/buildbuddy-changed-gate
+  --owned <path>`; it overlaps the selected fast tests and selected clippy.
 - For deeper shared crates, use `affected-*` when you need reverse-dependency
   confidence, and expect broad closures for high-fanout crates.
 - For the remote-compatible BuildBuddy gate, run `make buildbuddy-ci`, or

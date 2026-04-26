@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mode="owned"
+test_command="owned-fast-test"
+clippy_command="owned-clippy-rbe"
+paths=()
+
+usage() {
+  cat <<'EOF'
+usage: buildbuddy-changed-gate [--owned|--affected] [--local-test] <changed-path>...
+
+Runs the selected BuildBuddy test and clippy lanes in parallel for the supplied
+changed paths. Use --affected for reverse-dependency confidence and --local-test
+when the selected test lane is already warm locally.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --owned)
+      mode="owned"
+      shift
+      ;;
+    --affected)
+      mode="affected"
+      shift
+      ;;
+    --local-test)
+      if [[ "${mode}" == "owned" ]]; then
+        test_command="owned-fast-test-local"
+      else
+        test_command="affected-fast-test-local"
+      fi
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do
+        paths+=("$1")
+        shift
+      done
+      ;;
+    -*)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      paths+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ "${mode}" == "affected" ]]; then
+  clippy_command="affected-clippy-rbe"
+  if [[ "${test_command}" == "owned-fast-test" ]]; then
+    test_command="affected-fast-test"
+  elif [[ "${test_command}" == "owned-fast-test-local" ]]; then
+    test_command="affected-fast-test-local"
+  fi
+fi
+
+if [[ "${#paths[@]}" -eq 0 ]]; then
+  echo "error: at least one changed path is required" >&2
+  usage >&2
+  exit 2
+fi
+
+workspace_root="$(git rev-parse --show-toplevel)"
+cd "${workspace_root}"
+
+temp_root="$(mktemp -d "${TMPDIR:-/tmp}/meerkat-bb-changed-gate.XXXXXX")"
+cleanup() {
+  chmod -R u+w "${temp_root}" 2>/dev/null || true
+  rm -rf "${temp_root}"
+}
+trap cleanup EXIT
+
+summarize_log() {
+  local name="$1"
+  local status="$2"
+  local log="$3"
+  if [[ "${status}" == "0" ]]; then
+    printf 'PASS %s\n' "${name}"
+  else
+    printf 'FAIL(%s) %s\n' "${status}" "${name}"
+  fi
+  grep -E 'INFO: Elapsed time:|INFO: Build completed|Executed |ERROR:|FAILED' "${log}" | tail -8 || true
+}
+
+run_lane() {
+  local lane="$1"
+  local command="$2"
+  local log="$3"
+  shift 3
+  (
+    export RUST_LANE_ID="${RUST_LANE_ID:-changed-gate}-${lane}"
+    export BUILDBUDDY_BAZEL_COMMAND="${command}"
+    ./scripts/buildbuddy-bazel-poc "${paths[@]}" "$@"
+  ) >"${log}" 2>&1
+}
+
+test_log="${temp_root}/test.log"
+clippy_log="${temp_root}/clippy.log"
+test_status_file="${temp_root}/test.status"
+clippy_status_file="${temp_root}/clippy.status"
+
+start_seconds="$(date +%s)"
+
+(
+  set +e
+  run_lane test "${test_command}" "${test_log}" --jobs=64
+  echo "$?" >"${test_status_file}"
+) &
+test_pid="$!"
+
+(
+  set +e
+  run_lane clippy "${clippy_command}" "${clippy_log}" --jobs=64 --color=no --curses=no
+  echo "$?" >"${clippy_status_file}"
+) &
+clippy_pid="$!"
+
+wait "${test_pid}" || true
+wait "${clippy_pid}" || true
+
+end_seconds="$(date +%s)"
+test_status="$(cat "${test_status_file}" 2>/dev/null || echo 1)"
+clippy_status="$(cat "${clippy_status_file}" 2>/dev/null || echo 1)"
+
+printf 'BuildBuddy changed gate (%s) wall: %ss\n' "${mode}" "$((end_seconds - start_seconds))"
+summarize_log "${test_command}" "${test_status}" "${test_log}"
+summarize_log "${clippy_command}" "${clippy_status}" "${clippy_log}"
+
+if [[ "${test_status}" != "0" || "${clippy_status}" != "0" ]]; then
+  exit 1
+fi
