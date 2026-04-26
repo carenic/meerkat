@@ -92,3 +92,11 @@ runs:
       run: |
         bb_bin="$(scripts/install-buildbuddy-cli --dir "${RUNNER_TEMP}/buildbuddy-cli")"
         echo "$(dirname "${bb_bin}")" >> "${GITHUB_PATH}"
+
+    - name: Cache Bazel external repositories
+      uses: actions/cache@v4
+      with:
+        path: /tmp/meerkat-bazel-repository-cache
+        key: buildbuddy-bazel-repository-${{ runner.os }}-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock') }}
+        restore-keys: |
+          buildbuddy-bazel-repository-${{ runner.os }}-

@@ -658,6 +658,15 @@ if (next !== original) fs.writeFileSync(lockfile, next);
   module_lock_args+=(--lockfile_mode=refresh)
 fi
 
+common_args=()
+if [[ -z "${BUILDBUDDY_NO_DEFAULT_REPOSITORY_CACHE:-}" ]]; then
+  BUILDBUDDY_REPOSITORY_CACHE="${BUILDBUDDY_REPOSITORY_CACHE:-${MEERKAT_BUILDBUDDY_REPOSITORY_CACHE:-/tmp/meerkat-bazel-repository-cache}}"
+fi
+if [[ -n "${BUILDBUDDY_REPOSITORY_CACHE:-}" ]]; then
+  mkdir -p "${BUILDBUDDY_REPOSITORY_CACHE}"
+  common_args+=(--repository_cache="${BUILDBUDDY_REPOSITORY_CACHE}")
+fi
+
 apple_platform_args=()
 if [[ "${config}" == buildbuddy-macos-rbe* ]]; then
   macos_sdk_version="${BUILDBUDDY_MACOS_SDK_VERSION:-26.2}"
@@ -671,6 +680,7 @@ fi
 
 exec "${bb_bin}" "${startup_args[@]}" "${command}" \
   "${module_lock_args[@]}" \
+  "${common_args[@]}" \
   --config="${config}" \
   --remote_header="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}" \
   "${apple_platform_args[@]}" \

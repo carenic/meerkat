@@ -185,6 +185,14 @@ else
   bad "BuildBuddy launcher does not refresh stale local path dependency locks"
 fi
 
+if grep -Fq 'Cache Bazel external repositories' .github/actions/setup-buildbuddy-ci/action.yml &&
+  grep -Fq -- '--repository_cache=' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'Retrying %s after transient external repository fetch failure' scripts/buildbuddy-ci-lane; then
+  pass "BuildBuddy CI caches and retries external repository fetches"
+else
+  bad "BuildBuddy CI does not guard against transient external repository fetch failures"
+fi
+
 if grep -Fq -- '--macos_sdk_version=' scripts/buildbuddy-bazel-poc &&
   grep -Fq -- '--macos_minimum_os=' scripts/buildbuddy-bazel-poc &&
   grep -Fq 'BUILDBUDDY_MACOS_SDK_VERSION' scripts/buildbuddy-bazel-poc; then
