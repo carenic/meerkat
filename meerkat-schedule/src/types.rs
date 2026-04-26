@@ -1157,8 +1157,8 @@ pub fn default_planning_horizon_occurrences() -> u32 {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use meerkat_core::ToolNameSet;
     use meerkat_core::skills::{SkillName, SourceUuid};
-    use std::collections::HashSet;
 
     fn fixture_skill_key(name: &str) -> SkillKey {
         SkillKey::new(SourceUuid::builtin(), SkillName::parse(name).unwrap())
@@ -1226,7 +1226,7 @@ mod tests {
     #[test]
     fn resolved_spawn_snapshot_roundtrip_allow_filter() {
         let snapshot = ResolvedSpawnSnapshot {
-            tool_filter: meerkat_core::tool_scope::ToolFilter::Allow(HashSet::from([
+            tool_filter: meerkat_core::tool_scope::ToolFilter::Allow(ToolNameSet::from_iter([
                 "shell".to_string(),
                 "read_file".to_string(),
             ])),
@@ -1241,7 +1241,7 @@ mod tests {
     #[test]
     fn resolved_spawn_snapshot_roundtrip_deny_filter() {
         let snapshot = ResolvedSpawnSnapshot {
-            tool_filter: meerkat_core::tool_scope::ToolFilter::Deny(HashSet::from([
+            tool_filter: meerkat_core::tool_scope::ToolFilter::Deny(ToolNameSet::from_iter([
                 "dangerous_tool".to_string(),
             ])),
             model: "gpt-5.4".into(),
@@ -1287,8 +1287,8 @@ mod tests {
     fn helper_options_spec_with_resolved_snapshot_roundtrip() {
         let spec = HelperOptionsSpec {
             resolved_spawn_snapshot: Some(ResolvedSpawnSnapshot {
-                tool_filter: meerkat_core::tool_scope::ToolFilter::Allow(HashSet::from([
-                    "shell".to_string()
+                tool_filter: meerkat_core::tool_scope::ToolFilter::Allow(ToolNameSet::from_iter([
+                    "shell".to_string(),
                 ])),
                 model: "claude-sonnet-4-6".into(),
                 provider_params: None,

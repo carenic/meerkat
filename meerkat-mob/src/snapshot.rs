@@ -23,7 +23,7 @@ pub struct ParentToolScopeSnapshot {
 impl ParentToolScopeSnapshot {
     /// Convert this snapshot into a `ToolFilter::Allow` containing the visible tool names.
     pub fn to_tool_filter(&self) -> ToolFilter {
-        ToolFilter::Allow(self.visible_tool_names.clone())
+        ToolFilter::Allow(self.visible_tool_names.iter().cloned().collect())
     }
 
     /// Build a tool filter with additional allow/deny overlays applied on top
@@ -48,7 +48,7 @@ impl ParentToolScopeSnapshot {
             }
         }
 
-        ToolFilter::Allow(names)
+        ToolFilter::Allow(names.into_iter().collect())
     }
 
     /// Create a snapshot from a set of visible tool definitions.

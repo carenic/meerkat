@@ -345,15 +345,14 @@ impl AgentMobToolSurface {
                         ));
                     }
                 }
-                let comms_tools: std::collections::HashSet<String> = [
+                let comms_tools = [
                     "send",
                     "send_message",
                     "send_request",
                     "send_response",
                     "peers",
                 ]
-                .iter()
-                .map(ToString::to_string)
+                .into_iter()
                 .collect();
                 Ok(ResolvedSpawnTooling {
                     inherited_tool_filter: Some(meerkat_core::tool_scope::ToolFilter::Allow(

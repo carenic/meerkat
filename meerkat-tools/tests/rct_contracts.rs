@@ -591,8 +591,7 @@ fn test_regression_filtered_dispatcher_enforces_tool_access_policy() {
 
     // Test 1: DenyList should block specified tools
     {
-        let policy =
-            ToolAccessPolicy::DenyList(vec!["shell".to_string(), "shell_job_cancel".to_string()]);
+        let policy = ToolAccessPolicy::DenyList(vec!["shell".into(), "shell_job_cancel".into()]);
         let filtered = FilteredDispatcher::new(inner.clone(), &policy);
 
         let tool_names: Vec<_> = filtered.tools().iter().map(|t| t.name.clone()).collect();
@@ -620,7 +619,7 @@ fn test_regression_filtered_dispatcher_enforces_tool_access_policy() {
 
     // Test 2: AllowList should only permit specified tools
     {
-        let policy = ToolAccessPolicy::AllowList(vec!["task_list".to_string()]);
+        let policy = ToolAccessPolicy::AllowList(vec!["task_list".into()]);
         let filtered = FilteredDispatcher::new(inner.clone(), &policy);
 
         let tool_names: Vec<_> = filtered.tools().iter().map(|t| t.name.clone()).collect();
@@ -700,7 +699,7 @@ async fn test_regression_filtered_dispatcher_dispatch_blocked_returns_access_den
     }
 
     let inner = Arc::new(MockDispatcher);
-    let policy = ToolAccessPolicy::DenyList(vec!["shell".to_string()]);
+    let policy = ToolAccessPolicy::DenyList(vec!["shell".into()]);
     let filtered = FilteredDispatcher::new(inner, &policy);
 
     // Attempting to dispatch a blocked tool should return AccessDenied.

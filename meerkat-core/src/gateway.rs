@@ -37,7 +37,7 @@ use crate::tokio;
 use crate::tool_catalog::{ToolCatalogCapabilities, ToolCatalogEntry};
 #[cfg(test)]
 use crate::types::ToolResult;
-use crate::types::{ToolCallView, ToolDef};
+use crate::types::{ToolCallView, ToolDef, ToolName};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -148,7 +148,7 @@ pub struct ToolGateway {
     /// Parallel vector: tool index -> owning dispatcher entry index
     tool_entry: Vec<usize>,
     /// Routing table: tool name -> tool index
-    route: HashMap<String, usize>,
+    route: HashMap<ToolName, usize>,
     /// Dispatcher entries with their availability
     entries: Vec<DispatcherEntry>,
     /// Cached visible tool set; rebuilt only when availability changes.
@@ -256,7 +256,7 @@ impl ToolGatewayBuilder {
     /// Returns an error if any two dispatchers provide tools with the same name.
     /// All tools are checked for collisions regardless of their availability.
     pub fn build(self) -> Result<ToolGateway, ToolError> {
-        let mut route: HashMap<String, usize> = HashMap::new();
+        let mut route: HashMap<ToolName, usize> = HashMap::new();
         let mut all_tools: Vec<Arc<ToolDef>> = Vec::new();
         let mut catalog_entries: Vec<ToolCatalogEntry> = Vec::new();
         let mut tool_entry: Vec<usize> = Vec::new();
@@ -277,14 +277,14 @@ impl ToolGatewayBuilder {
                 };
 
             for entry in dispatcher_catalog {
-                if route.contains_key(&entry.tool.name) {
+                if route.contains_key(entry.tool.name.as_str()) {
                     return Err(ToolError::Other(format!(
                         "tool name collision in gateway: '{}'",
                         entry.tool.name
                     )));
                 }
                 let tool_idx = all_tools.len();
-                route.insert(entry.tool.name.clone(), tool_idx);
+                route.insert(entry.tool.tool_name(), tool_idx);
                 all_tools.push(Arc::clone(&entry.tool));
                 catalog_entries.push(entry);
                 tool_entry.push(entry_idx);

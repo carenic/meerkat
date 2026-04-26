@@ -461,8 +461,12 @@ impl From<&meerkat_core::ToolFilter> for ToolFilter {
     fn from(f: &meerkat_core::ToolFilter) -> Self {
         match f {
             meerkat_core::ToolFilter::All => Self::All,
-            meerkat_core::ToolFilter::Allow(names) => Self::Allow(names.iter().cloned().collect()),
-            meerkat_core::ToolFilter::Deny(names) => Self::Deny(names.iter().cloned().collect()),
+            meerkat_core::ToolFilter::Allow(names) => {
+                Self::Allow(names.iter().map(|name| name.as_str().to_string()).collect())
+            }
+            meerkat_core::ToolFilter::Deny(names) => {
+                Self::Deny(names.iter().map(|name| name.as_str().to_string()).collect())
+            }
         }
     }
 }

@@ -134,7 +134,7 @@ impl FilteredDispatcher {
             ToolAccessPolicy::Inherit => all_names,
             ToolAccessPolicy::AllowList(allow) => {
                 let allow_set: HashSet<&str> =
-                    allow.iter().map(std::string::String::as_str).collect();
+                    allow.iter().map(meerkat_core::ToolName::as_str).collect();
                 all_names
                     .into_iter()
                     .filter(|n| allow_set.contains(n.as_str()))
@@ -142,7 +142,7 @@ impl FilteredDispatcher {
             }
             ToolAccessPolicy::DenyList(deny) => {
                 let deny_set: HashSet<&str> =
-                    deny.iter().map(std::string::String::as_str).collect();
+                    deny.iter().map(meerkat_core::ToolName::as_str).collect();
                 all_names
                     .into_iter()
                     .filter(|n| !deny_set.contains(n.as_str()))
@@ -267,7 +267,7 @@ mod tests {
     fn filtered_dispatcher_is_not_exact_catalog_capable() {
         let inner: Arc<dyn AgentToolDispatcher> = Arc::new(MockDispatcher::new(vec!["a", "b"]));
         let filtered =
-            FilteredDispatcher::new(inner, &ToolAccessPolicy::AllowList(vec!["a".to_string()]));
+            FilteredDispatcher::new(inner, &ToolAccessPolicy::AllowList(vec!["a".into()]));
 
         assert!(
             !filtered.tool_catalog_capabilities().exact_catalog,
@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn test_filtered_dispatcher_allow_list_only_includes_specified_tools() {
         let inner = Arc::new(MockDispatcher::new(vec!["shell", "task_list", "wait"]));
-        let policy = ToolAccessPolicy::AllowList(vec!["task_list".to_string()]);
+        let policy = ToolAccessPolicy::AllowList(vec!["task_list".into()]);
         let filtered = FilteredDispatcher::new(inner, &policy);
 
         let tool_names: Vec<_> = filtered.tools().iter().map(|t| t.name.clone()).collect();
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn test_filtered_dispatcher_deny_list_excludes_specified_tools() {
         let inner = Arc::new(MockDispatcher::new(vec!["shell", "task_list", "wait"]));
-        let policy = ToolAccessPolicy::DenyList(vec!["shell".to_string()]);
+        let policy = ToolAccessPolicy::DenyList(vec!["shell".into()]);
         let filtered = FilteredDispatcher::new(inner, &policy);
 
         let tool_names: Vec<_> = filtered.tools().iter().map(|t| t.name.clone()).collect();
@@ -317,7 +317,7 @@ mod tests {
     #[tokio::test]
     async fn test_filtered_dispatcher_blocked_tool_returns_access_denied() {
         let inner = Arc::new(MockDispatcher::new(vec!["shell", "task_list"]));
-        let policy = ToolAccessPolicy::DenyList(vec!["shell".to_string()]);
+        let policy = ToolAccessPolicy::DenyList(vec!["shell".into()]);
         let filtered = FilteredDispatcher::new(inner, &policy);
 
         // Allowed tool succeeds.
@@ -352,8 +352,7 @@ mod tests {
         ]));
 
         // Deny shell and dangerous_exec - common security restriction
-        let policy =
-            ToolAccessPolicy::DenyList(vec!["shell".to_string(), "dangerous_exec".to_string()]);
+        let policy = ToolAccessPolicy::DenyList(vec!["shell".into(), "dangerous_exec".into()]);
         let filtered = FilteredDispatcher::new(inner, &policy);
 
         // Only safe tools should be visible

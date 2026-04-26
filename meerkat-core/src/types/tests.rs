@@ -1579,6 +1579,29 @@ mod content_block_tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn tool_name_and_set_keep_string_wire_shape() {
+        use super::{ToolName, ToolNameSet};
+
+        let name = ToolName::new("read_file");
+        assert_eq!(serde_json::to_string(&name).unwrap(), "\"read_file\"");
+        let parsed: ToolName = serde_json::from_str("\"read_file\"").unwrap();
+        assert_eq!(parsed.as_str(), "read_file");
+
+        let names: ToolNameSet = ["read_file", "shell"].into_iter().collect();
+        let value = serde_json::to_value(&names).unwrap();
+        let array = value
+            .as_array()
+            .expect("tool name set remains array-shaped");
+        assert_eq!(array.len(), 2);
+        assert!(array.contains(&serde_json::json!("read_file")));
+        assert!(array.contains(&serde_json::json!("shell")));
+
+        let parsed: ToolNameSet = serde_json::from_value(value).unwrap();
+        assert!(parsed.contains("read_file"));
+        assert!(parsed.contains("shell"));
+    }
+
+    #[test]
     fn tool_provenance_roundtrip_all_kinds() {
         use super::{ToolProvenance, ToolSourceKind};
 

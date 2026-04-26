@@ -67,7 +67,7 @@ fn make_call<'a>(name: &'a str, args: &'a serde_json::value::RawValue) -> ToolCa
 #[tokio::test]
 async fn policy_blocked_tool_surfaces_as_access_denied() {
     let inner: Arc<dyn AgentToolDispatcher> = Arc::new(TwoToolDispatcher);
-    let policy = ToolAccessPolicy::DenyList(vec!["shell".to_string()]);
+    let policy = ToolAccessPolicy::DenyList(vec!["shell".into()]);
     let filtered = FilteredDispatcher::new(inner, &policy);
 
     let args = serde_json::value::RawValue::from_string(json!({}).to_string()).unwrap();

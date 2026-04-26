@@ -2148,7 +2148,10 @@ mod tests {
         // tool_access_policy is the AllowList variant with the two tools.
         match params.tool_access_policy {
             Some(ToolAccessPolicy::AllowList(ref tools)) => {
-                assert_eq!(tools, &vec!["grep".to_string(), "read".to_string()]);
+                assert_eq!(
+                    tools.iter().map(|name| name.as_str()).collect::<Vec<_>>(),
+                    vec!["grep", "read"]
+                );
             }
             other => panic!("expected AllowList, got {other:?}"),
         }

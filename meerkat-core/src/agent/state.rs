@@ -1101,8 +1101,8 @@ where
                         {
                             self.tool_scope.apply_staged_projection_with_previous(
                                 dispatcher_tools.clone(),
-                                control_tool_names,
-                                deferred_tool_names,
+                                control_tool_names.into_iter().collect(),
+                                deferred_tool_names.into_iter().collect(),
                                 previous_visibility_state,
                                 &visibility_state,
                             )

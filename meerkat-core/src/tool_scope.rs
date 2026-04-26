@@ -2,7 +2,7 @@
 
 use crate::session::{SessionToolVisibilityState, ToolVisibilityWitness};
 use crate::tool_catalog::stable_owner_key_for_tool;
-use crate::types::ToolDef;
+use crate::types::{ToolDef, ToolNameSet};
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15,13 +15,13 @@ pub enum ToolFilter {
     #[default]
     All,
     /// Only listed tools are visible.
-    Allow(HashSet<String>),
+    Allow(ToolNameSet),
     /// Listed tools are hidden.
-    Deny(HashSet<String>),
+    Deny(ToolNameSet),
 }
 
 impl ToolFilter {
-    fn names(&self) -> Option<&HashSet<String>> {
+    fn names(&self) -> Option<&ToolNameSet> {
         match self {
             Self::All => None,
             Self::Allow(names) | Self::Deny(names) => Some(names),
@@ -299,18 +299,18 @@ impl ToolVisibilityOwner for LocalToolVisibilityOwner {
 #[derive(Debug, Clone)]
 struct ToolScopeState {
     base_tools: Arc<[Arc<ToolDef>]>,
-    known_base_names: HashSet<String>,
-    control_tool_names: HashSet<String>,
-    deferred_tool_names: HashSet<String>,
-    active_turn_allow: Option<HashSet<String>>,
-    active_turn_deny: HashSet<String>,
+    known_base_names: ToolNameSet,
+    control_tool_names: ToolNameSet,
+    deferred_tool_names: ToolNameSet,
+    active_turn_allow: Option<ToolNameSet>,
+    active_turn_deny: ToolNameSet,
 }
 
 /// Composed filter representation using most-restrictive semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComposedToolFilter {
-    allow: Option<HashSet<String>>,
-    deny: HashSet<String>,
+    allow: Option<ToolNameSet>,
+    deny: ToolNameSet,
 }
 
 impl ComposedToolFilter {
@@ -388,17 +388,17 @@ impl ToolScope {
         deferred_tool_names: HashSet<String>,
         visibility_owner: Arc<dyn ToolVisibilityOwner>,
     ) -> Self {
-        let known_base_names: HashSet<String> =
+        let known_base_names: ToolNameSet =
             base_tools.iter().map(|tool| tool.name.clone()).collect();
 
         Self {
             state: Arc::new(RwLock::new(ToolScopeState {
                 base_tools,
                 known_base_names,
-                control_tool_names,
-                deferred_tool_names,
+                control_tool_names: control_tool_names.into_iter().collect(),
+                deferred_tool_names: deferred_tool_names.into_iter().collect(),
                 active_turn_allow: None,
-                active_turn_deny: HashSet::new(),
+                active_turn_deny: ToolNameSet::new(),
             })),
             visibility_owner,
             fail_next_boundary_apply: Arc::new(AtomicBool::new(false)),
@@ -519,8 +519,8 @@ impl ToolScope {
         let previous_visibility_state = self.visibility_owner.visibility_state()?;
         self.apply_staged_projection_with_previous(
             new_base_tools,
-            control_tool_names,
-            deferred_tool_names,
+            control_tool_names.into_iter().collect(),
+            deferred_tool_names.into_iter().collect(),
             &previous_visibility_state,
             visibility_state,
         )
@@ -529,8 +529,8 @@ impl ToolScope {
     pub(crate) fn apply_staged_projection_with_previous(
         &self,
         new_base_tools: Arc<[Arc<ToolDef>]>,
-        control_tool_names: HashSet<String>,
-        deferred_tool_names: HashSet<String>,
+        control_tool_names: ToolNameSet,
+        deferred_tool_names: ToolNameSet,
         previous_visibility_state: &SessionToolVisibilityState,
         visibility_state: &SessionToolVisibilityState,
     ) -> Result<ToolScopeBoundaryResult, ToolScopeApplyError> {
@@ -558,15 +558,15 @@ impl ToolScope {
             .base_tools
             .iter()
             .map(|tool| tool.name.clone())
-            .collect::<HashSet<_>>();
+            .collect::<ToolNameSet>();
 
         let known_base_names = state.known_base_names.clone();
         if let Some(allow) = state.active_turn_allow.as_mut() {
-            allow.retain(|name| known_base_names.contains(name));
+            allow.retain(|name| known_base_names.contains(name.as_str()));
         }
         state
             .active_turn_deny
-            .retain(|name| known_base_names.contains(name));
+            .retain(|name| known_base_names.contains(name.as_str()));
 
         let tools = Self::visible_tools_for_state(&state, visibility_state);
         let visible_names = tools
@@ -575,8 +575,8 @@ impl ToolScope {
             .collect::<Vec<_>>();
 
         Ok(ToolScopeBoundaryResult {
-            previous_base_names,
-            current_base_names: state.known_base_names.clone(),
+            previous_base_names: previous_base_names.to_string_set(),
+            current_base_names: state.known_base_names.to_string_set(),
             previous_visible_names,
             visible_names,
             previous_active_revision,
@@ -587,8 +587,8 @@ impl ToolScope {
 
     /// Compose filters with most-restrictive semantics.
     pub fn compose(filters: &[ToolFilter]) -> ComposedToolFilter {
-        let mut allow: Option<HashSet<String>> = None;
-        let mut deny: HashSet<String> = HashSet::new();
+        let mut allow: Option<ToolNameSet> = None;
+        let mut deny = ToolNameSet::new();
 
         for filter in filters {
             match filter {
@@ -609,13 +609,18 @@ impl ToolScope {
     }
 
     /// Helper: intersection for allow-list composition.
-    fn allow_intersection(left: &HashSet<String>, right: &HashSet<String>) -> HashSet<String> {
-        left.intersection(right).cloned().collect()
+    fn allow_intersection(left: &ToolNameSet, right: &ToolNameSet) -> ToolNameSet {
+        left.iter()
+            .filter(|name| right.contains(name.as_str()))
+            .cloned()
+            .collect()
     }
 
     /// Helper: union for deny-list composition.
-    fn deny_union(left: &HashSet<String>, right: &HashSet<String>) -> HashSet<String> {
-        left.union(right).cloned().collect()
+    fn deny_union(left: &ToolNameSet, right: &ToolNameSet) -> ToolNameSet {
+        let mut union = left.clone();
+        union.extend(right.iter().cloned());
+        union
     }
 
     fn visible_names_for_state(
@@ -723,14 +728,18 @@ impl ToolScope {
             ToolFilter::Allow(names) => ToolFilter::Allow(
                 names
                     .iter()
-                    .filter(|name| Self::filter_name_applies(state, visibility_state, name))
+                    .filter(|name| {
+                        Self::filter_name_applies(state, visibility_state, name.as_str())
+                    })
                     .cloned()
                     .collect(),
             ),
             ToolFilter::Deny(names) => ToolFilter::Deny(
                 names
                     .iter()
-                    .filter(|name| Self::filter_name_applies(state, visibility_state, name))
+                    .filter(|name| {
+                        Self::filter_name_applies(state, visibility_state, name.as_str())
+                    })
                     .cloned()
                     .collect(),
             ),
@@ -847,7 +856,7 @@ impl ToolScope {
                 state
                     .known_base_names
                     .iter()
-                    .cloned()
+                    .map(|name| name.as_str().to_string())
                     .collect::<BTreeSet<_>>()
             })
             .map_err(|_| ToolScopeApplyError::LockPoisoned)
@@ -887,6 +896,7 @@ impl ToolScope {
         Ok(durable_filter_names(&visibility_state)
             .into_iter()
             .filter(|name| !state.known_base_names.contains(name.as_str()))
+            .map(crate::types::ToolName::into_string)
             .collect::<BTreeSet<_>>())
     }
 
@@ -958,7 +968,7 @@ impl ToolScopeHandle {
 
         let mut known_names = state.known_base_names.clone();
         for control_name in &state.control_tool_names {
-            known_names.remove(control_name);
+            known_names.remove(control_name.as_str());
         }
         known_names.extend(durable_filter_names(&visibility_state));
         validate_filter(&filter, &known_names)?;
@@ -984,6 +994,8 @@ impl ToolScopeHandle {
         allow: Option<HashSet<String>>,
         deny: HashSet<String>,
     ) -> Result<(), ToolScopeStageError> {
+        let allow: Option<ToolNameSet> = allow.map(|names| names.into_iter().collect());
+        let deny: ToolNameSet = deny.into_iter().collect();
         let mut state = self
             .state
             .write()
@@ -1015,7 +1027,7 @@ impl ToolScopeHandle {
 
 fn validate_filter(
     filter: &ToolFilter,
-    known_base_names: &HashSet<String>,
+    known_base_names: &ToolNameSet,
 ) -> Result<(), ToolScopeStageError> {
     let Some(names) = filter.names() else {
         return Ok(());
@@ -1023,8 +1035,8 @@ fn validate_filter(
 
     let mut unknown: Vec<String> = names
         .iter()
-        .filter(|name| !known_base_names.contains(*name))
-        .cloned()
+        .filter(|name| !known_base_names.contains(name.as_str()))
+        .map(|name| name.as_str().to_string())
         .collect();
 
     if unknown.is_empty() {
@@ -1036,8 +1048,8 @@ fn validate_filter(
     Err(ToolScopeStageError::UnknownTools { names: unknown })
 }
 
-fn durable_filter_names(state: &SessionToolVisibilityState) -> HashSet<String> {
-    let mut names = HashSet::new();
+fn durable_filter_names(state: &SessionToolVisibilityState) -> ToolNameSet {
+    let mut names = ToolNameSet::new();
     for filter in [
         &state.inherited_base_filter,
         &state.active_filter,
@@ -1069,9 +1081,9 @@ fn extend_filter_witnesses(
     };
 
     for name in filter_names {
-        if let Some(tool) = base_tools.iter().find(|tool| tool.name == *name) {
+        if let Some(tool) = base_tools.iter().find(|tool| tool.name == name.as_str()) {
             witnesses.insert(
-                name.clone(),
+                name.as_str().to_string(),
                 ToolVisibilityWitness {
                     stable_owner_key: stable_owner_key_for_tool(tool),
                     last_seen_provenance: tool.provenance.clone(),
@@ -1081,8 +1093,11 @@ fn extend_filter_witnesses(
     }
 }
 
-fn sorted_names(names: &HashSet<String>) -> Vec<String> {
-    let mut values = names.iter().cloned().collect::<Vec<_>>();
+fn sorted_names(names: &ToolNameSet) -> Vec<String> {
+    let mut values = names
+        .iter()
+        .map(|name| name.as_str().to_string())
+        .collect::<Vec<_>>();
     values.sort_unstable();
     values
 }
@@ -1092,11 +1107,15 @@ fn sorted_names(names: &HashSet<String>) -> Vec<String> {
 mod tests {
     use super::ToolScopeRevision;
     use super::{ToolFilter, ToolScope, ToolScopeStageError};
-    use crate::types::{ToolDef, ToolProvenance, ToolSourceKind};
+    use crate::types::{ToolDef, ToolNameSet, ToolProvenance, ToolSourceKind};
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    fn set(names: &[&str]) -> HashSet<String> {
+    fn set(names: &[&str]) -> ToolNameSet {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    fn raw_set(names: &[&str]) -> HashSet<String> {
         names.iter().map(|name| (*name).to_string()).collect()
     }
 
@@ -1125,6 +1144,28 @@ mod tests {
                 source_id: source_id.to_string(),
             }),
         })
+    }
+
+    #[test]
+    fn tool_filter_typed_names_keep_legacy_string_wire_shape() -> Result<(), String> {
+        let filter = ToolFilter::Allow(set(&["read_file", "shell"]));
+        let value = serde_json::to_value(&filter).unwrap();
+        let names = value["Allow"]
+            .as_array()
+            .expect("tool filter names remain string array-shaped");
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&serde_json::json!("read_file")));
+        assert!(names.contains(&serde_json::json!("shell")));
+
+        let parsed: ToolFilter = serde_json::from_value(value).unwrap();
+        match parsed {
+            ToolFilter::Allow(names) => {
+                assert!(names.contains("read_file"));
+                assert!(names.contains("shell"));
+            }
+            other => return Err(format!("expected allow filter, got {other:?}")),
+        }
+        Ok(())
     }
 
     #[test]
@@ -1164,7 +1205,7 @@ mod tests {
     fn control_tools_remain_visible_and_unfilterable() {
         let scope = ToolScope::new_with_control_tool_names(
             tools(&["visible", "tool_catalog_search"]),
-            set(&["tool_catalog_search"]),
+            raw_set(&["tool_catalog_search"]),
         );
         let handle = scope.handle();
 
@@ -1197,7 +1238,7 @@ mod tests {
         let scope = ToolScope::new_with_projection_names(
             tools(&["visible", "deferred"]),
             HashSet::new(),
-            set(&["deferred"]),
+            raw_set(&["deferred"]),
         );
 
         assert_eq!(
@@ -1237,7 +1278,7 @@ mod tests {
             .apply_staged_projection(
                 late_deferred,
                 HashSet::new(),
-                set(&["late_deferred"]),
+                raw_set(&["late_deferred"]),
                 &visibility_state,
             )
             .expect("projection refresh should succeed");
@@ -1258,7 +1299,7 @@ mod tests {
             .stage_external_filter(ToolFilter::Deny(set(&["a"])))
             .unwrap();
         handle
-            .set_turn_overlay(Some(set(&["b", "c"])), set(&["c"]))
+            .set_turn_overlay(Some(raw_set(&["b", "c"])), raw_set(&["c"]))
             .unwrap();
 
         let snapshot = scope.snapshot().expect("snapshot should be available");
@@ -1365,8 +1406,8 @@ mod tests {
         let applied = scope
             .apply_staged_projection_with_previous(
                 tools(&["visible", "secret"]),
-                HashSet::new(),
-                HashSet::new(),
+                ToolNameSet::new(),
+                ToolNameSet::new(),
                 &previous_visibility_state,
                 &promoted_visibility_state,
             )
@@ -1439,7 +1480,7 @@ mod tests {
         let scope = ToolScope::new_with_projection_names(
             vec![Arc::clone(&requested)].into(),
             HashSet::new(),
-            set(&["deferred"]),
+            raw_set(&["deferred"]),
         );
 
         scope
@@ -1461,7 +1502,7 @@ mod tests {
             .apply_staged_projection(
                 vec![Arc::clone(&requested)].into(),
                 HashSet::new(),
-                set(&["deferred"]),
+                raw_set(&["deferred"]),
                 &promoted,
             )
             .unwrap();
@@ -1476,7 +1517,7 @@ mod tests {
             .apply_staged_projection(
                 vec![Arc::clone(&rebound)].into(),
                 HashSet::new(),
-                set(&["deferred"]),
+                raw_set(&["deferred"]),
                 &current,
             )
             .unwrap();
@@ -1538,7 +1579,7 @@ mod tests {
         );
 
         handle
-            .set_turn_overlay(Some(set(&["b", "c"])), set(&["b"]))
+            .set_turn_overlay(Some(raw_set(&["b", "c"])), raw_set(&["b"]))
             .unwrap();
         assert_eq!(
             scope

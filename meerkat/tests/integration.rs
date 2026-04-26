@@ -695,8 +695,7 @@ mod tool_access_policy {
 
     #[test]
     fn test_allow_list_structure() {
-        let policy =
-            ToolAccessPolicy::AllowList(vec!["safe_tool".to_string(), "another_safe".to_string()]);
+        let policy = ToolAccessPolicy::AllowList(vec!["safe_tool".into(), "another_safe".into()]);
 
         // Should serialize correctly
         let json = serde_json::to_value(&policy).expect("Should serialize");
@@ -709,8 +708,8 @@ mod tool_access_policy {
         match parsed {
             ToolAccessPolicy::AllowList(tools) => {
                 assert_eq!(tools.len(), 2);
-                assert!(tools.contains(&"safe_tool".to_string()));
-                assert!(tools.contains(&"another_safe".to_string()));
+                assert!(tools.contains(&"safe_tool".into()));
+                assert!(tools.contains(&"another_safe".into()));
             }
             _ => panic!("Wrong variant"),
         }
@@ -718,7 +717,7 @@ mod tool_access_policy {
 
     #[test]
     fn test_deny_list_structure() {
-        let policy = ToolAccessPolicy::DenyList(vec!["dangerous_tool".to_string()]);
+        let policy = ToolAccessPolicy::DenyList(vec!["dangerous_tool".into()]);
 
         // Should serialize correctly
         let json = serde_json::to_value(&policy).expect("Should serialize");
@@ -729,7 +728,7 @@ mod tool_access_policy {
         match parsed {
             ToolAccessPolicy::DenyList(tools) => {
                 assert_eq!(tools.len(), 1);
-                assert!(tools.contains(&"dangerous_tool".to_string()));
+                assert!(tools.contains(&"dangerous_tool".into()));
             }
             _ => panic!("Wrong variant"),
         }

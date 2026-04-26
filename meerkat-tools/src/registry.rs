@@ -4,12 +4,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::ToolValidationError;
-use meerkat_core::types::ToolDef;
+use meerkat_core::types::{ToolDef, ToolName};
 
 /// Registry for managing available tools and their schemas
 #[derive(Debug, Clone, Default)]
 pub struct ToolRegistry {
-    tools: HashMap<String, Arc<ToolDef>>,
+    tools: HashMap<ToolName, Arc<ToolDef>>,
 }
 
 impl ToolRegistry {
@@ -20,7 +20,7 @@ impl ToolRegistry {
 
     /// Register a new tool
     pub fn register(&mut self, def: ToolDef) {
-        self.tools.insert(def.name.clone(), Arc::new(def));
+        self.tools.insert(def.tool_name(), Arc::new(def));
     }
 
     /// Register multiple tools
