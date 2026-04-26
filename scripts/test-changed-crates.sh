@@ -2,4 +2,4 @@
 set -euo pipefail
 
 ROOT="${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
-exec "${ROOT}/scripts/cargo-agent-gate" --staged "$@"
+exec "${ROOT}/scripts/agent-gate" --staged "$@"

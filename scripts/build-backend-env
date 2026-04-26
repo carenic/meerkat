@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Shared backend selection helpers for Cargo-default / BuildBuddy-opt-in gates.
+
+meerkat_buildbuddy_enabled() {
+  case "${MEERKAT_BUILDBUDDY:-${MEERKAT_AGENT_GATE_BACKEND:-}}" in
+    1|true|TRUE|yes|YES|on|ON|buildbuddy)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+meerkat_selected_build_backend() {
+  if meerkat_buildbuddy_enabled; then
+    printf 'buildbuddy\n'
+  else
+    printf 'cargo\n'
+  fi
+}

@@ -159,7 +159,7 @@ writes `dispatch-context.txt` and `dispatch-inputs.txt` when
 `MEERKAT_BUILDBUDDY_LOG_ROOT` is set, so changed-path runs have
 commit/toolchain context even when they do not use the workspace CI summary
 writer. Normal GitHub CI remains Cargo-based unless the repository variable
-`MEERKAT_BUILDBUDDY_CI=true` enables the optional CI job.
+`MEERKAT_BUILDBUDDY=true` (or `1`) enables the optional CI job.
 
 The dispatch modes are:
 
@@ -343,11 +343,12 @@ to roughly `4-6s` once those lanes were prepared.
   override that auto choice while benchmarking.
 - For the default developer entrypoint, use `scripts/agent-gate`. It runs the
   Cargo changed-path gate unless `--buildbuddy` or
-  `MEERKAT_AGENT_GATE_BACKEND=buildbuddy` opts into BuildBuddy. Direct
-  integration test files and importable `tests/support` modules are narrowed to
-  exact Cargo test binaries for both nextest and clippy when the mapping is
-  unambiguous. Cargo and BuildBuddy selectors share the same Cargo metadata and
-  test-module import traversal logic in `scripts/rust-test-selector.mjs`.
+  `MEERKAT_BUILDBUDDY=1` opts into BuildBuddy. The legacy
+  `MEERKAT_AGENT_GATE_BACKEND=buildbuddy` switch still works. Direct integration
+  test files and importable `tests/support` modules are narrowed to exact Cargo
+  test binaries for both nextest and clippy when the mapping is unambiguous.
+  Cargo and BuildBuddy selectors share the same Cargo metadata and test-module
+  import traversal logic in `scripts/rust-test-selector.mjs`.
   Required-feature Cargo test edits are narrowed to the exact test binary with
   the needed features. BuildBuddy also generates those Bazel test targets, but
   keeps e2e/system/live tests out of the fast test lane; the changed gate
@@ -396,8 +397,8 @@ to roughly `4-6s` once those lanes were prepared.
   or `scripts/buildbuddy-ci-dispatch --mode changed-paths --paths '<paths>'`.
 - To enable the optional BuildBuddy job inside normal GitHub CI, add the
   `BUILDBUDDY_API_KEY` repository secret and set the repository variable
-  `MEERKAT_BUILDBUDDY_CI=true`. The default reusable-workflow mode is
-  `changed-committed`; override it with `MEERKAT_BUILDBUDDY_CI_MODE`,
+  `MEERKAT_BUILDBUDDY=true` (or `1`). The default reusable-workflow mode is
+  `full-fresh`; override it with `MEERKAT_BUILDBUDDY_CI_MODE`,
   `MEERKAT_BUILDBUDDY_CHANGED_MODE`, `MEERKAT_BUILDBUDDY_BASE`, or
   `MEERKAT_BUILDBUDDY_CHANGED_PATHS` when a branch or rollout needs a broader
   gate.

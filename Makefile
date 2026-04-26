@@ -215,7 +215,8 @@ cargo-agent-gate: rust-lane-doctor
 	@scripts/cargo-agent-gate $(AGENT_GATE_ARGS)
 
 agent-gate:
-	@if [ "$${MEERKAT_AGENT_GATE_BACKEND:-cargo}" = "buildbuddy" ]; then \
+	@. ./scripts/build-backend-env; \
+	if meerkat_buildbuddy_enabled; then \
 		$(MAKE) buildbuddy-doctor; \
 	else \
 		$(MAKE) rust-lane-doctor; \
@@ -604,7 +605,7 @@ help:
 	@echo "  $(GREEN)fmt-check$(NC)     - Check code formatting"
 	@echo "  $(GREEN)audit$(NC)         - Run security audit (cargo-deny)"
 	@echo "  $(GREEN)rust-lane-doctor$(NC)- Check Rust lane isolation and filtered test lanes"
-	@echo "  $(GREEN)agent-gate$(NC)    - Run default Cargo or opt-in BuildBuddy changed gate (AGENT_GATE_ARGS=...)"
+	@echo "  $(GREEN)agent-gate$(NC)    - Run Cargo or MEERKAT_BUILDBUDDY=1 BuildBuddy changed gate (AGENT_GATE_ARGS=...)"
 	@echo "  $(GREEN)cargo-agent-gate$(NC)- Run Cargo gate for changed agent files"
 	@echo "  $(GREEN)buildbuddy-install$(NC)- Install pinned optional BuildBuddy CLI"
 	@echo "  $(GREEN)buildbuddy-generate$(NC)- Regenerate optional Bazel BUILD files"

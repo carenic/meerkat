@@ -215,11 +215,24 @@ if grep -Fq 'name: Cargo CI' .github/workflows/ci.yml &&
   ! grep -Fq 'uses: ./.github/workflows/buildbuddy.yml' .github/workflows/ci.yml &&
   grep -Fq 'name: BuildBuddy CI' .github/workflows/buildbuddy.yml &&
   grep -Fq 'pull_request:' .github/workflows/buildbuddy.yml &&
-  grep -Fq 'MEERKAT_BUILDBUDDY_CI' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'MEERKAT_BUILDBUDDY' .github/workflows/buildbuddy.yml &&
   grep -Fq 'BuildBuddy CI gate' .github/workflows/buildbuddy.yml; then
   pass "Cargo CI and BuildBuddy CI are separate workflows"
 else
   bad "Cargo CI and BuildBuddy CI are not separated cleanly"
+fi
+
+if grep -Fq 'vars.MEERKAT_BUILDBUDDY == '"'"'true'"'"'' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'MEERKAT_BUILDBUDDY: ${{ vars.MEERKAT_BUILDBUDDY' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'MEERKAT_BUILDBUDDY=1' README.md &&
+  grep -Fq 'MEERKAT_BUILDBUDDY=1' scripts/agent-gate &&
+  grep -Fq '. ./scripts/build-backend-env' Makefile &&
+  grep -Fq 'source "${ROOT}/scripts/build-backend-env"' scripts/pre-push-unit.sh &&
+  grep -Fq 'scripts/agent-gate" --staged' scripts/test-changed-crates.sh &&
+  grep -Fq 'scripts/agent-gate" --committed --clippy-only' scripts/pre-push-clippy.sh; then
+  pass "MEERKAT_BUILDBUDDY is the single opt-in switch for CI and hooks"
+else
+  bad "BuildBuddy opt-in switch is not wired consistently"
 fi
 
 if grep -Fq 'full-fresh' .github/workflows/buildbuddy.yml &&

@@ -18,9 +18,9 @@ repos:
   # Manual: changed-crate deterministic validation when you want a local preflight.
   - repo: local
     hooks:
-      - id: cargo-check-changed
+      - id: agent-check-changed
         name: clippy + deterministic tests (changed crates)
-        entry: scripts/cargo-agent-gate --staged
+        entry: scripts/agent-gate --staged
         language: script
         types: [rust]
         pass_filenames: false

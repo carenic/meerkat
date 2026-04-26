@@ -6,11 +6,13 @@ base_ref="${BUILDBUDDY_AGENT_BASE:-}"
 local_test=0
 dry_run=0
 scope="all"
+clippy_only=0
+tests_only=0
 paths=()
 
 usage() {
   cat <<'EOF'
-usage: buildbuddy-agent-gate [--owned|--affected] [--base <rev>] [--staged|--committed|--working-tree] [--local-test] [--dry-run] [path ...]
+usage: buildbuddy-agent-gate [--owned|--affected] [--base <rev>] [--staged|--committed|--working-tree] [--local-test] [--clippy-only|--tests-only] [--dry-run] [path ...]
 
 Runs the opt-in BuildBuddy gate most useful for agent edits. If paths are not
 provided, the script derives changed files from:
@@ -49,6 +51,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --local-test)
       local_test=1
+      shift
+      ;;
+    --clippy-only)
+      clippy_only=1
+      shift
+      ;;
+    --tests-only)
+      tests_only=1
       shift
       ;;
     --staged)
@@ -92,6 +102,12 @@ done
 
 workspace_root="$(git rev-parse --show-toplevel)"
 cd "${workspace_root}"
+
+if [[ "${clippy_only}" -eq 1 && "${tests_only}" -eq 1 ]]; then
+  echo "error: --clippy-only and --tests-only are mutually exclusive" >&2
+  usage >&2
+  exit 2
+fi
 
 resolve_base() {
   if [[ -n "${base_ref}" ]]; then
@@ -196,6 +212,12 @@ fi
 args=("--${mode}")
 if [[ "${local_test}" -eq 1 ]]; then
   args+=("--local-test")
+fi
+if [[ "${clippy_only}" -eq 1 ]]; then
+  args+=("--clippy-only")
+fi
+if [[ "${tests_only}" -eq 1 ]]; then
+  args+=("--tests-only")
 fi
 if [[ "${dry_run}" -eq 1 ]]; then
   exec ./scripts/buildbuddy-changed-gate --dry-run "${args[@]}" "${relevant[@]}"

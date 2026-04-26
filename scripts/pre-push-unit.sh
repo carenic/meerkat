@@ -7,9 +7,15 @@ set -euo pipefail
 
 ROOT="${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 CARGO="${CARGO:-$ROOT/scripts/repo-cargo}"
+source "${ROOT}/scripts/build-backend-env"
 
 CACHE_VERSION="v3"
-NEXTEST_TIMEOUT_SECS="${MEERKAT_PRE_PUSH_NEXTEST_TIMEOUT_SECS:-120}"
+backend="$(meerkat_selected_build_backend)"
+if meerkat_buildbuddy_enabled; then
+  NEXTEST_TIMEOUT_SECS="${MEERKAT_PRE_PUSH_NEXTEST_TIMEOUT_SECS:-600}"
+else
+  NEXTEST_TIMEOUT_SECS="${MEERKAT_PRE_PUSH_NEXTEST_TIMEOUT_SECS:-120}"
+fi
 LOCK_WAIT_SECS="${MEERKAT_PRE_PUSH_UNIT_LOCK_WAIT_SECS:-180}"
 GIT_DIR_PATH="$(git rev-parse --git-dir)"
 HOOK_CACHE_ROOT="${GIT_DIR_PATH}/meerkat-hook-cache"
@@ -125,7 +131,7 @@ retry_lane() {
 }
 
 tree="$(tree_key)"
-stamp_key="${CACHE_VERSION}-${tree}"
+stamp_key="${CACHE_VERSION}-${backend}-${tree}"
 stamp_path="${HOOK_CACHE_DIR}/${stamp_key}.ok"
 
 if [[ "${MEERKAT_SKIP_PRE_PUSH_UNIT_CACHE:-0}" != "1" && -f "$stamp_path" ]]; then
@@ -141,10 +147,22 @@ if [[ "${MEERKAT_SKIP_PRE_PUSH_UNIT_CACHE:-0}" != "1" && -f "$stamp_path" ]]; th
   exit 0
 fi
 
-retry_lane \
-  "workspace unit lane" \
-  "$CARGO" unit
-retry_lane \
-  "e2e-fast lane" \
-  "$CARGO" e2e-fast
-printf 'tree=%s\nrunners=unit,e2e-fast\n' "$tree" > "$stamp_path"
+if [[ "${backend}" == "buildbuddy" ]]; then
+  buildbuddy_mode="${MEERKAT_BUILDBUDDY_CI_MODE:-full-warm}"
+  retry_lane \
+    "BuildBuddy unit lane" \
+    env MEERKAT_BUILDBUDDY_CI_MODE="${buildbuddy_mode}" \
+      "$ROOT/scripts/buildbuddy-ci-lane" test-unit
+  retry_lane \
+    "BuildBuddy e2e-fast lane" \
+    env MEERKAT_BUILDBUDDY_CI_MODE="${buildbuddy_mode}" \
+      "$ROOT/scripts/buildbuddy-ci-lane" e2e-fast
+else
+  retry_lane \
+    "workspace unit lane" \
+    "$CARGO" unit
+  retry_lane \
+    "e2e-fast lane" \
+    "$CARGO" e2e-fast
+fi
+printf 'tree=%s\nbackend=%s\nrunners=unit,e2e-fast\n' "$tree" "$backend" > "$stamp_path"

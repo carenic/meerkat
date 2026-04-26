@@ -7,11 +7,13 @@ clippy_command="owned-clippy-rbe"
 build_command="owned-build"
 dry_run=0
 split_mode="${BUILDBUDDY_CHANGED_GATE_SPLIT:-auto}"
+clippy_only=0
+tests_only=0
 paths=()
 
 usage() {
   cat <<'EOF'
-usage: buildbuddy-changed-gate [--owned|--affected] [--local-test] [--parallel-split|--serial-split] [--dry-run] <changed-path>...
+usage: buildbuddy-changed-gate [--owned|--affected] [--local-test] [--clippy-only|--tests-only] [--parallel-split|--serial-split] [--dry-run] <changed-path>...
 
 Runs the selected BuildBuddy test/build and clippy lanes for the supplied
 changed paths. Small exact lanes run in parallel; broad package-suite lanes run
@@ -42,6 +44,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dry-run)
       dry_run=1
+      shift
+      ;;
+    --clippy-only)
+      clippy_only=1
+      shift
+      ;;
+    --tests-only)
+      tests_only=1
       shift
       ;;
     --parallel-split)
@@ -101,6 +111,12 @@ esac
 
 workspace_root="$(git rev-parse --show-toplevel)"
 cd "${workspace_root}"
+
+if [[ "${clippy_only}" -eq 1 && "${tests_only}" -eq 1 ]]; then
+  echo "error: --clippy-only and --tests-only are mutually exclusive" >&2
+  usage >&2
+  exit 2
+fi
 
 temp_root="$(mktemp -d "${TMPDIR:-/tmp}/meerkat-bb-changed-gate.XXXXXX")"
 cleanup() {
@@ -183,7 +199,13 @@ if [[ "${dry_run}" -eq 1 ]]; then
   printf 'test-targets: %s\n' "${test_targets:-<none>}"
   printf 'build-targets: %s\n' "${build_targets:-<none>}"
   printf 'clippy-targets: %s\n' "${clippy_targets:-<none>}"
-  if [[ -n "${test_targets}" && "${test_command}" != *-local && "${test_targets}" == "${clippy_targets}" ]]; then
+  if [[ "${clippy_only}" -eq 1 ]]; then
+    printf 'plan: clippy-only\n'
+  elif [[ "${tests_only}" -eq 1 && -z "${test_targets}" ]]; then
+    printf 'plan: build-only\n'
+  elif [[ "${tests_only}" -eq 1 ]]; then
+    printf 'plan: test-only\n'
+  elif [[ -n "${test_targets}" && "${test_command}" != *-local && "${test_targets}" == "${clippy_targets}" ]]; then
     printf 'plan: combined test+clippy\n'
   elif [[ -z "${test_targets}" && "${build_targets}" == "${clippy_targets}" ]]; then
     printf 'plan: combined build+clippy\n'
@@ -198,6 +220,49 @@ if [[ "${dry_run}" -eq 1 ]]; then
 fi
 
 start_seconds="$(date +%s)"
+
+if [[ "${clippy_only}" -eq 1 ]]; then
+  set +e
+  run_lane clippy "${clippy_command}" "${clippy_log}" --jobs=64 --color=no --curses=no
+  echo "$?" >"${clippy_status_file}"
+  set -e
+
+  end_seconds="$(date +%s)"
+  clippy_status="$(cat "${clippy_status_file}" 2>/dev/null || echo 1)"
+  printf 'BuildBuddy changed gate (%s, clippy-only) wall: %ss\n' "${mode}" "$((end_seconds - start_seconds))"
+  summarize_log "${clippy_command}" "${clippy_status}" "${clippy_log}"
+  if [[ "${clippy_status}" != "0" ]]; then
+    exit 1
+  fi
+  exit 0
+fi
+
+if [[ "${tests_only}" -eq 1 ]]; then
+  if [[ -z "${test_targets}" ]]; then
+    set +e
+    run_lane build "${build_command}" "${test_log}" --jobs=64 --color=no --curses=no
+    echo "$?" >"${test_status_file}"
+    set -e
+  else
+    set +e
+    run_lane test "${test_command}" "${test_log}" --jobs=64
+    echo "$?" >"${test_status_file}"
+    set -e
+  fi
+
+  end_seconds="$(date +%s)"
+  test_status="$(cat "${test_status_file}" 2>/dev/null || echo 1)"
+  printf 'BuildBuddy changed gate (%s, tests-only) wall: %ss\n' "${mode}" "$((end_seconds - start_seconds))"
+  if [[ -z "${test_targets}" ]]; then
+    summarize_log "${build_command}" "${test_status}" "${test_log}"
+  else
+    summarize_log "${test_command}" "${test_status}" "${test_log}"
+  fi
+  if [[ "${test_status}" != "0" ]]; then
+    exit 1
+  fi
+  exit 0
+fi
 
 if [[ "${test_command}" != *-local && -n "${test_targets}" && "${test_targets}" == "${clippy_targets}" ]]; then
   (

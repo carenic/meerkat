@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-backend="${MEERKAT_AGENT_GATE_BACKEND:-cargo}"
+source "$(cd "$(dirname "$0")" && pwd)/build-backend-env"
+
+backend="$(meerkat_selected_build_backend)"
 args=()
 
 usage() {
@@ -12,6 +14,7 @@ Runs the standard changed-path agent gate. Cargo is the default backend so the
 command works for every developer. BuildBuddy remains opt-in:
 
   scripts/agent-gate --buildbuddy --working-tree
+  MEERKAT_BUILDBUDDY=1 scripts/agent-gate --committed
   MEERKAT_AGENT_GATE_BACKEND=buildbuddy scripts/agent-gate --committed
 
 All remaining arguments are passed through to scripts/cargo-agent-gate or

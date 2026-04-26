@@ -99,6 +99,7 @@ permissions:
 
 env:
   CARGO_HOME: /tmp/meerkat-cargo-home
+  MEERKAT_BUILDBUDDY: ${{ vars.MEERKAT_BUILDBUDDY || 'false' }}
   BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
   RKAT_ANTHROPIC_API_KEY: ${{ secrets.RKAT_ANTHROPIC_API_KEY }}
@@ -112,7 +113,7 @@ env:
 jobs:
   doctor:
     name: BuildBuddy doctor
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -130,7 +131,7 @@ jobs:
 
   fmt-lint:
     name: Format, lint, and static checks
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -145,7 +146,7 @@ jobs:
 
   test-unit:
     name: Unit tests
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -160,7 +161,7 @@ jobs:
 
   integration-fast:
     name: Integration-fast lane
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -175,7 +176,7 @@ jobs:
 
   e2e-system:
     name: E2E system lane
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -190,7 +191,7 @@ jobs:
 
   sdk-suites:
     name: SDK suites + parity gates
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -220,7 +221,7 @@ jobs:
 
   machine-authority:
     name: Machine authority workflow
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -235,7 +236,7 @@ jobs:
 
   rmat-audit:
     name: RMAT audit + ownership ledger
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -250,7 +251,7 @@ jobs:
 
   seam-inventory:
     name: Seam inventory (strict)
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -265,7 +266,7 @@ jobs:
 
   wasm-contract-tests:
     name: WASM contract tests
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -280,7 +281,7 @@ jobs:
 
   e2e-fast:
     name: E2E fast lane
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -295,7 +296,7 @@ jobs:
 
   test-minimal:
     name: Minimal feature builds
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -310,7 +311,7 @@ jobs:
 
   test-feature-matrix-lib:
     name: Feature matrix (library)
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -325,7 +326,7 @@ jobs:
 
   test-feature-matrix-surface-checks:
     name: Feature matrix (surface checks)
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -340,7 +341,7 @@ jobs:
 
   wasm-check:
     name: WASM compilation check
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -355,7 +356,7 @@ jobs:
 
   audit:
     name: Security audit
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -422,7 +423,7 @@ jobs:
       - test-feature-matrix-surface-checks
       - wasm-check
       - audit
-    if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
     runs-on: ubuntu-latest
     steps:
       - name: Check results

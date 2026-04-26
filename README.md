@@ -148,15 +148,19 @@ For local multi-agent edits, use `make agent-gate` or `scripts/agent-gate`.
 Cargo is the default backend, so the command works without BuildBuddy access.
 It derives build-relevant changed files and runs a package-scoped Cargo clippy
 + nextest gate, escalating only global Rust lane changes to a workspace Cargo
-gate. Set `MEERKAT_AGENT_GATE_BACKEND=buildbuddy` or pass `--buildbuddy` to opt
-into the BuildBuddy changed-path gate. Use `--dry-run` to inspect the selected
-packages or paths before paying the build cost. The Cargo and BuildBuddy gates
-accept `--staged`, `--committed`, and `--working-tree` for hook and CI routing.
-When using Make, pass gate flags with `AGENT_GATE_ARGS='--dry-run --working-tree'`.
+gate. Set `MEERKAT_BUILDBUDDY=1` or pass `--buildbuddy` to opt into the
+BuildBuddy changed-path gate; the legacy
+`MEERKAT_AGENT_GATE_BACKEND=buildbuddy` switch still works. That same
+`MEERKAT_BUILDBUDDY=1` switch makes the standard pre-push Rust hooks choose
+BuildBuddy automatically.
+Use `--dry-run` to inspect the selected packages or paths before paying the
+build cost. The Cargo and BuildBuddy gates accept `--staged`, `--committed`,
+and `--working-tree` for hook and CI routing. When using Make, pass gate flags
+with `AGENT_GATE_ARGS='--dry-run --working-tree'`.
 The optional BuildBuddy workflow remains opt-in and uses
 `scripts/buildbuddy-ci-dispatch` to choose a full workspace gate or a changed
 branch/path gate. It can be run manually, or from normal CI by setting the
-repository variable `MEERKAT_BUILDBUDDY_CI=true` and adding the
+repository variable `MEERKAT_BUILDBUDDY=true` (or `1`) and adding the
 `BUILDBUDDY_API_KEY` repository secret. Without that variable, GitHub CI stays
 on the Cargo path.
 

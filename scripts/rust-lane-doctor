@@ -165,9 +165,18 @@ else
   printf '%s\n' "${agent_gate_probe}" >&2
 fi
 
+buildbuddy_agent_gate_probe="$(MEERKAT_BUILDBUDDY=1 ./scripts/agent-gate --dry-run --working-tree meerkat-runtime/src/input_ledger.rs 2>&1 || true)"
+if [[ "${buildbuddy_agent_gate_probe}" == *"BuildBuddy agent gate paths:"* &&
+  "${buildbuddy_agent_gate_probe}" == *"BuildBuddy changed gate dry-run"* ]]; then
+  pass "MEERKAT_BUILDBUDDY=1 routes agent-gate to BuildBuddy"
+else
+  bad "MEERKAT_BUILDBUDDY=1 did not route agent-gate to BuildBuddy"
+  printf '%s\n' "${buildbuddy_agent_gate_probe}" >&2
+fi
+
 exact_test_probe="$(./scripts/cargo-agent-gate --dry-run --working-tree meerkat-runtime/tests/meerkat_machine.rs 2>&1 || true)"
-if grep -q 'Cargo agent gate exact tests:' <<<"${exact_test_probe}" &&
-  grep -q -- '--test meerkat_machine' <<<"${exact_test_probe}"; then
+if [[ "${exact_test_probe}" == *"Cargo agent gate exact tests:"* &&
+  "${exact_test_probe}" == *"--test meerkat_machine"* ]]; then
   pass "cargo-agent-gate narrows direct integration test edits to exact test binaries"
 else
   bad "cargo-agent-gate did not select the exact integration test binary"
@@ -175,9 +184,9 @@ else
 fi
 
 support_test_probe="$(./scripts/cargo-agent-gate --dry-run --working-tree meerkat/tests/support/test_session_store.rs 2>&1 || true)"
-if grep -q 'Cargo agent gate exact tests:' <<<"${support_test_probe}" &&
-  grep -q -- '--test sdk_agentfactory' <<<"${support_test_probe}" &&
-  grep -q -- '--test sdk_structured_output' <<<"${support_test_probe}"; then
+if [[ "${support_test_probe}" == *"Cargo agent gate exact tests:"* &&
+  "${support_test_probe}" == *"--test sdk_agentfactory"* &&
+  "${support_test_probe}" == *"--test sdk_structured_output"* ]]; then
   pass "cargo-agent-gate narrows integration support edits to importing test binaries"
 else
   bad "cargo-agent-gate did not select exact importing integration test binaries"
@@ -185,9 +194,9 @@ else
 fi
 
 required_feature_test_probe="$(./scripts/cargo-agent-gate --dry-run --working-tree meerkat-cli/tests/cli_mobpack_live_smoke.rs 2>&1 || true)"
-if grep -q 'Cargo agent gate exact tests:' <<<"${required_feature_test_probe}" &&
-  grep -q -- '--features integration-real-tests' <<<"${required_feature_test_probe}" &&
-  grep -q -- '--test cli_mobpack_live_smoke' <<<"${required_feature_test_probe}"; then
+if [[ "${required_feature_test_probe}" == *"Cargo agent gate exact tests:"* &&
+  "${required_feature_test_probe}" == *"--features integration-real-tests"* &&
+  "${required_feature_test_probe}" == *"--test cli_mobpack_live_smoke"* ]]; then
   pass "cargo-agent-gate narrows required-feature test edits to exact test binaries"
 else
   bad "cargo-agent-gate did not select exact required-feature test binaries"
