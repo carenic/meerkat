@@ -1,19 +1,19 @@
 #!/usr/bin/env node
-import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, relative, resolve } from "node:path";
-
-const root = execFileSync("git", ["rev-parse", "--show-toplevel"], {
-  encoding: "utf8",
-}).trim();
-
-function gitLines(args) {
-  return execFileSync("git", args, { cwd: root, encoding: "utf8" })
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-}
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import {
+  crateName,
+  gitLines,
+  isFastTest,
+  normalizePath,
+  packageDir,
+  packageDirs,
+  packageForFile,
+  readMetadata,
+  root,
+  testSourcePaths,
+  workspacePackages,
+} from "./rust-test-selector.mjs";
 
 function parseArgs() {
   const paths = [];
@@ -48,78 +48,6 @@ function parseArgs() {
 
 const args = parseArgs();
 
-function cargoManifestFiles() {
-  return gitLines(["ls-files", "Cargo.lock", ":(glob)**/Cargo.toml"]);
-}
-
-function metadataFingerprint() {
-  const hash = createHash("sha256");
-  hash.update(root);
-  for (const file of cargoManifestFiles().sort()) {
-    const stat = statSync(resolve(root, file));
-    hash.update("\0");
-    hash.update(file);
-    hash.update("\0");
-    hash.update(String(stat.size));
-    hash.update("\0");
-    hash.update(String(stat.mtimeMs));
-  }
-  return hash.digest("hex");
-}
-
-function readMetadata() {
-  const cacheRoot = resolve(
-    process.env.XDG_CACHE_HOME || resolve(process.env.HOME || root, ".cache"),
-    "meerkat",
-    "bazel-selector-metadata",
-  );
-  const fingerprint = metadataFingerprint();
-  const cachePath = resolve(cacheRoot, `${fingerprint}.json`);
-  try {
-    return JSON.parse(readFileSync(cachePath, "utf8"));
-  } catch {
-    // Refresh below.
-  }
-
-  mkdirSync(cacheRoot, { recursive: true });
-  const lockPath = resolve(cacheRoot, `${fingerprint}.lock`);
-  try {
-    mkdirSync(lockPath);
-    try {
-      const metadata = JSON.parse(
-        execFileSync("./scripts/repo-cargo", ["metadata", "--format-version=1"], {
-          cwd: root,
-          encoding: "utf8",
-          maxBuffer: 64 * 1024 * 1024,
-        }),
-      );
-      const tmpPath = resolve(cacheRoot, `${fingerprint}.${process.pid}.tmp`);
-      writeFileSync(tmpPath, JSON.stringify(metadata));
-      renameSync(tmpPath, cachePath);
-      return metadata;
-    } finally {
-      rmSync(lockPath, { force: true, recursive: true });
-    }
-  } catch {
-    const sleepBuffer = new SharedArrayBuffer(4);
-    const sleepArray = new Int32Array(sleepBuffer);
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      try {
-        return JSON.parse(readFileSync(cachePath, "utf8"));
-      } catch {
-        Atomics.wait(sleepArray, 0, 0, 100);
-      }
-    }
-    return JSON.parse(
-      execFileSync("./scripts/repo-cargo", ["metadata", "--format-version=1"], {
-        cwd: root,
-        encoding: "utf8",
-        maxBuffer: 64 * 1024 * 1024,
-      }),
-    );
-  }
-}
-
 function changedFiles() {
   if (args.paths.length) return args.paths;
 
@@ -132,16 +60,10 @@ function changedFiles() {
 
 const metadata = readMetadata();
 
-const workspaceMembers = new Set(metadata.workspace_members);
-const packages = metadata.packages.filter(
-  (pkg) => pkg.source === null && workspaceMembers.has(pkg.id),
-);
+const packages = workspacePackages(metadata);
 const byId = new Map(packages.map((pkg) => [pkg.id, pkg]));
 const byName = new Map(packages.map((pkg) => [pkg.name, pkg]));
-const packageDir = (pkg) => relative(root, dirname(pkg.manifest_path)) || ".";
-const packageDirs = packages
-  .map((pkg) => [packageDir(pkg), pkg])
-  .sort((a, b) => b[0].length - a[0].length);
+const dirs = packageDirs(packages);
 
 const reverseDeps = new Map(packages.map((pkg) => [pkg.id, new Set()]));
 for (const pkg of packages) {
@@ -150,17 +72,6 @@ for (const pkg of packages) {
     const depPkg = byName.get(dep.name);
     if (depPkg) reverseDeps.get(depPkg.id)?.add(pkg.id);
   }
-}
-
-function packageForFile(file) {
-  const normalized = file.replaceAll("\\", "/").replace(/^\.\//, "");
-  for (const [dir, pkg] of packageDirs) {
-    if (dir === ".") continue;
-    if (normalized === `${dir}/Cargo.toml` || normalized.startsWith(`${dir}/`)) {
-      return pkg;
-    }
-  }
-  return null;
 }
 
 function hasFastSuite(pkg) {
@@ -181,69 +92,8 @@ function hasBazelTarget(pkg, name) {
   return contents.includes(`name = "${name}"`);
 }
 
-function crateName(name) {
-  return name.replaceAll("-", "_");
-}
-
-function testSourcePaths(target, pkg) {
-  const packageRoot = dirname(pkg.manifest_path);
-  const seen = new Set();
-  const paths = new Set();
-
-  function visit(file) {
-    if (seen.has(file)) return;
-    seen.add(file);
-    if (!file.startsWith(`${packageRoot}/`)) return;
-    const rel = relative(root, file).replaceAll("\\", "/");
-    if (!rel || rel.startsWith("..")) return;
-    paths.add(rel);
-
-    const source = readFileSync(file, "utf8");
-    const lineRe = /#[ \t]*\[[ \t]*path[ \t]*=[ \t]*"([^"]+)"[ \t]*\][ \t]*|(?:^|\n)[ \t]*(?:pub[ \t]+)?mod[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*;/g;
-    let pendingPath = null;
-    for (const match of source.matchAll(lineRe)) {
-      if (match[1]) {
-        pendingPath = match[1];
-        continue;
-      }
-      const modName = match[2];
-      if (!modName) continue;
-      if (pendingPath) {
-        visit(resolve(dirname(file), pendingPath));
-        pendingPath = null;
-        continue;
-      }
-
-      const flat = resolve(dirname(file), `${modName}.rs`);
-      const nested = resolve(dirname(file), modName, "mod.rs");
-      try {
-        if (statSync(flat).isFile()) {
-          visit(flat);
-          continue;
-        }
-      } catch {
-        // Try nested module layout below.
-      }
-      try {
-        if (statSync(nested).isFile()) visit(nested);
-      } catch {
-        // Missing modules are reported by rustc during validation.
-      }
-    }
-  }
-
-  visit(target.src_path);
-  return paths;
-}
-
-function isFastTest(pkg, target) {
-  const haystack = `${packageDir(pkg)} ${target.name} ${relative(root, target.src_path)}`.toLowerCase();
-  return !["e2e", "system", "live", "integration", "trybuild", "snapshot", "fixture", "slow"]
-    .some((tag) => haystack.includes(tag));
-}
-
 function exactTestLabelForFile(file, pkg, { fastOnly = false } = {}) {
-  const normalized = file.replaceAll("\\", "/").replace(/^\.\//, "");
+  const normalized = normalizePath(file);
   const labels = [];
   for (const target of pkg.targets) {
     if (!target.kind.includes("test")) continue;
@@ -333,7 +183,7 @@ const exactLabels = new Set();
 const unmapped = [];
 for (const file of files) {
   if (file.endsWith("BUILD.bazel") || file === "BUILD.bazel") continue;
-  const pkg = packageForFile(file);
+  const pkg = packageForFile(file, dirs);
   if (pkg) {
     const exactTestLabels = args.mode === "owned"
       ? exactTestLabelForFile(file, pkg, { fastOnly: args.kind === "test" })
