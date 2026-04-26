@@ -39,9 +39,9 @@ const DEFAULT_WASM_SYSTEM_PROMPT: &str = r"You are an autonomous agent. Your tas
 - If the task cannot be completed, explain what blocked progress and what was attempted.";
 use meerkat_core::{
     Agent, AgentBuilder, AgentEvent, AgentLlmClient, AgentSessionStore, AgentToolDispatcher,
-    BindingId, BlobStore, BudgetLimits, Config, ConnectionRef, HookRunOverrides, ModelRegistry,
-    OutputSchema, Provider, RealmConnectionSet, RealmId, Session, SessionLlmIdentity,
-    SessionMetadata, SessionTooling, ToolCategoryOverride,
+    BlobStore, BudgetLimits, Config, ConnectionRef, HookRunOverrides, ModelRegistry, OutputSchema,
+    Provider, RealmConnectionSet, RealmId, Session, SessionLlmIdentity, SessionMetadata,
+    SessionTooling, ToolCategoryOverride,
 };
 #[cfg(not(feature = "memory-store"))]
 use meerkat_core::{SessionId, SessionMeta};
@@ -862,69 +862,29 @@ impl std::fmt::Debug for AgentFactory {
 }
 
 impl AgentFactory {
-    fn env_default_connection_ref() -> Result<ConnectionRef, String> {
-        Ok(ConnectionRef {
-            realm: RealmId::parse("env_default").map_err(|e| e.to_string())?,
-            binding: BindingId::parse("default").map_err(|e| e.to_string())?,
-            profile: None,
-        })
-    }
-
     fn resolve_realm_binding_for_provider(
         config: &Config,
         provider: Provider,
         connection_ref: Option<&ConnectionRef>,
         preferred_realm: Option<&str>,
     ) -> Result<(RealmConnectionSet, String, ConnectionRef), String> {
-        if let Some(conn_ref) = connection_ref {
-            if let Some(section) = config.realm.get(conn_ref.realm.as_str()) {
-                let realm = RealmConnectionSet::from_config(conn_ref.realm.as_str(), section)
-                    .map_err(|e| e.to_string())?;
-                return Ok((realm, conn_ref.binding.to_string(), conn_ref.clone()));
-            }
-            if conn_ref.realm.as_str() == "env_default" && conn_ref.binding.as_str() == "default" {
-                let realm = RealmConnectionSet::synthesize_env_default(provider);
-                return Ok((realm, "default".to_string(), conn_ref.clone()));
-            }
-            return Err(format!(
-                "realm '{}' not found in config.realm",
-                conn_ref.realm
-            ));
-        }
-
-        for realm_id in preferred_realm
-            .into_iter()
-            .chain(std::iter::once("default"))
-        {
-            let Some(section) = config.realm.get(realm_id) else {
-                continue;
-            };
-            let Some(binding_id) = section.default_binding.as_deref() else {
-                continue;
-            };
-            let realm =
-                RealmConnectionSet::from_config(realm_id, section).map_err(|e| e.to_string())?;
-            let (_binding, backend, auth) = realm
-                .lookup_binding(binding_id)
-                .map_err(|e| e.to_string())?;
-            if backend.provider != provider || auth.provider != provider {
-                return Err(format!(
-                    "default binding '{realm_id}:{binding_id}' is for provider {:?}, \
-                     but model resolution selected provider {:?}",
-                    backend.provider, provider
-                ));
-            }
-            let connection_ref = ConnectionRef {
-                realm: RealmId::parse(realm_id).map_err(|e| e.to_string())?,
-                binding: BindingId::parse(binding_id).map_err(|e| e.to_string())?,
-                profile: None,
-            };
-            return Ok((realm, binding_id.to_string(), connection_ref));
-        }
-
-        let connection_ref = Self::env_default_connection_ref()?;
-        let realm = RealmConnectionSet::synthesize_env_default(provider);
-        Ok((realm, "default".to_string(), connection_ref))
+        let preferred_realm = preferred_realm
+            .map(RealmId::parse)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let target = meerkat_core::resolve_connection_ref_or_default_for_provider(
+            config,
+            provider,
+            connection_ref,
+            preferred_realm.as_ref(),
+            true,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok((
+            target.realm,
+            target.connection_ref.binding.to_string(),
+            target.connection_ref,
+        ))
     }
 
     #[cfg(all(
@@ -3014,8 +2974,9 @@ impl AgentFactory {
 mod tests {
     use super::*;
     use meerkat_core::{
-        BackendProfileConfig, CredentialSourceSpec, ProviderBindingConfig, RealmConfigSection,
-        SelfHostedApiStyle, SelfHostedModelConfig, SelfHostedServerConfig, SelfHostedTransport,
+        BackendProfileConfig, BindingId, CredentialSourceSpec, ProviderBindingConfig,
+        RealmConfigSection, SelfHostedApiStyle, SelfHostedModelConfig, SelfHostedServerConfig,
+        SelfHostedTransport,
     };
 
     #[test]
@@ -3045,8 +3006,11 @@ mod tests {
     #[test]
     fn persisted_env_default_connection_ref_rehydrates_without_config_realm() {
         let config = Config::default();
-        let connection_ref = AgentFactory::env_default_connection_ref()
-            .expect("static env_default connection ref should parse");
+        let connection_ref = ConnectionRef {
+            realm: RealmId::parse("env_default").expect("valid realm"),
+            binding: BindingId::parse("default").expect("valid binding"),
+            profile: None,
+        };
         let (realm, binding_id, resolved_ref) = AgentFactory::resolve_realm_binding_for_provider(
             &config,
             Provider::OpenAI,

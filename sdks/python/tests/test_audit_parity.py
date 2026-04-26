@@ -237,6 +237,25 @@ async def test_python_auth_helpers_send_binding_scoped_params():
     client._dispatcher = MagicMock()
     client._request = AsyncMock(return_value={})
 
+    await client.auth_login_complete(
+        "anthropic",
+        "code",
+        "state",
+        realm_id="prod",
+        binding_id="claude-console",
+    )
+    client._request.assert_called_with(
+        "auth/login/complete",
+        {
+            "provider": "anthropic",
+            "code": "code",
+            "state": "state",
+            "realm_id": "prod",
+            "binding_id": "claude-console",
+            "redirect_uri": "http://127.0.0.1:0/callback",
+        },
+    )
+
     await client.auth_login_device_complete(
         "anthropic",
         "device-code",

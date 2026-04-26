@@ -369,7 +369,7 @@ class MeerkatClient:
         `realm/get`."""
         return await self._request("realm/get", {"realm_id": realm_id})
 
-    async def list_auth_profiles(self, realm_id: str = "dev") -> dict[str, Any]:
+    async def list_auth_profiles(self, realm_id: str) -> dict[str, Any]:
         """List auth profiles / backend profiles / bindings for one
         realm. Delegates to `auth/profile/list`."""
         return await self._request("auth/profile/list", {"realm_id": realm_id})
@@ -417,8 +417,8 @@ class MeerkatClient:
         code: str,
         state: str,
         *,
-        realm_id: str = "dev",
-        binding_id: str | None = None,
+        realm_id: str,
+        binding_id: str,
         redirect_uri: str = "http://127.0.0.1:0/callback",
     ) -> dict[str, Any]:
         """Exchange an authorization code for tokens via
@@ -429,10 +429,9 @@ class MeerkatClient:
             "code": code,
             "state": state,
             "realm_id": realm_id,
+            "binding_id": binding_id,
             "redirect_uri": redirect_uri,
         }
-        if binding_id is not None:
-            params["binding_id"] = binding_id
         return await self._request("auth/login/complete", params)
 
     async def auth_login_device_start(self, provider: str) -> dict[str, Any]:
@@ -448,8 +447,8 @@ class MeerkatClient:
         provider: str,
         device_code: str,
         *,
-        realm_id: str = "dev",
-        binding_id: str | None = None,
+        realm_id: str,
+        binding_id: str,
     ) -> dict[str, Any]:
         """Poll once for device-code completion via
         `auth/login/device_complete`. Returns `{state: "pending" |
@@ -458,17 +457,16 @@ class MeerkatClient:
             "provider": provider,
             "device_code": device_code,
             "realm_id": realm_id,
+            "binding_id": binding_id,
         }
-        if binding_id is not None:
-            params["binding_id"] = binding_id
         return await self._request("auth/login/device_complete", params)
 
     async def auth_provision_api_key(
         self,
         access_token: str,
         *,
-        realm_id: str = "dev",
-        binding_id: str | None = None,
+        realm_id: str,
+        binding_id: str,
     ) -> dict[str, Any]:
         """Anthropic Console-OAuth → API key provisioning via
         `auth/login/provision_api_key` (plan §4b.5). The caller runs
@@ -478,9 +476,8 @@ class MeerkatClient:
         params: dict[str, Any] = {
             "access_token": access_token,
             "realm_id": realm_id,
+            "binding_id": binding_id,
         }
-        if binding_id is not None:
-            params["binding_id"] = binding_id
         return await self._request("auth/login/provision_api_key", params)
 
     async def auth_status(

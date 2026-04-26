@@ -14,7 +14,9 @@ use meerkat_anthropic::runtime::oauth as a_oauth;
 use meerkat_contracts::{
     WireAuthProfile, WireBackendProfile, WireProviderBinding, WireRealmConnectionSet,
 };
-use meerkat_core::{ConnectionRef, RealmConnectionSet};
+use meerkat_core::{
+    ConnectionRef, ConnectionTargetError, Provider, RealmConnectionSet, ResolvedConnectionTarget,
+};
 use meerkat_gemini::runtime::oauth as g_oauth;
 use meerkat_openai::runtime::oauth as o_oauth;
 use meerkat_providers::auth_oauth::{
@@ -28,6 +30,13 @@ use super::{RpcResponseExt, parse_params};
 use crate::error;
 use crate::protocol::{RpcId, RpcResponse};
 use crate::session_runtime::SessionRuntime;
+
+type ProviderEndpointResolution = (
+    Provider,
+    OAuthEndpoints,
+    PersistedAuthMode,
+    Option<&'static str>,
+);
 
 #[derive(serde::Deserialize)]
 struct RealmIdParams {
@@ -126,6 +135,40 @@ async fn resolve_binding_identity(
     ))
 }
 
+async fn resolve_oauth_target(
+    runtime: &SessionRuntime,
+    provider: Provider,
+    realm_id: Option<&str>,
+    binding_id: Option<&str>,
+) -> Result<ResolvedConnectionTarget, RpcResponse> {
+    let config = load_config(runtime).await?;
+    let explicit_realm = realm_id
+        .map(meerkat_core::RealmId::parse)
+        .transpose()
+        .map_err(|e| RpcResponse::error(None, error::INVALID_PARAMS, e.to_string()))?;
+    let explicit_binding = binding_id
+        .map(meerkat_core::BindingId::parse)
+        .transpose()
+        .map_err(|e| RpcResponse::error(None, error::INVALID_PARAMS, e.to_string()))?;
+    meerkat_core::resolve_realm_binding_target_for_provider(
+        &config,
+        provider,
+        explicit_realm.as_ref(),
+        explicit_binding.as_ref(),
+        runtime.realm_id(),
+        false,
+    )
+    .map_err(target_error_response)
+}
+
+fn target_error_response(error: ConnectionTargetError) -> RpcResponse {
+    let code = match error {
+        ConnectionTargetError::RealmConfigInvalid { .. } => error::INTERNAL_ERROR,
+        _ => error::INVALID_PARAMS,
+    };
+    RpcResponse::error(None, code, error.to_string())
+}
+
 #[allow(clippy::result_large_err)]
 fn require_token_store(
     runtime: &SessionRuntime,
@@ -143,19 +186,22 @@ fn require_token_store(
 fn provider_endpoints(
     provider: &str,
     redirect_uri: &str,
-) -> Result<(OAuthEndpoints, PersistedAuthMode, Option<&'static str>), String> {
+) -> Result<ProviderEndpointResolution, String> {
     match provider {
         "anthropic" | "claude" | "claude.ai" => Ok((
+            Provider::Anthropic,
             a_oauth::claude_ai_endpoints(redirect_uri),
             PersistedAuthMode::ClaudeAiOauth,
             None,
         )),
         "openai" | "chatgpt" => Ok((
+            Provider::OpenAI,
             o_oauth::chatgpt_endpoints(redirect_uri),
             PersistedAuthMode::ChatgptOauth,
             None,
         )),
         "google" | "gemini" | "code_assist" => Ok((
+            Provider::Gemini,
             g_oauth::code_assist_endpoints(redirect_uri),
             PersistedAuthMode::GoogleOauth,
             Some(g_oauth::CODE_ASSIST_CLIENT_SECRET),
@@ -426,7 +472,7 @@ pub async fn handle_auth_login_start(id: Option<RpcId>, params: Option<&RawValue
         Ok(v) => v,
         Err(r) => return r.with_id(id),
     };
-    let (endpoints, _mode, _secret) =
+    let (_provider, endpoints, _mode, _secret) =
         match provider_endpoints(&parsed.provider, &parsed.redirect_uri) {
             Ok(v) => v,
             Err(msg) => {
@@ -474,7 +520,8 @@ struct LoginCompleteParams {
     code: String,
     state: String,
     redirect_uri: String,
-    realm_id: String,
+    #[serde(default)]
+    realm_id: Option<String>,
     #[serde(default)]
     binding_id: Option<String>,
 }
@@ -488,25 +535,28 @@ pub async fn handle_auth_login_complete(
         Ok(v) => v,
         Err(r) => return r.with_id(id),
     };
-    let (endpoints, mode, client_secret) =
+    let (provider, endpoints, mode, client_secret) =
         match provider_endpoints(&parsed.provider, &parsed.redirect_uri) {
             Ok(v) => v,
             Err(msg) => {
                 return RpcResponse::error(id, error::INVALID_PARAMS, msg);
             }
         };
-    let binding_id = parsed.binding_id;
-    let (connection_ref, binding, auth_profile) = match resolve_binding_identity(
+    let target = match resolve_oauth_target(
         runtime,
-        &parsed.realm_id,
-        binding_id.as_deref().unwrap_or(""),
+        provider,
+        parsed.realm_id.as_deref(),
+        parsed.binding_id.as_deref(),
     )
     .await
     {
         Ok(v) => v,
         Err(r) => return r.with_id(id),
     };
-    if parsed.provider != auth_profile.provider.as_str() {
+    let connection_ref = target.connection_ref;
+    let binding = target.binding;
+    let auth_profile = target.auth_profile;
+    if provider != auth_profile.provider {
         return RpcResponse::error(
             id,
             error::INVALID_PARAMS,
@@ -633,7 +683,7 @@ pub async fn handle_auth_login_device_start(
         Ok(v) => v,
         Err(r) => return r.with_id(id),
     };
-    let (endpoints, _mode, _secret) = match provider_endpoints(&parsed.provider, "") {
+    let (_provider, endpoints, _mode, _secret) = match provider_endpoints(&parsed.provider, "") {
         Ok(v) => v,
         Err(msg) => return RpcResponse::error(id, error::INVALID_PARAMS, msg),
     };
@@ -673,7 +723,8 @@ pub async fn handle_auth_login_device_start(
 struct DeviceCompleteParams {
     provider: String,
     device_code: String,
-    realm_id: String,
+    #[serde(default)]
+    realm_id: Option<String>,
     #[serde(default)]
     binding_id: Option<String>,
 }
@@ -695,7 +746,8 @@ pub async fn handle_auth_login_device_complete(
         Ok(v) => v,
         Err(r) => return r.with_id(id),
     };
-    let (endpoints, mode, client_secret) = match provider_endpoints(&parsed.provider, "") {
+    let (provider, endpoints, mode, client_secret) = match provider_endpoints(&parsed.provider, "")
+    {
         Ok(v) => v,
         Err(msg) => return RpcResponse::error(id, error::INVALID_PARAMS, msg),
     };
@@ -709,18 +761,21 @@ pub async fn handle_auth_login_device_complete(
             ),
         );
     }
-    let binding_id = parsed.binding_id;
-    let (connection_ref, binding, auth_profile) = match resolve_binding_identity(
+    let target = match resolve_oauth_target(
         runtime,
-        &parsed.realm_id,
-        binding_id.as_deref().unwrap_or(""),
+        provider,
+        parsed.realm_id.as_deref(),
+        parsed.binding_id.as_deref(),
     )
     .await
     {
         Ok(v) => v,
         Err(r) => return r.with_id(id),
     };
-    if parsed.provider != auth_profile.provider.as_str() {
+    let connection_ref = target.connection_ref;
+    let binding = target.binding;
+    let auth_profile = target.auth_profile;
+    if provider != auth_profile.provider {
         return RpcResponse::error(
             id,
             error::INVALID_PARAMS,
@@ -818,7 +873,8 @@ pub async fn handle_auth_login_device_complete(
 struct ProvisionApiKeyParams {
     /// Access token acquired from a prior Console-OAuth flow.
     access_token: String,
-    realm_id: String,
+    #[serde(default)]
+    realm_id: Option<String>,
     #[serde(default)]
     binding_id: Option<String>,
 }
@@ -842,12 +898,26 @@ pub async fn handle_auth_login_provision_api_key(
         Ok(v) => v,
         Err(r) => return r.with_id(id),
     };
-    let binding_id = parsed.binding_id;
+    let target = match resolve_oauth_target(
+        runtime,
+        Provider::Anthropic,
+        parsed.realm_id.as_deref(),
+        parsed.binding_id.as_deref(),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(r) => return r.with_id(id),
+    };
+    let connection_ref = target.connection_ref;
     let store = match require_token_store(runtime, id.clone()) {
         Ok(s) => s,
         Err(r) => return r,
     };
-    let key = match TokenKey::parse(&parsed.realm_id, binding_id.as_deref().unwrap_or_default()) {
+    let key = match TokenKey::parse(
+        connection_ref.realm.as_str(),
+        connection_ref.binding.as_str(),
+    ) {
         Ok(k) => k,
         Err(err) => {
             return RpcResponse::error(
@@ -868,11 +938,11 @@ pub async fn handle_auth_login_provision_api_key(
         Ok(tokens) => RpcResponse::success(
             id,
             serde_json::json!({
-                "realm_id": &parsed.realm_id,
-                "binding_id": &binding_id,
+                "realm_id": connection_ref.realm.as_str(),
+                "binding_id": connection_ref.binding.as_str(),
                 "connection_ref": {
-                    "realm_id": &parsed.realm_id,
-                    "binding_id": &binding_id,
+                    "realm_id": connection_ref.realm.as_str(),
+                    "binding_id": connection_ref.binding.as_str(),
                 },
                 "provider": "anthropic",
                 "auth_mode": "oauth_to_api_key",
@@ -982,5 +1052,39 @@ pub async fn handle_auth_logout(
             error::INTERNAL_ERROR,
             format!("TokenStore clear failed: {e}"),
         ),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oauth_completion_params_keep_missing_identity_unowned_by_surface() {
+        let login: LoginCompleteParams = serde_json::from_value(serde_json::json!({
+            "provider": "anthropic",
+            "code": "code",
+            "state": "state",
+            "redirect_uri": "http://127.0.0.1:0/callback"
+        }))
+        .unwrap();
+        assert!(login.realm_id.is_none());
+        assert!(login.binding_id.is_none());
+
+        let device: DeviceCompleteParams = serde_json::from_value(serde_json::json!({
+            "provider": "anthropic",
+            "device_code": "device-code"
+        }))
+        .unwrap();
+        assert!(device.realm_id.is_none());
+        assert!(device.binding_id.is_none());
+
+        let provision: ProvisionApiKeyParams = serde_json::from_value(serde_json::json!({
+            "access_token": "token"
+        }))
+        .unwrap();
+        assert!(provision.realm_id.is_none());
+        assert!(provision.binding_id.is_none());
     }
 }

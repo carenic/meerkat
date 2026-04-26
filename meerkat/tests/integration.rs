@@ -241,11 +241,10 @@ mod tool_dispatch {
     #[cfg(feature = "mcp")]
     #[test]
     fn test_tool_timeout_enforced() {
-        // Create dispatcher with registry and router
-        let registry = ToolRegistry::new();
+        // Create dispatcher with router-backed live tool discovery.
         let router: Arc<dyn AgentToolDispatcher> = Arc::new(McpRouter::new());
         let timeout = Duration::from_secs(30);
-        let dispatcher = ToolDispatcher::new(registry, router).with_timeout(timeout);
+        let dispatcher = ToolDispatcher::new(router).with_timeout(timeout);
 
         // Dispatcher should be created (existence test)
         assert!(std::mem::size_of_val(&dispatcher) > 0);

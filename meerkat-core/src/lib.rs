@@ -281,6 +281,8 @@ pub use auth::{
 };
 pub use connection::{
     AuthProfile, AuthProfileConfig, BackendProfile, BackendProfileConfig, BindingId, BindingPolicy,
-    ConnectionRef, CredentialSourceSpec, IdentityError, ProfileId, ProviderBinding,
-    ProviderBindingConfig, ProviderBindingError, RealmConfigSection, RealmConnectionSet, RealmId,
+    ConnectionRef, ConnectionTargetError, CredentialSourceSpec, IdentityError, ProfileId,
+    ProviderBinding, ProviderBindingConfig, ProviderBindingError, RealmConfigSection,
+    RealmConnectionSet, RealmId, ResolvedConnectionTarget,
+    resolve_connection_ref_or_default_for_provider, resolve_realm_binding_target_for_provider,
 };
