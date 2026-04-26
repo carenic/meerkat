@@ -63,6 +63,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `Reset`
 - `StopRuntimeExecutor`
 - `Destroy`(session_id: SessionId)
+- `RecoverInputLifecycle`(input_id: String, phase: InputPhase, terminal_kind: Option<InputTerminalKind>, superseded_by: Option<String>, aggregate_id: Option<String>, abandon_reason: Option<InputAbandonReason>, abandon_attempt_count: u64, attempt_count: u64, run_id: Option<String>, boundary_sequence: Option<u64>, lane: Option<InputLane>)
 - `EnsureSessionWithExecutor`(session_id: SessionId)
 - `SetSilentIntents`(session_id: SessionId, intents: Set<String>)
 - `ContainsSession`(session_id: SessionId)
@@ -634,6 +635,36 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `runtime_is_bound`
 - Emits: `RuntimeDestroyed`
 - To: `Destroyed`
+
+### `RecoverInputLifecycleIdle`
+- From: `Idle`
+- On: `RecoverInputLifecycle`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, lane)
+- Emits: `InputLifecycleNotice`
+- To: `Idle`
+
+### `RecoverInputLifecycleAttached`
+- From: `Attached`
+- On: `RecoverInputLifecycle`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, lane)
+- Emits: `InputLifecycleNotice`
+- To: `Attached`
+
+### `RecoverInputLifecycleRunning`
+- From: `Running`
+- On: `RecoverInputLifecycle`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, lane)
+- Emits: `InputLifecycleNotice`
+- To: `Running`
+
+### `RecoverInputLifecycleRetired`
+- From: `Retired`
+- On: `RecoverInputLifecycle`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, lane)
+- Emits: `InputLifecycleNotice`
+- To: `Retired`
+
+### `RecoverInputLifecycleStopped`
+- From: `Stopped`
+- On: `RecoverInputLifecycle`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, lane)
+- Emits: `InputLifecycleNotice`
+- To: `Stopped`
 
 ### `EnsureSessionWithExecutorIdle`
 - From: `Idle`
@@ -3437,7 +3468,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `AttachSessionIngress`(comms_runtime_id)
 - Guards:
   - `session_registered`
-  - `owner_is_unattached`
+  - `owner_allows_session_attach`
 - To: `Idle`
 
 ### `AttachSessionIngressAttached`
@@ -3445,7 +3476,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `AttachSessionIngress`(comms_runtime_id)
 - Guards:
   - `session_registered`
-  - `owner_is_unattached`
+  - `owner_allows_session_attach`
 - To: `Attached`
 
 ### `AttachSessionIngressRunning`
@@ -3453,7 +3484,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `AttachSessionIngress`(comms_runtime_id)
 - Guards:
   - `session_registered`
-  - `owner_is_unattached`
+  - `owner_allows_session_attach`
 - To: `Running`
 
 ### `AttachSessionIngressRetired`
@@ -3461,7 +3492,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `AttachSessionIngress`(comms_runtime_id)
 - Guards:
   - `session_registered`
-  - `owner_is_unattached`
+  - `owner_allows_session_attach`
 - To: `Retired`
 
 ### `AttachSessionIngressStopped`
@@ -3469,7 +3500,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `AttachSessionIngress`(comms_runtime_id)
 - Guards:
   - `session_registered`
-  - `owner_is_unattached`
+  - `owner_allows_session_attach`
 - To: `Stopped`
 
 ### `AttachMobIngressIdle`
@@ -3517,7 +3548,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `DetachIngress`()
 - Guards:
   - `session_registered`
-  - `owner_is_attached`
 - To: `Idle`
 
 ### `DetachIngressAttached`
@@ -3525,7 +3555,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `DetachIngress`()
 - Guards:
   - `session_registered`
-  - `owner_is_attached`
 - To: `Attached`
 
 ### `DetachIngressRunning`
@@ -3533,7 +3562,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `DetachIngress`()
 - Guards:
   - `session_registered`
-  - `owner_is_attached`
 - To: `Running`
 
 ### `DetachIngressRetired`
@@ -3541,7 +3569,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `DetachIngress`()
 - Guards:
   - `session_registered`
-  - `owner_is_attached`
 - To: `Retired`
 
 ### `DetachIngressStopped`
@@ -3549,7 +3576,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `DetachIngress`()
 - Guards:
   - `session_registered`
-  - `owner_is_attached`
 - To: `Stopped`
 
 ### `BindSupervisorIdle`
