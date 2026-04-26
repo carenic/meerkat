@@ -87,6 +87,30 @@ else
   pass "Makefile test-all delegates to the filtered fast profile"
 fi
 
+raw_cargo_shell_hits="$(
+  rg -n '^\\s*(cargo|exec cargo)\\b|\\bcargo run -p xtask\\b' \
+    scripts specs \
+    --glob '*.sh' \
+    --glob '!scripts/repo-cargo' 2>/dev/null || true
+)"
+if [[ -n "${raw_cargo_shell_hits}" ]]; then
+  bad "shell build/test entrypoints bypass scripts/repo-cargo"
+  printf '%s\n' "${raw_cargo_shell_hits}" >&2
+else
+  pass "shell build/test entrypoints use the repo Cargo wrapper"
+fi
+
+agent_gate_probe="$(./scripts/agent-gate --dry-run --working-tree meerkat-runtime/src/input_ledger.rs 2>&1 || true)"
+if [[ -x scripts/agent-gate ]] &&
+  grep -q 'Cargo agent gate packages:' <<<"${agent_gate_probe}" &&
+  grep -q 'meerkat-runtime' <<<"${agent_gate_probe}" &&
+  ! grep -q 'BuildBuddy agent gate' <<<"${agent_gate_probe}"; then
+  pass "agent-gate defaults to the Cargo changed-path gate"
+else
+  bad "agent-gate default routing is not Cargo-first"
+  printf '%s\n' "${agent_gate_probe}" >&2
+fi
+
 if [[ -n "$(git status --short)" ]]; then
   note "working tree has local changes; doctor did not modify them"
 else
