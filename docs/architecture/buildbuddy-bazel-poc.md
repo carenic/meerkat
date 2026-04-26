@@ -18,6 +18,10 @@ Initial POC commit: `a58e2613f1a5f3cfb952b4035e8f0d38c0c35a71`
 
 ## Entry Points
 
+Install the pinned `bb` binary with `make buildbuddy-install` if it is not
+already on `PATH`. The installer writes to the user cache by default and checks
+the downloaded binary against a pinned SHA-256 digest.
+
 Use `scripts/buildbuddy-bazel-poc` with `BUILDBUDDY_BAZEL_COMMAND`:
 
 - `workspace-test`: run the full Bazel workspace test suite.
@@ -127,7 +131,10 @@ For an actual remote-compatible CI gate, use `scripts/buildbuddy-ci-workspace`.
 It runs `workspace-fast-clippy-rbe` and `workspace-build-clippy-rbe` in parallel
 on isolated fresh lanes, prints compact summaries, and cleans up the temporary
 output roots. Use `--warm` to reuse a stable output root for repeated local or
-agent gates.
+agent gates. The optional `.github/workflows/buildbuddy.yml` workflow is
+manual-only, requires a `BUILDBUDDY_API_KEY` secret, installs the pinned `bb`
+binary, and runs the same `make buildbuddy-ci` gate. Normal GitHub CI remains
+Cargo-based.
 
 `scripts/buildbuddy-prewarm-lanes` prepares common lanes for a new worktree:
 
@@ -252,6 +259,9 @@ to roughly `4-6s` once those lanes were prepared.
 - For deeper shared crates, use `affected-*` when you need reverse-dependency
   confidence, and expect broad closures for high-fanout crates.
 - For an opt-in BuildBuddy fast test pass, run `make buildbuddy-fast`.
+- To install the pinned BuildBuddy CLI without changing system directories, run
+  `make buildbuddy-install`. The BuildBuddy scripts also check that cache path
+  when `bb` is not already on `PATH`.
 - To check the Cargo/default side of the lane contract, run
   `make rust-lane-doctor`. It verifies that `repo-cargo` keeps caches outside
   the checkout, `RUST_LANE_ID` creates distinct same-checkout target dirs, and

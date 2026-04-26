@@ -32,10 +32,12 @@ if [[ -n "${BUILDBUDDY_BB:-}" ]]; then
   bb_bin="${BUILDBUDDY_BB}"
 elif command -v bb >/dev/null 2>&1; then
   bb_bin="bb"
+elif [[ -x "${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-cli/5.0.350/bin/bb" ]]; then
+  bb_bin="${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-cli/5.0.350/bin/bb"
 elif [[ -x /tmp/buildbuddy-poc/bin/bb ]]; then
   bb_bin="/tmp/buildbuddy-poc/bin/bb"
 else
-  echo "error: bb is not installed; set BUILDBUDDY_BB to the BuildBuddy CLI path" >&2
+  echo "error: bb is not installed; run make buildbuddy-install or set BUILDBUDDY_BB" >&2
   exit 1
 fi
 

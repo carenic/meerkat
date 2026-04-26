@@ -44,10 +44,12 @@ if [[ -n "${BUILDBUDDY_BB:-}" && -x "${BUILDBUDDY_BB}" ]]; then
   pass "BuildBuddy CLI found via BUILDBUDDY_BB"
 elif command -v bb >/dev/null 2>&1; then
   pass "BuildBuddy CLI found on PATH"
+elif [[ -x "${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-cli/5.0.350/bin/bb" ]]; then
+  pass "BuildBuddy CLI found in pinned repo cache"
 elif [[ -x /tmp/buildbuddy-poc/bin/bb ]]; then
   pass "BuildBuddy CLI found at /tmp/buildbuddy-poc/bin/bb"
 else
-  bad "BuildBuddy CLI not found; install bb or set BUILDBUDDY_BB"
+  bad "BuildBuddy CLI not found; run make buildbuddy-install or set BUILDBUDDY_BB"
 fi
 
 if [[ -f .bazelrc ]] && grep -q 'build:buildbuddy-macos-rbe' .bazelrc; then

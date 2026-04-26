@@ -1,0 +1,35 @@
+name: BuildBuddy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-arm64-rbe:
+    name: macOS arm64 RBE gate
+    runs-on: ubuntu-latest
+    env:
+      BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Require BuildBuddy API key
+        run: |
+          if [[ -z "${BUILDBUDDY_API_KEY}" ]]; then
+            echo "BUILDBUDDY_API_KEY secret is required for the optional BuildBuddy workflow." >&2
+            exit 1
+          fi
+
+      - name: Install pinned BuildBuddy CLI
+        run: |
+          bb_bin="$(scripts/install-buildbuddy-cli --dir "${RUNNER_TEMP}/buildbuddy-cli")"
+          echo "$(dirname "${bb_bin}")" >> "${GITHUB_PATH}"
+
+      - name: BuildBuddy doctor
+        run: make buildbuddy-doctor
+
+      - name: Remote workspace gate
+        run: make buildbuddy-ci
