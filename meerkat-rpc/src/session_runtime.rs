@@ -589,6 +589,7 @@ pub struct SessionRuntime {
     factory: AgentFactory,
     service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
     schedule_service: ScheduleService,
+    artifact_store: Arc<dyn meerkat_core::ArtifactStore>,
     schedule_host: Mutex<Option<meerkat::surface::ScheduleHostHandle>>,
     /// Canonical staged-session authority (facade-owned). Holds sessions
     /// that have been created (ID returned to caller) but not yet materialized
@@ -638,6 +639,9 @@ pub struct SessionRuntime {
     /// inject scheduler tools into resumed/runtime-backed agent builds.
     pub builder_schedule_tools_slot:
         Arc<StdRwLock<Option<Arc<dyn meerkat_core::AgentToolDispatcher>>>>,
+    /// Runtime-owned approval records. Surfaces only project decisions into
+    /// this service; approval status is service-owned.
+    approval_service: meerkat_core::ApprovalService,
 }
 
 fn session_metadata_marks_archived(session: &Session) -> bool {
@@ -646,6 +650,36 @@ fn session_metadata_marks_archived(session: &Session) -> bool {
         .get("session_archived")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
+}
+
+fn approval_service_from_persistence(
+    persistence: &PersistenceBundle,
+) -> meerkat_core::ApprovalService {
+    let Some(store_path) = persistence.store_path() else {
+        return meerkat_core::ApprovalService::new();
+    };
+    let path = store_path.join("approvals.json");
+    match meerkat_store::FileApprovalStore::open(&path) {
+        Ok(store) => match meerkat_core::ApprovalService::with_store(Arc::new(store)) {
+            Ok(service) => service,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "failed to load approval records; falling back to process-local approvals"
+                );
+                meerkat_core::ApprovalService::new()
+            }
+        },
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                path = %path.display(),
+                "failed to open approval store; falling back to process-local approvals"
+            );
+            meerkat_core::ApprovalService::new()
+        }
+    }
 }
 
 impl SessionRuntime {
@@ -752,6 +786,7 @@ impl SessionRuntime {
         notification_sink: crate::router::NotificationSink,
     ) -> Self {
         let schedule_service = ScheduleService::new(persistence.schedule_store());
+        let artifact_store = persistence.artifact_store();
         let factory_clone = factory.clone();
         let builder = FactoryAgentBuilder::new(factory, config);
         let builder_mob_tools_slot = Arc::clone(&builder.default_mob_tools);
@@ -764,6 +799,7 @@ impl SessionRuntime {
                 schedule_service.clone(),
             ))),
         );
+        let approval_service = approval_service_from_persistence(&persistence);
         let (service, runtime_adapter) =
             meerkat::surface::build_runtime_backed_service(builder, max_sessions, persistence);
         let service = Arc::new(service);
@@ -780,6 +816,7 @@ impl SessionRuntime {
             factory: factory_clone,
             service,
             schedule_service,
+            artifact_store,
             schedule_host: Mutex::new(None),
             staged_sessions: Arc::new(StagedSessionRegistry::new()),
             max_sessions,
@@ -807,6 +844,7 @@ impl SessionRuntime {
             registered_tools_slot: StdRwLock::new(Arc::new(StdRwLock::new(Vec::new()))),
             builder_mob_tools_slot,
             builder_schedule_tools_slot,
+            approval_service,
         }
     }
 
@@ -820,6 +858,7 @@ impl SessionRuntime {
         notification_sink: crate::router::NotificationSink,
     ) -> Self {
         let schedule_service = ScheduleService::new(persistence.schedule_store());
+        let artifact_store = persistence.artifact_store();
         let factory_clone = factory.clone();
         let builder =
             FactoryAgentBuilder::new_with_config_store(factory, initial_config, config_store);
@@ -833,6 +872,7 @@ impl SessionRuntime {
                 schedule_service.clone(),
             ))),
         );
+        let approval_service = approval_service_from_persistence(&persistence);
         let (service, runtime_adapter) =
             meerkat::surface::build_runtime_backed_service(builder, max_sessions, persistence);
         let service = Arc::new(service);
@@ -849,6 +889,7 @@ impl SessionRuntime {
             factory: factory_clone,
             service,
             schedule_service,
+            artifact_store,
             schedule_host: Mutex::new(None),
             staged_sessions: Arc::new(StagedSessionRegistry::new()),
             max_sessions,
@@ -876,6 +917,7 @@ impl SessionRuntime {
             registered_tools_slot: StdRwLock::new(Arc::new(StdRwLock::new(Vec::new()))),
             builder_mob_tools_slot,
             builder_schedule_tools_slot,
+            approval_service,
         }
     }
 
@@ -969,6 +1011,10 @@ impl SessionRuntime {
     /// Build the runtime adapter appropriate for this runtime's persistence mode.
     pub fn runtime_adapter(&self) -> Arc<MeerkatMachine> {
         self.runtime_adapter.clone()
+    }
+
+    pub fn approval_service(&self) -> meerkat_core::ApprovalService {
+        self.approval_service.clone()
     }
 
     /// Project the owning live session into the provider-backed realtime open seam.
@@ -1096,6 +1142,10 @@ impl SessionRuntime {
 
     pub fn blob_store(&self) -> Arc<dyn meerkat_core::BlobStore> {
         self.service.blob_store()
+    }
+
+    pub fn artifact_store(&self) -> Arc<dyn meerkat_core::ArtifactStore> {
+        self.artifact_store.clone()
     }
 
     pub fn default_llm_client(&self) -> Option<Arc<dyn LlmClient>> {
@@ -3479,6 +3529,125 @@ impl SessionRuntime {
         None
     }
 
+    /// Whether this runtime has a durable event replay projection installed.
+    pub fn supports_event_replay(&self) -> bool {
+        self.service.has_event_projection()
+    }
+
+    /// Read the latest durable event cursor for a session scope.
+    pub async fn event_latest_cursor(
+        &self,
+        scope: meerkat_contracts::EventReplayScope,
+    ) -> Result<Option<meerkat_contracts::EventReplayCursor>, RpcError> {
+        let session_id = scope.session_id().clone();
+        let latest = self
+            .service
+            .event_log_latest_seq(&session_id)
+            .await
+            .map_err(session_error_to_rpc)?;
+        let Some(sequence) = latest else {
+            return Ok(None);
+        };
+        if sequence == 0 && self.read_session_rich(&session_id).await.is_none() {
+            return Err(RpcError {
+                code: error::SESSION_NOT_FOUND,
+                message: format!("Session not found: {session_id}"),
+                data: None,
+            });
+        }
+        Ok(Some(meerkat_contracts::EventReplayCursor::new(
+            scope, sequence,
+        )))
+    }
+
+    /// Read durable events after a typed cursor.
+    pub async fn event_list_since(
+        &self,
+        params: meerkat_contracts::EventsListSinceParams,
+    ) -> Result<Option<meerkat_contracts::EventsListSinceResult>, RpcError> {
+        let latest = match self.event_latest_cursor(params.scope.clone()).await? {
+            Some(cursor) => cursor,
+            None => return Ok(None),
+        };
+        let from_cursor = params
+            .cursor
+            .unwrap_or_else(|| meerkat_contracts::EventReplayCursor::new(params.scope.clone(), 0));
+        let from_seq = from_cursor
+            .validate_for_list_since(&params.scope, latest.sequence)
+            .map_err(|err| RpcError {
+                code: error::INVALID_PARAMS,
+                message: match err {
+                    meerkat_contracts::EventReplayCursorError::ScopeMismatch => {
+                        "event replay cursor scope does not match requested scope".to_string()
+                    }
+                    meerkat_contracts::EventReplayCursorError::AheadOfLatest {
+                        requested_sequence,
+                        latest_sequence,
+                    } => format!(
+                        "event replay cursor sequence {requested_sequence} is ahead of latest sequence {latest_sequence}"
+                    ),
+                    meerkat_contracts::EventReplayCursorError::SequenceOverflow => {
+                        "event replay cursor sequence overflow".to_string()
+                    }
+                },
+                data: None,
+            })?;
+        let session_id = params.scope.session_id().clone();
+        let stored = self
+            .service
+            .event_log_read_from(&session_id, from_seq)
+            .await
+            .map_err(session_error_to_rpc)?
+            .unwrap_or_default();
+        let limit = params.limit.unwrap_or(stored.len()).max(1);
+        let has_more = stored.len() > limit;
+        let events = stored
+            .into_iter()
+            .take(limit)
+            .map(|stored| {
+                meerkat_contracts::EventReplayEnvelope::session(
+                    session_id.clone(),
+                    stored.seq,
+                    stored.timestamp,
+                    stored.event,
+                )
+            })
+            .collect();
+        Ok(Some(meerkat_contracts::EventsListSinceResult {
+            contract_version: meerkat_contracts::ContractVersion::CURRENT,
+            scope: params.scope,
+            from_cursor,
+            latest_cursor: latest,
+            events,
+            has_more,
+        }))
+    }
+
+    /// Read a point-in-time session snapshot and its paired replay cursor.
+    pub async fn event_snapshot(
+        &self,
+        scope: meerkat_contracts::EventReplayScope,
+    ) -> Result<Option<meerkat_contracts::EventsSnapshotResult>, RpcError> {
+        let latest = match self.event_latest_cursor(scope.clone()).await? {
+            Some(cursor) => cursor,
+            None => return Ok(None),
+        };
+        let session = self
+            .read_session_rich(scope.session_id())
+            .await
+            .ok_or_else(|| RpcError {
+                code: error::SESSION_NOT_FOUND,
+                message: format!("Session not found: {}", scope.session_id()),
+                data: None,
+            })?;
+        Ok(Some(meerkat_contracts::EventsSnapshotResult {
+            contract_version: meerkat_contracts::ContractVersion::CURRENT,
+            scope,
+            cursor: latest,
+            snapshot: meerkat_contracts::EventsSnapshotBody::Session { session },
+        }))
+    }
+
     /// Read a session transcript as canonical wire history, including pending sessions.
     pub async fn read_session_history_rich(
         &self,
@@ -5291,6 +5460,79 @@ mod tests {
             meerkat::PersistenceBundle::new(store, Some(runtime_store), blob_store),
             crate::router::NotificationSink::noop(),
         )
+    }
+
+    fn approval_request() -> meerkat_core::ApprovalRequest {
+        meerkat_core::ApprovalRequest {
+            requester: meerkat_core::ApprovalPrincipalId::new("human:alice").expect("principal"),
+            owner: meerkat_core::ApprovalOwnerRef::Runtime,
+            resource: meerkat_core::ApprovalResourceRef {
+                kind: meerkat_core::ApprovalResourceKind::Runtime,
+                id: "local".to_string(),
+            },
+            proposed_action: meerkat_core::ApprovalProposedAction {
+                kind: meerkat_core::ApprovalActionKind::Other,
+                summary: "manual gate".to_string(),
+                body: None,
+            },
+            risk: meerkat_core::ApprovalRisk::Medium,
+            request_body: None,
+            allowed_decisions: std::collections::BTreeSet::from([
+                meerkat_core::ApprovalDecision::Approve,
+                meerkat_core::ApprovalDecision::Deny,
+            ]),
+            expires_at: None,
+            metadata: meerkat_core::SurfaceMetadata::default(),
+            request_provenance: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_service_reopens_from_realm_persistence_store_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_manifest, bundle) = meerkat::open_realm_persistence_in(
+            temp.path(),
+            "approval-realm",
+            Some(meerkat_store::RealmBackend::Sqlite),
+            None,
+        )
+        .await
+        .expect("open persistence");
+        let runtime = SessionRuntime::new(
+            AgentFactory::new(temp.path().join("agent-sessions-a")),
+            Config::default(),
+            10,
+            bundle,
+            crate::router::NotificationSink::noop(),
+        );
+        assert!(runtime.approval_service().is_persistent());
+        let record = runtime
+            .approval_service()
+            .request(approval_request())
+            .expect("request approval");
+
+        let (_manifest, reopened_bundle) = meerkat::open_realm_persistence_in(
+            temp.path(),
+            "approval-realm",
+            Some(meerkat_store::RealmBackend::Sqlite),
+            None,
+        )
+        .await
+        .expect("reopen persistence");
+        let reopened = SessionRuntime::new(
+            AgentFactory::new(temp.path().join("agent-sessions-b")),
+            Config::default(),
+            10,
+            reopened_bundle,
+            crate::router::NotificationSink::noop(),
+        );
+        assert!(reopened.approval_service().is_persistent());
+        let loaded = reopened
+            .approval_service()
+            .get(&record.approval_id)
+            .expect("load approval after runtime reconstruction");
+        assert_eq!(loaded.approval_id, record.approval_id);
+        assert_eq!(loaded.status, meerkat_core::ApprovalStatus::Pending);
     }
 
     fn self_hosted_test_config(server: &str, inline_video: bool) -> Config {

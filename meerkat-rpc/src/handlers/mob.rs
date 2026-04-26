@@ -316,6 +316,12 @@ pub async fn handle_spawn(
         Ok(m) => m,
         Err(resp) => return resp,
     };
+    if let Err(err) = meerkat::surface::validate_public_surface_metadata(
+        params.labels.as_ref(),
+        params.context.as_ref(),
+    ) {
+        return invalid_params(id, err);
+    }
     let mut spec = SpawnMemberSpec::new(params.profile.as_str(), params.agent_identity.as_str());
     spec.initial_message = params.initial_message;
     spec.runtime_mode = params.runtime_mode;
@@ -428,6 +434,12 @@ pub async fn handle_spawn_many(
 
     let mut specs = Vec::with_capacity(params.specs.len());
     for s in &params.specs {
+        if let Err(err) = meerkat::surface::validate_public_surface_metadata(
+            s.labels.as_ref(),
+            s.context.as_ref(),
+        ) {
+            return invalid_params(id, err);
+        }
         let mut spec = SpawnMemberSpec::new(s.profile.as_str(), s.agent_identity.as_str());
         spec.initial_message = s.initial_message.clone();
         spec.runtime_mode = s.runtime_mode;
@@ -709,6 +721,8 @@ pub struct MobAppendSystemContextParams {
 
 pub type MobMemberSendParams = meerkat_contracts::MobMemberSendParams;
 pub type MobMemberSendResult = meerkat_contracts::MobMemberSendResult;
+pub type MobIngressInteractionParams = meerkat_contracts::MobIngressInteractionParams;
+pub type MobIngressInteractionResult = meerkat_contracts::MobIngressInteractionResult;
 
 pub async fn handle_member_send(
     id: Option<RpcId>,
@@ -755,6 +769,89 @@ pub async fn handle_member_send(
         }
         Err(err) => invalid_params(id, err.to_string()),
     }
+}
+
+pub async fn handle_ingress_interaction(
+    id: Option<RpcId>,
+    params: Option<&RawValue>,
+    state: &Arc<MobMcpState>,
+) -> RpcResponse {
+    let params: MobIngressInteractionParams = match parse_params(params) {
+        Ok(p) => p,
+        Err(resp) => return resp.with_id(id),
+    };
+    let mob_id = match parse_mob_id(id.clone(), &params.mob_id) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    let spec = match spawn_spec_from_wire(&params.spec) {
+        Ok(spec) => spec,
+        Err(err) => return invalid_params(id, err),
+    };
+    let identity = spec.identity.clone();
+    let content = match ContentInput::try_from(params.content) {
+        Ok(content) => content,
+        Err(error) => return invalid_params(id, error),
+    };
+    let handle = match state.handle_for(&mob_id).await {
+        Ok(handle) => handle,
+        Err(err) => return invalid_params(id, err.to_string()),
+    };
+    let events_after_cursor = match handle.events().latest_cursor().await {
+        Ok(cursor) => cursor,
+        Err(err) => return invalid_params(id, err.to_string()),
+    };
+    let ensure_outcome = match handle.ensure_member(spec).await {
+        Ok(meerkat_mob::runtime::EnsureMemberOutcome::Spawned(spawn)) => {
+            meerkat_contracts::MobEnsureMemberOutcomeWire::Spawned(spawn_receipt_wire(
+                &mob_id, &spawn,
+            ))
+        }
+        Ok(meerkat_mob::runtime::EnsureMemberOutcome::Existed(entry)) => {
+            meerkat_contracts::MobEnsureMemberOutcomeWire::Existed(member_list_entry_wire(
+                &mob_id, &entry,
+            ))
+        }
+        Err(err) => return invalid_params(id, err.to_string()),
+    };
+    let member = match handle.member(&identity).await {
+        Ok(member) => member,
+        Err(err) => return invalid_params(id, err.to_string()),
+    };
+    let receipt = match member
+        .send_with_render_metadata(
+            content,
+            params.handling_mode.into(),
+            params.render_metadata.map(Into::into),
+        )
+        .await
+    {
+        Ok(receipt) => receipt,
+        Err(err) => return invalid_params(id, err.to_string()),
+    };
+    let latest_event_cursor = match handle.events().latest_cursor().await {
+        Ok(cursor) => cursor,
+        Err(err) => return invalid_params(id, err.to_string()),
+    };
+    let identity_str = receipt.identity.to_string();
+    let delivery = MobMemberSendResult {
+        mob_id: mob_id.to_string(),
+        agent_identity: identity_str.clone(),
+        member_ref: meerkat_contracts::WireMemberRef::encode(mob_id.as_str(), &identity_str),
+        handling_mode: receipt.handling_mode.into(),
+    };
+    RpcResponse::success(
+        id,
+        MobIngressInteractionResult {
+            mob_id: mob_id.to_string(),
+            agent_identity: identity_str.clone(),
+            member_ref: meerkat_contracts::WireMemberRef::encode(mob_id.as_str(), &identity_str),
+            ensure_outcome,
+            delivery,
+            events_after_cursor,
+            latest_event_cursor,
+        },
+    )
 }
 
 pub async fn handle_append_system_context(
@@ -808,6 +905,8 @@ pub struct MobEventsParams {
     pub after_cursor: u64,
     #[serde(default = "default_events_limit")]
     pub limit: usize,
+    #[serde(default)]
+    pub strict: bool,
 }
 
 const fn default_events_limit() -> usize {
@@ -823,14 +922,17 @@ pub async fn handle_events(
         Ok(p) => p,
         Err(resp) => return resp.with_id(id),
     };
-    match state
-        .mob_events(
-            &meerkat_mob::MobId::from(params.mob_id.as_str()),
-            params.after_cursor,
-            params.limit,
-        )
-        .await
-    {
+    let mob_id = meerkat_mob::MobId::from(params.mob_id.as_str());
+    let result = if params.strict {
+        state
+            .mob_events_strict(&mob_id, params.after_cursor, params.limit)
+            .await
+    } else {
+        state
+            .mob_events(&mob_id, params.after_cursor, params.limit)
+            .await
+    };
+    match result {
         Ok(events) => RpcResponse::success(id, serde_json::json!({ "events": events })),
         Err(err) => invalid_params(id, err.to_string()),
     }
@@ -1708,6 +1810,9 @@ pub async fn handle_mob_turn_start(
 fn spawn_spec_from_wire(
     spec_wire: &meerkat_contracts::MobMemberSpecWire,
 ) -> Result<SpawnMemberSpec, String> {
+    spec_wire
+        .validate_public_surface_metadata()
+        .map_err(|err| err.to_string())?;
     let mut spec = SpawnMemberSpec::new(
         spec_wire.profile.as_str(),
         spec_wire.agent_identity.as_str(),
@@ -1917,7 +2022,7 @@ pub async fn handle_list_members_matching(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::panic)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use meerkat_mob::{AgentIdentity, AgentRuntimeId, FenceToken};
@@ -2092,6 +2197,46 @@ mod tests {
         assert!(minimal_params.inherited_tool_filter.is_none());
         assert!(minimal_params.override_profile.is_none());
         assert!(minimal_params.connection_ref.is_none());
+    }
+
+    #[test]
+    fn mob_spawn_surface_metadata_rejects_reserved_labels() {
+        let value = serde_json::json!({
+            "mob_id": "m1",
+            "profile": "worker",
+            "agent_identity": "w1",
+            "labels": {
+                "meerkat.runtime_id": "spoof"
+            }
+        });
+        let params: MobSpawnParams = serde_json::from_value(value).unwrap();
+        let result = meerkat::surface::validate_public_surface_metadata(
+            params.labels.as_ref(),
+            params.context.as_ref(),
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("meerkat.runtime_id"));
+    }
+
+    #[test]
+    fn mob_member_wire_surface_metadata_rejects_reserved_app_context() {
+        let spec = meerkat_contracts::MobMemberSpecWire {
+            profile: "worker".into(),
+            agent_identity: "w1".into(),
+            initial_message: None,
+            runtime_mode: None,
+            backend: None,
+            binding: None,
+            context: Some(serde_json::json!({"meerkat.runtime_id": "spoof"})),
+            labels: None,
+            additional_instructions: None,
+            auto_wire_parent: None,
+        };
+
+        let result = spawn_spec_from_wire(&spec);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("meerkat.runtime_id"));
     }
 
     #[test]

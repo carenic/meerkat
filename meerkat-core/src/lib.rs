@@ -15,6 +15,8 @@ pub mod tokio {
 }
 
 pub mod agent;
+pub mod approval;
+pub mod artifact;
 pub mod auth;
 pub mod blob;
 pub mod budget;
@@ -48,6 +50,7 @@ pub mod ops;
 pub mod ops_lifecycle;
 pub mod peer_correlation;
 pub mod peer_meta;
+pub mod placement;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod prompt;
 pub mod provider;
@@ -64,6 +67,7 @@ pub mod session_store;
 pub mod skills;
 pub mod skills_config;
 pub mod state;
+pub mod surface_metadata;
 pub mod time_compat;
 pub mod tool_catalog;
 pub mod tool_scope;
@@ -77,6 +81,21 @@ pub use agent::{
     AgentToolDispatcher, BindOutcome, CommsCapabilityError, CommsRuntime, DispatcherCapabilities,
     ExternalToolUpdate, FilteredToolDispatcher, LlmStreamResult, select_tool_catalog_mode,
     should_compose_tool_catalog_control_plane,
+};
+pub use approval::{
+    ApprovalActionKind, ApprovalDecision, ApprovalDecisionRecord, ApprovalError, ApprovalId,
+    ApprovalListFilter, ApprovalOwnerRef, ApprovalPrincipalId, ApprovalProposedAction,
+    ApprovalRecord, ApprovalRequest, ApprovalResourceKind, ApprovalResourceRef, ApprovalRisk,
+    ApprovalService, ApprovalStatus, ApprovalStore, ApprovalStoreError, InMemoryApprovalStore,
+};
+pub use artifact::{
+    ArtifactContentHandle, ArtifactError, ArtifactHandle, ArtifactId, ArtifactListFilter,
+    ArtifactOwner, ArtifactPayload, ArtifactRecord, ArtifactStore, ArtifactType,
+};
+pub use auth::{
+    ActingOnBehalfOf, AuthGrant, GrantAction, GrantScope, PrincipalContractError, PrincipalId,
+    PrincipalKind, PrincipalRef, VisibilityClass, can_observe_visibility,
+    metadata_grants_no_visibility,
 };
 pub use blob::{BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError};
 pub use budget::{Budget, BudgetLimits, BudgetPool};
@@ -96,6 +115,12 @@ pub use peer_correlation::{
     InboundPeerRequestState, InteractionStreamState, OutboundPeerRequestState, PeerCorrelationId,
 };
 pub use peer_meta::PeerMeta;
+pub use placement::{ExecutionPlacement, ExecutionPlacementIdentity, PlacementError};
+pub use surface_metadata::{
+    MEERKAT_METADATA_PREFIX, RESERVED_MOB_LABEL_KEYS, RuntimeMetadata, SurfaceMetadata,
+    SurfaceMetadataError, is_reserved_meerkat_label_key, is_reserved_meerkat_metadata_key,
+    validate_public_app_context, validate_public_labels,
+};
 
 pub use completion_feed::{
     CompletionBatch, CompletionEnrichmentData, CompletionEnrichmentProvider, CompletionEntry,

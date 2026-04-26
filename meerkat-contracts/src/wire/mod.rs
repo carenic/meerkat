@@ -1,8 +1,12 @@
 //! Canonical wire response types.
 
+mod approval;
+mod artifact;
+mod auth;
 mod comms;
 mod connection;
 mod event;
+mod host;
 mod mcp_live;
 mod mob;
 mod models;
@@ -16,6 +20,12 @@ pub mod skills;
 pub mod supervisor_bridge;
 mod usage;
 
+pub use approval::{
+    ApprovalActionKind, ApprovalDecideParams, ApprovalDecision, ApprovalDecisionRecord,
+    ApprovalGetParams, ApprovalId, ApprovalListFilter, ApprovalListParams, ApprovalListResult,
+    ApprovalOwnerRef, ApprovalPrincipalId, ApprovalProposedAction, ApprovalRecord, ApprovalRequest,
+    ApprovalRequestParams, ApprovalResourceKind, ApprovalResourceRef, ApprovalRisk, ApprovalStatus,
+};
 pub use comms::{
     CommsCommandError, CommsCommandRequest, HandlingMode as WireCommsHandlingMode,
     InputSource as WireCommsInputSource, InputStreamMode as WireCommsInputStreamMode,
@@ -28,7 +38,25 @@ pub use connection::{
     WireLoginStart, WireProviderBinding, WireRealmConnectionSet, WireRealmList, WireRealmSummary,
 };
 
-pub use event::WireEvent;
+pub use artifact::{
+    ArtifactDownloadParams, ArtifactDownloadResult, ArtifactIdParams, ArtifactListParams,
+    ArtifactListResult,
+};
+pub use auth::{
+    ActingOnBehalfOf, AuthGrant, GrantAction, GrantScope, PrincipalId, PrincipalKind, PrincipalRef,
+    VisibilityClass,
+};
+pub use event::{
+    EventReplayCursor, EventReplayCursorError, EventReplayEnvelope, EventReplayEventId,
+    EventReplayScope, EventsLatestCursorParams, EventsLatestCursorResult, EventsListSinceParams,
+    EventsListSinceResult, EventsSnapshotBody, EventsSnapshotParams, EventsSnapshotResult,
+    WireEvent,
+};
+pub use host::{
+    RuntimeHostCapabilities, RuntimeHostEndpointProjection, RuntimeHostFeatureFlags,
+    RuntimeHostHealth, RuntimeHostHealthStatus, RuntimeHostIdScope, RuntimeHostInfo,
+    RuntimeHostRealmProjection,
+};
 pub use mcp_live::{
     McpAddParams, McpLiveOpResponse, McpLiveOpStatus, McpLiveOperation, McpReloadParams,
     McpRemoveParams,
@@ -39,20 +67,20 @@ pub use mob::{
     MobDependencyModeInput, MobDispatchModeInput, MobEnsureMemberOutcomeWire,
     MobEnsureMemberParams, MobEnsureMemberResult, MobEventRouterConfigInput,
     MobExternalBackendConfigInput, MobFlowNodeInput, MobFlowSpecInput, MobFlowStepInput,
-    MobFrameSpecInput, MobFrameStepInput, MobLifecycleParams, MobLimitsSpecInput,
-    MobListMembersMatchingParams, MobListMembersMatchingResult, MobMcpServerConfigInput,
-    MobMemberFilterWire, MobMemberListEntryWire, MobMemberSendParams, MobMemberSendResult,
-    MobMemberSpecWire, MobOrchestratorInput, MobPeerTarget, MobPolicyModeInput,
-    MobProfileBindingInput, MobProfileInput, MobReconcileFailureWire, MobReconcileOptionsWire,
-    MobReconcileParams, MobReconcileReportWire, MobReconcileResult, MobRepeatUntilInput,
-    MobRoleWiringRuleInput, MobSkillSourceInput, MobSpawnPolicyInput, MobSpawnReceiptWire,
-    MobStepOutputFormatInput, MobSubmitWorkParams, MobSubmitWorkResult, MobSupervisorSpecInput,
-    MobToolConfigInput, MobTopologyRuleInput, MobTopologySpecInput, MobUnwireParams,
-    MobUnwireResult, MobWireParams, MobWireResult, MobWiringRulesInput, WireAgentRuntimeId,
-    WireHandlingMode, WireMemberRef, WireMemberRefError, WireMemberState, WireMobBackendKind,
-    WireMobLifecycleAction, WireMobMemberStatus, WireMobRuntimeMode, WireRenderClass,
-    WireRenderMetadata, WireRenderSalience, WireRuntimeBinding, WireTrustedPeerSpec,
-    WireWorkOrigin,
+    MobFrameSpecInput, MobFrameStepInput, MobIngressInteractionParams, MobIngressInteractionResult,
+    MobLifecycleParams, MobLimitsSpecInput, MobListMembersMatchingParams,
+    MobListMembersMatchingResult, MobMcpServerConfigInput, MobMemberFilterWire,
+    MobMemberListEntryWire, MobMemberSendParams, MobMemberSendResult, MobMemberSpecWire,
+    MobOrchestratorInput, MobPeerTarget, MobPolicyModeInput, MobProfileBindingInput,
+    MobProfileInput, MobReconcileFailureWire, MobReconcileOptionsWire, MobReconcileParams,
+    MobReconcileReportWire, MobReconcileResult, MobRepeatUntilInput, MobRoleWiringRuleInput,
+    MobSkillSourceInput, MobSpawnPolicyInput, MobSpawnReceiptWire, MobStepOutputFormatInput,
+    MobSubmitWorkParams, MobSubmitWorkResult, MobSupervisorSpecInput, MobToolConfigInput,
+    MobTopologyRuleInput, MobTopologySpecInput, MobUnwireParams, MobUnwireResult, MobWireParams,
+    MobWireResult, MobWiringRulesInput, WireAgentRuntimeId, WireHandlingMode, WireMemberRef,
+    WireMemberRefError, WireMemberState, WireMobBackendKind, WireMobLifecycleAction,
+    WireMobMemberStatus, WireMobRuntimeMode, WireRenderClass, WireRenderMetadata,
+    WireRenderSalience, WireRuntimeBinding, WireTrustedPeerSpec, WireWorkOrigin,
 };
 pub use models::{
     CatalogModelEntry, ModelsCatalogResponse, ProviderCatalog, WireModelBetaHeader,

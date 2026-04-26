@@ -46,9 +46,16 @@ pub use schedule_host::{
 #[cfg(not(target_arch = "wasm32"))]
 pub use stdio_json::{StdioJsonWriter, spawn_stdio_json_writer};
 
-use meerkat_contracts::{CapabilitiesResponse, CapabilityEntry, ContractVersion};
+use meerkat_contracts::{
+    CapabilitiesResponse, CapabilityEntry, ContractVersion, RuntimeHostCapabilities,
+    RuntimeHostEndpointProjection, RuntimeHostFeatureFlags, RuntimeHostHealth,
+    RuntimeHostHealthStatus, RuntimeHostIdScope, RuntimeHostInfo, RuntimeHostRealmProjection,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use meerkat_core::ConfigStoreMetadata;
 use meerkat_core::{AgentEvent, Config, PeerMeta};
 
+use std::collections::BTreeMap;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::mpsc;
 #[cfg(target_arch = "wasm32")]
@@ -66,6 +73,194 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 #[cfg(feature = "mcp")]
 use std::sync::{Mutex, OnceLock};
+
+/// Surface-specific facts used to build a read-only runtime host projection.
+#[derive(Debug, Clone)]
+pub struct RuntimeHostSurfaceOptions {
+    pub process_name: String,
+    pub process_version: String,
+    pub runtime_backed_sessions: bool,
+    pub mobs: bool,
+    pub mcp_live: bool,
+    pub comms: bool,
+    pub blobs: bool,
+    pub artifacts: bool,
+    pub session_events: bool,
+    pub event_replay: bool,
+    pub session_streams: bool,
+    pub schedules: bool,
+    pub skills: bool,
+    pub approvals: bool,
+    pub rpc_transport: Option<String>,
+    pub rest_base_url: Option<String>,
+    pub rpc_methods: Vec<String>,
+    pub rest_paths: Vec<String>,
+}
+
+/// Config-store facts needed for runtime host projection.
+///
+/// This keeps the public surface helper independent of native-only config-store
+/// types so browser/WASM builds can still construct host projections.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeHostMetadataProjection {
+    pub realm_id: Option<String>,
+    pub instance_id: Option<String>,
+    pub backend: Option<String>,
+    pub state_root: Option<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<&ConfigStoreMetadata> for RuntimeHostMetadataProjection {
+    fn from(metadata: &ConfigStoreMetadata) -> Self {
+        Self {
+            realm_id: metadata.realm_id.clone(),
+            instance_id: metadata.instance_id.clone(),
+            backend: metadata.backend.clone(),
+            state_root: metadata
+                .resolved_paths
+                .as_ref()
+                .map(|paths| paths.root.clone()),
+        }
+    }
+}
+
+impl RuntimeHostSurfaceOptions {
+    /// Build a process-local default for callers that do not own a richer
+    /// transport context.
+    pub fn process(process_name: impl Into<String>, process_version: impl Into<String>) -> Self {
+        Self {
+            process_name: process_name.into(),
+            process_version: process_version.into(),
+            runtime_backed_sessions: false,
+            mobs: false,
+            mcp_live: false,
+            comms: false,
+            blobs: false,
+            artifacts: false,
+            session_events: false,
+            event_replay: false,
+            session_streams: false,
+            schedules: false,
+            skills: false,
+            approvals: false,
+            rpc_transport: None,
+            rest_base_url: None,
+            rpc_methods: Vec::new(),
+            rest_paths: Vec::new(),
+        }
+    }
+}
+
+fn runtime_host_id(
+    metadata: Option<&RuntimeHostMetadataProjection>,
+) -> (String, RuntimeHostIdScope) {
+    if let Some(metadata) = metadata
+        && let (Some(realm_id), Some(instance_id)) =
+            (metadata.realm_id.as_ref(), metadata.instance_id.as_ref())
+    {
+        return (
+            format!("realm-instance:{realm_id}:{instance_id}"),
+            RuntimeHostIdScope::RealmInstance,
+        );
+    }
+
+    (
+        format!("process:{}", runtime_host_process_id()),
+        RuntimeHostIdScope::Process,
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn runtime_host_process_id() -> u32 {
+    std::process::id()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn runtime_host_process_id() -> u32 {
+    0
+}
+
+fn runtime_host_realm_projection(
+    metadata: Option<&RuntimeHostMetadataProjection>,
+    context_root: Option<std::path::PathBuf>,
+) -> RuntimeHostRealmProjection {
+    let mut projection = RuntimeHostRealmProjection::default();
+    if let Some(metadata) = metadata {
+        projection.realm_id = metadata.realm_id.clone();
+        projection.instance_id = metadata.instance_id.clone();
+        projection.backend = metadata.backend.clone();
+        projection.state_root = metadata.state_root.clone();
+    }
+    projection.context_root = context_root.map(|path| path.display().to_string());
+    projection
+}
+
+/// Build read-only capability flags for the runtime host surface.
+pub fn build_runtime_host_capabilities(
+    options: &RuntimeHostSurfaceOptions,
+) -> RuntimeHostCapabilities {
+    RuntimeHostCapabilities {
+        contract_version: ContractVersion::CURRENT,
+        features: RuntimeHostFeatureFlags {
+            runtime_backed_sessions: options.runtime_backed_sessions,
+            mobs: options.mobs,
+            mcp_live: options.mcp_live,
+            comms: options.comms,
+            blobs: options.blobs,
+            session_events: options.session_events,
+            session_streams: options.session_streams,
+            schedules: options.schedules,
+            skills: options.skills,
+            event_replay: options.event_replay,
+            artifacts: options.artifacts,
+            // First slice: these future surfaces are deliberately reported as
+            // unsupported until their owning lanes add durable contracts.
+            approvals: options.approvals,
+            external_members: false,
+            secure_remote_rpc: false,
+        },
+    }
+}
+
+/// Build a read-only runtime health projection.
+pub fn build_runtime_host_health() -> RuntimeHostHealth {
+    RuntimeHostHealth {
+        contract_version: ContractVersion::CURRENT,
+        status: RuntimeHostHealthStatus::Ok,
+        checks: BTreeMap::new(),
+    }
+}
+
+/// Build host information from existing surface/runtime facts.
+///
+/// This projection intentionally does not expose topology, lease, project, or
+/// host-registry authority. Callers can rebuild it from the config-store
+/// metadata and surface options.
+pub fn build_runtime_host_info(
+    options: &RuntimeHostSurfaceOptions,
+    metadata: Option<&RuntimeHostMetadataProjection>,
+    context_root: Option<std::path::PathBuf>,
+) -> RuntimeHostInfo {
+    let (host_id, host_id_scope) = runtime_host_id(metadata);
+    RuntimeHostInfo {
+        contract_version: ContractVersion::CURRENT,
+        host_id,
+        host_id_scope,
+        process_name: options.process_name.clone(),
+        process_version: options.process_version.clone(),
+        capabilities: build_runtime_host_capabilities(options),
+        health: build_runtime_host_health(),
+        realm: runtime_host_realm_projection(metadata, context_root),
+        endpoints: RuntimeHostEndpointProjection {
+            rpc_transport: options.rpc_transport.clone(),
+            rest_base_url: options.rest_base_url.clone(),
+            rpc_methods: options.rpc_methods.clone(),
+            rest_paths: options.rest_paths.clone(),
+        },
+        placement_labels: BTreeMap::new(),
+        policy_profile_summary: None,
+    }
+}
 
 /// Build a [`CapabilitiesResponse`] with status resolved against config.
 ///
@@ -178,8 +373,6 @@ pub fn resolve_keep_alive(requested: bool) -> Result<bool, String> {
     }
 }
 
-const RESERVED_MOB_PEER_META_LABELS: [&str; 3] = ["mob_id", "role", "meerkat_id"];
-
 /// Reject public `PeerMeta` labels that are reserved for mob-managed sessions.
 ///
 /// Mob runtime code stamps these labels internally when provisioning members.
@@ -201,19 +394,18 @@ pub fn validate_public_peer_meta(peer_meta: Option<&PeerMeta>) -> Result<(), Str
 pub fn validate_raw_labels(
     labels: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<(), String> {
-    let Some(labels) = labels else {
-        return Ok(());
-    };
+    meerkat_core::validate_public_labels(labels).map_err(|err| err.to_string())
+}
 
-    for &label in &RESERVED_MOB_PEER_META_LABELS {
-        if labels.contains_key(label) {
-            return Err(format!(
-                "peer_meta label '{label}' is reserved for mob-managed sessions"
-            ));
-        }
-    }
-
-    Ok(())
+/// Reject caller-owned surface metadata that attempts to set Meerkat-owned
+/// labels or top-level app-context keys.
+pub fn validate_public_surface_metadata(
+    labels: Option<&std::collections::BTreeMap<String, String>>,
+    app_context: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    let metadata =
+        meerkat_core::SurfaceMetadata::from_optional_parts(labels.cloned(), app_context.cloned());
+    metadata.validate_public().map_err(|err| err.to_string())
 }
 
 /// List all skills with provenance and shadow information.
@@ -458,7 +650,7 @@ mod tests {
         let Err(err) = result else {
             unreachable!("asserted reserved labels are rejected above");
         };
-        assert!(err.contains("mob-managed sessions"));
+        assert!(err.contains("reserved"));
         assert!(err.contains("mob_id"));
     }
 
@@ -470,6 +662,18 @@ mod tests {
             result.is_ok(),
             "ordinary peer metadata should stay available"
         );
+    }
+
+    #[test]
+    fn validate_public_surface_metadata_rejects_reserved_app_context_keys() {
+        let app_context = serde_json::json!({
+            "meerkat.runtime_id": "spoof",
+            "client_ref": "ok"
+        });
+        let result = validate_public_surface_metadata(None, Some(&app_context));
+
+        assert!(result.is_err(), "reserved app_context keys must fail");
+        assert!(result.unwrap_err().contains("meerkat.runtime_id"));
     }
 
     #[test]

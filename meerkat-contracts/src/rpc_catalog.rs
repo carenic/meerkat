@@ -106,6 +106,45 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
         RpcMethodDescriptor::basic("config/patch", "Merge-patch config"),
         RpcMethodDescriptor::basic("capabilities/get", "Get runtime capabilities"),
         RpcMethodDescriptor::result_only(
+            "runtime/host_info",
+            "Get read-only runtime host information",
+            "RuntimeHostInfo",
+        ),
+        RpcMethodDescriptor::result_only(
+            "runtime/capabilities",
+            "Get runtime host capability flags",
+            "RuntimeHostCapabilities",
+        ),
+        RpcMethodDescriptor::result_only(
+            "runtime/health",
+            "Get runtime host health",
+            "RuntimeHostHealth",
+        ),
+        RpcMethodDescriptor::typed(
+            "approval/request",
+            "Create a durable approval request",
+            "ApprovalRequestParams",
+            "ApprovalRecord",
+        ),
+        RpcMethodDescriptor::typed(
+            "approval/list",
+            "List durable approval requests",
+            "ApprovalListParams",
+            "ApprovalListResult",
+        ),
+        RpcMethodDescriptor::typed(
+            "approval/get",
+            "Get one durable approval request",
+            "ApprovalGetParams",
+            "ApprovalRecord",
+        ),
+        RpcMethodDescriptor::typed(
+            "approval/decide",
+            "Record a durable approval decision",
+            "ApprovalDecideParams",
+            "ApprovalRecord",
+        ),
+        RpcMethodDescriptor::result_only(
             "models/catalog",
             "Get the effective model catalog (built-in plus config-backed entries)",
             "ModelsCatalogResponse",
@@ -142,12 +181,32 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
     ];
 
     if options.blob_enabled {
-        methods.push(RpcMethodDescriptor::typed(
-            "blob/get",
-            "Fetch raw blob payload metadata and bytes by blob id",
-            "BlobGetParams",
-            "BlobPayload",
-        ));
+        methods.extend([
+            RpcMethodDescriptor::typed(
+                "blob/get",
+                "Fetch raw blob payload metadata and bytes by blob id",
+                "BlobGetParams",
+                "BlobPayload",
+            ),
+            RpcMethodDescriptor::typed(
+                "artifact/list",
+                "List stable artifact records",
+                "ArtifactListParams",
+                "ArtifactListResult",
+            ),
+            RpcMethodDescriptor::typed(
+                "artifact/get",
+                "Get one stable artifact record",
+                "ArtifactIdParams",
+                "ArtifactRecord",
+            ),
+            RpcMethodDescriptor::typed(
+                "artifact/download",
+                "Download blob-backed artifact payload bytes",
+                "ArtifactDownloadParams",
+                "ArtifactDownloadResult",
+            ),
+        ]);
     }
 
     if options.session_events_enabled {
@@ -167,6 +226,24 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
             RpcMethodDescriptor::basic(
                 "session/inject_context",
                 "Stage runtime system context for application at the next LLM boundary",
+            ),
+            RpcMethodDescriptor::typed(
+                "events/latest_cursor",
+                "Read the latest replay cursor for an event source",
+                "EventsLatestCursorParams",
+                "EventsLatestCursorResult",
+            ),
+            RpcMethodDescriptor::typed(
+                "events/list_since",
+                "List replayable events after a cursor",
+                "EventsListSinceParams",
+                "EventsListSinceResult",
+            ),
+            RpcMethodDescriptor::typed(
+                "events/snapshot",
+                "Read a point-in-time snapshot anchor for an event source",
+                "EventsSnapshotParams",
+                "EventsSnapshotResult",
             ),
         ]);
     }
@@ -337,6 +414,12 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
                 "MobMemberSendParams",
                 "MobMemberSendResult",
             ),
+            RpcMethodDescriptor::typed(
+                "mob/ingress_interaction",
+                "Ensure an ingress member, then deliver user input with a replay cursor receipt",
+                "MobIngressInteractionParams",
+                "MobIngressInteractionResult",
+            ),
             RpcMethodDescriptor::basic(
                 "mob/append_system_context",
                 "Append system context for a mob member",
@@ -506,6 +589,16 @@ mod tests {
     fn documented_surface_keeps_live_runtime_and_mob_methods() {
         let methods = rpc_method_names(RpcMethodCatalogOptions::documented_surface());
         assert!(methods.iter().any(|m| m == "session/inject_context"));
+        assert!(methods.iter().any(|m| m == "runtime/host_info"));
+        assert!(methods.iter().any(|m| m == "runtime/capabilities"));
+        assert!(methods.iter().any(|m| m == "runtime/health"));
+        assert!(methods.iter().any(|m| m == "events/latest_cursor"));
+        assert!(methods.iter().any(|m| m == "events/list_since"));
+        assert!(methods.iter().any(|m| m == "events/snapshot"));
+        assert!(methods.iter().any(|m| m == "approval/request"));
+        assert!(methods.iter().any(|m| m == "approval/list"));
+        assert!(methods.iter().any(|m| m == "approval/get"));
+        assert!(methods.iter().any(|m| m == "approval/decide"));
         assert!(
             methods
                 .iter()

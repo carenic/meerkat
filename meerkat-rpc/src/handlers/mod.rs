@@ -2,6 +2,7 @@
 //!
 //! Each sub-module handles a group of JSON-RPC methods.
 
+pub mod approval;
 pub mod auth;
 pub mod capabilities;
 #[cfg(feature = "comms")]
@@ -16,6 +17,7 @@ pub mod mob;
 pub mod models;
 pub mod realtime;
 pub mod runtime;
+pub mod runtime_host;
 pub mod schedule;
 pub mod session;
 pub mod skills;

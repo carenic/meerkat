@@ -866,6 +866,14 @@ fn validate_public_peer_meta(peer_meta: Option<&meerkat_core::PeerMeta>) -> Resu
     meerkat::surface::validate_public_peer_meta(peer_meta).map_err(ApiError::BadRequest)
 }
 
+fn validate_public_surface_metadata(
+    labels: Option<&BTreeMap<String, String>>,
+    app_context: Option<&Value>,
+) -> Result<(), ApiError> {
+    meerkat::surface::validate_public_surface_metadata(labels, app_context)
+        .map_err(ApiError::BadRequest)
+}
+
 /// Create session request
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
@@ -1151,6 +1159,9 @@ pub fn router(state: AppState) -> Router {
         .route("/skills", get(list_skills))
         .route("/skills/{id}", get(inspect_skill))
         .route("/capabilities", get(get_capabilities))
+        .route("/runtime/host_info", get(get_runtime_host_info))
+        .route("/runtime/capabilities", get(get_runtime_capabilities))
+        .route("/runtime/health", get(get_runtime_health))
         .route("/models/catalog", get(get_models_catalog))
         .route("/realtime/status", post(realtime_status))
         .route("/realtime/capabilities", post(realtime_capabilities))
@@ -2347,6 +2358,60 @@ async fn get_capabilities(
     Json(meerkat::surface::build_capabilities_response(&config))
 }
 
+fn rest_runtime_host_surface_options(
+    state: &AppState,
+) -> meerkat::surface::RuntimeHostSurfaceOptions {
+    let mut options = meerkat::surface::RuntimeHostSurfaceOptions::process(
+        "meerkat-rest",
+        env!("CARGO_PKG_VERSION"),
+    );
+    options.runtime_backed_sessions = true;
+    options.mobs = cfg!(feature = "mob");
+    options.mcp_live = cfg!(feature = "mcp");
+    options.comms = cfg!(feature = "comms");
+    options.blobs = true;
+    // Artifact records currently have a JSON-RPC surface and may reference REST
+    // blob transport, but REST does not yet expose artifact/* routes.
+    options.artifacts = false;
+    options.session_events = true;
+    options.session_streams = true;
+    options.schedules = cfg!(feature = "schedule");
+    options.skills = true;
+    options.approvals = false;
+    options.rest_base_url = Some(format!("http://{}:{}", state.rest_host, state.rest_port));
+    options.rest_paths = meerkat_contracts::rest_path_catalog()
+        .into_iter()
+        .map(|path| path.path.to_string())
+        .collect();
+    options
+}
+
+async fn get_runtime_host_info(
+    State(state): State<AppState>,
+) -> Json<meerkat_contracts::RuntimeHostInfo> {
+    let options = rest_runtime_host_surface_options(&state);
+    let metadata = state.config_store.metadata();
+    let metadata = metadata
+        .as_ref()
+        .map(meerkat::surface::RuntimeHostMetadataProjection::from);
+    Json(meerkat::surface::build_runtime_host_info(
+        &options,
+        metadata.as_ref(),
+        state.context_root.clone(),
+    ))
+}
+
+async fn get_runtime_capabilities(
+    State(state): State<AppState>,
+) -> Json<meerkat_contracts::RuntimeHostCapabilities> {
+    let options = rest_runtime_host_surface_options(&state);
+    Json(meerkat::surface::build_runtime_host_capabilities(&options))
+}
+
+async fn get_runtime_health() -> Json<meerkat_contracts::RuntimeHostHealth> {
+    Json(meerkat::surface::build_runtime_host_health())
+}
+
 /// Get the effective model catalog for the current config.
 async fn get_models_catalog(
     State(state): State<AppState>,
@@ -2737,6 +2802,10 @@ async fn create_session_inner(
 ) -> RequestTerminal<Result<Json<SessionResponse>, ApiError>> {
     // --- Validation (pre-stateful work) ---
     if let Err(e) = validate_public_peer_meta(req.peer_meta.as_ref()) {
+        return RequestTerminal::RespondWithoutPublish(Err(e));
+    }
+    if let Err(e) = validate_public_surface_metadata(req.labels.as_ref(), req.app_context.as_ref())
+    {
         return RequestTerminal::RespondWithoutPublish(Err(e));
     }
     let keep_alive_override = match resolve_keep_alive(req.keep_alive) {
@@ -5030,10 +5099,24 @@ mod tests {
         assert!(
             payload["error"]
                 .as_str()
-                .is_some_and(|msg| msg.contains("mob-managed sessions")),
+                .is_some_and(|msg| msg.contains("reserved") && msg.contains("mob_id")),
             "reserved mob label rejection should explain the trust boundary: {}",
             String::from_utf8_lossy(&body)
         );
+    }
+
+    #[test]
+    fn test_create_session_request_rejects_reserved_surface_metadata_keys() {
+        let app_context = serde_json::json!({
+            "meerkat.runtime_id": "spoof"
+        });
+        let result = validate_public_surface_metadata(None, Some(&app_context));
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::BadRequest(message) => assert!(message.contains("meerkat.runtime_id")),
+            other => panic!("expected bad request, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -5103,7 +5186,7 @@ mod tests {
         assert!(
             payload["error"]
                 .as_str()
-                .is_some_and(|msg| msg.contains("mob-managed sessions")),
+                .is_some_and(|msg| msg.contains("reserved for Meerkat-owned runtime facts")),
             "reserved mob label rejection should explain the trust boundary: {}",
             String::from_utf8_lossy(&body)
         );
@@ -5369,6 +5452,75 @@ mod tests {
             serde_json::json!(["provider_managed"])
         );
         assert_eq!(payload["capabilities"]["video_supported"], false);
+    }
+
+    #[tokio::test]
+    async fn test_runtime_host_routes_report_read_only_projection() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let temp = TempDir::new().unwrap();
+        let state = AppState::load_from(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        let app = router(state);
+
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/runtime/host_info")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "runtime host info failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["process_name"], "meerkat-rest");
+        assert!(
+            payload["host_id"].as_str().unwrap().starts_with("process:")
+                || payload["host_id"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("realm-instance:")
+        );
+        assert!(
+            matches!(
+                payload["host_id_scope"].as_str(),
+                Some("process" | "realm_instance")
+            ),
+            "unexpected host id scope: {payload}"
+        );
+        assert_eq!(
+            payload["capabilities"]["features"]["runtime_backed_sessions"],
+            true
+        );
+        assert_eq!(payload["capabilities"]["features"]["event_replay"], false);
+        assert_eq!(payload["capabilities"]["features"]["artifacts"], false);
+        assert_eq!(payload["capabilities"]["features"]["approvals"], false);
+
+        let text = serde_json::to_string(&payload).unwrap();
+        for forbidden in ["topology", "registry", "lease", "claim", "project"] {
+            assert!(
+                !text.contains(forbidden),
+                "runtime host projection must not claim topology authority token `{forbidden}`: {text}"
+            );
+        }
+
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/runtime/health")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let health: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health["status"], "ok");
     }
 
     #[tokio::test]

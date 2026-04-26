@@ -713,6 +713,124 @@ impl MethodRouter {
         }
     }
 
+    #[cfg(not(feature = "mini-surface"))]
+    async fn handle_artifact_list(
+        &self,
+        id: Option<crate::protocol::RpcId>,
+        params: Option<&serde_json::value::RawValue>,
+    ) -> RpcResponse {
+        let params: meerkat_contracts::ArtifactListParams = match params {
+            Some(raw) => match serde_json::from_str(raw.get()) {
+                Ok(params) => params,
+                Err(err) => {
+                    return RpcResponse::error(
+                        id,
+                        error::INVALID_PARAMS,
+                        format!("Invalid params: {err}"),
+                    );
+                }
+            },
+            None => meerkat_contracts::ArtifactListParams::default(),
+        };
+        match self
+            .runtime
+            .artifact_store()
+            .list(params.into_filter())
+            .await
+        {
+            Ok(artifacts) => {
+                RpcResponse::success(id, meerkat_contracts::ArtifactListResult { artifacts })
+            }
+            Err(err) => RpcResponse::error(id, error::INTERNAL_ERROR, err.to_string()),
+        }
+    }
+
+    #[cfg(not(feature = "mini-surface"))]
+    async fn handle_artifact_get(
+        &self,
+        id: Option<crate::protocol::RpcId>,
+        params: Option<&serde_json::value::RawValue>,
+    ) -> RpcResponse {
+        let params: meerkat_contracts::ArtifactIdParams = match handlers::parse_params(params) {
+            Ok(params) => params,
+            Err(response) => return response.with_id(id),
+        };
+        match self.runtime.artifact_store().get(&params.artifact_id).await {
+            Ok(record) => RpcResponse::success(id, record),
+            Err(meerkat_core::ArtifactError::NotFound(missing)) => RpcResponse::error(
+                id,
+                error::INVALID_PARAMS,
+                format!("artifact not found: {missing}"),
+            ),
+            Err(err) => RpcResponse::error(id, error::INTERNAL_ERROR, err.to_string()),
+        }
+    }
+
+    #[cfg(not(feature = "mini-surface"))]
+    async fn handle_artifact_download(
+        &self,
+        id: Option<crate::protocol::RpcId>,
+        params: Option<&serde_json::value::RawValue>,
+    ) -> RpcResponse {
+        let params: meerkat_contracts::ArtifactDownloadParams = match handlers::parse_params(params)
+        {
+            Ok(params) => params,
+            Err(response) => return response.with_id(id),
+        };
+        let record = match self.runtime.artifact_store().get(&params.artifact_id).await {
+            Ok(record) => record,
+            Err(meerkat_core::ArtifactError::NotFound(missing)) => {
+                return RpcResponse::error(
+                    id,
+                    error::INVALID_PARAMS,
+                    format!("artifact not found: {missing}"),
+                );
+            }
+            Err(err) => return RpcResponse::error(id, error::INTERNAL_ERROR, err.to_string()),
+        };
+        if let Some(expected) = params.expected_media_type.as_ref()
+            && expected != &record.media_type
+        {
+            return RpcResponse::error(
+                id,
+                error::INVALID_PARAMS,
+                format!(
+                    "artifact media type mismatch: expected {expected}, found {}",
+                    record.media_type
+                ),
+            );
+        }
+        let blob_ref = match &record.content_handle {
+            meerkat_core::ArtifactContentHandle::Blob(blob_ref) => blob_ref,
+            other => {
+                return RpcResponse::error(
+                    id,
+                    error::INVALID_PARAMS,
+                    meerkat_core::ArtifactError::UnsupportedContentHandle(other.opaque_id())
+                        .to_string(),
+                );
+            }
+        };
+        let blob_payload = match self.runtime.blob_store().get(&blob_ref.blob_id).await {
+            Ok(payload) => payload,
+            Err(meerkat_core::BlobStoreError::NotFound(_)) => {
+                return RpcResponse::error(
+                    id,
+                    error::INVALID_PARAMS,
+                    format!("artifact payload not found: {}", record.artifact_id),
+                );
+            }
+            Err(err) => return RpcResponse::error(id, error::INTERNAL_ERROR, err.to_string()),
+        };
+        match meerkat_core::ArtifactPayload::from_record_and_blob(&record, blob_payload) {
+            Ok(payload) => RpcResponse::success(
+                id,
+                meerkat_contracts::ArtifactDownloadResult { record, payload },
+            ),
+            Err(err) => RpcResponse::error(id, error::INVALID_PARAMS, err.to_string()),
+        }
+    }
+
     /// Create a new method router with an explicit mob state.
     ///
     /// The mob state is registered on the runtime. Also spawns schedule host
@@ -888,6 +1006,12 @@ impl MethodRouter {
             "session/history" => self.handle_session_history(id, params).await,
             #[cfg(not(feature = "mini-surface"))]
             "blob/get" => self.handle_blob_get(id, params).await,
+            #[cfg(not(feature = "mini-surface"))]
+            "artifact/list" => self.handle_artifact_list(id, params).await,
+            #[cfg(not(feature = "mini-surface"))]
+            "artifact/get" => self.handle_artifact_get(id, params).await,
+            #[cfg(not(feature = "mini-surface"))]
+            "artifact/download" => self.handle_artifact_download(id, params).await,
             "session/archive" => self.handle_session_archive(id, params).await,
             #[cfg(not(feature = "mini-surface"))]
             "session/external_event" => {
@@ -897,6 +1021,18 @@ impl MethodRouter {
             "session/peer_response_terminal" => {
                 handlers::event::handle_peer_response_terminal(id, params, self.runtime.clone())
                     .await
+            }
+            #[cfg(not(feature = "mini-surface"))]
+            "events/latest_cursor" => {
+                handlers::event::handle_events_latest_cursor(id, params, self.runtime.clone()).await
+            }
+            #[cfg(not(feature = "mini-surface"))]
+            "events/list_since" => {
+                handlers::event::handle_events_list_since(id, params, self.runtime.clone()).await
+            }
+            #[cfg(not(feature = "mini-surface"))]
+            "events/snapshot" => {
+                handlers::event::handle_events_snapshot(id, params, self.runtime.clone()).await
             }
             #[cfg(not(feature = "mini-surface"))]
             "session/inject_context" => self.handle_session_inject_context(id, params).await,
@@ -1016,6 +1152,10 @@ impl MethodRouter {
                 handlers::mob::handle_member_send(id, params, &self.mob_state).await
             }
             #[cfg(feature = "mob")]
+            "mob/ingress_interaction" => {
+                handlers::mob::handle_ingress_interaction(id, params, &self.mob_state).await
+            }
+            #[cfg(feature = "mob")]
             "mob/append_system_context" => {
                 handlers::mob::handle_append_system_context(
                     id,
@@ -1121,6 +1261,30 @@ impl MethodRouter {
             "capabilities/get" => {
                 let config = self.config_store.get().await.unwrap_or_default();
                 handlers::capabilities::handle_get(id, &config)
+            }
+            "runtime/host_info" => handlers::runtime_host::handle_info(
+                id,
+                &self.runtime,
+                &self.config_store,
+                self.runtime_adapter.runtime_mode() == meerkat_runtime::RuntimeMode::V9Compliant,
+            ),
+            "runtime/capabilities" => handlers::runtime_host::handle_capabilities(
+                id,
+                &self.runtime,
+                self.runtime_adapter.runtime_mode() == meerkat_runtime::RuntimeMode::V9Compliant,
+            ),
+            "runtime/health" => handlers::runtime_host::handle_health(id),
+            "approval/request" => {
+                handlers::approval::handle_request(id, params, self.runtime.clone()).await
+            }
+            "approval/list" => {
+                handlers::approval::handle_list(id, params, self.runtime.clone()).await
+            }
+            "approval/get" => {
+                handlers::approval::handle_get(id, params, self.runtime.clone()).await
+            }
+            "approval/decide" => {
+                handlers::approval::handle_decide(id, params, self.runtime.clone()).await
             }
             "models/catalog" => {
                 let config = self.config_store.get().await.unwrap_or_default();
@@ -2601,6 +2765,225 @@ mod tests {
         (router.with_runtime_adapter(runtime_adapter), notif_rx)
     }
 
+    #[tokio::test]
+    async fn runtime_host_info_reports_projection_without_topology_authority() {
+        let (router, _rx) = test_router_with_v9_runtime().await;
+        let response = router
+            .dispatch(RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "runtime/host_info".to_string(),
+                params: None,
+                id: Some(RpcId::Num(1)),
+            })
+            .await
+            .expect("response");
+        let value = serde_json::to_value(response).expect("response serializes");
+        let result = &value["result"];
+
+        assert!(
+            result["host_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("process:")),
+            "default host id should be process-scoped: {result}"
+        );
+        assert_eq!(result["host_id_scope"], "process");
+        assert_eq!(
+            result["capabilities"]["features"]["runtime_backed_sessions"],
+            true
+        );
+        assert_eq!(result["capabilities"]["features"]["event_replay"], false);
+
+        let text = serde_json::to_string(result).expect("result serializes");
+        for forbidden in ["topology", "registry", "lease", "claim", "project"] {
+            assert!(
+                !text.contains(forbidden),
+                "runtime host projection must not claim topology authority token `{forbidden}`: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_host_capabilities_and_health_are_read_only_projections() {
+        let (router, _rx) = test_router_with_v9_runtime().await;
+        let capabilities = router
+            .dispatch(RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "runtime/capabilities".to_string(),
+                params: None,
+                id: Some(RpcId::Num(1)),
+            })
+            .await
+            .expect("capabilities response");
+        let health = router
+            .dispatch(RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "runtime/health".to_string(),
+                params: None,
+                id: Some(RpcId::Num(2)),
+            })
+            .await
+            .expect("health response");
+
+        let capabilities = serde_json::to_value(capabilities).expect("serialize capabilities");
+        let health = serde_json::to_value(health).expect("serialize health");
+        assert_eq!(
+            capabilities["result"]["features"]["runtime_backed_sessions"],
+            true
+        );
+        assert_eq!(
+            capabilities["result"]["features"]["secure_remote_rpc"],
+            false
+        );
+        assert_eq!(capabilities["result"]["features"]["approvals"], false);
+        assert_eq!(health["result"]["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn approval_request_get_list_and_decide_round_trip() {
+        let (router, _rx) = test_router().await;
+        let request = make_request(
+            "approval/request",
+            serde_json::json!({
+                "requester": "human:alice",
+                "owner": {"owner_type": "session", "session_id": "session-1"},
+                "resource": {"kind": "shell_command", "id": "shell:rm"},
+                "proposed_action": {
+                    "kind": "shell_command",
+                    "summary": "run destructive shell command",
+                    "body": {"cmd": "rm -rf target/tmp"}
+                },
+                "risk": "high",
+                "request_body": {"why": "cleanup"},
+                "allowed_decisions": ["approve", "deny"],
+                "metadata": {
+                    "labels": {"client.thread_id": "thread-1"},
+                    "app_context": {"client_ref": "opaque"}
+                },
+                "request_provenance": {"tool_call_id": "call-1"}
+            }),
+        );
+
+        let created = router.dispatch(request).await.expect("response");
+        let created = result_value(&created);
+        let approval_id = created["approval_id"]
+            .as_str()
+            .expect("approval id")
+            .to_string();
+        assert_eq!(created["status"], "pending");
+        assert_eq!(created["request_provenance"]["tool_call_id"], "call-1");
+
+        let listed = router
+            .dispatch(make_request(
+                "approval/list",
+                serde_json::json!({"filter": {"status": "pending"}}),
+            ))
+            .await
+            .expect("list response");
+        let listed = result_value(&listed);
+        assert_eq!(listed["approvals"].as_array().expect("approvals").len(), 1);
+
+        let decided = router
+            .dispatch(make_request(
+                "approval/decide",
+                serde_json::json!({
+                    "approval_id": approval_id,
+                    "decision": "approve",
+                    "actor": "human:bob",
+                    "reason": "reviewed",
+                    "provenance": {"client": "mobile"}
+                }),
+            ))
+            .await
+            .expect("decide response");
+        let decided = result_value(&decided);
+        assert_eq!(decided["status"], "approved");
+        assert_eq!(decided["decision"]["actor"], "human:bob");
+        assert_eq!(decided["decision"]["provenance"]["client"], "mobile");
+        assert_eq!(decided["request_provenance"]["tool_call_id"], "call-1");
+
+        let fetched = router
+            .dispatch(make_request(
+                "approval/get",
+                serde_json::json!({"approval_id": decided["approval_id"]}),
+            ))
+            .await
+            .expect("get response");
+        let fetched = result_value(&fetched);
+        assert_eq!(fetched["status"], "approved");
+    }
+
+    #[tokio::test]
+    async fn approval_decide_rejects_duplicate_decisions() {
+        let (router, _rx) = test_router().await;
+        let created = router
+            .dispatch(make_request(
+                "approval/request",
+                serde_json::json!({
+                    "requester": "human:alice",
+                    "owner": {"owner_type": "runtime"},
+                    "resource": {"kind": "runtime", "id": "local"},
+                    "proposed_action": {"kind": "other", "summary": "manual gate"},
+                    "risk": "medium",
+                    "allowed_decisions": ["deny"]
+                }),
+            ))
+            .await
+            .expect("request response");
+        let approval_id = result_value(&created)["approval_id"]
+            .as_str()
+            .expect("approval id")
+            .to_string();
+
+        let first = router
+            .dispatch(make_request(
+                "approval/decide",
+                serde_json::json!({
+                    "approval_id": approval_id,
+                    "decision": "deny",
+                    "actor": "human:bob"
+                }),
+            ))
+            .await
+            .expect("first decision");
+        assert!(first.error.is_none());
+
+        let duplicate = router
+            .dispatch(make_request(
+                "approval/decide",
+                serde_json::json!({
+                    "approval_id": approval_id,
+                    "decision": "deny",
+                    "actor": "human:bob"
+                }),
+            ))
+            .await
+            .expect("duplicate decision");
+        assert_eq!(error_code(&duplicate), error::INVALID_PARAMS);
+        assert!(error_message(&duplicate).contains("already been decided"));
+    }
+
+    #[tokio::test]
+    async fn approval_request_rejects_reserved_metadata_spoofing() {
+        let (router, _rx) = test_router().await;
+        let response = router
+            .dispatch(make_request(
+                "approval/request",
+                serde_json::json!({
+                    "requester": "human:alice",
+                    "owner": {"owner_type": "runtime"},
+                    "resource": {"kind": "runtime", "id": "local"},
+                    "proposed_action": {"kind": "other", "summary": "manual gate"},
+                    "risk": "medium",
+                    "allowed_decisions": ["approve", "deny"],
+                    "metadata": {"labels": {"meerkat.approval_id": "spoof"}}
+                }),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(error_code(&response), error::INVALID_PARAMS);
+        assert!(error_message(&response).contains("reserved"));
+    }
+
     async fn test_router_with_v9_runtime_and_realtime_ws_host()
     -> (MethodRouter, mpsc::Receiver<RpcNotification>) {
         let (router, notif_rx) = test_router_with_v9_runtime().await;
@@ -2778,6 +3161,180 @@ mod tests {
         assert_eq!(result["blob_id"], blob_ref.blob_id.as_str());
         assert_eq!(result["media_type"], "image/png");
         assert_eq!(result["data"], "aGVsbG8=");
+    }
+
+    fn test_artifact_record(
+        artifact_id: &str,
+        blob_ref: meerkat_core::BlobRef,
+    ) -> meerkat_core::ArtifactRecord {
+        let mut record = meerkat_core::ArtifactRecord::new(
+            meerkat_core::ArtifactId::new(artifact_id).unwrap(),
+            meerkat_core::ArtifactType::Json,
+            "Report".to_string(),
+            "application/json".to_string(),
+            2,
+            Some("sha256:test-report".to_string()),
+            meerkat_core::ArtifactContentHandle::Blob(blob_ref),
+        )
+        .unwrap();
+        record.owner.session_id = Some("session-a".to_string());
+        record
+            .metadata
+            .labels
+            .insert("client.thread_id".to_string(), "thread-a".to_string());
+        record
+    }
+
+    async fn seed_test_artifact(router: &MethodRouter) -> meerkat_core::ArtifactRecord {
+        let blob_ref = router
+            .runtime
+            .blob_store()
+            .put_image("application/json", "e30=")
+            .await
+            .expect("blob stored");
+        let record = test_artifact_record("artifact-1", blob_ref);
+        router
+            .runtime
+            .artifact_store()
+            .put(record.clone())
+            .await
+            .expect("artifact stored");
+        record
+    }
+
+    #[tokio::test]
+    async fn artifact_list_and_get_return_stable_records() {
+        let (router, _rx) = test_router().await;
+        seed_test_artifact(&router).await;
+
+        let list_response = router
+            .dispatch(crate::protocol::RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(crate::protocol::RpcId::Num(1)),
+                method: "artifact/list".to_string(),
+                params: Some(
+                    serde_json::value::to_raw_value(&serde_json::json!({
+                        "session_id": "session-a",
+                        "label_equals": {"client.thread_id": "thread-a"}
+                    }))
+                    .expect("raw value"),
+                ),
+            })
+            .await
+            .expect("response");
+        assert!(
+            list_response.error.is_none(),
+            "artifact/list should succeed: {:?}",
+            list_response.error
+        );
+        let list_result: serde_json::Value =
+            serde_json::from_str(list_response.result.unwrap().get()).unwrap();
+        assert_eq!(list_result["artifacts"][0]["artifact_id"], "artifact-1");
+        assert!(!list_result.to_string().contains("/tmp"));
+        assert!(!list_result.to_string().contains("path"));
+
+        let get_response = router
+            .dispatch(crate::protocol::RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(crate::protocol::RpcId::Num(2)),
+                method: "artifact/get".to_string(),
+                params: Some(
+                    serde_json::value::to_raw_value(
+                        &serde_json::json!({ "artifact_id": "artifact-1" }),
+                    )
+                    .expect("raw value"),
+                ),
+            })
+            .await
+            .expect("response");
+        assert!(get_response.error.is_none(), "artifact/get should succeed");
+        let get_result: serde_json::Value =
+            serde_json::from_str(get_response.result.unwrap().get()).unwrap();
+        assert_eq!(get_result["artifact_id"], "artifact-1");
+    }
+
+    #[tokio::test]
+    async fn artifact_download_uses_artifact_id_and_blob_payload() {
+        let (router, _rx) = test_router().await;
+        seed_test_artifact(&router).await;
+
+        let response = router
+            .dispatch(crate::protocol::RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(crate::protocol::RpcId::Num(1)),
+                method: "artifact/download".to_string(),
+                params: Some(
+                    serde_json::value::to_raw_value(&serde_json::json!({
+                        "artifact_id": "artifact-1",
+                        "expected_media_type": "application/json"
+                    }))
+                    .expect("raw value"),
+                ),
+            })
+            .await
+            .expect("response");
+
+        assert!(
+            response.error.is_none(),
+            "artifact/download should succeed: {:?}",
+            response.error
+        );
+        let result: serde_json::Value =
+            serde_json::from_str(response.result.unwrap().get()).unwrap();
+        assert_eq!(result["record"]["artifact_id"], "artifact-1");
+        assert_eq!(result["payload"]["artifact_id"], "artifact-1");
+        assert_eq!(result["payload"]["media_type"], "application/json");
+        assert_eq!(result["payload"]["data"], "e30=");
+    }
+
+    #[tokio::test]
+    async fn artifact_get_missing_is_typed_error() {
+        let (router, _rx) = test_router().await;
+
+        let response = router
+            .dispatch(crate::protocol::RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(crate::protocol::RpcId::Num(1)),
+                method: "artifact/get".to_string(),
+                params: Some(
+                    serde_json::value::to_raw_value(
+                        &serde_json::json!({ "artifact_id": "missing" }),
+                    )
+                    .expect("raw value"),
+                ),
+            })
+            .await
+            .expect("response");
+
+        let err = response.error.expect("missing artifact should error");
+        assert_eq!(err.code, error::INVALID_PARAMS);
+        assert!(err.message.contains("artifact not found"));
+    }
+
+    #[tokio::test]
+    async fn artifact_download_rejects_media_type_mismatch() {
+        let (router, _rx) = test_router().await;
+        seed_test_artifact(&router).await;
+
+        let response = router
+            .dispatch(crate::protocol::RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(crate::protocol::RpcId::Num(1)),
+                method: "artifact/download".to_string(),
+                params: Some(
+                    serde_json::value::to_raw_value(&serde_json::json!({
+                        "artifact_id": "artifact-1",
+                        "expected_media_type": "text/plain"
+                    }))
+                    .expect("raw value"),
+                ),
+            })
+            .await
+            .expect("response");
+
+        let err = response.error.expect("mismatched media type should error");
+        assert_eq!(err.code, error::INVALID_PARAMS);
+        assert!(err.message.contains("media type mismatch"));
     }
 
     fn source_uuid(raw: &str) -> SourceUuid {
@@ -2963,6 +3520,10 @@ mod tests {
         assert!(method_names.contains(&"session/peer_response_terminal"));
         assert!(method_names.contains(&"session/inject_context"));
         assert!(method_names.contains(&"turn/start"));
+        assert!(method_names.contains(&"approval/request"));
+        assert!(method_names.contains(&"approval/list"));
+        assert!(method_names.contains(&"approval/get"));
+        assert!(method_names.contains(&"approval/decide"));
         assert!(
             !method_names.contains(&"session/destroy"),
             "generic session/destroy must not appear until it has member-aware mob semantics"
@@ -2975,6 +3536,7 @@ mod tests {
             assert!(method_names.contains(&"mob/force_cancel"));
             assert!(method_names.contains(&"mob/member_status"));
             assert!(method_names.contains(&"mob/member_send"));
+            assert!(method_names.contains(&"mob/ingress_interaction"));
             assert!(!method_names.contains(&"mob/tools"));
             assert!(!method_names.contains(&"mob/call"));
             assert!(method_names.contains(&"mob/stream_open"));
@@ -3268,6 +3830,176 @@ mod tests {
             "binding-era agent_runtime_id must not leak to app-facing mob/member_send"
         );
         assert_eq!(sent["handling_mode"], "queue");
+    }
+
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn mob_ingress_interaction_ensures_member_and_returns_replay_anchor() {
+        let (router, _notif_rx) = test_router().await;
+
+        let create_resp = router
+            .dispatch(make_request(
+                "mob/create",
+                serde_json::json!({
+                    "definition": {
+                        "id": "mob-ingress-interaction",
+                        "profiles": {
+                            "worker": {
+                                "model": "claude-sonnet-4-5",
+                                "external_addressable": true,
+                                "tools": { "comms": true }
+                            }
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        let mob_id = result_value(&create_resp)["mob_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let ingress_resp = router
+            .dispatch(make_request(
+                "mob/ingress_interaction",
+                serde_json::json!({
+                    "mob_id": mob_id,
+                    "spec": {
+                        "profile": "worker",
+                        "agent_identity": "ingress-1",
+                        "runtime_mode": "turn_driven"
+                    },
+                    "content": "Please acknowledge with INGRESS_OK."
+                }),
+            ))
+            .await
+            .unwrap();
+        let receipt = result_value(&ingress_resp);
+        assert_eq!(receipt["mob_id"], mob_id);
+        assert_eq!(receipt["agent_identity"], "ingress-1");
+        assert_eq!(receipt["delivery"]["agent_identity"], "ingress-1");
+        assert_eq!(receipt["delivery"]["handling_mode"], "queue");
+        assert!(
+            receipt["member_ref"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "ingress helper must return the opaque member_ref"
+        );
+        assert!(
+            receipt["ensure_outcome"].get("spawned").is_some(),
+            "first interaction should spawn the ingress member: {receipt}"
+        );
+        assert!(
+            receipt["events_after_cursor"].as_u64().is_some(),
+            "receipt must carry a replay anchor cursor"
+        );
+        assert!(
+            receipt["latest_event_cursor"].as_u64().is_some(),
+            "receipt must carry the post-delivery event cursor"
+        );
+        assert!(
+            receipt.get("agent_runtime_id").is_none(),
+            "binding-era agent_runtime_id must not leak from ingress helper"
+        );
+
+        let second_resp = router
+            .dispatch(make_request(
+                "mob/ingress_interaction",
+                serde_json::json!({
+                    "mob_id": mob_id,
+                    "spec": {
+                        "profile": "worker",
+                        "agent_identity": "ingress-1",
+                        "runtime_mode": "turn_driven"
+                    },
+                    "content": "Second interaction."
+                }),
+            ))
+            .await
+            .unwrap();
+        let second = result_value(&second_resp);
+        assert!(
+            second["ensure_outcome"].get("existed").is_some(),
+            "second interaction should reuse the ingress member: {second}"
+        );
+        assert_eq!(second["delivery"]["agent_identity"], "ingress-1");
+    }
+
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn mob_ingress_interaction_rejects_missing_mob() {
+        let (router, _notif_rx) = test_router().await;
+
+        let resp = router
+            .dispatch(make_request(
+                "mob/ingress_interaction",
+                serde_json::json!({
+                    "mob_id": "missing-mob",
+                    "spec": {
+                        "profile": "worker",
+                        "agent_identity": "ingress-missing",
+                        "runtime_mode": "turn_driven"
+                    },
+                    "content": "hello"
+                }),
+            ))
+            .await
+            .unwrap();
+        let err = resp.error.expect("missing mob should fail");
+        assert!(
+            err.message.contains("mob not found"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn mob_events_strict_rejects_stale_cursor() {
+        let (router, _notif_rx) = test_router().await;
+
+        let create_resp = router
+            .dispatch(make_request(
+                "mob/create",
+                serde_json::json!({
+                    "definition": {
+                        "id": "mob-events-strict",
+                        "profiles": {
+                            "worker": {
+                                "model": "claude-sonnet-4-5",
+                                "external_addressable": true,
+                                "tools": { "comms": true }
+                            }
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        let mob_id = result_value(&create_resp)["mob_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let resp = router
+            .dispatch(make_request(
+                "mob/events",
+                serde_json::json!({
+                    "mob_id": mob_id,
+                    "after_cursor": 999_999_u64,
+                    "limit": 10,
+                    "strict": true
+                }),
+            ))
+            .await
+            .unwrap();
+        let err = resp.error.expect("strict stale cursor should fail");
+        assert!(
+            err.message.contains("stale mob event cursor"),
+            "unexpected error: {}",
+            err.message
+        );
     }
 
     #[cfg(feature = "mob")]
@@ -4986,8 +5718,31 @@ mod tests {
         let resp = router.dispatch(req).await.unwrap();
         assert_eq!(error_code(&resp), error::INVALID_PARAMS);
         assert!(
-            error_message(&resp).contains("mob-managed sessions"),
+            error_message(&resp).contains("reserved for Meerkat-owned runtime facts"),
             "reserved mob label rejection should explain the trust boundary"
+        );
+    }
+
+    #[cfg(not(feature = "mini-surface"))]
+    #[tokio::test]
+    async fn events_latest_cursor_reports_unsupported_without_event_projection() {
+        let (router, _notif_rx) = test_router().await;
+        let req = make_request(
+            "events/latest_cursor",
+            serde_json::json!({
+                "scope": {
+                    "type": "session",
+                    "session_id": meerkat_core::SessionId::new().to_string()
+                }
+            }),
+        );
+
+        let resp = router.dispatch(req).await.unwrap();
+        assert_eq!(error_code(&resp), error::INVALID_REQUEST);
+        assert!(
+            error_message(&resp).contains("event replay is not enabled"),
+            "unsupported replay error should be explicit: {}",
+            error_message(&resp)
         );
     }
 
