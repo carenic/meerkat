@@ -392,7 +392,7 @@ if [[ -f "${lockfile}" ]] &&
 const fs = require("node:fs");
 const [lockfile, localVendor] = process.argv.slice(1);
 const original = fs.readFileSync(lockfile, "utf8");
-const next = original.replace(/\/[^"\\\n]*\/vendor\/oai-rt-rs/g, () => localVendor);
+const next = original.replace(/\/(?!\/)[^"\\\n/]+(?:\/[^"\\\n/]+)+\/vendor\/oai-rt-rs/g, () => localVendor);
 if (next !== original) fs.writeFileSync(lockfile, next);
 ' "${lockfile}" "${local_oai_vendor}"
   module_lock_args+=(--lockfile_mode=refresh)
