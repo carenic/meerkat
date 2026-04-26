@@ -252,8 +252,9 @@ profile so `cargo fast`, `cargo rct`, `cargo int`, and
 | Split fast workspace CI after lane change, first warm-root run | `51s` script wall |
 | Split fast workspace CI after lane change, warm | `4s` script wall |
 | Warm workspace CI after dispatch/test-speed hardening | `9s` script wall, `140` tests pass |
-| Exact BuildBuddy gate for `meerkat_machine` test edit | `32s` wall, `1` exact test + clippy |
-| Cargo `meerkat_machine` fast test binary after sleep removal | `0.246s` test runtime, `37` tests pass |
+| Exact BuildBuddy gate for `meerkat_machine` test edit | `21s` wall, `1` exact test + clippy combined |
+| Cargo agent gate for `meerkat_machine` test edit, tests only | `0.10s` Cargo work, `0.258s` nextest runtime, `37` tests pass |
+| Cargo agent gate for `meerkat_machine` test edit, clippy only | `0.20s` Cargo work |
 
 The first touch of a new local lane pays Bazel analysis and remote-cache
 materialization cost. Once warmed, the wall-clock floor is mostly the `bb`/Bazel
@@ -304,7 +305,9 @@ to roughly `4-6s` once those lanes were prepared.
 - To check the Cargo/default side of the lane contract, run
   `make rust-lane-doctor`. It verifies that `repo-cargo` keeps caches outside
   the checkout, `RUST_LANE_ID` creates distinct same-checkout target dirs, and
-  broad fast lanes still use the filtered nextest profile.
+  broad fast lanes still use the filtered nextest profile. It also guards the
+  Cargo agent gate's exact integration-test routing for direct `tests/*.rs`
+  edits.
 - To check whether a machine is ready for the optional BuildBuddy lanes, run
   `make buildbuddy-doctor`. It runs the Rust lane doctor first, then checks
   credentials, `bb`, Bazel config, selector health, and BuildBuddy lane
