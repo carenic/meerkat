@@ -876,7 +876,12 @@ fn run_result(session_id: SessionId, text: &str) -> RunResult {
 #[async_trait]
 impl SessionService for ContractSessionService {
     async fn create_session(&self, req: CreateSessionRequest) -> Result<RunResult, SessionError> {
-        let session_id = SessionId::new();
+        let session_id = req
+            .build
+            .as_ref()
+            .and_then(|build| build.resume_session.as_ref())
+            .map(|session| session.id().clone())
+            .unwrap_or_default();
         let comms_name = req
             .build
             .as_ref()
