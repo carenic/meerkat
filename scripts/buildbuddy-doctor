@@ -178,6 +178,7 @@ else
 fi
 
 if grep -Fq '/vendor/oai-rt-rs' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'original.replace' scripts/buildbuddy-bazel-poc &&
   grep -Fq -- '--lockfile_mode=refresh' scripts/buildbuddy-bazel-poc; then
   pass "BuildBuddy launcher refreshes stale local path dependency locks"
 else

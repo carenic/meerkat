@@ -192,8 +192,9 @@ metadata after the cache is warm.
 Because the workspace currently vendors `oai-rt-rs` as a Cargo path dependency,
 `MODULE.bazel.lock` can contain an absolute checkout path after lockfile
 generation. `scripts/buildbuddy-bazel-poc` detects when that path belongs to a
-different worktree or CI checkout and passes `--lockfile_mode=refresh` so Bazel
-re-resolves the local crate before analysis.
+different worktree or CI checkout, rewrites just that vendored path to the
+current checkout, and passes `--lockfile_mode=refresh` so Bazel re-resolves the
+local crate before analysis.
 
 Generated `rust_test` targets only carry `:package_runfiles` when their source
 appears to read package/workspace files at runtime. This keeps ordinary tests
