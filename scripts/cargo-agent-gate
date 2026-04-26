@@ -246,13 +246,17 @@ done
 
 test_flags=("${pkg_flags[@]}")
 exact_selector_package=""
+declare -A exact_selector_features=()
 declare -A exact_selector_tests=()
-exact_selector_output="$(./scripts/cargo-exact-tests.mjs "${relevant[@]}" 2>/dev/null || true)"
+exact_selector_output="$(./scripts/cargo-exact-tests.mjs --include-non-fast "${relevant[@]}" 2>/dev/null || true)"
 if [[ -n "${exact_selector_output}" ]]; then
   while IFS= read -r line; do
     case "${line}" in
       package=*)
         exact_selector_package="${line#package=}"
+        ;;
+      feature=*)
+        exact_selector_features["${line#feature=}"]=1
         ;;
       test=*)
         exact_selector_tests["${line#test=}"]=1
@@ -263,6 +267,10 @@ fi
 
 if [[ -n "${exact_selector_package}" && "${#sorted_packages[@]}" -eq 1 && "${#exact_selector_tests[@]}" -gt 0 ]]; then
   test_flags=("-p" "${exact_selector_package}")
+  if [[ "${#exact_selector_features[@]}" -gt 0 ]]; then
+    mapfile -t sorted_exact_features < <(printf '%s\n' "${!exact_selector_features[@]}" | sort)
+    test_flags+=("--features" "$(IFS=,; printf '%s' "${sorted_exact_features[*]}")")
+  fi
   mapfile -t sorted_exact_tests < <(printf '%s\n' "${!exact_selector_tests[@]}" | sort)
   for test_name in "${sorted_exact_tests[@]}"; do
     test_flags+=("--test" "${test_name}")
@@ -275,7 +283,11 @@ clippy_flags=("${pkg_flags[@]}")
 clippy_target_args=("--all-targets" "--all-features")
 if [[ "${#sorted_exact_tests[@]}" -gt 0 ]]; then
   clippy_flags=("${test_flags[@]}")
-  clippy_target_args=("--all-features")
+  if [[ "${#exact_selector_features[@]}" -gt 0 ]]; then
+    clippy_target_args=()
+  else
+    clippy_target_args=("--all-features")
+  fi
 fi
 
 printf 'Cargo agent gate packages:\n'
@@ -289,7 +301,9 @@ if [[ "${dry_run}" -eq 1 ]]; then
   if [[ "${run_clippy}" -eq 1 ]]; then
     printf 'DRY-RUN %s clippy' "$CARGO"
     printf ' %q' "${clippy_flags[@]}"
-    printf ' %q' "${clippy_target_args[@]}"
+    if [[ "${#clippy_target_args[@]}" -gt 0 ]]; then
+      printf ' %q' "${clippy_target_args[@]}"
+    fi
     printf ' -- -D warnings\n'
   fi
   if [[ "${run_tests}" -eq 1 ]]; then

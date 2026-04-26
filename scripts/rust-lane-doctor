@@ -164,6 +164,16 @@ else
   printf '%s\n' "${support_test_probe}" >&2
 fi
 
+required_feature_test_probe="$(./scripts/cargo-agent-gate --dry-run --working-tree meerkat-cli/tests/cli_mobpack_live_smoke.rs 2>&1 || true)"
+if grep -q 'Cargo agent gate exact tests:' <<<"${required_feature_test_probe}" &&
+  grep -q -- '--features integration-real-tests' <<<"${required_feature_test_probe}" &&
+  grep -q -- '--test cli_mobpack_live_smoke' <<<"${required_feature_test_probe}"; then
+  pass "cargo-agent-gate narrows required-feature test edits to exact test binaries"
+else
+  bad "cargo-agent-gate did not select exact required-feature test binaries"
+  printf '%s\n' "${required_feature_test_probe}" >&2
+fi
+
 if [[ -n "$(git status --short)" ]]; then
   note "working tree has local changes; doctor did not modify them"
 else
