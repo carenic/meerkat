@@ -126,6 +126,14 @@ else
   bad "CI or BuildBuddy workflow is missing a stable repo-cargo CARGO_HOME"
 fi
 
+selector_selftest_output="$(./scripts/rust-selector-selftest.mjs 2>&1 || true)"
+if grep -q '^rust selector selftest ok$' <<<"${selector_selftest_output}"; then
+  pass "Rust selector module parser selftest passes"
+else
+  bad "Rust selector module parser selftest failed"
+  printf '%s\n' "${selector_selftest_output}" >&2
+fi
+
 agent_gate_probe="$(./scripts/agent-gate --dry-run --working-tree meerkat-runtime/src/input_ledger.rs 2>&1 || true)"
 if [[ -x scripts/agent-gate ]] &&
   grep -q 'Cargo agent gate packages:' <<<"${agent_gate_probe}" &&

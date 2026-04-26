@@ -129,6 +129,27 @@ export function isFastTest(pkg, target) {
   );
 }
 
+export function moduleReferences(source) {
+  const refs = [];
+  let pendingPath = null;
+  for (const line of source.split(/\r?\n/)) {
+    const pathMatch = line.match(/#[ \t]*\[[ \t]*path[ \t]*=[ \t]*"([^"]+)"[ \t]*\]/);
+    if (pathMatch) pendingPath = pathMatch[1];
+
+    const modMatch = line.match(/(?:^|\s)(?:pub(?:\([^)]*\))?[ \t]+)?mod[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*;/);
+    const modName = modMatch?.[1];
+    if (!modName) continue;
+
+    if (pendingPath) {
+      refs.push({ path: pendingPath });
+      pendingPath = null;
+    } else {
+      refs.push({ name: modName });
+    }
+  }
+  return refs;
+}
+
 export function testSourcePaths(target, pkg) {
   const packageRoot = dirname(pkg.manifest_path);
   const seen = new Set();
@@ -143,24 +164,14 @@ export function testSourcePaths(target, pkg) {
     paths.add(rel);
 
     const source = readFileSync(file, "utf8");
-    const lineRe = /#[ \t]*\[[ \t]*path[ \t]*=[ \t]*"([^"]+)"[ \t]*\][ \t]*|(?:^|\n)[ \t]*(?:pub[ \t]+)?mod[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*;/g;
-    let pendingPath = null;
-    for (const match of source.matchAll(lineRe)) {
-      if (match[1]) {
-        pendingPath = match[1];
+    for (const ref of moduleReferences(source)) {
+      if (ref.path) {
+        visit(resolve(dirname(file), ref.path));
         continue;
       }
 
-      const modName = match[2];
-      if (!modName) continue;
-      if (pendingPath) {
-        visit(resolve(dirname(file), pendingPath));
-        pendingPath = null;
-        continue;
-      }
-
-      const flat = resolve(dirname(file), `${modName}.rs`);
-      const nested = resolve(dirname(file), modName, "mod.rs");
+      const flat = resolve(dirname(file), `${ref.name}.rs`);
+      const nested = resolve(dirname(file), ref.name, "mod.rs");
       try {
         if (statSync(flat).isFile()) {
           visit(flat);
