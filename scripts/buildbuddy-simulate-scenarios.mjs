@@ -18,6 +18,8 @@ Scenarios:
   support-file       Run exact selectors for a shared integration-test support file.
   changed-clippy     Run changed-scope clippy lanes for source and support edits.
   changed-gate       Run the combined changed-path test+clippy gate.
+  agent-gate         Run the auto-detected agent changed-path gate for a source path.
+  agent-gate-global  Run the auto-detected agent gate escalation for global config.
   source-gate        Run the combined changed-path build+clippy gate.
   parallel-gates     Run two same-worktree changed gates in parallel.
   parallel-gates-auto
@@ -232,6 +234,28 @@ async function changedGate(root) {
     "./scripts/buildbuddy-changed-gate",
     ["--owned", "meerkat/tests/support/test_session_store.rs"],
     { cwd: root, env: { RUST_LANE_ID: "scenario-changed-gate" }, label: "buildbuddy-changed-gate support" },
+  );
+  printResult(result);
+  return result.code;
+}
+
+async function agentGate(root) {
+  console.log("\n== agent-gate ==");
+  const result = await run(
+    "./scripts/buildbuddy-agent-gate",
+    ["--owned", "meerkat-runtime/src/input_ledger.rs"],
+    { cwd: root, env: { RUST_LANE_ID: "scenario-agent-gate" }, label: "buildbuddy-agent-gate source" },
+  );
+  printResult(result);
+  return result.code;
+}
+
+async function agentGateGlobal(root) {
+  console.log("\n== agent-gate-global ==");
+  const result = await run(
+    "./scripts/buildbuddy-agent-gate",
+    [".cargo/config.toml"],
+    { cwd: root, env: { RUST_LANE_ID: "scenario-agent-gate-global" }, label: "buildbuddy-agent-gate global" },
   );
   printResult(result);
   return result.code;
@@ -543,6 +567,8 @@ const scenarios = requested.length === 0 || requested.includes("all")
       "support-file",
       "changed-clippy",
       "changed-gate",
+      "agent-gate",
+      "agent-gate-global",
       "source-gate",
       "parallel-gates",
       "parallel-gates-auto",
@@ -568,6 +594,8 @@ const runners = new Map([
   ["support-file", supportFile],
   ["changed-clippy", changedClippy],
   ["changed-gate", changedGate],
+  ["agent-gate", agentGate],
+  ["agent-gate-global", agentGateGlobal],
   ["source-gate", sourceGate],
   ["parallel-gates", parallelGates],
   ["parallel-gates-auto", parallelGatesAuto],

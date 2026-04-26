@@ -48,6 +48,9 @@ Use `scripts/buildbuddy-bazel-poc` with `BUILDBUDDY_BAZEL_COMMAND`:
 - `affected-fast-test <path>`: run fast suites for the reverse-dependency closure.
 - `fast-test`: run the root `//:fast_tests` suite.
 - `clippy`: run the rules_rust clippy aspect with `-D warnings`.
+- `make buildbuddy-agent-gate`: derive build-relevant changed files from the
+  current branch and working tree, then run the changed-path gate. Global
+  Cargo/Bazel/nextest configuration changes escalate to `make buildbuddy-ci-warm`.
 
 For local-spawn variants, append `-local` to the command name where available.
 Remote execution remains the default because local-spawn often spends time
@@ -105,6 +108,10 @@ modes:
 - `changed-clippy`: changed-scope clippy for representative source and shared
   support-file edits.
 - `changed-gate`: combined changed-path test and clippy gate.
+- `agent-gate`: auto-detected changed-path agent gate for a representative
+  source edit.
+- `agent-gate-global`: auto-detected global-change escalation to the warmed
+  workspace gate.
 - `source-gate`: combined changed-path build and clippy gate for a source edit
   with no owning fast tests.
 - `parallel-gates`: two same-worktree agents running changed-path gates in
@@ -203,6 +210,8 @@ profile so `cargo fast`, `cargo rct`, `cargo int`, and
 | Changed support gate, combined exact tests + exact clippy, warm | `3.85-3.856s` script wall |
 | Changed source gate, combined owning build + clippy, first touch | `16.97-17.16s` script wall |
 | Changed source gate, combined owning build + clippy, warm | `3.79-3.927s` script wall |
+| Agent gate, owned source path (`meerkat-runtime/src/input_ledger.rs`) | `23s` wall, selected `24` tests / clippy |
+| Agent gate, global BuildBuddy/Makefile edit escalation | `39s` warmed workspace wall after script edits |
 | Two same-worktree changed gates, combined first touch | `24.91s` / `25.10s` wall |
 | Two same-worktree changed gates, combined warm | `4.47s` / `4.63s` wall |
 | Two same-worktree changed gates, auto fallback lanes | `28.37s` / `28.59s` wall |
@@ -256,6 +265,10 @@ to roughly `4-6s` once those lanes were prepared.
   one second for the representative shared support-file case.
 - For a normal post-edit agent gate, use `scripts/buildbuddy-changed-gate
   --owned <path>`; it overlaps the selected fast tests and selected clippy.
+- For the common multi-agent case where the agent has local edits and just
+  needs the right check, use `make buildbuddy-agent-gate`. It includes
+  committed branch changes, staged changes, unstaged changes, and untracked
+  build-relevant files.
 - For deeper shared crates, use `affected-*` when you need reverse-dependency
   confidence, and expect broad closures for high-fanout crates.
 - For an opt-in BuildBuddy fast test pass, run `make buildbuddy-fast`.
