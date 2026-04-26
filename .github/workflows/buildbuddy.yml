@@ -82,7 +82,10 @@ jobs:
           MEERKAT_BUILDBUDDY_BASE: ${{ inputs.base }}
           MEERKAT_BUILDBUDDY_CHANGED_PATHS: ${{ inputs.paths }}
           MEERKAT_BUILDBUDDY_LOG_ROOT: ${{ runner.temp }}/buildbuddy-logs
-        run: scripts/buildbuddy-ci-dispatch
+        run: |
+          set -o pipefail
+          mkdir -p "${MEERKAT_BUILDBUDDY_LOG_ROOT}"
+          scripts/buildbuddy-ci-dispatch 2>&1 | tee "${MEERKAT_BUILDBUDDY_LOG_ROOT}/dispatch.log"
 
       - name: Upload BuildBuddy logs
         if: always()
