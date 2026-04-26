@@ -162,6 +162,7 @@ rust_test(
     tags = [
         "fast",
     ],
+    size = "small",
     data = [
         "//meerkat:package_runfiles",
     ],

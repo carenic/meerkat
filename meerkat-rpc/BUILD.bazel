@@ -429,6 +429,7 @@ rust_test(
     tags = [
         "fast",
     ],
+    size = "small",
     data = [
         "//meerkat-rpc:rkat_rpc_bin",
         "//meerkat-rpc:rkat_rpc_mini_bin",
@@ -502,6 +503,7 @@ rust_test(
     tags = [
         "fast",
     ],
+    size = "small",
     data = [
         "//meerkat-rpc:rkat_rpc_bin",
         "//meerkat-rpc:rkat_rpc_mini_bin",
@@ -575,6 +577,7 @@ rust_test(
     tags = [
         "fast",
     ],
+    size = "small",
     data = [
         "//meerkat-rpc:rkat_rpc_bin",
         "//meerkat-rpc:rkat_rpc_mini_bin",
@@ -648,6 +651,7 @@ rust_test(
     tags = [
         "fast",
     ],
+    size = "small",
     data = [
         "//meerkat-rpc:rkat_rpc_bin",
         "//meerkat-rpc:rkat_rpc_mini_bin",

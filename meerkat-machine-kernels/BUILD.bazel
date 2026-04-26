@@ -86,6 +86,7 @@ rust_test(
     tags = [
         "fast",
     ],
+    size = "small",
     data = [],
     env = {
         "RUST_MIN_STACK": "16777216",

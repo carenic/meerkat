@@ -132,6 +132,7 @@ rust_test(
     tags = [
         "fast",
     ],
+    size = "small",
     data = [
         ":package_runfiles",
     ],

@@ -179,6 +179,7 @@ rust_test(
     tags = [
         "fast",
     ],
+    size = "small",
     data = [
         ":package_runfiles",
         "//:workspace_cargo_manifests",
@@ -343,6 +344,7 @@ rust_test(
     tags = [
         "fast",
     ],
+    size = "small",
     data = [
         ":package_runfiles",
         "//:workspace_cargo_manifests",
@@ -508,6 +510,7 @@ rust_test(
     tags = [
         "fast",
     ],
+    size = "small",
     data = [
         ":package_runfiles",
         "//:workspace_cargo_manifests",
@@ -589,6 +592,7 @@ rust_test(
     tags = [
         "fast",
     ],
+    size = "small",
     data = [
         ":package_runfiles",
         "//:workspace_cargo_manifests",

@@ -553,6 +553,9 @@ for (const pkg of localPackages.values()) {
       }
       const env = [`        "RUST_MIN_STACK": "16777216",`];
       attrs.splice(attrs.length - 1, 0, `    tags = ${listExpr([...new Set(tags)].sort())},`);
+      if (tags.includes("fast")) {
+        attrs.splice(attrs.length - 1, 0, `    size = "small",`);
+      }
       if (usesTrybuild) {
         data.push("//:workspace_runfiles");
         data.push("@rules_rust//rust/toolchain:current_cargo_files");

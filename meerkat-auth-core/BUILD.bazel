@@ -91,6 +91,7 @@ rust_test(
     tags = [
         "fast",
     ],
+    size = "small",
     data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
@@ -144,6 +145,7 @@ rust_test(
     tags = [
         "fast",
     ],
+    size = "small",
     data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
@@ -197,6 +199,7 @@ rust_test(
     tags = [
         "fast",
     ],
+    size = "small",
     data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
@@ -250,6 +253,7 @@ rust_test(
     tags = [
         "fast",
     ],
+    size = "small",
     data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
@@ -303,6 +307,7 @@ rust_test(
     tags = [
         "fast",
     ],
+    size = "small",
     data = [
         ":package_runfiles",
     ],
@@ -358,6 +363,7 @@ rust_test(
     tags = [
         "fast",
     ],
+    size = "small",
     data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
@@ -411,6 +417,7 @@ rust_test(
     tags = [
         "fast",
     ],
+    size = "small",
     data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
