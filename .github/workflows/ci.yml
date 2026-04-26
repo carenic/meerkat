@@ -19,16 +19,23 @@ env:
 
 jobs:
   buildbuddy-optional:
-    name: Optional BuildBuddy gate
+    name: Optional BuildBuddy CI
     if: ${{ vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     uses: ./.github/workflows/buildbuddy.yml
     with:
-      mode: ${{ vars.MEERKAT_BUILDBUDDY_CI_MODE || 'changed-committed' }}
+      mode: ${{ vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
       changed_mode: ${{ vars.MEERKAT_BUILDBUDDY_CHANGED_MODE || 'owned' }}
       base: ${{ vars.MEERKAT_BUILDBUDDY_BASE || 'origin/main' }}
       paths: ${{ vars.MEERKAT_BUILDBUDDY_CHANGED_PATHS || '' }}
     secrets:
       BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      RKAT_ANTHROPIC_API_KEY: ${{ secrets.RKAT_ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      RKAT_OPENAI_API_KEY: ${{ secrets.RKAT_OPENAI_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      RKAT_GEMINI_API_KEY: ${{ secrets.RKAT_GEMINI_API_KEY }}
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
 
   fmt-lint:
     name: Format, lint, and static checks
@@ -509,7 +516,7 @@ jobs:
   gate:
     name: CI gate
     if: always()
-    needs: [fmt-lint, sdk-suites, machine-authority, test-unit, integration-fast, e2e-fast, test-minimal, test-feature-matrix-lib, test-feature-matrix-surface-checks, wasm-check, wasm-contract-tests, rmat-audit, seam-inventory, audit]
+    needs: [fmt-lint, sdk-suites, rust-release-packaging, machine-authority, test-unit, integration-fast, e2e-fast, e2e-system, e2e-live, e2e-smoke, test-minimal, test-feature-matrix-lib, test-feature-matrix-surface-checks, wasm-check, wasm-contract-tests, rmat-audit, seam-inventory, audit]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
@@ -518,10 +525,14 @@ jobs:
           for job in \
             fmt-lint \
             sdk-suites \
+            rust-release-packaging \
             machine-authority \
             test-unit \
             integration-fast \
             e2e-fast \
+            e2e-system \
+            e2e-live \
+            e2e-smoke \
             test-minimal \
             test-feature-matrix-lib \
             test-feature-matrix-surface-checks \
@@ -534,10 +545,14 @@ jobs:
             case "$job" in
               fmt-lint) result="${{ needs.fmt-lint.result }}" ;;
               sdk-suites) result="${{ needs.sdk-suites.result }}" ;;
+              rust-release-packaging) result="${{ needs.rust-release-packaging.result }}" ;;
               machine-authority) result="${{ needs.machine-authority.result }}" ;;
               test-unit) result="${{ needs.test-unit.result }}" ;;
               integration-fast) result="${{ needs.integration-fast.result }}" ;;
               e2e-fast) result="${{ needs.e2e-fast.result }}" ;;
+              e2e-system) result="${{ needs.e2e-system.result }}" ;;
+              e2e-live) result="${{ needs.e2e-live.result }}" ;;
+              e2e-smoke) result="${{ needs.e2e-smoke.result }}" ;;
               test-minimal) result="${{ needs.test-minimal.result }}" ;;
               test-feature-matrix-lib) result="${{ needs.test-feature-matrix-lib.result }}" ;;
               test-feature-matrix-surface-checks) result="${{ needs.test-feature-matrix-surface-checks.result }}" ;;

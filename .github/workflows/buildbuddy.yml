@@ -6,7 +6,7 @@ on:
       mode:
         description: BuildBuddy gate to run
         required: false
-        default: changed-committed
+        default: full-fresh
         type: string
       changed_mode:
         description: Changed-path selector breadth
@@ -26,14 +26,30 @@ on:
     secrets:
       BUILDBUDDY_API_KEY:
         required: true
+      ANTHROPIC_API_KEY:
+        required: false
+      RKAT_ANTHROPIC_API_KEY:
+        required: false
+      OPENAI_API_KEY:
+        required: false
+      RKAT_OPENAI_API_KEY:
+        required: false
+      GEMINI_API_KEY:
+        required: false
+      RKAT_GEMINI_API_KEY:
+        required: false
+      GOOGLE_API_KEY:
+        required: false
   workflow_dispatch:
     inputs:
       mode:
         description: BuildBuddy gate to run
         required: true
-        default: workspace-fresh
+        default: full-fresh
         type: choice
         options:
+          - full-fresh
+          - full-warm
           - workspace-fresh
           - workspace-warm
           - e2e-system
@@ -69,6 +85,14 @@ jobs:
     runs-on: ubuntu-latest
     env:
       BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      RKAT_ANTHROPIC_API_KEY: ${{ secrets.RKAT_ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      RKAT_OPENAI_API_KEY: ${{ secrets.RKAT_OPENAI_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      RKAT_GEMINI_API_KEY: ${{ secrets.RKAT_GEMINI_API_KEY }}
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      MEERKAT_CLEAN_E2E_SCENARIO_TARGETS: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -78,13 +102,42 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: buildbuddy
 
       - name: Install nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest,wasm-pack,cargo-deny,cargo-machete
+
+      - name: Install TLC
+        run: |
+          mkdir -p $HOME/.local/lib $HOME/.local/bin
+          curl -sL -o $HOME/.local/lib/tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          printf '#!/bin/sh\njava -jar %s/tla2tools.jar "$@"\n' "$HOME/.local/lib" > $HOME/.local/bin/tlc
+          chmod +x $HOME/.local/bin/tlc
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Require BuildBuddy API key
         run: |

@@ -213,10 +213,35 @@ rm -rf "${dispatch_log_root}"
 
 if grep -Fq 'workflow_call:' .github/workflows/buildbuddy.yml &&
   grep -Fq 'uses: ./.github/workflows/buildbuddy.yml' .github/workflows/ci.yml &&
-  grep -Fq 'MEERKAT_BUILDBUDDY_CI' .github/workflows/ci.yml; then
+  grep -Fq 'MEERKAT_BUILDBUDDY_CI' .github/workflows/ci.yml &&
+  grep -Fq 'MEERKAT_BUILDBUDDY_CI_MODE' .github/workflows/ci.yml &&
+  grep -Fq 'full-fresh' .github/workflows/ci.yml; then
   pass "GitHub CI wires the optional BuildBuddy workflow behind an opt-in variable"
 else
   bad "GitHub CI is missing the optional reusable BuildBuddy workflow wiring"
+fi
+
+if grep -Fq 'full-fresh' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'scripts/buildbuddy-ci-full --fresh' scripts/buildbuddy-ci-dispatch &&
+  grep -Fq 'buildbuddy-ci-full:' Makefile &&
+  grep -Fq 'buildbuddy-ci-workspace' scripts/buildbuddy-ci-full &&
+  grep -Fq 'make lint' scripts/buildbuddy-ci-full &&
+  grep -Fq 'cargo-deny check' scripts/buildbuddy-ci-full &&
+  grep -Fq 'e2e-live' scripts/buildbuddy-ci-full &&
+  grep -Fq 'wasm-pack test --headless --chrome' scripts/buildbuddy-ci-full; then
+  pass "BuildBuddy workflow has a full-CI mode covering native and compatibility lanes"
+else
+  bad "BuildBuddy workflow is missing the full-CI mode coverage"
+fi
+
+if grep -Fq 'rust-release-packaging' .github/workflows/ci.yml &&
+  grep -Fq 'e2e-system' .github/workflows/ci.yml &&
+  grep -Fq 'e2e-live' .github/workflows/ci.yml &&
+  grep -Fq 'e2e-smoke' .github/workflows/ci.yml &&
+  grep -Fq 'needs: [fmt-lint, sdk-suites, rust-release-packaging, machine-authority, test-unit, integration-fast, e2e-fast, e2e-system, e2e-live, e2e-smoke' .github/workflows/ci.yml; then
+  pass "Cargo CI gate depends on every Cargo CI lane"
+else
+  bad "Cargo CI gate does not depend on every Cargo CI lane"
 fi
 
 if grep -Fq 'name = "e2e_system_tests"' BUILD.bazel &&
