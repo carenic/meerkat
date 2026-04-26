@@ -2,6 +2,7 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
+import { testSourcePaths as sharedTestSourcePaths } from "./rust-test-selector.mjs";
 
 const root = execFileSync("git", ["rev-parse", "--show-toplevel"], {
   encoding: "utf8",
@@ -220,53 +221,10 @@ function rustSourceFiles(packageRoot, includeTests) {
   return files.sort();
 }
 
-function testSourcePaths(target, packageRoot) {
-  const seen = new Set();
-  const paths = new Set();
-
-  function visit(file) {
-    if (seen.has(file)) return;
-    seen.add(file);
-    if (!file.startsWith(`${packageRoot}/`)) return;
-    const rel = relative(packageRoot, file);
-    if (!rel || rel.startsWith("..")) return;
-    paths.add(rel);
-
-    const source = readFileSync(file, "utf8");
-    const lineRe = /#[ \t]*\[[ \t]*path[ \t]*=[ \t]*"([^"]+)"[ \t]*\][ \t]*|(?:^|\n)[ \t]*(?:pub[ \t]+)?mod[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*;/g;
-    let pendingPath = null;
-    for (const match of source.matchAll(lineRe)) {
-      if (match[1]) {
-        pendingPath = match[1];
-        continue;
-      }
-      const modName = match[2];
-      if (!modName) continue;
-      if (pendingPath) {
-        visit(resolve(dirname(file), pendingPath));
-        pendingPath = null;
-        continue;
-      }
-      const flat = resolve(dirname(file), `${modName}.rs`);
-      const nested = resolve(dirname(file), modName, "mod.rs");
-      try {
-        if (statSync(flat).isFile()) {
-          visit(flat);
-          continue;
-        }
-      } catch {
-        // Try nested module layout below.
-      }
-      try {
-        if (statSync(nested).isFile()) visit(nested);
-      } catch {
-        // Missing modules are reported by rustc during validation.
-      }
-    }
-  }
-
-  visit(target.src_path);
-  return [...paths].sort();
+function testSourcePaths(target, pkg, packageRoot) {
+  return [...sharedTestSourcePaths(target, pkg)]
+    .map((path) => relative(packageRoot, resolve(root, path)).replaceAll("\\", "/"))
+    .sort();
 }
 
 function compileData(target, packageRoot, includeTests) {
@@ -471,7 +429,7 @@ for (const pkg of localPackages.values()) {
       targetCompileData.labels.length ? ` + ${listExpr(targetCompileData.labels, 8)}` : ""
     }`;
     const srcsExpr = isTest
-      ? listExpr(testSourcePaths(target, dir), 8)
+      ? listExpr(testSourcePaths(target, pkg, dir), 8)
       : `glob(["src/**/*.rs"])`;
 
     const attrs = [
