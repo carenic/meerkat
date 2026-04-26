@@ -228,7 +228,11 @@ if grep -Fq 'full-fresh' .github/workflows/buildbuddy.yml &&
   grep -Fq 'Integration-fast lane (Bazel/RBE)' .github/workflows/buildbuddy.yml &&
   grep -Fq 'E2E system lane (Bazel/RBE)' .github/workflows/buildbuddy.yml &&
   grep -Fq 'SDK suites + parity gates (compat)' .github/workflows/buildbuddy.yml &&
-  grep -Fq 'scripts/buildbuddy-ci-lane' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'bb-unit-tests:' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'bb-e2e-smoke:' .github/workflows/buildbuddy.yml &&
+  ! grep -Fq 'strategy:' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'run-buildbuddy-ci-lane' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'scripts/buildbuddy-ci-lane' .github/actions/run-buildbuddy-ci-lane/action.yml &&
   grep -Fq 'workspace-unit-rbe' scripts/buildbuddy-bazel-poc &&
   grep -Fq 'workspace-integration-fast-rbe' scripts/buildbuddy-bazel-poc &&
   grep -Fq 'buildbuddy-ci-full:' Makefile &&

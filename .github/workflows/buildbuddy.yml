@@ -103,14 +103,21 @@ permissions:
 
 env:
   CARGO_HOME: /tmp/meerkat-cargo-home
+  BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  RKAT_ANTHROPIC_API_KEY: ${{ secrets.RKAT_ANTHROPIC_API_KEY }}
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  RKAT_OPENAI_API_KEY: ${{ secrets.RKAT_OPENAI_API_KEY }}
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+  RKAT_GEMINI_API_KEY: ${{ secrets.RKAT_GEMINI_API_KEY }}
+  GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+  MEERKAT_CLEAN_E2E_SCENARIO_TARGETS: "1"
 
 jobs:
   doctor:
     name: BuildBuddy doctor
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
-    env:
-      BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -125,144 +132,340 @@ jobs:
       - name: BuildBuddy doctor
         run: make buildbuddy-doctor
 
-  native:
-    name: ${{ matrix.label }}
-    needs: doctor
+  bb-build-clippy:
+    name: Build + clippy (Bazel/RBE)
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - lane: native-build-clippy
-            label: Build + clippy (Bazel/RBE)
-          - lane: native-unit-tests
-            label: Unit tests (Bazel/RBE)
-          - lane: native-integration-fast
-            label: Integration-fast lane (Bazel/RBE)
-          - lane: native-e2e-system
-            label: E2E system lane (Bazel/RBE)
-    env:
-      BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
-      MEERKAT_CLEAN_E2E_SCENARIO_TARGETS: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Setup BuildBuddy CI
-        uses: ./.github/actions/setup-buildbuddy-ci
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
         with:
+          lane: native-build-clippy
           profile: native
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
 
-      - name: Run ${{ matrix.label }}
-        env:
-          MEERKAT_BUILDBUDDY_CI_MODE: ${{ inputs.mode }}
-          MEERKAT_BUILDBUDDY_LOG_ROOT: ${{ runner.temp }}/buildbuddy-logs
-        run: |
-          mkdir -p "${MEERKAT_BUILDBUDDY_LOG_ROOT}"
-          export MEERKAT_BUILDBUDDY_CI_MODE="${MEERKAT_BUILDBUDDY_CI_MODE:-${{ vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}}"
-          scripts/buildbuddy-ci-lane "${{ matrix.lane }}"
-
-      - name: Upload BuildBuddy logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: buildbuddy-${{ matrix.lane }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/buildbuddy-logs
-          if-no-files-found: ignore
-
-  compatibility:
-    name: ${{ matrix.label }}
-    needs: doctor
+  bb-unit-tests:
+    name: Unit tests (Bazel/RBE)
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - lane: fmt-static
-            label: Format, lint, and static checks (compat)
-          - lane: cargo-all-features-clippy
-            label: Clippy all features (compat)
-          - lane: feature-clippy
-            label: Clippy feature matrix (compat)
-          - lane: unused-deps
-            label: Unused dependency audit (compat)
-          - lane: sdk-suites
-            label: SDK suites + parity gates (compat)
-          - lane: rust-release-packaging
-            label: Rust release packaging (compat)
-          - lane: machine-authority
-            label: Machine authority workflow (compat)
-          - lane: rmat-audit
-            label: RMAT audit + ownership ledger (compat)
-          - lane: seam-inventory
-            label: Seam inventory (strict) (compat)
-          - lane: wasm-contract
-            label: WASM contract tests (compat)
-          - lane: e2e-fast
-            label: E2E fast lane (compat)
-          - lane: e2e-live
-            label: E2E live lane (compat)
-          - lane: e2e-smoke
-            label: E2E smoke lane (compat)
-          - lane: minimal-feature-builds
-            label: Minimal feature builds (compat)
-          - lane: feature-matrix-lib
-            label: Feature matrix (library) (compat)
-          - lane: feature-matrix-surface
-            label: Feature matrix (surface checks) (compat)
-          - lane: wasm-check
-            label: WASM compilation check (compat)
-          - lane: security-audit
-            label: Security audit (compat)
-    env:
-      BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      RKAT_ANTHROPIC_API_KEY: ${{ secrets.RKAT_ANTHROPIC_API_KEY }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      RKAT_OPENAI_API_KEY: ${{ secrets.RKAT_OPENAI_API_KEY }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      RKAT_GEMINI_API_KEY: ${{ secrets.RKAT_GEMINI_API_KEY }}
-      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      MEERKAT_CLEAN_E2E_SCENARIO_TARGETS: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Setup BuildBuddy CI
-        uses: ./.github/actions/setup-buildbuddy-ci
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
         with:
+          lane: native-unit-tests
+          profile: native
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-integration-fast:
+    name: Integration-fast lane (Bazel/RBE)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: native-integration-fast
+          profile: native
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-e2e-system:
+    name: E2E system lane (Bazel/RBE)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: native-e2e-system
+          profile: native
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-fmt-static:
+    name: Format, lint, and static checks (compat)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps: &compat_lane_steps
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: fmt-static
           profile: full
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
 
-      - name: Run ${{ matrix.label }}
-        env:
-          MEERKAT_BUILDBUDDY_CI_MODE: ${{ inputs.mode }}
-          MEERKAT_BUILDBUDDY_LOG_ROOT: ${{ runner.temp }}/buildbuddy-logs
-        run: |
-          mkdir -p "${MEERKAT_BUILDBUDDY_LOG_ROOT}"
-          export MEERKAT_BUILDBUDDY_CI_MODE="${MEERKAT_BUILDBUDDY_CI_MODE:-${{ vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}}"
-          scripts/buildbuddy-ci-lane "${{ matrix.lane }}"
-
-      - name: Upload BuildBuddy logs
-        if: always()
-        uses: actions/upload-artifact@v4
+  bb-cargo-clippy:
+    name: Clippy all features (compat)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          name: buildbuddy-${{ matrix.lane }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/buildbuddy-logs
-          if-no-files-found: ignore
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: cargo-all-features-clippy
+          profile: full
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-feature-clippy:
+    name: Clippy feature matrix (compat)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: feature-clippy
+          profile: full
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-unused-deps:
+    name: Unused dependency audit (compat)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: unused-deps
+          profile: full
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-sdk-suites:
+    name: SDK suites + parity gates (compat)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: sdk-suites
+          profile: full
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-rust-release-packaging:
+    name: Rust release packaging (compat)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: rust-release-packaging
+          profile: full
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-machine-authority:
+    name: Machine authority workflow (compat)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: machine-authority
+          profile: full
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-rmat-audit:
+    name: RMAT audit + ownership ledger (compat)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: rmat-audit
+          profile: full
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-seam-inventory:
+    name: Seam inventory (strict) (compat)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: seam-inventory
+          profile: full
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-wasm-contract:
+    name: WASM contract tests (compat)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: wasm-contract
+          profile: full
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-e2e-fast:
+    name: E2E fast lane (compat)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: e2e-fast
+          profile: full
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-e2e-live:
+    name: E2E live lane (compat)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: e2e-live
+          profile: full
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-e2e-smoke:
+    name: E2E smoke lane (compat)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: e2e-smoke
+          profile: full
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-minimal-feature-builds:
+    name: Minimal feature builds (compat)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: minimal-feature-builds
+          profile: full
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-feature-matrix-lib:
+    name: Feature matrix (library) (compat)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: feature-matrix-lib
+          profile: full
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-feature-matrix-surface:
+    name: Feature matrix (surface checks) (compat)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: feature-matrix-surface
+          profile: full
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-wasm-check:
+    name: WASM compilation check (compat)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: wasm-check
+          profile: full
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+
+  bb-security-audit:
+    name: Security audit (compat)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: security-audit
+          profile: full
+          mode: ${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
 
   changed-gate:
     name: Changed-path gate (Bazel/RBE)
-    needs: doctor
     if: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.mode == 'changed-committed' || inputs.mode == 'changed-paths') }}
     runs-on: ubuntu-latest
-    env:
-      BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -296,15 +499,36 @@ jobs:
 
   gate:
     name: BuildBuddy CI gate
-    needs: [doctor, native, compatibility]
+    needs:
+      - doctor
+      - bb-build-clippy
+      - bb-unit-tests
+      - bb-integration-fast
+      - bb-e2e-system
+      - bb-fmt-static
+      - bb-cargo-clippy
+      - bb-feature-clippy
+      - bb-unused-deps
+      - bb-sdk-suites
+      - bb-rust-release-packaging
+      - bb-machine-authority
+      - bb-rmat-audit
+      - bb-seam-inventory
+      - bb-wasm-contract
+      - bb-e2e-fast
+      - bb-e2e-live
+      - bb-e2e-smoke
+      - bb-minimal-feature-builds
+      - bb-feature-matrix-lib
+      - bb-feature-matrix-surface
+      - bb-wasm-check
+      - bb-security-audit
     if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (vars.MEERKAT_BUILDBUDDY_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
     runs-on: ubuntu-latest
     steps:
       - name: Check results
         run: |
-          if [[ "${{ needs.doctor.result }}" != "success" ||
-                "${{ needs.native.result }}" != "success" ||
-                "${{ needs.compatibility.result }}" != "success" ]]; then
+          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}" == "true" ]]; then
             echo "BuildBuddy CI failed"
             exit 1
           fi
