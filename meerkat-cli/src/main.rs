@@ -4531,12 +4531,12 @@ async fn shutdown_mcp(_adapter: &Option<Arc<McpRouterAdapter>>) {
 /// For ephemeral sessions: delegates to `SessionService::start_turn()` and fabricates
 /// a placeholder receipt (no snapshot, no digest).
 ///
-/// For persistent sessions: delegates to `PersistentSessionService::apply_runtime_turn_with_result()`
+/// For persistent sessions: delegates to `PersistentSessionService::apply_runtime_turn()`
 /// which exports the committed session snapshot and real receipt.
 struct CliRuntimeExecutor {
     service: Arc<dyn meerkat_core::service::SessionService>,
     /// Persistent service reference for durable boundary commits.
-    /// When `Some`, `apply()` uses `apply_runtime_turn_with_result()`.
+    /// When `Some`, `apply()` uses `apply_runtime_turn()`.
     #[cfg(feature = "session-store")]
     persistent_service:
         Option<Arc<meerkat::PersistentSessionService<meerkat::FactoryAgentBuilder>>>,
@@ -4572,7 +4572,7 @@ impl meerkat_core::lifecycle::CoreExecutor for CliRuntimeExecutor {
             turn_metadata: primitive.turn_metadata().cloned(),
         };
 
-        // Persistent path: use apply_runtime_turn_with_result for real receipt + snapshot.
+        // Persistent path: use apply_runtime_turn for real receipt + snapshot.
         #[cfg(feature = "session-store")]
         if let Some(ref persistent) = self.persistent_service {
             let boundary = match &primitive {
@@ -4581,8 +4581,8 @@ impl meerkat_core::lifecycle::CoreExecutor for CliRuntimeExecutor {
                 }
                 _ => meerkat_core::lifecycle::run_primitive::RunApplyBoundary::Immediate,
             };
-            let (_run_result, output) = persistent
-                .apply_runtime_turn_with_result(
+            let output = persistent
+                .apply_runtime_turn(
                     &self.session_id,
                     run_id,
                     turn_req,

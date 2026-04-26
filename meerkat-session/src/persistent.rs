@@ -1100,54 +1100,6 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             .await
     }
 
-    pub async fn apply_runtime_turn_with_result(
-        &self,
-        id: &SessionId,
-        run_id: RunId,
-        req: StartTurnRequest,
-        boundary: RunApplyBoundary,
-        contributing_input_ids: Vec<InputId>,
-    ) -> Result<(RunResult, CoreApplyOutput), SessionError> {
-        let _ = self.discard_stale_live_session_if_needed(id).await?;
-        match self.inner.start_turn(id, req).await {
-            Ok(run_result) => {
-                let output = self
-                    .build_runtime_output(
-                        id,
-                        run_id,
-                        boundary,
-                        contributing_input_ids,
-                        Some(CoreApplyTerminal::RunResult(run_result.clone())),
-                    )
-                    .await?;
-                Ok((run_result, output))
-            }
-            Err(SessionError::Agent(meerkat_core::error::AgentError::NoPendingBoundary)) => {
-                let output = self
-                    .build_runtime_output(
-                        id,
-                        run_id,
-                        boundary,
-                        contributing_input_ids,
-                        Some(CoreApplyTerminal::NoPendingBoundary),
-                    )
-                    .await?;
-                let noop_result = RunResult {
-                    text: String::new(),
-                    session_id: id.clone(),
-                    usage: meerkat_core::types::Usage::default(),
-                    turns: 0,
-                    tool_calls: 0,
-                    structured_output: None,
-                    schema_warnings: None,
-                    skill_diagnostics: None,
-                };
-                Ok((noop_result, output))
-            }
-            Err(error) => Err(error),
-        }
-    }
-
     pub async fn apply_runtime_turn_outcome(
         &self,
         id: &SessionId,
@@ -1333,8 +1285,8 @@ impl<B: SessionAgentBuilder + 'static> SessionService for PersistentSessionServi
         };
 
         // Always persist after a direct start_turn call. Runtime-backed sessions
-        // that go through apply_runtime_turn_with_result() have their own atomic
-        // boundary commit path and don't call start_turn on PersistentSessionService.
+        // that go through apply_runtime_turn() have their own atomic boundary
+        // commit path and don't call start_turn on PersistentSessionService.
         let _ = self.persist_full_session(id).await?;
 
         Ok(result)
@@ -3491,7 +3443,7 @@ mod tests {
 
         let run_id = RunId::new();
         service
-            .apply_runtime_turn_with_result(
+            .apply_runtime_turn(
                 &created.session_id,
                 run_id,
                 StartTurnRequest {
@@ -3516,6 +3468,55 @@ mod tests {
         let persisted: Session =
             serde_json::from_slice(&snapshot).expect("runtime snapshot should deserialize");
         assert_no_inline_images_in_session(&persisted);
+    }
+
+    #[tokio::test]
+    async fn test_apply_runtime_turn_resume_pending_without_boundary_is_not_run_result() {
+        let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+        let runtime_store = Arc::new(InMemoryRuntimeStore::new());
+        let service = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            Arc::clone(&store),
+            Some(runtime_store),
+            memory_blob_store(),
+        );
+
+        let created = service
+            .create_session(create_request("seed", InitialTurnPolicy::Defer))
+            .await
+            .expect("create_session should succeed");
+        let run_id = RunId::new();
+        let contributing_input_ids = vec![meerkat_core::lifecycle::InputId::new()];
+        let mut req = start_turn_request("resume");
+        req.turn_metadata = Some(
+            meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                execution_kind: Some(meerkat_core::lifecycle::RuntimeExecutionKind::ResumePending),
+                ..Default::default()
+            },
+        );
+
+        let output = service
+            .apply_runtime_turn(
+                &created.session_id,
+                run_id.clone(),
+                req,
+                RunApplyBoundary::RunStart,
+                contributing_input_ids.clone(),
+            )
+            .await
+            .expect("runtime apply should commit typed no-pending terminal");
+
+        assert_eq!(output.receipt.run_id, run_id);
+        assert_eq!(
+            output.receipt.contributing_input_ids,
+            contributing_input_ids
+        );
+        assert!(output.run_result.is_none());
+        assert!(matches!(
+            output.terminal,
+            Some(CoreApplyTerminal::NoPendingBoundary)
+        ));
     }
 
     #[tokio::test]
@@ -4140,7 +4141,7 @@ mod tests {
             .expect("create_session should succeed");
 
         service
-            .apply_runtime_turn_with_result(
+            .apply_runtime_turn(
                 &result.session_id,
                 RunId::new(),
                 start_turn_request("runtime committed turn"),
@@ -4291,7 +4292,7 @@ mod tests {
             .expect("create_session should succeed");
 
         service
-            .apply_runtime_turn_with_result(
+            .apply_runtime_turn(
                 &result.session_id,
                 RunId::new(),
                 start_turn_request("runtime committed turn"),

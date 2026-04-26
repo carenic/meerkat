@@ -2589,9 +2589,9 @@ impl SessionRuntime {
                 }
             }
 
-            let (_, output) = self
+            let output = self
                 .service
-                .apply_runtime_turn_with_result(
+                .apply_runtime_turn(
                     session_id,
                     run_id,
                     StartTurnRequest {
@@ -2648,9 +2648,9 @@ impl SessionRuntime {
                     .await;
             }
         }
-        let (_, output) = self
+        let output = self
             .service
-            .apply_runtime_turn_with_result(
+            .apply_runtime_turn(
                 session_id,
                 run_id,
                 StartTurnRequest {
