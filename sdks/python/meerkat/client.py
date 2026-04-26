@@ -20,7 +20,6 @@ Example::
 from __future__ import annotations
 
 import asyncio
-import base64
 from dataclasses import asdict, is_dataclass
 import json
 import os
@@ -142,40 +141,6 @@ def _skill_refs_to_wire(refs: list[SkillRef] | None) -> list[dict[str, str]] | N
         }
         for r in refs
     ]
-
-
-def _encode_agent_runtime_ref(raw: Any) -> str | None:
-    """Encode the wire ``{identity, generation}`` shape as an opaque
-    ``AgentRuntimeRef`` handle.
-
-    The server emits ``AgentRuntimeId`` as a ``{"identity": ..., "generation": ...}``
-    object. The SDK re-encodes it as a base64url-encoded opaque token
-    (``base64url(json({"i": identity, "g": generation}))``) so public
-    callers cannot parse incarnation internals — they can only compare
-    handles for equality to detect incarnation rotation. This matches the
-    ``WireMemberRef`` pattern from dogma round 1 (PR #295).
-
-    Returns ``None`` when the field is absent (``None``). Any other
-    non-canonical shape surfaces as a typed ``MeerkatError`` at the
-    boundary — no string legacy form, no ``agent_identity`` alias, no
-    fabrication.
-    """
-    if raw is None:
-        return None
-    if not isinstance(raw, dict):
-        raise MeerkatError(
-            "INVALID_RESPONSE",
-            f"Invalid agent_runtime_id wire shape: expected object, got {type(raw).__name__}",
-        )
-    identity = raw.get("identity")
-    generation = raw.get("generation")
-    if not isinstance(identity, str) or not identity or not isinstance(generation, int):
-        raise MeerkatError(
-            "INVALID_RESPONSE",
-            "Invalid agent_runtime_id wire shape: missing identity/generation",
-        )
-    payload = json.dumps({"i": identity, "g": generation}, separators=(",", ":"))
-    return base64.urlsafe_b64encode(payload.encode("utf-8")).rstrip(b"=").decode("ascii")
 
 
 class MeerkatClient:
@@ -1418,15 +1383,8 @@ class MeerkatClient:
             "mob/member_status",
             {"mob_id": mob_id, "agent_identity": agent_identity},
         )
-        runtime_ref = _encode_agent_runtime_ref(result.get("agent_runtime_id"))
         return {
             "status": str(result.get("status", "unknown")),
-            "agent_runtime_id": runtime_ref or "",
-            "fence_token": (
-                int(result["fence_token"])
-                if isinstance(result.get("fence_token"), int)
-                else 0
-            ),
             **(
                 {"output_preview": str(result["output_preview"])}
                 if result.get("output_preview") is not None
@@ -1485,16 +1443,9 @@ class MeerkatClient:
         for entry in members:
             if not isinstance(entry, dict):
                 continue
-            runtime_ref = _encode_agent_runtime_ref(entry.get("agent_runtime_id"))
             normalized.append(
                 {
                     "agent_identity": str(entry.get("agent_identity", "")),
-                    "agent_runtime_id": runtime_ref or "",
-                    "fence_token": (
-                        int(entry["fence_token"])
-                        if isinstance(entry.get("fence_token"), int)
-                        else 0
-                    ),
                     "status": str(entry.get("status", "unknown")),
                     **(
                         {"output_preview": str(entry["output_preview"])}
@@ -1542,16 +1493,9 @@ class MeerkatClient:
         for entry in members:
             if not isinstance(entry, dict):
                 continue
-            runtime_ref = _encode_agent_runtime_ref(entry.get("agent_runtime_id"))
             normalized.append(
                 {
                     "agent_identity": str(entry.get("agent_identity", "")),
-                    "agent_runtime_id": runtime_ref or "",
-                    "fence_token": (
-                        int(entry["fence_token"])
-                        if isinstance(entry.get("fence_token"), int)
-                        else 0
-                    ),
                     "status": str(entry.get("status", "unknown")),
                     **(
                         {"output_preview": str(entry["output_preview"])}

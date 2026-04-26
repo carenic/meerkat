@@ -479,10 +479,11 @@ if include_scenario(40):
             )
             respawned_member_ref = respawn_result["receipt"]["member_ref"]
             respawned_snapshot = await wait_for(
-                "reviewer runtime id changes after respawn",
+                "reviewer bridge session changes after respawn",
                 lambda: mob.member_status("reviewer-1"),
-                lambda state: state.get("agent_runtime_id")
-                and state.get("agent_runtime_id") != reviewer_state.get("agent_runtime_id"),
+                lambda state: state.get("current_session_id")
+                and state.get("current_session_id")
+                != reviewer_state.get("current_session_id"),
                 timeout_secs=60.0,
             )
             respawn_receipt = await mob.member("reviewer-1").send(
@@ -498,8 +499,8 @@ if include_scenario(40):
                 timeout_secs=120.0,
             )
             assert (
-                respawned_state.get("agent_runtime_id")
-                == respawned_snapshot.get("agent_runtime_id")
+                respawned_state.get("current_session_id")
+                == respawned_snapshot.get("current_session_id")
             )
             assert "reviewer_respawn_40" in (
                 respawned_state.get("output_preview") or ""

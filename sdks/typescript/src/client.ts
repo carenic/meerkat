@@ -146,53 +146,6 @@ interface PlatformTarget {
   binaryName: string;
 }
 
-/**
- * Encode the wire `{identity, generation}` shape as an opaque
- * `AgentRuntimeRef` handle.
- *
- * The server emits `AgentRuntimeId` as a `{identity, generation}` object.
- * The SDK re-encodes it as a base64url-encoded opaque token
- * (`base64url(json({"i": identity, "g": generation}))`) so public callers
- * cannot parse incarnation internals — they can only compare handles for
- * equality to detect incarnation rotation. Matches the `WireMemberRef`
- * pattern from dogma round 1 (PR #295).
- *
- * Returns `""` when the field is absent. Any other non-canonical shape
- * surfaces as a typed `MeerkatError` at the boundary — no string legacy
- * form, no `agent_identity` alias, no fabrication.
- */
-export function encodeAgentRuntimeRef(raw: unknown): string {
-  if (raw == null) {
-    return "";
-  }
-  if (typeof raw !== "object") {
-    throw new MeerkatError(
-      "INVALID_RESPONSE",
-      `Invalid agent_runtime_id wire shape: expected object, got ${typeof raw}`,
-    );
-  }
-  const record = raw as Record<string, unknown>;
-  const identity = record.identity;
-  const generation = record.generation;
-  if (
-    typeof identity !== "string" ||
-    identity.length === 0 ||
-    typeof generation !== "number" ||
-    !Number.isFinite(generation)
-  ) {
-    throw new MeerkatError(
-      "INVALID_RESPONSE",
-      "Invalid agent_runtime_id wire shape: missing identity/generation",
-    );
-  }
-  const payload = JSON.stringify({ i: identity, g: generation });
-  return Buffer.from(payload, "utf-8")
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
-
 /** Options for connecting to the rkat-rpc runtime. */
 export interface ConnectOptions {
   realmId?: string;
@@ -1118,14 +1071,6 @@ export class MeerkatClient {
     agentIdentity: string,
   ): Promise<{
     status: string;
-    /**
-     * Opaque incarnation handle. Compare for equality to detect
-     * incarnation rotation; internals are not parseable. Encoded
-     * client-side from the wire `{identity, generation}` shape, matching
-     * the `MemberRef` pattern.
-     */
-    agentRuntimeId: string;
-    fenceToken: number;
     outputPreview?: string;
     error?: string;
     tokensUsed: number;
@@ -1159,21 +1104,8 @@ export class MeerkatClient {
       result.peer_connectivity && typeof result.peer_connectivity === "object"
         ? (result.peer_connectivity as Record<string, unknown>)
         : undefined;
-    const agentRuntimeId = encodeAgentRuntimeRef(result.agent_runtime_id);
-    const fenceToken =
-      typeof result.fence_token === "number" && Number.isFinite(result.fence_token)
-        ? result.fence_token
-        : undefined;
-    if (!agentRuntimeId || fenceToken === undefined) {
-      throw new MeerkatError(
-        "INVALID_RESPONSE",
-        "Invalid mob/member_status response: missing runtime identity fields",
-      );
-    }
     return {
       status: String(result.status ?? "unknown"),
-      agentRuntimeId,
-      fenceToken,
       outputPreview: result.output_preview != null ? String(result.output_preview) : undefined,
       error: result.error != null ? String(result.error) : undefined,
       tokensUsed: Number(result.tokens_used ?? 0),
@@ -1333,15 +1265,10 @@ export class MeerkatClient {
       const member =
         entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
       const agentIdentity = String(member.agent_identity ?? "");
-      const agentRuntimeId = encodeAgentRuntimeRef(member.agent_runtime_id);
-      const fenceToken =
-        typeof member.fence_token === "number" && Number.isFinite(member.fence_token)
-          ? member.fence_token
-          : undefined;
-      if (!agentIdentity || !agentRuntimeId || fenceToken === undefined) {
+      if (!agentIdentity) {
         throw new MeerkatError(
           "INVALID_RESPONSE",
-          "Invalid mob/wait_kickoff response: member missing runtime identity fields",
+          "Invalid mob/wait_kickoff response: member missing agent_identity",
         );
       }
       const rawConnectivity =
@@ -1350,8 +1277,6 @@ export class MeerkatClient {
           : undefined;
       return {
         agentIdentity,
-        agentRuntimeId,
-        fenceToken,
         status: String(member.status ?? "unknown"),
         outputPreview:
           member.output_preview != null ? String(member.output_preview) : undefined,
@@ -1395,15 +1320,10 @@ export class MeerkatClient {
       const member =
         entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
       const agentIdentity = String(member.agent_identity ?? "");
-      const agentRuntimeId = encodeAgentRuntimeRef(member.agent_runtime_id);
-      const fenceToken =
-        typeof member.fence_token === "number" && Number.isFinite(member.fence_token)
-          ? member.fence_token
-          : undefined;
-      if (!agentIdentity || !agentRuntimeId || fenceToken === undefined) {
+      if (!agentIdentity) {
         throw new MeerkatError(
           "INVALID_RESPONSE",
-          "Invalid mob/wait_ready response: member missing runtime identity fields",
+          "Invalid mob/wait_ready response: member missing agent_identity",
         );
       }
       const rawConnectivity =
@@ -1412,8 +1332,6 @@ export class MeerkatClient {
           : undefined;
       return {
         agentIdentity,
-        agentRuntimeId,
-        fenceToken,
         status: String(member.status ?? "unknown"),
         outputPreview:
           member.output_preview != null ? String(member.output_preview) : undefined,
