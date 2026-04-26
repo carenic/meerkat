@@ -151,7 +151,7 @@ impl CatalogControlDispatcher {
                     .staged_session_filters_allow_name(&entry.tool.name)
                 {
                     SearchVisibilityStatus::BlockedByFilter
-                } else if !entry.currently_callable {
+                } else if !entry.currently_callable() {
                     SearchVisibilityStatus::TemporarilyUnavailable
                 } else {
                     SearchVisibilityStatus::Deferred
@@ -265,7 +265,7 @@ impl CatalogControlDispatcher {
                         });
                         continue;
                     }
-                    if !entry.currently_callable {
+                    if !entry.currently_callable() {
                         resolutions.push(ToolCatalogLoadResolution {
                             name,
                             accepted: false,

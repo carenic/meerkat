@@ -3373,8 +3373,8 @@ mod prompt_tests {
     use meerkat_core::ops::ToolDispatchOutcome;
     use meerkat_core::types::{StopReason, ToolCallView, ToolDef, ToolResult};
     use meerkat_core::{
-        AgentToolDispatcher, Config, Message, ToolCatalogCapabilities,
-        ToolCatalogDeferredEligibility, ToolCatalogEntry, ToolCategoryOverride, ToolPlaneClass,
+        AgentToolDispatcher, Config, Message, ToolCatalogCapabilities, ToolCatalogEntry,
+        ToolCategoryOverride,
     };
     use std::pin::Pin;
     use std::sync::Arc;
@@ -3414,12 +3414,7 @@ mod prompt_tests {
                             "callback:registered".to_string(),
                         )
                     } else {
-                        ToolCatalogEntry {
-                            tool: Arc::clone(tool),
-                            plane: ToolPlaneClass::Session,
-                            currently_callable: true,
-                            deferred_eligibility: ToolCatalogDeferredEligibility::InlineOnly,
-                        }
+                        ToolCatalogEntry::session_inline(Arc::clone(tool), true)
                     }
                 })
                 .collect::<Vec<_>>()

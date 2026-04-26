@@ -318,7 +318,6 @@ mod tests {
     use crate::inbox::Inbox;
     use crate::trust::TrustedPeers;
     use meerkat_core::ToolCatalogDeferredEligibility;
-    use meerkat_core::ToolPlaneClass;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct ExactDeferredDispatcher {
@@ -363,14 +362,11 @@ mod tests {
         }
 
         fn tool_catalog(&self) -> Arc<[ToolCatalogEntry]> {
-            vec![ToolCatalogEntry {
-                tool: Arc::clone(&self.tool),
-                plane: ToolPlaneClass::Session,
-                currently_callable: true,
-                deferred_eligibility: ToolCatalogDeferredEligibility::DeferredEligible {
-                    stable_owner_key: "callback:secret_lookup".to_string(),
-                },
-            }]
+            vec![ToolCatalogEntry::session_deferred(
+                Arc::clone(&self.tool),
+                true,
+                "callback:secret_lookup".to_string(),
+            )]
             .into()
         }
     }

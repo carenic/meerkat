@@ -154,9 +154,7 @@ pub use event_injector::{EventInjector, EventInjectorError};
 pub use event_tap::{
     EventTap, EventTapState, new_event_tap, tap_emit, tap_send_terminal, tap_try_send,
 };
-pub use gateway::{
-    Availability, AvailabilityCheck, DynamicToolComposite, ToolGateway, ToolGatewayBuilder,
-};
+pub use gateway::{DynamicToolComposite, ToolGateway, ToolGatewayBuilder};
 pub use handles::{
     AuthLeasePhase, CommsDrainHandle, DrainExitReason, DrainMode, DslRejectionKind,
     DslTransitionError, ExternalToolSurfaceHandle, McpServerLifecycleHandle, PeerCommsHandle,
@@ -241,9 +239,9 @@ pub use session_recovery::{
 pub use session_store::{SessionFilter, SessionStore, SessionStoreError};
 pub use state::LoopState;
 pub use tool_catalog::{
-    ToolCatalogCapabilities, ToolCatalogDeferredEligibility, ToolCatalogEntry,
+    ToolCallability, ToolCatalogCapabilities, ToolCatalogDeferredEligibility, ToolCatalogEntry,
     ToolCatalogLoadRejectedReason, ToolCatalogLoadResolution, ToolCatalogMode, ToolPlaneClass,
-    deferred_session_entry_count, deferred_session_schema_volume,
+    ToolUnavailableReason, deferred_session_entry_count, deferred_session_schema_volume,
     select_catalog_mode_from_snapshot,
 };
 pub use tool_scope::{

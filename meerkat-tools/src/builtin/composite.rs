@@ -485,10 +485,21 @@ impl AgentToolDispatcher for CompositeDispatcher {
             }
         }
 
-        if let Some(ref ext) = self.external
-            && ext.tools().iter().any(|t| t.name == call.name)
-        {
-            return ext.dispatch(call).await;
+        if let Some(ref ext) = self.external {
+            if ext.tool_catalog_capabilities().exact_catalog {
+                if let Some(entry) = ext
+                    .tool_catalog()
+                    .iter()
+                    .find(|entry| entry.tool.name == call.name)
+                {
+                    if let Some(reason) = entry.callability.unavailable_reason() {
+                        return Err(ToolError::unavailable(call.name, reason.to_string()));
+                    }
+                    return ext.dispatch(call).await;
+                }
+            } else if ext.tools().iter().any(|t| t.name == call.name) {
+                return ext.dispatch(call).await;
+            }
         }
 
         Err(ToolError::NotFound {
@@ -676,7 +687,7 @@ mod tests {
         fn tools(&self) -> Arc<[Arc<ToolDef>]> {
             self.catalog
                 .iter()
-                .filter(|entry| entry.currently_callable)
+                .filter(|entry| entry.currently_callable())
                 .map(|entry| Arc::clone(&entry.tool))
                 .collect::<Vec<_>>()
                 .into()
@@ -697,7 +708,7 @@ mod tests {
             if self
                 .catalog
                 .iter()
-                .any(|entry| entry.tool.name == call.name && entry.currently_callable)
+                .any(|entry| entry.tool.name == call.name && entry.currently_callable())
             {
                 return Ok(ToolResult::new(call.id.to_string(), "{}".to_string(), false).into());
             }
@@ -787,6 +798,42 @@ mod tests {
             1,
             "collision losers must be absent from the exact catalog"
         );
+    }
+
+    #[tokio::test]
+    async fn exact_external_non_callable_winner_dispatches_unavailable() {
+        let store = Arc::new(MemoryTaskStore::new());
+        let external: Arc<dyn AgentToolDispatcher> =
+            Arc::new(ExactExternalDispatcher::new(&[("external_only", false)]));
+
+        let dispatcher = CompositeDispatcher::new(
+            store,
+            &BuiltinToolConfig::default(),
+            None,
+            None,
+            Some(external),
+            None,
+            true,
+        )
+        .expect("composite dispatcher should build");
+
+        let catalog = dispatcher.tool_catalog();
+        assert!(
+            !catalog
+                .iter()
+                .find(|entry| entry.tool.name == "external_only")
+                .expect("external catalog entry")
+                .currently_callable()
+        );
+
+        let call_json = serde_json::value::RawValue::from_string("{}".to_string()).unwrap();
+        let call = ToolCallView {
+            id: "ext-unavailable",
+            name: "external_only",
+            args: &call_json,
+        };
+        let result = dispatcher.dispatch(call).await;
+        assert!(matches!(result, Err(ToolError::Unavailable { .. })));
     }
 
     #[tokio::test]
