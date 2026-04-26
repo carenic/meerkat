@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import {
   crateName,
@@ -47,6 +47,11 @@ function parseArgs() {
 }
 
 const args = parseArgs();
+
+function printAndExit(text, code = 0) {
+  writeSync(1, `${text}\n`);
+  process.exit(code);
+}
 
 function changedFiles() {
   if (args.paths.length) return args.paths;
@@ -174,12 +179,10 @@ if (args.includeAll) {
       .filter(hasFastSuite)
       .map((pkg) => `//${packageDir(pkg)}:fast_tests`)
       .sort();
-  console.log(labels.length ? labels.join(" ") : args.kind === "test" ? "//:fast_tests" : "//...");
-  process.exit(0);
+  printAndExit(labels.length ? labels.join(" ") : args.kind === "test" ? "//:fast_tests" : "//...");
 }
 if (files.length === 0) {
-  console.log(args.kind === "test" ? "//:fast_tests" : "//...");
-  process.exit(0);
+  printAndExit(args.kind === "test" ? "//:fast_tests" : "//...");
 }
 
 const seedIds = new Set();
@@ -214,11 +217,9 @@ for (const file of files) {
 
 if (unmapped.length || (seedIds.size === 0 && exactLabels.size === 0)) {
   if (suppressedOwnedTestTarget && args.emptyIfNoLabels) {
-    console.log("");
-    process.exit(0);
+    printAndExit("");
   }
-  console.log(args.kind === "test" ? "//:fast_tests" : "//...");
-  process.exit(0);
+  printAndExit(args.kind === "test" ? "//:fast_tests" : "//...");
 }
 
 const selectedIds = args.mode === "owned" ? seedIds : affectedClosure(seedIds);
@@ -245,9 +246,9 @@ const labels = args.kind === "build"
 const uniqueLabels = [...new Set(labels)].sort();
 
 if (uniqueLabels.length) {
-  console.log(uniqueLabels.join(" "));
+  printAndExit(uniqueLabels.join(" "));
 } else if (args.emptyIfNoLabels) {
-  console.log("");
+  printAndExit("");
 } else {
-  console.log(args.kind === "test" ? "//:fast_tests" : "//...");
+  printAndExit(args.kind === "test" ? "//:fast_tests" : "//...");
 }
