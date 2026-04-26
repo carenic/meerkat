@@ -18,6 +18,7 @@ cd "$(git rev-parse --show-toplevel)"
 # Reuse the same xtask build path as the existing machine-authority
 # pre-push gate so both hooks share the isolated target dir.
 XTASK_TARGET_DIR="${XTASK_TARGET_DIR:-$HOME/.cache/meerkat/xtask-target}"
+CARGO="${CARGO:-./scripts/repo-cargo}"
 
 export CARGO_TARGET_DIR="$XTASK_TARGET_DIR"
-cargo run -p xtask -- audit-generated-headers
+"$CARGO" run -p xtask -- audit-generated-headers

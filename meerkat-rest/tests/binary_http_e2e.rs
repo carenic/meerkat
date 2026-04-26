@@ -16,6 +16,17 @@ fn rest_binary_path() -> Option<PathBuf> {
         }
     }
 
+    if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") {
+        let target_dir = PathBuf::from(target_dir);
+        let candidates = [
+            target_dir.join("debug/rkat-rest"),
+            target_dir.join("release/rkat-rest"),
+        ];
+        if let Some(candidate) = candidates.into_iter().find(|candidate| candidate.exists()) {
+            return Some(candidate);
+        }
+    }
+
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir.parent()?;
     let debug = workspace_root.join("target/debug/rkat-rest");

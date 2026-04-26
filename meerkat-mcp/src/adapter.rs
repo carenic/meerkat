@@ -445,7 +445,14 @@ mod tests {
 
     fn test_server_path() -> PathBuf {
         if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") {
-            return PathBuf::from(target_dir).join("debug/mcp-test-server");
+            let target_dir = PathBuf::from(target_dir);
+            for profile in ["debug", "release"] {
+                let candidate = target_dir.join(profile).join("mcp-test-server");
+                if candidate.exists() {
+                    return candidate;
+                }
+            }
+            return target_dir.join("debug/mcp-test-server");
         }
 
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
