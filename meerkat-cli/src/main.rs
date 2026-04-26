@@ -1792,7 +1792,11 @@ enum MobCommands {
     /// Inspect a .mobpack archive.
     Inspect { pack: PathBuf },
     /// Validate a .mobpack archive.
-    Validate { pack: PathBuf },
+    Validate {
+        pack: PathBuf,
+        #[arg(long, value_enum)]
+        trust_policy: Option<TrustPolicyArg>,
+    },
     /// Deploy a .mobpack archive with a prompt.
     Deploy {
         pack: PathBuf,
@@ -1926,6 +1930,8 @@ enum MobWebCommands {
         pack: PathBuf,
         #[arg(short = 'o', long)]
         output: PathBuf,
+        #[arg(long, value_enum)]
+        trust_policy: Option<TrustPolicyArg>,
     },
 }
 
@@ -8126,8 +8132,11 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
         return Ok(());
     }
 
-    if let MobCommands::Validate { pack } = &command {
-        println!("{}", execute_mob_validate(pack).await?);
+    if let MobCommands::Validate { pack, trust_policy } = &command {
+        println!(
+            "{}",
+            execute_mob_validate(scope, pack, *trust_policy).await?
+        );
         return Ok(());
     }
 
@@ -8170,10 +8179,18 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
     }
 
     if let MobCommands::Web {
-        command: MobWebCommands::Build { pack, output },
+        command:
+            MobWebCommands::Build {
+                pack,
+                output,
+                trust_policy,
+            },
     } = &command
     {
-        println!("{}", execute_mob_web_build(pack, output).await?);
+        println!(
+            "{}",
+            execute_mob_web_build(scope, pack, output, *trust_policy).await?
+        );
         return Ok(());
     }
 
@@ -8540,36 +8557,74 @@ async fn execute_mob_inspect(pack: &std::path::Path) -> anyhow::Result<String> {
 }
 
 #[cfg(feature = "mob")]
-async fn execute_mob_validate(pack: &std::path::Path) -> anyhow::Result<String> {
+struct VerifiedMobpack {
+    bytes: Vec<u8>,
+    archive: MobpackArchive,
+    digest: meerkat_mob_pack::digest::MobpackDigest,
+    trust_warnings: Vec<String>,
+}
+
+#[cfg(feature = "mob")]
+async fn load_verified_mobpack(
+    scope: &RuntimeScope,
+    pack: &std::path::Path,
+    cli_trust_policy: Option<TrustPolicyArg>,
+    action: &'static str,
+) -> anyhow::Result<VerifiedMobpack> {
     let bytes = tokio::fs::read(pack)
         .await
         .map_err(|err| anyhow::anyhow!("failed reading pack '{}': {err}", pack.display()))?;
-    // Post-wave-a dogma: `validate_archive_bytes` was retired along with the
-    // web-build bypass (commit 82bb88166). The canonical structural gate is
-    // `inspect_archive_bytes`, which runs the same required-file + manifest +
-    // definition checks and additionally surfaces the file list. We discard
-    // the inspection payload here; `rkat mob validate` is the trust/structural
-    // CLI seam and only reports pass/fail + digest.
-    let _ = inspect_archive_bytes(&bytes)
-        .map_err(|err| anyhow::anyhow!("mob validate failed: {err}"))?;
-    let digest = compute_archive_digest(&bytes)
-        .map_err(|err| anyhow::anyhow!("mob validate failed: {err}"))?;
-    Ok(format!("valid\t{digest}"))
+    let files = extract_targz_safe(&bytes).map_err(|err| anyhow::anyhow!("{action}: {err}"))?;
+    let archive = MobpackArchive::from_extracted_files(&files)
+        .map_err(|err| anyhow::anyhow!("{action}: {err}"))?;
+    let digest =
+        compute_archive_digest(&bytes).map_err(|err| anyhow::anyhow!("{action}: {err}"))?;
+    let config_trust = read_config_trust_policy(scope)?;
+    let trust_policy = resolve_trust_policy(
+        cli_trust_policy,
+        |key| std::env::var(key).ok(),
+        config_trust,
+    )?;
+    let trusted_signers = load_trusted_signers(
+        &user_trust_store_path(scope),
+        &project_trust_store_path(scope),
+    )
+    .map_err(|err| anyhow::anyhow!("{action}: {err}"))?;
+    let trust_warnings = verify_pack_trust(&files, digest, trust_policy, &trusted_signers)
+        .map_err(|err| anyhow::anyhow!("{action}: {err}"))?;
+    Ok(VerifiedMobpack {
+        bytes,
+        archive,
+        digest,
+        trust_warnings,
+    })
+}
+
+#[cfg(feature = "mob")]
+async fn execute_mob_validate(
+    scope: &RuntimeScope,
+    pack: &std::path::Path,
+    cli_trust_policy: Option<TrustPolicyArg>,
+) -> anyhow::Result<String> {
+    let verified =
+        load_verified_mobpack(scope, pack, cli_trust_policy, "mob validate failed").await?;
+    let mut rendered = format!("valid\t{}", verified.digest);
+    for warning in verified.trust_warnings {
+        rendered.push_str(&format!("\nwarning\t{warning}"));
+    }
+    Ok(rendered)
 }
 
 #[cfg(feature = "mob")]
 async fn execute_mob_web_build(
+    scope: &RuntimeScope,
     pack: &std::path::Path,
     output: &std::path::Path,
+    cli_trust_policy: Option<TrustPolicyArg>,
 ) -> anyhow::Result<String> {
-    let bytes = tokio::fs::read(pack)
-        .await
-        .map_err(|err| anyhow::anyhow!("failed reading pack '{}': {err}", pack.display()))?;
-    let files =
-        extract_targz_safe(&bytes).map_err(|err| anyhow::anyhow!("mob web build failed: {err}"))?;
-    let archive = MobpackArchive::from_extracted_files(&files)
-        .map_err(|err| anyhow::anyhow!("mob web build failed: {err}"))?;
-    if let Some(requires) = &archive.manifest.requires {
+    let verified =
+        load_verified_mobpack(scope, pack, cli_trust_policy, "mob web build failed").await?;
+    if let Some(requires) = &verified.archive.manifest.requires {
         for cap in &requires.capabilities {
             if matches!(cap.as_str(), "shell" | "mcp_stdio" | "process_spawn") {
                 anyhow::bail!("forbidden capability '{cap}' is not allowed for web builds");
@@ -8580,12 +8635,12 @@ async fn execute_mob_web_build(
     tokio::fs::create_dir_all(output).await.map_err(|err| {
         anyhow::anyhow!("failed creating web output '{}': {err}", output.display())
     })?;
-    tokio::fs::write(output.join("mobpack.bin"), &bytes)
+    tokio::fs::write(output.join("mobpack.bin"), &verified.bytes)
         .await
         .map_err(|err| anyhow::anyhow!("failed writing mobpack.bin: {err}"))?;
     tokio::fs::write(
         output.join("manifest.web.toml"),
-        toml::to_string(&archive.manifest)
+        toml::to_string(&verified.archive.manifest)
             .map_err(|err| anyhow::anyhow!("failed encoding web manifest: {err}"))?,
     )
     .await
@@ -8606,7 +8661,11 @@ async fn execute_mob_web_build(
         .await
         .map_err(|err| anyhow::anyhow!("failed writing runtime_bg.wasm: {err}"))?;
 
-    Ok(format!("web\t{}", output.display()))
+    let mut rendered = format!("web\t{}", output.display());
+    for warning in verified.trust_warnings {
+        rendered.push_str(&format!("\nwarning\t{warning}"));
+    }
+    Ok(rendered)
 }
 
 #[cfg(feature = "mob")]
@@ -8656,28 +8715,17 @@ async fn execute_mob_deploy_internal(
     prompt: &str,
     invocation: DeployInvocation,
 ) -> anyhow::Result<String> {
-    let bytes = tokio::fs::read(pack)
-        .await
-        .map_err(|err| anyhow::anyhow!("failed reading pack '{}': {err}", pack.display()))?;
-    let files =
-        extract_targz_safe(&bytes).map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
-    let archive = MobpackArchive::from_extracted_files(&files)
-        .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
-    let digest = compute_archive_digest(&bytes)
-        .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
-    let config_trust = read_config_trust_policy(scope)?;
-    let trust_policy = resolve_trust_policy(
+    let VerifiedMobpack {
+        archive,
+        trust_warnings: warnings,
+        ..
+    } = load_verified_mobpack(
+        scope,
+        pack,
         invocation.cli_trust_policy,
-        |key| std::env::var(key).ok(),
-        config_trust,
-    )?;
-    let trusted_signers = load_trusted_signers(
-        &user_trust_store_path(scope),
-        &project_trust_store_path(scope),
+        "mob deploy failed",
     )
-    .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
-    let warnings = verify_pack_trust(&files, digest, trust_policy, &trusted_signers)
-        .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
+    .await?;
     validate_required_capabilities(&archive.manifest, &runtime_capabilities(invocation.surface))
         .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
     let effective_config = load_deploy_config_with_pack_defaults(
@@ -11091,11 +11139,17 @@ mod tests {
             Commands::Mob {
                 command:
                     MobCommands::Web {
-                        command: MobWebCommands::Build { pack, output },
+                        command:
+                            MobWebCommands::Build {
+                                pack,
+                                output,
+                                trust_policy,
+                            },
                     },
             } => {
                 assert_eq!(pack, PathBuf::from("./fixture.mobpack"));
                 assert_eq!(output, PathBuf::from("./web-out"));
+                assert_eq!(trust_policy, None);
             }
             _ => unreachable!("expected mob web build command"),
         }
@@ -11184,18 +11238,41 @@ mod tests {
     #[tokio::test]
     async fn test_mob_validate_success_and_failure_behaviors() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let scope = test_scope_with_context(temp.path().to_path_buf());
         let mob_dir = create_mobpack_fixture_dir(temp.path());
         let valid_pack = temp.path().join("valid.mobpack");
         execute_mob_pack(&mob_dir, &valid_pack, None)
             .await
             .expect("pack before validate");
 
-        let ok_output = execute_mob_validate(&valid_pack)
+        let ok_output = execute_mob_validate(&scope, &valid_pack, None)
             .await
             .expect("validate should succeed");
         assert!(
             ok_output.starts_with("valid\t"),
             "validate success should report digest"
+        );
+        assert!(
+            ok_output.contains("warning\tunsigned pack accepted in permissive mode"),
+            "validate should surface trust verification warnings: {ok_output}"
+        );
+
+        let strict_err = execute_mob_validate(&scope, &valid_pack, Some(TrustPolicyArg::Strict))
+            .await
+            .expect_err("strict validate should reject unsigned packs");
+        assert!(
+            strict_err.to_string().contains("unsigned pack"),
+            "strict validate should fail through trust verification: {strict_err}"
+        );
+
+        let web_out = temp.path().join("web-out");
+        let web_err =
+            execute_mob_web_build(&scope, &valid_pack, &web_out, Some(TrustPolicyArg::Strict))
+                .await
+                .expect_err("strict web build should reject unsigned packs");
+        assert!(
+            web_err.to_string().contains("unsigned pack"),
+            "web build should share the trust verification seam: {web_err}"
         );
 
         let invalid_pack = temp.path().join("invalid.mobpack");
@@ -11209,7 +11286,7 @@ mod tests {
             .await
             .expect("write invalid archive");
 
-        let err = execute_mob_validate(&invalid_pack)
+        let err = execute_mob_validate(&scope, &invalid_pack, None)
             .await
             .expect_err("validate should fail when definition.json is missing");
         assert!(
@@ -12025,6 +12102,7 @@ capabilities = ["definitely_missing_capability"]
     #[tokio::test]
     async fn test_e2e_validate_missing_definition() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let scope = test_scope_with_context(temp.path().to_path_buf());
         let invalid_pack = temp.path().join("missing-definition.mobpack");
         let archive = meerkat_mob_pack::targz::create_targz(&std::collections::BTreeMap::from([(
             "manifest.toml".to_string(),
@@ -12035,7 +12113,7 @@ capabilities = ["definitely_missing_capability"]
             .await
             .expect("write archive");
 
-        let err = execute_mob_validate(&invalid_pack)
+        let err = execute_mob_validate(&scope, &invalid_pack, None)
             .await
             .expect_err("validate should reject missing definition");
         assert!(
