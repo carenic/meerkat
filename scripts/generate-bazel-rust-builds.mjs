@@ -129,6 +129,31 @@ function needsWorkspaceRunfiles(target) {
   ].some((needle) => source.includes(needle));
 }
 
+function needsPackageRunfiles(target) {
+  const source = readFileSync(target.src_path, "utf8");
+  return [
+    "CARGO_MANIFEST_DIR",
+    "WORKSPACE_ROOT",
+    "workspace_root",
+    "rev-parse",
+    "read_to_string",
+    "read_dir",
+    "tokio::fs::read",
+    "std::fs::read",
+    "fs::read",
+    "SKILL.md",
+    "AGENTS.md",
+    "Cargo.toml",
+    "test-fixtures",
+    ".github/",
+    "scripts/",
+    "docs/",
+    "target-codex",
+    "walk_rust_sources",
+    "scan_for_manual_input_schema_literals",
+  ].some((needle) => source.includes(needle));
+}
+
 function workspaceDataLabels(target) {
   const source = readFileSync(target.src_path, "utf8");
   const labels = new Set();
@@ -485,9 +510,11 @@ for (const pkg of localPackages.values()) {
       }
       const currentPackageRunfiles = `//${relative(root, dir)}:package_runfiles`;
       const data = [
-        ":package_runfiles",
         ...extraData.filter((label) => label !== currentPackageRunfiles),
       ];
+      if (needsPackageRunfiles(target) || extraData.includes(currentPackageRunfiles) || usesTrybuild) {
+        data.unshift(":package_runfiles");
+      }
       const env = [`        "RUST_MIN_STACK": "16777216",`];
       attrs.splice(attrs.length - 1, 0, `    tags = ${listExpr([...new Set(tags)].sort())},`);
       if (usesTrybuild) {

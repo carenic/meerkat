@@ -86,9 +86,7 @@ rust_test(
     tags = [
         "fast",
     ],
-    data = [
-        ":package_runfiles",
-    ],
+    data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
     },

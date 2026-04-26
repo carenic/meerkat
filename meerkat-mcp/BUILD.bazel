@@ -83,9 +83,7 @@ rust_test(
     tags = [
         "integration",
     ],
-    data = [
-        ":package_runfiles",
-    ],
+    data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
     },

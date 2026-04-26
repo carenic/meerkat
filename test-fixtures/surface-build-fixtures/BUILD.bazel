@@ -118,9 +118,7 @@ rust_test(
         "fixture",
         "live",
     ],
-    data = [
-        ":package_runfiles",
-    ],
+    data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
     },

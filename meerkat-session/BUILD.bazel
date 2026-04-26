@@ -91,9 +91,7 @@ rust_test(
     tags = [
         "fast",
     ],
-    data = [
-        ":package_runfiles",
-    ],
+    data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
     },
@@ -203,9 +201,7 @@ rust_test(
     tags = [
         "fast",
     ],
-    data = [
-        ":package_runfiles",
-    ],
+    data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
     },
@@ -260,7 +256,6 @@ rust_test(
         "trybuild",
     ],
     data = [
-        ":package_runfiles",
         "//meerkat-core:package_runfiles",
     ],
     env = {

@@ -131,6 +131,12 @@ Path selectors cache `cargo metadata` under
 small first-populator lock, so simultaneous agents do not serialize on Cargo
 metadata after the cache is warm.
 
+Generated `rust_test` targets only carry `:package_runfiles` when their source
+appears to read package/workspace files at runtime. This keeps ordinary tests
+from being invalidated by unrelated non-source package files while preserving
+runtime data for tests that scan source trees, read manifests, load skills, or
+inspect workspace fixtures.
+
 ## Observed Results
 
 Representative measurements from the POC environment:
@@ -162,6 +168,7 @@ Representative measurements from the POC environment:
 | Two same-worktree changed gates, auto fallback lanes | `28.37s` / `28.59s` wall |
 | Two temp worktree changed gates, source/support | `27.61s` / `33.29s` wall |
 | Three cold parallel selectors with metadata cache lock | `0` Cargo lock waits |
+| Package non-source probe after runfiles trim | `13/151` tests executed, `53` actions |
 | Fresh temp worktree source edit probe | `23.98s` wall |
 | Fresh temp worktree exact-test edit probe | `48.31s` wall |
 | Fresh temp worktree support-local edit probe | `49.99s` wall |

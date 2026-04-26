@@ -201,7 +201,6 @@ rust_test(
         "integration",
     ],
     data = [
-        ":package_runfiles",
         "//meerkat-rpc:rkat_rpc_bin",
         "//meerkat-rpc:rkat_rpc_mini_bin",
     ],
@@ -431,7 +430,6 @@ rust_test(
         "fast",
     ],
     data = [
-        ":package_runfiles",
         "//meerkat-rpc:rkat_rpc_bin",
         "//meerkat-rpc:rkat_rpc_mini_bin",
     ],
@@ -505,7 +503,6 @@ rust_test(
         "fast",
     ],
     data = [
-        ":package_runfiles",
         "//meerkat-rpc:rkat_rpc_bin",
         "//meerkat-rpc:rkat_rpc_mini_bin",
     ],
@@ -579,7 +576,6 @@ rust_test(
         "fast",
     ],
     data = [
-        ":package_runfiles",
         "//meerkat-rpc:rkat_rpc_bin",
         "//meerkat-rpc:rkat_rpc_mini_bin",
     ],
@@ -653,7 +649,6 @@ rust_test(
         "fast",
     ],
     data = [
-        ":package_runfiles",
         "//meerkat-rpc:rkat_rpc_bin",
         "//meerkat-rpc:rkat_rpc_mini_bin",
     ],
@@ -727,7 +722,6 @@ rust_test(
         "e2e",
     ],
     data = [
-        ":package_runfiles",
         "//meerkat-rpc:rkat_rpc_bin",
         "//meerkat-rpc:rkat_rpc_mini_bin",
     ],

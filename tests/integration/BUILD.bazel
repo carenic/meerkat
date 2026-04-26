@@ -155,9 +155,7 @@ rust_test(
         "e2e",
         "integration",
     ],
-    data = [
-        ":package_runfiles",
-    ],
+    data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
     },
@@ -220,9 +218,7 @@ rust_test(
         "e2e",
         "integration",
     ],
-    data = [
-        ":package_runfiles",
-    ],
+    data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
     },
@@ -283,9 +279,7 @@ rust_test(
         "integration",
         "live",
     ],
-    data = [
-        ":package_runfiles",
-    ],
+    data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
     },
@@ -407,9 +401,7 @@ rust_test(
         "e2e",
         "integration",
     ],
-    data = [
-        ":package_runfiles",
-    ],
+    data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
     },
@@ -470,9 +462,7 @@ rust_test(
         "integration",
         "system",
     ],
-    data = [
-        ":package_runfiles",
-    ],
+    data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
     },
@@ -531,9 +521,7 @@ rust_test(
     tags = [
         "integration",
     ],
-    data = [
-        ":package_runfiles",
-    ],
+    data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
     },
@@ -592,9 +580,7 @@ rust_test(
     tags = [
         "integration",
     ],
-    data = [
-        ":package_runfiles",
-    ],
+    data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
     },
@@ -653,9 +639,7 @@ rust_test(
     tags = [
         "integration",
     ],
-    data = [
-        ":package_runfiles",
-    ],
+    data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
     },
@@ -777,9 +761,7 @@ rust_test(
     tags = [
         "integration",
     ],
-    data = [
-        ":package_runfiles",
-    ],
+    data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
     },
@@ -838,9 +820,7 @@ rust_test(
     tags = [
         "integration",
     ],
-    data = [
-        ":package_runfiles",
-    ],
+    data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
     },
@@ -899,9 +879,7 @@ rust_test(
     tags = [
         "integration",
     ],
-    data = [
-        ":package_runfiles",
-    ],
+    data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
     },
