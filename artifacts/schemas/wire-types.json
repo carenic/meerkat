@@ -10833,7 +10833,7 @@
         "type": "string"
       },
       "source_kind": {
-        "description": "Discriminator: \"inline_secret\" / \"env\" /\n\"external_resolver\" / \"platform_default\" / \"command\" /\n\"file_descriptor\".",
+        "description": "Discriminator: \"inline_secret\" / \"managed_store\" / \"env\" /\n\"external_resolver\" / \"platform_default\" / \"command\" /\n\"file_descriptor\".",
         "type": "string"
       }
     },
@@ -11908,7 +11908,7 @@
             "type": "string"
           },
           "source_kind": {
-            "description": "Discriminator: \"inline_secret\" / \"env\" /\n\"external_resolver\" / \"platform_default\" / \"command\" /\n\"file_descriptor\".",
+            "description": "Discriminator: \"inline_secret\" / \"managed_store\" / \"env\" /\n\"external_resolver\" / \"platform_default\" / \"command\" /\n\"file_descriptor\".",
             "type": "string"
           }
         },

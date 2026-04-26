@@ -327,20 +327,6 @@ pub fn rest_path_catalog() -> Vec<RestPathDescriptor> {
             )],
         ),
         RestPathDescriptor::new(
-            "/mob/{id}/members/{agent_identity}/realtime/attach",
-            vec![RestOperationDescriptor::new(
-                "post",
-                "Attach realtime attachment intent to a mob member",
-            )],
-        ),
-        RestPathDescriptor::new(
-            "/mob/{id}/members/{agent_identity}/realtime/detach",
-            vec![RestOperationDescriptor::new(
-                "post",
-                "Detach realtime attachment intent from a mob member",
-            )],
-        ),
-        RestPathDescriptor::new(
             "/mob/{id}/members/{agent_identity}/cancel",
             vec![RestOperationDescriptor::new(
                 "post",
@@ -446,12 +432,19 @@ mod tests {
             "/schedules/{id}/occurrences",
             "/sessions/{id}/realtime-attachment-status",
             "/mob/{id}/members/{agent_identity}/status",
-            "/mob/{id}/members/{agent_identity}/realtime/attach",
-            "/mob/{id}/members/{agent_identity}/realtime/detach",
             "/mob/{id}/members/{agent_identity}/cancel",
             "/mob/{id}/members/{agent_identity}/respawn",
         ] {
             assert!(paths.iter().any(|path| path == &expected));
+        }
+        for retired in [
+            "/mob/{id}/members/{agent_identity}/realtime/attach",
+            "/mob/{id}/members/{agent_identity}/realtime/detach",
+        ] {
+            assert!(
+                !paths.iter().any(|path| path == &retired),
+                "retired caller realtime route must not be catalogued: {retired}"
+            );
         }
     }
 

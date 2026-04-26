@@ -97,16 +97,6 @@
         "summary": "Force-cancel a mob member"
       }
     },
-    "/mob/{id}/members/{agent_identity}/realtime/attach": {
-      "post": {
-        "summary": "Attach realtime attachment intent to a mob member"
-      }
-    },
-    "/mob/{id}/members/{agent_identity}/realtime/detach": {
-      "post": {
-        "summary": "Detach realtime attachment intent from a mob member"
-      }
-    },
     "/mob/{id}/members/{agent_identity}/respawn": {
       "post": {
         "summary": "Respawn a mob member with topology restore"
