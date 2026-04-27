@@ -185,6 +185,22 @@ else
   bad "BuildBuddy launcher does not refresh stale local path dependency locks"
 fi
 
+vendor_runfiles_order="$(
+  awk '
+    /name = "package_runfiles"/ { runfiles = NR }
+    /rust_library\(/ { rust_library = NR }
+    END {
+      if (runfiles > 0 && rust_library > 0 && runfiles < rust_library) print "ok";
+    }
+  ' vendor/oai-rt-rs/BUILD.bazel
+)"
+if [[ "${vendor_runfiles_order}" == "ok" ]] &&
+  grep -Fq 'ensureGeneratedBlockBefore(' scripts/generate-bazel-rust-builds.mjs; then
+  pass "Vendored oai-rt-rs runfiles target is declared before generated crate macro"
+else
+  bad "Vendored oai-rt-rs runfiles target may be hidden by generated crate macro evaluation"
+fi
+
 if grep -Fq 'Cache Bazel external repositories' .github/actions/setup-buildbuddy-ci/action.yml &&
   grep -Fq -- '--repository_cache=' scripts/buildbuddy-bazel-poc &&
   grep -Fq 'MEERKAT_BUILDBUDDY_FETCH_RETRIES' scripts/buildbuddy-ci-lane &&
