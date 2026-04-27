@@ -206,13 +206,14 @@ fi
 
 if [[ -x scripts/run-surface-feature-matrix ]] &&
   grep -Fq './scripts/run-surface-feature-matrix' .github/workflows/ci.yml &&
-  grep -Fq 'scripts/run-surface-feature-matrix' tools/buildbuddy/cargo_lane_test.sh &&
   grep -Fq -- '-p meerkat-rpc \' scripts/run-surface-feature-matrix &&
   grep -Fq -- '-p meerkat-rest \' scripts/run-surface-feature-matrix &&
-  grep -Fq -- '-p meerkat-mcp-server' scripts/run-surface-feature-matrix; then
-  pass "Surface feature matrix uses shared grouped Cargo checks in Cargo and BuildBuddy CI"
+  grep -Fq -- '-p meerkat-mcp-server' scripts/run-surface-feature-matrix &&
+  grep -Fq 'default_target="//:surface_feature_matrix_builds"' scripts/buildbuddy-bazel-poc &&
+  ! grep -Fq 'test-feature-matrix-surface-checks)' tools/buildbuddy/cargo_lane_test.sh; then
+  pass "Surface feature matrix keeps Cargo checks for Cargo CI and uses Bazel-native targets for BuildBuddy CI"
 else
-  bad "Surface feature matrix is not shared between Cargo and BuildBuddy CI"
+  bad "Surface feature matrix is not split cleanly between Cargo and BuildBuddy CI"
 fi
 
 if [[ -x scripts/run-build-backend-lane ]] &&
@@ -328,6 +329,18 @@ if grep -Fq 'default_target="//tools/buildbuddy:sdk_suites_cargo_equivalent_test
   pass "BuildBuddy SDK, WASM, and audit lanes use real cargo-equivalent Bazel test targets"
 else
   bad "BuildBuddy SDK, WASM, or audit lane is still static, host-only, or unmapped"
+fi
+
+if grep -Fq 'default_target="//:surface_feature_matrix_builds"' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'command="build"' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'name = "surface_feature_matrix_builds"' BUILD.bazel &&
+  grep -Fq 'meerkat_rpc_surface_min' meerkat-rpc/BUILD.bazel &&
+  grep -Fq 'meerkat_rest_surface_comms' meerkat-rest/BUILD.bazel &&
+  grep -Fq 'meerkat_mcp_server_surface_comms' meerkat-mcp-server/BUILD.bazel &&
+  grep -Fq 'rkat_surface_session_store_comms_mcp_bin' meerkat-cli/BUILD.bazel; then
+  pass "BuildBuddy surface feature matrix uses Bazel-native feature-variant build targets"
+else
+  bad "BuildBuddy surface feature matrix still routes through cargo-in-shell"
 fi
 
 if awk '

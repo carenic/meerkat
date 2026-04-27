@@ -53,7 +53,6 @@ sh_test(
     for name, lane in {
         "minimal_feature_builds_cargo_equivalent_test": "test-minimal",
         "feature_matrix_lib_cargo_equivalent_test": "test-feature-matrix-lib",
-        "feature_matrix_surface_cargo_equivalent_test": "test-feature-matrix-surface-checks",
     }.items()
 ]
 

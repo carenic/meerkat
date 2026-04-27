@@ -74,10 +74,6 @@ case "${lane}" in
     "${CARGO}" check -p meerkat-mob --no-default-features --features runtime-adapter
     "${CARGO}" test -p meerkat --features all-providers,comms,mcp --lib --tests
     ;;
-  test-feature-matrix-surface-checks)
-    CARGO="${CARGO}" scripts/run-surface-feature-matrix
-    CARGO="${CARGO}" ROOT="${work_root}" scripts/check_surface_modularity.sh
-    ;;
   *)
     echo "unknown cargo-equivalent BuildBuddy lane: ${lane}" >&2
     exit 2

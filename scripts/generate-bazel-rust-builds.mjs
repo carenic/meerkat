@@ -447,7 +447,7 @@ const packageRunfileLabels = [...localPackages.values()]
 packageRunfileLabels.push("//vendor/oai-rt-rs:package_runfiles");
 packageRunfileLabels.sort();
 
-function writeRootBuild(fastTestLabels, e2eSystemTestLabels) {
+function writeRootBuild(fastTestLabels, e2eSystemTestLabels, surfaceFeatureMatrixLabels) {
   const lines = [
     `# Root package marker for Bazel module extension labels.`,
     ``,
@@ -553,11 +553,47 @@ function writeRootBuild(fastTestLabels, e2eSystemTestLabels) {
       ``,
     );
   }
+  if (surfaceFeatureMatrixLabels.length) {
+    lines.push(
+      `filegroup(`,
+      `    name = "surface_feature_matrix_builds",`,
+      `    srcs = ${listExpr(surfaceFeatureMatrixLabels, 8)},`,
+      `    visibility = ["//visibility:public"],`,
+      `)`,
+      ``,
+    );
+  }
   writeGenerated(resolve(root, "BUILD.bazel"), lines.join("\n"));
 }
 
+const surfaceFeatureVariantSpecs = [
+  { name: "surface_min", packageKey: "meerkat-rpc", features: [], targetNames: null },
+  { name: "surface_comms_mcp", packageKey: "meerkat-rpc", features: ["comms", "mcp"], targetNames: null },
+  { name: "surface_mini", packageKey: "meerkat-rpc", features: ["mini-surface"], targetNames: ["rkat-rpc-mini"] },
+  { name: "surface_min", packageKey: "meerkat-rest", features: [], targetNames: null },
+  { name: "surface_comms", packageKey: "meerkat-rest", features: ["comms"], targetNames: null },
+  { name: "surface_min", packageKey: "meerkat-mcp-server", features: [], targetNames: null },
+  { name: "surface_comms", packageKey: "meerkat-mcp-server", features: ["comms"], targetNames: null },
+  { name: "surface_session_store", packageKey: "meerkat-cli", features: ["session-store"], targetNames: null },
+  { name: "surface_session_store_mcp", packageKey: "meerkat-cli", features: ["session-store", "mcp"], targetNames: null },
+  {
+    name: "surface_mini_providers",
+    packageKey: "meerkat-cli",
+    features: ["anthropic", "openai", "gemini", "jsonl-store", "session-store"],
+    targetNames: ["rkat-mini"],
+  },
+  {
+    name: "surface_mini_providers_skills",
+    packageKey: "meerkat-cli",
+    features: ["anthropic", "openai", "gemini", "jsonl-store", "session-store", "skills"],
+    targetNames: ["rkat-mini"],
+  },
+  { name: "surface_session_store_comms_mcp", packageKey: "meerkat-cli", features: ["session-store", "comms", "mcp"], targetNames: null },
+];
+
 const fastTestLabels = [];
 const e2eSystemTestLabels = [];
+const surfaceFeatureMatrixLabels = [];
 
 for (const pkg of localPackages.values()) {
   const dir = packageDir(pkg);
@@ -569,6 +605,7 @@ for (const pkg of localPackages.values()) {
   const libOrMacro = pkg.targets.find((target) =>
     target.kind.includes("proc-macro") || target.kind.includes("lib")
   );
+  const key = packageKey(pkg);
 
   for (const target of pkg.targets) {
     const rule = targetRule(target);
@@ -593,7 +630,6 @@ for (const pkg of localPackages.values()) {
       ? [...new Set([packageLabel(pkg), ...localDeps(pkg, false)])].sort()
       : localDeps(pkg, false);
     const procMacroDeps = localDeps(pkg, true);
-    const key = packageKey(pkg);
     const externalNormal = `all_crate_deps(\n        package_name = ${q(key)},\n        normal = True,\n    )`;
     const externalNormalWithDev = `all_crate_deps(\n        package_name = ${q(key)},\n        normal = True,\n        normal_dev = True,\n    )`;
     const externalProc = `all_crate_deps(\n        package_name = ${q(key)},\n        proc_macro = True,\n    )`;
@@ -787,6 +823,81 @@ for (const pkg of localPackages.values()) {
     }
   }
 
+  const packageSurfaceSpecs = surfaceFeatureVariantSpecs.filter((spec) => spec.packageKey === key);
+  if (packageSurfaceSpecs.length) {
+    const externalNormal = `all_crate_deps(\n        package_name = ${q(key)},\n        normal = True,\n    )`;
+    const externalProc = `all_crate_deps(\n        package_name = ${q(key)},\n        proc_macro = True,\n    )`;
+    const optionalExternal = optionalExternalDeps(pkg);
+    const procMacroDeps = localDeps(pkg, true);
+    const procExpr = procMacroDeps.length
+      ? `${listExpr(procMacroDeps)} + ${externalProc}`
+      : externalProc;
+    const aliasesExpr = `aliases(package_name = ${q(key)})`;
+    const packageBuildTargets = pkg.targets.filter((target) => {
+      const rule = targetRule(target);
+      return (rule === "rust_library" || rule === "rust_binary") &&
+        !target.kind.includes("bench") &&
+        !target.kind.includes("example");
+    });
+    for (const spec of packageSurfaceSpecs) {
+      const explicitNames = spec.targetNames ? new Set(spec.targetNames) : null;
+      const selectedTargets = packageBuildTargets.filter((target) =>
+        explicitNames ? explicitNames.has(target.name) : true
+      );
+      if (explicitNames && libOrMacro && !selectedTargets.some((target) => target.name === libOrMacro.name)) {
+        selectedTargets.unshift(libOrMacro);
+      }
+      const libVariantNames = new Map();
+      for (const target of selectedTargets) {
+        if (target.kind.includes("proc-macro") || target.kind.includes("lib")) {
+          libVariantNames.set(target.name, `${crateName(target.name)}_${spec.name}`);
+        }
+      }
+      const primaryLibVariantName = libOrMacro ? libVariantNames.get(libOrMacro.name) : null;
+      for (const target of selectedTargets) {
+        const rule = targetRule(target);
+        if (rule !== "rust_library" && rule !== "rust_binary") continue;
+        const targetCompileData = compileData(target, dir, false);
+        const compileDataExpr = `${listExpr(targetCompileData.paths, 8)}${
+          targetCompileData.labels.length ? ` + ${listExpr(targetCompileData.labels, 8)}` : ""
+        }`;
+        const name = target.kind.includes("proc-macro") || target.kind.includes("lib")
+          ? `${crateName(target.name)}_${spec.name}`
+          : `${crateName(target.name)}_${spec.name}_bin`;
+        const localDependencyLabels = target.kind.includes("bin") && primaryLibVariantName
+          ? [...new Set([`:${primaryLibVariantName}`, ...localDeps(pkg, false)])]
+          : localDeps(pkg, false);
+        const depsWithOptionalExternal = [...new Set([...localDependencyLabels, ...optionalExternal])].sort();
+        const depsExpr = depsWithOptionalExternal.length
+          ? `${listExpr(depsWithOptionalExternal)} + ${externalNormal}`
+          : externalNormal;
+        const attrs = [
+          `    name = ${q(name)},`,
+          `    aliases = ${aliasesExpr},`,
+          `    crate_name = ${q(crateName(target.name))},`,
+          `    crate_root = ${q(relative(dir, target.src_path))},`,
+          `    crate_features = ${listExpr(spec.features)},`,
+          `    edition = "2024",`,
+          `    compile_data = ${compileDataExpr},`,
+          `    srcs = glob(["src/**/*.rs"]),`,
+          `    visibility = ["//visibility:public"],`,
+        ];
+        if (rule === "rust_binary") {
+          attrs.push(
+            `    rustc_env = {\n        "CARGO_BIN_NAME": ${q(target.name)},\n        "CARGO_MANIFEST_DIR": ${q(relative(root, dir) || ".")},\n    },`,
+          );
+        }
+        attrs.push(
+          `    tags = ${listExpr(["buildbuddy", "feature-matrix", "surface"])},`,
+          `    proc_macro_deps = ${procExpr},`,
+          `    deps = ${depsExpr},`,
+        );
+        rules.push(`${rule}(\n${attrs.join("\n")}\n)`);
+        surfaceFeatureMatrixLabels.push(`//${relative(root, dir)}:${name}`);
+      }
+    }
+  }
+
   if (rules.length === 0) continue;
   if (packageFastTests.length) {
     rules.push(`test_suite(\n    name = "fast_tests",\n    tests = ${listExpr(packageFastTests.sort())},\n)`);
@@ -816,7 +927,11 @@ for (const pkg of localPackages.values()) {
   );
 }
 
-writeRootBuild([...new Set(fastTestLabels)].sort(), [...new Set(e2eSystemTestLabels)].sort());
+writeRootBuild(
+  [...new Set(fastTestLabels)].sort(),
+  [...new Set(e2eSystemTestLabels)].sort(),
+  [...new Set(surfaceFeatureMatrixLabels)].sort(),
+);
 if (checkOnly && staleFileCount > 0) {
   console.error(`${staleFileCount} generated Bazel file(s) are stale; run node scripts/generate-bazel-rust-builds.mjs`);
   process.exit(1);

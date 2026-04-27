@@ -35,7 +35,7 @@ Common commands:
                             Cargo-equivalent minimal feature lane as a Bazel test action.
   feature-matrix-lib-rbe    Cargo-equivalent library feature matrix as a Bazel test action.
   feature-matrix-surface-rbe
-                            Cargo-equivalent surface feature matrix as a Bazel test action.
+                            Bazel-native surface feature matrix build targets.
   fast-test                  Root //:fast_tests suite.
   owned-fast-test <path>     Owning fast suite or exact fast test for a path.
   owned-build <path>         Owning build label for a path.
@@ -392,12 +392,10 @@ case "${command}" in
     )
     ;;
   feature-matrix-surface-rbe)
-    command="test"
+    command="build"
     config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
-    default_target="//tools/buildbuddy:feature_matrix_surface_cargo_equivalent_test"
+    default_target="//:surface_feature_matrix_builds"
     extra_args+=(
-      --test_output=errors
-      --test_summary=terse
       --color=no
       --curses=no
     )

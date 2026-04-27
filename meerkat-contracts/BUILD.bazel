@@ -189,6 +189,56 @@ rust_test(
 )
 
 rust_test(
+    name = "image_generation_wire_test",
+    aliases = aliases(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "image_generation_wire",
+    crate_root = "tests/image_generation_wire.rs",
+    crate_features = [
+        "schema",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/image_generation_wire.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "image_generation_wire",
+        "CARGO_MANIFEST_DIR": "./meerkat-contracts",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-contracts",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-schedule:meerkat_schedule",
+    ] + all_crate_deps(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "realtime_audio_format_test",
     aliases = aliases(
         package_name = "meerkat-contracts",
@@ -542,6 +592,7 @@ test_suite(
     name = "fast_tests",
     tests = [
         ":connection_ref_wire_test",
+        ":image_generation_wire_test",
         ":meerkat_contracts_unit_test",
         ":realtime_audio_format_test",
         ":realtime_barge_in_test",
