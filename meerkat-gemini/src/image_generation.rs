@@ -13,6 +13,11 @@ use meerkat_core::lifecycle::run_primitive::ModelId;
 use serde::{Deserialize, Serialize};
 
 const GEMINI_IMAGE_DEFAULT_MODEL: &str = "gemini-3.1-flash-image-preview";
+const GEMINI_IMAGE_MODELS: &[&str] = &[
+    GEMINI_IMAGE_DEFAULT_MODEL,
+    "gemini-3-pro-image-preview",
+    "gemini-2.5-flash-image",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeminiImageTurnPlan {
@@ -109,8 +114,7 @@ impl ImageGenerationProviderProfile for GeminiImageGenerationProfile {
     }
 
     fn owns_model(&self, model: &str) -> bool {
-        matches!(Provider::infer_from_model(model), Some(Provider::Gemini))
-            || model.starts_with("gemini-")
+        is_supported_gemini_image_model(model)
     }
 
     fn image_generation_documentation(&self) -> Option<&'static str> {
@@ -130,6 +134,9 @@ impl ImageGenerationProviderProfile for GeminiImageGenerationProfile {
         capabilities: ImageGenerationTargetCapabilities,
         max_count: NonZeroU32,
     ) -> Result<ImageGenerationProviderResolution, ImageOperationDenialReason> {
+        if !self.owns_model(requested_model.as_str()) {
+            return Err(ImageOperationDenialReason::UnsupportedTarget);
+        }
         let output = gemini_image_output_options_with_provider_params(
             requested_model.as_str(),
             &request.size,
@@ -152,6 +159,10 @@ impl ImageGenerationProviderProfile for GeminiImageGenerationProfile {
             },
         })
     }
+}
+
+fn is_supported_gemini_image_model(model: &str) -> bool {
+    GEMINI_IMAGE_MODELS.contains(&model)
 }
 
 pub fn gemini_image_output_options(
@@ -275,7 +286,7 @@ mod tests {
         let resolution = GeminiImageGenerationProfile
             .resolve_execution_plan(
                 operation_id()?,
-                &ModelId::new("gemini-image-model"),
+                &ModelId::new(GEMINI_IMAGE_DEFAULT_MODEL),
                 &request,
                 capabilities(),
                 NonZeroU32::MIN,
@@ -298,7 +309,7 @@ mod tests {
 
         let result = GeminiImageGenerationProfile.resolve_execution_plan(
             operation_id()?,
-            &ModelId::new("gemini-image-model"),
+            &ModelId::new(GEMINI_IMAGE_DEFAULT_MODEL),
             &request,
             capabilities(),
             NonZeroU32::MIN,
@@ -307,6 +318,26 @@ mod tests {
         assert!(matches!(
             result,
             Err(ImageOperationDenialReason::ProjectionUnsupported)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn profile_rejects_non_image_gemini_models() -> Result<(), Box<dyn std::error::Error>> {
+        let request = generate_request(serde_json::Value::Null)?;
+
+        assert!(!GeminiImageGenerationProfile.owns_model("gemini-3-flash-preview"));
+        let result = GeminiImageGenerationProfile.resolve_execution_plan(
+            operation_id()?,
+            &ModelId::new("gemini-3-flash-preview"),
+            &request,
+            capabilities(),
+            NonZeroU32::MIN,
+        );
+
+        assert!(matches!(
+            result,
+            Err(ImageOperationDenialReason::UnsupportedTarget)
         ));
         Ok(())
     }

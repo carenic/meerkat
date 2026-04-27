@@ -846,6 +846,19 @@ impl meerkat_core::ImageGenerationPlanner for CompositeImageGenerationPlanner {
             capabilities,
             one,
         )?;
+        let requires_scoped_override = resolution.execution_plan.requires_scoped_override();
+        let machine_routing_realtime_capable = if requires_scoped_override {
+            model_realtime_capable(
+                resolution.execution_plan.provider.0.as_str(),
+                resolution.provider_call_model.as_str(),
+            )
+        } else {
+            effective_provider
+                .map(|provider| {
+                    model_realtime_capable(provider.as_str(), status.effective_model.as_str())
+                })
+                .unwrap_or(false)
+        };
         let machine_routing_model = if resolution.execution_plan.requires_scoped_override() {
             resolution.provider_call_model.clone()
         } else {
@@ -854,7 +867,7 @@ impl meerkat_core::ImageGenerationPlanner for CompositeImageGenerationPlanner {
         Ok(meerkat_core::ImageGenerationResolvedPlan {
             provider_model: resolution.provider_call_model,
             machine_routing_model,
-            machine_routing_realtime_capable: true,
+            machine_routing_realtime_capable,
             execution_plan: resolution.execution_plan,
             projected_messages: image_projection_messages(request),
         })
@@ -889,6 +902,13 @@ fn image_projection_messages(
     vec![meerkat_core::Message::User(
         meerkat_core::UserMessage::text(text),
     )]
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn model_realtime_capable(provider: &str, model: &str) -> bool {
+    meerkat_core::model_profile::capabilities::capabilities_for(provider, model)
+        .map(|caps| caps.realtime)
+        .unwrap_or(false)
 }
 
 /// Return `true` when the OpenAI model ID advertises
@@ -3456,6 +3476,100 @@ mod tests {
         assert!(
             caps.iter().any(|cap| cap.as_str() == "comms"),
             "per-session comms identity should expose comms capability to skills"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn image_planner_derives_scoped_target_realtime_capability() {
+        use meerkat_core::ImageGenerationPlanner as _;
+
+        struct NativeImageProfile;
+
+        impl meerkat_core::ImageGenerationProviderProfile for NativeImageProfile {
+            fn canonical_provider(&self) -> &'static str {
+                "gemini"
+            }
+
+            fn default_model_for_session(
+                &self,
+                _effective_provider: Option<Provider>,
+                _effective_model: &meerkat_core::lifecycle::run_primitive::ModelId,
+            ) -> meerkat_core::lifecycle::run_primitive::ModelId {
+                meerkat_core::lifecycle::run_primitive::ModelId::new(
+                    "gemini-3.1-flash-image-preview",
+                )
+            }
+
+            fn owns_model(&self, model: &str) -> bool {
+                model == "gemini-3.1-flash-image-preview"
+            }
+
+            fn resolve_execution_plan(
+                &self,
+                _operation_id: meerkat_core::ImageOperationId,
+                requested_model: &meerkat_core::lifecycle::run_primitive::ModelId,
+                _request: &meerkat_core::GenerateImageRequest,
+                capabilities: meerkat_core::ImageGenerationTargetCapabilities,
+                max_count: std::num::NonZeroU32,
+            ) -> Result<
+                meerkat_core::ImageGenerationProviderResolution,
+                meerkat_core::ImageOperationDenialReason,
+            > {
+                Ok(meerkat_core::ImageGenerationProviderResolution {
+                    provider_call_model: requested_model.clone(),
+                    execution_plan: meerkat_core::GenerateImageExecutionPlan {
+                        provider: meerkat_core::ProviderId::new("gemini"),
+                        backend: meerkat_core::ImageGenerationBackendKind::NativeModel,
+                        max_count,
+                        capabilities,
+                        requires_scoped_override: true,
+                        provider_plan: serde_json::Value::Null,
+                    },
+                })
+            }
+        }
+
+        let planner = CompositeImageGenerationPlanner::new(vec![Arc::new(NativeImageProfile)]);
+        let status = meerkat_core::SessionModelRoutingStatus::new(
+            meerkat_core::lifecycle::run_primitive::ModelId::new("gpt-realtime"),
+            None,
+            None,
+            None,
+        );
+        let request = meerkat_core::GenerateImageRequest::new(
+            meerkat_core::ImageGenerationIntent::Generate {
+                prompt: meerkat_core::PromptText::new("draw a cat").unwrap(),
+                prompt_source: meerkat_core::PromptSource::ModelDistilled {
+                    tool_call_id: meerkat_core::ToolCallId::new("tool-call"),
+                },
+                reference_images: Vec::new(),
+            },
+            meerkat_core::ImageGenerationTargetPreference::ProviderDefault {
+                provider: meerkat_core::ProviderId::new("gemini"),
+            },
+            meerkat_core::ImageSizePreference::Square1024,
+            meerkat_core::ImageQualityPreference::Auto,
+            meerkat_core::ImageFormatPreference::Png,
+            std::num::NonZeroU32::MIN,
+        )
+        .unwrap();
+
+        let plan = planner
+            .resolve_image_generation_plan(
+                &status,
+                serde_json::from_str("\"00000000-0000-0000-0000-000000000000\"").unwrap(),
+                &request,
+            )
+            .unwrap();
+
+        assert_eq!(
+            plan.machine_routing_model.as_str(),
+            "gemini-3.1-flash-image-preview"
+        );
+        assert!(
+            !plan.machine_routing_realtime_capable,
+            "uncatalogued Gemini image models must not be treated as realtime-capable"
         );
     }
 
