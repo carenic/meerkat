@@ -2979,8 +2979,14 @@ mod tests {
             )
             .expect("complete should succeed");
 
-        // Wait for TTL to expire
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Backdate the completed job instead of sleeping; this keeps the test
+        // focused on cleanup behavior rather than wall-clock waiting.
+        manager.completed_at.lock().await.insert(
+            job_id.clone(),
+            Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .expect("2 seconds before now should be representable"),
+        );
 
         // Trigger cleanup (spawning a new job triggers cleanup_old_jobs internally)
         let _trigger = manager
@@ -2999,6 +3005,12 @@ mod tests {
         assert!(
             !drained.is_empty(),
             "drain_completed must return the unnotified completion"
+        );
+        manager.completed_at.lock().await.insert(
+            job_id.clone(),
+            Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .expect("2 seconds before now should be representable"),
         );
 
         // Trigger cleanup again

@@ -1,0 +1,606 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_macro", "rust_test")
+
+
+
+filegroup(
+
+    name = "cargo_manifest",
+
+    srcs = ["Cargo.toml"],
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+filegroup(
+
+    name = "package_runfiles",
+
+    srcs = glob(["Cargo.toml", "**/*"], exclude = ["BUILD", "BUILD.bazel"], allow_empty = True),
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+rust_library(
+    name = "meerkat_mcp_server",
+    aliases = aliases(package_name = "meerkat-mcp-server"),
+    crate_name = "meerkat_mcp_server",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "comms",
+        "schedule",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        normal = True,
+    ),
+)
+
+rust_test(
+    name = "meerkat_mcp_server_unit_test",
+    aliases = aliases(
+        package_name = "meerkat-mcp-server",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "meerkat_mcp_server",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "comms",
+        "schedule",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "./meerkat-mcp-server",
+    },
+    tags = [
+        "fast",
+        "unit",
+    ],
+    size = "small",
+    data = [
+        "//:test_fixtures",
+        "//test-fixtures/machine-dsl-tests:package_runfiles",
+        "//test-fixtures/mcp-test-server:package_runfiles",
+        "//test-fixtures/surface-build-fixtures:package_runfiles",
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_binary(
+    name = "rkat_mcp_bin",
+    aliases = aliases(package_name = "meerkat-mcp-server"),
+    crate_name = "rkat_mcp",
+    crate_root = "src/main.rs",
+    crate_features = [
+        "comms",
+        "schedule",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "rkat-mcp",
+        "CARGO_MANIFEST_DIR": "meerkat-mcp-server",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-mcp-server:meerkat_mcp_server",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        normal = True,
+    ),
+)
+
+rust_test(
+    name = "binary_stdio_e2e_test",
+    aliases = aliases(
+        package_name = "meerkat-mcp-server",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "binary_stdio_e2e",
+    crate_root = "tests/binary_stdio_e2e.rs",
+    crate_features = [
+        "comms",
+        "schedule",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ] + [
+        "//:live_smoke_support",
+    ],
+    srcs = [
+        "tests/binary_stdio_e2e.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "binary_stdio_e2e",
+        "CARGO_MANIFEST_DIR": "./meerkat-mcp-server",
+    },
+    tags = [
+        "e2e",
+    ],
+    data = [
+        ":package_runfiles",
+        "//:workspace_cargo_manifests",
+        "//:workspace_metadata",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-mcp-server:meerkat_mcp_server",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "live_mcp_matrix_test",
+    aliases = aliases(
+        package_name = "meerkat-mcp-server",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "live_mcp_matrix",
+    crate_root = "tests/live_mcp_matrix.rs",
+    crate_features = [
+        "comms",
+        "schedule",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ] + [
+        "//:live_smoke_support",
+    ],
+    srcs = [
+        "tests/live_mcp_matrix.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "live_mcp_matrix",
+        "CARGO_MANIFEST_DIR": "./meerkat-mcp-server",
+    },
+    tags = [
+        "live",
+    ],
+    data = [
+        ":package_runfiles",
+        "//:test_fixtures",
+        "//test-fixtures/machine-dsl-tests:package_runfiles",
+        "//test-fixtures/mcp-test-server:package_runfiles",
+        "//test-fixtures/surface-build-fixtures:package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-mcp-server:meerkat_mcp_server",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "mcp_binding_input_test",
+    aliases = aliases(
+        package_name = "meerkat-mcp-server",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "mcp_binding_input",
+    crate_root = "tests/mcp_binding_input.rs",
+    crate_features = [
+        "comms",
+        "schedule",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ] + [
+        "//:live_smoke_support",
+    ],
+    srcs = [
+        "tests/mcp_binding_input.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "mcp_binding_input",
+        "CARGO_MANIFEST_DIR": "./meerkat-mcp-server",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-mcp-server:meerkat_mcp_server",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "runtime_backed_ingress_test",
+    aliases = aliases(
+        package_name = "meerkat-mcp-server",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "runtime_backed_ingress",
+    crate_root = "tests/runtime_backed_ingress.rs",
+    crate_features = [
+        "comms",
+        "schedule",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ] + [
+        "//:live_smoke_support",
+    ],
+    srcs = [
+        "tests/runtime_backed_ingress.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "runtime_backed_ingress",
+        "CARGO_MANIFEST_DIR": "./meerkat-mcp-server",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-mcp-server:meerkat_mcp_server",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_library(
+    name = "meerkat_mcp_server_surface_min",
+    aliases = aliases(package_name = "meerkat-mcp-server"),
+    crate_name = "meerkat_mcp_server",
+    crate_root = "src/lib.rs",
+    crate_features = [],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    tags = [
+        "buildbuddy",
+        "feature-matrix",
+        "surface",
+    ],
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        normal = True,
+    ),
+)
+
+rust_binary(
+    name = "rkat_mcp_surface_min_bin",
+    aliases = aliases(package_name = "meerkat-mcp-server"),
+    crate_name = "rkat_mcp",
+    crate_root = "src/main.rs",
+    crate_features = [],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "rkat-mcp",
+        "CARGO_MANIFEST_DIR": "meerkat-mcp-server",
+    },
+    tags = [
+        "buildbuddy",
+        "feature-matrix",
+        "surface",
+    ],
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+        ":meerkat_mcp_server_surface_min",
+    ] + all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        normal = True,
+    ),
+)
+
+rust_library(
+    name = "meerkat_mcp_server_surface_comms",
+    aliases = aliases(package_name = "meerkat-mcp-server"),
+    crate_name = "meerkat_mcp_server",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "comms",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    tags = [
+        "buildbuddy",
+        "feature-matrix",
+        "surface",
+    ],
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+    ] + all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        normal = True,
+    ),
+)
+
+rust_binary(
+    name = "rkat_mcp_surface_comms_bin",
+    aliases = aliases(package_name = "meerkat-mcp-server"),
+    crate_name = "rkat_mcp",
+    crate_root = "src/main.rs",
+    crate_features = [
+        "comms",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "rkat-mcp",
+        "CARGO_MANIFEST_DIR": "meerkat-mcp-server",
+    },
+    tags = [
+        "buildbuddy",
+        "feature-matrix",
+        "surface",
+    ],
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-client:meerkat_client",
+        "//meerkat-comms:meerkat_comms",
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-mob-mcp:meerkat_mob_mcp",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-store:meerkat_store",
+        "//meerkat-tools:meerkat_tools",
+        "//meerkat:meerkat",
+        ":meerkat_mcp_server_surface_comms",
+    ] + all_crate_deps(
+        package_name = "meerkat-mcp-server",
+        normal = True,
+    ),
+)
+
+test_suite(
+    name = "fast_tests",
+    tests = [
+        ":mcp_binding_input_test",
+        ":meerkat_mcp_server_unit_test",
+        ":runtime_backed_ingress_test",
+    ],
+)

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_cargo="${script_dir}/repo-cargo"
+
+exec "${repo_cargo}" nextest run \
+  --workspace \
+  --profile fast \
+  --show-progress none \
+  --status-level none \
+  --final-status-level fail \
+  "$@"

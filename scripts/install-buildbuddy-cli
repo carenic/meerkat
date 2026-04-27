@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+version="5.0.350"
+install_dir="${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-cli/${version}/bin"
+
+usage() {
+  cat <<'USAGE'
+usage: install-buildbuddy-cli [--dir <dir>]
+
+Installs the pinned BuildBuddy CLI used by the optional BuildBuddy/Bazel lanes.
+The binary is downloaded from buildbuddy-io/bazel releases and checked against
+a pinned SHA-256 digest for the host OS/architecture.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dir)
+      install_dir="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+arch="$(uname -m)"
+case "${arch}" in
+  aarch64) arch="arm64" ;;
+  amd64) arch="x86_64" ;;
+esac
+
+case "${os}-${arch}" in
+  darwin-arm64)
+    sha256="f16cc54449eb62ee65ac7ec3b45d7bce7922225a3c004925cbb25982faa8a9cd"
+    ;;
+  darwin-x86_64)
+    sha256="9389cd6669c38b6c98c9458d3f3d4aa2d1f77a9de844a5a36e8094f5e2a4ecdd"
+    ;;
+  linux-arm64)
+    sha256="84e2d1a8c176259382080436103196962cdfc993baf87d25e0eaf39038db8469"
+    ;;
+  linux-x86_64)
+    sha256="d14e6a240dc5e8bc3ebb625ff7c139ba8e380f1440f9e2f60e9c1d7850d012c9"
+    ;;
+  *)
+    echo "unsupported BuildBuddy CLI platform: ${os}-${arch}" >&2
+    exit 1
+    ;;
+esac
+
+mkdir -p "${install_dir}"
+bb_bin="${install_dir}/bb"
+if [[ -x "${bb_bin}" ]] && "${bb_bin}" version 2>/dev/null | grep -q "bb ${version}"; then
+  printf '%s\n' "${bb_bin}"
+  exit 0
+fi
+
+tmp="$(mktemp "${TMPDIR:-/tmp}/buildbuddy-cli.XXXXXX")"
+cleanup() {
+  rm -f "${tmp}"
+}
+trap cleanup EXIT
+
+url="https://github.com/buildbuddy-io/bazel/releases/download/${version}/bazel-${version}-${os}-${arch}"
+curl -fsSL "${url}" -o "${tmp}"
+
+actual="$(shasum -a 256 "${tmp}" | awk '{print $1}')"
+if [[ "${actual}" != "${sha256}" ]]; then
+  echo "BuildBuddy CLI checksum mismatch for ${url}" >&2
+  echo "expected: ${sha256}" >&2
+  echo "actual:   ${actual}" >&2
+  exit 1
+fi
+
+chmod 0755 "${tmp}"
+mv "${tmp}" "${bb_bin}"
+printf '%s\n' "${bb_bin}"

@@ -5,4 +5,6 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 cd "$ROOT"
 
-exec cargo xtask machine-verify --all "$@"
+CARGO="${CARGO:-./scripts/repo-cargo}"
+
+exec "$CARGO" xtask machine-verify --all "$@"

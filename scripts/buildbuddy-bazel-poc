@@ -1,0 +1,687 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: buildbuddy-bazel-poc [changed-path ...] [bazel args...]
+
+Runs the optional BuildBuddy/Bazel lane selected by BUILDBUDDY_BAZEL_COMMAND.
+Cargo remains the default developer path; this script is for opt-in remote
+execution/cache experiments and CI gates.
+
+Common commands:
+  workspace-test             Full Bazel workspace test lane.
+  workspace-test-rbe         Remote-compatible workspace test lane.
+  workspace-fast-rbe         Cargo-fast-equivalent remote workspace test lane.
+  workspace-unit-rbe         Unit-test-only remote workspace test lane.
+  workspace-integration-fast-rbe
+                            Integration-fast remote workspace test lane.
+  workspace-fast-clippy-rbe  Fast tests plus clippy aspect.
+  workspace-build-clippy-rbe Build/clippy labels for the workspace build set.
+  e2e-system-rbe           Bazel-native system e2e suite with runfile binaries.
+  e2e-fast-rbe             Bazel-native fast e2e lane.
+  e2e-live-rbe             Bazel-native live e2e lane.
+  e2e-smoke-rbe            Bazel-native smoke e2e lane.
+  machine-authority-rbe    Bazel-native machine authority lane.
+  rmat-audit-rbe           Bazel-native RMAT + ownership audit lane.
+  seam-inventory-rbe       Bazel-native strict seam inventory lane.
+  fmt-static-rbe           Bazel-native formatting and static source gates.
+  feature-clippy-rbe       Bazel-native clippy lane for feature-covered build labels.
+  sdk-suites-rbe           Bazel-native SDK parity and wrapper coverage lane.
+  wasm-contract-rbe        Bazel-native WASM contract lane.
+  wasm-check-rbe           Bazel-native WASM compilation check lane.
+  security-audit-rbe       Bazel-native dependency/security audit lane.
+  minimal-feature-builds-rbe
+                            Cargo-equivalent minimal feature lane as a Bazel test action.
+  feature-matrix-lib-rbe    Cargo-equivalent library feature matrix as a Bazel test action.
+  feature-matrix-surface-rbe
+                            Bazel-native surface feature matrix build targets.
+  fast-test                  Root //:fast_tests suite.
+  owned-fast-test <path>     Owning fast suite or exact fast test for a path.
+  owned-build <path>         Owning build label for a path.
+  owned-clippy-rbe <path>    Owning build/test labels with clippy -D warnings.
+  affected-*                 Reverse-dependency variants of owned-* commands.
+
+Examples:
+  BUILDBUDDY_BAZEL_COMMAND=workspace-fast-rbe scripts/buildbuddy-bazel-poc --jobs=64
+  BUILDBUDDY_BAZEL_COMMAND=owned-clippy-rbe scripts/buildbuddy-bazel-poc meerkat/src/lib.rs --jobs=64
+
+Use scripts/buildbuddy-changed-gate --dry-run <path> to inspect selected labels
+without running Bazel.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
+if [[ -z "${BUILDBUDDY_API_KEY:-}" && -f "${HOME}/.zshrc" ]]; then
+  key_line="$(grep -m1 -E '^[[:space:]]*(export[[:space:]]+)?BUILDBUDDY_API_KEY=' "${HOME}/.zshrc" || true)"
+  if [[ -n "${key_line}" ]]; then
+    key_value="${key_line#*=}"
+    key_value="${key_value%%[[:space:]]#*}"
+    key_value="${key_value%\"}"
+    key_value="${key_value#\"}"
+    key_value="${key_value%\'}"
+    key_value="${key_value#\'}"
+    if [[ -n "${key_value}" && "${key_value}" != *'$'* && "${key_value}" != *'`'* ]]; then
+      BUILDBUDDY_API_KEY="${key_value}"
+      export BUILDBUDDY_API_KEY
+    fi
+  fi
+fi
+if [[ -z "${BUILDBUDDY_API_KEY:-}" && -f "${HOME}/.zshrc" ]]; then
+  BUILDBUDDY_API_KEY="$(zsh -lc 'source ~/.zshrc >/dev/null 2>&1 || true; print -r -- ${BUILDBUDDY_API_KEY-}')"
+  export BUILDBUDDY_API_KEY
+fi
+
+if [[ -z "${BUILDBUDDY_API_KEY:-}" ]]; then
+  echo "error: BUILDBUDDY_API_KEY is not set" >&2
+  exit 1
+fi
+
+workspace_root="$(git rev-parse --show-toplevel)"
+
+if [[ -n "${BUILDBUDDY_BB:-}" ]]; then
+  bb_bin="${BUILDBUDDY_BB}"
+elif command -v bb >/dev/null 2>&1; then
+  bb_bin="bb"
+elif [[ -x "${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-cli/5.0.350/bin/bb" ]]; then
+  bb_bin="${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-cli/5.0.350/bin/bb"
+elif [[ -x /tmp/buildbuddy-poc/bin/bb ]]; then
+  bb_bin="/tmp/buildbuddy-poc/bin/bb"
+else
+  echo "error: bb is not installed; run make buildbuddy-install or set BUILDBUDDY_BB" >&2
+  exit 1
+fi
+
+config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy}"
+command="${BUILDBUDDY_BAZEL_COMMAND:-build}"
+requested_command="${command}"
+extra_args=()
+fast_test_tag_filters="-local,-e2e,-system,-live,-integration,-slow,-required-feature,-trybuild,-snapshot,-fixture"
+e2e_test_env=(
+  --test_env=ANTHROPIC_API_KEY
+  --test_env=RKAT_ANTHROPIC_API_KEY
+  --test_env=OPENAI_API_KEY
+  --test_env=RKAT_OPENAI_API_KEY
+  --test_env=GEMINI_API_KEY
+  --test_env=RKAT_GEMINI_API_KEY
+  --test_env=GOOGLE_API_KEY
+  --test_env=PATH
+  --test_env=HOME
+  --test_env=CARGO_HOME
+  --test_env=MEERKAT_CLEAN_E2E_SCENARIO_TARGETS
+  --test_env=MEERKAT_STRICT_E2E_PREREQS=1
+)
+case "${command}" in
+  workspace-test)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//..."
+    host_cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
+    extra_args+=(
+      --test_env="MEERKAT_HOST_CARGO_HOME=${host_cargo_home}"
+      --build_tests_only
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  workspace-test-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//..."
+    extra_args+=(
+      --build_tests_only
+      --test_tag_filters=-local
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  workspace-fast-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//..."
+    extra_args+=(
+      --build_tests_only
+      --test_tag_filters="${fast_test_tag_filters}"
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  workspace-unit-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//..."
+    extra_args+=(
+      --build_tests_only
+      --test_tag_filters="unit,-local,-e2e,-system,-live,-integration,-slow,-required-feature,-trybuild,-snapshot,-fixture"
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  workspace-integration-fast-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//..."
+    extra_args+=(
+      --build_tests_only
+      --test_tag_filters="integration,-local,-e2e,-system,-live,-slow,-required-feature,-trybuild,-snapshot,-fixture"
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  workspace-test-clippy-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//..."
+    extra_args+=(
+      --build_tests_only
+      --test_tag_filters=-local
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+      --aspects="@rules_rust//rust:defs.bzl%rust_clippy_aspect"
+      --output_groups="+clippy_checks"
+      --@rules_rust//rust/settings:clippy_flag=-Dwarnings
+    )
+    ;;
+  workspace-fast-clippy-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//..."
+    extra_args+=(
+      --build_tests_only
+      --test_tag_filters="${fast_test_tag_filters}"
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+      --aspects="@rules_rust//rust:defs.bzl%rust_clippy_aspect"
+      --output_groups="+clippy_checks"
+      --@rules_rust//rust/settings:clippy_flag=-Dwarnings
+    )
+    ;;
+  e2e-system-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//:e2e_system_tests"
+    extra_args+=(
+      "${e2e_test_env[@]}"
+      --build_tests_only
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  e2e-fast-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//tests/integration:e2e_fast_lane_test"
+    extra_args+=(
+      "${e2e_test_env[@]}"
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  e2e-live-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//tests/integration:e2e_live_lane_test"
+    extra_args+=(
+      "${e2e_test_env[@]}"
+      --test_arg=--ignored
+      --test_arg=--test-threads=1
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  e2e-smoke-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//tests/integration:e2e_smoke_lane_test"
+    extra_args+=(
+      "${e2e_test_env[@]}"
+      --test_arg=--ignored
+      --test_arg=--test-threads=1
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  machine-authority-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//xtask:machines_contracts_test //xtask:protocol_codegen_drift_test"
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  rmat-audit-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//xtask:rmat_audit_test //xtask:rmat_strict_test"
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  seam-inventory-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//xtask:seam_inventory_strict_test"
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  fmt-static-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//xtask:buildbuddy_static_lanes_test"
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  feature-clippy-rbe)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target=""
+    extra_args+=(
+      --aspects="@rules_rust//rust:defs.bzl%rust_clippy_aspect"
+      --output_groups="+clippy_checks"
+      --@rules_rust//rust/settings:clippy_flag=-Dwarnings
+      --color=no
+      --curses=no
+    )
+    ;;
+  sdk-suites-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//tools/buildbuddy:sdk_suites_cargo_equivalent_test"
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  wasm-contract-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//tools/buildbuddy:wasm_contract_cargo_equivalent_test"
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  wasm-check-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//tools/buildbuddy:wasm_check_cargo_equivalent_test"
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  security-audit-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//tools/buildbuddy:security_audit_cargo_equivalent_test"
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  minimal-feature-builds-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//tools/buildbuddy:minimal_feature_builds_cargo_equivalent_test"
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  feature-matrix-lib-rbe)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//tools/buildbuddy:feature_matrix_lib_cargo_equivalent_test"
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  feature-matrix-surface-rbe)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//:surface_feature_matrix_builds"
+    extra_args+=(
+      --color=no
+      --curses=no
+    )
+    ;;
+  e2e-system-local)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//:e2e_system_tests"
+    extra_args+=(
+      --spawn_strategy=local
+      --jobs="${BUILDBUDDY_LOCAL_JOBS:-8}"
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  workspace-test-local)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//..."
+    host_cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
+    extra_args+=(
+      --test_env="MEERKAT_HOST_CARGO_HOME=${host_cargo_home}"
+      --build_tests_only
+      --spawn_strategy=local
+      --jobs="${BUILDBUDDY_LOCAL_JOBS:-8}"
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  fast-test)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe-fast}"
+    default_target="//:fast_tests"
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  fast-test-local)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe-fast}"
+    default_target="//:fast_tests"
+    extra_args+=(
+      --spawn_strategy=local
+      --jobs="${BUILDBUDDY_LOCAL_JOBS:-8}"
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  affected-fast-test)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe-fast}"
+    default_target=""
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  affected-fast-test-local)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe-fast}"
+    default_target=""
+    extra_args+=(
+      --spawn_strategy=local
+      --jobs="${BUILDBUDDY_LOCAL_JOBS:-8}"
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  owned-fast-test)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe-fast}"
+    default_target=""
+    extra_args+=(
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  owned-fast-test-local)
+    command="test"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe-fast}"
+    default_target=""
+    extra_args+=(
+      --spawn_strategy=local
+      --jobs="${BUILDBUDDY_LOCAL_JOBS:-8}"
+      --test_output=errors
+      --test_summary=terse
+      --color=no
+      --curses=no
+    )
+    ;;
+  clippy)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//..."
+    extra_args+=(
+      --aspects="@rules_rust//rust:defs.bzl%rust_clippy_aspect"
+      --output_groups="+clippy_checks"
+      --@rules_rust//rust/settings:clippy_flag=-Dwarnings
+    )
+    ;;
+  clippy-rbe)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//..."
+    extra_args+=(
+      --build_tag_filters=-local,-manual,-noclippy
+      --aspects="@rules_rust//rust:defs.bzl%rust_clippy_aspect"
+      --output_groups="+clippy_checks"
+      --@rules_rust//rust/settings:clippy_flag=-Dwarnings
+    )
+    ;;
+  affected-clippy | owned-clippy)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target=""
+    extra_args+=(
+      --aspects="@rules_rust//rust:defs.bzl%rust_clippy_aspect"
+      --output_groups="+clippy_checks"
+      --@rules_rust//rust/settings:clippy_flag=-Dwarnings
+    )
+    ;;
+  affected-clippy-rbe | owned-clippy-rbe)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target=""
+    extra_args+=(
+      --aspects="@rules_rust//rust:defs.bzl%rust_clippy_aspect"
+      --output_groups="+clippy_checks"
+      --@rules_rust//rust/settings:clippy_flag=-Dwarnings
+    )
+    ;;
+  workspace-build-clippy-rbe)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target=""
+    extra_args+=(
+      --aspects="@rules_rust//rust:defs.bzl%rust_clippy_aspect"
+      --output_groups="+clippy_checks"
+      --@rules_rust//rust/settings:clippy_flag=-Dwarnings
+    )
+    ;;
+  owned-build)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target=""
+    ;;
+  owned-build-local)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target=""
+    extra_args+=(
+      --spawn_strategy=local
+      --jobs="${BUILDBUDDY_LOCAL_JOBS:-8}"
+    )
+    ;;
+  affected-build)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target=""
+    ;;
+  affected-build-local)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target=""
+    extra_args+=(
+      --spawn_strategy=local
+      --jobs="${BUILDBUDDY_LOCAL_JOBS:-8}"
+    )
+    ;;
+  *)
+    default_target="//meerkat-machine-dsl-core:meerkat_machine_dsl_core"
+    ;;
+esac
+if [[ "${requested_command}" == affected-fast-test || "${requested_command}" == affected-fast-test-local || "${requested_command}" == owned-fast-test || "${requested_command}" == owned-fast-test-local || "${requested_command}" == owned-build || "${requested_command}" == owned-build-local || "${requested_command}" == affected-build || "${requested_command}" == affected-build-local || "${requested_command}" == affected-clippy || "${requested_command}" == affected-clippy-rbe || "${requested_command}" == owned-clippy || "${requested_command}" == owned-clippy-rbe || "${requested_command}" == workspace-build-clippy-rbe || "${requested_command}" == feature-clippy-rbe ]]; then
+  selector_args=()
+  if [[ "${requested_command}" == workspace-build-clippy-rbe || "${requested_command}" == feature-clippy-rbe ]]; then
+    selector_args+=(--all --build)
+  fi
+  if [[ "${requested_command}" == owned-fast-test || "${requested_command}" == owned-fast-test-local || "${requested_command}" == owned-build || "${requested_command}" == owned-build-local || "${requested_command}" == owned-clippy || "${requested_command}" == owned-clippy-rbe ]]; then
+    selector_args+=(--owned)
+  fi
+  if [[ "${requested_command}" == owned-build || "${requested_command}" == owned-build-local || "${requested_command}" == affected-build || "${requested_command}" == affected-build-local ]]; then
+    selector_args+=(--build)
+  fi
+  if [[ "${requested_command}" == owned-clippy || "${requested_command}" == owned-clippy-rbe || "${requested_command}" == affected-clippy || "${requested_command}" == affected-clippy-rbe ]]; then
+    selector_args+=(--clippy)
+  fi
+  if [[ $# -gt 0 && "${1}" != -* ]]; then
+    changed_paths=()
+    while [[ $# -gt 0 && "${1}" != -* ]]; do
+      changed_paths+=("${1}")
+      shift
+    done
+    target="$("./scripts/bazel-affected-fast-tests.mjs" "${selector_args[@]}" "${changed_paths[@]}")"
+  else
+    target="$("./scripts/bazel-affected-fast-tests.mjs" "${selector_args[@]}")"
+  fi
+elif [[ $# -gt 0 && "${1}" != -* ]]; then
+  target="${1}"
+  shift
+else
+  target="${default_target}"
+fi
+
+startup_args=()
+if [[ -z "${BUILDBUDDY_NO_DEFAULT_OUTPUT_BASE:-}" ]]; then
+  if [[ -z "${BUILDBUDDY_OUTPUT_BASE:-}" ]]; then
+    cache_root="${MEERKAT_BUILDBUDDY_OUTPUT_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-bazel}"
+    workspace_hash="$(printf '%s' "${workspace_root}" | shasum -a 256 | awk '{print substr($1, 1, 16)}')"
+    lane_key="${BUILDBUDDY_OUTPUT_LANE:-${requested_command}-${config}}"
+    agent_lane="${BUILDBUDDY_AGENT_LANE:-${RUST_LANE_ID:-${CODEX_AGENT_ID:-}}}"
+    if [[ -n "${agent_lane}" ]]; then
+      lane_key="${lane_key}-${agent_lane}"
+    fi
+    lane_key="$(printf '%s' "${lane_key}" | tr -c 'A-Za-z0-9_.-' '-')"
+    BUILDBUDDY_OUTPUT_BASE="${cache_root}/$(basename "${workspace_root}")-${workspace_hash}-${lane_key}"
+  fi
+fi
+if [[ -n "${BUILDBUDDY_OUTPUT_BASE:-}" ]]; then
+  mkdir -p "$(dirname "${BUILDBUDDY_OUTPUT_BASE}")"
+  startup_args+=(--output_base="${BUILDBUDDY_OUTPUT_BASE}")
+fi
+if [[ -z "${BUILDBUDDY_NO_DEFAULT_MAX_IDLE:-}" ]]; then
+  BUILDBUDDY_MAX_IDLE_SECS="${BUILDBUDDY_MAX_IDLE_SECS:-600}"
+fi
+if [[ -n "${BUILDBUDDY_MAX_IDLE_SECS:-}" ]]; then
+  startup_args+=(--max_idle_secs="${BUILDBUDDY_MAX_IDLE_SECS}")
+fi
+
+module_lock_args=()
+lockfile="${workspace_root}/MODULE.bazel.lock"
+local_oai_vendor="${workspace_root}/vendor/oai-rt-rs"
+if [[ -f "${lockfile}" ]] &&
+  grep -Fq '/vendor/oai-rt-rs' "${lockfile}" &&
+  ! grep -Fq "${local_oai_vendor}" "${lockfile}"; then
+  node -e '
+const fs = require("node:fs");
+const [lockfile, localVendor] = process.argv.slice(1);
+const original = fs.readFileSync(lockfile, "utf8");
+const next = original.replace(/\/(?!\/)[^"\\\n/]+(?:\/[^"\\\n/]+)+\/vendor\/oai-rt-rs/g, () => localVendor);
+if (next !== original) fs.writeFileSync(lockfile, next);
+' "${lockfile}" "${local_oai_vendor}"
+  module_lock_args+=(--lockfile_mode=refresh)
+fi
+
+common_args=()
+if [[ -z "${BUILDBUDDY_NO_DEFAULT_REPOSITORY_CACHE:-}" ]]; then
+  BUILDBUDDY_REPOSITORY_CACHE="${BUILDBUDDY_REPOSITORY_CACHE:-${MEERKAT_BUILDBUDDY_REPOSITORY_CACHE:-/tmp/meerkat-bazel-repository-cache}}"
+fi
+if [[ -n "${BUILDBUDDY_REPOSITORY_CACHE:-}" ]]; then
+  mkdir -p "${BUILDBUDDY_REPOSITORY_CACHE}"
+  common_args+=(--repository_cache="${BUILDBUDDY_REPOSITORY_CACHE}")
+fi
+
+apple_platform_args=()
+if [[ "${config}" == buildbuddy-macos-rbe* ]]; then
+  macos_sdk_version="${BUILDBUDDY_MACOS_SDK_VERSION:-26.2}"
+  macos_minimum_os="${BUILDBUDDY_MACOS_MINIMUM_OS:-13.0}"
+  apple_platform_args+=(
+    --macos_sdk_version="${macos_sdk_version}"
+    --macos_minimum_os="${macos_minimum_os}"
+    --host_macos_minimum_os="${macos_minimum_os}"
+  )
+fi
+
+exec "${bb_bin}" "${startup_args[@]}" "${command}" \
+  "${module_lock_args[@]}" \
+  "${common_args[@]}" \
+  --config="${config}" \
+  --remote_header="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}" \
+  "${apple_platform_args[@]}" \
+  "${extra_args[@]}" \
+  ${target} \
+  "$@"

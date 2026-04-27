@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mode="${MEERKAT_BUILDBUDDY_CI_MODE:-workspace-fresh}"
+changed_mode="${MEERKAT_BUILDBUDDY_CHANGED_MODE:-owned}"
+base_ref="${MEERKAT_BUILDBUDDY_BASE:-origin/main}"
+paths_text="${MEERKAT_BUILDBUDDY_CHANGED_PATHS:-}"
+dry_run=0
+
+usage() {
+  cat <<'EOF'
+usage: buildbuddy-ci-dispatch [--mode <mode>] [--owned|--affected] [--base <rev>] [--paths <paths>] [--dry-run]
+
+Modes:
+  full-fresh         Run the full BuildBuddy CI profile on fresh output roots.
+  full-warm          Run the full BuildBuddy CI profile on warmed output roots.
+  workspace-fresh    Run the fresh optional BuildBuddy workspace CI gate.
+  workspace-warm     Run the warmed optional BuildBuddy workspace CI gate.
+  e2e-system         Run only the Bazel-native system e2e suite.
+  fmt-lint, test-unit, integration-fast, e2e-system, ...
+                    Run one visible BuildBuddy CI lane matching Cargo CI.
+  changed-committed  Run the BuildBuddy changed-path gate for branch commits.
+  changed-paths      Run the BuildBuddy changed-path gate for explicit paths.
+
+Environment equivalents:
+  MEERKAT_BUILDBUDDY_CI_MODE
+  MEERKAT_BUILDBUDDY_CHANGED_MODE
+  MEERKAT_BUILDBUDDY_BASE
+  MEERKAT_BUILDBUDDY_CHANGED_PATHS
+  MEERKAT_BUILDBUDDY_LOG_ROOT
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --mode requires a value" >&2
+        usage >&2
+        exit 2
+      fi
+      mode="$2"
+      shift 2
+      ;;
+    --owned)
+      changed_mode="owned"
+      shift
+      ;;
+    --affected)
+      changed_mode="affected"
+      shift
+      ;;
+    --base)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --base requires a revision" >&2
+        usage >&2
+        exit 2
+      fi
+      base_ref="$2"
+      shift 2
+      ;;
+    --paths)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --paths requires a value" >&2
+        usage >&2
+        exit 2
+      fi
+      paths_text="$2"
+      shift 2
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+workspace_root="$(git rev-parse --show-toplevel)"
+cd "${workspace_root}"
+
+if [[ -n "${MEERKAT_BUILDBUDDY_LOG_ROOT:-}" ]]; then
+  mkdir -p "${MEERKAT_BUILDBUDDY_LOG_ROOT}"
+  scripts/buildbuddy-write-context --mode "${mode}" >"${MEERKAT_BUILDBUDDY_LOG_ROOT}/dispatch-context.txt"
+  {
+    printf 'mode=%s\n' "${mode}"
+    printf 'changed_mode=%s\n' "${changed_mode}"
+    printf 'base=%s\n' "${base_ref}"
+    if [[ -n "${paths_text}" ]]; then
+      printf 'paths=%s\n' "${paths_text}"
+    fi
+    printf 'dry_run=%s\n' "${dry_run}"
+  } >"${MEERKAT_BUILDBUDDY_LOG_ROOT}/dispatch-inputs.txt"
+fi
+
+mode_args=("--${changed_mode}")
+if [[ "${dry_run}" -eq 1 ]]; then
+  mode_args+=("--dry-run")
+fi
+
+case "${mode}" in
+  full-fresh|full)
+    if [[ "${dry_run}" -eq 1 ]]; then
+      echo "DRY-RUN scripts/buildbuddy-ci-full --fresh"
+    else
+      exec scripts/buildbuddy-ci-full --fresh
+    fi
+    ;;
+  full-warm)
+    if [[ "${dry_run}" -eq 1 ]]; then
+      echo "DRY-RUN scripts/buildbuddy-ci-full --warm"
+    else
+      exec scripts/buildbuddy-ci-full --warm
+    fi
+    ;;
+  workspace-fresh)
+    if [[ "${dry_run}" -eq 1 ]]; then
+      echo "DRY-RUN make buildbuddy-ci"
+    else
+      exec make buildbuddy-ci
+    fi
+    ;;
+  workspace-warm)
+    if [[ "${dry_run}" -eq 1 ]]; then
+      echo "DRY-RUN make buildbuddy-ci-warm"
+    else
+      exec make buildbuddy-ci-warm
+    fi
+    ;;
+  e2e-system)
+    if [[ "${dry_run}" -eq 1 ]]; then
+      echo "DRY-RUN scripts/buildbuddy-ci-lane native-e2e-system --mode e2e-system"
+    else
+      exec scripts/buildbuddy-ci-lane native-e2e-system --mode e2e-system
+    fi
+    ;;
+  fmt-lint|sdk-suites|rust-release-packaging|machine-authority|rmat-audit|seam-inventory|wasm-contract-tests|test-unit|integration-fast|e2e-fast|e2e-system|e2e-live|e2e-smoke|test-minimal|test-feature-matrix-lib|test-feature-matrix-surface-checks|wasm-check|audit|native-build-clippy|native-unit-tests|native-integration-fast|native-e2e-system|fmt-static|cargo-all-features-clippy|feature-clippy|unused-deps|wasm-contract|minimal-feature-builds|feature-matrix-lib|feature-matrix-surface|security-audit)
+    lane_args=("${mode}" --mode "${mode}")
+    if [[ "${dry_run}" -eq 1 ]]; then
+      lane_args+=(--dry-run)
+    fi
+    exec scripts/buildbuddy-ci-lane "${lane_args[@]}"
+    ;;
+  changed-committed|changed)
+    exec ./scripts/buildbuddy-agent-gate "${mode_args[@]}" --committed --base "${base_ref}"
+    ;;
+  changed-paths|paths)
+    if [[ -z "${paths_text}" ]]; then
+      echo "error: changed-paths mode requires --paths or MEERKAT_BUILDBUDDY_CHANGED_PATHS" >&2
+      exit 2
+    fi
+    mapfile -t paths < <(printf '%s\n' "${paths_text}" | tr '[:space:]' '\n' | awk 'NF' | sort -u)
+    exec ./scripts/buildbuddy-agent-gate "${mode_args[@]}" --base "${base_ref}" "${paths[@]}"
+    ;;
+  *)
+    echo "unknown BuildBuddy CI mode: ${mode}" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

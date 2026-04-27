@@ -1960,7 +1960,8 @@ fn normalize_generated_contents(path: &Path, contents: &str) -> Result<String> {
 }
 
 fn rustfmt_source(source: &str) -> Result<String> {
-    let mut child = Command::new("rustfmt")
+    let rustfmt = std::env::var_os("RUSTFMT").unwrap_or_else(|| "rustfmt".into());
+    let mut child = Command::new(rustfmt)
         .args(["--edition", "2024", "--emit", "stdout"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2026,6 +2027,9 @@ fn remove_dir_if_empty(path: &Path) -> Result<()> {
 }
 
 pub fn repo_root() -> Result<PathBuf> {
+    if let Some(root) = bazel_runfiles_workspace_root() {
+        return Ok(root);
+    }
     if let Some(root) = std::env::var_os("MEERKAT_MACHINE_ROOT") {
         return Ok(PathBuf::from(root));
     }
@@ -2034,6 +2038,23 @@ pub fn repo_root() -> Result<PathBuf> {
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| anyhow!("failed to resolve repo root from xtask manifest dir"))
+}
+
+fn bazel_runfiles_workspace_root() -> Option<PathBuf> {
+    let workspace = std::env::var("TEST_WORKSPACE").ok()?;
+    for base in [
+        std::env::var_os("TEST_SRCDIR"),
+        std::env::var_os("RUNFILES_DIR"),
+    ] {
+        let Some(base) = base else {
+            continue;
+        };
+        let candidate = PathBuf::from(base).join(&workspace);
+        if candidate.join("Cargo.toml").exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn machine_authority_path(root: &Path, slug: &str) -> PathBuf {

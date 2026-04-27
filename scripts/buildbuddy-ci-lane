@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: buildbuddy-ci-lane <lane> [--mode <mode>] [--dry-run]
+
+Runs one visible optional BuildBuddy CI lane. Standard BuildBuddy CI lanes use
+Bazel/BuildBuddy directly and keep the same visible failure boundaries as Cargo
+CI.
+
+Modes:
+  full-fresh, full       Run every lane on fresh local output roots.
+  full-warm             Run every lane on warm local output roots.
+  workspace-fresh       Run only native workspace lanes on fresh roots.
+  workspace-warm        Run only native workspace lanes on warm roots.
+  e2e-system            Run only the native system e2e lane.
+  <lane>                Run only the named lane.
+EOF
+}
+
+mode="${MEERKAT_BUILDBUDDY_CI_MODE:-full-fresh}"
+dry_run=0
+lane=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --mode requires a value" >&2
+        usage >&2
+        exit 2
+      fi
+      mode="$2"
+      shift 2
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      if [[ -n "${lane}" ]]; then
+        echo "error: only one lane may be specified" >&2
+        usage >&2
+        exit 2
+      fi
+      lane="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "${lane}" ]]; then
+  echo "error: lane is required" >&2
+  usage >&2
+  exit 2
+fi
+
+workspace_root="$(git rev-parse --show-toplevel)"
+cd "${workspace_root}"
+
+is_native_lane=0
+case "${lane}" in
+  native-build-clippy|native-unit-tests|native-integration-fast|native-e2e-system|test-unit|integration-fast|e2e-system|e2e-fast|e2e-live|e2e-smoke|machine-authority|rmat-audit|seam-inventory)
+    is_native_lane=1
+    ;;
+esac
+
+should_run=0
+root_mode="fresh"
+case "${mode}" in
+  full|full-fresh)
+    should_run=1
+    root_mode="fresh"
+    ;;
+  full-warm)
+    should_run=1
+    root_mode="warm"
+    ;;
+  workspace-fresh)
+    if [[ "${is_native_lane}" == "1" ]]; then
+      should_run=1
+    fi
+    root_mode="fresh"
+    ;;
+  workspace-warm)
+    if [[ "${is_native_lane}" == "1" ]]; then
+      should_run=1
+    fi
+    root_mode="warm"
+    ;;
+  e2e-system)
+    if [[ "${lane}" == "native-e2e-system" || "${lane}" == "e2e-system" ]]; then
+      should_run=1
+    fi
+    root_mode="fresh"
+    ;;
+  changed|changed-committed|changed-paths|paths)
+    should_run=0
+    ;;
+  "${lane}")
+    should_run=1
+    root_mode="fresh"
+    ;;
+  *)
+    should_run=0
+    ;;
+esac
+
+if [[ "${should_run}" != "1" ]]; then
+  printf 'SKIP %s for BuildBuddy mode %s\n' "${lane}" "${mode}"
+  exit 0
+fi
+
+run_id="${GITHUB_RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
+attempt="${GITHUB_RUN_ATTEMPT:-0}"
+log_root="${MEERKAT_BUILDBUDDY_LOG_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-ci-lane-logs/${run_id}-${attempt}}"
+lane_log_root="${log_root}/${lane}"
+summary_path="${lane_log_root}/summary.tsv"
+context_path="${lane_log_root}/context.txt"
+mkdir -p "${lane_log_root}"
+
+scripts/buildbuddy-write-context --mode "${mode}-${lane}" >"${context_path}"
+printf 'name\tstatus\twall_seconds\tlog\tcommand\n' >"${summary_path}"
+
+run_logged() {
+  local name="$1"
+  shift
+  local log="${lane_log_root}/${name}.log"
+  local start end status attempt max_fetch_retries
+  start="$(date +%s)"
+  if [[ "${dry_run}" == "1" ]]; then
+    {
+      printf 'DRY-RUN '
+      printf '%q ' "$@"
+      printf '\n'
+    } | tee "${log}"
+    status=0
+  else
+    attempt=0
+    max_fetch_retries="${MEERKAT_BUILDBUDDY_FETCH_RETRIES:-4}"
+    set +e
+    "$@" >"${log}" 2>&1
+    status="$?"
+    set -e
+    while [[ "${status}" != "0" &&
+      "${attempt}" -lt "${max_fetch_retries}" ]] &&
+      grep -Eq 'GET returned 5[0-9][0-9]|Bad Gateway|Proxy Error|Error downloading' "${log}"; do
+      attempt="$((attempt + 1))"
+      printf 'Retrying %s after transient external repository fetch failure (%s/%s)...\n' \
+        "${name}" "${attempt}" "${max_fetch_retries}" | tee -a "${log}"
+      sleep "$((attempt * 5))"
+      set +e
+      "$@" >>"${log}" 2>&1
+      status="$?"
+      set -e
+    done
+  fi
+  end="$(date +%s)"
+  printf '%s\t%s\t%s\t%s\t' "${name}" "${status}" "$((end - start))" "${log}" >>"${summary_path}"
+  printf '%q ' "$@" >>"${summary_path}"
+  printf '\n' >>"${summary_path}"
+  if [[ "${status}" == "0" ]]; then
+    printf 'PASS %s (%ss)\n' "${name}" "$((end - start))"
+  else
+    printf 'FAIL(%s) %s (%ss)\n' "${status}" "${name}" "$((end - start))"
+    tail -120 "${log}" || true
+    exit "${status}"
+  fi
+}
+
+run_bazel_lane() {
+  local name="${lane}"
+  if [[ "${1:-}" == "--name" ]]; then
+    name="$2"
+    shift 2
+  fi
+  local bazel_command="$1"
+  shift
+  local output_root
+  if [[ "${root_mode}" == "warm" ]]; then
+    output_root="${MEERKAT_BUILDBUDDY_OUTPUT_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-ci-lanes}"
+  else
+    output_root="${MEERKAT_BUILDBUDDY_OUTPUT_ROOT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/meerkat-buildbuddy-ci-lanes}"
+  fi
+  run_logged "${name}" env \
+    MEERKAT_BUILDBUDDY_OUTPUT_ROOT="${output_root}" \
+    RUST_LANE_ID="buildbuddy-ci-${lane}" \
+    BUILDBUDDY_OUTPUT_LANE="${lane}" \
+    BUILDBUDDY_BAZEL_COMMAND="${bazel_command}" \
+    ./scripts/buildbuddy-bazel-poc "$@"
+}
+
+case "${lane}" in
+  native-build-clippy)
+    run_bazel_lane workspace-build-clippy-rbe --jobs=64 --color=no --curses=no
+    ;;
+  native-unit-tests)
+    run_bazel_lane workspace-unit-rbe --jobs=64
+    ;;
+  native-integration-fast)
+    run_bazel_lane workspace-integration-fast-rbe --jobs=64
+    ;;
+  native-e2e-system)
+    run_bazel_lane e2e-system-rbe --jobs=64
+    ;;
+  fmt-lint)
+    run_bazel_lane --name fmt-static fmt-static-rbe --jobs=64
+    run_bazel_lane --name native-build-clippy workspace-build-clippy-rbe --jobs=64 --color=no --curses=no
+    run_bazel_lane --name feature-clippy feature-clippy-rbe --jobs=64 --color=no --curses=no
+    run_bazel_lane --name unused-deps security-audit-rbe --jobs=64
+    ;;
+  fmt-static)
+    run_bazel_lane fmt-static-rbe --jobs=64
+    ;;
+  cargo-all-features-clippy)
+    run_bazel_lane workspace-build-clippy-rbe --jobs=64 --color=no --curses=no
+    ;;
+  feature-clippy)
+    run_bazel_lane feature-clippy-rbe --jobs=64 --color=no --curses=no
+    ;;
+  unused-deps)
+    run_bazel_lane security-audit-rbe --jobs=64
+    ;;
+  sdk-suites)
+    run_bazel_lane sdk-suites-rbe --jobs=64
+    ;;
+  rust-release-packaging)
+    echo "rust-release-packaging is release-preflight/manual-only; use Cargo release-preflight for package archive verification" >&2
+    exit 2
+    ;;
+  machine-authority)
+    run_bazel_lane machine-authority-rbe --jobs=64
+    ;;
+  rmat-audit)
+    run_bazel_lane rmat-audit-rbe --jobs=64
+    ;;
+  seam-inventory)
+    run_bazel_lane seam-inventory-rbe --jobs=64
+    ;;
+  wasm-contract)
+    run_bazel_lane wasm-contract-rbe --jobs=64
+    ;;
+  wasm-contract-tests)
+    run_bazel_lane wasm-contract-rbe --jobs=64
+    ;;
+  test-unit)
+    run_bazel_lane workspace-unit-rbe --jobs=64
+    ;;
+  integration-fast)
+    run_bazel_lane workspace-integration-fast-rbe --jobs=64
+    ;;
+  e2e-fast)
+    run_bazel_lane e2e-fast-rbe --jobs=64
+    ;;
+  e2e-system)
+    run_bazel_lane e2e-system-rbe --jobs=64
+    ;;
+  e2e-live)
+    run_bazel_lane e2e-live-rbe --jobs=64
+    ;;
+  e2e-smoke)
+    run_bazel_lane e2e-smoke-rbe --jobs=64
+    ;;
+  minimal-feature-builds)
+    run_bazel_lane minimal-feature-builds-rbe --jobs=64
+    ;;
+  test-minimal)
+    run_bazel_lane minimal-feature-builds-rbe --jobs=64
+    ;;
+  feature-matrix-lib)
+    run_bazel_lane feature-matrix-lib-rbe --jobs=64
+    ;;
+  test-feature-matrix-lib)
+    run_bazel_lane feature-matrix-lib-rbe --jobs=64
+    ;;
+  feature-matrix-surface)
+    run_bazel_lane feature-matrix-surface-rbe --jobs=64
+    ;;
+  test-feature-matrix-surface-checks)
+    run_bazel_lane feature-matrix-surface-rbe --jobs=64
+    ;;
+  wasm-check)
+    run_bazel_lane wasm-check-rbe --jobs=64
+    ;;
+  security-audit)
+    run_bazel_lane security-audit-rbe --jobs=64
+    ;;
+  audit)
+    run_bazel_lane security-audit-rbe --jobs=64
+    ;;
+  *)
+    echo "unknown BuildBuddy CI lane: ${lane}" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+printf 'logs: %s\n' "${lane_log_root}"
+printf 'summary: %s\n' "${summary_path}"

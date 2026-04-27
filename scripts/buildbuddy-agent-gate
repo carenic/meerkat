@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mode="owned"
+base_ref="${BUILDBUDDY_AGENT_BASE:-}"
+local_test=0
+dry_run=0
+scope="all"
+clippy_only=0
+tests_only=0
+paths=()
+
+usage() {
+  cat <<'EOF'
+usage: buildbuddy-agent-gate [--owned|--affected] [--base <rev>] [--staged|--committed|--working-tree] [--local-test] [--clippy-only|--tests-only] [--dry-run] [path ...]
+
+Runs the opt-in BuildBuddy gate most useful for agent edits. If paths are not
+provided, the script derives changed files from:
+
+  - merge-base(<base>, HEAD)..HEAD
+  - unstaged edits
+  - staged edits
+  - untracked files
+
+Docs-only and other non-build changes are ignored. Use --staged for pre-commit
+experiments, --committed for pre-push/CI branch probes, and --working-tree for
+unstaged/untracked local probes. Global build/test files escalate to the warmed
+workspace BuildBuddy CI gate; crate-local changes run the changed-path
+test/build + clippy gate.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --owned)
+      mode="owned"
+      shift
+      ;;
+    --affected)
+      mode="affected"
+      shift
+      ;;
+    --base)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --base requires a revision" >&2
+        usage >&2
+        exit 2
+      fi
+      base_ref="$2"
+      shift 2
+      ;;
+    --local-test)
+      local_test=1
+      shift
+      ;;
+    --clippy-only)
+      clippy_only=1
+      shift
+      ;;
+    --tests-only)
+      tests_only=1
+      shift
+      ;;
+    --staged)
+      scope="staged"
+      shift
+      ;;
+    --committed)
+      scope="committed"
+      shift
+      ;;
+    --working-tree)
+      scope="working-tree"
+      shift
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do
+        paths+=("$1")
+        shift
+      done
+      ;;
+    -*)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      paths+=("$1")
+      shift
+      ;;
+  esac
+done
+
+workspace_root="$(git rev-parse --show-toplevel)"
+cd "${workspace_root}"
+
+if [[ "${clippy_only}" -eq 1 && "${tests_only}" -eq 1 ]]; then
+  echo "error: --clippy-only and --tests-only are mutually exclusive" >&2
+  usage >&2
+  exit 2
+fi
+
+resolve_base() {
+  if [[ -n "${base_ref}" ]]; then
+    printf '%s\n' "${base_ref}"
+    return
+  fi
+  if git rev-parse --verify origin/main >/dev/null 2>&1; then
+    printf '%s\n' "origin/main"
+    return
+  fi
+  if git rev-parse --verify main >/dev/null 2>&1; then
+    printf '%s\n' "main"
+    return
+  fi
+  git rev-parse HEAD
+}
+
+collect_changed_paths() {
+  if [[ "${#paths[@]}" -gt 0 ]]; then
+    printf '%s\n' "${paths[@]}"
+    return
+  fi
+
+  local base
+  base="$(resolve_base)"
+  case "${scope}" in
+    all|committed)
+      if git merge-base "${base}" HEAD >/dev/null 2>&1; then
+        local merge_base
+        merge_base="$(git merge-base "${base}" HEAD)"
+        git diff --name-only --diff-filter=ACMR "${merge_base}..HEAD" --
+      fi
+      ;;
+  esac
+  case "${scope}" in
+    all|working-tree)
+      git diff --name-only --diff-filter=ACMR --
+      git ls-files --others --exclude-standard
+      ;;
+  esac
+  case "${scope}" in
+    all|staged)
+      git diff --cached --name-only --diff-filter=ACMR --
+      ;;
+  esac
+}
+
+is_relevant_path() {
+  case "$1" in
+    *.rs|Cargo.toml|Cargo.lock|MODULE.bazel|MODULE.bazel.lock|Makefile|.bazelrc|BUILD.bazel|*/BUILD.bazel|.cargo/config.toml|.config/nextest.toml|.github/workflows/buildbuddy.yml|.github/workflows/ci.yml)
+      return 0
+      ;;
+    scripts/agent-gate|scripts/buildbuddy*|scripts/bazel-*.mjs|scripts/generate-bazel-rust-builds.mjs|scripts/install-buildbuddy-cli|scripts/repo-cargo|scripts/cargo-*|scripts/rust-lane-doctor|scripts/test-rct.sh)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_global_path() {
+  case "$1" in
+    Cargo.toml|Cargo.lock|MODULE.bazel|MODULE.bazel.lock|Makefile|.bazelrc|.cargo/config.toml|.config/nextest.toml|.github/workflows/buildbuddy.yml|.github/workflows/ci.yml|scripts/agent-gate|scripts/buildbuddy*|scripts/bazel-*.mjs|scripts/generate-bazel-rust-builds.mjs|scripts/install-buildbuddy-cli|scripts/repo-cargo|scripts/cargo-*|scripts/rust-lane-doctor|scripts/test-rct.sh)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+mapfile -t changed < <(collect_changed_paths | awk 'NF' | sort -u)
+relevant=()
+global=0
+for path in "${changed[@]}"; do
+  if is_relevant_path "${path}"; then
+    relevant+=("${path}")
+    if is_global_path "${path}"; then
+      global=1
+    fi
+  fi
+done
+
+if [[ "${#relevant[@]}" -eq 0 ]]; then
+  echo "BuildBuddy agent gate: no build-relevant changes detected."
+  exit 0
+fi
+
+printf 'BuildBuddy agent gate paths:\n'
+printf '  %s\n' "${relevant[@]}"
+
+if [[ "${global}" -eq 1 ]]; then
+  echo "Global build/test configuration changed; running warmed workspace gate."
+  if [[ "${dry_run}" -eq 1 ]]; then
+    echo "DRY-RUN make buildbuddy-ci-warm"
+    exit 0
+  fi
+  exec make buildbuddy-ci-warm
+fi
+
+args=("--${mode}")
+if [[ "${local_test}" -eq 1 ]]; then
+  args+=("--local-test")
+fi
+if [[ "${clippy_only}" -eq 1 ]]; then
+  args+=("--clippy-only")
+fi
+if [[ "${tests_only}" -eq 1 ]]; then
+  args+=("--tests-only")
+fi
+if [[ "${dry_run}" -eq 1 ]]; then
+  exec ./scripts/buildbuddy-changed-gate --dry-run "${args[@]}" "${relevant[@]}"
+fi
+exec ./scripts/buildbuddy-changed-gate "${args[@]}" "${relevant[@]}"

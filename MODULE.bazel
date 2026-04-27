@@ -1,0 +1,74 @@
+module(
+    name = "meerkat",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "rules_rust", version = "0.70.0")
+bazel_dep(name = "rules_shell", version = "0.8.0")
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "toolchains_buildbuddy", version = "0.0.4")
+
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "cargo_deny_darwin_arm64",
+    build_file_content = 'exports_files(["cargo-deny"])',
+    sha256 = "2437a51d904b29abe2d3aa9ea87e353c86cff108d519ba1e5fb495bb28e7fbaf",
+    strip_prefix = "cargo-deny-0.19.4-aarch64-apple-darwin",
+    urls = ["https://github.com/EmbarkStudios/cargo-deny/releases/download/0.19.4/cargo-deny-0.19.4-aarch64-apple-darwin.tar.gz"],
+)
+
+http_archive(
+    name = "node_darwin_arm64",
+    build_file_content = 'filegroup(name = "node", srcs = glob(["**/*"]), visibility = ["//visibility:public"])',
+    sha256 = "db4b275b83736df67533529a18cc55de2549a8329ace6c7bcc68f8d22d3c9000",
+    strip_prefix = "node-v22.22.2-darwin-arm64",
+    urls = ["https://nodejs.org/dist/v22.22.2/node-v22.22.2-darwin-arm64.tar.gz"],
+)
+
+http_archive(
+    name = "python_darwin_arm64",
+    build_file_content = 'filegroup(name = "python", srcs = glob(["**/*"]), visibility = ["//visibility:public"])',
+    sha256 = "6f304f4ec30854611f23316578302235fb517cd970519ecdd11a8c4db87fd843",
+    urls = ["https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.14.4%2B20260414-aarch64-apple-darwin-install_only_stripped.tar.gz"],
+)
+
+http_archive(
+    name = "wasm_pack_darwin_arm64",
+    build_file_content = 'exports_files(["wasm-pack"])',
+    sha256 = "9d0e70c6b229de18f0abfe910f2963e8f09ebae218250e9b09a1c3fdd955bef9",
+    strip_prefix = "wasm-pack-v0.14.0-aarch64-apple-darwin",
+    urls = ["https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.14.0/wasm-pack-v0.14.0-aarch64-apple-darwin.tar.gz"],
+)
+
+buildbuddy = use_extension("@toolchains_buildbuddy//:extensions.bzl", "buildbuddy")
+use_repo(buildbuddy, "buildbuddy_toolchain")
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    versions = ["1.94.0"],
+)
+use_repo(rust, "rust_toolchains")
+register_toolchains("@rust_toolchains//:all")
+
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.annotation(
+    crate = "oai-rt-rs",
+    version = "0.2.1",
+    additive_build_file_content = """
+# Maintained here so root workspace_runfiles can cross the vendored
+# path-dependency Bazel package boundary.
+filegroup(
+    name = "package_runfiles",
+    srcs = glob(["**/*"], exclude = ["BUILD", "BUILD.bazel"], allow_empty = True),
+    visibility = ["//visibility:public"],
+)
+""",
+)
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = ["//:Cargo.toml"],
+)
+use_repo(crate, "crates")

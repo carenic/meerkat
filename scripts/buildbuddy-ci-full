@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+workspace_root="$(git rev-parse --show-toplevel)"
+cd "${workspace_root}"
+
+mode="fresh"
+case "${1:-}" in
+  "" | --fresh)
+    mode="fresh"
+    ;;
+  --warm)
+    mode="warm"
+    ;;
+  -h | --help)
+    cat <<'EOF'
+usage: buildbuddy-ci-full [--fresh|--warm]
+
+Runs the full BuildBuddy CI profile. Bazel/BuildBuddy-native lanes run first
+and cover workspace build/clippy, fast tests, and system e2e. The remaining
+compatibility lanes run through the normal repo entrypoints in the same job so
+they reuse one Cargo target dir instead of rebuilding once per GitHub job.
+EOF
+    exit 0
+    ;;
+  *)
+    echo "unknown argument: $1" >&2
+    exit 2
+    ;;
+esac
+
+run_id="$(date +%Y%m%d-%H%M%S)"
+log_root="${MEERKAT_BUILDBUDDY_LOG_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-full-ci-logs/${run_id}-${mode}}"
+summary_path="${log_root}/summary.tsv"
+context_path="${log_root}/benchmark-context.txt"
+mkdir -p "${log_root}"
+
+scripts/buildbuddy-write-context --mode "full-${mode}" >"${context_path}"
+printf 'name\tstatus\twall_seconds\tlog\tcommand\n' >"${summary_path}"
+
+run_logged() {
+  local name="$1"
+  shift
+  local log="${log_root}/${name}.log"
+  local start end status
+  start="$(date +%s)"
+  set +e
+  "$@" >"${log}" 2>&1
+  status="$?"
+  set -e
+  end="$(date +%s)"
+  printf '%s\t%s\t%s\t%s\t' "${name}" "${status}" "$((end - start))" "${log}" >>"${summary_path}"
+  printf '%q ' "$@" >>"${summary_path}"
+  printf '\n' >>"${summary_path}"
+  if [[ "${status}" == "0" ]]; then
+    printf 'PASS %s (%ss)\n' "${name}" "$((end - start))"
+  else
+    printf 'FAIL(%s) %s (%ss)\n' "${status}" "${name}" "$((end - start))"
+    tail -80 "${log}" || true
+    exit "${status}"
+  fi
+}
+
+if [[ "${mode}" == "warm" ]]; then
+  run_logged buildbuddy-native scripts/buildbuddy-ci-workspace --warm
+else
+  run_logged buildbuddy-native scripts/buildbuddy-ci-workspace --fresh
+fi
+
+run_logged fmt-static \
+  bash -lc 'make fmt-check legacy-surface-gate bridge-no-responsestatus-gate verify-version-parity verify-rpc-surface-alignment verify-sdk-wrapper-freshness'
+
+run_logged cargo-all-features-clippy \
+  make lint
+
+run_logged feature-clippy \
+  make lint-feature-matrix
+
+run_logged unused-deps \
+  ./scripts/repo-cargo machete --with-metadata
+
+run_logged sdk-suites \
+  bash -lc './scripts/repo-cargo build -p meerkat-rpc && make test-sdk-python test-sdk-typescript verify-sdk-wrapper-freshness'
+
+run_logged rust-release-packaging \
+  make check-rust-release-packaging
+
+run_logged machine-authority \
+  bash -lc './scripts/repo-cargo xtask machine-codegen --all && git diff --exit-code && ./scripts/repo-cargo xtask machine-check-drift --all && ./scripts/repo-cargo xtask machine-verify --all && ./scripts/repo-cargo xtask protocol-codegen && git diff --exit-code && ./scripts/repo-cargo xtask audit-generated-headers'
+
+run_logged rmat-audit \
+  bash -lc './scripts/repo-cargo run -p xtask -- ownership-ledger --check-drift && ./scripts/repo-cargo run -p xtask -- rmat-audit --strict'
+
+run_logged seam-inventory \
+  ./scripts/repo-cargo run -p xtask -- seam-inventory --strict
+
+run_logged wasm-contract \
+  bash -lc 'RUSTFLAGS='\''--cfg getrandom_backend="wasm_js"'\'' ./scripts/repo-cargo test -p meerkat-web-runtime --target wasm32-unknown-unknown --test browser_contract --no-run && RUSTFLAGS='\''--cfg getrandom_backend="wasm_js"'\'' ./scripts/repo-cargo test -p meerkat-web-runtime --target wasm32-unknown-unknown --test release_targets --no-run && RUSTFLAGS='\''--cfg getrandom_backend="wasm_js"'\'' wasm-pack test --headless --chrome meerkat-web-runtime --test browser_contract && RUSTFLAGS='\''--cfg getrandom_backend="wasm_js"'\'' wasm-pack test --headless --chrome meerkat-web-runtime --test release_targets'
+
+run_logged e2e-fast \
+  ./scripts/repo-cargo e2e-fast
+
+run_logged e2e-live \
+  ./scripts/repo-cargo e2e-live
+
+run_logged e2e-smoke \
+  ./scripts/repo-cargo e2e-smoke
+
+run_logged minimal-feature-builds \
+  make test-minimal
+
+run_logged feature-matrix-lib \
+  make test-feature-matrix-lib
+
+run_logged feature-matrix-surface \
+  make test-feature-matrix-surface
+
+run_logged wasm-check \
+  bash -lc 'RUSTFLAGS='\''--cfg getrandom_backend="wasm_js"'\'' ./scripts/repo-cargo check -p meerkat-web-runtime --target wasm32-unknown-unknown && RUSTFLAGS='\''--cfg getrandom_backend="wasm_js"'\'' ./scripts/repo-cargo clippy -p meerkat-web-runtime --target wasm32-unknown-unknown -- -D warnings'
+
+run_logged security-audit \
+  cargo-deny check
+
+printf 'BuildBuddy full CI (%s) passed\n' "${mode}"
+printf 'logs: %s\n' "${log_root}"
+printf 'summary: %s\n' "${summary_path}"
+printf 'context: %s\n' "${context_path}"

@@ -13,7 +13,7 @@ YELLOW := \033[0;33m
 RED := \033[0;31m
 NC := \033[0m
 
-.PHONY: all build test test-unit test-int e2e-fast e2e-build e2e-system e2e-live e2e-smoke test-int-real test-e2e test-all test-minimal test-feature-matrix-lib test-feature-matrix-surface test-feature-matrix test-surface-modularity test-sdk-python test-sdk-typescript test-sdk-suites lint lint-feature-matrix fmt fmt-check audit ci ci-smoke release-preflight release-preflight-smoke publish-dry-run publish-dry-run-python publish-dry-run-typescript release-dry-run release-dry-run-smoke clean doc release install-hooks coverage check help legacy-surface-gate legacy-surface-inventory session-control-gate deprecated-backend-gate deprecated-backend-inventory verify-version-parity verify-schema-freshness verify-rpc-surface-alignment verify-sdk-wrapper-freshness check-rust-release-packaging check-mini-skill-size bump-sdk-versions smoke-sdk-python-artifact smoke-sdk-typescript-artifact xtask-build machine-codegen machine-verify machine-check-drift seam-inventory rmat-audit audit-generated-headers
+.PHONY: all build test test-unit test-int e2e-fast e2e-build e2e-system e2e-live e2e-smoke test-int-real test-e2e test-all test-minimal test-feature-matrix-lib test-feature-matrix-surface test-feature-matrix test-surface-modularity test-sdk-python test-sdk-typescript test-sdk-suites lint lint-feature-matrix fmt fmt-check audit rust-lane-doctor agent-gate cargo-agent-gate buildbuddy-install buildbuddy-generate buildbuddy-generate-check buildbuddy-doctor buildbuddy-agent-gate buildbuddy-ci-dispatch buildbuddy-fast buildbuddy-benchmark buildbuddy-ci buildbuddy-ci-warm buildbuddy-ci-full buildbuddy-ci-full-warm ci ci-smoke release-preflight release-preflight-smoke publish-dry-run publish-dry-run-python publish-dry-run-typescript release-dry-run release-dry-run-smoke clean doc release install-hooks coverage check help legacy-surface-gate legacy-surface-inventory session-control-gate deprecated-backend-gate deprecated-backend-inventory verify-version-parity verify-schema-freshness verify-rpc-surface-alignment verify-sdk-wrapper-freshness check-rust-release-packaging check-mini-skill-size bump-sdk-versions smoke-sdk-python-artifact smoke-sdk-typescript-artifact xtask-build machine-codegen machine-verify machine-check-drift seam-inventory rmat-audit audit-generated-headers
 
 # Default target
 all: ci
@@ -31,23 +31,20 @@ release:
 # Fast test suite (unit + integration-fast, skips doctests and ignored)
 test:
 	@echo "$(GREEN)Running fast tests (unit + integration-fast)...$(NC)"
-	$(CARGO) nextest run --workspace --show-progress none --status-level none --final-status-level fail
+	$(CARGO) fast
 
 # Unit tests only
 test-unit:
 	@echo "$(GREEN)Running unit tests...$(NC)"
 	$(CARGO) nextest run --workspace --lib --show-progress none --status-level none --final-status-level fail
 
-# Integration-fast tests only (no unit tests). Must stay in sync with the
-# `int` cargo alias in `.cargo/config.toml`: both exclude the e2e lane
-# binaries (`e2e_{fast,system,live,smoke,models}_lane`) since those have
-# their own Makefile targets and scenario-test timeouts incompatible with
-# the integration-fast lane's default 300s nextest deadline.
+# Integration-fast tests only (no unit tests). The `int` cargo alias excludes
+# the dedicated e2e lane binaries since those have their own Makefile targets
+# and scenario-test timeouts incompatible with the integration-fast lane's
+# default nextest deadline.
 test-int:
 	@echo "$(GREEN)Running integration-fast tests...$(NC)"
-	$(CARGO) nextest run --workspace --tests \
-		-E 'not binary(e2e_fast_lane) and not binary(e2e_system_lane) and not binary(e2e_live_lane) and not binary(e2e_smoke_lane) and not binary(e2e_models_lane)' \
-		--show-progress none --status-level none --final-status-level fail
+	$(CARGO) int
 
 # Deterministic end-to-end lane (canonical integration harness)
 e2e-fast:
@@ -56,7 +53,7 @@ e2e-fast:
 
 e2e-build:
 	@echo "$(YELLOW)Running e2e-build lane (ignored by default)...$(NC)"
-	$(CARGO) test -p meerkat-integration-tests --test e2e_build_lane -- --ignored
+	$(CARGO) e2e-build
 
 # Real local resources only (binaries, sockets, filesystems; no live providers)
 e2e-system:
@@ -86,11 +83,12 @@ test-e2e:
 	@$(MAKE) e2e-live
 	@$(MAKE) e2e-smoke
 
-# Full test suite (for CI)
-# Includes all tests with all features
+# Full deterministic fast suite with all features. Dedicated e2e lanes remain
+# explicit so broad workspace commands do not accidentally run local-resource or
+# live-provider wrappers.
 test-all:
-	@echo "$(GREEN)Running full test suite...$(NC)"
-	$(CARGO) nextest run --workspace --all-features
+	@echo "$(GREEN)Running all-feature fast suite...$(NC)"
+	@scripts/run-build-backend-lane test-all
 
 # Python SDK test suite
 test-sdk-python:
@@ -137,19 +135,8 @@ test-feature-matrix-lib:
 # Surface crate feature combinations
 test-feature-matrix-surface:
 	@echo "$(GREEN)Running surface feature matrix checks...$(NC)"
-	$(CARGO) check -p meerkat-rpc --no-default-features
-	$(CARGO) check -p meerkat-rpc --no-default-features --features comms,mcp
-	$(CARGO) check -p meerkat-rpc --bin rkat-rpc-mini --no-default-features --features mini-surface
-	$(CARGO) check -p meerkat-rest --no-default-features
-	$(CARGO) check -p meerkat-rest --no-default-features --features comms
-	$(CARGO) check -p meerkat-mcp-server --no-default-features
-	$(CARGO) check -p meerkat-mcp-server --no-default-features --features comms
-	$(CARGO) check -p rkat --no-default-features --features session-store
-	$(CARGO) check -p rkat --no-default-features --features session-store,mcp
-	$(CARGO) check -p rkat --bin rkat-mini --no-default-features --features anthropic,openai,gemini,jsonl-store,session-store
-	$(CARGO) check -p rkat --bin rkat-mini --no-default-features --features anthropic,openai,gemini,jsonl-store,session-store,skills
+	CARGO="$(CARGO)" ./scripts/run-surface-feature-matrix
 	$(CARGO) nextest run -p rkat --no-default-features --features session-store,mcp --no-capture
-	$(CARGO) check -p rkat --no-default-features --features session-store,comms,mcp
 
 # Session capability matrix (A-F builds from spec)
 test-session-matrix:
@@ -177,7 +164,7 @@ test-surface-modularity:
 # Run clippy linter
 lint:
 	@echo "$(GREEN)Running clippy...$(NC)"
-	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
+	@scripts/run-build-backend-lane lint
 
 # Run clippy across key feature combinations (not just --all-features)
 lint-feature-matrix:
@@ -207,6 +194,73 @@ audit:
 audit-alt:
 	@echo "$(GREEN)Running cargo-audit...$(NC)"
 	$(CARGO) audit
+
+rust-lane-doctor:
+	@echo "$(GREEN)Checking Rust lane isolation and test-lane shape...$(NC)"
+	@scripts/rust-lane-doctor
+
+cargo-agent-gate: rust-lane-doctor
+	@echo "$(GREEN)Running Cargo agent changed-path gate...$(NC)"
+	@scripts/cargo-agent-gate $(AGENT_GATE_ARGS)
+
+agent-gate:
+	@. ./scripts/build-backend-env; \
+	if meerkat_buildbuddy_enabled; then \
+		$(MAKE) buildbuddy-doctor; \
+	else \
+		$(MAKE) rust-lane-doctor; \
+	fi
+	@echo "$(GREEN)Running agent changed-path gate...$(NC)"
+	@scripts/agent-gate $(AGENT_GATE_ARGS)
+
+buildbuddy-install:
+	@echo "$(GREEN)Installing pinned BuildBuddy CLI...$(NC)"
+	@scripts/install-buildbuddy-cli
+
+# Optional BuildBuddy/remote-cache lanes. Cargo remains the default path.
+buildbuddy-generate:
+	@echo "$(GREEN)Regenerating optional Bazel BUILD files...$(NC)"
+	@node scripts/generate-bazel-rust-builds.mjs
+
+buildbuddy-generate-check:
+	@echo "$(GREEN)Checking generated optional Bazel BUILD files...$(NC)"
+	@node scripts/generate-bazel-rust-builds.mjs --check
+
+buildbuddy-doctor:
+	@echo "$(GREEN)Checking optional BuildBuddy setup...$(NC)"
+	@scripts/buildbuddy-doctor
+
+buildbuddy-agent-gate: buildbuddy-doctor
+	@echo "$(GREEN)Running BuildBuddy agent changed-path gate...$(NC)"
+	@scripts/buildbuddy-agent-gate $(AGENT_GATE_ARGS)
+
+buildbuddy-ci-dispatch: buildbuddy-doctor
+	@echo "$(GREEN)Dispatching optional BuildBuddy CI gate...$(NC)"
+	@scripts/buildbuddy-ci-dispatch $(BUILDBUDDY_CI_ARGS)
+
+buildbuddy-fast: buildbuddy-doctor
+	@echo "$(GREEN)Running BuildBuddy fast workspace test lane...$(NC)"
+	@BUILDBUDDY_BAZEL_COMMAND=workspace-fast-rbe scripts/buildbuddy-bazel-poc --jobs=64
+
+buildbuddy-benchmark:
+	@echo "$(GREEN)Benchmarking Cargo and BuildBuddy fast lanes...$(NC)"
+	@scripts/buildbuddy-benchmark-fast-lanes
+
+buildbuddy-ci: buildbuddy-doctor
+	@echo "$(GREEN)Running BuildBuddy workspace CI gate...$(NC)"
+	@scripts/buildbuddy-ci-workspace --fresh
+
+buildbuddy-ci-warm: buildbuddy-doctor
+	@echo "$(GREEN)Running warmed BuildBuddy workspace CI gate...$(NC)"
+	@scripts/buildbuddy-ci-workspace --warm
+
+buildbuddy-ci-full: buildbuddy-doctor
+	@echo "$(GREEN)Running full BuildBuddy CI gate...$(NC)"
+	@scripts/buildbuddy-ci-full --fresh
+
+buildbuddy-ci-full-warm: buildbuddy-doctor
+	@echo "$(GREEN)Running warmed full BuildBuddy CI gate...$(NC)"
+	@scripts/buildbuddy-ci-full --warm
 
 # Full CI pipeline - runs the required deterministic lanes plus build policy checks
 ci: fmt-check legacy-surface-gate session-control-gate deprecated-backend-gate bridge-no-responsestatus-gate verify-version-parity verify-rpc-surface-alignment verify-sdk-wrapper-freshness check-rust-release-packaging lint lint-feature-matrix test-unit test-int e2e-fast e2e-system test-minimal test-feature-matrix test-surface-modularity seam-inventory rmat-audit audit-generated-headers audit
@@ -523,12 +577,13 @@ help:
 	@echo "  $(GREEN)test-unit$(NC)     - Run unit tests only"
 	@echo "  $(GREEN)test-int$(NC)      - Run integration-fast tests only"
 	@echo "  $(GREEN)e2e-fast$(NC)      - Run deterministic end-to-end lane"
+	@echo "  $(GREEN)e2e-build$(NC)     - Run build-composition e2e lane (ignored)"
 	@echo "  $(GREEN)e2e-system$(NC)    - Run real-binary / real-local-resource lane"
 	@echo "  $(GREEN)e2e-live$(NC)      - Run targeted live-provider lane (ignored)"
 	@echo "  $(GREEN)e2e-smoke$(NC)     - Run kitchen-sink live smoke lane (ignored)"
 	@echo "  $(GREEN)test-int-real$(NC) - Legacy alias for e2e-system"
 	@echo "  $(GREEN)test-e2e$(NC)      - Legacy alias for e2e-live + e2e-smoke"
-	@echo "  $(GREEN)test-all$(NC)      - Run full test suite (CI)"
+	@echo "  $(GREEN)test-all$(NC)      - Run all-feature fast suite"
 	@echo "  $(GREEN)test-sdk-python$(NC)- Run Python SDK test suite"
 	@echo "  $(GREEN)test-sdk-typescript$(NC)- Run TypeScript SDK test suite"
 	@echo "  $(GREEN)test-sdk-suites$(NC)- Run both SDK suites"
@@ -538,6 +593,21 @@ help:
 	@echo "  $(GREEN)fmt$(NC)           - Fix code formatting"
 	@echo "  $(GREEN)fmt-check$(NC)     - Check code formatting"
 	@echo "  $(GREEN)audit$(NC)         - Run security audit (cargo-deny)"
+	@echo "  $(GREEN)rust-lane-doctor$(NC)- Check Rust lane isolation and filtered test lanes"
+	@echo "  $(GREEN)agent-gate$(NC)    - Run Cargo or MEERKAT_BUILDBUDDY=1 BuildBuddy changed gate (AGENT_GATE_ARGS=...)"
+	@echo "  $(GREEN)cargo-agent-gate$(NC)- Run Cargo gate for changed agent files"
+	@echo "  $(GREEN)buildbuddy-install$(NC)- Install pinned optional BuildBuddy CLI"
+	@echo "  $(GREEN)buildbuddy-generate$(NC)- Regenerate optional Bazel BUILD files"
+	@echo "  $(GREEN)buildbuddy-generate-check$(NC)- Check optional Bazel BUILD freshness"
+	@echo "  $(GREEN)buildbuddy-doctor$(NC)- Check optional BuildBuddy setup"
+	@echo "  $(GREEN)buildbuddy-agent-gate$(NC)- Run BuildBuddy gate for changed agent files (AGENT_GATE_ARGS=...)"
+	@echo "  $(GREEN)buildbuddy-ci-dispatch$(NC)- Dispatch optional BuildBuddy CI mode (BUILDBUDDY_CI_ARGS=...)"
+	@echo "  $(GREEN)buildbuddy-fast$(NC)- Run optional BuildBuddy fast test lane"
+	@echo "  $(GREEN)buildbuddy-benchmark$(NC)- Compare Cargo and BuildBuddy fast lanes"
+	@echo "  $(GREEN)buildbuddy-ci$(NC) - Run optional BuildBuddy workspace CI gate"
+	@echo "  $(GREEN)buildbuddy-ci-warm$(NC) - Run warmed BuildBuddy workspace CI gate"
+	@echo "  $(GREEN)buildbuddy-ci-full$(NC) - Run full optional BuildBuddy CI gate"
+	@echo "  $(GREEN)buildbuddy-ci-full-warm$(NC) - Run warmed full BuildBuddy CI gate"
 	@echo "  $(GREEN)ci$(NC)            - Run full CI pipeline"
 	@echo "  $(GREEN)check$(NC)         - Quick compilation check"
 	@echo "  $(GREEN)doc$(NC)           - Generate documentation"

@@ -175,11 +175,28 @@ fn select_compositions(
 }
 
 pub fn repo_root() -> Result<PathBuf> {
+    if let Some(root) = bazel_runfiles_workspace_root() {
+        return Ok(root);
+    }
     if let Some(root) = env::var_os("MEERKAT_MACHINE_ROOT") {
         return Ok(PathBuf::from(root));
     }
 
     workspace_root()
+}
+
+fn bazel_runfiles_workspace_root() -> Option<PathBuf> {
+    let workspace = env::var("TEST_WORKSPACE").ok()?;
+    for base in [env::var_os("TEST_SRCDIR"), env::var_os("RUNFILES_DIR")] {
+        let Some(base) = base else {
+            continue;
+        };
+        let candidate = PathBuf::from(base).join(&workspace);
+        if candidate.join("Cargo.toml").exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 pub fn machine_model_path(root: &Path, slug: &str) -> PathBuf {
@@ -219,7 +236,16 @@ pub fn collect_drift_mismatches(root: &Path, selection: &Selection) -> Result<Ve
 }
 
 fn run_xtask(root: &Path, subcommand: &str, selection: &Selection) -> Result<std::process::Output> {
-    let mut cmd = Command::new("cargo");
+    let workspace = workspace_root()?;
+    let repo_cargo = workspace.join("scripts/repo-cargo");
+    let cargo = if repo_cargo.exists() {
+        repo_cargo
+    } else {
+        std::env::var_os("CARGO")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("cargo"))
+    };
+    let mut cmd = Command::new(cargo);
     cmd.arg("run")
         .arg("-p")
         .arg("xtask")
@@ -228,7 +254,7 @@ fn run_xtask(root: &Path, subcommand: &str, selection: &Selection) -> Result<std
         .arg("--")
         .arg(subcommand)
         .env("MEERKAT_MACHINE_ROOT", root)
-        .current_dir(workspace_root()?);
+        .current_dir(&workspace);
 
     for machine in &selection.machines {
         cmd.arg("--machine").arg(&machine.slug);
@@ -239,7 +265,7 @@ fn run_xtask(root: &Path, subcommand: &str, selection: &Selection) -> Result<std
 
     let output = cmd.output().with_context(|| {
         format!(
-            "run cargo xtask {subcommand} for repo root override {}",
+            "run repo-cargo xtask {subcommand} for repo root override {}",
             root.display()
         )
     })?;

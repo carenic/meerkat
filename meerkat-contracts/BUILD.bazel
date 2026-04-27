@@ -1,0 +1,605 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_macro", "rust_test")
+
+
+
+filegroup(
+
+    name = "cargo_manifest",
+
+    srcs = ["Cargo.toml"],
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+filegroup(
+
+    name = "package_runfiles",
+
+    srcs = glob(["Cargo.toml", "**/*"], exclude = ["BUILD", "BUILD.bazel"], allow_empty = True),
+
+    visibility = ["//visibility:public"],
+
+)
+
+
+
+rust_library(
+    name = "meerkat_contracts",
+    aliases = aliases(package_name = "meerkat-contracts"),
+    crate_name = "meerkat_contracts",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "schema",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-contracts",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-core:meerkat_core",
+        "//meerkat-schedule:meerkat_schedule",
+    ] + all_crate_deps(
+        package_name = "meerkat-contracts",
+        normal = True,
+    ),
+)
+
+rust_test(
+    name = "meerkat_contracts_unit_test",
+    aliases = aliases(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "meerkat_contracts",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "schema",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "./meerkat-contracts",
+    },
+    tags = [
+        "fast",
+        "unit",
+    ],
+    size = "small",
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-contracts",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-core:meerkat_core",
+        "//meerkat-schedule:meerkat_schedule",
+    ] + all_crate_deps(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_binary(
+    name = "emit_schemas_bin",
+    aliases = aliases(package_name = "meerkat-contracts"),
+    crate_name = "emit_schemas",
+    crate_root = "src/bin/emit-schemas.rs",
+    crate_features = [
+        "schema",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "emit-schemas",
+        "CARGO_MANIFEST_DIR": "meerkat-contracts",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-contracts",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-schedule:meerkat_schedule",
+    ] + all_crate_deps(
+        package_name = "meerkat-contracts",
+        normal = True,
+    ),
+)
+
+rust_test(
+    name = "connection_ref_wire_test",
+    aliases = aliases(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "connection_ref_wire",
+    crate_root = "tests/connection_ref_wire.rs",
+    crate_features = [
+        "schema",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/connection_ref_wire.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "connection_ref_wire",
+        "CARGO_MANIFEST_DIR": "./meerkat-contracts",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-contracts",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-schedule:meerkat_schedule",
+    ] + all_crate_deps(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "image_generation_wire_test",
+    aliases = aliases(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "image_generation_wire",
+    crate_root = "tests/image_generation_wire.rs",
+    crate_features = [
+        "schema",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/image_generation_wire.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "image_generation_wire",
+        "CARGO_MANIFEST_DIR": "./meerkat-contracts",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-contracts",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-schedule:meerkat_schedule",
+    ] + all_crate_deps(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "realtime_audio_format_test",
+    aliases = aliases(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "realtime_audio_format",
+    crate_root = "tests/realtime_audio_format.rs",
+    crate_features = [
+        "schema",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/realtime_audio_format.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "realtime_audio_format",
+        "CARGO_MANIFEST_DIR": "./meerkat-contracts",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-contracts",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-schedule:meerkat_schedule",
+    ] + all_crate_deps(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "realtime_barge_in_test",
+    aliases = aliases(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "realtime_barge_in",
+    crate_root = "tests/realtime_barge_in.rs",
+    crate_features = [
+        "schema",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/realtime_barge_in.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "realtime_barge_in",
+        "CARGO_MANIFEST_DIR": "./meerkat-contracts",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-contracts",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-schedule:meerkat_schedule",
+    ] + all_crate_deps(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "realtime_deadline_and_jitter_test",
+    aliases = aliases(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "realtime_deadline_and_jitter",
+    crate_root = "tests/realtime_deadline_and_jitter.rs",
+    crate_features = [
+        "schema",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/realtime_deadline_and_jitter.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "realtime_deadline_and_jitter",
+        "CARGO_MANIFEST_DIR": "./meerkat-contracts",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-contracts",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-schedule:meerkat_schedule",
+    ] + all_crate_deps(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "realtime_tool_timeout_test",
+    aliases = aliases(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "realtime_tool_timeout",
+    crate_root = "tests/realtime_tool_timeout.rs",
+    crate_features = [
+        "schema",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/realtime_tool_timeout.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "realtime_tool_timeout",
+        "CARGO_MANIFEST_DIR": "./meerkat-contracts",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-contracts",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-schedule:meerkat_schedule",
+    ] + all_crate_deps(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "regression_wire_types_test",
+    aliases = aliases(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "regression_wire_types",
+    crate_root = "tests/regression_wire_types.rs",
+    crate_features = [
+        "schema",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/regression_wire_types.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "regression_wire_types",
+        "CARGO_MANIFEST_DIR": "./meerkat-contracts",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-contracts",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-schedule:meerkat_schedule",
+    ] + all_crate_deps(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "session_accept_input_typed_round_trip_test",
+    aliases = aliases(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "session_accept_input_typed_round_trip",
+    crate_root = "tests/session_accept_input_typed_round_trip.rs",
+    crate_features = [
+        "schema",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/session_accept_input_typed_round_trip.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "session_accept_input_typed_round_trip",
+        "CARGO_MANIFEST_DIR": "./meerkat-contracts",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-contracts",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-schedule:meerkat_schedule",
+    ] + all_crate_deps(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "skill_ref_wire_no_legacy_test",
+    aliases = aliases(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "skill_ref_wire_no_legacy",
+    crate_root = "tests/skill_ref_wire_no_legacy.rs",
+    crate_features = [
+        "schema",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/skill_ref_wire_no_legacy.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "skill_ref_wire_no_legacy",
+        "CARGO_MANIFEST_DIR": "./meerkat-contracts",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-contracts",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-contracts:meerkat_contracts",
+        "//meerkat-core:meerkat_core",
+        "//meerkat-schedule:meerkat_schedule",
+    ] + all_crate_deps(
+        package_name = "meerkat-contracts",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+test_suite(
+    name = "fast_tests",
+    tests = [
+        ":connection_ref_wire_test",
+        ":image_generation_wire_test",
+        ":meerkat_contracts_unit_test",
+        ":realtime_audio_format_test",
+        ":realtime_barge_in_test",
+        ":realtime_deadline_and_jitter_test",
+        ":realtime_tool_timeout_test",
+        ":regression_wire_types_test",
+        ":session_accept_input_typed_round_trip_test",
+        ":skill_ref_wire_no_legacy_test",
+    ],
+)

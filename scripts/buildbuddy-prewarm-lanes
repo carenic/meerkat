@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+profile="${1:-dev}"
+
+wait_for_all() {
+  local status=0
+  local pid
+  for pid in "$@"; do
+    if ! wait "${pid}"; then
+      status=1
+    fi
+  done
+  return "${status}"
+}
+
+run_lane() {
+  local lane="$1"
+  local command="$2"
+  shift 2
+  (
+    export RUST_LANE_ID="${RUST_LANE_ID_PREFIX:-prewarm}-${lane}"
+    export BUILDBUDDY_BAZEL_COMMAND="${command}"
+    if [[ "${command}" == "build" ]]; then
+      export BUILDBUDDY_BAZEL_CONFIG="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    fi
+    ./scripts/buildbuddy-bazel-poc "$@"
+  )
+}
+
+case "${profile}" in
+  dev)
+    run_lane source build //meerkat-machine-dsl-core:meerkat_machine_dsl_core --jobs=64 --color=no --curses=no &
+    pid_source=$!
+    run_lane source-clippy owned-clippy-rbe meerkat-machine-dsl-core/src/lib.rs --jobs=64 --color=no --curses=no &
+    pid_source_clippy=$!
+    run_lane exact-test fast-test //meerkat-mob:member_session_bindings_test --jobs=64 &
+    pid_exact=$!
+    run_lane support-local fast-test-local //meerkat:sdk_agentfactory_test //meerkat:sdk_structured_output_test --color=no --curses=no &
+    pid_support=$!
+    run_lane support-clippy owned-clippy-rbe meerkat/tests/support/test_session_store.rs --jobs=64 --color=no --curses=no &
+    pid_support_clippy=$!
+    wait_for_all "${pid_source}" "${pid_source_clippy}" "${pid_exact}" "${pid_support}" "${pid_support_clippy}"
+    ;;
+  ci)
+    run_lane workspace-fast-clippy-rbe workspace-fast-clippy-rbe --jobs=64 &
+    pid_workspace=$!
+    run_lane workspace-build-clippy-rbe workspace-build-clippy-rbe --jobs=64 --color=no --curses=no &
+    pid_clippy=$!
+    wait_for_all "${pid_workspace}" "${pid_clippy}"
+    ;;
+  ci-fast)
+    run_lane fast fast-test --jobs=64 &
+    pid_fast=$!
+    run_lane clippy-rbe clippy-rbe --jobs=64 --color=no --curses=no &
+    pid_clippy=$!
+    wait_for_all "${pid_fast}" "${pid_clippy}"
+    ;;
+  *)
+    cat >&2 <<'EOF'
+usage: buildbuddy-prewarm-lanes [dev|ci|ci-fast]
+
+Profiles:
+  dev  Prewarm common source, changed-clippy, exact-test, and support-file feedback lanes.
+  ci   Prewarm/run split workspace test+clippy and build-clippy lanes in parallel.
+  ci-fast
+       Prewarm/run fast-test and clippy-rbe lanes in parallel.
+EOF
+    exit 2
+    ;;
+esac

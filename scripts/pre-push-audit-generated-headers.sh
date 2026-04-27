@@ -15,9 +15,19 @@ set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
+ROOT="${ROOT:-$(pwd)}"
+source "${ROOT}/scripts/build-backend-env"
+
+if meerkat_buildbuddy_enabled; then
+  MEERKAT_BUILDBUDDY_CI_MODE="${MEERKAT_BUILDBUDDY_CI_MODE:-full-warm}" \
+    "${ROOT}/scripts/buildbuddy-ci-lane" machine-authority
+  exit 0
+fi
+
 # Reuse the same xtask build path as the existing machine-authority
 # pre-push gate so both hooks share the isolated target dir.
 XTASK_TARGET_DIR="${XTASK_TARGET_DIR:-$HOME/.cache/meerkat/xtask-target}"
+CARGO="${CARGO:-./scripts/repo-cargo}"
 
 export CARGO_TARGET_DIR="$XTASK_TARGET_DIR"
-cargo run -p xtask -- audit-generated-headers
+"$CARGO" run -p xtask -- audit-generated-headers

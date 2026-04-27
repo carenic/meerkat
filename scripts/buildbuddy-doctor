@@ -1,0 +1,430 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+workspace_root="$(git rev-parse --show-toplevel)"
+cd "${workspace_root}"
+
+ok=0
+warn=0
+fail=0
+
+pass() {
+  ok=$((ok + 1))
+  printf 'PASS %s\n' "$1"
+}
+
+note() {
+  warn=$((warn + 1))
+  printf 'WARN %s\n' "$1"
+}
+
+bad() {
+  fail=$((fail + 1))
+  printf 'FAIL %s\n' "$1"
+}
+
+has_buildbuddy_key() {
+  if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
+    return 0
+  fi
+  if [[ -f "${HOME}/.zshrc" ]] &&
+    grep -q -E '^[[:space:]]*(export[[:space:]]+)?BUILDBUDDY_API_KEY=' "${HOME}/.zshrc"; then
+    return 0
+  fi
+  return 1
+}
+
+if has_buildbuddy_key; then
+  pass "BuildBuddy API key is configured"
+else
+  bad "BuildBuddy API key is not configured; set BUILDBUDDY_API_KEY or add it to ~/.zshrc"
+fi
+
+if [[ -n "${BUILDBUDDY_BB:-}" && -x "${BUILDBUDDY_BB}" ]]; then
+  pass "BuildBuddy CLI found via BUILDBUDDY_BB"
+elif command -v bb >/dev/null 2>&1; then
+  pass "BuildBuddy CLI found on PATH"
+elif [[ -x "${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-cli/5.0.350/bin/bb" ]]; then
+  pass "BuildBuddy CLI found in pinned repo cache"
+elif [[ -x /tmp/buildbuddy-poc/bin/bb ]]; then
+  pass "BuildBuddy CLI found at /tmp/buildbuddy-poc/bin/bb"
+else
+  bad "BuildBuddy CLI not found; run make buildbuddy-install or set BUILDBUDDY_BB"
+fi
+
+if [[ -f .bazelrc ]] && grep -q 'build:buildbuddy-macos-rbe' .bazelrc; then
+  pass ".bazelrc has buildbuddy-macos-rbe config"
+else
+  bad ".bazelrc is missing buildbuddy-macos-rbe config"
+fi
+
+if grep -q 'platforms=//platforms:macos_arm64' .bazelrc &&
+  grep -q 'OSFamily=darwin' .bazelrc &&
+  grep -q 'Arch=arm64' .bazelrc; then
+  pass "BuildBuddy RBE config targets macOS arm64 executors"
+else
+  bad "BuildBuddy RBE config is not pinned to macOS arm64"
+fi
+
+if [[ -f MODULE.bazel ]] &&
+  grep -q 'toolchains_buildbuddy' MODULE.bazel &&
+  grep -q 'rules_rust' MODULE.bazel; then
+  pass "Bazel module declares BuildBuddy toolchain and rules_rust"
+else
+  bad "MODULE.bazel is missing BuildBuddy/rules_rust dependencies"
+fi
+
+generate_check_log="${TMPDIR:-/tmp}/meerkat-buildbuddy-generate-check.$$"
+if node scripts/generate-bazel-rust-builds.mjs --check >"${generate_check_log}" 2>&1; then
+  pass "Generated Bazel BUILD files are up to date"
+else
+  bad "Generated Bazel BUILD files are stale"
+  cat "${generate_check_log}" >&2
+fi
+rm -f "${generate_check_log}"
+
+fast_parity_output="$(node scripts/buildbuddy-fast-parity.mjs 2>&1 || true)"
+if [[ "${fast_parity_output}" == "BuildBuddy fast parity ok:"* ]]; then
+  pass "${fast_parity_output}"
+else
+  bad "BuildBuddy fast parity check failed"
+  printf '%s\n' "${fast_parity_output}" >&2
+fi
+
+for tag in local e2e system live integration slow required-feature trybuild snapshot fixture; do
+  if ! grep -q -- "fast_test_tag_filters=.*-${tag}" scripts/buildbuddy-bazel-poc; then
+    bad "workspace-fast-rbe does not exclude ${tag} tests"
+  fi
+done
+if ! grep -q 'fast_test_tag_filters=' scripts/buildbuddy-bazel-poc; then
+  bad "workspace fast tag filters are not centralized"
+elif grep -q -- '--test_tag_filters="${fast_test_tag_filters}"' scripts/buildbuddy-bazel-poc; then
+  pass "BuildBuddy workspace fast lanes exclude non-fast test tags"
+else
+  bad "BuildBuddy workspace fast lanes do not use the centralized non-fast tag filter"
+fi
+
+build_label_count="$(./scripts/bazel-affected-fast-tests.mjs --all --build | wc -w | tr -d ' ')"
+if [[ "${build_label_count}" =~ ^[0-9]+$ && "${build_label_count}" -gt 0 ]]; then
+  pass "Bazel selector can enumerate ${build_label_count} build labels"
+else
+  bad "Bazel selector did not enumerate build labels"
+fi
+
+support_test_labels="$(./scripts/bazel-affected-fast-tests.mjs --owned --test meerkat/tests/support/test_session_store.rs)"
+if [[ "${support_test_labels}" == *"//meerkat:sdk_agentfactory_test"* ]] &&
+  [[ "${support_test_labels}" == *"//meerkat:sdk_structured_output_test"* ]]; then
+  pass "Bazel selector narrows integration support edits to importing tests"
+else
+  bad "Bazel selector did not select exact importing integration tests"
+  printf '%s\n' "${support_test_labels}" >&2
+fi
+
+required_feature_test_labels="$(./scripts/bazel-affected-fast-tests.mjs --owned --test --empty-if-no-labels meerkat-cli/tests/cli_mobpack_live_smoke.rs)"
+if [[ -z "${required_feature_test_labels}" ]]; then
+  pass "Bazel selector avoids broad fast tests for required-feature test edits"
+else
+  bad "Bazel selector broadened required-feature test edits to unrelated tests"
+  printf '%s\n' "${required_feature_test_labels}" >&2
+fi
+
+required_feature_build_labels="$(./scripts/bazel-affected-fast-tests.mjs --owned --build meerkat-cli/tests/cli_mobpack_live_smoke.rs)"
+required_feature_clippy_labels="$(./scripts/bazel-affected-fast-tests.mjs --owned --clippy meerkat-cli/tests/cli_mobpack_live_smoke.rs)"
+if [[ "${required_feature_build_labels}" == "//meerkat-cli:cli_mobpack_live_smoke_test" ]] &&
+  [[ "${required_feature_clippy_labels}" == "//meerkat-cli:cli_mobpack_live_smoke_test" ]]; then
+  pass "Bazel selector narrows required-feature build/clippy edits to the exact test target"
+else
+  bad "Bazel selector did not narrow required-feature build/clippy edits"
+  printf 'build: %s\nclippy: %s\n' "${required_feature_build_labels}" "${required_feature_clippy_labels}" >&2
+fi
+
+optional_required_feature_build_labels="$(./scripts/bazel-affected-fast-tests.mjs --owned --build xtask/tests/machines_contracts.rs)"
+optional_required_feature_clippy_labels="$(./scripts/bazel-affected-fast-tests.mjs --owned --clippy xtask/tests/machines_contracts.rs)"
+if [[ "${optional_required_feature_build_labels}" == "//xtask:machines_contracts_test" ]] &&
+  [[ "${optional_required_feature_clippy_labels}" == "//xtask:machines_contracts_test" ]]; then
+  pass "Bazel selector narrows optional-dependency required-feature edits"
+else
+  bad "Bazel selector did not narrow optional-dependency required-feature edits"
+  printf 'build: %s\nclippy: %s\n' "${optional_required_feature_build_labels}" "${optional_required_feature_clippy_labels}" >&2
+fi
+
+changed_gate_dry_run="$(./scripts/buildbuddy-agent-gate --dry-run --working-tree xtask/tests/machines_contracts.rs 2>&1 || true)"
+if [[ "${changed_gate_dry_run}" == *"build-targets: //xtask:machines_contracts_test"* ]] &&
+  [[ "${changed_gate_dry_run}" == *"clippy-targets: //xtask:machines_contracts_test"* ]] &&
+  [[ "${changed_gate_dry_run}" == *"plan: combined build+clippy"* ]]; then
+  pass "BuildBuddy dry-run explains required-feature exact target routing"
+else
+  bad "BuildBuddy dry-run did not explain required-feature exact routing"
+  printf '%s\n' "${changed_gate_dry_run}" >&2
+fi
+
+mixed_changed_gate_dry_run="$(./scripts/buildbuddy-changed-gate --owned --dry-run meerkat/tests/support/test_session_store.rs xtask/tests/machines_contracts.rs 2>&1 || true)"
+if [[ "${mixed_changed_gate_dry_run}" == *"test-targets: //meerkat:sdk_agentfactory_test //meerkat:sdk_structured_output_test"* ]] &&
+  [[ "${mixed_changed_gate_dry_run}" == *"clippy-targets: //meerkat:sdk_agentfactory_test //meerkat:sdk_structured_output_test //xtask:machines_contracts_test"* ]] &&
+  [[ "${mixed_changed_gate_dry_run}" == *"plan: split test + clippy"* ]]; then
+  pass "BuildBuddy mixed fast/non-fast edits keep exact clippy coverage"
+else
+  bad "BuildBuddy mixed fast/non-fast edit routing lost exact coverage"
+  printf '%s\n' "${mixed_changed_gate_dry_run}" >&2
+fi
+
+broad_changed_gate_dry_run="$(./scripts/buildbuddy-changed-gate --owned --dry-run meerkat-cli/src/main.rs meerkat-store/src/realm.rs 2>&1 || true)"
+if [[ "${broad_changed_gate_dry_run}" == *"plan: split test + clippy"* ]] &&
+  [[ "${broad_changed_gate_dry_run}" == *"split-execution: serial"* ]]; then
+  pass "BuildBuddy broad source edits use serial split cache warmup"
+else
+  bad "BuildBuddy broad source edit routing is not cache-aware"
+  printf '%s\n' "${broad_changed_gate_dry_run}" >&2
+fi
+
+if grep -Fq '/vendor/oai-rt-rs' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'original.replace' scripts/buildbuddy-bazel-poc &&
+  grep -Fq -- '--lockfile_mode=refresh' scripts/buildbuddy-bazel-poc; then
+  pass "BuildBuddy launcher refreshes stale local path dependency locks"
+else
+  bad "BuildBuddy launcher does not refresh stale local path dependency locks"
+fi
+
+if grep -Fq 'name = "package_runfiles"' vendor/oai-rt-rs/BUILD.bazel &&
+  grep -Fq '//vendor/oai-rt-rs:package_runfiles' BUILD.bazel xtask/BUILD.bazel &&
+  grep -Fq 'crate = "oai-rt-rs"' MODULE.bazel &&
+  grep -Fq 'additive_build_file_content' MODULE.bazel &&
+  grep -Fq 'additive_build_file_content' MODULE.bazel.lock; then
+  pass "Vendored oai-rt-rs runfiles target is declared in checked-in and lock-generated BUILD content"
+else
+  bad "Vendored oai-rt-rs runfiles target is missing from checked-in or lock-generated BUILD content"
+fi
+
+if grep -Fq 'Cache Bazel external repositories' .github/actions/setup-buildbuddy-ci/action.yml &&
+  grep -Fq -- '--repository_cache=' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'MEERKAT_BUILDBUDDY_FETCH_RETRIES' scripts/buildbuddy-ci-lane &&
+  grep -Fq 'Retrying %s after transient external repository fetch failure' scripts/buildbuddy-ci-lane; then
+  pass "BuildBuddy CI caches and retries external repository fetches"
+else
+  bad "BuildBuddy CI does not guard against transient external repository fetch failures"
+fi
+
+if [[ -x scripts/run-surface-feature-matrix ]] &&
+  grep -Fq './scripts/run-surface-feature-matrix' .github/workflows/cargo.yml &&
+  grep -Fq -- '-p meerkat-rpc \' scripts/run-surface-feature-matrix &&
+  grep -Fq -- '-p meerkat-rest \' scripts/run-surface-feature-matrix &&
+  grep -Fq -- '-p meerkat-mcp-server' scripts/run-surface-feature-matrix &&
+  grep -Fq 'default_target="//:surface_feature_matrix_builds"' scripts/buildbuddy-bazel-poc &&
+  ! grep -Fq 'test-feature-matrix-surface-checks)' tools/buildbuddy/cargo_lane_test.sh; then
+  pass "Surface feature matrix keeps Cargo checks for Cargo CI and uses Bazel-native targets for BuildBuddy CI"
+else
+  bad "Surface feature matrix is not split cleanly between Cargo and BuildBuddy CI"
+fi
+
+if [[ -x scripts/run-build-backend-lane ]] &&
+  grep -Fq 'scripts/run-build-backend-lane lint' Makefile &&
+  grep -Fq 'scripts/run-build-backend-lane test-all' Makefile &&
+  grep -Fq 'buildbuddy-ci-lane" cargo-all-features-clippy' scripts/run-build-backend-lane &&
+  grep -Fq 'buildbuddy-ci-lane" test-unit' scripts/run-build-backend-lane &&
+  grep -Fq 'buildbuddy-ci-lane" integration-fast' scripts/run-build-backend-lane; then
+  pass "Developer lint and full fast-test lanes use BuildBuddy when MEERKAT_BUILDBUDDY is enabled"
+else
+  bad "Developer lint and full fast-test lanes do not honor the BuildBuddy opt-in"
+fi
+
+if grep -Fq -- '--macos_sdk_version=' scripts/buildbuddy-bazel-poc &&
+  grep -Fq -- '--macos_minimum_os=' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'BUILDBUDDY_MACOS_SDK_VERSION' scripts/buildbuddy-bazel-poc; then
+  pass "BuildBuddy macOS lanes pin executor SDK selection with overrides"
+else
+  bad "BuildBuddy macOS lanes do not pin executor SDK selection"
+fi
+
+dispatch_log_root="$(mktemp -d "${TMPDIR:-/tmp}/meerkat-buildbuddy-dispatch-doctor.XXXXXX")"
+dispatch_dry_run="$(
+  MEERKAT_BUILDBUDDY_LOG_ROOT="${dispatch_log_root}" \
+    ./scripts/buildbuddy-ci-dispatch --mode changed-paths --paths meerkat-runtime/src/input_ledger.rs --dry-run 2>&1 || true
+)"
+if [[ -s "${dispatch_log_root}/dispatch-context.txt" ]] &&
+  [[ -s "${dispatch_log_root}/dispatch-inputs.txt" ]] &&
+  grep -q '^mode=changed-paths$' "${dispatch_log_root}/dispatch-inputs.txt" &&
+  grep -q '^dry_run=1$' "${dispatch_log_root}/dispatch-inputs.txt" &&
+  [[ "${dispatch_dry_run}" == *"BuildBuddy changed gate dry-run (owned)"* ]]; then
+  pass "BuildBuddy CI dispatch writes changed-path context artifacts"
+else
+  bad "BuildBuddy CI dispatch did not write changed-path context artifacts"
+  printf '%s\n' "${dispatch_dry_run}" >&2
+  find "${dispatch_log_root}" -maxdepth 1 -type f -print >&2 || true
+fi
+rm -rf "${dispatch_log_root}"
+
+if grep -Fq 'name: CI' .github/workflows/ci.yml &&
+  grep -Fq 'uses: ./.github/workflows/cargo.yml' .github/workflows/ci.yml &&
+  grep -Fq 'uses: ./.github/workflows/buildbuddy.yml' .github/workflows/ci.yml &&
+  grep -Fq 'name: CI gate' .github/workflows/ci.yml &&
+  grep -Fq 'name: Cargo CI' .github/workflows/cargo.yml &&
+  grep -Fq 'workflow_call:' .github/workflows/cargo.yml &&
+  grep -Fq 'name: Cargo CI gate' .github/workflows/cargo.yml &&
+  grep -Fq 'name: BuildBuddy CI' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'workflow_call:' .github/workflows/buildbuddy.yml &&
+  ! grep -Fq 'pull_request:' .github/workflows/cargo.yml &&
+  ! grep -Fq 'push:' .github/workflows/cargo.yml &&
+  ! grep -Fq 'pull_request:' .github/workflows/buildbuddy.yml &&
+  ! grep -Fq 'push:' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'MEERKAT_BUILDBUDDY' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'BuildBuddy CI gate' .github/workflows/buildbuddy.yml; then
+  pass "Automatic CI selects Cargo or reusable BuildBuddy, not both"
+else
+  bad "Automatic CI does not select exactly one build backend"
+fi
+
+if grep -Fq 'vars.MEERKAT_BUILDBUDDY == '"'"'true'"'"'' .github/workflows/ci.yml &&
+  grep -Fq 'vars.MEERKAT_BUILDBUDDY == '"'"'true'"'"'' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'MEERKAT_BUILDBUDDY: ${{ vars.MEERKAT_BUILDBUDDY' .github/workflows/ci.yml &&
+  grep -Fq 'MEERKAT_BUILDBUDDY: ${{ vars.MEERKAT_BUILDBUDDY' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'MEERKAT_BUILDBUDDY=1' README.md &&
+  grep -Fq 'MEERKAT_BUILDBUDDY=1' scripts/agent-gate &&
+  ! grep -Fq 'MEERKAT_AGENT_GATE_BACKEND' scripts/build-backend-env &&
+  ! grep -Fq 'MEERKAT_AGENT_GATE_BACKEND=buildbuddy' README.md &&
+  ! grep -Fq 'MEERKAT_AGENT_GATE_BACKEND=buildbuddy' docs/architecture/buildbuddy-bazel-poc.md &&
+  grep -Fq '. ./scripts/build-backend-env' Makefile &&
+  grep -Fq 'source "${ROOT}/scripts/build-backend-env"' scripts/pre-push-unit.sh &&
+  grep -Fq 'scripts/agent-gate" --staged' scripts/test-changed-crates.sh &&
+  grep -Fq 'scripts/agent-gate" --committed --clippy-only' scripts/pre-push-clippy.sh; then
+  pass "MEERKAT_BUILDBUDDY is the single opt-in switch for CI and hooks"
+else
+  bad "BuildBuddy opt-in switch is not wired consistently"
+fi
+
+if grep -Fq 'full-fresh' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'fmt-lint:' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'test-unit:' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'integration-fast:' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'e2e-system:' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'SDK suites + parity gates' .github/workflows/buildbuddy.yml &&
+  ! grep -Fq 'changed-gate:' .github/workflows/buildbuddy.yml &&
+  ! grep -Fq 'Changed-path gate (Bazel/RBE)' .github/workflows/buildbuddy.yml &&
+  ! grep -Fq 'rust-release-packaging:' .github/workflows/buildbuddy.yml &&
+  ! grep -Fq 'e2e-smoke:' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'BuildBuddy E2E smoke lane' .github/workflows/live-e2e.yml &&
+  ! grep -Fq 'Build + clippy (Bazel/RBE)' .github/workflows/buildbuddy.yml &&
+  ! grep -Fq '(compat)' .github/workflows/buildbuddy.yml &&
+  ! grep -Fq 'strategy:' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'run-buildbuddy-ci-lane' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'scripts/buildbuddy-ci-lane' .github/actions/run-buildbuddy-ci-lane/action.yml &&
+  grep -Fq 'workspace-unit-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'workspace-integration-fast-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'e2e-fast-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'e2e-live-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'e2e-smoke-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'machine-authority-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'rmat-audit-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'seam-inventory-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'sdk-suites-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'wasm-contract-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'security-audit-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'buildbuddy-ci-full:' Makefile &&
+  grep -Fq 'e2e-live' scripts/buildbuddy-ci-lane &&
+  ! grep -Fq 'run_compat_lane' scripts/buildbuddy-ci-lane &&
+  ! grep -Fq './scripts/repo-cargo' scripts/buildbuddy-ci-lane &&
+  ! grep -Fq 'cargo-deny check' scripts/buildbuddy-ci-lane &&
+  ! grep -Fq 'wasm-pack test' scripts/buildbuddy-ci-lane; then
+  pass "BuildBuddy workflow exposes standard CI as a 1:1 Cargo lane map"
+else
+  bad "BuildBuddy workflow does not match the Cargo lane map"
+fi
+
+if grep -Fq 'default_target="//tools/buildbuddy:sdk_suites_cargo_equivalent_test"' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'default_target="//tools/buildbuddy:wasm_contract_cargo_equivalent_test"' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'default_target="//tools/buildbuddy:wasm_check_cargo_equivalent_test"' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'default_target="//tools/buildbuddy:security_audit_cargo_equivalent_test"' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'name = "sdk_suites_cargo_equivalent_test"' tools/buildbuddy/BUILD.bazel &&
+  grep -Fq 'name = "wasm_contract_cargo_equivalent_test"' tools/buildbuddy/BUILD.bazel &&
+  grep -Fq 'name = "wasm_check_cargo_equivalent_test"' tools/buildbuddy/BUILD.bazel &&
+  grep -Fq 'name = "security_audit_cargo_equivalent_test"' tools/buildbuddy/BUILD.bazel; then
+  pass "BuildBuddy SDK, WASM, and audit lanes use real cargo-equivalent Bazel test targets"
+else
+  bad "BuildBuddy SDK, WASM, or audit lane is still static, host-only, or unmapped"
+fi
+
+if grep -Fq 'default_target="//:surface_feature_matrix_builds"' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'command="build"' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'name = "surface_feature_matrix_builds"' BUILD.bazel &&
+  grep -Fq 'meerkat_rpc_surface_min' meerkat-rpc/BUILD.bazel &&
+  grep -Fq 'meerkat_rest_surface_comms' meerkat-rest/BUILD.bazel &&
+  grep -Fq 'meerkat_mcp_server_surface_comms' meerkat-mcp-server/BUILD.bazel &&
+  grep -Fq 'rkat_surface_session_store_comms_mcp_bin' meerkat-cli/BUILD.bazel; then
+  pass "BuildBuddy surface feature matrix uses Bazel-native feature-variant build targets"
+else
+  bad "BuildBuddy surface feature matrix still routes through cargo-in-shell"
+fi
+
+if awk '
+  /sdk-suites-rbe\)/ { lane = "sdk" }
+  /wasm-contract-rbe\)/ { lane = "wasm-contract" }
+  /wasm-check-rbe\)/ { lane = "wasm-check" }
+  /security-audit-rbe\)/ { lane = "audit" }
+  lane != "" && /;;/ { lane = "" }
+  lane != "" && /buildbuddy_static_lanes_test/ { bad = 1 }
+  lane != "" && /meerkat-web-runtime:.*_test/ { bad = 1 }
+  END { exit bad ? 1 : 0 }
+' scripts/buildbuddy-bazel-poc; then
+  pass "BuildBuddy full lanes do not route through static or host-only placeholder tests"
+else
+  bad "BuildBuddy full lanes still contain placeholder test routing"
+fi
+
+if ! grep -Fq 'rust-release-packaging:' .github/workflows/cargo.yml &&
+  grep -Fq 'Verify Rust release packaging' .github/workflows/release.yml &&
+  grep -Fq 'e2e-system' .github/workflows/cargo.yml &&
+  ! grep -Fq 'e2e-live:' .github/workflows/cargo.yml &&
+  ! grep -Fq 'e2e-smoke:' .github/workflows/cargo.yml &&
+  grep -Fq 'Cargo E2E live lane' .github/workflows/live-e2e.yml &&
+  grep -Fq 'Cargo E2E smoke lane' .github/workflows/live-e2e.yml &&
+  grep -Fq 'needs: [cargo, buildbuddy]' .github/workflows/ci.yml &&
+  grep -Fq 'needs: [fmt-lint, sdk-suites, machine-authority, test-unit, integration-fast, e2e-fast, e2e-system, test-minimal' .github/workflows/cargo.yml &&
+  ! grep -Fq 'needs: [fmt-lint, sdk-suites, rust-release-packaging' .github/workflows/cargo.yml; then
+  pass "CI gate selects one backend and Cargo gate depends on every standard Cargo CI lane"
+else
+  bad "CI gate does not match the backend selector and standard/nightly lane split"
+fi
+
+if grep -Fq 'name = "e2e_system_tests"' BUILD.bazel &&
+  grep -Fq 'workspace-unit-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'workspace-integration-fast-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'e2e-fast-rbe' scripts/buildbuddy-ci-lane &&
+  grep -Fq 'e2e-live-rbe' scripts/buildbuddy-ci-lane &&
+  grep -Fq 'e2e-smoke-rbe' scripts/buildbuddy-ci-lane &&
+  grep -Fq 'machine-authority-rbe' scripts/buildbuddy-ci-lane &&
+  grep -Fq 'rmat-audit-rbe' scripts/buildbuddy-ci-lane &&
+  grep -Fq 'seam-inventory-rbe' scripts/buildbuddy-ci-lane &&
+  grep -Fq 'system_e2e_command="e2e-system-rbe"' scripts/buildbuddy-ci-workspace &&
+  grep -Fq 'RKAT_TEST_BIN_RKAT_RPC' tests/integration/BUILD.bazel &&
+  grep -Fq 'CARGO_BIN_EXE_rkat' meerkat-cli/BUILD.bazel; then
+  pass "BuildBuddy CI has native unit, integration-fast, and e2e lanes"
+else
+  bad "BuildBuddy CI is missing native test lane wiring"
+fi
+
+ci_workflow_gate_dry_run="$(./scripts/buildbuddy-agent-gate --dry-run .github/workflows/ci.yml 2>&1 || true)"
+if [[ "${ci_workflow_gate_dry_run}" == *"Global build/test configuration changed"* ]] &&
+  [[ "${ci_workflow_gate_dry_run}" == *"DRY-RUN make buildbuddy-ci-warm"* ]]; then
+  pass "BuildBuddy agent gate escalates normal CI workflow edits"
+else
+  bad "BuildBuddy agent gate does not escalate normal CI workflow edits"
+  printf '%s\n' "${ci_workflow_gate_dry_run}" >&2
+fi
+
+sample_a="${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-bazel/$(basename "${workspace_root}")-sample-workspace-fast-rbe-agent-a"
+sample_b="${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-bazel/$(basename "${workspace_root}")-sample-workspace-fast-rbe-agent-b"
+if [[ "${sample_a}" != "${sample_b}" ]]; then
+  pass "BuildBuddy lane model supports distinct same-worktree agent output roots"
+else
+  bad "BuildBuddy lane model would collide for same-worktree agents"
+fi
+
+if [[ -n "$(git status --short)" ]]; then
+  note "working tree has local changes; doctor did not modify them"
+else
+  pass "working tree is clean"
+fi
+
+printf '\nBuildBuddy doctor: %s pass, %s warn, %s fail\n' "${ok}" "${warn}" "${fail}"
+if [[ "${fail}" -gt 0 ]]; then
+  exit 1
+fi

@@ -909,7 +909,17 @@ mod mcp_protocol {
         let workspace_root = std::path::Path::new(&manifest_dir)
             .parent()
             .unwrap_or(std::path::Path::new("."));
-        let server_path = workspace_root.join("target/debug/mcp-test-server");
+        let server_path = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .and_then(|target_dir| {
+                [
+                    target_dir.join("debug/mcp-test-server"),
+                    target_dir.join("release/mcp-test-server"),
+                ]
+                .into_iter()
+                .find(|path| path.exists())
+            })
+            .unwrap_or_else(|| workspace_root.join("target/debug/mcp-test-server"));
 
         if !server_path.exists() {
             eprintln!("Skipping: MCP test server not built (run cargo build -p mcp-test-server)");

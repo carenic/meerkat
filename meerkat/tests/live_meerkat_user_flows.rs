@@ -316,7 +316,17 @@ fn gemini_model() -> String {
 fn get_test_server_path() -> Option<std::path::PathBuf> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").ok()?;
     let workspace_root = std::path::Path::new(&manifest_dir).parent()?;
-    let server_path = workspace_root.join("target/debug/mcp-test-server");
+    let server_path = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .and_then(|target_dir| {
+            [
+                target_dir.join("debug/mcp-test-server"),
+                target_dir.join("release/mcp-test-server"),
+            ]
+            .into_iter()
+            .find(|path| path.exists())
+        })
+        .unwrap_or_else(|| workspace_root.join("target/debug/mcp-test-server"));
     if server_path.exists() {
         Some(server_path)
     } else {

@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+base_ref="${CARGO_AGENT_BASE:-}"
+dry_run=0
+scope="all"
+run_clippy=1
+run_tests=1
+paths=()
+
+usage() {
+  cat <<'EOF'
+usage: cargo-agent-gate [--base <rev>] [--staged|--committed|--working-tree] [--clippy-only|--tests-only] [--dry-run] [path ...]
+
+Runs the default Cargo gate most useful for local agent edits. If paths are not
+provided, the script derives changed files from branch, staged, unstaged, and
+untracked changes. Use --staged for pre-commit hooks, --committed for pre-push
+hooks, and --working-tree for unstaged/untracked local probes. Crate-local
+Rust/TOML edits run package-scoped clippy and nextest by default. Global
+Cargo/nextest lane changes escalate to workspace Cargo gates.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --base requires a revision" >&2
+        usage >&2
+        exit 2
+      fi
+      base_ref="$2"
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --staged)
+      scope="staged"
+      shift
+      ;;
+    --committed)
+      scope="committed"
+      shift
+      ;;
+    --working-tree)
+      scope="working-tree"
+      shift
+      ;;
+    --clippy-only)
+      run_clippy=1
+      run_tests=0
+      shift
+      ;;
+    --tests-only)
+      run_clippy=0
+      run_tests=1
+      shift
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do
+        paths+=("$1")
+        shift
+      done
+      ;;
+    -*)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      paths+=("$1")
+      shift
+      ;;
+  esac
+done
+
+workspace_root="$(git rev-parse --show-toplevel)"
+cd "${workspace_root}"
+CARGO="${CARGO:-./scripts/repo-cargo}"
+metadata_json=""
+
+resolve_base() {
+  if [[ -n "${base_ref}" ]]; then
+    printf '%s\n' "${base_ref}"
+    return
+  fi
+  if git rev-parse --verify origin/main >/dev/null 2>&1; then
+    printf '%s\n' "origin/main"
+    return
+  fi
+  if git rev-parse --verify main >/dev/null 2>&1; then
+    printf '%s\n' "main"
+    return
+  fi
+  git rev-parse HEAD
+}
+
+collect_changed_paths() {
+  if [[ "${#paths[@]}" -gt 0 ]]; then
+    printf '%s\n' "${paths[@]}"
+    return
+  fi
+
+  local base
+  base="$(resolve_base)"
+  case "${scope}" in
+    all|committed)
+      if git merge-base "${base}" HEAD >/dev/null 2>&1; then
+        local merge_base
+        merge_base="$(git merge-base "${base}" HEAD)"
+        git diff --name-only --diff-filter=ACMR "${merge_base}..HEAD" --
+      fi
+      ;;
+  esac
+  case "${scope}" in
+    all|working-tree)
+      git diff --name-only --diff-filter=ACMR --
+      git ls-files --others --exclude-standard
+      ;;
+  esac
+  case "${scope}" in
+    all|staged)
+      git diff --cached --name-only --diff-filter=ACMR --
+      ;;
+  esac
+}
+
+is_rust_relevant_path() {
+  case "$1" in
+    *.rs|Cargo.toml|Cargo.lock|.cargo/config.toml|.config/nextest.toml|scripts/repo-cargo|scripts/agent-gate|scripts/cargo-*|scripts/rust-lane-doctor|scripts/test-rct.sh|Makefile)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_global_path() {
+  case "$1" in
+    Cargo.toml|Cargo.lock|.cargo/config.toml|.config/nextest.toml|scripts/repo-cargo|scripts/agent-gate|scripts/cargo-*|scripts/rust-lane-doctor|scripts/test-rct.sh|Makefile)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+package_name_for_dir() {
+  local dir="$1"
+  if [[ -z "${metadata_json}" ]]; then
+    metadata_json="$("$CARGO" metadata --format-version=1 --no-deps)"
+  fi
+  printf '%s' "${metadata_json}" |
+    node -e '
+      const fs = require("fs");
+      const path = require("path");
+      const metadata = JSON.parse(fs.readFileSync(0, "utf8"));
+      const root = process.argv[1];
+      const dir = path.resolve(root, process.argv[2]);
+      const pkg = metadata.packages.find((pkg) => path.dirname(pkg.manifest_path) === dir);
+      if (pkg) process.stdout.write(pkg.name);
+    ' "${workspace_root}" "${dir}"
+}
+
+mapfile -t changed < <(collect_changed_paths | awk 'NF' | sort -u)
+relevant=()
+global=0
+for path in "${changed[@]}"; do
+  if is_rust_relevant_path "${path}"; then
+    relevant+=("${path}")
+    if is_global_path "${path}"; then
+      global=1
+    fi
+  fi
+done
+
+if [[ "${#relevant[@]}" -eq 0 ]]; then
+  echo "Cargo agent gate: no Rust build-relevant changes detected."
+  exit 0
+fi
+
+printf 'Cargo agent gate paths:\n'
+printf '  %s\n' "${relevant[@]}"
+
+if [[ "${global}" -eq 1 ]]; then
+  echo "Global Rust build/test configuration changed; running workspace Cargo gate."
+  if [[ "${dry_run}" -eq 1 ]]; then
+    if [[ "${run_tests}" -eq 1 ]]; then
+      echo "DRY-RUN $CARGO fast --no-run"
+    fi
+    if [[ "${run_clippy}" -eq 1 ]]; then
+      echo "DRY-RUN $CARGO clippy --workspace --all-targets --all-features -- -D warnings"
+    fi
+    exit 0
+  fi
+  if [[ "${run_tests}" -eq 1 ]]; then
+    "$CARGO" fast --no-run
+  fi
+  if [[ "${run_clippy}" -eq 1 ]]; then
+    "$CARGO" clippy --workspace --all-targets --all-features -- -D warnings
+  fi
+  exit 0
+fi
+
+declare -A package_names=()
+for path in "${relevant[@]}"; do
+  if [[ "${path}" == */* ]]; then
+    dir="${path%/*}"
+  else
+    dir="."
+  fi
+  while [[ -n "${dir}" && "${dir}" != "." ]]; do
+    if [[ -f "${dir}/Cargo.toml" ]]; then
+      pkg="$(package_name_for_dir "${dir}")"
+      if [[ -n "${pkg}" ]]; then
+        package_names["${pkg}"]=1
+      fi
+      break
+    fi
+    if [[ "${dir}" != */* ]]; then
+      break
+    fi
+    dir="${dir%/*}"
+  done
+done
+
+if [[ "${#package_names[@]}" -eq 0 ]]; then
+  echo "Cargo agent gate: no crate-local changes detected."
+  exit 0
+fi
+
+pkg_flags=()
+mapfile -t sorted_packages < <(printf '%s\n' "${!package_names[@]}" | sort)
+for pkg in "${sorted_packages[@]}"; do
+  pkg_flags+=("-p" "${pkg}")
+done
+
+test_flags=("${pkg_flags[@]}")
+exact_selector_package=""
+declare -A exact_selector_features=()
+declare -A exact_selector_tests=()
+exact_selector_output="$(./scripts/cargo-exact-tests.mjs --include-non-fast "${relevant[@]}" 2>/dev/null || true)"
+if [[ -n "${exact_selector_output}" ]]; then
+  while IFS= read -r line; do
+    case "${line}" in
+      package=*)
+        exact_selector_package="${line#package=}"
+        ;;
+      feature=*)
+        exact_selector_features["${line#feature=}"]=1
+        ;;
+      test=*)
+        exact_selector_tests["${line#test=}"]=1
+        ;;
+    esac
+  done <<<"${exact_selector_output}"
+fi
+
+if [[ -n "${exact_selector_package}" && "${#sorted_packages[@]}" -eq 1 && "${#exact_selector_tests[@]}" -gt 0 ]]; then
+  test_flags=("-p" "${exact_selector_package}")
+  if [[ "${#exact_selector_features[@]}" -gt 0 ]]; then
+    mapfile -t sorted_exact_features < <(printf '%s\n' "${!exact_selector_features[@]}" | sort)
+    test_flags+=("--features" "$(IFS=,; printf '%s' "${sorted_exact_features[*]}")")
+  fi
+  mapfile -t sorted_exact_tests < <(printf '%s\n' "${!exact_selector_tests[@]}" | sort)
+  for test_name in "${sorted_exact_tests[@]}"; do
+    test_flags+=("--test" "${test_name}")
+  done
+else
+  sorted_exact_tests=()
+fi
+
+clippy_flags=("${pkg_flags[@]}")
+clippy_target_args=("--all-targets" "--all-features")
+if [[ "${#sorted_exact_tests[@]}" -gt 0 ]]; then
+  clippy_flags=("${test_flags[@]}")
+  if [[ "${#exact_selector_features[@]}" -gt 0 ]]; then
+    clippy_target_args=()
+  else
+    clippy_target_args=("--all-features")
+  fi
+fi
+
+printf 'Cargo agent gate packages:\n'
+printf '  %s\n' "${sorted_packages[@]}"
+if [[ "${#sorted_exact_tests[@]}" -gt 0 ]]; then
+  printf 'Cargo agent gate exact tests:\n'
+  printf '  %s\n' "${sorted_exact_tests[@]}"
+fi
+
+if [[ "${dry_run}" -eq 1 ]]; then
+  if [[ "${run_clippy}" -eq 1 ]]; then
+    printf 'DRY-RUN %s clippy' "$CARGO"
+    printf ' %q' "${clippy_flags[@]}"
+    if [[ "${#clippy_target_args[@]}" -gt 0 ]]; then
+      printf ' %q' "${clippy_target_args[@]}"
+    fi
+    printf ' -- -D warnings\n'
+  fi
+  if [[ "${run_tests}" -eq 1 ]]; then
+    printf 'DRY-RUN %s nextest run' "$CARGO"
+    printf ' %q' "${test_flags[@]}"
+    printf ' --profile fast --no-tests=pass --show-progress none --status-level none --final-status-level fail\n'
+  fi
+  exit 0
+fi
+
+if [[ "${run_clippy}" -eq 1 ]]; then
+  "$CARGO" clippy "${clippy_flags[@]}" "${clippy_target_args[@]}" -- -D warnings
+fi
+if [[ "${run_tests}" -eq 1 ]]; then
+  "$CARGO" nextest run "${test_flags[@]}" --profile fast --no-tests=pass \
+    --show-progress none --status-level none --final-status-level fail
+fi

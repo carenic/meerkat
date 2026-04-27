@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
@@ -110,6 +111,8 @@ fn run_label(spec: &Spec) -> String {
 }
 
 async fn run_spec(spec: &'static Spec) -> Result<(), String> {
+    let spec_started = Instant::now();
+    eprintln!("e2e lane start: {}", run_label(spec));
     if let Some(message) = prereq_failure(spec) {
         if strict_prereqs_enabled() {
             return Err(format!("{}: {message}", run_label(spec)));
@@ -162,6 +165,11 @@ async fn run_spec(spec: &'static Spec) -> Result<(), String> {
     }
     .await;
     clean_scenario_target_dir_if_requested(spec, &scenario_target_dir);
+    eprintln!(
+        "e2e lane done: {} in {:.3}s",
+        run_label(spec),
+        spec_started.elapsed().as_secs_f64()
+    );
     result
 }
 
@@ -220,6 +228,9 @@ async fn run_command(
     timeout_secs: u64,
 ) -> Result<CompletedCommand, String> {
     let argv = normalize_command_with_env(command, env_overrides);
+    let display = argv.join(" ");
+    let started = Instant::now();
+    eprintln!("e2e command start: {display}");
     let mut child = Command::new(&argv[0]);
     child
         .args(&argv[1..])
@@ -235,21 +246,27 @@ async fn run_command(
         .await
         .map_err(|_| {
             format!(
-                "command timed out after {timeout_secs}s: {}",
-                argv.join(" ")
+                "command timed out after {timeout_secs}s in {:.3}s: {display}",
+                started.elapsed().as_secs_f64()
             )
         })?
-        .map_err(|error| format!("failed to run {}: {error}", argv.join(" ")))?;
+        .map_err(|error| format!("failed to run {display}: {error}"))?;
+    let elapsed = started.elapsed();
 
     let combined = combine_output(&output.stdout, &output.stderr);
     if !output.status.success() {
         return Err(format!(
-            "command failed (exit {:?}): {}\n{}",
+            "command failed after {:.3}s (exit {:?}): {}\n{}",
+            elapsed.as_secs_f64(),
             output.status.code(),
-            argv.join(" "),
+            display,
             combined
         ));
     }
+    eprintln!(
+        "e2e command done: {display} in {:.3}s",
+        elapsed.as_secs_f64()
+    );
 
     Ok(CompletedCommand { output: combined })
 }
@@ -532,6 +549,9 @@ fn clean_scenario_target_dir_if_requested(spec: &Spec, cargo_target_dir: &Path) 
     if !clean_e2e_scenario_targets_enabled() || !cargo_target_dir.exists() {
         return;
     }
+    if matches!(spec.lane, Lane::System) {
+        return;
+    }
     if let Err(error) = std::fs::remove_dir_all(cargo_target_dir) {
         eprintln!(
             "failed to clean e2e scenario target for {} at {}: {error}",
@@ -542,6 +562,13 @@ fn clean_scenario_target_dir_if_requested(spec: &Spec, cargo_target_dir: &Path) 
 }
 
 fn scenario_cargo_target_dir(spec: &Spec) -> Result<PathBuf, String> {
+    if matches!(spec.lane, Lane::System) {
+        // System-lane wrappers are serialized in-process, so their nested cargo
+        // invocations can safely reuse the lane's normal target dir. That lets
+        // CI prebuild/clippy steps feed the e2e-system lane instead of forcing
+        // a second copy of the same artifacts under e2e-lanes/.
+        return cargo_target_dir();
+    }
     Ok(cargo_target_dir()?
         .join("e2e-lanes")
         .join(source_revision_key())
@@ -688,6 +715,9 @@ async fn ensure_binary_signatures_fresh(spec: &Spec, env_overrides: &[(String, S
 }
 
 fn workspace_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("WORKSPACE_ROOT") {
+        return PathBuf::from(root);
+    }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
         .parent()

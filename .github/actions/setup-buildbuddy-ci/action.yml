@@ -1,0 +1,102 @@
+name: Setup BuildBuddy CI
+description: Install the toolchain needed by optional BuildBuddy CI lanes.
+
+inputs:
+  profile:
+    description: "Setup profile: native, doctor, lint, sdk, rust, wasm, audit, or full."
+    required: false
+    default: native
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust
+      if: ${{ inputs.profile == 'doctor' || inputs.profile == 'lint' || inputs.profile == 'sdk' || inputs.profile == 'rust' || inputs.profile == 'wasm' || inputs.profile == 'audit' || inputs.profile == 'full' }}
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Add wasm32 target
+      if: ${{ inputs.profile == 'wasm' || inputs.profile == 'full' }}
+      shell: bash
+      run: rustup target add wasm32-unknown-unknown
+
+    - name: Setup Python
+      if: ${{ inputs.profile == 'sdk' || inputs.profile == 'full' }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.14"
+
+    - name: Setup Node
+      if: ${{ inputs.profile == 'doctor' || inputs.profile == 'lint' || inputs.profile == 'sdk' || inputs.profile == 'native' || inputs.profile == 'full' }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: "22"
+
+    - name: Setup Java
+      if: ${{ inputs.profile == 'full' }}
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 21
+
+    - name: Cache cargo registry
+      if: ${{ inputs.profile == 'lint' || inputs.profile == 'sdk' || inputs.profile == 'rust' || inputs.profile == 'wasm' || inputs.profile == 'audit' || inputs.profile == 'full' }}
+      uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: buildbuddy
+
+    - name: Install lint tools
+      if: ${{ inputs.profile == 'lint' }}
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-machete
+
+    - name: Install wasm tools
+      if: ${{ inputs.profile == 'wasm' }}
+      uses: taiki-e/install-action@v2
+      with:
+        tool: wasm-pack
+
+    - name: Install audit tools
+      if: ${{ inputs.profile == 'audit' }}
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-deny
+
+    - name: Install full Rust CI tools
+      if: ${{ inputs.profile == 'full' }}
+      uses: taiki-e/install-action@v2
+      with:
+        tool: nextest,wasm-pack,cargo-deny,cargo-machete
+
+    - name: Install TLC
+      if: ${{ inputs.profile == 'full' }}
+      shell: bash
+      run: |
+        mkdir -p "$HOME/.local/lib" "$HOME/.local/bin"
+        curl -sL -o "$HOME/.local/lib/tla2tools.jar" \
+          https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+        printf '#!/bin/sh\njava -jar %s/tla2tools.jar "$@"\n' "$HOME/.local/lib" > "$HOME/.local/bin/tlc"
+        chmod +x "$HOME/.local/bin/tlc"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    - name: Require BuildBuddy API key
+      shell: bash
+      run: |
+        if [[ -z "${BUILDBUDDY_API_KEY}" ]]; then
+          echo "BUILDBUDDY_API_KEY secret is required for the optional BuildBuddy workflow." >&2
+          exit 1
+        fi
+
+    - name: Install pinned BuildBuddy CLI
+      shell: bash
+      run: |
+        bb_bin="$(scripts/install-buildbuddy-cli --dir "${RUNNER_TEMP}/buildbuddy-cli")"
+        echo "$(dirname "${bb_bin}")" >> "${GITHUB_PATH}"
+
+    - name: Cache Bazel external repositories
+      uses: actions/cache@v4
+      with:
+        path: /tmp/meerkat-bazel-repository-cache
+        key: buildbuddy-bazel-repository-${{ runner.os }}-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock') }}
+        restore-keys: |
+          buildbuddy-bazel-repository-${{ runner.os }}-

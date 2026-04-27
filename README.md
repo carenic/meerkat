@@ -114,6 +114,7 @@ Meerkat’s repo-wide test lanes are intentionally named by execution model:
 - `cargo unit` for unit tests
 - `cargo int` for integration-fast tests
 - `cargo e2e-fast` for deterministic end-to-end coverage
+- `cargo e2e-build` for build-composition end-to-end coverage
 - `cargo e2e-system` for real binaries / real local resources, but no live providers
 - `cargo e2e-live` for targeted live-provider integration checks
 - `cargo e2e-smoke` for compound live-provider smoke scenarios
@@ -130,10 +131,34 @@ Inside the repo, prefer the wrapped form:
 ./scripts/repo-cargo unit
 ./scripts/repo-cargo int
 ./scripts/repo-cargo e2e-fast
+./scripts/repo-cargo e2e-build
 ./scripts/repo-cargo e2e-system
 ./scripts/repo-cargo e2e-live
 ./scripts/repo-cargo e2e-smoke
 ```
+
+Use `make rust-lane-doctor` when changing build/test entrypoints. It verifies
+that wrapped Cargo caches stay outside the repository, same-checkout agents can
+select distinct target dirs, and the fast test profile still excludes dedicated
+e2e wrappers. `scripts/repo-cargo` uses `RUST_LANE_ID` first, then
+`MEERKAT_AGENT_LANE`, then `CODEX_AGENT_ID`; without any of those it derives a
+lane from the current worktree path.
+
+For local multi-agent edits, use `make agent-gate` or `scripts/agent-gate`.
+Cargo is the default backend, so the command works without BuildBuddy access.
+It derives build-relevant changed files and runs a package-scoped Cargo clippy
++ nextest gate, escalating only global Rust lane changes to a workspace Cargo
+gate. Set `MEERKAT_BUILDBUDDY=1` or pass `--buildbuddy` to opt into the
+BuildBuddy changed-path gate. That same `MEERKAT_BUILDBUDDY=1` switch makes
+the standard pre-push Rust hooks choose BuildBuddy automatically.
+Use `--dry-run` to inspect the selected packages or paths before paying the
+build cost. The Cargo and BuildBuddy gates accept `--staged`, `--committed`,
+and `--working-tree` for hook and CI routing. When using Make, pass gate flags
+with `AGENT_GATE_ARGS='--dry-run --working-tree'`.
+The optional BuildBuddy workflow remains opt-in and mirrors the standard Cargo
+CI lanes. It can be run manually, or from normal CI by setting the repository
+variable `MEERKAT_BUILDBUDDY=true` (or `1`) and adding the `BUILDBUDDY_API_KEY`
+repository secret. Without that variable, GitHub CI stays on the Cargo path.
 
 Default CI requires `unit`, `int`, `e2e-fast`, and `e2e-system`. Live-provider lanes stay opt-in.
 
