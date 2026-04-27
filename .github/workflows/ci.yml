@@ -1,4 +1,4 @@
-name: Cargo CI
+name: CI
 
 on:
   push:
@@ -16,10 +16,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_HOME: /tmp/meerkat-cargo-home
+  MEERKAT_BUILDBUDDY: ${{ vars.MEERKAT_BUILDBUDDY || 'false' }}
 
 jobs:
   fmt-lint:
     name: Format, lint, and static checks
+    if: ${{ !(vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -63,6 +65,7 @@ jobs:
 
   sdk-suites:
     name: SDK suites + parity gates
+    if: ${{ !(vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -100,6 +103,7 @@ jobs:
 
   machine-authority:
     name: Machine authority workflow
+    if: ${{ !(vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -150,6 +154,7 @@ jobs:
 
   rmat-audit:
     name: RMAT audit + ownership ledger
+    if: ${{ !(vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -171,6 +176,7 @@ jobs:
 
   seam-inventory:
     name: Seam inventory (strict)
+    if: ${{ !(vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -189,6 +195,7 @@ jobs:
 
   wasm-contract-tests:
     name: WASM contract tests
+    if: ${{ !(vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -252,6 +259,7 @@ jobs:
 
   test-unit:
     name: Unit tests
+    if: ${{ !(vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -271,6 +279,7 @@ jobs:
 
   integration-fast:
     name: Integration-fast lane
+    if: ${{ !(vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -300,6 +309,7 @@ jobs:
 
   e2e-fast:
     name: E2E fast lane
+    if: ${{ !(vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -321,6 +331,7 @@ jobs:
 
   e2e-system:
     name: E2E system lane
+    if: ${{ !(vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -350,6 +361,7 @@ jobs:
 
   test-minimal:
     name: Minimal feature builds
+    if: ${{ !(vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -377,6 +389,7 @@ jobs:
 
   test-feature-matrix-lib:
     name: Feature matrix (library)
+    if: ${{ !(vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -407,6 +420,7 @@ jobs:
 
   test-feature-matrix-surface-checks:
     name: Feature matrix (surface checks)
+    if: ${{ !(vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -428,6 +442,7 @@ jobs:
 
   wasm-check:
     name: WASM compilation check
+    if: ${{ !(vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -456,6 +471,7 @@ jobs:
 
   audit:
     name: Security audit
+    if: ${{ !(vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -464,55 +480,63 @@ jobs:
       - name: Run cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
 
+  buildbuddy:
+    name: BuildBuddy CI
+    if: ${{ (vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    uses: ./.github/workflows/buildbuddy.yml
+    with:
+      mode: ${{ vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+    secrets: inherit
+
   gate:
-    name: Cargo CI gate
+    name: CI gate
     if: always()
-    needs: [fmt-lint, sdk-suites, machine-authority, test-unit, integration-fast, e2e-fast, e2e-system, test-minimal, test-feature-matrix-lib, test-feature-matrix-surface-checks, wasm-check, wasm-contract-tests, rmat-audit, seam-inventory, audit]
+    needs: [buildbuddy, fmt-lint, sdk-suites, machine-authority, test-unit, integration-fast, e2e-fast, e2e-system, test-minimal, test-feature-matrix-lib, test-feature-matrix-surface-checks, wasm-check, wasm-contract-tests, rmat-audit, seam-inventory, audit]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
         run: |
+          bb_enabled="${{ (vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}"
           failed=""
-          for job in \
-            fmt-lint \
-            sdk-suites \
-            machine-authority \
-            test-unit \
-            integration-fast \
-            e2e-fast \
-            e2e-system \
-            test-minimal \
-            test-feature-matrix-lib \
-            test-feature-matrix-surface-checks \
-            wasm-check \
-            wasm-contract-tests \
-            rmat-audit \
-            seam-inventory \
-            audit
-          do
-            case "$job" in
-              fmt-lint) result="${{ needs.fmt-lint.result }}" ;;
-              sdk-suites) result="${{ needs.sdk-suites.result }}" ;;
-              machine-authority) result="${{ needs.machine-authority.result }}" ;;
-              test-unit) result="${{ needs.test-unit.result }}" ;;
-              integration-fast) result="${{ needs.integration-fast.result }}" ;;
-              e2e-fast) result="${{ needs.e2e-fast.result }}" ;;
-              e2e-system) result="${{ needs.e2e-system.result }}" ;;
-              test-minimal) result="${{ needs.test-minimal.result }}" ;;
-              test-feature-matrix-lib) result="${{ needs.test-feature-matrix-lib.result }}" ;;
-              test-feature-matrix-surface-checks) result="${{ needs.test-feature-matrix-surface-checks.result }}" ;;
-              wasm-check) result="${{ needs.wasm-check.result }}" ;;
-              wasm-contract-tests) result="${{ needs.wasm-contract-tests.result }}" ;;
-              rmat-audit) result="${{ needs.rmat-audit.result }}" ;;
-              seam-inventory) result="${{ needs.seam-inventory.result }}" ;;
-              audit) result="${{ needs.audit.result }}" ;;
-            esac
-            if [[ "$result" != "success" ]]; then
-              echo "$job: $result"
-              failed="true"
+
+          check_result() {
+            local job="$1"
+            local result="$2"
+            local expected_skipped="$3"
+            if [[ "$result" == "success" ]]; then
+              return
             fi
-          done
+            if [[ "$expected_skipped" == "true" && "$result" == "skipped" ]]; then
+              return
+            fi
+            echo "$job: $result"
+            failed="true"
+          }
+
+          buildbuddy_expected_skipped="false"
+          if [[ "$bb_enabled" != "true" ]]; then
+            buildbuddy_expected_skipped="true"
+          fi
+          check_result buildbuddy "${{ needs.buildbuddy.result }}" "$buildbuddy_expected_skipped"
+
+          cargo_expected_skipped="$bb_enabled"
+          check_result fmt-lint "${{ needs.fmt-lint.result }}" "$cargo_expected_skipped"
+          check_result sdk-suites "${{ needs.sdk-suites.result }}" "$cargo_expected_skipped"
+          check_result machine-authority "${{ needs.machine-authority.result }}" "$cargo_expected_skipped"
+          check_result test-unit "${{ needs.test-unit.result }}" "$cargo_expected_skipped"
+          check_result integration-fast "${{ needs.integration-fast.result }}" "$cargo_expected_skipped"
+          check_result e2e-fast "${{ needs.e2e-fast.result }}" "$cargo_expected_skipped"
+          check_result e2e-system "${{ needs.e2e-system.result }}" "$cargo_expected_skipped"
+          check_result test-minimal "${{ needs.test-minimal.result }}" "$cargo_expected_skipped"
+          check_result test-feature-matrix-lib "${{ needs.test-feature-matrix-lib.result }}" "$cargo_expected_skipped"
+          check_result test-feature-matrix-surface-checks "${{ needs.test-feature-matrix-surface-checks.result }}" "$cargo_expected_skipped"
+          check_result wasm-check "${{ needs.wasm-check.result }}" "$cargo_expected_skipped"
+          check_result wasm-contract-tests "${{ needs.wasm-contract-tests.result }}" "$cargo_expected_skipped"
+          check_result rmat-audit "${{ needs.rmat-audit.result }}" "$cargo_expected_skipped"
+          check_result seam-inventory "${{ needs.seam-inventory.result }}" "$cargo_expected_skipped"
+          check_result audit "${{ needs.audit.result }}" "$cargo_expected_skipped"
+
           if [[ -n "$failed" ]]; then
             exit 1
           fi
-          echo "All checks passed"
+          echo "Selected CI backend passed"
