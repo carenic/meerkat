@@ -2291,11 +2291,9 @@ where
                         // Feed OpsBarrierSatisfied through the shared turn-input
                         // path so the runtime handle remains the primary writer
                         // when present.
-                        use crate::generated::protocol_ops_barrier_satisfaction::accept_wait_all_satisfied;
-                        let obligation = accept_wait_all_satisfied(wait_result.satisfied);
                         self.apply_turn_input(TurnExecutionInput::OpsBarrierSatisfied {
                             run_id: run_id.clone(),
-                            operation_ids: obligation.operation_ids,
+                            operation_ids: wait_result.satisfied.operation_ids,
                         })?;
                     }
                     self.observe_cancel_after_boundary_request(&run_id)?;

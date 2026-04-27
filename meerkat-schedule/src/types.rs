@@ -5,7 +5,7 @@ use meerkat_core::types::RenderMetadata;
 use meerkat_core::{ContentInput, OutputSchema, PeerMeta, Provider, SessionId};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -943,6 +943,8 @@ pub struct Schedule {
     pub next_occurrence_ordinal: OccurrenceOrdinal,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planning_cursor_utc: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub superseded_ack_ids: BTreeSet<OccurrenceId>,
     #[serde(flatten)]
     pub config: ScheduleConfig,
 }
@@ -961,6 +963,7 @@ impl Schedule {
             missing_target_policy: request.missing_target_policy,
             next_occurrence_ordinal: OccurrenceOrdinal(0),
             planning_cursor_utc: None,
+            superseded_ack_ids: BTreeSet::new(),
             config: ScheduleConfig {
                 name: request.name,
                 description: request.description,

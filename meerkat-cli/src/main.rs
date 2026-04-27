@@ -4385,6 +4385,7 @@ fn realm_store_path(manifest: &meerkat_store::RealmManifest, scope: &RuntimeScop
 async fn create_mcp_tools(
     scope: &RuntimeScope,
     wait_for_mcp: bool,
+    external_surface_handle: Option<Arc<dyn meerkat_core::ExternalToolSurfaceHandle>>,
 ) -> anyhow::Result<Option<McpRouterAdapter>> {
     use meerkat_core::mcp_config::{McpConfig, McpScope};
     use meerkat_mcp::{McpConnection, McpRouter};
@@ -4430,10 +4431,15 @@ async fn create_mcp_tools(
     tracing::info!("Loading {} MCP server(s)", servers_with_scope.len());
 
     // Stage all servers for parallel connection
-    let mut router = McpRouter::new();
+    let mut router = match external_surface_handle {
+        Some(handle) => McpRouter::new_with_surface_handle(handle),
+        None => McpRouter::new(),
+    };
     for s in &servers_with_scope {
         tracing::info!("Staging MCP server: {}", s.server.name);
-        router.stage_add(s.server.clone());
+        router
+            .stage_add(s.server.clone())
+            .map_err(|e| anyhow::anyhow!("MCP config: {e}"))?;
     }
 
     // Apply staged ops — spawns background connection tasks
@@ -4488,13 +4494,14 @@ fn resolve_keep_alive(requested: bool) -> anyhow::Result<bool> {
 async fn load_mcp_external_tools(
     scope: &RuntimeScope,
     wait_for_mcp: bool,
+    external_surface_handle: Option<Arc<dyn meerkat_core::ExternalToolSurfaceHandle>>,
 ) -> (
     Option<Arc<dyn AgentToolDispatcher>>,
     Option<Arc<McpRouterAdapter>>,
 ) {
     #[cfg(feature = "mcp")]
     {
-        match create_mcp_tools(scope, wait_for_mcp).await {
+        match create_mcp_tools(scope, wait_for_mcp, external_surface_handle).await {
             Ok(Some(adapter)) => {
                 let adapter = Arc::new(adapter);
                 let external: Arc<dyn AgentToolDispatcher> = adapter.clone();
@@ -4510,6 +4517,7 @@ async fn load_mcp_external_tools(
     #[cfg(not(feature = "mcp"))]
     {
         let _ = wait_for_mcp;
+        let _ = external_surface_handle;
         (None, None)
     }
 }
@@ -5384,9 +5392,22 @@ async fn run_agent(
         };
         #[cfg(not(feature = "mob"))]
         let mut run_mob_tools: Option<()> = None;
+        // Prepare epoch-local bindings before MCP startup so the router stages
+        // and applies external-tool surface lifecycle directly on the
+        // session-owned MeerkatMachine handle.
+        let bindings = runtime_adapter
+            .prepare_bindings(session_id.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("runtime bindings: {e}"))?;
+
         // Load optional MCP tools immediately before external tool composition so
         // later early-return windows cannot skip adapter shutdown.
-        let (mcp_external_tools, mcp_adapter) = load_mcp_external_tools(scope, wait_for_mcp).await;
+        let (mcp_external_tools, mcp_adapter) = load_mcp_external_tools(
+            scope,
+            wait_for_mcp,
+            Some(Arc::clone(&bindings.external_tool_surface)),
+        )
+        .await;
         // Mob tools now flow through mob_tools (factory pattern), not external_tools.
         // Only MCP tools remain as external_tools.
         let external_tools = mcp_external_tools;
@@ -5408,13 +5429,6 @@ async fn run_agent(
 
         let output_pipeline =
             CliOutputPipeline::new(stream, verbose, stream_policy.clone(), primary_scope_path)?;
-
-        // Prepare epoch-local bindings on the same runtime adapter the service
-        // uses for runtime-owned tool surfaces.
-        let bindings = runtime_adapter
-            .prepare_bindings(session_id.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("runtime bindings: {e}"))?;
 
         let mut build = SessionBuildOptions {
             provider: Some(provider.as_core()),
@@ -5938,9 +5952,22 @@ async fn resume_session_with_llm_override(
         };
         #[cfg(not(feature = "mob"))]
         let mut run_mob_tools: Option<()> = None;
+        // Prepare epoch-local bindings before MCP startup so resumed sessions
+        // stage and apply MCP surface lifecycle directly on the session-owned
+        // MeerkatMachine handle.
+        let resume_bindings = resume_adapter
+            .prepare_bindings(session_id.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("runtime bindings: {e}"))?;
+
         // Load optional MCP tools immediately before external tool composition so
         // later early-return windows cannot skip adapter shutdown.
-        let (mcp_external_tools, mcp_adapter) = load_mcp_external_tools(scope, wait_for_mcp).await;
+        let (mcp_external_tools, mcp_adapter) = load_mcp_external_tools(
+            scope,
+            wait_for_mcp,
+            Some(Arc::clone(&resume_bindings.external_tool_surface)),
+        )
+        .await;
         // Mob tools now flow through mob_tools (factory pattern), not external_tools.
         // Only MCP tools remain as external_tools.
         let external_tools = mcp_external_tools;
@@ -5966,12 +5993,6 @@ async fn resume_session_with_llm_override(
                 session_id: session_id.to_string(),
             }],
         )?;
-
-        // Prepare epoch-local bindings for the resumed session.
-        let resume_bindings = resume_adapter
-            .prepare_bindings(session_id.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("runtime bindings: {e}"))?;
 
         // Wave-c C-12: lift runtime-side preload-skill names into typed
         // `SkillKey`s (builtin source) before the SessionBuildOptions

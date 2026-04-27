@@ -2,6 +2,8 @@ load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_macro", "rust_test")
 
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
 
 
 filegroup(
@@ -196,6 +198,7 @@ rust_test(
         "//meerkat-tools:package_runfiles",
         "//meerkat:cargo_manifest",
         "//meerkat:package_runfiles",
+        "//xtask:cargo_manifest",
         "//:workspace_runfiles",
         "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin",
         "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib",
@@ -313,6 +316,7 @@ rust_test(
         "//meerkat-machine-kernels:package_runfiles",
         "//meerkat-machine-schema:package_runfiles",
         "//meerkat-mob:package_runfiles",
+        "//meerkat-runtime:package_runfiles",
         "//:workspace_runfiles",
         "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin",
         "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib",
@@ -617,6 +621,27 @@ rust_test(
         normal = True,
         normal_dev = True,
     ),
+)
+
+sh_test(
+    name = "machine_verify_all_tlc_test",
+    srcs = ["tests/machine_verify_all_tlc_test.sh"],
+    args = ["$(rootpath :xtask_bin)"],
+    data = [
+        ":xtask_bin",
+        "//:workspace_runfiles",
+        "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib",
+        "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin",
+    ],
+    env = {
+        "RUSTFMT": "$(rootpath @@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin)",
+    },
+    size = "enormous",
+    timeout = "eternal",
+    tags = [
+        "buildbuddy",
+        "required-feature",
+    ],
 )
 
 test_suite(

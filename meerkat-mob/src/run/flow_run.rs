@@ -166,7 +166,7 @@ impl Default for State {
     }
 }
 
-pub mod inputs {
+pub(crate) mod inputs {
     use super::*;
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct CreateRun {
@@ -279,7 +279,7 @@ pub mod inputs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Input {
+pub(crate) enum Input {
     CreateRun(inputs::CreateRun),
     StartRun(inputs::StartRun),
     DispatchStep(inputs::DispatchStep),
@@ -308,7 +308,7 @@ pub enum Input {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum InputKind {
+pub(crate) enum InputKind {
     CreateRun,
     StartRun,
     DispatchStep,
@@ -473,13 +473,13 @@ pub struct Outcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TransitionError {
+pub(crate) enum TransitionError {
     Refusal(TransitionRefusal),
     Kernel(KernelError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TransitionRefusal {
+pub(crate) enum TransitionRefusal {
     NoMatchingTransition {
         phase: Phase,
         trigger: TriggerDiscriminant,
@@ -493,7 +493,7 @@ pub enum TransitionRefusal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TriggerDiscriminant {
+pub(crate) enum TriggerDiscriminant {
     Input(InputKind),
 }
 
@@ -632,7 +632,7 @@ fn maybe_add_unique<T: Ord + Clone>(
     }
 }
 
-pub fn transition<C: Context>(
+pub(crate) fn transition<C: Context>(
     state: &State,
     input: Input,
     context: &C,

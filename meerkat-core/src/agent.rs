@@ -341,6 +341,18 @@ pub trait AgentToolDispatcher: Send + Sync {
         _handle: Arc<dyn crate::handles::McpServerLifecycleHandle>,
     ) {
     }
+
+    /// Bind the session-canonical external tool-surface handle.
+    ///
+    /// MCP dispatchers use this to route add/remove/reload/call lifecycle
+    /// semantics through the session's MeerkatMachine DSL instead of their
+    /// standalone compatibility projection. The default implementation is a
+    /// no-op for dispatchers that do not own dynamic external tool surfaces.
+    fn bind_external_tool_surface_handle(
+        &self,
+        _handle: Arc<dyn crate::handles::ExternalToolSurfaceHandle>,
+    ) {
+    }
 }
 
 /// Compute whether the current exact catalog should stay inline or switch to deferred mode.

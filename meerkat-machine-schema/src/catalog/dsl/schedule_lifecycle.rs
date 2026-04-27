@@ -264,12 +264,12 @@ machine! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MisfirePolicy {
     Skip,
-    Execute,
+    CatchUpWithin,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlapPolicy {
+    AllowConcurrent,
     SkipIfRunning,
-    Queue,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissingTargetPolicy {

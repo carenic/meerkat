@@ -222,50 +222,305 @@ pub(crate) enum MobMachineCommandResult {
 #[doc(hidden)]
 #[must_use]
 pub fn canonical_mob_machine_command_manifest() -> IndexSet<&'static str> {
-    let mut variants: IndexSet<&'static str> = MobMachineCommand::command_manifest()
-        .iter()
-        .copied()
-        .collect();
-    for exemption in MOB_MACHINE_COMMAND_MANIFEST_EXEMPTIONS {
-        variants.shift_remove(exemption.variant_name());
-    }
-    variants
+    canonical_mob_machine_command_classifications()
+        .into_iter()
+        .flat_map(|record| record.classification.catalog_input_names())
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MobMachineCommandManifestExemption {
-    FlowTrackerCounts,
-    OrchestratorSnapshot,
-    LifecycleSnapshot,
-    EnsureMember,
-    Reconcile,
-    ListMembersMatching,
-    Wire,
-    Unwire,
+pub enum MobMachineCommandClassification {
+    CatalogInput(MobMachineCatalogInput),
+    CatalogInputs(&'static [MobMachineCatalogInput]),
+    ShellMechanic(MobMachineShellMechanicReason),
 }
 
-const MOB_MACHINE_COMMAND_MANIFEST_EXEMPTIONS: &[MobMachineCommandManifestExemption] = &[
-    MobMachineCommandManifestExemption::FlowTrackerCounts,
-    MobMachineCommandManifestExemption::OrchestratorSnapshot,
-    MobMachineCommandManifestExemption::LifecycleSnapshot,
-    MobMachineCommandManifestExemption::EnsureMember,
-    MobMachineCommandManifestExemption::Reconcile,
-    MobMachineCommandManifestExemption::ListMembersMatching,
-    MobMachineCommandManifestExemption::Wire,
-    MobMachineCommandManifestExemption::Unwire,
-];
-
-impl MobMachineCommandManifestExemption {
-    const fn variant_name(self) -> &'static str {
+impl MobMachineCommandClassification {
+    #[must_use]
+    pub fn catalog_inputs(self) -> Vec<MobMachineCatalogInput> {
         match self {
-            Self::FlowTrackerCounts => "FlowTrackerCounts",
-            Self::OrchestratorSnapshot => "OrchestratorSnapshot",
-            Self::LifecycleSnapshot => "LifecycleSnapshot",
+            Self::CatalogInput(input) => vec![input],
+            Self::CatalogInputs(inputs) => inputs.to_vec(),
+            Self::ShellMechanic(_) => Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn catalog_input_names(self) -> Vec<&'static str> {
+        self.catalog_inputs()
+            .into_iter()
+            .map(MobMachineCatalogInput::as_str)
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobMachineCatalogInput {
+    RunFlow,
+    CancelFlow,
+    FlowStatus,
+    Spawn,
+    EnsureMember,
+    Reconcile,
+    Retire,
+    Respawn,
+    RetireAll,
+    WireMembers,
+    UnwireMembers,
+    WireExternalPeer,
+    UnwireExternalPeer,
+    SubmitWork,
+    CancelWork,
+    CancelAllWork,
+    Stop,
+    Resume,
+    Complete,
+    Reset,
+    Destroy,
+    TaskCreate,
+    TaskUpdate,
+    TaskList,
+    TaskGet,
+    McpServerStates,
+    RosterSnapshot,
+    ListMembers,
+    ListMembersIncludingRetiring,
+    ListAllMembers,
+    MemberStatus,
+    SubscribeAgentEvents,
+    SubscribeAllAgentEvents,
+    SubscribeMobEvents,
+    PollEvents,
+    ReplayAllEvents,
+    RecordOperatorActionProvenance,
+    GetMember,
+    SetSpawnPolicy,
+    Shutdown,
+    ForceCancel,
+}
+
+impl MobMachineCatalogInput {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RunFlow => "RunFlow",
+            Self::CancelFlow => "CancelFlow",
+            Self::FlowStatus => "FlowStatus",
+            Self::Spawn => "Spawn",
             Self::EnsureMember => "EnsureMember",
             Self::Reconcile => "Reconcile",
-            Self::ListMembersMatching => "ListMembersMatching",
-            Self::Wire => "Wire",
-            Self::Unwire => "Unwire",
+            Self::Retire => "Retire",
+            Self::Respawn => "Respawn",
+            Self::RetireAll => "RetireAll",
+            Self::WireMembers => "WireMembers",
+            Self::UnwireMembers => "UnwireMembers",
+            Self::WireExternalPeer => "WireExternalPeer",
+            Self::UnwireExternalPeer => "UnwireExternalPeer",
+            Self::SubmitWork => "SubmitWork",
+            Self::CancelWork => "CancelWork",
+            Self::CancelAllWork => "CancelAllWork",
+            Self::Stop => "Stop",
+            Self::Resume => "Resume",
+            Self::Complete => "Complete",
+            Self::Reset => "Reset",
+            Self::Destroy => "Destroy",
+            Self::TaskCreate => "TaskCreate",
+            Self::TaskUpdate => "TaskUpdate",
+            Self::TaskList => "TaskList",
+            Self::TaskGet => "TaskGet",
+            Self::McpServerStates => "McpServerStates",
+            Self::RosterSnapshot => "RosterSnapshot",
+            Self::ListMembers => "ListMembers",
+            Self::ListMembersIncludingRetiring => "ListMembersIncludingRetiring",
+            Self::ListAllMembers => "ListAllMembers",
+            Self::MemberStatus => "MemberStatus",
+            Self::SubscribeAgentEvents => "SubscribeAgentEvents",
+            Self::SubscribeAllAgentEvents => "SubscribeAllAgentEvents",
+            Self::SubscribeMobEvents => "SubscribeMobEvents",
+            Self::PollEvents => "PollEvents",
+            Self::ReplayAllEvents => "ReplayAllEvents",
+            Self::RecordOperatorActionProvenance => "RecordOperatorActionProvenance",
+            Self::GetMember => "GetMember",
+            Self::SetSpawnPolicy => "SetSpawnPolicy",
+            Self::Shutdown => "Shutdown",
+            Self::ForceCancel => "ForceCancel",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobMachineShellMechanicReason {
+    TestInspection,
+    FilteredRosterProjection,
+    ProducerWiringBridge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MobMachineCommandClassificationRecord {
+    pub command: &'static str,
+    pub classification: MobMachineCommandClassification,
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn canonical_mob_machine_command_classifications() -> Vec<MobMachineCommandClassificationRecord>
+{
+    MobMachineCommand::command_variant_manifest()
+        .iter()
+        .copied()
+        .map(|variant| MobMachineCommandClassificationRecord {
+            command: variant.as_str(),
+            classification: mob_machine_command_classification(variant),
+        })
+        .collect()
+}
+
+const fn mob_machine_command_classification(
+    variant: MobMachineCommandVariant,
+) -> MobMachineCommandClassification {
+    match variant {
+        #[cfg(test)]
+        MobMachineCommandVariant::FlowTrackerCounts
+        | MobMachineCommandVariant::OrchestratorSnapshot
+        | MobMachineCommandVariant::LifecycleSnapshot
+        | MobMachineCommandVariant::DslT2Snapshot => {
+            MobMachineCommandClassification::ShellMechanic(
+                MobMachineShellMechanicReason::TestInspection,
+            )
+        }
+        MobMachineCommandVariant::ListMembersMatching => {
+            MobMachineCommandClassification::ShellMechanic(
+                MobMachineShellMechanicReason::FilteredRosterProjection,
+            )
+        }
+        MobMachineCommandVariant::Wire => MobMachineCommandClassification::CatalogInputs(&[
+            MobMachineCatalogInput::WireMembers,
+            MobMachineCatalogInput::WireExternalPeer,
+        ]),
+        MobMachineCommandVariant::Unwire => MobMachineCommandClassification::CatalogInputs(&[
+            MobMachineCatalogInput::UnwireMembers,
+            MobMachineCatalogInput::UnwireExternalPeer,
+        ]),
+        MobMachineCommandVariant::RunFlow => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::RunFlow)
+        }
+        MobMachineCommandVariant::CancelFlow => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::CancelFlow)
+        }
+        MobMachineCommandVariant::FlowStatus => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::FlowStatus)
+        }
+        MobMachineCommandVariant::Spawn => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::Spawn)
+        }
+        MobMachineCommandVariant::EnsureMember => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::EnsureMember)
+        }
+        MobMachineCommandVariant::Reconcile => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::Reconcile)
+        }
+        MobMachineCommandVariant::Retire => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::Retire)
+        }
+        MobMachineCommandVariant::Respawn => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::Respawn)
+        }
+        MobMachineCommandVariant::RetireAll => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::RetireAll)
+        }
+        MobMachineCommandVariant::SubmitWork => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::SubmitWork)
+        }
+        MobMachineCommandVariant::CancelWork => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::CancelWork)
+        }
+        MobMachineCommandVariant::CancelAllWork => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::CancelAllWork)
+        }
+        MobMachineCommandVariant::Stop => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::Stop)
+        }
+        MobMachineCommandVariant::Resume => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::Resume)
+        }
+        MobMachineCommandVariant::Complete => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::Complete)
+        }
+        MobMachineCommandVariant::Reset => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::Reset)
+        }
+        MobMachineCommandVariant::Destroy => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::Destroy)
+        }
+        MobMachineCommandVariant::TaskCreate => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::TaskCreate)
+        }
+        MobMachineCommandVariant::TaskUpdate => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::TaskUpdate)
+        }
+        MobMachineCommandVariant::TaskList => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::TaskList)
+        }
+        MobMachineCommandVariant::TaskGet => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::TaskGet)
+        }
+        MobMachineCommandVariant::McpServerStates => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::McpServerStates)
+        }
+        MobMachineCommandVariant::RosterSnapshot => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::RosterSnapshot)
+        }
+        MobMachineCommandVariant::ListMembers => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::ListMembers)
+        }
+        MobMachineCommandVariant::ListMembersIncludingRetiring => {
+            MobMachineCommandClassification::CatalogInput(
+                MobMachineCatalogInput::ListMembersIncludingRetiring,
+            )
+        }
+        MobMachineCommandVariant::ListAllMembers => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::ListAllMembers)
+        }
+        MobMachineCommandVariant::MemberStatus => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::MemberStatus)
+        }
+        MobMachineCommandVariant::SubscribeAgentEvents => {
+            MobMachineCommandClassification::CatalogInput(
+                MobMachineCatalogInput::SubscribeAgentEvents,
+            )
+        }
+        MobMachineCommandVariant::SubscribeAllAgentEvents => {
+            MobMachineCommandClassification::CatalogInput(
+                MobMachineCatalogInput::SubscribeAllAgentEvents,
+            )
+        }
+        MobMachineCommandVariant::SubscribeMobEvents => {
+            MobMachineCommandClassification::CatalogInput(
+                MobMachineCatalogInput::SubscribeMobEvents,
+            )
+        }
+        MobMachineCommandVariant::PollEvents => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::PollEvents)
+        }
+        MobMachineCommandVariant::ReplayAllEvents => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::ReplayAllEvents)
+        }
+        MobMachineCommandVariant::RecordOperatorActionProvenance => {
+            MobMachineCommandClassification::CatalogInput(
+                MobMachineCatalogInput::RecordOperatorActionProvenance,
+            )
+        }
+        MobMachineCommandVariant::GetMember => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::GetMember)
+        }
+        MobMachineCommandVariant::SetSpawnPolicy => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::SetSpawnPolicy)
+        }
+        MobMachineCommandVariant::Shutdown => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::Shutdown)
+        }
+        MobMachineCommandVariant::ForceCancel => {
+            MobMachineCommandClassification::CatalogInput(MobMachineCatalogInput::ForceCancel)
         }
     }
 }

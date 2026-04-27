@@ -34,6 +34,10 @@ pub enum ScheduleLifecycleInput {
     Delete {
         at_utc: DateTime<Utc>,
     },
+    ConfirmOccurrencesSuperseded {
+        occurrence_id: crate::types::OccurrenceId,
+        superseding_revision: ScheduleRevision,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +135,10 @@ pub enum OccurrenceLifecycleEffect {
     Skipped,
     Misfired,
     Superseded,
+    OccurrencesSuperseded {
+        occurrence_id: crate::types::OccurrenceId,
+        superseding_revision: ScheduleRevision,
+    },
     DeliveryFailed,
     LeaseExpired,
 }
@@ -161,6 +169,8 @@ pub enum OccurrenceLifecycleError {
     NotLiveForTerminal,
     #[error("occurrence must hold an active lease before it can expire")]
     NotLeaseHolding,
+    #[error("OccurrenceLifecycleMachine emitted invalid occurrence id `{id}`: {source}")]
+    InvalidOccurrenceId { id: String, source: uuid::Error },
 }
 
 // ===========================================================================
@@ -198,7 +208,7 @@ impl Occurrence {
             .effects
             .iter()
             .map(map_occurrence_effect)
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(OccurrenceLifecycleMutator {
             occurrence: self,
@@ -435,8 +445,10 @@ fn map_occurrence_error(
 }
 
 /// Map DSL effect → domain effect (1:1 by name).
-fn map_occurrence_effect(effect: &occ_dsl::OccurrenceLifecycleEffect) -> OccurrenceLifecycleEffect {
-    match effect {
+fn map_occurrence_effect(
+    effect: &occ_dsl::OccurrenceLifecycleEffect,
+) -> Result<OccurrenceLifecycleEffect, OccurrenceLifecycleError> {
+    Ok(match effect {
         occ_dsl::OccurrenceLifecycleEffect::Claimed => OccurrenceLifecycleEffect::Claimed,
         occ_dsl::OccurrenceLifecycleEffect::DispatchStarted => {
             OccurrenceLifecycleEffect::DispatchStarted
@@ -448,11 +460,18 @@ fn map_occurrence_effect(effect: &occ_dsl::OccurrenceLifecycleEffect) -> Occurre
         occ_dsl::OccurrenceLifecycleEffect::Skipped => OccurrenceLifecycleEffect::Skipped,
         occ_dsl::OccurrenceLifecycleEffect::Misfired => OccurrenceLifecycleEffect::Misfired,
         occ_dsl::OccurrenceLifecycleEffect::Superseded => OccurrenceLifecycleEffect::Superseded,
+        occ_dsl::OccurrenceLifecycleEffect::OccurrencesSuperseded {
+            occurrence_id,
+            superseding_revision,
+        } => OccurrenceLifecycleEffect::OccurrencesSuperseded {
+            occurrence_id: occurrence_id_from_dsl(occurrence_id)?,
+            superseding_revision: ScheduleRevision(*superseding_revision),
+        },
         occ_dsl::OccurrenceLifecycleEffect::DeliveryFailed => {
             OccurrenceLifecycleEffect::DeliveryFailed
         }
         occ_dsl::OccurrenceLifecycleEffect::LeaseExpired => OccurrenceLifecycleEffect::LeaseExpired,
-    }
+    })
 }
 
 // ===========================================================================
@@ -472,15 +491,22 @@ impl Schedule {
         match input {
             // Create is special: constructs a fresh schedule, no prior state to project
             ScheduleLifecycleInput::Create(request) => {
-                let schedule = Schedule::new(request);
-                // The DSL would emit EmitScheduleNotice, but Create constructs
-                // the schedule outside the DSL so we emit manually.
+                let mut schedule = Schedule::new(request);
+                let dsl_input = sched_dsl::ScheduleLifecycleInput::Create {
+                    trigger_key: trigger_stable_key(&schedule.trigger),
+                    target_binding_key: schedule.target.stable_key(),
+                    misfire_policy: to_dsl_misfire_policy(&schedule.misfire_policy),
+                    overlap_policy: to_dsl_overlap_policy(&schedule.overlap_policy),
+                    missing_target_policy: to_dsl_missing_target_policy(
+                        &schedule.missing_target_policy,
+                    ),
+                };
+                let (transition, dsl_state) = run_schedule_dsl(&schedule, dsl_input)?;
+                write_back_schedule(&dsl_state, &mut schedule);
+                let effects = map_schedule_effects(&transition, None);
                 Ok(ScheduleLifecycleMutator {
-                    effects: vec![ScheduleLifecycleEffect::EmitScheduleNotice {
-                        new_state: schedule.phase,
-                        revision: schedule.revision,
-                    }],
                     schedule,
+                    effects,
                     revision_bumped: false,
                 })
             }
@@ -490,16 +516,7 @@ impl Schedule {
             // handles only the machine-owned Revise transition.
             ScheduleLifecycleInput::Update(request) => {
                 let mut schedule = schedule.ok_or(ScheduleLifecycleError::MissingSchedule)?;
-                let revision_bumped = apply_update(&mut schedule, request)?;
-                let mut effects = vec![ScheduleLifecycleEffect::EmitScheduleNotice {
-                    new_state: schedule.phase,
-                    revision: schedule.revision,
-                }];
-                if revision_bumped {
-                    effects.push(ScheduleLifecycleEffect::SupersedePendingOccurrences {
-                        superseding_revision: schedule.revision,
-                    });
-                }
+                let (revision_bumped, effects) = apply_update(&mut schedule, request)?;
                 Ok(ScheduleLifecycleMutator {
                     schedule,
                     effects,
@@ -519,11 +536,10 @@ impl Schedule {
                 };
                 let (transition, dsl_state) = run_schedule_dsl(&schedule, dsl_input)?;
                 write_back_schedule(&dsl_state, &mut schedule);
-                let effects = transition
-                    .effects
-                    .iter()
-                    .map(|e| map_schedule_effect(e, planning_cursor_utc, next_occurrence_ordinal))
-                    .collect();
+                let effects = map_schedule_effects(
+                    &transition,
+                    Some((planning_cursor_utc, next_occurrence_ordinal)),
+                );
                 Ok(ScheduleLifecycleMutator {
                     schedule,
                     effects,
@@ -539,13 +555,7 @@ impl Schedule {
                 let (transition, dsl_state) = run_schedule_dsl(&schedule, dsl_input)?;
                 write_back_schedule(&dsl_state, &mut schedule);
                 schedule.config.updated_at_utc = at_utc;
-                let effects = transition
-                    .effects
-                    .iter()
-                    .map(|e| {
-                        map_schedule_effect(e, DateTime::default(), OccurrenceOrdinal::default())
-                    })
-                    .collect();
+                let effects = map_schedule_effects(&transition, None);
                 Ok(ScheduleLifecycleMutator {
                     schedule,
                     effects,
@@ -561,13 +571,7 @@ impl Schedule {
                 let (transition, dsl_state) = run_schedule_dsl(&schedule, dsl_input)?;
                 write_back_schedule(&dsl_state, &mut schedule);
                 schedule.config.updated_at_utc = at_utc;
-                let effects = transition
-                    .effects
-                    .iter()
-                    .map(|e| {
-                        map_schedule_effect(e, DateTime::default(), OccurrenceOrdinal::default())
-                    })
-                    .collect();
+                let effects = map_schedule_effects(&transition, None);
                 Ok(ScheduleLifecycleMutator {
                     schedule,
                     effects,
@@ -586,17 +590,30 @@ impl Schedule {
                 schedule.config.deleted_at_utc = Some(at_utc);
                 schedule.config.updated_at_utc = at_utc;
                 let revision_bumped = schedule.revision != old_revision;
-                let effects = transition
-                    .effects
-                    .iter()
-                    .map(|e| {
-                        map_schedule_effect(e, DateTime::default(), OccurrenceOrdinal::default())
-                    })
-                    .collect();
+                let effects = map_schedule_effects(&transition, None);
                 Ok(ScheduleLifecycleMutator {
                     schedule,
                     effects,
                     revision_bumped,
+                })
+            }
+
+            ScheduleLifecycleInput::ConfirmOccurrencesSuperseded {
+                occurrence_id,
+                superseding_revision,
+            } => {
+                let mut schedule = schedule.ok_or(ScheduleLifecycleError::MissingSchedule)?;
+                let dsl_input = sched_dsl::ScheduleLifecycleInput::ConfirmOccurrencesSuperseded {
+                    occurrence_id: sched_dsl::OccurrenceId(occurrence_id.0.to_string()),
+                    superseding_revision: superseding_revision.0,
+                };
+                let (transition, dsl_state) = run_schedule_dsl(&schedule, dsl_input)?;
+                write_back_schedule(&dsl_state, &mut schedule);
+                let effects = map_schedule_effects(&transition, None);
+                Ok(ScheduleLifecycleMutator {
+                    schedule,
+                    effects,
+                    revision_bumped: false,
                 })
             }
         }
@@ -608,7 +625,7 @@ impl Schedule {
 fn apply_update(
     schedule: &mut Schedule,
     request: UpdateScheduleRequest,
-) -> Result<bool, ScheduleLifecycleError> {
+) -> Result<(bool, Vec<ScheduleLifecycleEffect>), ScheduleLifecycleError> {
     if schedule.phase == SchedulePhase::Deleted {
         return Err(ScheduleLifecycleError::Deleted);
     }
@@ -672,11 +689,19 @@ fn apply_update(
             overlap_policy: to_dsl_overlap_policy(&schedule.overlap_policy),
             missing_target_policy: to_dsl_missing_target_policy(&schedule.missing_target_policy),
         };
-        let (_transition, dsl_state) = run_schedule_dsl(schedule, dsl_input)?;
+        let (transition, dsl_state) = run_schedule_dsl(schedule, dsl_input)?;
         write_back_schedule(&dsl_state, schedule);
+        schedule.touch();
+        return Ok((true, map_schedule_effects(&transition, None)));
     }
     schedule.touch();
-    Ok(revision_affecting_change)
+    Ok((
+        false,
+        vec![ScheduleLifecycleEffect::EmitScheduleNotice {
+            new_state: schedule.phase,
+            revision: schedule.revision,
+        }],
+    ))
 }
 
 /// Project schedule → DSL state, apply DSL input, return transition + new state.
@@ -713,6 +738,11 @@ fn project_schedule(sched: &Schedule) -> sched_dsl::ScheduleLifecycleMachineStat
         missing_target_policy: to_dsl_missing_target_policy(&sched.missing_target_policy),
         planning_cursor_utc_ms: sched.planning_cursor_utc.map(datetime_to_millis),
         next_occurrence_ordinal: sched.next_occurrence_ordinal.0,
+        superseded_ack_ids: sched
+            .superseded_ack_ids
+            .iter()
+            .map(|id| sched_dsl::OccurrenceId(id.0.to_string()))
+            .collect(),
     }
 }
 
@@ -726,6 +756,11 @@ fn write_back_schedule(dsl: &sched_dsl::ScheduleLifecycleMachineState, sched: &m
     sched.revision = ScheduleRevision(dsl.revision);
     sched.planning_cursor_utc = dsl.planning_cursor_utc_ms.and_then(millis_to_datetime);
     sched.next_occurrence_ordinal = OccurrenceOrdinal(dsl.next_occurrence_ordinal);
+    sched.superseded_ack_ids = dsl
+        .superseded_ack_ids
+        .iter()
+        .filter_map(|id| crate::types::OccurrenceId::parse(&id.0).ok())
+        .collect();
 }
 
 /// Map DSL schedule effect → domain effect.
@@ -762,6 +797,19 @@ fn map_schedule_effect(
             }
         }
     }
+}
+
+fn map_schedule_effects(
+    transition: &sched_dsl::ScheduleLifecycleMachineTransition,
+    planning_window: Option<(DateTime<Utc>, OccurrenceOrdinal)>,
+) -> Vec<ScheduleLifecycleEffect> {
+    let (planning_cursor_utc, next_occurrence_ordinal) =
+        planning_window.unwrap_or_else(|| (DateTime::default(), OccurrenceOrdinal::default()));
+    transition
+        .effects
+        .iter()
+        .map(|effect| map_schedule_effect(effect, planning_cursor_utc, next_occurrence_ordinal))
+        .collect()
 }
 
 // ===========================================================================
@@ -822,6 +870,17 @@ fn from_dsl_failure_class(fc: occ_dsl::FailureClass) -> OccurrenceFailureClass {
     }
 }
 
+fn occurrence_id_from_dsl(
+    id: &occ_dsl::OccurrenceId,
+) -> Result<crate::types::OccurrenceId, OccurrenceLifecycleError> {
+    crate::types::OccurrenceId::parse(&id.0).map_err(|source| {
+        OccurrenceLifecycleError::InvalidOccurrenceId {
+            id: id.0.clone(),
+            source,
+        }
+    })
+}
+
 fn to_dsl_misfire_policy(policy: &crate::types::MisfirePolicy) -> sched_dsl::MisfirePolicy {
     match policy {
         crate::types::MisfirePolicy::Skip => sched_dsl::MisfirePolicy::Skip,
@@ -862,7 +921,15 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn sample_occurrence() -> Occurrence {
-        let schedule = Schedule::new(CreateScheduleRequest {
+        Occurrence::planned_from_schedule(
+            &sample_schedule(),
+            crate::OccurrenceOrdinal(0),
+            Utc::now(),
+        )
+    }
+
+    fn sample_schedule() -> Schedule {
+        Schedule::new(CreateScheduleRequest {
             name: Some("claim-guard".into()),
             description: None,
             trigger: TriggerSpec::Once {
@@ -884,8 +951,7 @@ mod tests {
             labels: BTreeMap::new(),
             planning_horizon_days: Some(1),
             planning_horizon_occurrences: Some(1),
-        });
-        Occurrence::planned_from_schedule(&schedule, crate::OccurrenceOrdinal(0), Utc::now())
+        })
     }
 
     #[test]
@@ -920,5 +986,78 @@ mod tests {
             result,
             Err(OccurrenceLifecycleError::NotDispatching)
         ));
+    }
+
+    #[test]
+    fn supersede_emits_occurrence_ack_effect() -> Result<(), Box<dyn std::error::Error>> {
+        let occurrence = sample_occurrence();
+        let superseding_revision = ScheduleRevision(2);
+
+        let mutator = occurrence
+            .clone()
+            .apply(OccurrenceLifecycleInput::Supersede {
+                superseded_by_revision: superseding_revision,
+                at_utc: Utc::now(),
+            })?;
+
+        assert_eq!(mutator.occurrence.phase, OccurrencePhase::Superseded);
+        assert_eq!(
+            mutator.occurrence.superseded_by_revision,
+            Some(superseding_revision)
+        );
+        assert_eq!(
+            mutator.effects,
+            vec![
+                OccurrenceLifecycleEffect::Superseded,
+                OccurrenceLifecycleEffect::OccurrencesSuperseded {
+                    occurrence_id: occurrence.occurrence_id,
+                    superseding_revision,
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn schedule_records_supersede_ack_without_effects() -> Result<(), Box<dyn std::error::Error>> {
+        let schedule = sample_schedule();
+        let occurrence_id = crate::types::OccurrenceId::new();
+        let revision = schedule.revision.next();
+
+        let mutator = Schedule::apply(
+            Some(schedule.clone()),
+            ScheduleLifecycleInput::ConfirmOccurrencesSuperseded {
+                occurrence_id: occurrence_id.clone(),
+                superseding_revision: revision,
+            },
+        )?;
+
+        assert_eq!(mutator.schedule.phase, SchedulePhase::Active);
+        assert_eq!(mutator.schedule.revision, schedule.revision);
+        assert!(mutator.effects.is_empty());
+        assert!(mutator.schedule.superseded_ack_ids.contains(&occurrence_id));
+        Ok(())
+    }
+
+    #[test]
+    fn delete_from_deleted_is_idempotent_noop() -> Result<(), Box<dyn std::error::Error>> {
+        let schedule = sample_schedule();
+        let first = Schedule::apply(
+            Some(schedule),
+            ScheduleLifecycleInput::Delete { at_utc: Utc::now() },
+        )?;
+        let deleted = first.schedule;
+        let revision_after_delete = deleted.revision;
+
+        let second = Schedule::apply(
+            Some(deleted),
+            ScheduleLifecycleInput::Delete { at_utc: Utc::now() },
+        )?;
+
+        assert_eq!(second.schedule.phase, SchedulePhase::Deleted);
+        assert_eq!(second.schedule.revision, revision_after_delete);
+        assert!(second.effects.is_empty());
+        assert!(!second.revision_bumped);
+        Ok(())
     }
 }

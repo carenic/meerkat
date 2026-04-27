@@ -579,41 +579,391 @@ pub(crate) enum MeerkatMachineCommandResult {
 #[doc(hidden)]
 #[must_use]
 pub fn canonical_meerkat_machine_command_manifest() -> IndexSet<&'static str> {
-    let mut variants: IndexSet<&'static str> = MeerkatMachineCommand::command_manifest()
-        .iter()
-        .copied()
-        .collect();
-    for exemption in MEERKAT_MACHINE_COMMAND_MANIFEST_EXEMPTIONS {
-        variants.shift_remove(exemption.variant_name());
-    }
-    variants
+    canonical_meerkat_machine_command_classifications()
+        .into_iter()
+        .flat_map(|record| record.classification.catalog_input_names())
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MeerkatMachineCommandManifestExemption {
-    ConfigureModelRoutingBaseline,
-    RequestSwitchTurn,
-    RuntimeRealtimeChannelStatus,
-    SessionModelRoutingStatus,
-    PrepareLocalSessionBindings,
+pub enum MeerkatMachineCommandClassification {
+    CatalogInput(MeerkatMachineCatalogInput),
+    CatalogInputs(&'static [MeerkatMachineCatalogInput]),
+    ShellMechanic(MeerkatMachineShellMechanicReason),
 }
 
-const MEERKAT_MACHINE_COMMAND_MANIFEST_EXEMPTIONS: &[MeerkatMachineCommandManifestExemption] = &[
-    MeerkatMachineCommandManifestExemption::ConfigureModelRoutingBaseline,
-    MeerkatMachineCommandManifestExemption::RequestSwitchTurn,
-    MeerkatMachineCommandManifestExemption::RuntimeRealtimeChannelStatus,
-    MeerkatMachineCommandManifestExemption::SessionModelRoutingStatus,
-    MeerkatMachineCommandManifestExemption::PrepareLocalSessionBindings,
-];
-
-impl MeerkatMachineCommandManifestExemption {
-    const fn variant_name(self) -> &'static str {
+impl MeerkatMachineCommandClassification {
+    #[must_use]
+    pub fn catalog_inputs(self) -> Vec<MeerkatMachineCatalogInput> {
         match self {
-            Self::ConfigureModelRoutingBaseline => "ConfigureModelRoutingBaseline",
-            Self::RequestSwitchTurn => "RequestSwitchTurn",
-            Self::RuntimeRealtimeChannelStatus => "RuntimeRealtimeChannelStatus",
-            Self::SessionModelRoutingStatus => "SessionModelRoutingStatus",
-            Self::PrepareLocalSessionBindings => "PrepareLocalSessionBindings",
+            Self::CatalogInput(input) => vec![input],
+            Self::CatalogInputs(inputs) => inputs.to_vec(),
+            Self::ShellMechanic(_) => Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn catalog_input_names(self) -> Vec<&'static str> {
+        self.catalog_inputs()
+            .into_iter()
+            .map(MeerkatMachineCatalogInput::as_str)
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeerkatMachineCatalogInput {
+    RegisterSession,
+    UnregisterSession,
+    EnsureSessionWithExecutor,
+    SetSilentIntents,
+    InterruptCurrentRun,
+    CancelAfterBoundary,
+    StopRuntimeExecutor,
+    ContainsSession,
+    SessionHasExecutor,
+    SessionHasComms,
+    OpsLifecycleRegistry,
+    PrepareBindings,
+    InputState,
+    ListActiveInputs,
+    ReconfigureSessionLlmIdentity,
+    StagePersistentFilter,
+    RequestDeferredTools,
+    PublishCommittedVisibleSet,
+    SetPeerIngressContext,
+    NotifyDrainExited,
+    AbortAll,
+    Abort,
+    Wait,
+    Ingest,
+    PublishEvent,
+    Retire,
+    Recycle,
+    Reset,
+    Recover,
+    Destroy,
+    RuntimeState,
+    RuntimeRealtimeAttachmentStatus,
+    SetModelRoutingBaseline,
+    RequestFiniteSwitchTurn,
+    RequestUntilChangedSwitchTurn,
+    AdmitModelRoutingAssistantTurn,
+    BeginImageOperation,
+    ActivateImageOperationOverride,
+    CompleteImageOperation,
+    RestoreImageOperationOverride,
+    LoadBoundaryReceipt,
+    AcceptWithCompletion,
+    AcceptWithoutWake,
+    Prepare,
+    Commit,
+    Fail,
+}
+
+impl MeerkatMachineCatalogInput {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RegisterSession => "RegisterSession",
+            Self::UnregisterSession => "UnregisterSession",
+            Self::EnsureSessionWithExecutor => "EnsureSessionWithExecutor",
+            Self::SetSilentIntents => "SetSilentIntents",
+            Self::InterruptCurrentRun => "InterruptCurrentRun",
+            Self::CancelAfterBoundary => "CancelAfterBoundary",
+            Self::StopRuntimeExecutor => "StopRuntimeExecutor",
+            Self::ContainsSession => "ContainsSession",
+            Self::SessionHasExecutor => "SessionHasExecutor",
+            Self::SessionHasComms => "SessionHasComms",
+            Self::OpsLifecycleRegistry => "OpsLifecycleRegistry",
+            Self::PrepareBindings => "PrepareBindings",
+            Self::InputState => "InputState",
+            Self::ListActiveInputs => "ListActiveInputs",
+            Self::ReconfigureSessionLlmIdentity => "ReconfigureSessionLlmIdentity",
+            Self::StagePersistentFilter => "StagePersistentFilter",
+            Self::RequestDeferredTools => "RequestDeferredTools",
+            Self::PublishCommittedVisibleSet => "PublishCommittedVisibleSet",
+            Self::SetPeerIngressContext => "SetPeerIngressContext",
+            Self::NotifyDrainExited => "NotifyDrainExited",
+            Self::AbortAll => "AbortAll",
+            Self::Abort => "Abort",
+            Self::Wait => "Wait",
+            Self::Ingest => "Ingest",
+            Self::PublishEvent => "PublishEvent",
+            Self::Retire => "Retire",
+            Self::Recycle => "Recycle",
+            Self::Reset => "Reset",
+            Self::Recover => "Recover",
+            Self::Destroy => "Destroy",
+            Self::RuntimeState => "RuntimeState",
+            Self::RuntimeRealtimeAttachmentStatus => "RuntimeRealtimeAttachmentStatus",
+            Self::SetModelRoutingBaseline => "SetModelRoutingBaseline",
+            Self::RequestFiniteSwitchTurn => "RequestFiniteSwitchTurn",
+            Self::RequestUntilChangedSwitchTurn => "RequestUntilChangedSwitchTurn",
+            Self::AdmitModelRoutingAssistantTurn => "AdmitModelRoutingAssistantTurn",
+            Self::BeginImageOperation => "BeginImageOperation",
+            Self::ActivateImageOperationOverride => "ActivateImageOperationOverride",
+            Self::CompleteImageOperation => "CompleteImageOperation",
+            Self::RestoreImageOperationOverride => "RestoreImageOperationOverride",
+            Self::LoadBoundaryReceipt => "LoadBoundaryReceipt",
+            Self::AcceptWithCompletion => "AcceptWithCompletion",
+            Self::AcceptWithoutWake => "AcceptWithoutWake",
+            Self::Prepare => "Prepare",
+            Self::Commit => "Commit",
+            Self::Fail => "Fail",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeerkatMachineShellMechanicReason {
+    ModelRoutingShellConfiguration,
+    TurnControlOverlayRequest,
+    RealtimeTransportObservation,
+    SessionModelRoutingObservation,
+    LocalSessionBindingBootstrap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeerkatMachineCommandClassificationRecord {
+    pub command: &'static str,
+    pub classification: MeerkatMachineCommandClassification,
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn canonical_meerkat_machine_command_classifications()
+-> Vec<MeerkatMachineCommandClassificationRecord> {
+    MeerkatMachineCommand::command_variant_manifest()
+        .iter()
+        .copied()
+        .map(|variant| MeerkatMachineCommandClassificationRecord {
+            command: variant.as_str(),
+            classification: meerkat_machine_command_classification(variant),
+        })
+        .collect()
+}
+
+const fn meerkat_machine_command_classification(
+    variant: MeerkatMachineCommandVariant,
+) -> MeerkatMachineCommandClassification {
+    match variant {
+        MeerkatMachineCommandVariant::ConfigureModelRoutingBaseline => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::SetModelRoutingBaseline,
+            )
+        }
+        MeerkatMachineCommandVariant::RequestSwitchTurn => {
+            MeerkatMachineCommandClassification::CatalogInputs(&[
+                MeerkatMachineCatalogInput::RequestFiniteSwitchTurn,
+                MeerkatMachineCatalogInput::RequestUntilChangedSwitchTurn,
+            ])
+        }
+        MeerkatMachineCommandVariant::RuntimeRealtimeChannelStatus => {
+            MeerkatMachineCommandClassification::ShellMechanic(
+                MeerkatMachineShellMechanicReason::RealtimeTransportObservation,
+            )
+        }
+        MeerkatMachineCommandVariant::SessionModelRoutingStatus => {
+            MeerkatMachineCommandClassification::ShellMechanic(
+                MeerkatMachineShellMechanicReason::SessionModelRoutingObservation,
+            )
+        }
+        MeerkatMachineCommandVariant::PrepareLocalSessionBindings => {
+            MeerkatMachineCommandClassification::ShellMechanic(
+                MeerkatMachineShellMechanicReason::LocalSessionBindingBootstrap,
+            )
+        }
+        MeerkatMachineCommandVariant::RegisterSession => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::RegisterSession,
+            )
+        }
+        MeerkatMachineCommandVariant::UnregisterSession => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::UnregisterSession,
+            )
+        }
+        MeerkatMachineCommandVariant::EnsureSessionWithExecutor => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::EnsureSessionWithExecutor,
+            )
+        }
+        MeerkatMachineCommandVariant::SetSilentIntents => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::SetSilentIntents,
+            )
+        }
+        MeerkatMachineCommandVariant::InterruptCurrentRun => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::InterruptCurrentRun,
+            )
+        }
+        MeerkatMachineCommandVariant::CancelAfterBoundary => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::CancelAfterBoundary,
+            )
+        }
+        MeerkatMachineCommandVariant::StopRuntimeExecutor => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::StopRuntimeExecutor,
+            )
+        }
+        MeerkatMachineCommandVariant::ContainsSession => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::ContainsSession,
+            )
+        }
+        MeerkatMachineCommandVariant::SessionHasExecutor => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::SessionHasExecutor,
+            )
+        }
+        MeerkatMachineCommandVariant::SessionHasComms => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::SessionHasComms,
+            )
+        }
+        MeerkatMachineCommandVariant::OpsLifecycleRegistry => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::OpsLifecycleRegistry,
+            )
+        }
+        MeerkatMachineCommandVariant::PrepareBindings => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::PrepareBindings,
+            )
+        }
+        MeerkatMachineCommandVariant::InputState => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::InputState,
+            )
+        }
+        MeerkatMachineCommandVariant::ListActiveInputs => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::ListActiveInputs,
+            )
+        }
+        MeerkatMachineCommandVariant::ReconfigureSessionLlmIdentity => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::ReconfigureSessionLlmIdentity,
+            )
+        }
+        MeerkatMachineCommandVariant::StagePersistentFilter => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::StagePersistentFilter,
+            )
+        }
+        MeerkatMachineCommandVariant::RequestDeferredTools => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::RequestDeferredTools,
+            )
+        }
+        MeerkatMachineCommandVariant::PublishCommittedVisibleSet => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::PublishCommittedVisibleSet,
+            )
+        }
+        MeerkatMachineCommandVariant::SetPeerIngressContext => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::SetPeerIngressContext,
+            )
+        }
+        MeerkatMachineCommandVariant::NotifyDrainExited => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::NotifyDrainExited,
+            )
+        }
+        MeerkatMachineCommandVariant::AbortAll => {
+            MeerkatMachineCommandClassification::CatalogInput(MeerkatMachineCatalogInput::AbortAll)
+        }
+        MeerkatMachineCommandVariant::Abort => {
+            MeerkatMachineCommandClassification::CatalogInput(MeerkatMachineCatalogInput::Abort)
+        }
+        MeerkatMachineCommandVariant::Wait => {
+            MeerkatMachineCommandClassification::CatalogInput(MeerkatMachineCatalogInput::Wait)
+        }
+        MeerkatMachineCommandVariant::Ingest => {
+            MeerkatMachineCommandClassification::CatalogInput(MeerkatMachineCatalogInput::Ingest)
+        }
+        MeerkatMachineCommandVariant::PublishEvent => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::PublishEvent,
+            )
+        }
+        MeerkatMachineCommandVariant::Retire => {
+            MeerkatMachineCommandClassification::CatalogInput(MeerkatMachineCatalogInput::Retire)
+        }
+        MeerkatMachineCommandVariant::Recycle => {
+            MeerkatMachineCommandClassification::CatalogInput(MeerkatMachineCatalogInput::Recycle)
+        }
+        MeerkatMachineCommandVariant::Reset => {
+            MeerkatMachineCommandClassification::CatalogInput(MeerkatMachineCatalogInput::Reset)
+        }
+        MeerkatMachineCommandVariant::Recover => {
+            MeerkatMachineCommandClassification::CatalogInput(MeerkatMachineCatalogInput::Recover)
+        }
+        MeerkatMachineCommandVariant::Destroy => {
+            MeerkatMachineCommandClassification::CatalogInput(MeerkatMachineCatalogInput::Destroy)
+        }
+        MeerkatMachineCommandVariant::RuntimeState => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::RuntimeState,
+            )
+        }
+        MeerkatMachineCommandVariant::RuntimeRealtimeAttachmentStatus => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::RuntimeRealtimeAttachmentStatus,
+            )
+        }
+        MeerkatMachineCommandVariant::AdmitModelRoutingAssistantTurn => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::AdmitModelRoutingAssistantTurn,
+            )
+        }
+        MeerkatMachineCommandVariant::BeginImageOperation => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::BeginImageOperation,
+            )
+        }
+        MeerkatMachineCommandVariant::ActivateImageOperationOverride => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::ActivateImageOperationOverride,
+            )
+        }
+        MeerkatMachineCommandVariant::CompleteImageOperation => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::CompleteImageOperation,
+            )
+        }
+        MeerkatMachineCommandVariant::RestoreImageOperationOverride => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::RestoreImageOperationOverride,
+            )
+        }
+        MeerkatMachineCommandVariant::LoadBoundaryReceipt => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::LoadBoundaryReceipt,
+            )
+        }
+        MeerkatMachineCommandVariant::AcceptWithCompletion => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::AcceptWithCompletion,
+            )
+        }
+        MeerkatMachineCommandVariant::AcceptWithoutWake => {
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::AcceptWithoutWake,
+            )
+        }
+        MeerkatMachineCommandVariant::Prepare => {
+            MeerkatMachineCommandClassification::CatalogInput(MeerkatMachineCatalogInput::Prepare)
+        }
+        MeerkatMachineCommandVariant::Commit => {
+            MeerkatMachineCommandClassification::CatalogInput(MeerkatMachineCatalogInput::Commit)
+        }
+        MeerkatMachineCommandVariant::Fail => {
+            MeerkatMachineCommandClassification::CatalogInput(MeerkatMachineCatalogInput::Fail)
         }
     }
 }

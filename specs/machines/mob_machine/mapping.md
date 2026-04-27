@@ -8,49 +8,124 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `MobMachine`
 
 ### Code Anchors
-- `mob_handle_surface`: `meerkat-mob/src/runtime/handle.rs` — identity-first public MobMachine handle surface
-- `mob_actor_authority`: `meerkat-mob/src/runtime/actor.rs` — MobMachine actor authority and command execution for wire, unwire, bind, rotate, release, spawn, observe runtime, submit work, retire, reset, respawn, complete, mark completed, stop/stopped, resume, task, force cancel, subscribe events, shutdown, destroy, terminalized member, record operator action provenance, flow, run, orchestrator, coordinator, cleanup, append failure ledger, escalate supervisor, peer, progress, notices, wiring graph, and session binding
+- `mob_handle_surface`: `meerkat-mob/src/runtime/handle.rs` — identity-first public MobMachine handle surface for ensure member, reconcile, and member command routing
+- `mob_actor_authority`: `meerkat-mob/src/runtime/actor.rs` — MobMachine actor authority and command execution for wire, unwire, bind, rotate, release, spawn, ensure member, reconcile, observe runtime, submit work, retire, reset, respawn, complete, mark completed, stop/stopped, resume, task, force cancel, subscribe events, shutdown, destroy, terminalized member, record operator action provenance, flow, run, create frame seed, create loop seed, project frame phase, project loop state, orchestrator, coordinator, cleanup, append failure ledger, escalate supervisor, peer, progress, notices, kickoff resolve started/callback pending/failed/cancelled/clear, wiring graph, and session binding
 
 ### Scenarios
-- `spawn-work-terminal` — member spawn, runtime-ready observation, work submission, and terminal work closure
+- `spawn-work-terminal` — member spawn, ensure member, reconcile, runtime-ready observation, work submission, and terminal work closure
 - `retire-respawn-destroy` — member retires, resets, respawns with a new runtime incarnation, stops/stopped, resumes, shuts down, destroys cleanly, and resets to running when reusable
 - `wiring-and-session-binding` — wire and unwire members, bind rotate release member session, enforce known identity for bindings, expose pending spawn, member session binding changed, and wiring lifecycle notices
-- `task-flow-and-run-lifecycle` — task create or update pending/in progress/completed/cancelled, run flow, start flow, create run, start run, complete flow, finish run, mark completed, flow terminalized, and force cancel running work
+- `task-flow-and-run-lifecycle` — task create or update pending/in progress/completed/cancelled, run flow, start flow, create run, create frame seed, create loop seed, project frame phase, project loop state, start run, complete flow, finish run, mark completed, kickoff resolve started or failed, kickoff clear, flow terminalized, and force cancel running work
 - `event-subscriptions-and-notices` — subscribe agent, all agent, and mob events; emit member, run, flow, progress, task, terminal, and wiring notices
 - `orchestrator-coordinator-cleanup` — initialize, stop, resume, and destroy orchestrator; bind or unbind coordinator; begin and finish cleanup; notify coordinator and escalate supervisor
 - `operator-provenance-and-peer-input` — record operator action provenance, trust operation peer, admit peer input, append failure ledger, and surface peer-exposed member inputs
 
 ### Transitions
-- `WireMembersRunning`
-  - anchors: `mob_actor_authority`
-  - scenarios: `wiring-and-session-binding`
-- `UnwireMembersRunning`
-  - anchors: `mob_actor_authority`
-  - scenarios: `wiring-and-session-binding`
-- `WireExternalPeerRunning`
-  - anchors: `mob_actor_authority`
-  - scenarios: `retire-respawn-destroy`, `wiring-and-session-binding`, `task-flow-and-run-lifecycle`, `operator-provenance-and-peer-input`
-- `UnwireExternalPeerRunning`
-  - anchors: `mob_actor_authority`
-  - scenarios: `retire-respawn-destroy`, `wiring-and-session-binding`, `task-flow-and-run-lifecycle`, `operator-provenance-and-peer-input`
-- `BindMemberSessionRunning`
-  - anchors: `mob_actor_authority`
-  - scenarios: `wiring-and-session-binding`
-- `RotateMemberSessionRunning`
-  - anchors: `mob_actor_authority`
-  - scenarios: `wiring-and-session-binding`
-- `ReleaseMemberSessionRunning`
-  - anchors: `mob_actor_authority`
-  - scenarios: `wiring-and-session-binding`
 - `SpawnRunningFresh`
   - anchors: `mob_actor_authority`
   - scenarios: `retire-respawn-destroy`
 - `SpawnRunningReplacing`
   - anchors: `mob_actor_authority`
   - scenarios: `retire-respawn-destroy`
+- `EnsureMemberRunningExisting`
+  - anchors: `mob_handle_surface`, `mob_actor_authority`
+  - scenarios: `spawn-work-terminal`, `retire-respawn-destroy`
+- `EnsureMemberRunningMissing`
+  - anchors: `mob_handle_surface`, `mob_actor_authority`
+  - scenarios: `spawn-work-terminal`, `retire-respawn-destroy`
+- `ReconcileRunning`
+  - anchors: `mob_handle_surface`, `mob_actor_authority`
+  - scenarios: `spawn-work-terminal`, `retire-respawn-destroy`, `task-flow-and-run-lifecycle`
+- `ReconcileStopped`
+  - anchors: `mob_actor_authority`
+  - scenarios: `spawn-work-terminal`, `retire-respawn-destroy`
+- `ReconcileCompleted`
+  - anchors: `mob_actor_authority`
+  - scenarios: `spawn-work-terminal`, `task-flow-and-run-lifecycle`
 - `ObserveRuntimeReady`
   - anchors: `mob_actor_authority`
   - scenarios: `spawn-work-terminal`
+- `StartupMarkReadyRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `StartupMarkReadyStopped`
+  - anchors: `mob_actor_authority`
+  - scenarios: `spawn-work-terminal`, `retire-respawn-destroy`, `task-flow-and-run-lifecycle`
+- `StartupMarkReadyCompleted`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffMarkPendingRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffMarkPendingStopped`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffMarkPendingCompleted`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffMarkStartingRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffMarkStartingStopped`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffMarkStartingCompleted`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffResolveStartedRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffResolveStartedStopped`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffResolveStartedCompleted`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffResolveCallbackPendingRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffResolveCallbackPendingStopped`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffResolveCallbackPendingCompleted`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffResolveFailedFromStartingRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffResolveFailedFromStartingStopped`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffResolveFailedFromStartingCompleted`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffResolveCancelledRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffResolveCancelledStopped`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffResolveCancelledCompleted`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffCancelRequestedRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffCancelRequestedStopped`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffCancelRequestedCompleted`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffClearRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffClearStopped`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `KickoffClearCompleted`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
 - `SubmitWorkRunningExternal`
   - anchors: `mob_actor_authority`
   - scenarios: `task-flow-and-run-lifecycle`
@@ -114,6 +189,27 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ResetToRunning`
   - anchors: `mob_actor_authority`
   - scenarios: `retire-respawn-destroy`
+- `WireMembersRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `wiring-and-session-binding`
+- `UnwireMembersRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `wiring-and-session-binding`
+- `WireExternalPeerRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `retire-respawn-destroy`, `wiring-and-session-binding`, `task-flow-and-run-lifecycle`, `operator-provenance-and-peer-input`
+- `UnwireExternalPeerRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `retire-respawn-destroy`, `wiring-and-session-binding`, `task-flow-and-run-lifecycle`, `operator-provenance-and-peer-input`
+- `BindMemberSessionRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `wiring-and-session-binding`
+- `RotateMemberSessionRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `wiring-and-session-binding`
+- `ReleaseMemberSessionRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `wiring-and-session-binding`
 - `TaskCreateRunning`
   - anchors: `mob_actor_authority`
   - scenarios: `task-flow-and-run-lifecycle`
@@ -249,6 +345,72 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RunFlowRunning`
   - anchors: `mob_actor_authority`
   - scenarios: `task-flow-and-run-lifecycle`
+- `CreateRunSeedRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `CreateFrameSeedRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `CreateLoopSeedRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `RecordLoopBodyFrameCompletedRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `RecordLoopUntilConditionMetRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `RecordLoopUntilConditionFailedRunning`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `RecordLoopUntilConditionFailedExhausted`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeFlowRunReducerCommandStartRun`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeFlowRunReducerCommandActiveRun`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`, `event-subscriptions-and-notices`
+- `AuthorizeFlowRunReducerCommandDispatchStep`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`, `event-subscriptions-and-notices`
+- `AuthorizeFlowRunReducerCommandCancelStep`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeFlowRunReducerCommandTerminalCompleted`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeFlowRunReducerCommandTerminalFailed`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeFlowRunReducerCommandTerminalCanceled`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`, `event-subscriptions-and-notices`
+- `AuthorizeFlowFrameReducerCommandActiveFrame`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeFlowFrameReducerCommandSealFrame`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeLoopIterationReducerCommandBodyFrameStarted`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeLoopIterationReducerCommandBodyFrameCompleted`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeLoopIterationReducerCommandBodyFrameFailed`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeLoopIterationReducerCommandBodyFrameCanceled`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeLoopIterationReducerCommandUntilFeedback`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeLoopIterationReducerCommandCancelLoop`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
 - `StartFlowRunning`
   - anchors: `mob_actor_authority`
   - scenarios: `task-flow-and-run-lifecycle`
@@ -290,10 +452,10 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - scenarios: `retire-respawn-destroy`, `wiring-and-session-binding`
 - `SessionIngressDetachFailedForMobDestroyRunning`
   - anchors: `mob_actor_authority`
-  - scenarios: `retire-respawn-destroy`, `wiring-and-session-binding`, `task-flow-and-run-lifecycle`
+  - scenarios: `task-flow-and-run-lifecycle`
 - `SessionIngressDetachFailedForMobDestroyStopped`
   - anchors: `mob_actor_authority`
-  - scenarios: `retire-respawn-destroy`, `wiring-and-session-binding`
+  - scenarios: `retire-respawn-destroy`, `wiring-and-session-binding`, `task-flow-and-run-lifecycle`
 - `RetireStoppedPreservingBinding`
   - anchors: `mob_actor_authority`
   - scenarios: `retire-respawn-destroy`
@@ -329,12 +491,12 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RequestRuntimeRetire`
   - anchors: `mob_actor_authority`
   - scenarios: `retire-respawn-destroy`
-- `RequestSessionIngressDetachForMobDestroy`
-  - anchors: `mob_actor_authority`
-  - scenarios: `wiring-and-session-binding`
 - `RequestRuntimeDestroy`
   - anchors: `mob_actor_authority`
   - scenarios: `retire-respawn-destroy`
+- `RequestSessionIngressDetachForMobDestroy`
+  - anchors: `mob_actor_authority`
+  - scenarios: `wiring-and-session-binding`
 - `EmitMemberLifecycleNotice`
   - anchors: `mob_actor_authority`
   - scenarios: `wiring-and-session-binding`, `event-subscriptions-and-notices`
@@ -371,6 +533,15 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `EmitTaskNotice`
   - anchors: `mob_actor_authority`
   - scenarios: `event-subscriptions-and-notices`
+- `PersistKickoffUpdate`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `PersistKickoffFailureUpdate`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `EmitKickoffLifecycleNotice`
+  - anchors: `mob_actor_authority`
+  - scenarios: `wiring-and-session-binding`, `task-flow-and-run-lifecycle`, `event-subscriptions-and-notices`
 - `WiringGraphChanged`
   - anchors: `mob_actor_authority`
   - scenarios: `wiring-and-session-binding`

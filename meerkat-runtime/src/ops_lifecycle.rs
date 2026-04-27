@@ -730,9 +730,15 @@ impl ShellState {
             .iter()
             .map(|id| mm_dsl::OperationId::from_domain(id).0)
             .collect();
+        let dsl_id_tokens: std::collections::BTreeSet<mm_dsl::OperationId> = operation_ids
+            .iter()
+            .map(mm_dsl::OperationId::from_domain)
+            .collect();
         self.dsl_apply(
             mm_dsl::MeerkatMachineInput::RequestWaitAll {
+                wait_request_id: mm_dsl::WaitRequestId::from_domain(wait_request_id),
                 operation_ids: dsl_ids,
+                operation_id_tokens: dsl_id_tokens,
             },
             "RequestWaitAll",
         )?;

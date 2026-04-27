@@ -1,5 +1,887 @@
+//! MeerkatMachine DSL definition with real bridging types.
 use super::OptionValueExt;
 use meerkat_machine_dsl::machine;
+
+// ---------------------------------------------------------------------------
+// Bridging types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct SessionId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct AgentRuntimeId(pub String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct FenceToken(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Generation(pub u64);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct RunId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct InputId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct WorkId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct OperationId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct WaitRequestId(pub String);
+
+/// Typed async-operation kind. Closed mirror of
+/// [`meerkat_core::ops_lifecycle::OperationKind`] — replaces the former
+/// newtype wrapper around an opaque JSON-encoded string. The DSL writes this
+/// variant directly on `RegisterOp` so guards on `PeerReadyOp`
+/// (`kind_is_mob_member_child`) can reason about the closed set without
+/// string parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum OperationKind {
+    #[default]
+    MobMemberChild,
+    BackgroundToolOp,
+}
+
+/// Typed mirror of [`meerkat_core::Provider`] for use inside DSL bridging
+/// types. Closed 5-variant enum; the seam carries the discriminant directly
+/// rather than a JSON-encoded string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum Provider {
+    #[default]
+    Anthropic,
+    OpenAI,
+    Gemini,
+    SelfHosted,
+    Other,
+}
+
+/// Typed mirror of [`meerkat_core::ConnectionRef`] — structural string
+/// projection carrying the flat forms of `realm` / `binding` / `profile`
+/// with bidirectional `From`.
+///
+/// The DSL layer keeps string fields because this mirror is the
+/// DSL-layer identity carrier (used inside runtime-owned guards /
+/// transitions where slug validation has already happened at the
+/// boundary). Domain-side `ConnectionRef` carries the typed atoms
+/// (`RealmId` / `BindingId` / `ProfileId`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ConnectionRef {
+    pub realm_id: String,
+    pub binding_id: String,
+    pub profile_id: Option<String>,
+}
+
+/// Fallible conversion — DSL-layer flat strings may be slug-invalid
+/// (the DSL mirror intentionally accepts opaque strings to survive
+/// deserialization drift across schema versions), so lifting back to
+/// Typed mirror of [`meerkat_core::SessionLlmIdentity`] — structural field
+/// projection with typed `Provider` and `ConnectionRef` mirrors. The
+/// `provider_params` payload is a legitimately open-set `serde_json::Value`
+/// at the persistence boundary (arbitrary provider-specific options), so it
+/// rides on a stable JSON-serialization field inside the DSL — never parsed
+/// back as a discriminant inside any guard or transition.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct SessionLlmIdentity {
+    pub model: String,
+    pub provider: Provider,
+    pub self_hosted_server_id: Option<String>,
+    /// Stable JSON serialization of the open-set `provider_params` payload.
+    /// Carried as an opaque identity token; DSL guards never inspect its
+    /// content. Boundary-legitimate per the dogma round-4 brief's
+    /// "variable JSON payload" carve-out applied at field granularity.
+    pub provider_params_repr: Option<String>,
+    pub connection_ref: Option<ConnectionRef>,
+}
+
+/// Typed mirror of [`meerkat_core::SessionToolVisibilityState`] —
+/// structural projection using typed `ToolFilter` / `ToolVisibilityWitness`
+/// mirrors plus ordered name sets for deterministic Ord/Hash.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct SessionToolVisibilityState {
+    pub capability_base_filter: ToolFilter,
+    pub inherited_base_filter: ToolFilter,
+    pub active_filter: ToolFilter,
+    pub staged_filter: ToolFilter,
+    pub active_requested_deferred_names: std::collections::BTreeSet<String>,
+    pub staged_requested_deferred_names: std::collections::BTreeSet<String>,
+    pub active_revision: u64,
+    pub staged_revision: u64,
+    pub requested_witnesses: std::collections::BTreeMap<String, ToolVisibilityWitness>,
+    pub filter_witnesses: std::collections::BTreeMap<String, ToolVisibilityWitness>,
+}
+
+/// Typed mirror of
+/// [`crate::meerkat_machine_types::SessionLlmCapabilitySurface`] — structural
+/// projection of the boolean capability matrix plus optional call timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct SessionLlmCapabilitySurface {
+    pub supports_temperature: bool,
+    pub supports_thinking: bool,
+    pub supports_reasoning: bool,
+    pub inline_video: bool,
+    pub vision: bool,
+    pub image_tool_results: bool,
+    pub supports_web_search: bool,
+    pub realtime: bool,
+    pub call_timeout_secs: Option<u64>,
+}
+
+/// Typed capability-surface resolution status. Closed mirror of
+/// [`crate::meerkat_machine_types::SessionLlmCapabilitySurfaceStatus`] —
+/// replaces the former JSON-stringified wrapper the DSL used to carry the
+/// two-state discriminant across the seam.
+///
+/// The DSL stores the variant directly on `ReconfigureSessionLlmIdentity`
+/// flow state; the shell maps to/from the domain enum via the `From` impls
+/// below — no `serde_json::to_string`, no string compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum SessionLlmCapabilitySurfaceStatus {
+    Resolved,
+    #[default]
+    Unresolved,
+}
+
+/// Typed mirror of
+/// [`crate::meerkat_machine_types::SessionToolVisibilityDelta`] — structural
+/// projection using typed `ToolFilter` mirrors plus the two boolean change
+/// flags. Replaces the former `format!("{id:?}")` Debug-stringified wrapper.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct SessionToolVisibilityDelta {
+    pub previous_capability_base_filter: ToolFilter,
+    pub current_capability_base_filter: ToolFilter,
+    pub committed_visible_set_changed: bool,
+    pub revision_bumped: bool,
+}
+
+/// Typed mirror of [`meerkat_core::ToolFilter`] — closed 3-variant
+/// discriminant with a `BTreeSet<String>` name payload for
+/// `Allow`/`Deny` so the value is `Ord + Hash` and deterministic across
+/// iteration, matching the R3 `InputAbandonReason::MaxAttemptsExhausted {
+/// attempts }` pattern of carrying the discriminant's companion data in a
+/// field with stable ordering.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum ToolFilter {
+    #[default]
+    All,
+    Allow(std::collections::BTreeSet<String>),
+    Deny(std::collections::BTreeSet<String>),
+}
+
+/// Typed mirror of [`meerkat_core::types::ToolSourceKind`] — closed
+/// 10-variant discriminant for tool provenance classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum ToolSourceKind {
+    #[default]
+    Builtin,
+    Shell,
+    Comms,
+    Memory,
+    Schedule,
+    Mob,
+    MobTasks,
+    Callback,
+    Mcp,
+    RustBundle,
+}
+
+/// Typed mirror of [`meerkat_core::types::ToolProvenance`] — structural
+/// projection carried inside [`ToolVisibilityWitness`], using the typed
+/// `ToolSourceKind` discriminant mirror.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ToolProvenance {
+    pub kind: ToolSourceKind,
+    pub source_id: String,
+}
+
+/// Typed mirror of [`meerkat_core::ToolVisibilityWitness`] — structural
+/// projection of the two optional witness fields.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ToolVisibilityWitness {
+    pub stable_owner_key: Option<String>,
+    pub last_seen_provenance: Option<ToolProvenance>,
+}
+
+/// Per-session realtime binding-state lifecycle.
+///
+/// Unit variants only — carried inside `MeerkatMachine` state as a closed
+/// set of phases. The default (`Unbound`) is paired with
+/// `realtime_binding_authority_epoch == None` by the
+/// `realtime_binding_epoch_consistency` invariant.
+///
+/// Default serde tagging reuses the variant names as string values
+/// (`"Unbound"`, `"BindingNotReady"`, `"BindingReady"`, `"ReplacementPending"`)
+/// to preserve wire-format compatibility with earlier stringly-typed clients.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum RealtimeBindingState {
+    #[default]
+    Unbound,
+    BindingNotReady,
+    BindingReady,
+    ReplacementPending,
+}
+
+/// Product-turn lifecycle phase for a provider-managed realtime session
+/// (U9 / dogma #4).
+///
+/// The realtime-WS shell previously tracked turn lifecycle as three shell
+/// locals (`product_turn_in_flight`, `product_turn_committed`,
+/// `product_output_started`). This enum collapses the product of those
+/// three orthogonal milestones into a closed set of phases the DSL owns:
+///
+/// - `Idle`: between turns — no input accepted yet.
+/// - `AwaitingProgress`: input accepted; no commit, no output observed.
+/// - `Committed`: `TurnCommitted` arrived but no output delta yet.
+/// - `OutputStarted`: output delta / tool call arrived but no commit yet.
+/// - `Preemptible`: both `TurnCommitted` and output have landed — the
+///   only state in which an input chunk should preempt the current
+///   provider-managed turn (the "committed turn has visible assistant-side
+///   progress" rule documented on `should_preempt_on_input`).
+///
+/// Transitions are idempotent via guard rejection: the runtime handle
+/// reports guard-rejected transitions as `Ok(false)` so the shell can
+/// fire unconditionally on every lifecycle event without tracking its
+/// own phase.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum RealtimeProductTurnPhase {
+    #[default]
+    Idle,
+    AwaitingProgress,
+    Committed,
+    OutputStarted,
+    Preemptible,
+}
+
+/// Projection-freshness discriminant for the realtime provider session
+/// (dogma round 2, U-C / dogma #1, #3, #13, #20).
+///
+/// Replaces the shell-local `ProjectionFreshness` enum previously owned by
+/// `meerkat-rpc::realtime_ws`. Freshness truth is now canonical DSL state
+/// owned by the session's MeerkatMachine; the realtime-WS shell reads it via
+/// the [`RealtimeProductTurnHandle`] and fires typed inputs for each
+/// observer tick, turn terminal, and refresh-drain.
+///
+/// The `baseline_ms` companion field
+/// ([`MeerkatMachineState::realtime_projection_frontier_ms`]) pairs with this
+/// discriminant: it holds the `baseline_ms` while `Clean`, and the
+/// `new_at_ms` of the pending advance while `StaleDeferred` / `StaleImmediate`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum RealtimeProjectionFreshness {
+    /// Provider projection matches canonical session state as of
+    /// `realtime_projection_frontier_ms`. No refresh owed.
+    #[default]
+    Clean,
+    /// Canonical state advanced while the provider turn was live; refresh
+    /// blocked until the turn terminates so barge-in continuity isn't broken.
+    StaleDeferred,
+    /// Refresh owed at the next drain site (idle input-chunk arrival or
+    /// turn-end).
+    StaleImmediate,
+}
+
+/// Typed classification of a clean provider-session close for the realtime
+/// socket (dogma round 2, U-C / dogma #1, #3, #18, #20).
+///
+/// Replaces the shell-local boolean pair (`client_has_submitted_input`,
+/// `last_turn_terminally_completed`) previously owned by the realtime-WS
+/// dispatch loop. The DSL owns the classification; the shell reads
+/// [`RealtimeProductTurnHandle::reconnect_policy_on_clean_close`] at the
+/// clean-close branch point and dispatches on the typed value.
+///
+/// Semantics: a `CleanExit` means the session has no in-flight client work
+/// that would need to be recovered via reattach (either the client never
+/// submitted anything, or the last turn reached a terminal completion).
+/// `ReattachAndRecover` means the client issued work that has not yet
+/// reached a terminal completion, so a clean close is treated as a
+/// mid-work disconnect and the channel proactively re-opens.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum RealtimeReconnectPolicy {
+    /// A clean close has nothing to recover — either the client never
+    /// submitted input on this session, or the last observed turn reached
+    /// a terminal completion.
+    #[default]
+    CleanExit,
+    /// The client issued work that has not yet reached a terminal turn
+    /// completion; a clean close is a mid-work disconnect and the channel
+    /// should proactively reattach.
+    ReattachAndRecover,
+}
+
+/// Bridging type for an MCP server identifier, matching the catalog type.
+/// Used as the key in `mcp_server_states` and carried on MCP lifecycle
+/// inputs and effects.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct McpServerId(pub String);
+
+/// Bridging wrapper mapping [`meerkat_core::PeerCorrelationId`] into the DSL
+/// macro's type system. Keyed map values for `pending_peer_requests` and
+/// `inbound_peer_requests`; carried on every W1-A peer-lifecycle input and
+/// effect.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct PeerCorrelationId(pub String);
+
+/// Typed outbound peer-request state, mirroring
+/// [`meerkat_core::OutboundPeerRequestState`]. Unit variants only; failure
+/// reason travels on the `PeerResponseTerminalArrived` input's companion
+/// fields, not in the enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum OutboundPeerRequestState {
+    #[default]
+    Sent,
+    AcceptedProgress,
+    Completed,
+    Failed,
+    TimedOut,
+}
+
+/// Typed inbound peer-request state, mirroring
+/// [`meerkat_core::InboundPeerRequestState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum InboundPeerRequestState {
+    #[default]
+    Received,
+    Replied,
+}
+
+/// Typed terminal disposition carried on `PeerResponseTerminalArrived`.
+/// Mirror of [`meerkat_core::handles::PeerTerminalDisposition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum PeerTerminalDisposition {
+    #[default]
+    Completed,
+    Failed,
+}
+
+/// Typed lifecycle state of an interaction stream reservation (U6 / dogma #5).
+///
+/// Owns whether a reserved subscriber/stream channel is still claimable
+/// (`Reserved`), live with an attached consumer (`Attached`), or terminal
+/// (`Completed` after a terminal event won, `Expired` after the TTL elapsed
+/// without an attach, `ClosedEarly` after the consumer dropped the stream
+/// before terminal). Mirror of [`meerkat_core::InteractionStreamState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum InteractionStreamState {
+    #[default]
+    Reserved,
+    Attached,
+    Completed,
+    Expired,
+    ClosedEarly,
+}
+
+/// Per-server MCP connection lifecycle state. Matches the catalog copy;
+/// unit variants only so the DSL can reason about state via map inserts.
+/// Failure detail travels on the `McpServerFailed` input and
+/// `McpServerStateChanged` effect's companion fields, not on the enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum McpServerState {
+    #[default]
+    PendingConnect,
+    Connected,
+    Failed,
+    Disconnected,
+}
+
+/// Stable identity of a comms runtime instance (W2-G / issue #264).
+///
+/// The runtime derives this string from the `Arc<dyn CommsRuntime>` pointer
+/// address via `CommsRuntimeId::from_runtime()`. The DSL treats it as an
+/// opaque newtype; two distinct `Arc`s produce distinct ids so the owner
+/// invariant can catch silent transport swaps.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct CommsRuntimeId(pub String);
+
+/// Mob instance identifier for peer-ingress ownership (W2-G / issue #264).
+///
+/// Bridging newtype mirroring `meerkat_mob::ids::MobId`. The DSL layer keeps
+/// this opaque because `meerkat-runtime` does not depend on `meerkat-mob`;
+/// the shell stringifies the real `MobId` before firing `AttachMobIngress`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct MobId(pub String);
+
+/// Peer-ingress transport capability ownership kind (W2-G / issue #264).
+///
+/// Paired with `peer_ingress_comms_runtime_id` and `peer_ingress_mob_id` in
+/// DSL state; `peer_ingress_owner_consistency` enforces pairing. Silent
+/// downgrade `MobOwned` → `SessionOwned` is structurally impossible:
+/// `AttachSessionIngress` requires `Unattached`; `AttachMobIngress` permits
+/// `Unattached` or `SessionOwned` but never `MobOwned` → `SessionOwned`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum PeerIngressOwnerKind {
+    #[default]
+    Unattached,
+    SessionOwned,
+    MobOwned,
+}
+
+/// Supervisor-bridge authorization kind (Wave 3 D Row 21).
+///
+/// Paired with `supervisor_bound_{name, peer_id, address, epoch}` in DSL
+/// state; `supervisor_binding_consistency` enforces pairing. Rotation is
+/// structural: `BindSupervisor` requires `Unbound`; `AuthorizeSupervisor`
+/// requires `Bound`; `RevokeSupervisor` requires `Bound` and returns to
+/// `Unbound`. Before Wave 3 D this fact lived as an `Option<AuthorizedSupervisorState>`
+/// on the comms drain task's stack — the identity and epoch of the
+/// authorized supervisor were helper-local while the corresponding trust
+/// edge was router-owned. Moving the authorization discriminant + epoch
+/// into DSL state collapses that split ownership.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum SupervisorBindingKind {
+    #[default]
+    Unbound,
+    Bound,
+}
+
+/// Typed turn-execution phase, mirrored 1:1 by the closed set of literals the
+/// DSL transitions assign to `turn_phase`. Replaces the prior stringly-typed
+/// encoding so the ephemeral driver and runtime handles consume an exhaustive
+/// enum instead of parsing folklore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum TurnPhase {
+    #[default]
+    Ready,
+    ApplyingPrimitive,
+    CallingLlm,
+    WaitingForOps,
+    DrainingBoundary,
+    Extracting,
+    ErrorRecovery,
+    Cancelling,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Typed registration substate. Closed set of literals previously assigned to
+/// `registration_phase`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum RegistrationPhase {
+    #[default]
+    Queuing,
+    Active,
+}
+
+/// Typed comms drain substate. Mirrors the closed set of literals the DSL
+/// transitions assign to `drain_phase`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum DrainPhase {
+    #[default]
+    Inactive,
+    Running,
+    Stopped,
+    ExitedRespawnable,
+}
+
+/// Typed comms drain mode. Mirrors `crate::meerkat_machine::CommsDrainMode`
+/// (which is the shell-side enum) so the DSL can hold a closed set of typed
+/// variants instead of a `Debug`-formatted string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum DrainMode {
+    #[default]
+    Timed,
+    AttachedSession,
+    PersistentHost,
+}
+
+/// Typed external-tool surface global phase. Closed set of literals previously
+/// assigned to `surface_phase`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum SurfacePhase {
+    #[default]
+    Operating,
+    Shutdown,
+}
+
+/// Typed live-topology reconfigure phase. Closed set of literals previously
+/// assigned to `live_topology_phase`. The catalog DSL holds a parallel copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveTopologyPhase {
+    #[default]
+    Idle,
+    Reconfiguring,
+    Detached,
+    HostIdentityApplied,
+    HostVisibilityApplied,
+}
+
+/// Typed input-lifecycle phase, mirroring the closed set of literals the DSL
+/// transitions assign to `input_phases`. The shell projects from this onto the
+/// richer `crate::input_state::InputLifecycleState` (which keeps an `Accepted`
+/// pre-DSL-admission variant the DSL itself never writes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum InputPhase {
+    #[default]
+    Queued,
+    Staged,
+    Applied,
+    AppliedPendingConsumption,
+    Consumed,
+    Superseded,
+    Coalesced,
+    Abandoned,
+}
+
+/// Typed input terminal kind, mirroring the closed set of literals the DSL
+/// transitions assign to `input_terminal_kind`. The companion fields
+/// (`input_superseded_by`, `input_aggregate_id`, `input_abandon_reason`,
+/// `input_abandon_attempt_count`) carry payload metadata for variants that
+/// need it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum InputTerminalKind {
+    #[default]
+    Consumed,
+    Superseded,
+    Coalesced,
+    Abandoned,
+}
+
+/// Typed pending external-surface op. Closed set of literals previously
+/// assigned to `surface_pending_op`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum SurfacePendingOp {
+    #[default]
+    None,
+    Add,
+    Reload,
+}
+
+/// Typed staged external-surface op. Closed set of literals previously
+/// assigned to `surface_staged_op`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum SurfaceStagedOp {
+    #[default]
+    None,
+    Add,
+    Remove,
+    Reload,
+}
+
+/// Typed turn primitive kind. Closed mirror of
+/// [`meerkat_core::turn_execution_authority::TurnPrimitiveKind`] — replaces the
+/// former literal-string `primitive_kind` field and `StartConversationRun`
+/// input field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum TurnPrimitiveKind {
+    #[default]
+    None,
+    ConversationTurn,
+    ImmediateAppend,
+    ImmediateContextAppend,
+}
+
+/// Typed turn terminal outcome. Closed mirror of
+/// [`meerkat_core::turn_execution_authority::TurnTerminalOutcome`] — replaces
+/// the former literal-string `terminal_outcome` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum TurnTerminalOutcome {
+    #[default]
+    None,
+    Completed,
+    Failed,
+    Cancelled,
+    BudgetExhausted,
+    TimeBudgetExceeded,
+    StructuredOutputValidationFailed,
+}
+
+/// Typed pre-run phase marker. Closed set: `idle`, `attached`, `retired`.
+/// Replaces the former literal-string `pre_run_phase` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum PreRunPhase {
+    #[default]
+    Idle,
+    Attached,
+    Retired,
+}
+
+/// Typed runtime notice classifier for the `RuntimeNotice` effect. Closed set
+/// of per-transition runtime lifecycle markers (drain exited, runtime reset,
+/// executor stopped/exited, runtime recovered) emitted by the runtime-control
+/// plane. Replaces the former literal-string `kind` field on `RuntimeNotice`
+/// so the shell dispatcher matches exhaustively on a typed discriminant
+/// instead of comparing string literals. `detail` stays `String` — it's a
+/// free-form diagnostic message that accompanies the kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum RuntimeNoticeKind {
+    #[default]
+    Drain,
+    Reset,
+    Stop,
+    Exit,
+    Recover,
+}
+
+/// Typed reason classifier for the `TurnRunCancelled` effect. Closed set of
+/// cancellation-observation origins emitted when a turn's cancellation
+/// request lands at an observable boundary. Replaces the former literal-
+/// string `reason` field on `TurnRunCancelled`. Only one origin is emitted
+/// today (`Observed`, fired by the `CancellationObserved` transition), but
+/// this remains a closed classifier not a free-form message — future
+/// cancellation origins extend the enum rather than reintroducing strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum TurnCancellationReason {
+    #[default]
+    Observed,
+}
+
+/// Typed recoverable LLM retry failure classifier. Closed mirror of
+/// [`meerkat_core::retry::LlmRetryFailureKind`] so retry authority records the
+/// retry cause as data, not as a parsed diagnostic string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LlmRetryFailureKind {
+    #[default]
+    RateLimited,
+    NetworkTimeout,
+    CallTimeout,
+    RetryableProviderError,
+}
+
+/// Typed admission-signal classifier for the `PostAdmissionSignal` effect.
+/// Closed set of post-admission wake/interrupt intents emitted by the
+/// ingress authority so the shell dispatcher matches exhaustively on a
+/// typed discriminant instead of comparing string literals. Mirrors the
+/// shell-side `driver::ephemeral::PostAdmissionSignal` strength ordering
+/// (WakeLoop < InterruptYielding < RequestImmediateProcessing); the
+/// shell enum additionally carries a `None` bottom that the DSL never
+/// emits, so only the three emitted variants appear here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum PostAdmissionSignalKind {
+    #[default]
+    WakeLoop,
+    InterruptYielding,
+    RequestImmediateProcessing,
+}
+
+/// Typed base lifecycle state for an external tool surface. Closed mirror of
+/// [`meerkat_core::tool_scope::ExternalToolSurfaceBaseState`] — replaces the
+/// former literal-string values in `surface_base_state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum ExternalToolSurfaceBaseState {
+    #[default]
+    Absent,
+    Active,
+    Removing,
+    Removed,
+}
+
+/// Typed last-delta operation for an external tool surface. Closed mirror of
+/// [`meerkat_core::tool_scope::ExternalToolSurfaceDeltaOperation`] — replaces
+/// the former literal-string values in `surface_last_delta_operation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum ExternalToolSurfaceDeltaOperation {
+    #[default]
+    None,
+    Add,
+    Remove,
+    Reload,
+}
+
+/// Typed last-delta phase for an external tool surface. Closed mirror of
+/// [`meerkat_core::tool_scope::ExternalToolSurfaceDeltaPhase`] — replaces the
+/// former literal-string values in `surface_last_delta_phase`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum ExternalToolSurfaceDeltaPhase {
+    #[default]
+    None,
+    Pending,
+    Applied,
+    Draining,
+    Failed,
+    Forced,
+}
+
+/// Typed drain-exit reason. Closed mirror of
+/// [`meerkat_core::handles::DrainExitReason`] — replaces the former
+/// literal-string `reason` field on `NotifyDrainExited`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum DrainExitReason {
+    #[default]
+    IdleTimeout,
+    Dismissed,
+    Failed,
+    Aborted,
+    SessionShutdown,
+}
+
+/// Typed work-lane origin for [`MeerkatMachineInput::Ingest`]. Closed set of
+/// the work-lane labels the DSL observes on the admission seam — replaces
+/// the former literal-string `origin` field. Structurally mirrors the
+/// `MobMachine.RequestRuntimeIngress.origin` seam so the cross-machine
+/// composition binds on a single typed enum instead of parallel
+/// string-typed slots. Transport sources ([`meerkat_core::comms::InputSource`])
+/// arriving from the shell side collapse to `External`; the
+/// runtime-control-plane `Ingest` dispatch uses the dedicated `Ingest`
+/// variant; mob-bridged ingress carries `External`/`Internal` matching
+/// `meerkat-mob::ids::WorkOrigin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum WorkOrigin {
+    #[default]
+    External,
+    Internal,
+    /// Canonical admission entrypoint fired by the runtime control plane
+    /// with no surface-level transport or work-lane label.
+    Ingest,
+}
+
+/// Typed async-operation lifecycle status. Closed mirror of
+/// [`meerkat_core::ops_lifecycle::OperationStatus`] — replaces the former
+/// literal-string values in the DSL's `op_statuses` map.
+///
+/// The DSL writes these variants directly on each ops lifecycle transition
+/// (`RegisterOp`, `StartOp`, `CompleteOp`, `FailOp`, `CancelOp`, `AbortOp`,
+/// `RetireRequestedOp`, `RetireCompletedOp`, `TerminateOp`). The shell's
+/// `ShellState::status()` reads the typed value directly and maps to the
+/// domain enum via the `From` impl below — no string compares, no string
+/// parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum OperationStatus {
+    #[default]
+    Absent,
+    Provisioning,
+    Running,
+    Retiring,
+    Completed,
+    Failed,
+    Aborted,
+    Cancelled,
+    Retired,
+    Terminated,
+}
+
+/// Typed discriminant mirror of
+/// [`meerkat_core::ops_lifecycle::OperationTerminalOutcome`] — replaces the
+/// former opaque JSON string carried in the DSL's `op_terminal_outcomes`
+/// map. Unit variants only; payload data (completion result, failure error,
+/// cancellation reason, terminated reason) rides on the companion
+/// `op_terminal_payload: Map<String, String>` field of the DSL state as
+/// JSON keyed to the same operation id, and is reconstructed in the shell
+/// by pairing the typed discriminant with the companion entry.
+///
+/// The DSL writes these variants directly on each terminal transition
+/// (`CompleteOp`, `FailOp`, `CancelOp`, `AbortOp`, `RetireCompletedOp`,
+/// `TerminateOp`); the shell reads them through the typed map and rebuilds
+/// the domain enum in `ShellState::terminal_outcome`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum OperationTerminalOutcomeKind {
+    #[default]
+    Completed,
+    Failed,
+    Aborted,
+    Cancelled,
+    Retired,
+    Terminated,
+}
+
+/// Typed input-abandonment reason. Closed mirror of the discriminant set of
+/// [`crate::input_state::InputAbandonReason`] — replaces the former
+/// `format!("{reason:?}")` Debug round-trip in the DSL's
+/// `input_abandon_reason` map.
+///
+/// The `MaxAttemptsExhausted` variant's `attempts` payload rides on the
+/// companion `input_abandon_attempt_count: Map<String, u64>` field of the
+/// DSL state; this enum only carries the discriminant. The domain
+/// `InputAbandonReason::MaxAttemptsExhausted { attempts }` is reconstructed
+/// in the driver by pairing the typed discriminant with that companion map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum InputAbandonReason {
+    #[default]
+    Retired,
+    Reset,
+    Stopped,
+    Destroyed,
+    Cancelled,
+    MaxAttemptsExhausted,
+}
+
+/// Typed work-lane assignment for admitted inputs. Replaces the former
+/// parallel `queue_lane` / `steer_lane` sets with a single map
+/// (`input_lane: Map<String, Enum<InputLane>>`) so mutual exclusion is
+/// structural — an admitted input is in exactly one lane by construction.
+///
+/// DSL-side mirror of the shell's `meerkat_core::types::HandlingMode`; the
+/// DSL owns the typed mirror so transitions can carry it without depending
+/// on the shell's domain enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum InputLane {
+    #[default]
+    Queue,
+    Steer,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum RoutingSwitchTurnPhase {
@@ -72,10 +954,175 @@ pub enum RoutingImageTerminal {
     ScopedRestoreFailed,
 }
 
-machine! {
+// Track-B (R5): declarative peer endpoint descriptor for the runtime
+// DSL. Shape mirrors `meerkat_core::comms::TrustedPeerDescriptor`.
+// The catalog DSL holds an identical type; the two are structurally
+// equivalent so the schema validator sees consistent opaque struct
+// shapes.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct PeerEndpoint {
+    pub name: PeerName,
+    pub peer_id: PeerId,
+    pub address: PeerAddress,
+    pub signing_key: PeerSigningKey,
+}
+
+impl PeerEndpoint {
+    pub fn new(
+        name: impl Into<PeerName>,
+        peer_id: impl Into<PeerId>,
+        address: impl Into<PeerAddress>,
+        signing_key: impl Into<PeerSigningKey>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            peer_id: peer_id.into(),
+            address: address.into(),
+            signing_key: signing_key.into(),
+        }
+    }
+}
+
+impl From<&meerkat_core::comms::TrustedPeerDescriptor> for PeerEndpoint {
+    fn from(spec: &meerkat_core::comms::TrustedPeerDescriptor) -> Self {
+        Self {
+            name: PeerName(spec.name.as_str().to_owned()),
+            peer_id: PeerId(spec.peer_id.to_string()),
+            address: PeerAddress(spec.address.to_string()),
+            signing_key: PeerSigningKey(spec.pubkey),
+        }
+    }
+}
+
+/// DSL-local carrier for the Ed25519 public signing key associated with a
+/// peer endpoint. The MeerkatMachine owns this projection alongside the
+/// endpoint identity atoms so trust reconciliation can install the exact
+/// key into the comms trust store without shell-side defaults.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct PeerSigningKey(pub [u8; 32]);
+
+impl From<[u8; 32]> for PeerSigningKey {
+    fn from(key: [u8; 32]) -> Self {
+        Self(key)
+    }
+}
+
+/// DSL-local newtype for a peer display name. Wraps the slug string
+/// so the schema validator sees a stable opaque shape; mirrors
+/// `meerkat_core::comms::PeerName` but avoids dragging the core
+/// comms types into the DSL grammar.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct PeerName(pub String);
+
+impl<T: Into<String>> From<T> for PeerName {
+    fn from(s: T) -> Self {
+        Self(s.into())
+    }
+}
+
+impl PeerName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// DSL-local newtype for the canonical peer routing id.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct PeerId(pub String);
+
+impl<T: Into<String>> From<T> for PeerId {
+    fn from(s: T) -> Self {
+        Self(s.into())
+    }
+}
+
+impl PeerId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// DSL-local newtype for a peer transport endpoint URL.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct PeerAddress(pub String);
+
+impl<T: Into<String>> From<T> for PeerAddress {
+    fn from(s: T) -> Self {
+        Self(s.into())
+    }
+}
+
+impl PeerAddress {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+// Ensure we keep the exact generated schema DSL body from the catalog source.
+
+#[macro_export]
+macro_rules! meerkat_catalog_machine_dsl {
+    ($rust_crate:literal, $rust_module:literal) => {
+        machine! {
     machine MeerkatMachine {
         version: 1,
-        rust: "self" / "catalog::dsl::meerkat_machine",
+        rust: $rust_crate / $rust_module,
 
         state {
             lifecycle_phase: MeerkatPhase,
@@ -83,8 +1130,28 @@ machine! {
             active_runtime_id: Option<AgentRuntimeId>,
             active_fence_token: Option<FenceToken>,
             current_run_id: Option<RunId>,
-            pre_run_phase: Option<String>,
+            pre_run_phase: Option<Enum<PreRunPhase>>,
+            turn_phase: TurnPhase,
+            primitive_kind: Option<Enum<TurnPrimitiveKind>>,
+            admitted_content_shape: Option<String>,
+            vision_enabled: bool,
+            image_tool_results_enabled: bool,
+            tool_calls_pending: u64,
+            pending_op_refs: Set<String>,
+            barrier_operation_ids: Set<String>,
+            has_barrier_ops: bool,
+            barrier_satisfied: bool,
+            boundary_count: u64,
+            cancel_after_boundary: bool,
+            terminal_outcome: Option<Enum<TurnTerminalOutcome>>,
+            extraction_attempts: u64,
+            max_extraction_retries: u64,
+            llm_retry_attempt: u64,
+            llm_retry_max_retries: u64,
+            llm_retry_selected_delay_ms: u64,
+            llm_retry_last_failure_kind: Option<Enum<LlmRetryFailureKind>>,
             silent_intent_overrides: Set<String>,
+
             // --- Model-routing / image-operation authority (Phase 1) ---
             model_routing_baseline_model: Option<String>,
             model_routing_baseline_realtime: Option<bool>,
@@ -113,116 +1180,242 @@ machine! {
             model_routing_image_denials: Map<String, Enum<RoutingDenialReason>>,
             model_routing_approval_phases: Map<String, Enum<RoutingApprovalPhase>>,
             model_routing_approval_parent_kind: Map<String, Enum<RoutingApprovalParentKind>>,
-            // Realtime-attachment authority state — per-session binding-state
-            // machine with monotonic authority epochs for provider-callback
-            // validation. See docs/architecture/realtime-259-port-plan.md.
+
+            // --- Registration substate ---
+            registration_phase: RegistrationPhase,
+
+            // --- Comms drain substate ---
+            drain_phase: DrainPhase,
+            drain_mode: Option<DrainMode>,
+
+            // --- Visibility substate ---
+            //
+            // `next_staged_visibility_revision` is the DSL-owned monotonic
+            // counter that mints staged-revision tokens (dogma round 4,
+            // wave 2b #12). `StageVisibilityFilter` / `StageDeferredNames` /
+            // `RequestDeferredTools` increment it in their `update {}` and
+            // write the new value into `staged_visibility_revision` in the
+            // same atomic transition; the shell's `MachineToolVisibilityOwner`
+            // reads the minted value back and applies it to its projection
+            // rather than minting independently.
+            next_staged_visibility_revision: u64,
+            active_filter: ToolFilter,
+            staged_filter: ToolFilter,
+            active_visibility_revision: u64,
+            staged_visibility_revision: u64,
+            active_deferred_names: Set<String>,
+            staged_deferred_names: Set<String>,
+
+            // --- Input lifecycle substate ---
+            input_phases: Map<String, InputPhase>,
+            input_terminal_kind: Map<String, InputTerminalKind>,
+            input_superseded_by: Map<String, String>,
+            input_aggregate_id: Map<String, String>,
+            input_abandon_reason: Map<String, Enum<InputAbandonReason>>,
+            input_abandon_attempt_count: Map<String, u64>,
+            input_attempt_counts: Map<String, u64>,
+            input_run_associations: Map<String, String>,
+            input_boundary_sequences: Map<String, u64>,
+            next_admission_seq: u64,
+            input_admission_seq: Map<String, u64>,
+            // Unified work-lane membership for admitted inputs. Mutual
+            // exclusion between Queue and Steer is structural: an input
+            // maps to exactly one `InputLane` value by construction.
+            // Replaces the former `queue_lane`/`steer_lane` parallel sets.
+            input_lane: Map<String, Enum<InputLane>>,
+
+            // --- Ops lifecycle substate ---
+            op_statuses: Map<String, Enum<OperationStatus>>,
+            op_completion_seq: Map<String, u64>,
+            // Terminal-outcome discriminant. Payload (result/error/reason)
+            // rides on the companion `op_terminal_payload` map as JSON.
+            op_terminal_outcomes: Map<String, Enum<OperationTerminalOutcomeKind>>,
+            op_terminal_payload: Map<String, String>,
+            op_kinds: Map<String, Enum<OperationKind>>,
+            op_peer_ready: Map<String, bool>,
+            op_progress_counts: Map<String, u64>,
+            active_op_count: u64,
+            wait_active: bool,
+            wait_request_id: Option<WaitRequestId>,
+            wait_operation_ids: Set<String>,
+            wait_operation_id_tokens: Set<OperationId>,
+            next_completion_seq: u64,
+
+            // --- External tool surface substate ---
+            known_surfaces: Set<String>,
+            active_surfaces: Set<String>,
+            visible_surfaces: Set<String>,
+            surface_base_state: Map<String, Enum<ExternalToolSurfaceBaseState>>,
+            surface_pending_op: Map<String, SurfacePendingOp>,
+            surface_staged_op: Map<String, SurfaceStagedOp>,
+            reload_staged_surfaces: Set<String>,
+            surface_staged_intent_sequence: Map<String, u64>,
+            next_staged_intent_sequence: u64,
+            surface_pending_task_sequence: Map<String, u64>,
+            next_pending_task_sequence: u64,
+            surface_pending_lineage_sequence: Map<String, u64>,
+            surface_inflight_calls: Map<String, u64>,
+            surface_last_delta_operation: Map<String, Enum<ExternalToolSurfaceDeltaOperation>>,
+            surface_last_delta_phase: Map<String, Enum<ExternalToolSurfaceDeltaPhase>>,
+            snapshot_epoch: u64,
+            snapshot_aligned_epoch: u64,
+            surface_draining_since_ms: Map<String, u64>,
+            surface_removal_timeout_at_ms: Map<String, u64>,
+            surface_removal_applied_at_turn: Map<String, u64>,
+            surface_phase: SurfacePhase,
+            removal_timeout_ms: u64,
+
+            // --- Realtime-attachment authority (per-session) ---
             realtime_intent_present: bool,
             realtime_binding_state: Enum<RealtimeBindingState>,
             realtime_binding_authority_epoch: Option<u64>,
             realtime_reattach_required: bool,
             realtime_next_authority_epoch: u64,
+
+            // --- Realtime reconnect progress (wave-c C-9c R4) ---
+            //
+            // Overlay-tracked reconnect progress the realtime-WS shell projects
+            // into the DSL via `ProjectRealtimeReconnectProgress`. RPC/MCP
+            // `realtime/status` queries against a session whose socket is
+            // actively reconnecting read these fields through
+            // `project_realtime_attachment_status` so the public
+            // `RealtimeChannelStatus` surfaces real `attempt_count` and
+            // `next_retry_at` instead of the pre-R4 `1`/`0` hard-codes.
+            //
+            // Cleared on `PublishRealtimeSignal::BindingReady` and on any
+            // transition that returns the binding to `Unbound` without a
+            // reattach requirement — the overlay only owns the reconnect
+            // cycle's lifetime, so progress fields fall to zero the instant
+            // the cycle ends.
             realtime_reconnect_attempt_count: u64,
             realtime_reconnect_next_retry_at_ms: Option<u64>,
             realtime_reconnect_deadline_at_ms: Option<u64>,
-            // Live-topology reconfigure phase — temporarily blocks realtime
-            // publishes/attaches while an LLM-identity swap is in progress.
-            live_topology_phase: Enum<LiveTopologyPhase>,
-            // MCP server connection authority. Keyed on the configured server
-            // name (McpServerId). The runtime reads this map to drive the
-            // deterministic [MCP_PENDING] system-notice toggle and to gate
-            // tool availability as servers complete their handshakes.
-            mcp_server_states: Map<McpServerId, Enum<McpServerState>>,
+
+            // --- Live-topology reconfigure phase ---
+            live_topology_phase: LiveTopologyPhase,
+
+            // --- MCP server lifecycle ---
+            //
+            // Per-server connection state keyed by configured `McpServerId`.
+            // Shell translates incoming transport events into DSL inputs;
+            // `[MCP_PENDING]` system-notice toggle and tool-availability
+            // filters read this map directly.
+            mcp_server_states: Map<McpServerId, McpServerState>,
 
             // --- Peer interaction lifecycle (W1-A / issue #264) ---
             //
-            // Outbound request lifecycle: the shell inserts on send, advances
-            // on progress/terminal arrival, and removes on terminal so
-            // projection consumers (subscriber / stream registries) drop
-            // associated channels deterministically via the
-            // `PeerInteractionCleanup` effect.
-            pending_peer_requests: Map<PeerCorrelationId, Enum<OutboundPeerRequestState>>,
-            // Inbound mirror for requests we owe a reply to.
-            inbound_peer_requests: Map<PeerCorrelationId, Enum<InboundPeerRequestState>>,
+            // Outbound request lifecycle: each send records `Sent` under its
+            // correlation id; progress and terminal response arrival rewrite
+            // the state; timeouts mark `TimedOut`. Terminal transitions emit
+            // `PeerInteractionCleanup` so the shell drops any subscriber /
+            // stream channel keyed on the same correlation id.
+            //
+            // The registries the shell used to hand-maintain
+            // (`subscriber_registry`, `interaction_stream_registry`) now
+            // project off this map: channel live iff
+            // `corr_id ∈ pending_peer_requests ∧ state ≠ terminal`.
+            pending_peer_requests: Map<PeerCorrelationId, OutboundPeerRequestState>,
+            // Inbound request lifecycle: mirror of the outbound map for
+            // responses we owe back to remote peers. Receiver-side guard
+            // prevents duplicate replies on the same correlation id.
+            inbound_peer_requests: Map<PeerCorrelationId, InboundPeerRequestState>,
 
             // --- Session-context advancement (W2-E / issue #264) ---
             //
             // Monotonic watermark in milliseconds of the last canonical
             // session-context mutation the shell reported via
             // `AdvanceSessionContext`. Advancing transitions emit
-            // `SessionContextAdvanced` so the realtime projection consumer
-            // refreshes from a typed effect instead of polling a watch
-            // channel.
+            // `SessionContextAdvanced { updated_at_ms }` which the shell's
+            // realtime projection consumer uses to drive a typed
+            // `ProjectionFreshness` state machine instead of polling a
+            // watch channel. Initialized to 0 so the first mutation always
+            // advances.
             last_session_context_updated_at_ms: u64,
 
             // --- Interaction stream lifecycle (U6 / dogma #5) ---
             //
-            // Shell-side `interaction_stream_registry` becomes a pure
-            // projection of channels keyed on these sets. Reservation TTL is
-            // shell-owned mechanics; entry into / exit from each lifecycle
-            // state is DSL truth. Lifecycle is encoded as two disjoint sets
-            // (matching the same pattern used elsewhere in this DSL for
-            // tagged-union state without map value comparison) — Reserved
-            // sits in `reserved_interaction_streams`, Attached in
-            // `attached_interaction_streams`, terminal states leave both
-            // sets and emit `InteractionStreamCleanup`.
+            // Authoritative reservation/attach/completion truth for any
+            // interaction stream — covers both peer-request streams (keyed
+            // on the same correlation id as `pending_peer_requests`) and
+            // plain input streams (keyed on a fresh correlation id). The
+            // shell-side `interaction_stream_registry` becomes a pure
+            // projection of sender/receiver channels: the `state` field,
+            // TTL bookkeeping, and CAS transitions all live here.
+            //
+            // The lifecycle is encoded as two disjoint sets — `Reserved`
+            // streams are in `reserved_interaction_streams`; `Attached`
+            // streams are in `attached_interaction_streams`. Terminal
+            // states (`Completed`, `Expired`, `ClosedEarly`) leave both
+            // sets and emit `InteractionStreamCleanup` so the shell drops
+            // the matching channel entry. The
+            // `interaction_stream_disjoint` invariant enforces that no
+            // correlation id sits in both sets simultaneously, matching
+            // the at-most-one-state-per-id semantics of a tagged-union
+            // map without depending on map value comparison in DSL guards.
             reserved_interaction_streams: Set<PeerCorrelationId>,
             attached_interaction_streams: Set<PeerCorrelationId>,
 
             // --- Realtime product-turn lifecycle (U9 / dogma #4) ---
             //
-            // Closed-phase encoding of the product-session turn lifecycle:
-            // `Idle` → `AwaitingProgress` → {`Committed`, `OutputStarted`}
-            // → `Preemptible` → `Idle`. Replaces the shell-local boolean
-            // triple (`product_turn_in_flight`, `product_turn_committed`,
-            // `product_output_started`) in the realtime-WS dispatcher.
+            // Collapses the old shell locals (`product_turn_in_flight`,
+            // `product_turn_committed`, `product_output_started`) into a
+            // canonical five-phase closed set owned by the DSL. The
+            // realtime-WS shell fires one input per lifecycle event and
+            // reads `should_preempt_on_input` off the typed handle; no
+            // shell-side bool tracking, no helper-local event matching.
             realtime_product_turn_phase: Enum<RealtimeProductTurnPhase>,
 
             // --- Realtime projection freshness (dogma round 2, U-C / dogma #1, #3, #13, #20) ---
             //
-            // Closed-set encoding of the realtime provider session's
-            // projection-freshness relative to canonical session truth.
-            // Replaces the shell-local `ProjectionFreshness` enum +
-            // observer queue in `meerkat-rpc::realtime_ws`. The shell
-            // fires `RealtimeProjectionAdvanceObserved` /
-            // `RealtimeProjectionRefreshed` / `RealtimeProjectionReset`
-            // inputs; the DSL decides the resulting freshness.
+            // Canonical freshness truth for the realtime provider session's
+            // projection relative to the canonical session state. Replaces
+            // the shell-local `ProjectionFreshness` enum + observer queue
+            // previously owned by `meerkat-rpc::realtime_ws`.
+            //
+            // `realtime_projection_freshness` carries the discriminant;
+            // `realtime_projection_frontier_ms` holds the monotonic
+            // watermark — the `baseline_ms` while `Clean`, or the pending
+            // advance's `new_at_ms` while `StaleDeferred` / `StaleImmediate`.
+            // Transitions are driven by four inputs:
+            //   * `RealtimeProjectionAdvanceObserved { advanced_at_ms }` —
+            //     fired on every `SessionContextAdvanced` observer tick;
+            //     routes to `StaleDeferred` if the product turn is live,
+            //     `StaleImmediate` otherwise.
+            //   * `RealtimeProjectionRefreshed { observed_ms }` — fired
+            //     after a successful provider-session refresh drain.
+            //   * `RealtimeProjectionReset { baseline_ms }` — fired on
+            //     product-session close / error / reconnect to re-seed the
+            //     `Clean` baseline.
+            //   * `ProductTurnTerminal` also folds in a
+            //     `StaleDeferred → StaleImmediate` promotion so the DSL
+            //     owns the turn-end-drain promotion directly.
             realtime_projection_freshness: Enum<RealtimeProjectionFreshness>,
             realtime_projection_frontier_ms: u64,
 
             // --- Realtime reconnect policy (dogma round 2, U-C / dogma #1, #3, #18, #20) ---
             //
-            // Typed classification of what a clean provider-session close
-            // means for the realtime channel's reconnect behavior. Replaces
-            // the shell-local boolean pair (`client_has_submitted_input`,
-            // `last_turn_terminally_completed`).
+            // Classifies what a clean provider-session close means for the
+            // realtime channel's reconnect behavior. Replaces the shell-
+            // local boolean pair (`client_has_submitted_input`,
+            // `last_turn_terminally_completed`) that used to co-decide
+            // `needs_reattach`. The shell reads this field directly at the
+            // clean-close branch via
+            // `RealtimeProductTurnHandle::reconnect_policy_on_clean_close`
+            // and dispatches on the typed value.
             realtime_reconnect_policy: Enum<RealtimeReconnectPolicy>,
 
             // --- Peer-ingress transport capability ownership (W2-G / issue #264) ---
             //
-            // Tracks which subsystem owns the peer-ingress transport capability
-            // for this session. `Unattached` is the initial state; session
-            // standalone paths move to `SessionOwned`; mob provisioners move to
-            // `MobOwned` (promotion from `SessionOwned` is allowed, but silent
-            // downgrade from `MobOwned` → `SessionOwned` is rejected by the
-            // `AttachSessionIngress` guard — the s71 regression class closed
-            // structurally). `peer_ingress_comms_runtime_id` and
-            // `peer_ingress_mob_id` are populated iff the kind variant names
-            // them; the `peer_ingress_owner_consistency` invariant enforces
-            // pairing.
-            //
-            // C-F3 — `peer_ingress_mob_id` has a cross-machine "mob-exists"
-            // contract: when a mob is destroyed, every session whose
-            // `peer_ingress_mob_id == Some(that_mob)` must receive a
-            // `DetachIngress` input before the mob fires its own
-            // `RequestRuntimeDestroy`. That ordering is formalised as the
-            // `mob_destroying_session_ingress` handoff obligation declared
-            // on the canonical `MobMachine::RequestSessionIngressDetachForMobDestroy`
-            // effect in the `mob_destroy_session_ingress_bundle`
-            // composition. The `xtask seam-inventory`
-            // destroy-obligation-pairing check
-            // (`## Destroy-obligation Pairing`) flags any canonical
-            // routed `Request*Destroy*` effect that lacks the paired
-            // ingress-detach ack protocol.
+            // Tracks which subsystem owns the peer-ingress transport
+            // capability for this session. `Unattached` is the initial state;
+            // session-standalone paths move to `SessionOwned`; mob
+            // provisioners move to `MobOwned` (promotion from `SessionOwned`
+            // is allowed, but silent downgrade from `MobOwned` →
+            // `SessionOwned` is rejected by the `AttachSessionIngress`
+            // guard — the s71 regression class closed structurally).
+            // `peer_ingress_comms_runtime_id` and `peer_ingress_mob_id` are
+            // populated iff the kind variant names them; the
+            // `peer_ingress_owner_consistency` invariant enforces pairing.
             peer_ingress_owner_kind: Enum<PeerIngressOwnerKind>,
             peer_ingress_comms_runtime_id: Option<CommsRuntimeId>,
             peer_ingress_mob_id: Option<MobId>,
@@ -232,38 +1425,17 @@ machine! {
             // Canonical authorization fact for the supervisor-bridge
             // command surface. Previously lived as an
             // `Option<AuthorizedSupervisorState>` on the comms drain
-            // task's stack; the companion trust edge was router-owned,
-            // so the authorization discriminant had split ownership.
-            // The DSL now owns both the kind and the canonical binding
+            // task's stack; the companion trust edge was router-owned, so
+            // the authorization discriminant had split ownership. Now the
+            // DSL owns both the kind and the full canonical binding
             // (`peer_id` + `name` + `address` + `epoch`); the trust edge
             // in the router stays in lock-step via shell-side
             // `add_trusted_peer` / `remove_trusted_peer` calls that only
-            // run after the DSL mutator accepts the matching
+            // run after the DSL mutator accepts the corresponding
             // `BindSupervisor` / `AuthorizeSupervisor` / `RevokeSupervisor`
             // transition. The `supervisor_binding_consistency` invariant
             // enforces that the companion fields are populated exactly
             // when `supervisor_binding_kind == Bound`.
-            //
-            // C-F2 formalises the step-lock as a pair of generated
-            // handoff obligations on the `supervisor_trust_bundle`
-            // composition:
-            //
-            //   * `supervisor_trust_publish` — producer effect
-            //     `PublishSupervisorTrustEdge`; realising actor
-            //     `supervisor_bridge_owner` calls
-            //     `meerkat-comms::Router::add_trusted_peer(...)` and
-            //     feeds back `SupervisorTrustEdgePublished` (success)
-            //     or `SupervisorTrustEdgePublishFailed` (failure,
-            //     triggers DSL rollback).
-            //   * `supervisor_trust_revoke` — producer effect
-            //     `RevokeSupervisorTrustEdge`; realising actor calls
-            //     `Router::remove_trusted_peer(...)` and feeds back
-            //     `SupervisorTrustEdgeRevoked` or
-            //     `SupervisorTrustEdgeRevokeFailed`.
-            //
-            // Both use `ClosurePolicy::AckRequired`. See
-            // `supervisor_trust_bundle` and `xtask seam-inventory` output
-            // (`## Declared Handoff Obligation Pairs`).
             supervisor_binding_kind: Enum<SupervisorBindingKind>,
             supervisor_bound_name: Option<String>,
             supervisor_bound_peer_id: Option<String>,
@@ -272,43 +1444,19 @@ machine! {
 
             // --- Track-B (R5): peer-projection state ---
             //
-            // The identity-level wiring graph owned by `MobMachine` is
-            // projected onto endpoint-level peer sets here. This session
-            // sees its own "local" endpoint (what it publishes as its
-            // address to the comms layer), a set of "direct" peer
-            // endpoints (non-mob peering — e.g. standalone product
-            // sessions wiring to each other), and a "mob overlay" set
-            // computed by the `RecomputeMobPeerOverlay` composition
-            // driver from `wiring_edges` + `member_session_bindings`.
+            // Identity-level wiring from MobMachine is projected onto
+            // endpoint-level peer sets here. See the schema DSL
+            // (`catalog::dsl::meerkat_machine`) for the full rationale;
+            // the `effective` trust set is derived as
+            // `direct_peer_endpoints ∪ mob_overlay_peer_endpoints` by
+            // the comms reconciliation handler (Commit 4) on receipt
+            // of `CommsTrustReconcileRequested`.
             //
-            // The effective trust set is the union `direct ∪ overlay`.
-            // It is NOT stored separately here — `effective` is a pure
-            // read-side projection (dogma #11: "derived projections
-            // never authoritative"). The comms reconciliation handler
-            // consumes `CommsTrustReconcileRequested` and reads the
-            // snapshot to compute the effective set on receipt.
-            //
-            // Two independent epoch namespaces:
-            //
-            // * `peer_projection_epoch` advances on every Track-B
-            //   peer-projection mutation (direct add/remove + overlay
-            //   apply). Carried in `PeerProjectionChanged` /
-            //   `CommsTrustReconcileRequested` so the comms
-            //   reconciliation handler can linearize trust-store
-            //   reconciles.
-            //
-            // * `mob_overlay_epoch` is the overlay-specific watermark
-            //   the `stale_overlay_epoch` guard reads. The
-            //   `RecomputeMobPeerOverlay` driver supplies the overlay
-            //   epoch; it threads the driver's monotonically
-            //   increasing per-overlay counter (the driver in turn
-            //   threads `MobMachine.topology_epoch` through that
-            //   counter). Keeping this namespace separate from
-            //   `peer_projection_epoch` prevents direct-endpoint
-            //   mutations (which legitimately bump
-            //   `peer_projection_epoch`) from accidentally racing
-            //   ahead of the overlay guard and locking out future
-            //   overlay dispatches.
+            // `peer_projection_epoch` carries general effective-set
+            // change freshness; `mob_overlay_epoch` is the overlay-
+            // specific watermark the `stale_overlay_epoch` guard uses
+            // so direct-endpoint mutations cannot lock out overlay
+            // dispatches.
             local_endpoint: Option<PeerEndpoint>,
             direct_peer_endpoints: Set<PeerEndpoint>,
             mob_overlay_peer_endpoints: Set<PeerEndpoint>,
@@ -322,6 +1470,25 @@ machine! {
             active_fence_token = None,
             current_run_id = None,
             pre_run_phase = None,
+            turn_phase = TurnPhase::Ready,
+            primitive_kind = None,
+            admitted_content_shape = None,
+            vision_enabled = false,
+            image_tool_results_enabled = false,
+            tool_calls_pending = 0,
+            pending_op_refs = EmptySet,
+            barrier_operation_ids = EmptySet,
+            has_barrier_ops = false,
+            barrier_satisfied = false,
+            boundary_count = 0,
+            cancel_after_boundary = false,
+            terminal_outcome = None,
+            extraction_attempts = 0,
+            max_extraction_retries = 0,
+            llm_retry_attempt = 0,
+            llm_retry_max_retries = 0,
+            llm_retry_selected_delay_ms = 0,
+            llm_retry_last_failure_kind = None,
             silent_intent_overrides = EmptySet,
             model_routing_baseline_model = None,
             model_routing_baseline_realtime = None,
@@ -350,6 +1517,68 @@ machine! {
             model_routing_image_denials = EmptyMap,
             model_routing_approval_phases = EmptyMap,
             model_routing_approval_parent_kind = EmptyMap,
+            // Registration substate
+            registration_phase = RegistrationPhase::Queuing,
+            // Comms drain substate
+            drain_phase = DrainPhase::Inactive,
+            drain_mode = None,
+            // Visibility substate
+            next_staged_visibility_revision = 0,
+            active_filter = ToolFilter::All,
+            staged_filter = ToolFilter::All,
+            active_visibility_revision = 0,
+            staged_visibility_revision = 0,
+            active_deferred_names = EmptySet,
+            staged_deferred_names = EmptySet,
+            // Input lifecycle substate
+            input_phases = EmptyMap,
+            input_terminal_kind = EmptyMap,
+            input_superseded_by = EmptyMap,
+            input_aggregate_id = EmptyMap,
+            input_abandon_reason = EmptyMap,
+            input_abandon_attempt_count = EmptyMap,
+            input_attempt_counts = EmptyMap,
+            input_run_associations = EmptyMap,
+            input_boundary_sequences = EmptyMap,
+            next_admission_seq = 0,
+            input_admission_seq = EmptyMap,
+            input_lane = EmptyMap,
+            // Ops lifecycle substate
+            op_statuses = EmptyMap,
+            op_completion_seq = EmptyMap,
+            op_terminal_outcomes = EmptyMap,
+            op_terminal_payload = EmptyMap,
+            op_kinds = EmptyMap,
+            op_peer_ready = EmptyMap,
+            op_progress_counts = EmptyMap,
+            active_op_count = 0,
+            wait_active = false,
+            wait_request_id = None,
+            wait_operation_ids = EmptySet,
+            wait_operation_id_tokens = EmptySet,
+            next_completion_seq = 0,
+            known_surfaces = EmptySet,
+            active_surfaces = EmptySet,
+            visible_surfaces = EmptySet,
+            surface_base_state = EmptyMap,
+            surface_pending_op = EmptyMap,
+            surface_staged_op = EmptyMap,
+            reload_staged_surfaces = EmptySet,
+            surface_staged_intent_sequence = EmptyMap,
+            next_staged_intent_sequence = 0,
+            surface_pending_task_sequence = EmptyMap,
+            next_pending_task_sequence = 0,
+            surface_pending_lineage_sequence = EmptyMap,
+            surface_inflight_calls = EmptyMap,
+            surface_last_delta_operation = EmptyMap,
+            surface_last_delta_phase = EmptyMap,
+            snapshot_epoch = 0,
+            snapshot_aligned_epoch = 0,
+            surface_draining_since_ms = EmptyMap,
+            surface_removal_timeout_at_ms = EmptyMap,
+            surface_removal_applied_at_turn = EmptyMap,
+            surface_phase = SurfacePhase::Operating,
+            removal_timeout_ms = 30000,
             realtime_intent_present = false,
             realtime_binding_state = RealtimeBindingState::Unbound,
             realtime_binding_authority_epoch = None,
@@ -377,8 +1606,7 @@ machine! {
             supervisor_bound_peer_id = None,
             supervisor_bound_address = None,
             supervisor_bound_epoch = None,
-
-            // Track-B (R5): peer-projection state — initialised empty.
+            // Track-B (R5): peer-projection state initialised empty.
             local_endpoint = None,
             direct_peer_endpoints = EmptySet,
             mob_overlay_peer_endpoints = EmptySet,
@@ -416,7 +1644,7 @@ machine! {
             },
             PrepareBindings { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: SessionId },
             SetPeerIngressContext { keep_alive: bool },
-            NotifyDrainExited { reason: String },
+            NotifyDrainExited { reason: Enum<DrainExitReason> },
             InterruptCurrentRun,
             CancelAfterBoundary,
             StagePersistentFilter { filter: ToolFilter, witnesses: Map<String, ToolVisibilityWitness> },
@@ -433,20 +1661,8 @@ machine! {
             Retire { session_id: SessionId },
             Reset,
             StopRuntimeExecutor,
+            RuntimeExecutorExited,
             Destroy { session_id: SessionId },
-            RecoverInputLifecycle {
-                input_id: InputId,
-                phase: Enum<InputPhase>,
-                terminal_kind: Option<Enum<InputTerminalKind>>,
-                superseded_by: Option<InputId>,
-                aggregate_id: Option<String>,
-                abandon_reason: Option<Enum<InputAbandonReason>>,
-                abandon_attempt_count: u64,
-                attempt_count: u64,
-                run_id: Option<RunId>,
-                boundary_sequence: Option<BoundarySequence>,
-                lane: Option<Enum<InputLane>>,
-            },
             // Absorbed inputs
             EnsureSessionWithExecutor { session_id: SessionId },
             SetSilentIntents { session_id: SessionId, intents: Set<String> },
@@ -461,7 +1677,7 @@ machine! {
             Wait { session_id: SessionId },
             Ingest { runtime_id: AgentRuntimeId, work_id: WorkId, origin: Enum<WorkOrigin> },
             PublishEvent { kind: String },
-            RuntimeState { runtime_id: AgentRuntimeId },
+            RuntimeState { runtime_id: String },
             RuntimeRealtimeAttachmentStatus { session_id: SessionId },
             ModelRoutingStatus { session_id: SessionId },
             SetModelRoutingBaseline { baseline_model: String, realtime_capable: bool },
@@ -499,13 +1715,156 @@ machine! {
             ActivateImageOperationOverride { operation_id: String, target_model: String, target_realtime_capable: bool },
             CompleteImageOperation { operation_id: String, terminal: Enum<RoutingImageTerminal>, terminal_payload: String },
             RestoreImageOperationOverride { operation_id: String },
-            LoadBoundaryReceipt { runtime_id: AgentRuntimeId, sequence: BoundarySequence },
-            AcceptWithCompletion { input_id: InputId, request_immediate_processing: bool, interrupt_yielding: bool, wake_if_idle: bool, run_id: RunId },
+            LoadBoundaryReceipt { runtime_id: String, sequence: u64 },
+            AcceptWithCompletion { input_id: InputId, request_immediate_processing: bool, interrupt_yielding: bool, wake_if_idle: bool },
             AcceptWithoutWake { input_id: InputId },
             Prepare { session_id: SessionId, run_id: RunId },
             Commit { input_id: InputId, run_id: RunId },
             Fail { run_id: RunId },
             Recycle,
+            StartConversationRun {
+                run_id: RunId,
+                primitive_kind: Enum<TurnPrimitiveKind>,
+                admitted_content_shape: String,
+                vision_enabled: bool,
+                image_tool_results_enabled: bool,
+                max_extraction_retries: u64,
+            },
+            StartImmediateAppend { run_id: RunId, admitted_content_shape: String },
+            StartImmediateContext { run_id: RunId, admitted_content_shape: String },
+            PrimitiveApplied,
+            LlmReturnedToolCalls { tool_count: u64 },
+            LlmReturnedTerminal,
+            RegisterPendingOps { op_refs: Set<String>, barrier_operation_ids: Set<String> },
+            ToolCallsResolved,
+            OpsBarrierSatisfied { operation_ids: Set<String> },
+            BoundaryContinue,
+            BoundaryComplete,
+            EnterExtraction { max_extraction_retries: u64 },
+            ExtractionStart,
+            ExtractionValidationPassed,
+            ExtractionValidationFailed { error: String },
+            RecoverableFailure {
+                failure_kind: Enum<LlmRetryFailureKind>,
+                retry_attempt: u64,
+                max_retries: u64,
+                selected_delay_ms: u64,
+                error: String,
+            },
+            FatalFailure { error: String },
+            RetryRequested { retry_attempt: u64 },
+            CancelNow,
+            RequestCancelAfterBoundary,
+            CancellationObserved,
+            AcknowledgeTerminal { outcome: Enum<TurnTerminalOutcome> },
+            TurnLimitReached,
+            BudgetExhausted,
+            TimeBudgetExceeded,
+            ForceCancelNoRun,
+            RunCompleted { run_id: RunId },
+            RunFailed { run_id: RunId, error: String },
+            RunCancelled { run_id: RunId },
+            // Input lifecycle inputs
+            RecoverInputLifecycle {
+                input_id: String,
+                phase: Enum<InputPhase>,
+                terminal_kind: Option<Enum<InputTerminalKind>>,
+                superseded_by: Option<String>,
+                aggregate_id: Option<String>,
+                abandon_reason: Option<Enum<InputAbandonReason>>,
+                abandon_attempt_count: u64,
+                attempt_count: u64,
+                run_id: Option<String>,
+                boundary_sequence: Option<u64>,
+                lane: Option<Enum<InputLane>>,
+            },
+            QueueAccepted { input_id: String },
+            SteerAccepted { input_id: String },
+            ChangeLane { input_id: String, new_lane: Enum<InputLane> },
+            StageForRun { input_id: String, run_id: String },
+            IncrementAttemptCount { input_id: String },
+            RollbackStaged { input_id: String, lane: Enum<InputLane> },
+            MarkApplied { input_id: String },
+            MarkAppliedPendingConsumption { input_id: String },
+            ConsumeInput { input_id: String },
+            ConsumeOnAccept { input_id: String },
+            SupersedeInput { input_id: String, superseded_by: String },
+            CoalesceInput { input_id: String, aggregate_id: String },
+            AbandonInput {
+                input_id: String,
+                reason: Enum<InputAbandonReason>,
+                attempt_count: u64,
+            },
+            RecordBoundarySeq { input_id: String, seq: u64 },
+            // Ops lifecycle inputs.
+            // Terminal transitions carry a typed outcome discriminant plus
+            // an opaque `payload` string — the inner payload of the domain
+            // `OperationTerminalOutcome` encoded as JSON by the shell. The
+            // DSL does not parse the payload; it only tracks the closed-set
+            // discriminant so guards can reason about it.
+            RegisterOp { operation_id: String, kind: Enum<OperationKind> },
+            StartOp { operation_id: String },
+            CompleteOp { operation_id: String, outcome: Enum<OperationTerminalOutcomeKind>, payload: String },
+            FailOp { operation_id: String, outcome: Enum<OperationTerminalOutcomeKind>, payload: String },
+            CancelOp { operation_id: String, outcome: Enum<OperationTerminalOutcomeKind>, payload: String },
+            AbortOp { operation_id: String, outcome: Enum<OperationTerminalOutcomeKind>, payload: String },
+            PeerReadyOp { operation_id: String },
+            ProgressReportedOp { operation_id: String },
+            RetireRequestedOp { operation_id: String },
+            RetireCompletedOp { operation_id: String, outcome: Enum<OperationTerminalOutcomeKind>, payload: String },
+            TerminateOp { operation_id: String, outcome: Enum<OperationTerminalOutcomeKind>, payload: String },
+            RequestWaitAll { wait_request_id: WaitRequestId, operation_ids: Set<String>, operation_id_tokens: Set<OperationId> },
+            SatisfyWaitAll,
+            CancelWaitAll,
+            // Comms drain inputs
+            SpawnDrain { mode: DrainMode },
+            StopDrain,
+            DrainExitedClean,
+            DrainExitedRespawnable,
+            // Visibility inputs
+            // Dogma round 4, wave 2b #12: `StageVisibilityFilter` no longer
+            // accepts a revision parameter — the DSL mints it via
+            // `next_staged_visibility_revision` in the transition's update.
+            StageVisibilityFilter { filter: ToolFilter },
+            CommitVisibilityFilter { filter: ToolFilter, revision: u64 },
+            StageDeferredNames { names: Set<String> },
+            CommitDeferredNames { names: Set<String> },
+            // Sync the DSL monotonic staged-revision counter to at least the
+            // max of externally-installed active/staged revisions. Fired
+            // from the shell's `replace_visibility_state` path (recovery
+            // and LLM-reconfigure hot-swap), so subsequent
+            // `StageVisibilityFilter` / `StageDeferredNames` mints advance
+            // from the already-durable high-water mark rather than 0 —
+            // preserving `max(active, staged)`-advance across external
+            // state installs.
+            SyncVisibilityRevisions { active_revision: u64, staged_revision: u64 },
+            SurfaceRegister { surface_id: String },
+            SurfaceStageAdd { surface_id: String, now_ms: u64 },
+            SurfaceStageRemove { surface_id: String, now_ms: u64 },
+            SurfaceStageReload { surface_id: String, now_ms: u64 },
+            SurfaceApplyBoundary {
+                surface_id: String,
+                now_ms: u64,
+                staged_intent_sequence: u64,
+                applied_at_turn: u64,
+            },
+            SurfaceMarkPendingSucceeded {
+                surface_id: String,
+                pending_task_sequence: u64,
+                staged_intent_sequence: u64,
+            },
+            SurfaceMarkPendingFailed {
+                surface_id: String,
+                pending_task_sequence: u64,
+                staged_intent_sequence: u64,
+                reason: String,
+            },
+            SurfaceCallStarted { surface_id: String },
+            SurfaceCallFinished { surface_id: String },
+            SurfaceFinalizeRemovalClean { surface_id: String },
+            SurfaceFinalizeRemovalForced { surface_id: String },
+            SurfaceSnapshotAligned { epoch: u64 },
+            SurfaceShutdown,
             // Realtime-attachment inputs.
             ProjectRealtimeIntent { present: bool },
             BeginRealtimeBinding,
@@ -514,62 +1873,17 @@ machine! {
             RequireRealtimeReattach,
             RequireRealtimeReattachForAuthority { authority_epoch: u64 },
             PublishRealtimeSignal { authority_epoch: u64, next_binding_state: Enum<RealtimeBindingState> },
+            // Wave-c C-9c R4: overlay-tracked reconnect progress projected
+            // into DSL state so RPC/MCP status queries read real retry state.
+            // The `*_ms` fields are millis-since-epoch so the DSL doesn't
+            // depend on `chrono::DateTime`; the shell converts at the
+            // projection boundary.
             ProjectRealtimeReconnectProgress {
                 attempt_count: u64,
                 next_retry_at_ms: Option<u64>,
                 deadline_at_ms: Option<u64>,
             },
             ClearRealtimeReconnectProgress,
-            // Ops-barrier satisfaction feedback input (wired to the
-            // `ops_barrier_satisfaction` handoff protocol on the compat
-            // `mob_bundle` composition). Carries the exact operation ids
-            // whose completion released the outstanding barrier so the
-            // turn-state authority can observe barrier closure.
-            OpsBarrierSatisfied { operation_ids: Set<OperationId> },
-            // MCP server lifecycle inputs. The shell translates MCP connection
-            // events into these inputs so the DSL owns authoritative per-server
-            // state; tool availability and the `[MCP_PENDING]` notice are then
-            // pure reads off `self.mcp_server_states`.
-            McpServerConnectPending { server_id: McpServerId },
-            McpServerConnected { server_id: McpServerId },
-            McpServerFailed { server_id: McpServerId, error: String },
-            McpServerDisconnected { server_id: McpServerId },
-            McpServerReload { server_id: McpServerId },
-            // Peer interaction lifecycle inputs (W1-A). Fire on outbound send,
-            // response arrival (progress or terminal), timeout, inbound
-            // request arrival, and inbound reply completion.
-            PeerRequestSent { corr_id: PeerCorrelationId, to: String },
-            PeerResponseProgressArrived { corr_id: PeerCorrelationId },
-            PeerResponseTerminalArrived { corr_id: PeerCorrelationId, disposition: Enum<PeerTerminalDisposition> },
-            PeerRequestTimedOut { corr_id: PeerCorrelationId },
-            PeerRequestReceived { corr_id: PeerCorrelationId },
-            PeerResponseReplied { corr_id: PeerCorrelationId },
-            // Session-context advancement input (W2-E / issue #264).
-            AdvanceSessionContext { updated_at_ms: u64 },
-            // Interaction stream lifecycle inputs (U6 / dogma #5).
-            InteractionStreamReserved { corr_id: PeerCorrelationId },
-            InteractionStreamAttached { corr_id: PeerCorrelationId },
-            InteractionStreamCompleted { corr_id: PeerCorrelationId },
-            InteractionStreamExpired { corr_id: PeerCorrelationId },
-            InteractionStreamClosedEarly { corr_id: PeerCorrelationId },
-            // Realtime product-turn lifecycle inputs (U9 / dogma #4). Fired
-            // from the realtime-WS dispatcher on every observed provider-
-            // session event; idempotent transitions are guard-rejected.
-            ProductTurnInFlight,
-            ProductTurnCommitted,
-            ProductOutputStarted,
-            ProductTurnInterrupted,
-            ProductTurnTerminal,
-            // Realtime projection freshness inputs (dogma round 2, U-C /
-            // dogma #1, #3, #13, #20).
-            RealtimeProjectionAdvanceObserved { advanced_at_ms: u64 },
-            RealtimeProjectionRefreshed { observed_ms: u64 },
-            RealtimeProjectionReset { baseline_ms: u64 },
-            // Realtime reconnect-policy inputs (dogma round 2, U-C /
-            // dogma #1, #3, #18, #20).
-            ClassifyRealtimeClientInputSubmitted,
-            ClassifyRealtimeMidTurnActivity,
-            ClassifyRealtimeTurnTerminated,
             // Live-topology reconfigure inputs.
             BeginLiveTopologyReconfigure { authority_epoch: u64 },
             MarkLiveTopologyDetached,
@@ -578,6 +1892,76 @@ machine! {
             CompleteLiveTopology,
             AbortLiveTopologyBeforeDetach,
             FailLiveTopologyAfterDetach,
+            // MCP server lifecycle inputs. Shell fires these when transport
+            // state changes; each rewrites the server's slot in
+            // `mcp_server_states` and emits `McpServerStateChanged`.
+            McpServerConnectPending { server_id: McpServerId },
+            McpServerConnected { server_id: McpServerId },
+            McpServerFailed { server_id: McpServerId, error: String },
+            McpServerDisconnected { server_id: McpServerId },
+            McpServerReload { server_id: McpServerId },
+            // Peer interaction lifecycle inputs (W1-A). Shell fires these on
+            // outbound send, response arrival (progress or terminal),
+            // timeout, inbound request arrival, and inbound reply completion.
+            PeerRequestSent { corr_id: PeerCorrelationId, to: String },
+            PeerResponseProgressArrived { corr_id: PeerCorrelationId },
+            PeerResponseTerminalArrived { corr_id: PeerCorrelationId, disposition: PeerTerminalDisposition },
+            PeerRequestTimedOut { corr_id: PeerCorrelationId },
+            PeerRequestReceived { corr_id: PeerCorrelationId },
+            PeerResponseReplied { corr_id: PeerCorrelationId },
+            // Session-context advancement input (W2-E). Shell fires this at every
+            // site that mutates canonical session truth (prompt append, external
+            // content injection, tool-result append, external assistant output,
+            // runtime-system-context append). The transition records
+            // `last_session_context_updated_at_ms` and emits
+            // `SessionContextAdvanced` so external projection consumers (realtime
+            // provider session) refresh from a typed effect instead of polling a
+            // watch channel. Monotonic: rejected when `updated_at_ms` is not
+            // strictly greater than the last advance we recorded.
+            AdvanceSessionContext { updated_at_ms: u64 },
+            // Interaction stream lifecycle inputs (U6 / dogma #5). Shell fires
+            // these on reservation, attach, terminal completion, TTL expiry,
+            // and consumer drop. See the `interaction_streams` state field
+            // commentary for invariants.
+            InteractionStreamReserved { corr_id: PeerCorrelationId },
+            InteractionStreamAttached { corr_id: PeerCorrelationId },
+            InteractionStreamCompleted { corr_id: PeerCorrelationId },
+            InteractionStreamExpired { corr_id: PeerCorrelationId },
+            InteractionStreamClosedEarly { corr_id: PeerCorrelationId },
+            // Realtime product-turn lifecycle inputs (U9 / dogma #4). The
+            // realtime-WS shell fires one of these per observed provider-
+            // session event (input accepted, TurnCommitted, output delta /
+            // tool call, interrupted, logical turn completed); idempotent
+            // transitions are guard-rejected and surfaced as `Ok(false)`
+            // by the handle.
+            ProductTurnInFlight,
+            ProductTurnCommitted,
+            ProductOutputStarted,
+            ProductTurnInterrupted,
+            ProductTurnTerminal,
+            // Realtime projection freshness inputs (dogma round 2, U-C /
+            // dogma #1, #3, #13, #20). The realtime-WS shell fires
+            // `RealtimeProjectionAdvanceObserved` on every
+            // `SessionContextAdvanced` observer tick, `RealtimeProjectionRefreshed`
+            // after a successful provider-session rebuild, and
+            // `RealtimeProjectionReset` on product-session close / error /
+            // reconnect. The DSL decides whether each advance lands as
+            // `StaleDeferred` (turn live) or `StaleImmediate` (turn idle).
+            RealtimeProjectionAdvanceObserved { advanced_at_ms: u64 },
+            RealtimeProjectionRefreshed { observed_ms: u64 },
+            RealtimeProjectionReset { baseline_ms: u64 },
+            // Realtime reconnect-policy inputs (dogma round 2, U-C / dogma
+            // #1, #3, #18, #20). `ClassifyRealtimeClientInputSubmitted` fires
+            // when the client's input chunk is accepted by the provider
+            // session, flipping the policy to `ReattachAndRecover`.
+            // `ClassifyRealtimeMidTurnActivity` fires on a provider-issued
+            // tool call inside a live turn (mid-work signal), also routing to
+            // `ReattachAndRecover`. `ClassifyRealtimeTurnTerminated` fires
+            // on a logical turn terminal, routing to `CleanExit` (the
+            // session delivered what the client asked for).
+            ClassifyRealtimeClientInputSubmitted,
+            ClassifyRealtimeMidTurnActivity,
+            ClassifyRealtimeTurnTerminated,
             // Peer-ingress transport capability ownership (W2-G).
             //
             // `AttachSessionIngress` only succeeds from `Unattached`:
@@ -591,13 +1975,13 @@ machine! {
             DetachIngress,
             // Supervisor-bridge authorization (Wave 3 D Row 21).
             //
-            // `BindSupervisor` establishes the initial binding from
-            // `Unbound`. `AuthorizeSupervisor` rotates an already-`Bound`
-            // binding — the shell enforces the "new supervisor must be
-            // authorized by the current supervisor" gate via
-            // sender-authentication on the incoming request before
-            // firing this input. `RevokeSupervisor` tears the binding
-            // down and returns to `Unbound`; the `epoch` and `peer_id`
+            // `BindSupervisor` establishes the initial binding from the
+            // `Unbound` state. `AuthorizeSupervisor` rotates an already
+            // `Bound` binding — the shell enforces the "new supervisor must
+            // be authorized by the current supervisor" gate via
+            // sender-authentication on the incoming request before firing
+            // this input. `RevokeSupervisor` tears the binding down and
+            // returns to `Unbound`; the `epoch` and `peer_id` arguments
             // must match the current binding so a stale revoke cannot
             // clear a rotated binding.
             BindSupervisor {
@@ -619,17 +2003,19 @@ machine! {
 
             // Supervisor-trust-edge feedback inputs (C-F2 / wave-d D-d).
             //
-            // The `PublishSupervisorTrustEdge` and `RevokeSupervisorTrustEdge`
-            // producer effects feed back through these four inputs. The
-            // `epoch` carries through from the producer effect so transitions
-            // can guard against stale
-            // acks — if the supervisor binding rotated forward between
-            // effect emission and ack arrival, the ack is rejected without
-            // mutating state. Guards: current binding is `Bound`; the
-            // `peer_id` and `epoch` both match `supervisor_bound_peer_id`
-            // / `supervisor_bound_epoch`. The transitions are phase-
-            // preserving self-loops: the feedback is a correlation fact,
-            // not a semantic state mutation.
+            // Feedback acks for the `supervisor_trust_publish` /
+            // `supervisor_trust_revoke` handoff protocols hosted on the
+            // canonical `MeerkatMachine` producer effects. The realising shell
+            // (`comms_drain::try_handle_supervisor_bridge_command`) calls
+            // `Router::add_trusted_peer` / `remove_trusted_peer` after the
+            // `BindSupervisor` / `AuthorizeSupervisor` / `RevokeSupervisor`
+            // DSL commit, then stages one of these four inputs carrying
+            // the `epoch` observed on the producer effect. The
+            // transitions guard on `peer_id` and `epoch` matching the
+            // current `supervisor_bound_*` binding, so a stale ack for
+            // epoch `N - 1` arriving after the binding has rotated to
+            // epoch `N` is rejected by the DSL without clearing the
+            // outstanding obligation.
             SupervisorTrustEdgePublished {
                 peer_id: String,
                 epoch: u64,
@@ -649,32 +2035,9 @@ machine! {
                 reason: String,
             },
 
-            // =====================================================================
-            // Track-B (R5): peer-projection inputs.
-            //
-            // Drive the MeerkatMachine's endpoint-level peer sets. The
-            // `RecomputeMobPeerOverlay` composition driver emits
-            // `ApplyMobPeerOverlay` to each bound session based on the
-            // identity-level wiring graph owned by MobMachine; direct
-            // peering surfaces emit `PublishLocalEndpoint` /
-            // `AddDirectPeerEndpoint` / `RemoveDirectPeerEndpoint` when
-            // they establish or tear down non-mob peering.
-            //
-            // - `PublishLocalEndpoint { endpoint }` / `ClearLocalEndpoint`:
-            //   session self-endpoint publication. `Clear` guarded on
-            //   `local_endpoint != None`.
-            // - `AddDirectPeerEndpoint { endpoint }` / `RemoveDirectPeerEndpoint { endpoint }`:
-            //   non-mob peering. Add guarded on not-already-direct;
-            //   Remove guarded on present-in-direct. Both bump
-            //   `peer_projection_epoch` and emit
-            //   `CommsTrustReconcileRequested`.
-            // - `ApplyMobPeerOverlay { epoch, endpoints }`: replaces
-            //   `mob_overlay_peer_endpoints` wholesale and sets
-            //   `peer_projection_epoch = epoch`. Guarded by
-            //   `stale_overlay_epoch` — rejects when
-            //   `epoch < self.peer_projection_epoch` so out-of-order
-            //   overlay applications cannot clobber a newer topology.
-            // =====================================================================
+            // Track-B (R5) peer-projection inputs. See catalog DSL for
+            // full rationale. Rejected in `Initializing`, `Retired`,
+            // `Stopped`, `Destroyed`.
             PublishLocalEndpoint {
                 endpoint: PeerEndpoint,
             },
@@ -689,19 +2052,6 @@ machine! {
                 epoch: u64,
                 endpoints: Set<PeerEndpoint>,
             },
-            PendingSucceeded {
-                surface_id: SurfaceId,
-                pending_task_sequence: u64,
-                staged_intent_sequence: u64,
-            },
-            PendingFailed {
-                surface_id: SurfaceId,
-                pending_task_sequence: u64,
-                reason: String,
-            },
-            SnapshotAligned {
-                snapshot_epoch: u64,
-            },
         }
 
         surface_only [
@@ -714,47 +2064,41 @@ machine! {
             RuntimeState,
             RuntimeRealtimeAttachmentStatus,
             ModelRoutingStatus,
-            LoadBoundaryReceipt,
-            Recover
+            LoadBoundaryReceipt
         ]
 
         signal MeerkatMachineSignal {
             Initialize,
             BoundaryApplied { revision: u64 },
             DrainQueuedRun { run_id: RunId },
-            StartConversationRun,
-            StartImmediateAppend,
-            StartImmediateContext,
             ClassifyExternalEnvelope,
             ClassifyPlainEvent,
             EnsureDrainRunning,
-            StageAdd,
-            StageRemove,
-            StageReload,
-            ApplySurfaceBoundary {
-                surface_id: SurfaceId,
-                operation: Enum<SurfaceDeltaOperation>,
-                pending_task_sequence: u64,
-                staged_intent_sequence: u64,
-                applied_at_turn: TurnNumber,
-            },
-            CallStarted,
-            CallFinished,
-            FinalizeRemovalClean,
-            FinalizeRemovalForced,
-            ShutdownSurface,
         }
 
         effect MeerkatMachineEffect {
             RuntimeBound { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken },
             RuntimeRetired { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken },
             RuntimeDestroyed { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken },
+            TurnRunStarted { run_id: RunId },
+            TurnBoundaryApplied { run_id: RunId, boundary_sequence: u64 },
+            TurnRunCompleted { run_id: RunId, outcome: Enum<TurnTerminalOutcome> },
+            // `error` is a free-form error message paired with a terminal
+            // outcome; it is not a closed classifier (its values include
+            // variable error strings bubbled up from extraction / LLM
+            // failures via `TurnFailed { error }`). Kept as `String`.
+            TurnRunFailed { run_id: RunId, error: String },
+            TurnRunCancelled { run_id: RunId, reason: Enum<TurnCancellationReason> },
+            TurnCheckCompaction,
             RequestCancellationAtBoundary,
             WakeInterrupt,
             CommittedVisibleSetPublished { revision: u64 },
             // `kind` is a closed classifier of runtime lifecycle markers;
             // `detail` stays `String` because it's a free-form diagnostic
-            // message paired with the kind.
+            // message paired with the kind (e.g. "runtime executor stopped",
+            // "runtime recovered"). Detail strings are not matched on by
+            // consumers — they surface through structured logging / traces
+            // as human-readable context.
             RuntimeNotice { kind: Enum<RuntimeNoticeKind>, detail: String },
             ModelRoutingStatusChanged { topology_epoch: u64 },
             SwitchTurnDenied { request_id: String, reason: Enum<RoutingDenialReason> },
@@ -782,98 +2126,106 @@ machine! {
             RecordTerminalOutcome,
             RecordRunAssociation,
             RecordBoundarySequence,
-            SubmitOpEvent,
-            NotifyOpWatcher,
-            ExposeOperationPeer,
-            RetainTerminalRecord,
-            EvictCompletedRecord,
+            SubmitOpEvent { operation_id: String },
+            NotifyOpWatcher { operation_id: String },
+            ExposeOperationPeer { operation_id: String },
+            RetainTerminalRecord { operation_id: String },
+            EvictCompletedRecord { operation_id: String },
             CompletionProduced { seq: u64, operation_id: OperationId, kind: OperationKind },
             WaitAllSatisfied { wait_request_id: WaitRequestId, operation_ids: Set<OperationId> },
             CollectCompletedResult,
             EnqueueClassifiedEntry,
             SpawnDrainTask,
+            // `surface_id` stays `String`: it's an opaque surface identity,
+            // not a closed classifier. `operation` is the same typed
+            // discriminant used on `EmitExternalToolDelta` and on the
+            // `surface_last_delta_operation` state map.
             ScheduleSurfaceCompletion {
-                surface_id: SurfaceId,
-                operation: Enum<SurfaceDeltaOperation>,
+                surface_id: String,
+                operation: Enum<ExternalToolSurfaceDeltaOperation>,
                 pending_task_sequence: u64,
                 staged_intent_sequence: u64,
-                applied_at_turn: TurnNumber,
+                applied_at_turn: u64,
             },
             RefreshVisibleSurfaceSet { snapshot_epoch: u64 },
-            EmitExternalToolDelta,
-            CloseSurfaceConnection,
-            RejectSurfaceCall,
-            // Realtime-attachment effects.
-            RealtimeIntentProjected { present: bool },
-            RealtimeBindingRotated { authority_epoch: u64 },
-            RealtimeReconnectProgressProjected {
-                attempt_count: u64,
-                next_retry_at_ms: Option<u64>,
-                deadline_at_ms: Option<u64>,
+            // `surface_id` stays `String` (opaque surface identity). Both
+            // `operation` and `phase` are closed classifiers mirrored from
+            // `meerkat-core::tool_scope`.
+            EmitExternalToolDelta {
+                surface_id: String,
+                operation: Enum<ExternalToolSurfaceDeltaOperation>,
+                phase: Enum<ExternalToolSurfaceDeltaPhase>,
             },
-            // MCP server lifecycle effects. Emitted on each per-server state
-            // transition so the shell can toggle the `[MCP_PENDING]` system
-            // notice and refresh tool availability deterministically.
-            McpServerStateChanged { server_id: McpServerId, new_state: Enum<McpServerState> },
-            McpServerReloadRequested { server_id: McpServerId },
-            // Peer interaction lifecycle effects (W1-A). Emitted on every
-            // lifecycle-advancing transition so the shell can drop channels
-            // (`subscriber_registry`, `interaction_stream_registry`) keyed on
-            // `corr_id` — the map handles become a pure projection of these
-            // effects.
-            PeerInteractionStateChanged { corr_id: PeerCorrelationId, new_state: Enum<OutboundPeerRequestState> },
-            PeerInteractionCleanup { corr_id: PeerCorrelationId },
-            InboundPeerInteractionStateChanged { corr_id: PeerCorrelationId, new_state: Enum<InboundPeerRequestState> },
-            // Session-context advancement effect (W2-E / issue #264). Emitted
-            // on every transition that advances canonical session-context
-            // truth. The realtime projection consumer installs a typed
-            // observer on the session's DSL handle to drive a typed
-            // `ProjectionFreshness` state.
-            SessionContextAdvanced { updated_at_ms: u64 },
-            // Interaction stream lifecycle effects (U6 / dogma #5).
-            InteractionStreamStateChanged { corr_id: PeerCorrelationId, new_state: Enum<InteractionStreamState> },
-            InteractionStreamCleanup { corr_id: PeerCorrelationId },
-            // Realtime product-turn phase change effect (U9 / dogma #4).
-            RealtimeProductTurnPhaseChanged { new_phase: Enum<RealtimeProductTurnPhase> },
-            // Realtime projection freshness + reconnect policy change
-            // effects (dogma round 2, U-C / dogma #1, #3, #13, #18, #20).
-            RealtimeProjectionFreshnessChanged {
-                new_freshness: Enum<RealtimeProjectionFreshness>,
-                frontier_ms: u64,
-            },
-            RealtimeReconnectPolicyChanged { new_policy: Enum<RealtimeReconnectPolicy> },
-            // Live-topology reconfigure effects.
-            LiveTopologyPhaseChanged,
-            // --- Track-B (R5): peer-projection effects ---
-            //
-            // `LocalEndpointChanged` fires on publish/clear so the comms
-            // layer can re-advertise the session's self-endpoint.
-            //
-            // `PeerProjectionChanged` is the declarative "the effective
-            // peer set was recomputed" signal. Carries the
-            // post-transition `peer_projection_epoch` so consumers can
-            // linearize observations.
-            //
-            // `CommsTrustReconcileRequested` fires whenever the
-            // effective peer set (direct ∪ overlay) could have
-            // changed. The comms runtime reconciliation handler
-            // (Commit 4) reads the snapshot on receipt, computes the
-            // effective set via `direct_peer_endpoints ∪
-            // mob_overlay_peer_endpoints`, and diffs against its
-            // own "applied trust store" view to compute add/remove
-            // deltas. The DSL emits "reconcile needed at epoch N";
-            // the shell does the mechanical trust-store diff.
-            LocalEndpointChanged { endpoint: Option<PeerEndpoint> },
-            PeerProjectionChanged { peer_projection_epoch: u64 },
-            CommsTrustReconcileRequested { peer_projection_epoch: u64 },
+            CloseSurfaceConnection { surface_id: String },
+            RejectSurfaceCall { surface_id: String, reason: String },
             PublishSupervisorTrustEdge {
-                peer_id: PeerId,
+                peer_id: String,
                 name: String,
                 address: String,
                 signing_public_key: Option<String>,
                 epoch: u64,
             },
-            RevokeSupervisorTrustEdge { peer_id: PeerId, epoch: u64 },
+            RevokeSupervisorTrustEdge { peer_id: String, epoch: u64 },
+            // Realtime-attachment effects.
+            RealtimeIntentProjected { present: bool },
+            RealtimeBindingRotated { authority_epoch: u64 },
+            // Wave-c C-9c R4: reconnect-progress projected effect. Shell
+            // consumers (e.g. observability pipelines) can subscribe;
+            // production RPC/MCP `realtime/status` responders read the
+            // state field directly via `project_realtime_attachment_status`.
+            RealtimeReconnectProgressProjected {
+                attempt_count: u64,
+                next_retry_at_ms: Option<u64>,
+                deadline_at_ms: Option<u64>,
+            },
+            // Live-topology reconfigure effects.
+            LiveTopologyPhaseChanged,
+            // MCP server lifecycle effects.
+            McpServerStateChanged { server_id: McpServerId, new_state: McpServerState },
+            McpServerReloadRequested { server_id: McpServerId },
+            // Peer interaction lifecycle effects (W1-A). Emitted on every
+            // lifecycle-advancing transition so the shell can update
+            // subscriber/stream projections; the cleanup variant is the
+            // authoritative signal to drop channels keyed on `corr_id`.
+            PeerInteractionStateChanged { corr_id: PeerCorrelationId, new_state: OutboundPeerRequestState },
+            PeerInteractionCleanup { corr_id: PeerCorrelationId },
+            InboundPeerInteractionStateChanged { corr_id: PeerCorrelationId, new_state: InboundPeerRequestState },
+            // Session-context advancement effect (W2-E / issue #264). Emitted
+            // on every transition that advances canonical session-context
+            // truth. Replaces the hand-wired `projection_refresh_rx` polling
+            // channel in the realtime projection consumer — consumers
+            // subscribe to this typed effect via an observer installed on the
+            // session's DSL handle. `updated_at_ms` is monotonic; observers
+            // use it as the freshness baseline for their typed
+            // `ProjectionFreshness` state.
+            SessionContextAdvanced { updated_at_ms: u64 },
+            // Interaction stream lifecycle effects (U6 / dogma #5). Emitted on
+            // every state-advancing transition for observers/diagnostics; the
+            // cleanup variant is the authoritative signal to drop the
+            // shell-side channel projection.
+            InteractionStreamStateChanged { corr_id: PeerCorrelationId, new_state: InteractionStreamState },
+            InteractionStreamCleanup { corr_id: PeerCorrelationId },
+            // Realtime product-turn lifecycle effect (U9 / dogma #4). Emitted
+            // on every phase-advancing transition so the realtime-WS shell
+            // can log / observe phase changes without polling the handle.
+            // The realtime-WS dispatch loop reads the typed handle directly
+            // for preempt decisions; this effect is currently informational.
+            RealtimeProductTurnPhaseChanged { new_phase: Enum<RealtimeProductTurnPhase> },
+            // Realtime projection freshness + reconnect policy change
+            // effects (dogma round 2, U-C / dogma #1, #3, #13, #18, #20).
+            // Emitted on every DSL-owned projection-state / policy advance
+            // so the shell can trace transitions. The realtime-WS dispatcher
+            // reads the typed handle directly for drain + close-branch
+            // decisions; these effects are informational.
+            RealtimeProjectionFreshnessChanged {
+                new_freshness: Enum<RealtimeProjectionFreshness>,
+                frontier_ms: u64,
+            },
+            RealtimeReconnectPolicyChanged { new_policy: Enum<RealtimeReconnectPolicy> },
+            // Track-B (R5) peer-projection effects.
+            LocalEndpointChanged { endpoint: Option<PeerEndpoint> },
+            PeerProjectionChanged { peer_projection_epoch: u64 },
+            CommsTrustReconcileRequested { peer_projection_epoch: u64 },
         }
 
         // =====================================================================
@@ -883,6 +2235,12 @@ machine! {
         disposition RuntimeBound => routed [MobMachine],
         disposition RuntimeRetired => routed [MobMachine],
         disposition RuntimeDestroyed => routed [MobMachine],
+        disposition TurnRunStarted => local,
+        disposition TurnBoundaryApplied => local,
+        disposition TurnRunCompleted => local,
+        disposition TurnRunFailed => local,
+        disposition TurnRunCancelled => local,
+        disposition TurnCheckCompaction => local,
         disposition RequestCancellationAtBoundary => local,
         disposition WakeInterrupt => local,
         disposition CommittedVisibleSetPublished => external,
@@ -919,18 +2277,21 @@ machine! {
         disposition RetainTerminalRecord => local,
         disposition EvictCompletedRecord => local,
         disposition CompletionProduced => local,
-        disposition WaitAllSatisfied => local handoff ops_barrier_satisfaction,
+        disposition WaitAllSatisfied => external handoff ops_barrier_satisfaction,
         disposition CollectCompletedResult => local,
         disposition EnqueueClassifiedEntry => local,
         disposition SpawnDrainTask => local,
-        disposition ScheduleSurfaceCompletion => local handoff surface_completion,
+        disposition ScheduleSurfaceCompletion => external handoff surface_completion,
         disposition RefreshVisibleSurfaceSet => external handoff surface_snapshot_alignment,
         disposition EmitExternalToolDelta => external,
         disposition CloseSurfaceConnection => local,
         disposition RejectSurfaceCall => external,
+        disposition PublishSupervisorTrustEdge => external handoff supervisor_trust_publish,
+        disposition RevokeSupervisorTrustEdge => external handoff supervisor_trust_revoke,
         disposition RealtimeIntentProjected => external,
         disposition RealtimeBindingRotated => external,
         disposition RealtimeReconnectProgressProjected => external,
+        disposition LiveTopologyPhaseChanged => external,
         disposition McpServerStateChanged => external,
         disposition McpServerReloadRequested => external,
         disposition PeerInteractionStateChanged => external,
@@ -942,12 +2303,9 @@ machine! {
         disposition RealtimeProductTurnPhaseChanged => external,
         disposition RealtimeProjectionFreshnessChanged => external,
         disposition RealtimeReconnectPolicyChanged => external,
-        disposition LiveTopologyPhaseChanged => external,
         disposition LocalEndpointChanged => external,
         disposition PeerProjectionChanged => external,
         disposition CommsTrustReconcileRequested => external,
-        disposition PublishSupervisorTrustEdge => external handoff supervisor_trust_publish,
-        disposition RevokeSupervisorTrustEdge => external handoff supervisor_trust_revoke,
 
         // =====================================================================
         // Invariants
@@ -967,10 +2325,22 @@ machine! {
             || self.lifecycle_phase == Phase::Retired
         }
 
-        // Realtime binding state + authority epoch must stay in lockstep.
-        // Unbound iff no epoch; any active binding phase must carry Some(epoch).
+        invariant staged_surface_ops_are_known_and_sequenced {
+            for_all(surface_id in self.surface_staged_op.keys(),
+                self.known_surfaces.contains(surface_id)
+                && self.surface_staged_intent_sequence.contains_key(surface_id))
+        }
+
+        invariant staged_reload_surfaces_are_active {
+            for_all(surface_id in self.reload_staged_surfaces,
+                self.active_surfaces.contains(surface_id))
+        }
+
+        // Realtime binding state and authority epoch must stay in lockstep.
+        // Unbound iff no epoch; any active binding state must carry Some(epoch).
         // Prevents Unbound+Some(epoch) and BindingReady+None from being
-        // representable as a derived TLC fact.
+        // representable as a TLC-enforceable fact (DSL-native substitute for
+        // a typed sum).
         invariant realtime_binding_epoch_consistency {
             (self.realtime_binding_state == RealtimeBindingState::Unbound)
             == (self.realtime_binding_authority_epoch == None)
@@ -978,10 +2348,10 @@ machine! {
 
         // Peer-ingress owner companion fields must stay in lockstep with the
         // kind variant. `Unattached` carries no companions; `SessionOwned`
-        // carries only a comms runtime id; `MobOwned` carries both. The
-        // catalog DSL encodes the tagged-union discipline across three DSL
-        // fields; silent transitions that leave the comms runtime id behind
-        // become impossible to serialize.
+        // carries only a comms runtime id; `MobOwned` carries both. The DSL
+        // encodes the tagged-union discipline across three fields so silent
+        // transitions that leave the comms runtime id behind (the s71
+        // regression class) cannot serialize.
         invariant peer_ingress_owner_consistency {
             (self.peer_ingress_owner_kind == PeerIngressOwnerKind::Unattached
                 && self.peer_ingress_comms_runtime_id == None
@@ -996,9 +2366,9 @@ machine! {
 
         // Supervisor-binding tagged-union discipline (Wave 3 D Row 21).
         // `Unbound` carries no companions; `Bound` carries all four
-        // (`name`, `peer_id`, `address`, `epoch`). A half-populated
-        // binding is structurally unrepresentable — the split-ownership
-        // regression class is closed by construction.
+        // (`name`, `peer_id`, `address`, `epoch`). A half-populated binding
+        // is structurally unrepresentable — the split-ownership regression
+        // class is closed by construction.
         invariant supervisor_binding_consistency {
             (self.supervisor_binding_kind == SupervisorBindingKind::Unbound
                 && self.supervisor_bound_name == None
@@ -1047,6 +2417,7 @@ machine! {
                 self.active_fence_token = None;
                 self.current_run_id = None;
                 self.pre_run_phase = None;
+                self.registration_phase = RegistrationPhase::Queuing;
             }
             to Idle
         }
@@ -1060,6 +2431,7 @@ machine! {
                 self.active_fence_token = None;
                 self.current_run_id = None;
                 self.pre_run_phase = None;
+                self.registration_phase = RegistrationPhase::Queuing;
             }
             to Idle
         }
@@ -1073,6 +2445,7 @@ machine! {
                 self.active_fence_token = None;
                 self.current_run_id = None;
                 self.pre_run_phase = None;
+                self.registration_phase = RegistrationPhase::Queuing;
             }
             to Idle
         }
@@ -1086,6 +2459,7 @@ machine! {
                 self.active_fence_token = None;
                 self.current_run_id = None;
                 self.pre_run_phase = None;
+                self.registration_phase = RegistrationPhase::Queuing;
             }
             to Idle
         }
@@ -1099,6 +2473,7 @@ machine! {
                 self.active_fence_token = None;
                 self.current_run_id = None;
                 self.pre_run_phase = None;
+                self.registration_phase = RegistrationPhase::Queuing;
             }
             to Idle
         }
@@ -1133,9 +2508,9 @@ machine! {
             to Running
         }
 
-        // Phase 1 model-routing authority. The runtime shell realizes
-        // mechanics from these typed effects; scoped override and lifecycle
-        // truth stays here.
+        // Phase 1 model-routing authority. These transitions own the scoped
+        // override stack and image-operation phase projection; the shell only
+        // realizes provider / persistence mechanics from the effects.
         transition SetModelRoutingBaseline {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input SetModelRoutingBaseline { baseline_model, realtime_capable }
@@ -1761,7 +3136,17 @@ machine! {
             guard "active_requested_subset_of_staged_requested" {
                 for_all(requested_name in active_requested_deferred_names, staged_requested_deferred_names.contains(requested_name))
             }
-            update {}
+            update {
+                // Sync the DSL monotonic counter to at least the published
+                // active revision — guard `active_not_behind_staged` already
+                // ensures active >= staged, so max == active here. Keeps the
+                // counter honest when external callers install a visibility
+                // state that advanced past the DSL's local history
+                // (e.g. recovery, cross-session hot-swap).
+                if active_visibility_revision > self.next_staged_visibility_revision {
+                    self.next_staged_visibility_revision = active_visibility_revision;
+                }
+            }
             to Idle
             emit CommittedVisibleSetPublished { revision: active_visibility_revision }
         }
@@ -1782,7 +3167,11 @@ machine! {
             guard "active_requested_subset_of_staged_requested" {
                 for_all(requested_name in active_requested_deferred_names, staged_requested_deferred_names.contains(requested_name))
             }
-            update {}
+            update {
+                if active_visibility_revision > self.next_staged_visibility_revision {
+                    self.next_staged_visibility_revision = active_visibility_revision;
+                }
+            }
             to Attached
             emit CommittedVisibleSetPublished { revision: active_visibility_revision }
         }
@@ -1803,7 +3192,11 @@ machine! {
             guard "active_requested_subset_of_staged_requested" {
                 for_all(requested_name in active_requested_deferred_names, staged_requested_deferred_names.contains(requested_name))
             }
-            update {}
+            update {
+                if active_visibility_revision > self.next_staged_visibility_revision {
+                    self.next_staged_visibility_revision = active_visibility_revision;
+                }
+            }
             to Running
             emit CommittedVisibleSetPublished { revision: active_visibility_revision }
         }
@@ -1824,7 +3217,11 @@ machine! {
             guard "active_requested_subset_of_staged_requested" {
                 for_all(requested_name in active_requested_deferred_names, staged_requested_deferred_names.contains(requested_name))
             }
-            update {}
+            update {
+                if active_visibility_revision > self.next_staged_visibility_revision {
+                    self.next_staged_visibility_revision = active_visibility_revision;
+                }
+            }
             to Retired
             emit CommittedVisibleSetPublished { revision: active_visibility_revision }
         }
@@ -1845,7 +3242,11 @@ machine! {
             guard "active_requested_subset_of_staged_requested" {
                 for_all(requested_name in active_requested_deferred_names, staged_requested_deferred_names.contains(requested_name))
             }
-            update {}
+            update {
+                if active_visibility_revision > self.next_staged_visibility_revision {
+                    self.next_staged_visibility_revision = active_visibility_revision;
+                }
+            }
             to Stopped
             emit CommittedVisibleSetPublished { revision: active_visibility_revision }
         }
@@ -1920,6 +3321,60 @@ machine! {
             emit RuntimeNotice { kind: RuntimeNoticeKind::Stop, detail: "runtime executor stopped" }
         }
 
+        // RuntimeExecutorExited: async finalization of the stop-runtime path.
+        // Fired by the runtime loop after apply_executor_control sees the
+        // StopRuntimeExecutor control command complete and the driver has
+        // flipped to Stopped. Moves the DSL phase from whatever it was at
+        // stop-request time to Stopped.
+        transition RuntimeExecutorExitedFromAttached {
+            on input RuntimeExecutorExited
+            guard { self.lifecycle_phase == Phase::Attached }
+            update {
+                self.current_run_id = None;
+                self.pre_run_phase = None;
+                self.silent_intent_overrides = EmptySet;
+            }
+            to Stopped
+            emit RuntimeNotice { kind: RuntimeNoticeKind::Exit, detail: "runtime executor exited" }
+        }
+        transition RuntimeExecutorExitedFromRunning {
+            on input RuntimeExecutorExited
+            guard { self.lifecycle_phase == Phase::Running }
+            update {
+                self.current_run_id = None;
+                self.pre_run_phase = None;
+                self.silent_intent_overrides = EmptySet;
+            }
+            to Stopped
+            emit RuntimeNotice { kind: RuntimeNoticeKind::Exit, detail: "runtime executor exited" }
+        }
+        transition RuntimeExecutorExitedFromIdle {
+            on input RuntimeExecutorExited
+            guard { self.lifecycle_phase == Phase::Idle }
+            update {
+                self.silent_intent_overrides = EmptySet;
+            }
+            to Stopped
+            emit RuntimeNotice { kind: RuntimeNoticeKind::Exit, detail: "runtime executor exited" }
+        }
+        transition RuntimeExecutorExitedFromRetired {
+            on input RuntimeExecutorExited
+            guard { self.lifecycle_phase == Phase::Retired }
+            update {
+                self.current_run_id = None;
+                self.pre_run_phase = None;
+                self.silent_intent_overrides = EmptySet;
+            }
+            to Stopped
+            emit RuntimeNotice { kind: RuntimeNoticeKind::Exit, detail: "runtime executor exited" }
+        }
+        transition RuntimeExecutorExitedFromStopped {
+            on input RuntimeExecutorExited
+            guard { self.lifecycle_phase == Phase::Stopped }
+            update {}
+            to Stopped
+        }
+
         // 17. Destroy: from all non-Destroyed → Destroyed
         transition Destroy {
             on input Destroy { session_id }
@@ -1931,64 +3386,82 @@ machine! {
                 || self.lifecycle_phase == Phase::Retired
                 || self.lifecycle_phase == Phase::Stopped
             }
-            guard "runtime_is_bound" { self.active_runtime_id != None }
             update {
                 self.current_run_id = None;
                 self.pre_run_phase = None;
                 self.silent_intent_overrides = EmptySet;
+                self.registration_phase = RegistrationPhase::Queuing;
             }
             to Destroyed
             emit RuntimeDestroyed { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value") }
+        }
+
+        // 18. Recover: preserve coarse phase while replaying runtime state.
+        transition RecoverInitializing {
+            on input Recover
+            guard { self.lifecycle_phase == Phase::Initializing }
+            update {}
+            to Initializing
+            emit RuntimeNotice { kind: RuntimeNoticeKind::Recover, detail: "runtime recovered" }
+        }
+        transition RecoverIdle {
+            on input Recover
+            guard { self.lifecycle_phase == Phase::Idle }
+            update {}
+            to Idle
+            emit RuntimeNotice { kind: RuntimeNoticeKind::Recover, detail: "runtime recovered" }
+        }
+        transition RecoverAttached {
+            on input Recover
+            guard { self.lifecycle_phase == Phase::Attached }
+            update {}
+            to Attached
+            emit RuntimeNotice { kind: RuntimeNoticeKind::Recover, detail: "runtime recovered" }
+        }
+        transition RecoverRetired {
+            on input Recover
+            guard { self.lifecycle_phase == Phase::Retired }
+            update {}
+            to Retired
+            emit RuntimeNotice { kind: RuntimeNoticeKind::Recover, detail: "runtime recovered" }
+        }
+        transition RecoverStopped {
+            on input Recover
+            guard { self.lifecycle_phase == Phase::Stopped }
+            update {}
+            to Stopped
+            emit RuntimeNotice { kind: RuntimeNoticeKind::Recover, detail: "runtime recovered" }
         }
 
         // =====================================================================
         // Absorbed transitions
         // =====================================================================
 
-        // 17b. RecoverInputLifecycle: recovery feeds persisted lifecycle facts
-        // through the typed machine input. The runtime implementation carries
-        // the rich input-lifecycle maps; this catalog arm keeps the canonical
-        // input alphabet covered and emits the typed lifecycle notice rather
-        // than treating recovery as a shell-local projection write.
-        transition RecoverInputLifecycle {
-            per_phase [Idle, Attached, Running, Retired, Stopped]
-            on input RecoverInputLifecycle {
-                input_id,
-                phase,
-                terminal_kind,
-                superseded_by,
-                aggregate_id,
-                abandon_reason,
-                abandon_attempt_count,
-                attempt_count,
-                run_id,
-                boundary_sequence,
-                lane
-            }
-            update {}
-            to Idle
-            emit InputLifecycleNotice
-        }
-
-        // 18. EnsureSessionWithExecutor
-        // Idle → Attached (phase change)
+        // 19. EnsureSessionWithExecutor
+        // Idle → Attached (phase change), sets registration to Active
         transition EnsureSessionWithExecutorIdle {
             on input EnsureSessionWithExecutor { session_id }
             guard { self.lifecycle_phase == Phase::Idle }
-            update {}
+            update {
+                self.registration_phase = RegistrationPhase::Active;
+            }
             to Attached
         }
-        // Attached, Running: self-loop
+        // Attached, Running: self-loop (already Active)
         transition EnsureSessionWithExecutorAttached {
             on input EnsureSessionWithExecutor { session_id }
             guard { self.lifecycle_phase == Phase::Attached }
-            update {}
+            update {
+                self.registration_phase = RegistrationPhase::Active;
+            }
             to Attached
         }
         transition EnsureSessionWithExecutorRunning {
             on input EnsureSessionWithExecutor { session_id }
             guard { self.lifecycle_phase == Phase::Running }
-            update {}
+            update {
+                self.registration_phase = RegistrationPhase::Active;
+            }
             to Running
         }
         // Retired, Stopped: self-loop
@@ -2113,15 +3586,13 @@ machine! {
         // The `wake_if_idle` flag is the machine-owned truth for "this
         // input must wake the runtime loop when it reaches idle" (e.g.
         // peer_response_terminal queued while the session is running).
-        // Idle/Attached queued arms already emit WakeLoop
-        // unconditionally — the caller is about to wake — so
-        // wake_if_idle is ignored in those guards. The Running+Queued
-        // path splits on it: passive (no signal) vs WakeIfIdle (emit
-        // WakeLoop for the next idle reach).
+        // Idle/Attached queued arms already emit WakeLoop unconditionally
+        // — the caller is about to wake — so wake_if_idle is ignored in
+        // those guards. The Running+Queued path splits on it.
         //
         // Idle + queued (immediate=false, interrupt_yielding=false)
         transition AcceptWithCompletionIdleQueued {
-            on input AcceptWithCompletion { input_id, request_immediate_processing, interrupt_yielding, wake_if_idle, run_id }
+            on input AcceptWithCompletion { input_id, request_immediate_processing, interrupt_yielding, wake_if_idle }
             guard { self.lifecycle_phase == Phase::Idle }
             guard "session_registered" { self.session_id != None }
             guard "request_immediate_processing" { request_immediate_processing == false }
@@ -2133,7 +3604,7 @@ machine! {
         }
         // Idle + immediate (immediate=true, interrupt_yielding=false)
         transition AcceptWithCompletionIdleImmediate {
-            on input AcceptWithCompletion { input_id, request_immediate_processing, interrupt_yielding, wake_if_idle, run_id }
+            on input AcceptWithCompletion { input_id, request_immediate_processing, interrupt_yielding, wake_if_idle }
             guard { self.lifecycle_phase == Phase::Idle }
             guard "session_registered" { self.session_id != None }
             guard "request_immediate_processing" { request_immediate_processing == true }
@@ -2143,25 +3614,30 @@ machine! {
             emit IngressAccepted
             emit PostAdmissionSignal { signal: PostAdmissionSignalKind::RequestImmediateProcessing }
         }
-        // Attached + immediate → Running (phase change!)
+        // Attached + immediate — admission-only self-loop.
+        //
+        // Post-#32 W6-J (dogma #1 split): admission no longer transitions to
+        // Running. The `Prepare` DSL input is the sole authority for
+        // lifecycle_phase + current_run_id run-start; the runtime loop fires
+        // it from `machine_begin_run` with the loop's fresh run_id.
+        // AcceptWithCompletion*Immediate now only signals intent (post-
+        // admission signal + SubmitRunPrimitive emit) so the loop wakes;
+        // the DSL run-start happens when the loop calls Prepare.
         transition AcceptWithCompletionAttachedImmediate {
-            on input AcceptWithCompletion { input_id, request_immediate_processing, interrupt_yielding, wake_if_idle, run_id }
+            on input AcceptWithCompletion { input_id, request_immediate_processing, interrupt_yielding, wake_if_idle }
             guard { self.lifecycle_phase == Phase::Attached }
             guard "session_registered" { self.session_id != None }
             guard "request_immediate_processing" { request_immediate_processing == true }
             guard "interrupt_yielding" { interrupt_yielding == false }
-            update {
-                self.current_run_id = Some(run_id);
-                self.pre_run_phase = Some("attached");
-            }
-            to Running
+            update {}
+            to Attached
             emit IngressAccepted
             emit PostAdmissionSignal { signal: PostAdmissionSignalKind::RequestImmediateProcessing }
             emit SubmitRunPrimitive
         }
         // Attached + queued (immediate=false, interrupt_yielding=false)
         transition AcceptWithCompletionAttachedQueued {
-            on input AcceptWithCompletion { input_id, request_immediate_processing, interrupt_yielding, wake_if_idle, run_id }
+            on input AcceptWithCompletion { input_id, request_immediate_processing, interrupt_yielding, wake_if_idle }
             guard { self.lifecycle_phase == Phase::Attached }
             guard "session_registered" { self.session_id != None }
             guard "request_immediate_processing" { request_immediate_processing == false }
@@ -2173,7 +3649,7 @@ machine! {
         }
         // Running + queued passive (immediate=false, interrupt_yielding=false, wake_if_idle=false)
         transition AcceptWithCompletionRunningQueuedPassive {
-            on input AcceptWithCompletion { input_id, request_immediate_processing, interrupt_yielding, wake_if_idle, run_id }
+            on input AcceptWithCompletion { input_id, request_immediate_processing, interrupt_yielding, wake_if_idle }
             guard { self.lifecycle_phase == Phase::Running }
             guard "session_registered" { self.session_id != None }
             guard "request_immediate_processing" { request_immediate_processing == false }
@@ -2193,7 +3669,7 @@ machine! {
         // durable context alone — the admission signal becomes the
         // authority that schedules the next turn.
         transition AcceptWithCompletionRunningQueuedWakeIfIdle {
-            on input AcceptWithCompletion { input_id, request_immediate_processing, interrupt_yielding, wake_if_idle, run_id }
+            on input AcceptWithCompletion { input_id, request_immediate_processing, interrupt_yielding, wake_if_idle }
             guard { self.lifecycle_phase == Phase::Running }
             guard "session_registered" { self.session_id != None }
             guard "request_immediate_processing" { request_immediate_processing == false }
@@ -2206,7 +3682,7 @@ machine! {
         }
         // Running + interrupt_yielding (immediate=false, interrupt_yielding=true)
         transition AcceptWithCompletionRunningInterruptYielding {
-            on input AcceptWithCompletion { input_id, request_immediate_processing, interrupt_yielding, wake_if_idle, run_id }
+            on input AcceptWithCompletion { input_id, request_immediate_processing, interrupt_yielding, wake_if_idle }
             guard { self.lifecycle_phase == Phase::Running }
             guard "session_registered" { self.session_id != None }
             guard "request_immediate_processing" { request_immediate_processing == false }
@@ -2218,7 +3694,7 @@ machine! {
         }
         // Running + immediate (immediate=true, interrupt_yielding=false)
         transition AcceptWithCompletionRunningImmediate {
-            on input AcceptWithCompletion { input_id, request_immediate_processing, interrupt_yielding, wake_if_idle, run_id }
+            on input AcceptWithCompletion { input_id, request_immediate_processing, interrupt_yielding, wake_if_idle }
             guard { self.lifecycle_phase == Phase::Running }
             guard "session_registered" { self.session_id != None }
             guard "request_immediate_processing" { request_immediate_processing == true }
@@ -2280,7 +3756,7 @@ machine! {
             guard "session_registered" { self.session_id != None }
             update {
                 self.current_run_id = Some(run_id);
-                self.pre_run_phase = Some("idle");
+                self.pre_run_phase = Some(PreRunPhase::Idle);
             }
             to Running
             emit SubmitRunPrimitive
@@ -2291,7 +3767,7 @@ machine! {
             guard "session_registered" { self.session_id != None }
             update {
                 self.current_run_id = Some(run_id);
-                self.pre_run_phase = Some("attached");
+                self.pre_run_phase = Some(PreRunPhase::Attached);
             }
             to Running
             emit SubmitRunPrimitive
@@ -2303,44 +3779,1526 @@ machine! {
             guard { self.lifecycle_phase == Phase::Retired }
             update {
                 self.current_run_id = Some(run_id);
-                self.pre_run_phase = Some("retired");
+                self.pre_run_phase = Some(PreRunPhase::Retired);
             }
             to Running
             emit SubmitRunPrimitive
         }
 
-        // 30. StartConversationRun/StartImmediateAppend/StartImmediateContext:
-        //     Attached self-loops (signals), emit SubmitRunPrimitive
+        // 30. Turn execution absorption
+        transition StartConversationRunInitializing {
+            on input StartConversationRun { run_id, primitive_kind, admitted_content_shape, vision_enabled, image_tool_results_enabled, max_extraction_retries }
+            guard { self.lifecycle_phase == Phase::Initializing }
+            guard "turn_resettable" {
+                self.turn_phase == TurnPhase::Ready
+                || self.turn_phase == TurnPhase::Completed
+                || self.turn_phase == TurnPhase::Failed
+                || self.turn_phase == TurnPhase::Cancelled
+            }
+            update {
+                self.current_run_id = Some(run_id);
+                self.pre_run_phase = Some(PreRunPhase::Attached);
+                self.turn_phase = TurnPhase::ApplyingPrimitive;
+                self.primitive_kind = Some(primitive_kind);
+                self.admitted_content_shape = Some(admitted_content_shape);
+                self.vision_enabled = vision_enabled;
+                self.image_tool_results_enabled = image_tool_results_enabled;
+                self.tool_calls_pending = 0;
+                self.pending_op_refs = EmptySet;
+                self.barrier_operation_ids = EmptySet;
+                self.has_barrier_ops = false;
+                self.barrier_satisfied = false;
+                self.boundary_count = 0;
+                self.cancel_after_boundary = false;
+                self.terminal_outcome = None;
+                self.extraction_attempts = 0;
+                self.max_extraction_retries = max_extraction_retries;
+                self.llm_retry_attempt = 0;
+                self.llm_retry_max_retries = 0;
+                self.llm_retry_selected_delay_ms = 0;
+                self.llm_retry_last_failure_kind = None;
+            }
+            to Running
+            emit TurnRunStarted { run_id: run_id }
+        }
         transition StartConversationRunAttached {
-            on signal StartConversationRun
+            on input StartConversationRun { run_id, primitive_kind, admitted_content_shape, vision_enabled, image_tool_results_enabled, max_extraction_retries }
             guard { self.lifecycle_phase == Phase::Attached }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Attached
-            emit SubmitRunPrimitive
+            guard "turn_resettable" {
+                self.turn_phase == TurnPhase::Ready
+                || self.turn_phase == TurnPhase::Completed
+                || self.turn_phase == TurnPhase::Failed
+                || self.turn_phase == TurnPhase::Cancelled
+            }
+            update {
+                self.current_run_id = Some(run_id);
+                self.pre_run_phase = Some(PreRunPhase::Attached);
+                self.turn_phase = TurnPhase::ApplyingPrimitive;
+                self.primitive_kind = Some(primitive_kind);
+                self.admitted_content_shape = Some(admitted_content_shape);
+                self.vision_enabled = vision_enabled;
+                self.image_tool_results_enabled = image_tool_results_enabled;
+                self.tool_calls_pending = 0;
+                self.pending_op_refs = EmptySet;
+                self.barrier_operation_ids = EmptySet;
+                self.has_barrier_ops = false;
+                self.barrier_satisfied = false;
+                self.boundary_count = 0;
+                self.cancel_after_boundary = false;
+                self.terminal_outcome = None;
+                self.extraction_attempts = 0;
+                self.max_extraction_retries = max_extraction_retries;
+                self.llm_retry_attempt = 0;
+                self.llm_retry_max_retries = 0;
+                self.llm_retry_selected_delay_ms = 0;
+                self.llm_retry_last_failure_kind = None;
+            }
+            to Running
+            emit TurnRunStarted { run_id: run_id }
+        }
+        transition StartConversationRunRunning {
+            on input StartConversationRun { run_id, primitive_kind, admitted_content_shape, vision_enabled, image_tool_results_enabled, max_extraction_retries }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_resettable" {
+                self.turn_phase == TurnPhase::Ready
+                || self.turn_phase == TurnPhase::Completed
+                || self.turn_phase == TurnPhase::Failed
+                || self.turn_phase == TurnPhase::Cancelled
+            }
+            update {
+                self.current_run_id = Some(run_id);
+                self.turn_phase = TurnPhase::ApplyingPrimitive;
+                self.primitive_kind = Some(primitive_kind);
+                self.admitted_content_shape = Some(admitted_content_shape);
+                self.vision_enabled = vision_enabled;
+                self.image_tool_results_enabled = image_tool_results_enabled;
+                self.tool_calls_pending = 0;
+                self.pending_op_refs = EmptySet;
+                self.barrier_operation_ids = EmptySet;
+                self.has_barrier_ops = false;
+                self.barrier_satisfied = false;
+                self.boundary_count = 0;
+                self.cancel_after_boundary = false;
+                self.terminal_outcome = None;
+                self.extraction_attempts = 0;
+                self.max_extraction_retries = max_extraction_retries;
+                self.llm_retry_attempt = 0;
+                self.llm_retry_max_retries = 0;
+                self.llm_retry_selected_delay_ms = 0;
+                self.llm_retry_last_failure_kind = None;
+            }
+            to Running
+            emit TurnRunStarted { run_id: run_id }
+        }
+
+        transition StartImmediateAppendInitializing {
+            on input StartImmediateAppend { run_id, admitted_content_shape }
+            guard { self.lifecycle_phase == Phase::Initializing }
+            guard "turn_resettable" {
+                self.turn_phase == TurnPhase::Ready
+                || self.turn_phase == TurnPhase::Completed
+                || self.turn_phase == TurnPhase::Failed
+                || self.turn_phase == TurnPhase::Cancelled
+            }
+            update {
+                self.current_run_id = Some(run_id);
+                self.pre_run_phase = Some(PreRunPhase::Attached);
+                self.turn_phase = TurnPhase::ApplyingPrimitive;
+                self.primitive_kind = Some(TurnPrimitiveKind::ImmediateAppend);
+                self.admitted_content_shape = Some(admitted_content_shape);
+                self.vision_enabled = false;
+                self.image_tool_results_enabled = false;
+                self.tool_calls_pending = 0;
+                self.pending_op_refs = EmptySet;
+                self.barrier_operation_ids = EmptySet;
+                self.has_barrier_ops = false;
+                self.barrier_satisfied = false;
+                self.boundary_count = 0;
+                self.cancel_after_boundary = false;
+                self.terminal_outcome = None;
+                self.extraction_attempts = 0;
+                self.max_extraction_retries = 0;
+                self.llm_retry_attempt = 0;
+                self.llm_retry_max_retries = 0;
+                self.llm_retry_selected_delay_ms = 0;
+                self.llm_retry_last_failure_kind = None;
+            }
+            to Running
+            emit TurnRunStarted { run_id: run_id }
         }
         transition StartImmediateAppendAttached {
-            on signal StartImmediateAppend
+            on input StartImmediateAppend { run_id, admitted_content_shape }
             guard { self.lifecycle_phase == Phase::Attached }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Attached
-            emit SubmitRunPrimitive
+            guard "turn_resettable" {
+                self.turn_phase == TurnPhase::Ready
+                || self.turn_phase == TurnPhase::Completed
+                || self.turn_phase == TurnPhase::Failed
+                || self.turn_phase == TurnPhase::Cancelled
+            }
+            update {
+                self.current_run_id = Some(run_id);
+                self.pre_run_phase = Some(PreRunPhase::Attached);
+                self.turn_phase = TurnPhase::ApplyingPrimitive;
+                self.primitive_kind = Some(TurnPrimitiveKind::ImmediateAppend);
+                self.admitted_content_shape = Some(admitted_content_shape);
+                self.vision_enabled = false;
+                self.image_tool_results_enabled = false;
+                self.tool_calls_pending = 0;
+                self.pending_op_refs = EmptySet;
+                self.barrier_operation_ids = EmptySet;
+                self.has_barrier_ops = false;
+                self.barrier_satisfied = false;
+                self.boundary_count = 0;
+                self.cancel_after_boundary = false;
+                self.terminal_outcome = None;
+                self.extraction_attempts = 0;
+                self.max_extraction_retries = 0;
+                self.llm_retry_attempt = 0;
+                self.llm_retry_max_retries = 0;
+                self.llm_retry_selected_delay_ms = 0;
+                self.llm_retry_last_failure_kind = None;
+            }
+            to Running
+            emit TurnRunStarted { run_id: run_id }
+        }
+        transition StartImmediateAppendRunning {
+            on input StartImmediateAppend { run_id, admitted_content_shape }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_resettable" {
+                self.turn_phase == TurnPhase::Ready
+                || self.turn_phase == TurnPhase::Completed
+                || self.turn_phase == TurnPhase::Failed
+                || self.turn_phase == TurnPhase::Cancelled
+            }
+            update {
+                self.current_run_id = Some(run_id);
+                self.turn_phase = TurnPhase::ApplyingPrimitive;
+                self.primitive_kind = Some(TurnPrimitiveKind::ImmediateAppend);
+                self.admitted_content_shape = Some(admitted_content_shape);
+                self.vision_enabled = false;
+                self.image_tool_results_enabled = false;
+                self.tool_calls_pending = 0;
+                self.pending_op_refs = EmptySet;
+                self.barrier_operation_ids = EmptySet;
+                self.has_barrier_ops = false;
+                self.barrier_satisfied = false;
+                self.boundary_count = 0;
+                self.cancel_after_boundary = false;
+                self.terminal_outcome = None;
+                self.extraction_attempts = 0;
+                self.max_extraction_retries = 0;
+                self.llm_retry_attempt = 0;
+                self.llm_retry_max_retries = 0;
+                self.llm_retry_selected_delay_ms = 0;
+                self.llm_retry_last_failure_kind = None;
+            }
+            to Running
+            emit TurnRunStarted { run_id: run_id }
+        }
+
+        transition StartImmediateContextInitializing {
+            on input StartImmediateContext { run_id, admitted_content_shape }
+            guard { self.lifecycle_phase == Phase::Initializing }
+            guard "turn_resettable" {
+                self.turn_phase == TurnPhase::Ready
+                || self.turn_phase == TurnPhase::Completed
+                || self.turn_phase == TurnPhase::Failed
+                || self.turn_phase == TurnPhase::Cancelled
+            }
+            update {
+                self.current_run_id = Some(run_id);
+                self.pre_run_phase = Some(PreRunPhase::Attached);
+                self.turn_phase = TurnPhase::ApplyingPrimitive;
+                self.primitive_kind = Some(TurnPrimitiveKind::ImmediateContextAppend);
+                self.admitted_content_shape = Some(admitted_content_shape);
+                self.vision_enabled = false;
+                self.image_tool_results_enabled = false;
+                self.tool_calls_pending = 0;
+                self.pending_op_refs = EmptySet;
+                self.barrier_operation_ids = EmptySet;
+                self.has_barrier_ops = false;
+                self.barrier_satisfied = false;
+                self.boundary_count = 0;
+                self.cancel_after_boundary = false;
+                self.terminal_outcome = None;
+                self.extraction_attempts = 0;
+                self.max_extraction_retries = 0;
+                self.llm_retry_attempt = 0;
+                self.llm_retry_max_retries = 0;
+                self.llm_retry_selected_delay_ms = 0;
+                self.llm_retry_last_failure_kind = None;
+            }
+            to Running
+            emit TurnRunStarted { run_id: run_id }
         }
         transition StartImmediateContextAttached {
-            on signal StartImmediateContext
+            on input StartImmediateContext { run_id, admitted_content_shape }
             guard { self.lifecycle_phase == Phase::Attached }
-            guard "session_registered" { self.session_id != None }
+            guard "turn_resettable" {
+                self.turn_phase == TurnPhase::Ready
+                || self.turn_phase == TurnPhase::Completed
+                || self.turn_phase == TurnPhase::Failed
+                || self.turn_phase == TurnPhase::Cancelled
+            }
+            update {
+                self.current_run_id = Some(run_id);
+                self.pre_run_phase = Some(PreRunPhase::Attached);
+                self.turn_phase = TurnPhase::ApplyingPrimitive;
+                self.primitive_kind = Some(TurnPrimitiveKind::ImmediateContextAppend);
+                self.admitted_content_shape = Some(admitted_content_shape);
+                self.vision_enabled = false;
+                self.image_tool_results_enabled = false;
+                self.tool_calls_pending = 0;
+                self.pending_op_refs = EmptySet;
+                self.barrier_operation_ids = EmptySet;
+                self.has_barrier_ops = false;
+                self.barrier_satisfied = false;
+                self.boundary_count = 0;
+                self.cancel_after_boundary = false;
+                self.terminal_outcome = None;
+                self.extraction_attempts = 0;
+                self.max_extraction_retries = 0;
+                self.llm_retry_attempt = 0;
+                self.llm_retry_max_retries = 0;
+                self.llm_retry_selected_delay_ms = 0;
+                self.llm_retry_last_failure_kind = None;
+            }
+            to Running
+            emit TurnRunStarted { run_id: run_id }
+        }
+        transition StartImmediateContextRunning {
+            on input StartImmediateContext { run_id, admitted_content_shape }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_resettable" {
+                self.turn_phase == TurnPhase::Ready
+                || self.turn_phase == TurnPhase::Completed
+                || self.turn_phase == TurnPhase::Failed
+                || self.turn_phase == TurnPhase::Cancelled
+            }
+            update {
+                self.current_run_id = Some(run_id);
+                self.turn_phase = TurnPhase::ApplyingPrimitive;
+                self.primitive_kind = Some(TurnPrimitiveKind::ImmediateContextAppend);
+                self.admitted_content_shape = Some(admitted_content_shape);
+                self.vision_enabled = false;
+                self.image_tool_results_enabled = false;
+                self.tool_calls_pending = 0;
+                self.pending_op_refs = EmptySet;
+                self.barrier_operation_ids = EmptySet;
+                self.has_barrier_ops = false;
+                self.barrier_satisfied = false;
+                self.boundary_count = 0;
+                self.cancel_after_boundary = false;
+                self.terminal_outcome = None;
+                self.extraction_attempts = 0;
+                self.max_extraction_retries = 0;
+                self.llm_retry_attempt = 0;
+                self.llm_retry_max_retries = 0;
+                self.llm_retry_selected_delay_ms = 0;
+                self.llm_retry_last_failure_kind = None;
+            }
+            to Running
+            emit TurnRunStarted { run_id: run_id }
+        }
+
+        transition PrimitiveAppliedConversation {
+            on input PrimitiveApplied
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_applying_conversation" {
+                self.turn_phase == TurnPhase::ApplyingPrimitive
+                && self.primitive_kind == Some(TurnPrimitiveKind::ConversationTurn)
+            }
+            update {
+                self.turn_phase = TurnPhase::CallingLlm;
+            }
+            to Running
+            emit TurnCheckCompaction
+        }
+
+        transition PrimitiveAppliedImmediate {
+            on input PrimitiveApplied
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_applying_immediate" {
+                self.turn_phase == TurnPhase::ApplyingPrimitive
+                && (self.primitive_kind == Some(TurnPrimitiveKind::ImmediateAppend)
+                    || self.primitive_kind == Some(TurnPrimitiveKind::ImmediateContextAppend))
+            }
+            update {
+                self.boundary_count = self.boundary_count + 1;
+                self.turn_phase = TurnPhase::Completed;
+                self.terminal_outcome = Some(TurnTerminalOutcome::Completed);
+            }
+            to Running
+            emit TurnBoundaryApplied { run_id: self.current_run_id.get("value"), boundary_sequence: self.boundary_count }
+            emit TurnRunCompleted { run_id: self.current_run_id.get("value"), outcome: TurnTerminalOutcome::Completed }
+            emit TurnCheckCompaction
+        }
+
+        transition LlmReturnedToolCallsPositive {
+            on input LlmReturnedToolCalls { tool_count }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_calling_llm" { self.turn_phase == TurnPhase::CallingLlm }
+            guard "tool_count_positive" { tool_count > 0 }
+            update {
+                self.turn_phase = TurnPhase::WaitingForOps;
+                self.tool_calls_pending = tool_count;
+            }
+            to Running
+        }
+
+        transition LlmReturnedToolCallsZero {
+            on input LlmReturnedToolCalls { tool_count }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_calling_llm" { self.turn_phase == TurnPhase::CallingLlm }
+            guard "tool_count_zero" { tool_count == 0 }
+            update {
+                self.turn_phase = TurnPhase::DrainingBoundary;
+                self.tool_calls_pending = 0;
+            }
+            to Running
+        }
+
+        transition LlmReturnedTerminal {
+            on input LlmReturnedTerminal
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_calling_llm" { self.turn_phase == TurnPhase::CallingLlm }
+            update {
+                self.turn_phase = TurnPhase::DrainingBoundary;
+            }
+            to Running
+        }
+
+        transition RegisterPendingOps {
+            on input RegisterPendingOps { op_refs, barrier_operation_ids }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_waiting_or_calling" { self.turn_phase == TurnPhase::CallingLlm || self.turn_phase == TurnPhase::WaitingForOps }
+            update {
+                self.turn_phase = TurnPhase::WaitingForOps;
+                self.pending_op_refs = op_refs;
+                self.barrier_operation_ids = barrier_operation_ids;
+                self.has_barrier_ops = self.barrier_operation_ids != EmptySet;
+                self.barrier_satisfied = self.barrier_operation_ids == EmptySet;
+                self.tool_calls_pending = 0;
+            }
+            to Running
+        }
+
+        transition ToolCallsResolvedToCalling {
+            on input ToolCallsResolved
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_waiting_for_ops" { self.turn_phase == TurnPhase::WaitingForOps }
+            guard "barrier_not_satisfied" { self.barrier_satisfied == false }
+            update {
+                self.turn_phase = TurnPhase::CallingLlm;
+            }
+            to Running
+        }
+
+        transition ToolCallsResolvedToBoundary {
+            on input ToolCallsResolved
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_waiting_for_ops" { self.turn_phase == TurnPhase::WaitingForOps }
+            guard "barrier_satisfied" { self.barrier_satisfied == true }
+            update {
+                self.turn_phase = TurnPhase::DrainingBoundary;
+            }
+            to Running
+        }
+
+        transition OpsBarrierSatisfied {
+            on input OpsBarrierSatisfied { operation_ids }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_waiting_for_ops" { self.turn_phase == TurnPhase::WaitingForOps }
+            guard "matching_barrier_ids" { operation_ids == self.barrier_operation_ids }
+            update {
+                self.barrier_satisfied = true;
+                self.pending_op_refs = EmptySet;
+                self.barrier_operation_ids = EmptySet;
+                self.has_barrier_ops = false;
+            }
+            to Running
+        }
+
+        transition BoundaryContinue {
+            on input BoundaryContinue
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_draining_boundary" { self.turn_phase == TurnPhase::DrainingBoundary }
+            update {
+                self.boundary_count = self.boundary_count + 1;
+                self.turn_phase = TurnPhase::CallingLlm;
+            }
+            to Running
+            emit TurnBoundaryApplied { run_id: self.current_run_id.get("value"), boundary_sequence: self.boundary_count }
+            emit TurnCheckCompaction
+        }
+
+        transition BoundaryComplete {
+            on input BoundaryComplete
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_draining_boundary" { self.turn_phase == TurnPhase::DrainingBoundary }
+            update {
+                self.boundary_count = self.boundary_count + 1;
+                self.turn_phase = TurnPhase::Completed;
+                self.terminal_outcome = Some(TurnTerminalOutcome::Completed);
+            }
+            to Running
+            emit TurnBoundaryApplied { run_id: self.current_run_id.get("value"), boundary_sequence: self.boundary_count }
+            emit TurnRunCompleted { run_id: self.current_run_id.get("value"), outcome: TurnTerminalOutcome::Completed }
+            emit TurnCheckCompaction
+        }
+
+        transition EnterExtraction {
+            on input EnterExtraction { max_extraction_retries }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_draining_boundary" { self.turn_phase == TurnPhase::DrainingBoundary }
+            update {
+                self.turn_phase = TurnPhase::Extracting;
+                self.max_extraction_retries = max_extraction_retries;
+            }
+            to Running
+        }
+
+        transition ExtractionStart {
+            on input ExtractionStart
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_extracting" { self.turn_phase == TurnPhase::Extracting }
+            update {
+                self.turn_phase = TurnPhase::CallingLlm;
+            }
+            to Running
+        }
+
+        transition ExtractionValidationPassed {
+            on input ExtractionValidationPassed
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_extracting" { self.turn_phase == TurnPhase::Extracting }
+            update {
+                self.turn_phase = TurnPhase::Completed;
+                self.terminal_outcome = Some(TurnTerminalOutcome::Completed);
+            }
+            to Running
+            emit TurnRunCompleted { run_id: self.current_run_id.get("value"), outcome: TurnTerminalOutcome::Completed }
+            emit TurnCheckCompaction
+        }
+
+        transition ExtractionValidationFailedRetry {
+            on input ExtractionValidationFailed { error }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_extracting" { self.turn_phase == TurnPhase::Extracting }
+            guard "retries_remaining" { self.extraction_attempts < self.max_extraction_retries }
+            update {
+                self.extraction_attempts = self.extraction_attempts + 1;
+                self.turn_phase = TurnPhase::CallingLlm;
+            }
+            to Running
+            emit TurnCheckCompaction
+        }
+
+        transition ExtractionValidationFailedExhausted {
+            on input ExtractionValidationFailed { error }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_extracting" { self.turn_phase == TurnPhase::Extracting }
+            guard "retries_exhausted" { self.extraction_attempts >= self.max_extraction_retries }
+            update {
+                self.extraction_attempts = self.extraction_attempts + 1;
+                self.turn_phase = TurnPhase::Failed;
+                self.terminal_outcome = Some(TurnTerminalOutcome::Failed);
+            }
+            to Running
+            emit TurnRunFailed { run_id: self.current_run_id.get("value"), error: "ExtractionExhausted" }
+        }
+
+        transition RecoverableFailure {
+            on input RecoverableFailure {
+                failure_kind,
+                retry_attempt,
+                max_retries,
+                selected_delay_ms,
+                error
+            }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_non_terminal" {
+                self.turn_phase == TurnPhase::CallingLlm
+                || self.turn_phase == TurnPhase::WaitingForOps
+                || self.turn_phase == TurnPhase::DrainingBoundary
+                || self.turn_phase == TurnPhase::Extracting
+            }
+            guard "retry_attempt_present" { retry_attempt > 0 }
+            update {
+                self.turn_phase = TurnPhase::ErrorRecovery;
+                self.llm_retry_attempt = retry_attempt;
+                self.llm_retry_max_retries = max_retries;
+                self.llm_retry_selected_delay_ms = selected_delay_ms;
+                self.llm_retry_last_failure_kind = Some(failure_kind);
+            }
+            to Running
+        }
+
+        transition FatalFailure {
+            on input FatalFailure { error }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_not_terminal" { self.turn_phase != TurnPhase::Completed && self.turn_phase != TurnPhase::Failed && self.turn_phase != TurnPhase::Cancelled }
+            update {
+                self.turn_phase = TurnPhase::Failed;
+                self.terminal_outcome = Some(TurnTerminalOutcome::Failed);
+            }
+            to Running
+            emit TurnRunFailed { run_id: self.current_run_id.get("value"), error: error }
+        }
+
+        transition RetryRequested {
+            on input RetryRequested { retry_attempt }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_error_recovery" { self.turn_phase == TurnPhase::ErrorRecovery }
+            guard "retry_attempt_matches" { retry_attempt == self.llm_retry_attempt }
+            update {
+                self.turn_phase = TurnPhase::CallingLlm;
+            }
+            to Running
+            emit TurnCheckCompaction
+        }
+
+        transition CancelNow {
+            on input CancelNow
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_cancellable" {
+                self.turn_phase != TurnPhase::Ready
+                && self.turn_phase != TurnPhase::Completed
+                && self.turn_phase != TurnPhase::Failed
+                && self.turn_phase != TurnPhase::Cancelled
+            }
+            update {
+                self.turn_phase = TurnPhase::Cancelling;
+            }
+            to Running
+        }
+
+        transition RequestCancelAfterBoundary {
+            on input RequestCancelAfterBoundary
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_cancellable" {
+                self.turn_phase != TurnPhase::Ready
+                && self.turn_phase != TurnPhase::Completed
+                && self.turn_phase != TurnPhase::Failed
+                && self.turn_phase != TurnPhase::Cancelled
+            }
+            update {
+                self.cancel_after_boundary = true;
+            }
+            to Running
+        }
+
+        transition CancellationObserved {
+            on input CancellationObserved
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_cancelling" { self.turn_phase == TurnPhase::Cancelling }
+            update {
+                self.turn_phase = TurnPhase::Cancelled;
+                self.terminal_outcome = Some(TurnTerminalOutcome::Cancelled);
+            }
+            to Running
+            emit TurnRunCancelled { run_id: self.current_run_id.get("value"), reason: TurnCancellationReason::Observed }
+        }
+
+        transition AcknowledgeTerminal {
+            on input AcknowledgeTerminal { outcome }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_terminal" {
+                self.turn_phase == TurnPhase::Completed
+                || self.turn_phase == TurnPhase::Failed
+                || self.turn_phase == TurnPhase::Cancelled
+            }
+            update {
+                self.turn_phase = TurnPhase::Ready;
+                self.primitive_kind = None;
+                self.admitted_content_shape = None;
+                self.vision_enabled = false;
+                self.image_tool_results_enabled = false;
+                self.tool_calls_pending = 0;
+                self.pending_op_refs = EmptySet;
+                self.barrier_operation_ids = EmptySet;
+                self.has_barrier_ops = false;
+                self.barrier_satisfied = false;
+                self.boundary_count = 0;
+                self.cancel_after_boundary = false;
+                self.terminal_outcome = Some(outcome);
+                self.extraction_attempts = 0;
+                self.max_extraction_retries = 0;
+                self.llm_retry_attempt = 0;
+                self.llm_retry_max_retries = 0;
+                self.llm_retry_selected_delay_ms = 0;
+                self.llm_retry_last_failure_kind = None;
+            }
+            to Running
+        }
+
+        transition TurnLimitReached {
+            on input TurnLimitReached
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_not_terminal" { self.turn_phase != TurnPhase::Completed && self.turn_phase != TurnPhase::Failed && self.turn_phase != TurnPhase::Cancelled }
+            update {
+                self.turn_phase = TurnPhase::Failed;
+                self.terminal_outcome = Some(TurnTerminalOutcome::Failed);
+            }
+            to Running
+            emit TurnRunFailed { run_id: self.current_run_id.get("value"), error: "TurnLimitReached" }
+        }
+
+        transition BudgetExhausted {
+            on input BudgetExhausted
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_not_terminal" { self.turn_phase != TurnPhase::Completed && self.turn_phase != TurnPhase::Failed && self.turn_phase != TurnPhase::Cancelled }
+            update {
+                self.turn_phase = TurnPhase::Failed;
+                self.terminal_outcome = Some(TurnTerminalOutcome::BudgetExhausted);
+            }
+            to Running
+            emit TurnRunFailed { run_id: self.current_run_id.get("value"), error: "BudgetExhausted" }
+        }
+
+        transition TimeBudgetExceeded {
+            on input TimeBudgetExceeded
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "turn_not_terminal" { self.turn_phase != TurnPhase::Completed && self.turn_phase != TurnPhase::Failed && self.turn_phase != TurnPhase::Cancelled }
+            update {
+                self.turn_phase = TurnPhase::Failed;
+                self.terminal_outcome = Some(TurnTerminalOutcome::TimeBudgetExceeded);
+            }
+            to Running
+            emit TurnRunFailed { run_id: self.current_run_id.get("value"), error: "TimeBudgetExceeded" }
+        }
+
+        transition ForceCancelNoRun {
+            on input ForceCancelNoRun
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "no_run_bound" { self.current_run_id == None }
+            guard "turn_ready" { self.turn_phase == TurnPhase::Ready }
+            update {
+                self.turn_phase = TurnPhase::Cancelled;
+                self.terminal_outcome = Some(TurnTerminalOutcome::Cancelled);
+            }
+            to Running
+        }
+
+        transition RunCompleted {
+            on input RunCompleted { run_id }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "run_matches_binding" { self.current_run_id == Some(run_id) }
+            update {
+                self.turn_phase = TurnPhase::Completed;
+                self.terminal_outcome = Some(TurnTerminalOutcome::Completed);
+            }
+            to Running
+        }
+
+        transition RunFailed {
+            on input RunFailed { run_id, error }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "run_matches_binding" { self.current_run_id == Some(run_id) }
+            update {
+                self.turn_phase = TurnPhase::Failed;
+                self.terminal_outcome = Some(TurnTerminalOutcome::Failed);
+            }
+            to Running
+        }
+
+        transition RunCancelled {
+            on input RunCancelled { run_id }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "run_matches_binding" { self.current_run_id == Some(run_id) }
+            update {
+                self.turn_phase = TurnPhase::Cancelled;
+                self.terminal_outcome = Some(TurnTerminalOutcome::Cancelled);
+            }
+            to Running
+        }
+
+        transition SurfaceRegisterAttached {
+            on input SurfaceRegister { surface_id }
+            guard { self.lifecycle_phase == Phase::Attached }
+            update {
+                self.known_surfaces.insert(surface_id);
+            }
+            to Attached
+        }
+        transition SurfaceRegisterRunning {
+            on input SurfaceRegister { surface_id }
+            guard { self.lifecycle_phase == Phase::Running }
+            update {
+                self.known_surfaces.insert(surface_id);
+            }
+            to Running
+        }
+
+        transition SurfaceStageAddAttached {
+            on input SurfaceStageAdd { surface_id, now_ms }
+            guard { self.lifecycle_phase == Phase::Attached }
+            guard "surface_operating" { self.surface_phase == SurfacePhase::Operating }
+            update {
+                self.known_surfaces.insert(surface_id);
+                self.surface_staged_op.insert(surface_id, SurfaceStagedOp::Add);
+                self.reload_staged_surfaces.remove(surface_id);
+                self.next_staged_intent_sequence = self.next_staged_intent_sequence + 1;
+                self.surface_staged_intent_sequence.insert(surface_id, self.next_staged_intent_sequence);
+            }
+            to Attached
+        }
+        transition SurfaceStageAddRunning {
+            on input SurfaceStageAdd { surface_id, now_ms }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "surface_operating" { self.surface_phase == SurfacePhase::Operating }
+            update {
+                self.known_surfaces.insert(surface_id);
+                self.surface_staged_op.insert(surface_id, SurfaceStagedOp::Add);
+                self.reload_staged_surfaces.remove(surface_id);
+                self.next_staged_intent_sequence = self.next_staged_intent_sequence + 1;
+                self.surface_staged_intent_sequence.insert(surface_id, self.next_staged_intent_sequence);
+            }
+            to Running
+        }
+
+        transition SurfaceStageRemoveAttached {
+            on input SurfaceStageRemove { surface_id, now_ms }
+            guard { self.lifecycle_phase == Phase::Attached }
+            guard "surface_operating" { self.surface_phase == SurfacePhase::Operating }
+            update {
+                self.known_surfaces.insert(surface_id);
+                self.surface_staged_op.insert(surface_id, SurfaceStagedOp::Remove);
+                self.reload_staged_surfaces.remove(surface_id);
+                self.next_staged_intent_sequence = self.next_staged_intent_sequence + 1;
+                self.surface_staged_intent_sequence.insert(surface_id, self.next_staged_intent_sequence);
+            }
+            to Attached
+        }
+        transition SurfaceStageRemoveRunning {
+            on input SurfaceStageRemove { surface_id, now_ms }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "surface_operating" { self.surface_phase == SurfacePhase::Operating }
+            update {
+                self.known_surfaces.insert(surface_id);
+                self.surface_staged_op.insert(surface_id, SurfaceStagedOp::Remove);
+                self.reload_staged_surfaces.remove(surface_id);
+                self.next_staged_intent_sequence = self.next_staged_intent_sequence + 1;
+                self.surface_staged_intent_sequence.insert(surface_id, self.next_staged_intent_sequence);
+            }
+            to Running
+        }
+
+        transition SurfaceStageReloadAttached {
+            on input SurfaceStageReload { surface_id, now_ms }
+            guard { self.lifecycle_phase == Phase::Attached }
+            guard "surface_operating" { self.surface_phase == SurfacePhase::Operating }
+            guard "surface_active" { self.active_surfaces.contains(surface_id) }
+            update {
+                self.known_surfaces.insert(surface_id);
+                self.surface_staged_op.insert(surface_id, SurfaceStagedOp::Reload);
+                self.reload_staged_surfaces.insert(surface_id);
+                self.next_staged_intent_sequence = self.next_staged_intent_sequence + 1;
+                self.surface_staged_intent_sequence.insert(surface_id, self.next_staged_intent_sequence);
+            }
+            to Attached
+        }
+        transition SurfaceStageReloadRunning {
+            on input SurfaceStageReload { surface_id, now_ms }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "surface_operating" { self.surface_phase == SurfacePhase::Operating }
+            guard "surface_active" { self.active_surfaces.contains(surface_id) }
+            update {
+                self.known_surfaces.insert(surface_id);
+                self.surface_staged_op.insert(surface_id, SurfaceStagedOp::Reload);
+                self.reload_staged_surfaces.insert(surface_id);
+                self.next_staged_intent_sequence = self.next_staged_intent_sequence + 1;
+                self.surface_staged_intent_sequence.insert(surface_id, self.next_staged_intent_sequence);
+            }
+            to Running
+        }
+
+        transition SurfaceApplyBoundaryAddAttached {
+            on input SurfaceApplyBoundary { surface_id, now_ms, staged_intent_sequence, applied_at_turn }
+            guard { self.lifecycle_phase == Phase::Attached }
+            guard "surface_operating" { self.surface_phase == SurfacePhase::Operating }
+            guard "staged_add" { self.surface_staged_op.contains_key(surface_id) && self.surface_staged_op.get(surface_id).get("value") == SurfaceStagedOp::Add }
+            guard "staged_sequence_matches" { self.surface_staged_intent_sequence.contains_key(surface_id) && self.surface_staged_intent_sequence.get(surface_id).get("value") == staged_intent_sequence }
+            guard "no_pending_surface_op" {
+                !self.surface_pending_op.contains_key(surface_id)
+                || self.surface_pending_op.get(surface_id).get("value") == SurfacePendingOp::None
+            }
+            guard "base_accepts_add" {
+                !self.surface_base_state.contains_key(surface_id)
+                || self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Absent
+                || self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Active
+                || self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Removed
+            }
+            update {
+                self.known_surfaces.insert(surface_id);
+                self.next_pending_task_sequence = self.next_pending_task_sequence + 1;
+                self.surface_pending_op.insert(surface_id, SurfacePendingOp::Add);
+                self.surface_pending_task_sequence.insert(surface_id, self.next_pending_task_sequence);
+                self.surface_pending_lineage_sequence.insert(surface_id, staged_intent_sequence);
+                self.surface_staged_op.remove(surface_id);
+                self.surface_staged_intent_sequence.remove(surface_id);
+                self.reload_staged_surfaces.remove(surface_id);
+                self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Add);
+                self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Pending);
+                self.snapshot_epoch = self.snapshot_epoch + 1;
+            }
+            to Attached
+            emit ScheduleSurfaceCompletion {
+                surface_id: surface_id,
+                operation: ExternalToolSurfaceDeltaOperation::Add,
+                pending_task_sequence: self.next_pending_task_sequence,
+                staged_intent_sequence: staged_intent_sequence,
+                applied_at_turn: applied_at_turn,
+            }
+            emit EmitExternalToolDelta {
+                surface_id: surface_id,
+                operation: ExternalToolSurfaceDeltaOperation::Add,
+                phase: ExternalToolSurfaceDeltaPhase::Pending,
+            }
+        }
+        transition SurfaceApplyBoundaryAddRunning {
+            on input SurfaceApplyBoundary { surface_id, now_ms, staged_intent_sequence, applied_at_turn }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "surface_operating" { self.surface_phase == SurfacePhase::Operating }
+            guard "staged_add" { self.surface_staged_op.contains_key(surface_id) && self.surface_staged_op.get(surface_id).get("value") == SurfaceStagedOp::Add }
+            guard "staged_sequence_matches" { self.surface_staged_intent_sequence.contains_key(surface_id) && self.surface_staged_intent_sequence.get(surface_id).get("value") == staged_intent_sequence }
+            guard "no_pending_surface_op" {
+                !self.surface_pending_op.contains_key(surface_id)
+                || self.surface_pending_op.get(surface_id).get("value") == SurfacePendingOp::None
+            }
+            guard "base_accepts_add" {
+                !self.surface_base_state.contains_key(surface_id)
+                || self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Absent
+                || self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Active
+                || self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Removed
+            }
+            update {
+                self.known_surfaces.insert(surface_id);
+                self.next_pending_task_sequence = self.next_pending_task_sequence + 1;
+                self.surface_pending_op.insert(surface_id, SurfacePendingOp::Add);
+                self.surface_pending_task_sequence.insert(surface_id, self.next_pending_task_sequence);
+                self.surface_pending_lineage_sequence.insert(surface_id, staged_intent_sequence);
+                self.surface_staged_op.remove(surface_id);
+                self.surface_staged_intent_sequence.remove(surface_id);
+                self.reload_staged_surfaces.remove(surface_id);
+                self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Add);
+                self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Pending);
+                self.snapshot_epoch = self.snapshot_epoch + 1;
+            }
+            to Running
+            emit ScheduleSurfaceCompletion {
+                surface_id: surface_id,
+                operation: ExternalToolSurfaceDeltaOperation::Add,
+                pending_task_sequence: self.next_pending_task_sequence,
+                staged_intent_sequence: staged_intent_sequence,
+                applied_at_turn: applied_at_turn,
+            }
+            emit EmitExternalToolDelta {
+                surface_id: surface_id,
+                operation: ExternalToolSurfaceDeltaOperation::Add,
+                phase: ExternalToolSurfaceDeltaPhase::Pending,
+            }
+        }
+        transition SurfaceApplyBoundaryReloadAttached {
+            on input SurfaceApplyBoundary { surface_id, now_ms, staged_intent_sequence, applied_at_turn }
+            guard { self.lifecycle_phase == Phase::Attached }
+            guard "surface_operating" { self.surface_phase == SurfacePhase::Operating }
+            guard "staged_reload" { self.surface_staged_op.contains_key(surface_id) && self.surface_staged_op.get(surface_id).get("value") == SurfaceStagedOp::Reload }
+            guard "staged_sequence_matches" { self.surface_staged_intent_sequence.contains_key(surface_id) && self.surface_staged_intent_sequence.get(surface_id).get("value") == staged_intent_sequence }
+            guard "surface_active" { self.active_surfaces.contains(surface_id) }
+            guard "base_active" { self.surface_base_state.contains_key(surface_id) && self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Active }
+            guard "no_pending_surface_op" {
+                !self.surface_pending_op.contains_key(surface_id)
+                || self.surface_pending_op.get(surface_id).get("value") == SurfacePendingOp::None
+            }
+            update {
+                self.known_surfaces.insert(surface_id);
+                self.next_pending_task_sequence = self.next_pending_task_sequence + 1;
+                self.surface_pending_op.insert(surface_id, SurfacePendingOp::Reload);
+                self.surface_pending_task_sequence.insert(surface_id, self.next_pending_task_sequence);
+                self.surface_pending_lineage_sequence.insert(surface_id, staged_intent_sequence);
+                self.surface_staged_op.remove(surface_id);
+                self.surface_staged_intent_sequence.remove(surface_id);
+                self.reload_staged_surfaces.remove(surface_id);
+                self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Reload);
+                self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Pending);
+                self.snapshot_epoch = self.snapshot_epoch + 1;
+            }
+            to Attached
+            emit ScheduleSurfaceCompletion {
+                surface_id: surface_id,
+                operation: ExternalToolSurfaceDeltaOperation::Reload,
+                pending_task_sequence: self.next_pending_task_sequence,
+                staged_intent_sequence: staged_intent_sequence,
+                applied_at_turn: applied_at_turn,
+            }
+            emit EmitExternalToolDelta {
+                surface_id: surface_id,
+                operation: ExternalToolSurfaceDeltaOperation::Reload,
+                phase: ExternalToolSurfaceDeltaPhase::Pending,
+            }
+        }
+        transition SurfaceApplyBoundaryReloadRunning {
+            on input SurfaceApplyBoundary { surface_id, now_ms, staged_intent_sequence, applied_at_turn }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "surface_operating" { self.surface_phase == SurfacePhase::Operating }
+            guard "staged_reload" { self.surface_staged_op.contains_key(surface_id) && self.surface_staged_op.get(surface_id).get("value") == SurfaceStagedOp::Reload }
+            guard "staged_sequence_matches" { self.surface_staged_intent_sequence.contains_key(surface_id) && self.surface_staged_intent_sequence.get(surface_id).get("value") == staged_intent_sequence }
+            guard "surface_active" { self.active_surfaces.contains(surface_id) }
+            guard "base_active" { self.surface_base_state.contains_key(surface_id) && self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Active }
+            guard "no_pending_surface_op" {
+                !self.surface_pending_op.contains_key(surface_id)
+                || self.surface_pending_op.get(surface_id).get("value") == SurfacePendingOp::None
+            }
+            update {
+                self.known_surfaces.insert(surface_id);
+                self.next_pending_task_sequence = self.next_pending_task_sequence + 1;
+                self.surface_pending_op.insert(surface_id, SurfacePendingOp::Reload);
+                self.surface_pending_task_sequence.insert(surface_id, self.next_pending_task_sequence);
+                self.surface_pending_lineage_sequence.insert(surface_id, staged_intent_sequence);
+                self.surface_staged_op.remove(surface_id);
+                self.surface_staged_intent_sequence.remove(surface_id);
+                self.reload_staged_surfaces.remove(surface_id);
+                self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Reload);
+                self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Pending);
+                self.snapshot_epoch = self.snapshot_epoch + 1;
+            }
+            to Running
+            emit ScheduleSurfaceCompletion {
+                surface_id: surface_id,
+                operation: ExternalToolSurfaceDeltaOperation::Reload,
+                pending_task_sequence: self.next_pending_task_sequence,
+                staged_intent_sequence: staged_intent_sequence,
+                applied_at_turn: applied_at_turn,
+            }
+            emit EmitExternalToolDelta {
+                surface_id: surface_id,
+                operation: ExternalToolSurfaceDeltaOperation::Reload,
+                phase: ExternalToolSurfaceDeltaPhase::Pending,
+            }
+        }
+        transition SurfaceApplyBoundaryRemoveDrainingAttached {
+            on input SurfaceApplyBoundary { surface_id, now_ms, staged_intent_sequence, applied_at_turn }
+            guard { self.lifecycle_phase == Phase::Attached }
+            guard "surface_operating" { self.surface_phase == SurfacePhase::Operating }
+            guard "staged_remove" { self.surface_staged_op.contains_key(surface_id) && self.surface_staged_op.get(surface_id).get("value") == SurfaceStagedOp::Remove }
+            guard "staged_sequence_matches" { self.surface_staged_intent_sequence.contains_key(surface_id) && self.surface_staged_intent_sequence.get(surface_id).get("value") == staged_intent_sequence }
+            guard "base_active" { self.surface_base_state.contains_key(surface_id) && self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Active }
+            guard "no_pending_surface_op" {
+                !self.surface_pending_op.contains_key(surface_id)
+                || self.surface_pending_op.get(surface_id).get("value") == SurfacePendingOp::None
+            }
+            update {
+                self.known_surfaces.insert(surface_id);
+                self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                self.surface_pending_task_sequence.insert(surface_id, 0);
+                self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_staged_op.remove(surface_id);
+                self.surface_staged_intent_sequence.remove(surface_id);
+                self.reload_staged_surfaces.remove(surface_id);
+                self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Removing);
+                self.active_surfaces.remove(surface_id);
+                self.visible_surfaces.remove(surface_id);
+                self.surface_draining_since_ms.insert(surface_id, now_ms);
+                self.surface_removal_timeout_at_ms.insert(surface_id, now_ms + self.removal_timeout_ms);
+                self.surface_removal_applied_at_turn.insert(surface_id, applied_at_turn);
+                self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Remove);
+                self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Draining);
+                self.snapshot_epoch = self.snapshot_epoch + 1;
+            }
+            to Attached
+            emit RefreshVisibleSurfaceSet { snapshot_epoch: self.snapshot_epoch }
+            emit EmitExternalToolDelta {
+                surface_id: surface_id,
+                operation: ExternalToolSurfaceDeltaOperation::Remove,
+                phase: ExternalToolSurfaceDeltaPhase::Draining,
+            }
+        }
+        transition SurfaceApplyBoundaryRemoveDrainingRunning {
+            on input SurfaceApplyBoundary { surface_id, now_ms, staged_intent_sequence, applied_at_turn }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "surface_operating" { self.surface_phase == SurfacePhase::Operating }
+            guard "staged_remove" { self.surface_staged_op.contains_key(surface_id) && self.surface_staged_op.get(surface_id).get("value") == SurfaceStagedOp::Remove }
+            guard "staged_sequence_matches" { self.surface_staged_intent_sequence.contains_key(surface_id) && self.surface_staged_intent_sequence.get(surface_id).get("value") == staged_intent_sequence }
+            guard "base_active" { self.surface_base_state.contains_key(surface_id) && self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Active }
+            guard "no_pending_surface_op" {
+                !self.surface_pending_op.contains_key(surface_id)
+                || self.surface_pending_op.get(surface_id).get("value") == SurfacePendingOp::None
+            }
+            update {
+                self.known_surfaces.insert(surface_id);
+                self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                self.surface_pending_task_sequence.insert(surface_id, 0);
+                self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_staged_op.remove(surface_id);
+                self.surface_staged_intent_sequence.remove(surface_id);
+                self.reload_staged_surfaces.remove(surface_id);
+                self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Removing);
+                self.active_surfaces.remove(surface_id);
+                self.visible_surfaces.remove(surface_id);
+                self.surface_draining_since_ms.insert(surface_id, now_ms);
+                self.surface_removal_timeout_at_ms.insert(surface_id, now_ms + self.removal_timeout_ms);
+                self.surface_removal_applied_at_turn.insert(surface_id, applied_at_turn);
+                self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Remove);
+                self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Draining);
+                self.snapshot_epoch = self.snapshot_epoch + 1;
+            }
+            to Running
+            emit RefreshVisibleSurfaceSet { snapshot_epoch: self.snapshot_epoch }
+            emit EmitExternalToolDelta {
+                surface_id: surface_id,
+                operation: ExternalToolSurfaceDeltaOperation::Remove,
+                phase: ExternalToolSurfaceDeltaPhase::Draining,
+            }
+        }
+        transition SurfaceApplyBoundaryRemoveNoopAttached {
+            on input SurfaceApplyBoundary { surface_id, now_ms, staged_intent_sequence, applied_at_turn }
+            guard { self.lifecycle_phase == Phase::Attached }
+            guard "surface_operating" { self.surface_phase == SurfacePhase::Operating }
+            guard "staged_remove" { self.surface_staged_op.contains_key(surface_id) && self.surface_staged_op.get(surface_id).get("value") == SurfaceStagedOp::Remove }
+            guard "staged_sequence_matches" { self.surface_staged_intent_sequence.contains_key(surface_id) && self.surface_staged_intent_sequence.get(surface_id).get("value") == staged_intent_sequence }
+            guard "base_not_active" {
+                !self.surface_base_state.contains_key(surface_id)
+                || self.surface_base_state.get(surface_id).get("value") != ExternalToolSurfaceBaseState::Active
+            }
+            guard "no_pending_surface_op" {
+                !self.surface_pending_op.contains_key(surface_id)
+                || self.surface_pending_op.get(surface_id).get("value") == SurfacePendingOp::None
+            }
+            update {
+                self.known_surfaces.insert(surface_id);
+                self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                self.surface_pending_task_sequence.insert(surface_id, 0);
+                self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_staged_op.remove(surface_id);
+                self.surface_staged_intent_sequence.remove(surface_id);
+                self.reload_staged_surfaces.remove(surface_id);
+            }
+            to Attached
+        }
+        transition SurfaceApplyBoundaryRemoveNoopRunning {
+            on input SurfaceApplyBoundary { surface_id, now_ms, staged_intent_sequence, applied_at_turn }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "surface_operating" { self.surface_phase == SurfacePhase::Operating }
+            guard "staged_remove" { self.surface_staged_op.contains_key(surface_id) && self.surface_staged_op.get(surface_id).get("value") == SurfaceStagedOp::Remove }
+            guard "staged_sequence_matches" { self.surface_staged_intent_sequence.contains_key(surface_id) && self.surface_staged_intent_sequence.get(surface_id).get("value") == staged_intent_sequence }
+            guard "base_not_active" {
+                !self.surface_base_state.contains_key(surface_id)
+                || self.surface_base_state.get(surface_id).get("value") != ExternalToolSurfaceBaseState::Active
+            }
+            guard "no_pending_surface_op" {
+                !self.surface_pending_op.contains_key(surface_id)
+                || self.surface_pending_op.get(surface_id).get("value") == SurfacePendingOp::None
+            }
+            update {
+                self.known_surfaces.insert(surface_id);
+                self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                self.surface_pending_task_sequence.insert(surface_id, 0);
+                self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_staged_op.remove(surface_id);
+                self.surface_staged_intent_sequence.remove(surface_id);
+                self.reload_staged_surfaces.remove(surface_id);
+            }
+            to Running
+        }
+
+        transition SurfaceMarkPendingSucceededAddAttached {
+            on input SurfaceMarkPendingSucceeded { surface_id, pending_task_sequence, staged_intent_sequence }
+            guard { self.lifecycle_phase == Phase::Attached }
+            guard "pending_add" { self.surface_pending_op.contains_key(surface_id) && self.surface_pending_op.get(surface_id).get("value") == SurfacePendingOp::Add }
+            guard "pending_sequence_matches" { self.surface_pending_task_sequence.contains_key(surface_id) && self.surface_pending_task_sequence.get(surface_id).get("value") == pending_task_sequence }
+            guard "pending_lineage_matches" { self.surface_pending_lineage_sequence.contains_key(surface_id) && self.surface_pending_lineage_sequence.get(surface_id).get("value") == staged_intent_sequence }
+            update {
+                self.known_surfaces.insert(surface_id);
+                self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                self.surface_pending_task_sequence.insert(surface_id, 0);
+                self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Active);
+                self.active_surfaces.insert(surface_id);
+                self.visible_surfaces.insert(surface_id);
+                self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Add);
+                self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Applied);
+                self.snapshot_epoch = self.snapshot_epoch + 1;
+            }
+            to Attached
+            emit RefreshVisibleSurfaceSet { snapshot_epoch: self.snapshot_epoch }
+            emit EmitExternalToolDelta {
+                surface_id: surface_id,
+                operation: ExternalToolSurfaceDeltaOperation::Add,
+                phase: ExternalToolSurfaceDeltaPhase::Applied,
+            }
+        }
+        transition SurfaceMarkPendingSucceededAddRunning {
+            on input SurfaceMarkPendingSucceeded { surface_id, pending_task_sequence, staged_intent_sequence }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "pending_add" { self.surface_pending_op.contains_key(surface_id) && self.surface_pending_op.get(surface_id).get("value") == SurfacePendingOp::Add }
+            guard "pending_sequence_matches" { self.surface_pending_task_sequence.contains_key(surface_id) && self.surface_pending_task_sequence.get(surface_id).get("value") == pending_task_sequence }
+            guard "pending_lineage_matches" { self.surface_pending_lineage_sequence.contains_key(surface_id) && self.surface_pending_lineage_sequence.get(surface_id).get("value") == staged_intent_sequence }
+            update {
+                self.known_surfaces.insert(surface_id);
+                self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                self.surface_pending_task_sequence.insert(surface_id, 0);
+                self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Active);
+                self.active_surfaces.insert(surface_id);
+                self.visible_surfaces.insert(surface_id);
+                self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Add);
+                self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Applied);
+                self.snapshot_epoch = self.snapshot_epoch + 1;
+            }
+            to Running
+            emit RefreshVisibleSurfaceSet { snapshot_epoch: self.snapshot_epoch }
+            emit EmitExternalToolDelta {
+                surface_id: surface_id,
+                operation: ExternalToolSurfaceDeltaOperation::Add,
+                phase: ExternalToolSurfaceDeltaPhase::Applied,
+            }
+        }
+        transition SurfaceMarkPendingSucceededReloadAttached {
+            on input SurfaceMarkPendingSucceeded { surface_id, pending_task_sequence, staged_intent_sequence }
+            guard { self.lifecycle_phase == Phase::Attached }
+            guard "pending_reload" { self.surface_pending_op.contains_key(surface_id) && self.surface_pending_op.get(surface_id).get("value") == SurfacePendingOp::Reload }
+            guard "pending_sequence_matches" { self.surface_pending_task_sequence.contains_key(surface_id) && self.surface_pending_task_sequence.get(surface_id).get("value") == pending_task_sequence }
+            guard "pending_lineage_matches" { self.surface_pending_lineage_sequence.contains_key(surface_id) && self.surface_pending_lineage_sequence.get(surface_id).get("value") == staged_intent_sequence }
+            update {
+                self.known_surfaces.insert(surface_id);
+                self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                self.surface_pending_task_sequence.insert(surface_id, 0);
+                self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Active);
+                self.active_surfaces.insert(surface_id);
+                self.visible_surfaces.insert(surface_id);
+                self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Reload);
+                self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Applied);
+                self.snapshot_epoch = self.snapshot_epoch + 1;
+            }
+            to Attached
+            emit RefreshVisibleSurfaceSet { snapshot_epoch: self.snapshot_epoch }
+            emit EmitExternalToolDelta {
+                surface_id: surface_id,
+                operation: ExternalToolSurfaceDeltaOperation::Reload,
+                phase: ExternalToolSurfaceDeltaPhase::Applied,
+            }
+        }
+        transition SurfaceMarkPendingSucceededReloadRunning {
+            on input SurfaceMarkPendingSucceeded { surface_id, pending_task_sequence, staged_intent_sequence }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "pending_reload" { self.surface_pending_op.contains_key(surface_id) && self.surface_pending_op.get(surface_id).get("value") == SurfacePendingOp::Reload }
+            guard "pending_sequence_matches" { self.surface_pending_task_sequence.contains_key(surface_id) && self.surface_pending_task_sequence.get(surface_id).get("value") == pending_task_sequence }
+            guard "pending_lineage_matches" { self.surface_pending_lineage_sequence.contains_key(surface_id) && self.surface_pending_lineage_sequence.get(surface_id).get("value") == staged_intent_sequence }
+            update {
+                self.known_surfaces.insert(surface_id);
+                self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                self.surface_pending_task_sequence.insert(surface_id, 0);
+                self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Active);
+                self.active_surfaces.insert(surface_id);
+                self.visible_surfaces.insert(surface_id);
+                self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Reload);
+                self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Applied);
+                self.snapshot_epoch = self.snapshot_epoch + 1;
+            }
+            to Running
+            emit RefreshVisibleSurfaceSet { snapshot_epoch: self.snapshot_epoch }
+            emit EmitExternalToolDelta {
+                surface_id: surface_id,
+                operation: ExternalToolSurfaceDeltaOperation::Reload,
+                phase: ExternalToolSurfaceDeltaPhase::Applied,
+            }
+        }
+
+        transition SurfaceMarkPendingFailedAttached {
+            on input SurfaceMarkPendingFailed { surface_id, pending_task_sequence, staged_intent_sequence, reason }
+            guard { self.lifecycle_phase == Phase::Attached }
+            guard "pending_sequence_matches" { self.surface_pending_task_sequence.contains_key(surface_id) && self.surface_pending_task_sequence.get(surface_id).get("value") == pending_task_sequence }
+            guard "pending_lineage_matches" { self.surface_pending_lineage_sequence.contains_key(surface_id) && self.surface_pending_lineage_sequence.get(surface_id).get("value") == staged_intent_sequence }
+            update {
+                self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                self.surface_pending_task_sequence.insert(surface_id, 0);
+                self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Failed);
+            }
+            to Attached
+            emit EmitExternalToolDelta {
+                surface_id: surface_id,
+                operation: self.surface_last_delta_operation.get(surface_id).get("value"),
+                phase: ExternalToolSurfaceDeltaPhase::Failed,
+            }
+        }
+        transition SurfaceMarkPendingFailedRunning {
+            on input SurfaceMarkPendingFailed { surface_id, pending_task_sequence, staged_intent_sequence, reason }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "pending_sequence_matches" { self.surface_pending_task_sequence.contains_key(surface_id) && self.surface_pending_task_sequence.get(surface_id).get("value") == pending_task_sequence }
+            guard "pending_lineage_matches" { self.surface_pending_lineage_sequence.contains_key(surface_id) && self.surface_pending_lineage_sequence.get(surface_id).get("value") == staged_intent_sequence }
+            update {
+                self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                self.surface_pending_task_sequence.insert(surface_id, 0);
+                self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Failed);
+            }
+            to Running
+            emit EmitExternalToolDelta {
+                surface_id: surface_id,
+                operation: self.surface_last_delta_operation.get(surface_id).get("value"),
+                phase: ExternalToolSurfaceDeltaPhase::Failed,
+            }
+        }
+
+        transition SurfaceCallStartedActiveAttached {
+            on input SurfaceCallStarted { surface_id }
+            guard { self.lifecycle_phase == Phase::Attached }
+            guard "surface_active" { self.surface_base_state.contains_key(surface_id) && self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Active }
+            update {
+                self.surface_inflight_calls.increment(surface_id, 1);
+            }
+            to Attached
+        }
+        transition SurfaceCallStartedActiveRunning {
+            on input SurfaceCallStarted { surface_id }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "surface_active" { self.surface_base_state.contains_key(surface_id) && self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Active }
+            update {
+                self.surface_inflight_calls.increment(surface_id, 1);
+            }
+            to Running
+        }
+        transition SurfaceCallStartedRejectRemovingAttached {
+            on input SurfaceCallStarted { surface_id }
+            guard { self.lifecycle_phase == Phase::Attached }
+            guard "surface_removing" { self.surface_base_state.contains_key(surface_id) && self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Removing }
             update {}
             to Attached
-            emit SubmitRunPrimitive
+            emit RejectSurfaceCall { surface_id: surface_id, reason: "surface_draining" }
+        }
+        transition SurfaceCallStartedRejectRemovingRunning {
+            on input SurfaceCallStarted { surface_id }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "surface_removing" { self.surface_base_state.contains_key(surface_id) && self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Removing }
+            update {}
+            to Running
+            emit RejectSurfaceCall { surface_id: surface_id, reason: "surface_draining" }
+        }
+        transition SurfaceCallStartedRejectUnavailableAttached {
+            on input SurfaceCallStarted { surface_id }
+            guard { self.lifecycle_phase == Phase::Attached }
+            guard "surface_unavailable" {
+                !self.surface_base_state.contains_key(surface_id)
+                || (
+                    self.surface_base_state.get(surface_id).get("value") != ExternalToolSurfaceBaseState::Active
+                    && self.surface_base_state.get(surface_id).get("value") != ExternalToolSurfaceBaseState::Removing
+                )
+            }
+            update {}
+            to Attached
+            emit RejectSurfaceCall { surface_id: surface_id, reason: "surface_unavailable" }
+        }
+        transition SurfaceCallStartedRejectUnavailableRunning {
+            on input SurfaceCallStarted { surface_id }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "surface_unavailable" {
+                !self.surface_base_state.contains_key(surface_id)
+                || (
+                    self.surface_base_state.get(surface_id).get("value") != ExternalToolSurfaceBaseState::Active
+                    && self.surface_base_state.get(surface_id).get("value") != ExternalToolSurfaceBaseState::Removing
+                )
+            }
+            update {}
+            to Running
+            emit RejectSurfaceCall { surface_id: surface_id, reason: "surface_unavailable" }
+        }
+
+        transition SurfaceCallFinishedAttached {
+            on input SurfaceCallFinished { surface_id }
+            guard { self.lifecycle_phase == Phase::Attached }
+            guard "surface_active_or_removing" {
+                self.surface_base_state.contains_key(surface_id)
+                && (
+                    self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Active
+                    || self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Removing
+                )
+            }
+            guard "inflight_calls_remain" { self.surface_inflight_calls.contains_key(surface_id) && self.surface_inflight_calls.get(surface_id).get("value") > 0 }
+            update {
+                self.surface_inflight_calls.insert(surface_id, self.surface_inflight_calls.get(surface_id).get("value") - 1);
+            }
+            to Attached
+        }
+        transition SurfaceCallFinishedRunning {
+            on input SurfaceCallFinished { surface_id }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "surface_active_or_removing" {
+                self.surface_base_state.contains_key(surface_id)
+                && (
+                    self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Active
+                    || self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Removing
+                )
+            }
+            guard "inflight_calls_remain" { self.surface_inflight_calls.contains_key(surface_id) && self.surface_inflight_calls.get(surface_id).get("value") > 0 }
+            update {
+                self.surface_inflight_calls.insert(surface_id, self.surface_inflight_calls.get(surface_id).get("value") - 1);
+            }
+            to Running
+        }
+
+        transition SurfaceFinalizeRemovalCleanAttached {
+            on input SurfaceFinalizeRemovalClean { surface_id }
+            guard { self.lifecycle_phase == Phase::Attached }
+            guard "surface_removing" { self.surface_base_state.contains_key(surface_id) && self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Removing }
+            guard "no_inflight_calls_remain" {
+                !self.surface_inflight_calls.contains_key(surface_id)
+                || self.surface_inflight_calls.get(surface_id).get("value") == 0
+            }
+            update {
+                self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Removed);
+                self.active_surfaces.remove(surface_id);
+                self.visible_surfaces.remove(surface_id);
+                self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                self.surface_pending_task_sequence.insert(surface_id, 0);
+                self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_draining_since_ms.remove(surface_id);
+                self.surface_removal_timeout_at_ms.remove(surface_id);
+                self.surface_removal_applied_at_turn.remove(surface_id);
+                self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Remove);
+                self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Applied);
+                self.snapshot_epoch = self.snapshot_epoch + 1;
+            }
+            to Attached
+            emit CloseSurfaceConnection { surface_id: surface_id }
+            emit RefreshVisibleSurfaceSet { snapshot_epoch: self.snapshot_epoch }
+            emit EmitExternalToolDelta {
+                surface_id: surface_id,
+                operation: ExternalToolSurfaceDeltaOperation::Remove,
+                phase: ExternalToolSurfaceDeltaPhase::Applied,
+            }
+        }
+        transition SurfaceFinalizeRemovalCleanRunning {
+            on input SurfaceFinalizeRemovalClean { surface_id }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "surface_removing" { self.surface_base_state.contains_key(surface_id) && self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Removing }
+            guard "no_inflight_calls_remain" {
+                !self.surface_inflight_calls.contains_key(surface_id)
+                || self.surface_inflight_calls.get(surface_id).get("value") == 0
+            }
+            update {
+                self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Removed);
+                self.active_surfaces.remove(surface_id);
+                self.visible_surfaces.remove(surface_id);
+                self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                self.surface_pending_task_sequence.insert(surface_id, 0);
+                self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_draining_since_ms.remove(surface_id);
+                self.surface_removal_timeout_at_ms.remove(surface_id);
+                self.surface_removal_applied_at_turn.remove(surface_id);
+                self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Remove);
+                self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Applied);
+                self.snapshot_epoch = self.snapshot_epoch + 1;
+            }
+            to Running
+            emit CloseSurfaceConnection { surface_id: surface_id }
+            emit RefreshVisibleSurfaceSet { snapshot_epoch: self.snapshot_epoch }
+            emit EmitExternalToolDelta {
+                surface_id: surface_id,
+                operation: ExternalToolSurfaceDeltaOperation::Remove,
+                phase: ExternalToolSurfaceDeltaPhase::Applied,
+            }
+        }
+
+        transition SurfaceFinalizeRemovalForcedAttached {
+            on input SurfaceFinalizeRemovalForced { surface_id }
+            guard { self.lifecycle_phase == Phase::Attached }
+            guard "surface_removing" { self.surface_base_state.contains_key(surface_id) && self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Removing }
+            update {
+                self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Removed);
+                self.active_surfaces.remove(surface_id);
+                self.visible_surfaces.remove(surface_id);
+                self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                self.surface_pending_task_sequence.insert(surface_id, 0);
+                self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_inflight_calls.insert(surface_id, 0);
+                self.surface_draining_since_ms.remove(surface_id);
+                self.surface_removal_timeout_at_ms.remove(surface_id);
+                self.surface_removal_applied_at_turn.remove(surface_id);
+                self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Remove);
+                self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Forced);
+                self.snapshot_epoch = self.snapshot_epoch + 1;
+            }
+            to Attached
+            emit CloseSurfaceConnection { surface_id: surface_id }
+            emit RefreshVisibleSurfaceSet { snapshot_epoch: self.snapshot_epoch }
+            emit EmitExternalToolDelta {
+                surface_id: surface_id,
+                operation: ExternalToolSurfaceDeltaOperation::Remove,
+                phase: ExternalToolSurfaceDeltaPhase::Forced,
+            }
+        }
+        transition SurfaceFinalizeRemovalForcedRunning {
+            on input SurfaceFinalizeRemovalForced { surface_id }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "surface_removing" { self.surface_base_state.contains_key(surface_id) && self.surface_base_state.get(surface_id).get("value") == ExternalToolSurfaceBaseState::Removing }
+            update {
+                self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Removed);
+                self.active_surfaces.remove(surface_id);
+                self.visible_surfaces.remove(surface_id);
+                self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                self.surface_pending_task_sequence.insert(surface_id, 0);
+                self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_inflight_calls.insert(surface_id, 0);
+                self.surface_draining_since_ms.remove(surface_id);
+                self.surface_removal_timeout_at_ms.remove(surface_id);
+                self.surface_removal_applied_at_turn.remove(surface_id);
+                self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Remove);
+                self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Forced);
+                self.snapshot_epoch = self.snapshot_epoch + 1;
+            }
+            to Running
+            emit CloseSurfaceConnection { surface_id: surface_id }
+            emit RefreshVisibleSurfaceSet { snapshot_epoch: self.snapshot_epoch }
+            emit EmitExternalToolDelta {
+                surface_id: surface_id,
+                operation: ExternalToolSurfaceDeltaOperation::Remove,
+                phase: ExternalToolSurfaceDeltaPhase::Forced,
+            }
+        }
+
+        transition SurfaceSnapshotAlignedAttached {
+            on input SurfaceSnapshotAligned { epoch }
+            guard { self.lifecycle_phase == Phase::Attached }
+            update {
+                self.snapshot_aligned_epoch = epoch;
+            }
+            to Attached
+        }
+        transition SurfaceSnapshotAlignedRunning {
+            on input SurfaceSnapshotAligned { epoch }
+            guard { self.lifecycle_phase == Phase::Running }
+            update {
+                self.snapshot_aligned_epoch = epoch;
+            }
+            to Running
+        }
+
+        transition SurfaceShutdownAttached {
+            on input SurfaceShutdown
+            guard { self.lifecycle_phase == Phase::Attached }
+            update {
+                self.surface_phase = SurfacePhase::Shutdown;
+            }
+            to Attached
+        }
+        transition SurfaceShutdownRunning {
+            on input SurfaceShutdown
+            guard { self.lifecycle_phase == Phase::Running }
+            update {
+                self.surface_phase = SurfacePhase::Shutdown;
+            }
+            to Running
         }
 
         // 31. Commit: Running → Idle/Attached/Retired (guard pre_run_phase + run_id match)
         transition CommitRunningToIdle {
             on input Commit { input_id, run_id }
             guard { self.lifecycle_phase == Phase::Running }
-            guard "pre_run_phase_matches_idle" { self.pre_run_phase == Some("idle") }
+            guard "pre_run_phase_matches_idle" { self.pre_run_phase == Some(PreRunPhase::Idle) }
             guard "current_run_id_matches_binding" { self.current_run_id == Some(run_id) }
             update {
                 self.current_run_id = None;
@@ -2351,7 +5309,7 @@ machine! {
         transition CommitRunningToAttached {
             on input Commit { input_id, run_id }
             guard { self.lifecycle_phase == Phase::Running }
-            guard "pre_run_phase_matches_attached" { self.pre_run_phase == Some("attached") }
+            guard "pre_run_phase_matches_attached" { self.pre_run_phase == Some(PreRunPhase::Attached) }
             guard "current_run_id_matches_binding" { self.current_run_id == Some(run_id) }
             update {
                 self.current_run_id = None;
@@ -2362,7 +5320,7 @@ machine! {
         transition CommitRunningToRetired {
             on input Commit { input_id, run_id }
             guard { self.lifecycle_phase == Phase::Running }
-            guard "pre_run_phase_matches_retired" { self.pre_run_phase == Some("retired") }
+            guard "pre_run_phase_matches_retired" { self.pre_run_phase == Some(PreRunPhase::Retired) }
             guard "current_run_id_matches_binding" { self.current_run_id == Some(run_id) }
             update {
                 self.current_run_id = None;
@@ -2375,7 +5333,7 @@ machine! {
         transition FailRunningToIdle {
             on input Fail { run_id }
             guard { self.lifecycle_phase == Phase::Running }
-            guard "pre_run_phase_matches_idle" { self.pre_run_phase == Some("idle") }
+            guard "pre_run_phase_matches_idle" { self.pre_run_phase == Some(PreRunPhase::Idle) }
             guard "current_run_id_matches_binding" { self.current_run_id == Some(run_id) }
             update {
                 self.current_run_id = None;
@@ -2387,7 +5345,7 @@ machine! {
         transition FailRunningToAttached {
             on input Fail { run_id }
             guard { self.lifecycle_phase == Phase::Running }
-            guard "pre_run_phase_matches_attached" { self.pre_run_phase == Some("attached") }
+            guard "pre_run_phase_matches_attached" { self.pre_run_phase == Some(PreRunPhase::Attached) }
             guard "current_run_id_matches_binding" { self.current_run_id == Some(run_id) }
             update {
                 self.current_run_id = None;
@@ -2399,7 +5357,7 @@ machine! {
         transition FailRunningToRetired {
             on input Fail { run_id }
             guard { self.lifecycle_phase == Phase::Running }
-            guard "pre_run_phase_matches_retired" { self.pre_run_phase == Some("retired") }
+            guard "pre_run_phase_matches_retired" { self.pre_run_phase == Some(PreRunPhase::Retired) }
             guard "current_run_id_matches_binding" { self.current_run_id == Some(run_id) }
             update {
                 self.current_run_id = None;
@@ -2407,208 +5365,6 @@ machine! {
             }
             to Retired
             emit RecordTerminalOutcome
-        }
-
-        // 33. MCP surface signals: Attached/Running per-phase, emit EmitExternalToolDelta (or other)
-        transition StageAddAttached {
-            on signal StageAdd
-            guard { self.lifecycle_phase == Phase::Attached }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Attached
-            emit EmitExternalToolDelta
-        }
-        transition StageAddRunning {
-            on signal StageAdd
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Running
-            emit EmitExternalToolDelta
-        }
-        transition StageRemoveAttached {
-            on signal StageRemove
-            guard { self.lifecycle_phase == Phase::Attached }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Attached
-            emit EmitExternalToolDelta
-        }
-        transition StageRemoveRunning {
-            on signal StageRemove
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Running
-            emit EmitExternalToolDelta
-        }
-        transition StageReloadAttached {
-            on signal StageReload
-            guard { self.lifecycle_phase == Phase::Attached }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Attached
-            emit EmitExternalToolDelta
-        }
-        transition StageReloadRunning {
-            on signal StageReload
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Running
-            emit EmitExternalToolDelta
-        }
-        transition ApplySurfaceBoundaryAttached {
-            on signal ApplySurfaceBoundary { surface_id, operation, pending_task_sequence, staged_intent_sequence, applied_at_turn }
-            guard { self.lifecycle_phase == Phase::Attached }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Attached
-            emit ScheduleSurfaceCompletion {
-                surface_id: surface_id,
-                operation: operation,
-                pending_task_sequence: pending_task_sequence,
-                staged_intent_sequence: staged_intent_sequence,
-                applied_at_turn: applied_at_turn,
-            }
-        }
-        transition ApplySurfaceBoundaryRunning {
-            on signal ApplySurfaceBoundary { surface_id, operation, pending_task_sequence, staged_intent_sequence, applied_at_turn }
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Running
-            emit ScheduleSurfaceCompletion {
-                surface_id: surface_id,
-                operation: operation,
-                pending_task_sequence: pending_task_sequence,
-                staged_intent_sequence: staged_intent_sequence,
-                applied_at_turn: applied_at_turn,
-            }
-        }
-        transition PendingSucceededAttached {
-            on input PendingSucceeded { surface_id, pending_task_sequence, staged_intent_sequence }
-            guard { self.lifecycle_phase == Phase::Attached }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Attached
-            emit EmitExternalToolDelta
-        }
-        transition PendingSucceededRunning {
-            on input PendingSucceeded { surface_id, pending_task_sequence, staged_intent_sequence }
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Running
-            emit EmitExternalToolDelta
-        }
-        transition PendingFailedAttached {
-            on input PendingFailed { surface_id, pending_task_sequence, reason }
-            guard { self.lifecycle_phase == Phase::Attached }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Attached
-            emit EmitExternalToolDelta
-        }
-        transition PendingFailedRunning {
-            on input PendingFailed { surface_id, pending_task_sequence, reason }
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Running
-            emit EmitExternalToolDelta
-        }
-        transition CallStartedAttached {
-            on signal CallStarted
-            guard { self.lifecycle_phase == Phase::Attached }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Attached
-        }
-        transition CallStartedRunning {
-            on signal CallStarted
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Running
-        }
-        transition CallFinishedAttached {
-            on signal CallFinished
-            guard { self.lifecycle_phase == Phase::Attached }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Attached
-        }
-        transition CallFinishedRunning {
-            on signal CallFinished
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Running
-        }
-        transition FinalizeRemovalCleanAttached {
-            on signal FinalizeRemovalClean
-            guard { self.lifecycle_phase == Phase::Attached }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Attached
-            emit EmitExternalToolDelta
-        }
-        transition FinalizeRemovalCleanRunning {
-            on signal FinalizeRemovalClean
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Running
-            emit EmitExternalToolDelta
-        }
-        transition FinalizeRemovalForcedAttached {
-            on signal FinalizeRemovalForced
-            guard { self.lifecycle_phase == Phase::Attached }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Attached
-            emit EmitExternalToolDelta
-        }
-        transition FinalizeRemovalForcedRunning {
-            on signal FinalizeRemovalForced
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Running
-            emit EmitExternalToolDelta
-        }
-        transition SnapshotAlignedAttached {
-            on input SnapshotAligned { snapshot_epoch }
-            guard { self.lifecycle_phase == Phase::Attached }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Attached
-            emit EmitExternalToolDelta
-        }
-        transition SnapshotAlignedRunning {
-            on input SnapshotAligned { snapshot_epoch }
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Running
-            emit EmitExternalToolDelta
-        }
-        transition ShutdownSurfaceAttached {
-            on signal ShutdownSurface
-            guard { self.lifecycle_phase == Phase::Attached }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Attached
-            emit EmitExternalToolDelta
-        }
-        transition ShutdownSurfaceRunning {
-            on signal ShutdownSurface
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Running
-            emit EmitExternalToolDelta
         }
 
         // 34. Recycle: from Idle/Retired → Idle, from Attached → Attached
@@ -2635,6 +5391,741 @@ machine! {
             }
             to Attached
             emit InitiateRecycle
+        }
+
+        // =====================================================================
+        // Absorbed substate transitions — Input Lifecycle
+        // =====================================================================
+
+        // RecoverInputLifecycle: restore persisted input lifecycle facts
+        // through machine authority. Store recovery may present an input at
+        // any lifecycle phase, so this transition deliberately owns the
+        // whole recovered projection instead of replaying admit/stage/apply
+        // transitions whose preconditions may no longer hold after restart.
+        transition RecoverInputLifecycle {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RecoverInputLifecycle {
+                input_id,
+                phase,
+                terminal_kind,
+                superseded_by,
+                aggregate_id,
+                abandon_reason,
+                abandon_attempt_count,
+                attempt_count,
+                run_id,
+                boundary_sequence,
+                lane
+            }
+            update {
+                self.input_phases.insert(input_id, phase);
+
+                if terminal_kind != None {
+                    self.input_terminal_kind.insert(input_id, terminal_kind.get("value"));
+                } else {
+                    self.input_terminal_kind.remove(input_id);
+                }
+
+                if superseded_by != None {
+                    self.input_superseded_by.insert(input_id, superseded_by.get("value"));
+                } else {
+                    self.input_superseded_by.remove(input_id);
+                }
+
+                if aggregate_id != None {
+                    self.input_aggregate_id.insert(input_id, aggregate_id.get("value"));
+                } else {
+                    self.input_aggregate_id.remove(input_id);
+                }
+
+                if abandon_reason != None {
+                    self.input_abandon_reason.insert(input_id, abandon_reason.get("value"));
+                    self.input_abandon_attempt_count.insert(input_id, abandon_attempt_count);
+                } else {
+                    self.input_abandon_reason.remove(input_id);
+                    self.input_abandon_attempt_count.remove(input_id);
+                }
+
+                self.input_attempt_counts.insert(input_id, attempt_count);
+
+                if run_id != None {
+                    self.input_run_associations.insert(input_id, run_id.get("value"));
+                } else {
+                    self.input_run_associations.remove(input_id);
+                }
+
+                if boundary_sequence != None {
+                    self.input_boundary_sequences.insert(input_id, boundary_sequence.get("value"));
+                } else {
+                    self.input_boundary_sequences.remove(input_id);
+                }
+
+                if !self.input_admission_seq.contains_key(input_id) {
+                    self.input_admission_seq.insert(input_id, self.next_admission_seq);
+                    self.next_admission_seq += 1;
+                }
+
+                if lane != None {
+                    self.input_lane.insert(input_id, lane.get("value"));
+                } else {
+                    self.input_lane.remove(input_id);
+                }
+            }
+            to Idle
+            emit InputLifecycleNotice
+        }
+
+        // QueueAccepted: admit a new input into the queue lane
+        transition QueueAccepted {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input QueueAccepted { input_id }
+            guard "not_already_tracked" { !self.input_phases.contains_key(input_id) }
+            update {
+                self.input_phases.insert(input_id, InputPhase::Queued);
+                self.input_lane.insert(input_id, InputLane::Queue);
+                self.input_admission_seq.insert(input_id, self.next_admission_seq);
+                self.next_admission_seq += 1;
+            }
+            to Idle
+            emit IngressAccepted
+        }
+
+        // SteerAccepted: admit a new input into the steer lane.
+        // Symmetric sibling of QueueAccepted; the caller chooses lane based
+        // on the input's resolved HandlingMode. Mutually exclusive by
+        // construction because `input_lane` is a map, not two sets.
+        transition SteerAccepted {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input SteerAccepted { input_id }
+            guard "not_already_tracked" { !self.input_phases.contains_key(input_id) }
+            update {
+                self.input_phases.insert(input_id, InputPhase::Queued);
+                self.input_lane.insert(input_id, InputLane::Steer);
+                self.input_admission_seq.insert(input_id, self.next_admission_seq);
+                self.next_admission_seq += 1;
+            }
+            to Idle
+            emit IngressAccepted
+        }
+
+        // ChangeLane: move a tracked input between Queue and Steer lanes.
+        // Used for priority-front enqueue paths where the lane may differ
+        // from the admission default. Because `input_lane` is a map,
+        // insertion overwrites the prior lane — no strip-then-insert dance.
+        transition ChangeLane {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ChangeLane { input_id, new_lane }
+            guard "input_tracked" { self.input_phases.contains_key(input_id) }
+            update {
+                self.input_lane.insert(input_id, new_lane);
+            }
+            to Idle
+        }
+
+        // StageForRun: stage a queued input for a run. Removes the input
+        // from its work lane — staged inputs are no longer "currently
+        // queuable". The shell's queue projections are derived from
+        // `input_lane` membership and must not include staged inputs.
+        transition StageForRun {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input StageForRun { input_id, run_id }
+            guard "input_tracked" { self.input_phases.contains_key(input_id) }
+            update {
+                self.input_phases.insert(input_id, InputPhase::Staged);
+                self.input_run_associations.insert(input_id, run_id);
+                self.input_lane.remove(input_id);
+            }
+            to Idle
+            emit RecordRunAssociation
+        }
+
+        // IncrementAttemptCount: count this stage attempt for an input.
+        transition IncrementAttemptCount {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input IncrementAttemptCount { input_id }
+            guard "input_tracked" { self.input_phases.contains_key(input_id) }
+            update {
+                self.input_attempt_counts.increment(input_id, 1);
+            }
+            to Idle
+        }
+
+        // RollbackStaged: return a staged input to queued. The caller
+        // supplies the target lane (the shell's `HandlingMode` at rollback
+        // time) so the DSL can re-admit the input to its work lane without
+        // external post-hoc writes.
+        transition RollbackStaged {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RollbackStaged { input_id, lane }
+            guard "input_tracked" { self.input_phases.contains_key(input_id) }
+            update {
+                self.input_phases.insert(input_id, InputPhase::Queued);
+                self.input_run_associations.remove(input_id);
+                self.input_lane.insert(input_id, lane);
+            }
+            to Idle
+            emit InputLifecycleNotice
+        }
+
+        // MarkApplied: mark an input as applied
+        transition MarkApplied {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input MarkApplied { input_id }
+            guard "input_tracked" { self.input_phases.contains_key(input_id) }
+            update {
+                self.input_phases.insert(input_id, InputPhase::Applied);
+            }
+            to Idle
+            emit InputLifecycleNotice
+        }
+
+        // MarkAppliedPendingConsumption: Applied → AppliedPendingConsumption
+        transition MarkAppliedPendingConsumption {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input MarkAppliedPendingConsumption { input_id }
+            guard "input_tracked" { self.input_phases.contains_key(input_id) }
+            update {
+                self.input_phases.insert(input_id, InputPhase::AppliedPendingConsumption);
+            }
+            to Idle
+            emit InputLifecycleNotice
+        }
+
+        // ConsumeOnAccept: direct Accepted → Consumed (skip queue)
+        transition ConsumeOnAccept {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ConsumeOnAccept { input_id }
+            guard "input_tracked" { self.input_phases.contains_key(input_id) }
+            update {
+                self.input_phases.insert(input_id, InputPhase::Consumed);
+                self.input_lane.remove(input_id);
+            }
+            to Idle
+            emit RecordTerminalOutcome
+        }
+
+        // RecordBoundarySeq: record boundary sequence for crash recovery
+        transition RecordBoundarySeq {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RecordBoundarySeq { input_id, seq }
+            guard "input_tracked" { self.input_phases.contains_key(input_id) }
+            update {
+                self.input_boundary_sequences.insert(input_id, seq);
+            }
+            to Idle
+            emit RecordBoundarySequence
+        }
+
+        // ConsumeInput: terminal — mark input consumed, remove from lanes
+        transition ConsumeInput {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ConsumeInput { input_id }
+            guard "input_tracked" { self.input_phases.contains_key(input_id) }
+            update {
+                self.input_phases.insert(input_id, InputPhase::Consumed);
+                self.input_lane.remove(input_id);
+                self.input_terminal_kind.insert(input_id, InputTerminalKind::Consumed);
+                self.input_superseded_by.remove(input_id);
+                self.input_aggregate_id.remove(input_id);
+                self.input_abandon_reason.remove(input_id);
+                self.input_abandon_attempt_count.remove(input_id);
+            }
+            to Idle
+            emit RecordTerminalOutcome
+        }
+
+        // SupersedeInput: terminal — mark input superseded, remove from
+        // its work lane (either Queue or Steer; the unified map handles
+        // both cases with a single remove).
+        transition SupersedeInput {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input SupersedeInput { input_id, superseded_by }
+            guard "input_tracked" { self.input_phases.contains_key(input_id) }
+            update {
+                self.input_phases.insert(input_id, InputPhase::Superseded);
+                self.input_lane.remove(input_id);
+                self.input_terminal_kind.insert(input_id, InputTerminalKind::Superseded);
+                self.input_superseded_by.insert(input_id, superseded_by);
+                self.input_aggregate_id.remove(input_id);
+                self.input_abandon_reason.remove(input_id);
+                self.input_abandon_attempt_count.remove(input_id);
+            }
+            to Idle
+            emit RecordTerminalOutcome
+        }
+
+        // CoalesceInput: terminal — mark input coalesced, remove from
+        // its work lane.
+        transition CoalesceInput {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input CoalesceInput { input_id, aggregate_id }
+            guard "input_tracked" { self.input_phases.contains_key(input_id) }
+            update {
+                self.input_phases.insert(input_id, InputPhase::Coalesced);
+                self.input_lane.remove(input_id);
+                self.input_terminal_kind.insert(input_id, InputTerminalKind::Coalesced);
+                self.input_aggregate_id.insert(input_id, aggregate_id);
+                self.input_superseded_by.remove(input_id);
+                self.input_abandon_reason.remove(input_id);
+                self.input_abandon_attempt_count.remove(input_id);
+            }
+            to Idle
+            emit RecordTerminalOutcome
+        }
+
+        // AbandonInput: terminal — mark input abandoned, remove from lanes
+        transition AbandonInput {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input AbandonInput { input_id, reason, attempt_count }
+            guard "input_tracked" { self.input_phases.contains_key(input_id) }
+            update {
+                self.input_phases.insert(input_id, InputPhase::Abandoned);
+                self.input_lane.remove(input_id);
+                self.input_terminal_kind.insert(input_id, InputTerminalKind::Abandoned);
+                self.input_abandon_reason.insert(input_id, reason);
+                self.input_abandon_attempt_count.insert(input_id, attempt_count);
+                self.input_superseded_by.remove(input_id);
+                self.input_aggregate_id.remove(input_id);
+            }
+            to Idle
+            emit RecordTerminalOutcome
+        }
+
+        // =====================================================================
+        // Absorbed substate transitions — Ops Lifecycle
+        // =====================================================================
+
+        // RegisterOp: register a new operation as Provisioning
+        transition RegisterOp {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RegisterOp { operation_id, kind }
+            guard "not_already_registered" { !self.op_statuses.contains_key(operation_id) }
+            update {
+                self.op_statuses.insert(operation_id, OperationStatus::Provisioning);
+                self.op_kinds.insert(operation_id, kind);
+                self.op_peer_ready.insert(operation_id, false);
+                self.op_progress_counts.insert(operation_id, 0);
+                self.active_op_count += 1;
+            }
+            to Idle
+            emit SubmitOpEvent { operation_id: operation_id }
+        }
+
+        // StartOp: Provisioning -> Running.
+        transition StartOp {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input StartOp { operation_id }
+            guard "op_registered" { self.op_statuses.contains_key(operation_id) }
+            guard "from_status_valid" {
+                self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Provisioning)
+            }
+            update {
+                self.op_statuses.insert(operation_id, OperationStatus::Running);
+            }
+            to Idle
+            emit SubmitOpEvent { operation_id: operation_id }
+        }
+
+        // CompleteOp: terminal success from Running|Retiring.
+        transition CompleteOp {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input CompleteOp { operation_id, outcome, payload }
+            guard "op_registered" { self.op_statuses.contains_key(operation_id) }
+            guard "from_status_valid" {
+                self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Running)
+                || self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Retiring)
+            }
+            update {
+                self.op_statuses.insert(operation_id, OperationStatus::Completed);
+                self.op_terminal_outcomes.insert(operation_id, outcome);
+                self.op_terminal_payload.insert(operation_id, payload);
+                self.active_op_count -= 1;
+                self.op_completion_seq.insert(operation_id, self.next_completion_seq);
+                self.next_completion_seq += 1;
+            }
+            to Idle
+            emit SubmitOpEvent { operation_id: operation_id }
+            emit NotifyOpWatcher { operation_id: operation_id }
+        }
+
+        // FailOp: terminal failure from any non-terminal state.
+        // Shell callers: `provisioning_failed` (only Provisioning) and
+        // `fail_operation` (Provisioning|Running|Retiring). The DSL guard
+        // allows the union; the shell exposes distinct entry points for
+        // callers that only care about one sub-state.
+        transition FailOp {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input FailOp { operation_id, outcome, payload }
+            guard "op_registered" { self.op_statuses.contains_key(operation_id) }
+            guard "from_status_valid" {
+                self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Provisioning)
+                || self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Running)
+                || self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Retiring)
+            }
+            update {
+                self.op_statuses.insert(operation_id, OperationStatus::Failed);
+                self.op_terminal_outcomes.insert(operation_id, outcome);
+                self.op_terminal_payload.insert(operation_id, payload);
+                self.active_op_count -= 1;
+            }
+            to Idle
+            emit SubmitOpEvent { operation_id: operation_id }
+            emit NotifyOpWatcher { operation_id: operation_id }
+        }
+
+        // CancelOp: terminal cancellation from any non-terminal state.
+        transition CancelOp {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input CancelOp { operation_id, outcome, payload }
+            guard "op_registered" { self.op_statuses.contains_key(operation_id) }
+            guard "from_status_valid" {
+                self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Provisioning)
+                || self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Running)
+                || self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Retiring)
+            }
+            update {
+                self.op_statuses.insert(operation_id, OperationStatus::Cancelled);
+                self.op_terminal_outcomes.insert(operation_id, outcome);
+                self.op_terminal_payload.insert(operation_id, payload);
+                self.active_op_count -= 1;
+            }
+            to Idle
+            emit SubmitOpEvent { operation_id: operation_id }
+            emit NotifyOpWatcher { operation_id: operation_id }
+        }
+
+        // AbortOp: terminal abort from Provisioning only.
+        // The sole shell caller (`abort_provisioning`) aborts a spawn-in-flight
+        // op; the DSL guard narrows legality to `Provisioning` to keep the
+        // semantic boundary crisp.
+        transition AbortOp {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input AbortOp { operation_id, outcome, payload }
+            guard "op_registered" { self.op_statuses.contains_key(operation_id) }
+            guard "from_status_valid" {
+                self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Provisioning)
+            }
+            update {
+                self.op_statuses.insert(operation_id, OperationStatus::Aborted);
+                self.op_terminal_outcomes.insert(operation_id, outcome);
+                self.op_terminal_payload.insert(operation_id, payload);
+                self.active_op_count -= 1;
+            }
+            to Idle
+            emit SubmitOpEvent { operation_id: operation_id }
+            emit NotifyOpWatcher { operation_id: operation_id }
+        }
+
+        // PeerReadyOp: mark operation's peer as ready.
+        //
+        // The "only MobMemberChild ops expose a peer handoff" and
+        // "only once per op" decisions live in the DSL as guards, not in
+        // the shell. The shell classifies a guard rejection on
+        // `kind_is_mob_member_child` back into
+        // `OpsLifecycleError::PeerNotExpected`, and a rejection on
+        // `not_already_peer_ready` into `OpsLifecycleError::AlreadyPeerReady`
+        // via `classify_peer_ready_rejection`.
+        transition PeerReadyOp {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input PeerReadyOp { operation_id }
+            guard "op_registered" { self.op_statuses.contains_key(operation_id) }
+            guard "kind_is_mob_member_child" {
+                self.op_kinds.get_copied(operation_id) == Some(OperationKind::MobMemberChild)
+            }
+            guard "not_already_peer_ready" {
+                self.op_peer_ready.get_copied(operation_id) != Some(true)
+            }
+            guard "from_status_valid" {
+                self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Running)
+                || self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Retiring)
+            }
+            update {
+                self.op_peer_ready.insert(operation_id, true);
+            }
+            to Idle
+            emit SubmitOpEvent { operation_id: operation_id }
+        }
+
+        // ProgressReportedOp: progress tick (Running|Retiring only).
+        transition ProgressReportedOp {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ProgressReportedOp { operation_id }
+            guard "op_registered" { self.op_statuses.contains_key(operation_id) }
+            guard "from_status_valid" {
+                self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Running)
+                || self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Retiring)
+            }
+            update {
+                self.op_progress_counts.increment(operation_id, 1);
+            }
+            to Idle
+            emit SubmitOpEvent { operation_id: operation_id }
+        }
+
+        // RetireRequestedOp: Running -> Retiring (non-terminal).
+        transition RetireRequestedOp {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RetireRequestedOp { operation_id }
+            guard "op_registered" { self.op_statuses.contains_key(operation_id) }
+            guard "from_status_valid" {
+                self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Running)
+            }
+            update {
+                self.op_statuses.insert(operation_id, OperationStatus::Retiring);
+            }
+            to Idle
+            emit SubmitOpEvent { operation_id: operation_id }
+        }
+
+        // RetireCompletedOp: terminal retirement (Running|Retiring -> Retired).
+        transition RetireCompletedOp {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RetireCompletedOp { operation_id, outcome, payload }
+            guard "op_registered" { self.op_statuses.contains_key(operation_id) }
+            guard "from_status_valid" {
+                self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Running)
+                || self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Retiring)
+            }
+            update {
+                self.op_statuses.insert(operation_id, OperationStatus::Retired);
+                self.op_terminal_outcomes.insert(operation_id, outcome);
+                self.op_terminal_payload.insert(operation_id, payload);
+                self.active_op_count -= 1;
+            }
+            to Idle
+            emit SubmitOpEvent { operation_id: operation_id }
+            emit NotifyOpWatcher { operation_id: operation_id }
+        }
+
+        // TerminateOp: bulk-terminate variant used by owner-terminated cascade.
+        // Shell loops across non-terminal ops (mechanical cursor) and issues
+        // one TerminateOp per op; the session lock provides cascade atomicity.
+        // The "is this op terminal-able?" decision lives in the DSL guard —
+        // terminal-state TerminateOp is a guard rejection, surfaced to the
+        // caller via `classify_op_rejection` as `InvalidTransition`.
+        transition TerminateOp {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input TerminateOp { operation_id, outcome, payload }
+            guard "op_registered" { self.op_statuses.contains_key(operation_id) }
+            guard "from_status_valid" {
+                self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Provisioning)
+                || self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Running)
+                || self.op_statuses.get_copied(operation_id) == Some(OperationStatus::Retiring)
+            }
+            update {
+                self.op_statuses.insert(operation_id, OperationStatus::Terminated);
+                self.op_terminal_outcomes.insert(operation_id, outcome);
+                self.op_terminal_payload.insert(operation_id, payload);
+                self.active_op_count -= 1;
+            }
+            to Idle
+            emit SubmitOpEvent { operation_id: operation_id }
+            emit NotifyOpWatcher { operation_id: operation_id }
+        }
+
+        // RequestWaitAll: activate wait-all barrier with explicit membership.
+        // `wait_request_id`, `wait_operation_ids`, and the typed
+        // `wait_operation_id_tokens` handoff payload are DSL-owned; shell must
+        // not mirror them as canonical truth.
+        transition RequestWaitAll {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RequestWaitAll { wait_request_id, operation_ids, operation_id_tokens }
+            update {
+                self.wait_active = true;
+                self.wait_request_id = Some(wait_request_id);
+                self.wait_operation_ids = operation_ids;
+                self.wait_operation_id_tokens = operation_id_tokens;
+            }
+            to Idle
+        }
+
+        // SatisfyWaitAll: deactivate wait-all barrier once every member of
+        // `wait_operation_ids` has reached a terminal status. The
+        // "all members terminal" decision lives in the DSL guard — the
+        // shell no longer pre-computes the verdict before firing this input.
+        // A guard rejection under `wait_is_active` means the barrier wasn't
+        // active; a rejection under `all_members_terminal` means the shell
+        // fired early. Callers drive satisfaction by firing this input on
+        // each op terminalization; the guard serves as the fixed point.
+        transition SatisfyWaitAll {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input SatisfyWaitAll
+            guard "wait_is_active" { self.wait_active == true }
+            guard "all_members_terminal" {
+                for_all(member_id in self.wait_operation_ids,
+                    self.op_statuses.get_copied(member_id) == Some(OperationStatus::Completed)
+                    || self.op_statuses.get_copied(member_id) == Some(OperationStatus::Failed)
+                    || self.op_statuses.get_copied(member_id) == Some(OperationStatus::Aborted)
+                    || self.op_statuses.get_copied(member_id) == Some(OperationStatus::Cancelled)
+                    || self.op_statuses.get_copied(member_id) == Some(OperationStatus::Retired)
+                    || self.op_statuses.get_copied(member_id) == Some(OperationStatus::Terminated))
+            }
+            update {
+                self.wait_active = false;
+            }
+            to Idle
+            emit WaitAllSatisfied {
+                wait_request_id: self.wait_request_id.get("value"),
+                operation_ids: self.wait_operation_id_tokens
+            }
+        }
+
+        // CancelWaitAll: clear the wait-all barrier without the terminality
+        // check. Fired by the shell on `wait_all` future drop; the
+        // satisfaction obligation is NOT emitted because no authority
+        // resolved the request. Idempotent on an already-cleared barrier.
+        transition CancelWaitAll {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input CancelWaitAll
+            guard "wait_is_active" { self.wait_active == true }
+            update {
+                self.wait_active = false;
+                self.wait_request_id = None;
+                self.wait_operation_ids = EmptySet;
+                self.wait_operation_id_tokens = EmptySet;
+            }
+            to Idle
+        }
+
+        // =====================================================================
+        // Absorbed substate transitions — Comms Drain
+        // =====================================================================
+
+        // SpawnDrain: start a drain task
+        transition SpawnDrain {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input SpawnDrain { mode }
+            guard "drain_can_spawn" { self.drain_phase == DrainPhase::Inactive || self.drain_phase == DrainPhase::Stopped || self.drain_phase == DrainPhase::ExitedRespawnable }
+            update {
+                self.drain_phase = DrainPhase::Running;
+                self.drain_mode = Some(mode);
+            }
+            to Idle
+            emit SpawnDrainTask
+        }
+
+        // StopDrain: stop the running drain
+        transition StopDrain {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input StopDrain
+            guard "drain_is_running" { self.drain_phase == DrainPhase::Running }
+            update {
+                self.drain_phase = DrainPhase::Stopped;
+            }
+            to Idle
+        }
+
+        // DrainExitedClean: drain exited cleanly, reset to inactive
+        transition DrainExitedClean {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input DrainExitedClean
+            update {
+                self.drain_phase = DrainPhase::Inactive;
+                self.drain_mode = None;
+            }
+            to Idle
+        }
+
+        // DrainExitedRespawnable: drain exited but can be respawned
+        transition DrainExitedRespawnable {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input DrainExitedRespawnable
+            update {
+                self.drain_phase = DrainPhase::ExitedRespawnable;
+            }
+            to Idle
+        }
+
+        // =====================================================================
+        // Absorbed substate transitions — Visibility
+        // =====================================================================
+
+        // StageVisibilityFilter: stage a new tool filter; DSL mints the new
+        // staged-revision token via `next_staged_visibility_revision`
+        // (dogma round 4, wave 2b #12 — single-owner monotonic). The shell
+        // reads the minted value back via
+        // `MeerkatMachine::stage_session_dsl_input_with_minted_revision`.
+        transition StageVisibilityFilter {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input StageVisibilityFilter { filter }
+            update {
+                self.next_staged_visibility_revision = self.next_staged_visibility_revision + 1;
+                self.staged_filter = filter;
+                self.staged_visibility_revision = self.next_staged_visibility_revision;
+            }
+            to Idle
+            emit RefreshVisibleSurfaceSet { snapshot_epoch: self.snapshot_epoch }
+        }
+
+        // CommitVisibilityFilter: promote staged filter to active
+        transition CommitVisibilityFilter {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input CommitVisibilityFilter { filter, revision }
+            update {
+                self.active_filter = filter;
+                self.active_visibility_revision = revision;
+            }
+            to Idle
+            emit RefreshVisibleSurfaceSet { snapshot_epoch: self.snapshot_epoch }
+        }
+
+        // StageDeferredNames: stage a set of deferred tool names; DSL mints
+        // the new staged-revision token via `next_staged_visibility_revision`
+        // (dogma round 4, wave 2b #12). Shell reads the minted value back.
+        transition StageDeferredNames {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input StageDeferredNames { names }
+            update {
+                self.next_staged_visibility_revision = self.next_staged_visibility_revision + 1;
+                self.staged_deferred_names = names;
+                self.staged_visibility_revision = self.next_staged_visibility_revision;
+            }
+            to Idle
+            emit RefreshVisibleSurfaceSet { snapshot_epoch: self.snapshot_epoch }
+        }
+
+        // CommitDeferredNames: promote staged deferred names to active
+        transition CommitDeferredNames {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input CommitDeferredNames { names }
+            update {
+                self.active_deferred_names = names;
+            }
+            to Idle
+            emit RefreshVisibleSurfaceSet { snapshot_epoch: self.snapshot_epoch }
+        }
+
+        // SyncVisibilityRevisions: external-install water-mark reconciliation.
+        // Fired by the shell whenever an external durable visibility state is
+        // installed (recovery, cross-session hot-swap, LLM reconfigure). Keeps
+        // the DSL monotonic counter honest against externally-minted revisions
+        // so subsequent `StageVisibilityFilter` / `StageDeferredNames` mints
+        // continue advancing from the high-water mark rather than the DSL's
+        // local 0.
+        //
+        // Typed idempotence via guard: the transition fires only when at
+        // least one of the installed revisions exceeds the counter. When
+        // both revisions are at or below the counter (e.g., fresh-build
+        // with default-zero visibility state on a never-advanced counter,
+        // or recovery replay of a state the DSL already reflects), the
+        // guard rejects and the caller sees `Ok(false)` — no shell-side
+        // input-value pre-check, no silent no-op update.
+        transition SyncVisibilityRevisions {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input SyncVisibilityRevisions { active_revision, staged_revision }
+            guard "counter_advances" {
+                active_revision > self.next_staged_visibility_revision
+                || staged_revision > self.next_staged_visibility_revision
+            }
+            update {
+                if active_revision > self.next_staged_visibility_revision {
+                    self.next_staged_visibility_revision = active_revision;
+                }
+                if staged_revision > self.next_staged_visibility_revision {
+                    self.next_staged_visibility_revision = staged_revision;
+                }
+            }
+            to Idle
         }
 
         // =====================================================================
@@ -2739,6 +6230,10 @@ machine! {
             to Idle
         }
 
+        // Wave-c C-9c R4: overlay → DSL input that records the current
+        // reconnect-cycle attempt count and next-retry deadline so
+        // `project_realtime_attachment_status` can surface them to
+        // RPC/MCP `realtime/status` responders.
         transition ProjectRealtimeReconnectProgress {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input ProjectRealtimeReconnectProgress { attempt_count, next_retry_at_ms, deadline_at_ms }
@@ -2756,6 +6251,9 @@ machine! {
             }
         }
 
+        // Wave-c C-9c R4: reset the reconnect-progress fields. Shell fires
+        // this when the overlay clears (successful reconnect, operator
+        // detach, or non-reconnecting lifecycle transition).
         transition ClearRealtimeReconnectProgress {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input ClearRealtimeReconnectProgress
@@ -2771,6 +6269,128 @@ machine! {
                 next_retry_at_ms: None,
                 deadline_at_ms: None,
             }
+        }
+
+        // =====================================================================
+        // Live-topology reconfigure transitions
+        // =====================================================================
+
+        transition BeginLiveTopologyReconfigure {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input BeginLiveTopologyReconfigure { authority_epoch }
+            guard "session_registered" { self.session_id != None }
+            guard "authority_matches_current" { self.realtime_binding_authority_epoch == Some(authority_epoch) }
+            guard "topology_idle" { self.live_topology_phase == LiveTopologyPhase::Idle }
+            update {
+                self.live_topology_phase = LiveTopologyPhase::Reconfiguring;
+            }
+            to Idle
+            emit LiveTopologyPhaseChanged
+        }
+
+        // MarkLiveTopologyDetached is the "safe to detach" gate. It rejects
+        // while the runtime is mid-primitive (turn_phase != Ready && !=
+        // DrainingBoundary). A shell retry loop applies this input until the
+        // DSL accepts, encoding the "wait for next natural boundary" invariant
+        // at the DSL layer rather than in shell polling of current_run_id.
+        //
+        // **Catalog/runtime divergence (intentional):** the catalog DSL
+        // (`meerkat-machine-schema/src/catalog/dsl/meerkat_machine.rs`) does
+        // not model `turn_phase` and conservatively guards on
+        // `current_run_id == None` instead. That is a strict over-
+        // approximation of this guard: every catalog trace is admissible
+        // here, so invariants proven by TLC against the catalog hold in
+        // production. The runtime can additionally detach at
+        // `DrainingBoundary` mid-run, which TLC does not exercise.
+        transition MarkLiveTopologyDetached {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input MarkLiveTopologyDetached
+            guard "session_registered" { self.session_id != None }
+            guard "topology_reconfiguring" { self.live_topology_phase == LiveTopologyPhase::Reconfiguring }
+            guard "turn_at_safe_boundary" {
+                self.turn_phase == TurnPhase::Ready
+                || self.turn_phase == TurnPhase::DrainingBoundary
+                || self.turn_phase == TurnPhase::Completed
+                || self.turn_phase == TurnPhase::Failed
+                || self.turn_phase == TurnPhase::Cancelled
+            }
+            update {
+                self.live_topology_phase = LiveTopologyPhase::Detached;
+                self.realtime_binding_state = RealtimeBindingState::Unbound;
+                self.realtime_binding_authority_epoch = None;
+                self.realtime_reattach_required = false;
+                self.realtime_next_authority_epoch = self.realtime_next_authority_epoch + 1;
+            }
+            to Idle
+            emit LiveTopologyPhaseChanged
+        }
+
+        transition ApplyLiveTopologyIdentity {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ApplyLiveTopologyIdentity
+            guard "session_registered" { self.session_id != None }
+            guard "topology_detached" { self.live_topology_phase == LiveTopologyPhase::Detached }
+            update {
+                self.live_topology_phase = LiveTopologyPhase::HostIdentityApplied;
+            }
+            to Idle
+            emit LiveTopologyPhaseChanged
+        }
+
+        transition ApplyLiveTopologyVisibility {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ApplyLiveTopologyVisibility
+            guard "session_registered" { self.session_id != None }
+            guard "host_identity_applied" { self.live_topology_phase == LiveTopologyPhase::HostIdentityApplied }
+            update {
+                self.live_topology_phase = LiveTopologyPhase::HostVisibilityApplied;
+            }
+            to Idle
+            emit LiveTopologyPhaseChanged
+        }
+
+        transition CompleteLiveTopology {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input CompleteLiveTopology
+            guard "session_registered" { self.session_id != None }
+            guard "host_visibility_applied" { self.live_topology_phase == LiveTopologyPhase::HostVisibilityApplied }
+            update {
+                self.live_topology_phase = LiveTopologyPhase::Idle;
+            }
+            to Idle
+            emit LiveTopologyPhaseChanged
+        }
+
+        transition AbortLiveTopologyBeforeDetach {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input AbortLiveTopologyBeforeDetach
+            guard "session_registered" { self.session_id != None }
+            guard "topology_reconfiguring" { self.live_topology_phase == LiveTopologyPhase::Reconfiguring }
+            update {
+                self.live_topology_phase = LiveTopologyPhase::Idle;
+            }
+            to Idle
+            emit LiveTopologyPhaseChanged
+        }
+
+        transition FailLiveTopologyAfterDetach {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input FailLiveTopologyAfterDetach
+            guard "session_registered" { self.session_id != None }
+            guard "topology_past_detach" {
+                self.live_topology_phase == LiveTopologyPhase::Detached
+                || self.live_topology_phase == LiveTopologyPhase::HostIdentityApplied
+                || self.live_topology_phase == LiveTopologyPhase::HostVisibilityApplied
+            }
+            update {
+                self.live_topology_phase = LiveTopologyPhase::Idle;
+                self.realtime_binding_state = RealtimeBindingState::Unbound;
+                self.realtime_binding_authority_epoch = None;
+                self.realtime_reattach_required = true;
+                self.realtime_next_authority_epoch = self.realtime_next_authority_epoch + 1;
+            }
+            to Idle
+            emit LiveTopologyPhaseChanged
         }
 
         // =====================================================================
@@ -2811,9 +6431,6 @@ machine! {
             on input McpServerFailed { server_id, error }
             guard "session_registered" { self.session_id != None }
             update {
-                // The catalog DSL cannot carry payloads on enum state
-                // variants, so the error detail lives on the input and the
-                // emitted effect; state just records the `Failed` category.
                 self.mcp_server_states.insert(server_id, McpServerState::Failed);
             }
             to Idle
@@ -2836,8 +6453,8 @@ machine! {
             on input McpServerReload { server_id }
             guard "session_registered" { self.session_id != None }
             update {
-                // Reload moves the server back to PendingConnect; the shell is
-                // expected to tear down the prior connection and drive a fresh
+                // Reload moves the server back to PendingConnect; the shell
+                // tears down the prior connection and drives a fresh
                 // Connected / Failed transition on completion.
                 self.mcp_server_states.insert(server_id, McpServerState::PendingConnect);
             }
@@ -2849,6 +6466,16 @@ machine! {
         // =====================================================================
         // Peer interaction lifecycle transitions (W1-A / issue #264)
         // =====================================================================
+        //
+        // The shell fires these inputs on outbound peer-request send, progress
+        // / terminal response arrival, timeouts, and the mirror inbound
+        // lifecycle. Terminal-shaped transitions (`*Terminal`, `*TimedOut`,
+        // `Replied`) remove their corr_id from the state map and emit
+        // `PeerInteractionCleanup` / `InboundPeerInteractionStateChanged`,
+        // so subsequent double-terminal inputs are rejected at the
+        // `contains_key` guard — the projection invariant
+        // "channel live iff corr_id ∈ pending" is enforced by the DSL, not by
+        // shell discipline.
 
         transition PeerRequestSent {
             per_phase [Idle, Attached, Running, Retired, Stopped]
@@ -2932,9 +6559,23 @@ machine! {
             emit InboundPeerInteractionStateChanged { corr_id: corr_id, new_state: InboundPeerRequestState::Replied }
         }
 
-        // Session-context advancement (W2-E / issue #264). Monotonic guard
-        // filters out duplicate or out-of-order ticks at the DSL layer so
-        // callers fire unconditionally after any mutation.
+        // Session-context advancement transition (W2-E / issue #264).
+        //
+        // Fires at every shell site that mutates canonical session truth —
+        // prompt append, external content injection, tool-result append,
+        // external assistant output, runtime-system-context append, and the
+        // tail of any turn that advances the session's `updated_at`
+        // watermark. Monotonic: the guard rejects any advance whose
+        // `updated_at_ms` is not strictly greater than the last recorded
+        // watermark. This lets the shell apply the transition
+        // unconditionally post-mutation; duplicate or out-of-order ticks are
+        // filtered by the DSL, not by the caller.
+        //
+        // Advancing transitions emit `SessionContextAdvanced { updated_at_ms }`
+        // which the realtime projection consumer reads via an installed
+        // `SessionContextAdvancedObserver` to drive its typed
+        // `ProjectionFreshness` state. No polling, no watch channel, no
+        // hand-maintained `projection_refresh_dirty` flag.
         transition AdvanceSessionContext {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input AdvanceSessionContext { updated_at_ms }
@@ -2949,6 +6590,13 @@ machine! {
         // =====================================================================
         // Interaction stream lifecycle transitions (U6 / dogma #5)
         // =====================================================================
+        //
+        // The shell fires these inputs on reservation, attach, terminal
+        // completion, TTL expiry, and consumer drop. Active (non-terminal)
+        // states stay in the map; terminal transitions remove the entry and
+        // emit `InteractionStreamCleanup` so the shell drops the matching
+        // channel projection. Re-attach after terminal is rejected by the
+        // `not_already_present` / `is_reserved` guards.
 
         transition InteractionStreamReserved {
             per_phase [Idle, Attached, Running, Retired, Stopped]
@@ -3011,9 +6659,20 @@ machine! {
         }
 
         // =====================================================================
-        // Realtime product-turn lifecycle transitions (U9 / dogma #4)
+        // Realtime product-turn lifecycle (U9 / dogma #4)
         // =====================================================================
+        //
+        // Five-phase lifecycle: Idle → AwaitingProgress → {Committed,
+        // OutputStarted} → Preemptible → Idle. Each transition is guarded
+        // on the source phase(s) for which it advances; idempotent fires
+        // (e.g., `ProductTurnCommitted` when already `Committed` or
+        // `Preemptible`) are guard-rejected and surfaced as `Ok(false)` by
+        // the runtime handle, so the realtime-WS shell can fire
+        // unconditionally on every observed provider-session event without
+        // tracking its own phase.
 
+        // Input accepted — only meaningful from Idle. In-flight inputs on
+        // live turns do not rewind the phase.
         transition ProductTurnInFlight {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input ProductTurnInFlight
@@ -3027,6 +6686,8 @@ machine! {
             emit RealtimeProductTurnPhaseChanged { new_phase: RealtimeProductTurnPhase::AwaitingProgress }
         }
 
+        // `TurnCommitted` arrived from the provider. Valid from
+        // AwaitingProgress (→ Committed) and OutputStarted (→ Preemptible).
         transition ProductTurnCommittedFromAwaiting {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input ProductTurnCommitted
@@ -3053,6 +6714,8 @@ machine! {
             emit RealtimeProductTurnPhaseChanged { new_phase: RealtimeProductTurnPhase::Preemptible }
         }
 
+        // Output delta / tool call arrived. Valid from AwaitingProgress
+        // (→ OutputStarted) and Committed (→ Preemptible).
         transition ProductOutputStartedFromAwaiting {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input ProductOutputStarted
@@ -3079,6 +6742,10 @@ machine! {
             emit RealtimeProductTurnPhaseChanged { new_phase: RealtimeProductTurnPhase::Preemptible }
         }
 
+        // Interrupt clears the "output-started" milestone without tearing
+        // down the turn. Preemptible → Committed; OutputStarted →
+        // AwaitingProgress. Idempotent from Idle / AwaitingProgress /
+        // Committed is handled by the monotonic pair below.
         transition ProductTurnInterruptedFromPreemptible {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input ProductTurnInterrupted
@@ -3105,6 +6772,8 @@ machine! {
             emit RealtimeProductTurnPhaseChanged { new_phase: RealtimeProductTurnPhase::AwaitingProgress }
         }
 
+        // Logical-turn terminal. Rewinds any active phase back to Idle.
+        // Idempotent from Idle is rejected by the guard.
         transition ProductTurnTerminal {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input ProductTurnTerminal
@@ -3121,7 +6790,16 @@ machine! {
         // =====================================================================
         // Realtime projection freshness (dogma round 2, U-C / dogma #1, #3, #13, #20)
         // =====================================================================
+        //
+        // Canonical freshness state for the realtime provider session's
+        // projection relative to canonical session truth. Three transitions
+        // split on product-turn phase + current freshness to decide the next
+        // state; a fourth handles turn-end promotion.
 
+        // Observer tick arrived while the product turn is live — record the
+        // pending advance as `StaleDeferred` so barge-in continuity is
+        // preserved. Monotonic: rejects advances that don't surpass the
+        // current frontier.
         transition RealtimeProjectionAdvanceDuringTurn {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input RealtimeProjectionAdvanceObserved { advanced_at_ms }
@@ -3140,6 +6818,9 @@ machine! {
             }
         }
 
+        // Observer tick arrived while the product turn is idle — record the
+        // pending advance as `StaleImmediate` so the next drain site picks
+        // it up.
         transition RealtimeProjectionAdvanceWhileIdle {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input RealtimeProjectionAdvanceObserved { advanced_at_ms }
@@ -3158,6 +6839,19 @@ machine! {
             }
         }
 
+        // After a successful provider-session refresh drain (or at an
+        // own-turn commit that advanced the session-context watermark to
+        // `observed_ms`). Returns to `Clean` ONLY when `observed_ms`
+        // matches or exceeds the current frontier. If a concurrent
+        // external advance (e.g. a peer_response_terminal landing while
+        // our own turn was committing) already pushed the frontier above
+        // `observed_ms` via a `RealtimeProjectionAdvanceObserved` tick,
+        // the refresh is guard-rejected so the stale state at the higher
+        // frontier is preserved — the external advance still owes a
+        // refresh, and clobbering it here would drop the tick the next
+        // drain site depends on. This is the DSL-owned successor of the
+        // shell-side "preserve newer concurrent external advance" dance
+        // #299 introduced on the pre-U-C W2-E freshness state.
         transition RealtimeProjectionRefreshed {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input RealtimeProjectionRefreshed { observed_ms }
@@ -3181,6 +6875,14 @@ machine! {
             }
         }
 
+        // Re-seed `Clean` baseline on product-session close / error /
+        // reconnect. Monotonic in the same sense as `RealtimeProjectionRefreshed`:
+        // `baseline_ms` must not regress the frontier. If a newer observer
+        // tick transitioned the freshness to `StaleImmediate` / `StaleDeferred`
+        // at a higher frontier between the caller's read and this fire, the
+        // reset collapses to `Clean` at that higher frontier — the drain is
+        // about to re-enter via the product-session rebuild anyway, and
+        // regressing the frontier would drop a real advance.
         transition RealtimeProjectionReset {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input RealtimeProjectionReset { baseline_ms }
@@ -3204,7 +6906,16 @@ machine! {
         // =====================================================================
         // Realtime reconnect policy (dogma round 2, U-C / dogma #1, #3, #18, #20)
         // =====================================================================
+        //
+        // The DSL classifies what a clean provider-session close means for
+        // the realtime channel's reconnect behavior. Replaces the shell-local
+        // boolean pair (`client_has_submitted_input`,
+        // `last_turn_terminally_completed`).
 
+        // Client submitted work to the provider session — any subsequent
+        // clean close while this policy stands is a mid-work disconnect.
+        // Also promotes `StaleDeferred → StaleImmediate` at turn end is
+        // handled by `ClassifyRealtimeTurnTerminated`.
         transition ClassifyRealtimeClientInputSubmitted {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input ClassifyRealtimeClientInputSubmitted
@@ -3220,6 +6931,11 @@ machine! {
             }
         }
 
+        // Mid-turn activity on the provider session (e.g. a provider-issued
+        // tool call before a terminal turn completion) is not terminal, so
+        // flag the reconnect policy back to `ReattachAndRecover` if a prior
+        // terminal had already flipped us to `CleanExit`. Idempotent when
+        // already `ReattachAndRecover`.
         transition ClassifyRealtimeMidTurnActivity {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input ClassifyRealtimeMidTurnActivity
@@ -3235,6 +6951,11 @@ machine! {
             }
         }
 
+        // Logical turn reached a terminal stop reason — the session delivered
+        // the client's requested work. A subsequent clean close is a session
+        // finishing, not a mid-work drop. Also folds in the `StaleDeferred →
+        // StaleImmediate` promotion so the turn-end drain site picks up any
+        // pending async mutation.
         transition ClassifyRealtimeTurnTerminated {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input ClassifyRealtimeTurnTerminated
@@ -3259,123 +6980,7 @@ machine! {
         }
 
         // =====================================================================
-        // Live-topology reconfigure transitions
-        // =====================================================================
-
-        transition BeginLiveTopologyReconfigure {
-            per_phase [Idle, Attached, Running, Retired, Stopped]
-            on input BeginLiveTopologyReconfigure { authority_epoch }
-            guard "session_registered" { self.session_id != None }
-            guard "authority_matches_current" { self.realtime_binding_authority_epoch == Some(authority_epoch) }
-            guard "topology_idle" { self.live_topology_phase == LiveTopologyPhase::Idle }
-            update {
-                self.live_topology_phase = LiveTopologyPhase::Reconfiguring;
-            }
-            to Idle
-            emit LiveTopologyPhaseChanged
-        }
-
-        transition MarkLiveTopologyDetached {
-            per_phase [Idle, Attached, Running, Retired, Stopped]
-            on input MarkLiveTopologyDetached
-            guard "session_registered" { self.session_id != None }
-            guard "topology_reconfiguring" { self.live_topology_phase == LiveTopologyPhase::Reconfiguring }
-            // DSL-native "safe to detach now" guard.
-            //
-            // **Catalog/runtime divergence (intentional):** the runtime DSL
-            // (`meerkat-runtime/src/meerkat_machine/dsl.rs`) guards on the
-            // richer `turn_phase ∈ {Ready, DrainingBoundary, Completed,
-            // Failed, Cancelled}` set, which permits detach at the natural
-            // draining boundary mid-run. The catalog DSL is the TLC-facing
-            // twin and does not model `turn_phase`; it conservatively
-            // approximates "safe to detach" as "no run currently open"
-            // (`current_run_id == None`). This is a strict over-
-            // approximation: any TLC trace that exercises this transition
-            // under the catalog guard is also admissible under the runtime
-            // guard, so invariants proven here hold in production.
-            guard "no_active_run" { self.current_run_id == None }
-            update {
-                self.live_topology_phase = LiveTopologyPhase::Detached;
-                // Compose the detach into the binding authority.
-                self.realtime_binding_state = RealtimeBindingState::Unbound;
-                self.realtime_binding_authority_epoch = None;
-                self.realtime_reattach_required = false;
-                self.realtime_next_authority_epoch = self.realtime_next_authority_epoch + 1;
-            }
-            to Idle
-            emit LiveTopologyPhaseChanged
-        }
-
-        transition ApplyLiveTopologyIdentity {
-            per_phase [Idle, Attached, Running, Retired, Stopped]
-            on input ApplyLiveTopologyIdentity
-            guard "session_registered" { self.session_id != None }
-            guard "topology_detached" { self.live_topology_phase == LiveTopologyPhase::Detached }
-            update {
-                self.live_topology_phase = LiveTopologyPhase::HostIdentityApplied;
-            }
-            to Idle
-            emit LiveTopologyPhaseChanged
-        }
-
-        transition ApplyLiveTopologyVisibility {
-            per_phase [Idle, Attached, Running, Retired, Stopped]
-            on input ApplyLiveTopologyVisibility
-            guard "session_registered" { self.session_id != None }
-            guard "host_identity_applied" { self.live_topology_phase == LiveTopologyPhase::HostIdentityApplied }
-            update {
-                self.live_topology_phase = LiveTopologyPhase::HostVisibilityApplied;
-            }
-            to Idle
-            emit LiveTopologyPhaseChanged
-        }
-
-        transition CompleteLiveTopology {
-            per_phase [Idle, Attached, Running, Retired, Stopped]
-            on input CompleteLiveTopology
-            guard "session_registered" { self.session_id != None }
-            guard "host_visibility_applied" { self.live_topology_phase == LiveTopologyPhase::HostVisibilityApplied }
-            update {
-                self.live_topology_phase = LiveTopologyPhase::Idle;
-            }
-            to Idle
-            emit LiveTopologyPhaseChanged
-        }
-
-        transition AbortLiveTopologyBeforeDetach {
-            per_phase [Idle, Attached, Running, Retired, Stopped]
-            on input AbortLiveTopologyBeforeDetach
-            guard "session_registered" { self.session_id != None }
-            guard "topology_reconfiguring" { self.live_topology_phase == LiveTopologyPhase::Reconfiguring }
-            update {
-                self.live_topology_phase = LiveTopologyPhase::Idle;
-            }
-            to Idle
-            emit LiveTopologyPhaseChanged
-        }
-
-        transition FailLiveTopologyAfterDetach {
-            per_phase [Idle, Attached, Running, Retired, Stopped]
-            on input FailLiveTopologyAfterDetach
-            guard "session_registered" { self.session_id != None }
-            guard "topology_past_detach" {
-                self.live_topology_phase == LiveTopologyPhase::Detached
-                || self.live_topology_phase == LiveTopologyPhase::HostIdentityApplied
-                || self.live_topology_phase == LiveTopologyPhase::HostVisibilityApplied
-            }
-            update {
-                self.live_topology_phase = LiveTopologyPhase::Idle;
-                self.realtime_binding_state = RealtimeBindingState::Unbound;
-                self.realtime_binding_authority_epoch = None;
-                self.realtime_reattach_required = true;
-                self.realtime_next_authority_epoch = self.realtime_next_authority_epoch + 1;
-            }
-            to Idle
-            emit LiveTopologyPhaseChanged
-        }
-
-        // =====================================================================
-        // Peer-ingress transport capability ownership (W2-G)
+        // Peer-ingress transport capability ownership (W2-G / issue #264)
         // =====================================================================
 
         // AttachSessionIngress: valid from `Unattached`, or as an exact
@@ -3445,6 +7050,11 @@ machine! {
         // Supervisor-bridge authorization (Wave 3 D Row 21)
         // =====================================================================
 
+        // BindSupervisor: only valid from `Unbound`. The shell-side
+        // bootstrap gate (`validate_bind_request`) validates
+        // sender-authentication and bootstrap token before firing this
+        // input; the DSL owns the transition that flips the kind to
+        // `Bound` and records the canonical identity + epoch.
         transition BindSupervisor {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input BindSupervisor { name, peer_id, address, epoch }
@@ -3459,8 +7069,20 @@ machine! {
                 self.supervisor_bound_epoch = Some(epoch);
             }
             to Idle
+            emit PublishSupervisorTrustEdge {
+                peer_id: self.supervisor_bound_peer_id.get("value"),
+                name: self.supervisor_bound_name.get("value"),
+                address: self.supervisor_bound_address.get("value"),
+                signing_public_key: None,
+                epoch: self.supervisor_bound_epoch.get("value")
+            }
         }
 
+        // AuthorizeSupervisor: only valid from `Bound`. Rotates the
+        // current binding to a new supervisor + epoch. The shell-side
+        // gate (`validate_authorize_supervisor_request`) enforces that
+        // the rotation request is authenticated by the *current*
+        // supervisor before firing this input.
         transition AuthorizeSupervisor {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input AuthorizeSupervisor { name, peer_id, address, epoch }
@@ -3474,8 +7096,19 @@ machine! {
                 self.supervisor_bound_epoch = Some(epoch);
             }
             to Idle
+            emit PublishSupervisorTrustEdge {
+                peer_id: self.supervisor_bound_peer_id.get("value"),
+                name: self.supervisor_bound_name.get("value"),
+                address: self.supervisor_bound_address.get("value"),
+                signing_public_key: None,
+                epoch: self.supervisor_bound_epoch.get("value")
+            }
         }
 
+        // RevokeSupervisor: only valid from `Bound`. The epoch and
+        // peer_id must match the current binding exactly — a stale
+        // revoke for a superseded supervisor/epoch cannot tear down a
+        // freshly rotated binding.
         transition RevokeSupervisor {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input RevokeSupervisor { peer_id, epoch }
@@ -3496,24 +7129,16 @@ machine! {
                 self.supervisor_bound_epoch = None;
             }
             to Idle
+            emit RevokeSupervisorTrustEdge { peer_id: peer_id, epoch: epoch }
         }
 
-        // =====================================================================
-        // Supervisor-trust-edge feedback transitions (C-F2 / wave-d D-d)
-        // =====================================================================
+        // Supervisor-trust-edge feedback transitions (C-F2 / wave-d D-d).
         //
-        // Feedback acks for the `supervisor_trust_publish` /
-        // `supervisor_trust_revoke` handoff protocols. The realising shell
-        // (`comms_drain`) calls `Router::add_trusted_peer` /
-        // `remove_trusted_peer`, then stages one of these four inputs
-        // carrying the `epoch` it observed on the producer effect. Each
-        // transition is phase-preserving and guards on both `peer_id` and
-        // `epoch` matching the current binding — so an ack for epoch
-        // `N - 1` arriving after the binding has rotated to epoch `N` is
-        // rejected and the outstanding obligation stays open. The guards
-        // mirror the `supervisor_trust_bundle` composition's
-        // `correlation_fields = [peer_id, epoch]`.
-
+        // Each transition is phase-preserving and guards on both
+        // `peer_id` and `epoch` matching the current binding. An ack for
+        // epoch `N - 1` arriving after a rotation advanced the binding
+        // to epoch `N` is rejected by the DSL — the outstanding
+        // obligation stays open and the stale ack cannot satisfy it.
         transition SupervisorTrustEdgePublished {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input SupervisorTrustEdgePublished { peer_id, epoch }
@@ -3579,56 +7204,16 @@ machine! {
         }
 
         // =====================================================================
-        // Ops-barrier satisfaction (handoff feedback input)
-        // =====================================================================
-        //
-        // Delivered by the `ops_barrier_satisfaction` handoff protocol's
-        // submit helper once the realizing owner observes that every
-        // `operation_id` in the outstanding barrier has completed. The
-        // transition is a phase-preserving self-loop: the barrier is a
-        // correlation fact, not a phase mutation, and the runtime
-        // turn-state authority consumes the feedback through its own
-        // reducer via `TurnStateHandle::ops_barrier_satisfied(...)`.
-        //
-        // Keeping the transition present (rather than marking the input
-        // `surface_only`) lets the schema enforce the input-vs-transition
-        // coverage contract and gives TLC something concrete to cover.
-
-        transition OpsBarrierSatisfiedAttached {
-            on input OpsBarrierSatisfied { operation_ids }
-            guard { self.lifecycle_phase == Phase::Attached }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Attached
-        }
-        transition OpsBarrierSatisfiedRunning {
-            on input OpsBarrierSatisfied { operation_ids }
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "session_registered" { self.session_id != None }
-            update {}
-            to Running
-        }
-
-        // =====================================================================
         // Track-B (R5): peer-projection transitions.
         //
-        // Active session phases (`Idle`, `Attached`, `Running`) accept
-        // peer-projection mutations via `per_phase [...]`. Non-active
-        // phases (`Initializing`, `Retired`, `Stopped`, `Destroyed`)
-        // do not — the session is not participating in peer trust
-        // decisions outside the active phases.
-        //
-        // `per_phase` uses the DSL's multi-phase self-loop construct
-        // that expands into one transition per listed phase at macro
-        // expansion. Transitions are "to" the same phase they fired
-        // from.
+        // Valid in active session phases (`Idle`, `Attached`,
+        // `Running`). See catalog DSL for the full rationale and
+        // design notes. The `to Idle` clause is filler syntax —
+        // `per_phase` expansion overrides `to_phase` to the current
+        // phase (self-loop); the parser requires `to <Phase>` to be
+        // present.
         // =====================================================================
 
-        // PublishLocalEndpoint — no effective-peer-set change.
-        //
-        // The `to Idle` is filler syntax: `per_phase` expansion
-        // overrides `to_phase` to each listed phase (self-loop), but
-        // the parser still requires the `to <Phase>` clause.
         transition PublishLocalEndpoint {
             per_phase [Idle, Attached, Running]
             on input PublishLocalEndpoint { endpoint }
@@ -3639,7 +7224,6 @@ machine! {
             emit LocalEndpointChanged { endpoint: Some(endpoint) }
         }
 
-        // ClearLocalEndpoint — guarded on Some(endpoint) being present.
         transition ClearLocalEndpoint {
             per_phase [Idle, Attached, Running]
             on input ClearLocalEndpoint
@@ -3651,8 +7235,6 @@ machine! {
             emit LocalEndpointChanged { endpoint: None }
         }
 
-        // AddDirectPeerEndpoint — direct set update, epoch bump,
-        // reconcile effect.
         transition AddDirectPeerEndpoint {
             per_phase [Idle, Attached, Running]
             on input AddDirectPeerEndpoint { endpoint }
@@ -3666,7 +7248,6 @@ machine! {
             emit CommsTrustReconcileRequested { peer_projection_epoch: self.peer_projection_epoch }
         }
 
-        // RemoveDirectPeerEndpoint — direct set removal.
         transition RemoveDirectPeerEndpoint {
             per_phase [Idle, Attached, Running]
             on input RemoveDirectPeerEndpoint { endpoint }
@@ -3680,18 +7261,6 @@ machine! {
             emit CommsTrustReconcileRequested { peer_projection_epoch: self.peer_projection_epoch }
         }
 
-        // ApplyMobPeerOverlay — stale-epoch guard on the overlay-
-        // specific `mob_overlay_epoch`, wholesale overlay replacement.
-        // The guard uses `>` (strictly-newer) rather than `>=` so
-        // repeat application of the same epoch is rejected (the
-        // driver's epoch counter already suppresses no-op dispatches;
-        // any re-delivery at the same epoch is a retry-bug on the
-        // transport layer, not a legitimate state change).
-        //
-        // Both epochs bump on a successful apply: `mob_overlay_epoch`
-        // tracks overlay-specific freshness (used by the guard),
-        // `peer_projection_epoch` tracks general effective-set changes
-        // (carried in `CommsTrustReconcileRequested`).
         transition ApplyMobPeerOverlay {
             per_phase [Idle, Attached, Running]
             on input ApplyMobPeerOverlay { epoch, endpoints }
@@ -3707,480 +7276,7 @@ machine! {
         }
     }
 }
-
-// =====================================================================
-// Stub types for compilation
-// =====================================================================
-
-macro_rules! stub_newtype {
-    ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-        pub struct $name(pub String);
-        impl<T: Into<String>> From<T> for $name {
-            fn from(s: T) -> Self {
-                Self(s.into())
-            }
-        }
     };
 }
 
-macro_rules! stub_u64_newtype {
-    ($name:ident) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-        pub struct $name(pub u64);
-        impl From<u64> for $name {
-            fn from(value: u64) -> Self {
-                Self(value)
-            }
-        }
-    };
-}
-
-stub_newtype!(SessionId);
-stub_newtype!(AgentRuntimeId);
-stub_u64_newtype!(FenceToken);
-stub_newtype!(RunId);
-stub_newtype!(InputId);
-stub_newtype!(WorkId);
-stub_newtype!(WaitRequestId);
-stub_newtype!(OperationId);
-stub_newtype!(SessionLlmIdentity);
-stub_newtype!(SessionToolVisibilityState);
-stub_newtype!(SessionLlmCapabilitySurface);
-/// Typed capability-surface resolution status. Closed mirror of
-/// `meerkat_runtime::meerkat_machine_types::SessionLlmCapabilitySurfaceStatus` —
-/// replaces the former `stub_newtype!` stringly wrapper the catalog DSL
-/// carried for the two-state discriminant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum SessionLlmCapabilitySurfaceStatus {
-    Resolved,
-    #[default]
-    Unresolved,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum SurfaceDeltaOperation {
-    #[default]
-    None,
-    Add,
-    Remove,
-    Reload,
-}
-
-stub_newtype!(SurfaceId);
-stub_u64_newtype!(TurnNumber);
-stub_u64_newtype!(BoundarySequence);
-stub_newtype!(SessionToolVisibilityDelta);
-stub_newtype!(ToolFilter);
-stub_newtype!(ToolVisibilityWitness);
-stub_u64_newtype!(Generation);
-
-pub use crate::types::{CommsRuntimeId, McpServerId, MobId, PeerCorrelationId};
-
-/// Typed outbound peer-request state (catalog DSL twin).
-///
-/// Unit variants only: failure reason and terminal disposition travel on the
-/// companion fields of the DSL input / effect, not in the enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum OutboundPeerRequestState {
-    #[default]
-    Sent,
-    AcceptedProgress,
-    Completed,
-    Failed,
-    TimedOut,
-}
-
-/// Typed inbound peer-request state (catalog DSL twin).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum InboundPeerRequestState {
-    #[default]
-    Received,
-    Replied,
-}
-
-/// Typed terminal disposition for an outbound peer response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum PeerTerminalDisposition {
-    #[default]
-    Completed,
-    Failed,
-}
-
-/// Typed lifecycle state of an interaction stream reservation (catalog DSL twin).
-///
-/// Owns whether a reserved subscriber/stream channel is still claimable
-/// (`Reserved`), live with an attached consumer (`Attached`), or terminal
-/// (`Completed`, `Expired`, `ClosedEarly`). The shell-side
-/// `interaction_stream_registry` projects channels off this map; TTL is
-/// shell-owned mechanics, while every state transition is DSL truth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum InteractionStreamState {
-    #[default]
-    Reserved,
-    Attached,
-    Completed,
-    Expired,
-    ClosedEarly,
-}
-
-/// Per-server MCP connection lifecycle state.
-///
-/// Unit variants only: the catalog DSL (TLC-facing twin) does not model
-/// variant payloads in state. The `Failed` category is carried through the
-/// `McpServerFailed` input and the `McpServerStateChanged` effect with an
-/// `error: String` companion field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum McpServerState {
-    #[default]
-    PendingConnect,
-    Connected,
-    Failed,
-    Disconnected,
-}
-
-/// Per-session realtime binding-state lifecycle.
-///
-/// Unit variants only — this enum models the binding-state machine as a
-/// closed set of phases carried inside `MeerkatMachine` state. The default
-/// (`Unbound`) is paired with `realtime_binding_authority_epoch == None`
-/// by the `realtime_binding_epoch_consistency` invariant.
-///
-/// Default serde tagging reuses the variant names as string values
-/// (`"Unbound"`, `"BindingNotReady"`, `"BindingReady"`, `"ReplacementPending"`)
-/// to preserve wire-format compatibility with earlier stringly-typed clients.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum RealtimeBindingState {
-    #[default]
-    Unbound,
-    BindingNotReady,
-    BindingReady,
-    ReplacementPending,
-}
-
-/// Product-turn lifecycle phase for a provider-managed realtime session
-/// (U9 / dogma #4).
-///
-/// Unit variants — collapses the old shell-local boolean triple
-/// (`product_turn_in_flight`, `product_turn_committed`,
-/// `product_output_started`) into a closed five-phase lifecycle owned
-/// by the DSL. The `Preemptible` phase corresponds exactly to the "both
-/// committed and output-started" conjunction that the realtime shell
-/// used to compute via `should_preempt_product_turn_on_input`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum RealtimeProductTurnPhase {
-    #[default]
-    Idle,
-    AwaitingProgress,
-    Committed,
-    OutputStarted,
-    Preemptible,
-}
-
-/// Realtime provider-session projection freshness (dogma round 2, U-C /
-/// dogma #1, #3, #13, #20).
-///
-/// Catalog twin of [`crate::meerkat_machine::dsl::RealtimeProjectionFreshness`].
-/// Unit variants — the frontier watermark is carried in the companion
-/// state field `realtime_projection_frontier_ms`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum RealtimeProjectionFreshness {
-    #[default]
-    Clean,
-    StaleDeferred,
-    StaleImmediate,
-}
-
-/// Realtime reconnect-policy classification (dogma round 2, U-C /
-/// dogma #1, #3, #18, #20).
-///
-/// Catalog twin of [`crate::meerkat_machine::dsl::RealtimeReconnectPolicy`].
-/// Replaces the shell-local boolean pair (`client_has_submitted_input`,
-/// `last_turn_terminally_completed`) with a typed classification owned by
-/// the DSL.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum RealtimeReconnectPolicy {
-    #[default]
-    CleanExit,
-    ReattachAndRecover,
-}
-
-/// Peer-ingress transport capability ownership kind (W2-G / issue #264).
-///
-/// Unit variants — the DSL's tagged-union encoding pairs this kind with the
-/// companion fields `peer_ingress_comms_runtime_id` and
-/// `peer_ingress_mob_id`; the `peer_ingress_owner_consistency` invariant
-/// enforces pairing. Silent downgrade `MobOwned` → `SessionOwned` is
-/// impossible by construction: `AttachSessionIngress` only fires from
-/// `Unattached`, and `AttachMobIngress` permits promotion from
-/// `Unattached` or `SessionOwned` but never the reverse.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum PeerIngressOwnerKind {
-    #[default]
-    Unattached,
-    SessionOwned,
-    MobOwned,
-}
-
-/// Supervisor-bridge authorization kind (Wave 3 D Row 21).
-///
-/// Paired with `supervisor_bound_{name, peer_id, address, epoch}` in DSL
-/// state; `supervisor_binding_consistency` enforces pairing. Rotation is
-/// structural: `BindSupervisor` requires `Unbound`; `AuthorizeSupervisor`
-/// requires `Bound`; `RevokeSupervisor` requires `Bound` and returns to
-/// `Unbound`. Before Wave 3 D this fact lived as an `Option<AuthorizedSupervisorState>`
-/// on the comms drain task's stack — the identity and epoch of the
-/// authorized supervisor were helper-local while the corresponding trust
-/// edge was router-owned. Moving the authorization discriminant + epoch
-/// into DSL state collapses that split ownership.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum SupervisorBindingKind {
-    #[default]
-    Unbound,
-    Bound,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum OperationKind {
-    #[default]
-    ToolCall,
-    Completion,
-}
-
-/// Typed input-lifecycle phase (catalog DSL twin). Closed set of lifecycle
-/// phases written by input authority transitions and recovered through the
-/// machine-owned `RecoverInputLifecycle` input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum InputPhase {
-    #[default]
-    Queued,
-    Staged,
-    Applied,
-    AppliedPendingConsumption,
-    Consumed,
-    Superseded,
-    Coalesced,
-    Abandoned,
-}
-
-/// Typed input terminal kind (catalog DSL twin). Variant-specific payloads
-/// live in companion fields so the discriminant remains a closed set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum InputTerminalKind {
-    #[default]
-    Consumed,
-    Superseded,
-    Coalesced,
-    Abandoned,
-}
-
-/// Typed input abandon reason (catalog DSL twin).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum InputAbandonReason {
-    #[default]
-    StageAttemptsExceeded,
-    ReplacedByNewer,
-    RuntimeReset,
-    RuntimeRetired,
-}
-
-/// Typed work-lane membership for admitted inputs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum InputLane {
-    #[default]
-    Queue,
-    Steer,
-}
-
-/// Live-topology reconfigure phase (catalog DSL twin of the runtime
-/// `LiveTopologyPhase`). Closed set of phases the LLM-identity-swap pipeline
-/// progresses through; the `realtime_binding_*` invariants pair it with the
-/// binding authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum LiveTopologyPhase {
-    #[default]
-    Idle,
-    Reconfiguring,
-    Detached,
-    HostIdentityApplied,
-    HostVisibilityApplied,
-}
-
-/// Typed work-lane origin for [`MeerkatMachineInput::Ingest`]. Structural
-/// mirror of `MobMachine.WorkOrigin` so the cross-machine composition seam
-/// binds on a single typed enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum WorkOrigin {
-    #[default]
-    External,
-    Internal,
-    /// Canonical admission entrypoint fired by the runtime control plane
-    /// with no surface-level transport or work-lane label.
-    Ingest,
-}
-
-/// Typed runtime notice classifier for the `RuntimeNotice` effect (catalog
-/// DSL twin). Closed set of per-transition runtime lifecycle markers
-/// emitted by the runtime-control plane so the shell dispatcher matches
-/// exhaustively on a typed discriminant instead of comparing string
-/// literals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum RuntimeNoticeKind {
-    #[default]
-    Drain,
-    Reset,
-    Stop,
-    Exit,
-    Recover,
-}
-
-/// Typed admission-signal classifier for the `PostAdmissionSignal` effect
-/// (catalog DSL twin). Closed set of post-admission wake/interrupt intents
-/// emitted by the ingress authority so the shell dispatcher matches
-/// exhaustively on a typed discriminant instead of comparing string
-/// literals. Mirrors the runtime-side twin at
-/// `meerkat-runtime/src/meerkat_machine/dsl.rs::PostAdmissionSignalKind`;
-/// the shell-side `driver::ephemeral::PostAdmissionSignal` enum
-/// additionally carries a `None` bottom that the DSL never emits, so only
-/// the three emitted variants appear here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum PostAdmissionSignalKind {
-    #[default]
-    WakeLoop,
-    InterruptYielding,
-    RequestImmediateProcessing,
-}
-
-/// Track-B (R5) / wave-c C-6r: typed declarative peer endpoint descriptor.
-///
-/// Carries the fields the comms runtime needs to install a
-/// trusted peer: `name` (human-readable display slug), `peer_id`
-/// (Ed25519 pubkey-derived UUIDv5), `address` (transport URL), and
-/// `signing_key` (Ed25519 public key bytes used for envelope
-/// verification).
-/// Wave-c C-6r retypes the fields from bare `String` to typed
-/// newtypes — `PeerName`, `PeerId`, `PeerAddress`,
-/// `PeerSigningKey` — mirroring the runtime-side twin at
-/// `meerkat-runtime/src/meerkat_machine/dsl.rs::PeerEndpoint`. The
-/// two copies are required to stay structurally equivalent;
-/// the `peer_endpoint_structural_equivalence` tripwire in this
-/// crate's test harness asserts typed fields at both sites.
-///
-/// Equality is component-wise. `PartialOrd` + `Ord` enable
-/// `BTreeSet<PeerEndpoint>` storage; `Hash` is retained for
-/// `HashSet` use at call sites that prefer it.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct PeerEndpoint {
-    pub name: PeerName,
-    pub peer_id: PeerId,
-    pub address: PeerAddress,
-    pub signing_key: PeerSigningKey,
-}
-
-impl PeerEndpoint {
-    pub fn new(
-        name: impl Into<PeerName>,
-        peer_id: impl Into<PeerId>,
-        address: impl Into<PeerAddress>,
-        signing_key: impl Into<PeerSigningKey>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            peer_id: peer_id.into(),
-            address: address.into(),
-            signing_key: signing_key.into(),
-        }
-    }
-}
-
-/// Schema-side twin of `meerkat-runtime/src/meerkat_machine/dsl.rs`'s
-/// `From<&TrustedPeerDescriptor> for PeerEndpoint`. Keeps the
-/// conversion available to consumers that see only the schema crate
-/// (codegen, kernels, schema-facing callers) without forcing them to
-/// re-route through the runtime DSL. Mirrors the runtime side
-/// field-for-field — the `peer_endpoint_structural_equivalence`
-/// tripwire fails if either copy drifts.
-impl From<&meerkat_core::comms::TrustedPeerDescriptor> for PeerEndpoint {
-    fn from(spec: &meerkat_core::comms::TrustedPeerDescriptor) -> Self {
-        Self {
-            name: PeerName(spec.name.as_str().to_owned()),
-            peer_id: PeerId(spec.peer_id.to_string()),
-            address: PeerAddress(spec.address.to_string()),
-            signing_key: PeerSigningKey(spec.pubkey),
-        }
-    }
-}
-
-/// Schema-local carrier for the Ed25519 public signing key that belongs to a
-/// peer endpoint. Mirrors the runtime DSL twin so schema/codegen consumers see
-/// the trust-store key material as part of the machine-owned projection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct PeerSigningKey(pub [u8; 32]);
-
-impl From<[u8; 32]> for PeerSigningKey {
-    fn from(key: [u8; 32]) -> Self {
-        Self(key)
-    }
-}
-
-/// Schema-local newtype for a peer display name. Mirrors the shape
-/// that `meerkat_core::comms::PeerName` exposes across the core seam;
-/// the schema catalog keeps a DSL-local copy so `MachineSchema`
-/// validation sees a consistent opaque-struct shape regardless of the
-/// typed core form.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct PeerName(pub String);
-
-impl<T: Into<String>> From<T> for PeerName {
-    fn from(s: T) -> Self {
-        Self(s.into())
-    }
-}
-
-impl PeerName {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Schema-local newtype for the canonical routing identity of a peer
-/// (the UUIDv5-derived `PeerId` carried by `meerkat_core::comms::PeerId`).
-/// Stored as a slug string so `MachineSchema` validation sees a stable
-/// opaque shape; call sites convert to/from the core typed form at the
-/// runtime seam.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct PeerId(pub String);
-
-impl<T: Into<String>> From<T> for PeerId {
-    fn from(s: T) -> Self {
-        Self(s.into())
-    }
-}
-
-impl PeerId {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Schema-local newtype for a peer transport endpoint URL. Mirrors the
-/// shape of `meerkat_core::comms::PeerAddress` at the core seam; kept
-/// DSL-local so `MachineSchema` validation sees a stable opaque shape.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct PeerAddress(pub String);
-
-impl<T: Into<String>> From<T> for PeerAddress {
-    fn from(s: T) -> Self {
-        Self(s.into())
-    }
-}
-
-impl PeerAddress {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-// =====================================================================
-// Tests
-// =====================================================================
+crate::meerkat_catalog_machine_dsl!("self", "catalog::dsl::meerkat_machine");

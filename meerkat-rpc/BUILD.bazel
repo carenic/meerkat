@@ -52,7 +52,6 @@ rust_library(
     deps = [
         "//meerkat-anthropic:meerkat_anthropic",
         "//meerkat-client:meerkat_client",
-        "//meerkat-comms:meerkat_comms",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-gemini:meerkat_gemini",
@@ -115,7 +114,6 @@ rust_test(
     deps = [
         "//meerkat-anthropic:meerkat_anthropic",
         "//meerkat-client:meerkat_client",
-        "//meerkat-comms:meerkat_comms",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-gemini:meerkat_gemini",
@@ -850,7 +848,6 @@ rust_library(
     deps = [
         "//meerkat-anthropic:meerkat_anthropic",
         "//meerkat-client:meerkat_client",
-        "//meerkat-comms:meerkat_comms",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-gemini:meerkat_gemini",
@@ -989,7 +986,6 @@ rust_library(
     deps = [
         "//meerkat-anthropic:meerkat_anthropic",
         "//meerkat-client:meerkat_client",
-        "//meerkat-comms:meerkat_comms",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-gemini:meerkat_gemini",
@@ -1133,7 +1129,6 @@ rust_library(
     deps = [
         "//meerkat-anthropic:meerkat_anthropic",
         "//meerkat-client:meerkat_client",
-        "//meerkat-comms:meerkat_comms",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-gemini:meerkat_gemini",

@@ -2597,14 +2597,10 @@ async fn handle_meerkat_run(
         .clone()
         .unwrap_or_else(|| config.agent.model.clone());
 
-    // Build composed external tools:
-    // - callback tools supplied by the MCP client
-    // - per-session live MCP router adapter (for add/remove/reload parity)
+    // Build callback tools supplied by the MCP client. The per-session live
+    // MCP router is created after runtime bindings are prepared so its surface
+    // owner is session-canonical from construction.
     let callback_tools = build_callback_dispatcher(&input.tools);
-    let mcp_adapter = Arc::new(meerkat_mcp::McpRouterAdapter::new(McpRouter::new()));
-    let mcp_tools: Arc<dyn AgentToolDispatcher> = mcp_adapter.clone();
-    let external_tools = compose_external_tool_dispatchers(callback_tools.clone(), Some(mcp_tools))
-        .map_err(ToolCallError::internal)?;
 
     let enable_shell_override = input.builtin_config.as_ref().and_then(|c| c.enable_shell);
     let preload_skills = input.preload_skills.clone();
@@ -2631,6 +2627,12 @@ async fn handle_meerkat_run(
     let session = prepared_session.session;
     let session_id = prepared_session.session_id;
     let bindings = prepared_session.bindings;
+    let mcp_adapter = Arc::new(meerkat_mcp::McpRouterAdapter::new(
+        McpRouter::new_with_surface_handle(Arc::clone(&bindings.external_tool_surface)),
+    ));
+    let mcp_tools: Arc<dyn AgentToolDispatcher> = mcp_adapter.clone();
+    let external_tools = compose_external_tool_dispatchers(callback_tools.clone(), Some(mcp_tools))
+        .map_err(ToolCallError::internal)?;
 
     if let Some(context) = request_context.as_ref() {
         let service = state.service.clone();
@@ -2899,9 +2901,20 @@ async fn handle_meerkat_resume(
         .map(ProviderInput::to_provider)
         .or_else(|| stored_metadata.as_ref().map(|meta| meta.provider));
 
+    let resume_bindings = state
+        .runtime_adapter
+        .prepare_bindings(session_id.clone())
+        .await
+        .map_err(|e| {
+            ToolCallError::internal(format!(
+                "failed to prepare bindings for session {session_id}: {e}"
+            ))
+        })?;
+
     // Build composed external tools:
     // - callback tools supplied by the MCP client
-    // - per-session live MCP router adapter
+    // - per-session live MCP router adapter. New adapters are session-owned
+    // from construction; existing adapters are rebound during factory build.
     let callback_tools = build_callback_dispatcher(&input.tools);
     let existing_adapter = state
         .mcp_adapters
@@ -2909,9 +2922,11 @@ async fn handle_meerkat_resume(
         .await
         .get(&session_id.to_string())
         .cloned();
-    let mcp_adapter = existing_adapter
-        .clone()
-        .unwrap_or_else(|| Arc::new(meerkat_mcp::McpRouterAdapter::new(McpRouter::new())));
+    let mcp_adapter = existing_adapter.clone().unwrap_or_else(|| {
+        Arc::new(meerkat_mcp::McpRouterAdapter::new(
+            McpRouter::new_with_surface_handle(Arc::clone(&resume_bindings.external_tool_surface)),
+        ))
+    });
     let mcp_tools: Arc<dyn AgentToolDispatcher> = mcp_adapter.clone();
     let external_tools = compose_external_tool_dispatchers(callback_tools.clone(), Some(mcp_tools))
         .map_err(ToolCallError::internal)?;
@@ -2948,15 +2963,6 @@ async fn handle_meerkat_resume(
             })?),
             None => None,
         };
-    let resume_bindings = state
-        .runtime_adapter
-        .prepare_bindings(session_id.clone())
-        .await
-        .map_err(|e| {
-            ToolCallError::internal(format!(
-                "failed to prepare bindings for session {session_id}: {e}"
-            ))
-        })?;
     let llm_binding = meerkat_core::session_recovery::resolve_resume_llm_binding(
         stored_metadata
             .as_ref()

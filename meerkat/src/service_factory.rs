@@ -1148,12 +1148,14 @@ mod tests {
     {
         let temp = tempfile::tempdir().map_err(|err| format!("tempdir: {err}"))?;
         let mut router = meerkat_mcp::McpRouter::new();
-        router.stage_add(meerkat_core::McpServerConfig::stdio(
-            "planner",
-            "/bin/echo",
-            Vec::<String>::new(),
-            std::collections::HashMap::new(),
-        ));
+        router
+            .stage_add(meerkat_core::McpServerConfig::stdio(
+                "planner",
+                "/bin/echo",
+                Vec::<String>::new(),
+                std::collections::HashMap::new(),
+            ))
+            .map_err(|error| error.to_string())?;
         let dispatcher = Arc::new(meerkat_mcp::McpRouterAdapter::new(router))
             as Arc<dyn meerkat_core::AgentToolDispatcher>;
         let agent = build_factory_agent_with_mock(

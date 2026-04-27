@@ -1,10 +1,12 @@
 use super::OptionValueExt;
-use meerkat_machine_dsl::machine;
 
-machine! {
+#[macro_export]
+macro_rules! mob_catalog_machine_dsl {
+    ($rust_crate:literal, $rust_module:literal) => {
+        meerkat_machine_dsl::machine! {
     machine MobMachine {
         version: 1,
-        rust: "self" / "catalog::dsl::mob_machine",
+        rust: $rust_crate / $rust_module,
 
         state {
             lifecycle_phase: MobPhase,
@@ -12,9 +14,73 @@ machine! {
             externally_addressable_runtime_ids: Set<AgentRuntimeId>,
             runtime_fence_tokens: Map<AgentRuntimeId, FenceToken>,
             active_run_count: u64,
+            run_status: Map<RunId, Enum<FlowRunStatus>>,
+            run_ordered_steps: Map<RunId, Seq<StepId>>,
+            run_tracked_steps: Map<RunId, Set<StepId>>,
+            run_step_status: Map<RunId, Map<StepId, Option<Enum<StepRunStatus>>>>,
+            run_step_status_flat: Map<RunStepKey, Enum<StepRunStatus>>,
+            run_output_recorded: Map<RunId, Map<StepId, bool>>,
+            run_step_condition_results: Map<RunId, Map<StepId, Option<bool>>>,
+            run_step_has_conditions: Map<RunId, Map<StepId, bool>>,
+            run_step_dependencies: Map<RunId, Map<StepId, Seq<StepId>>>,
+            run_step_dependency_modes: Map<RunId, Map<StepId, Enum<DependencyMode>>>,
+            run_step_branches: Map<RunId, Map<StepId, Option<BranchId>>>,
+            run_step_collection_policies: Map<RunId, Map<StepId, Enum<CollectionPolicyKind>>>,
+            run_step_quorum_thresholds: Map<RunId, Map<StepId, u32>>,
+            run_step_target_counts: Map<RunId, Map<StepId, u32>>,
+            run_step_target_success_counts: Map<RunId, Map<StepId, u32>>,
+            run_step_target_terminal_failure_counts: Map<RunId, Map<StepId, u32>>,
+            run_output_recorded_flat: Map<RunStepKey, bool>,
+            run_target_retry_counts: Map<RunId, Map<String, u32>>,
+            run_escalation_threshold: Map<RunId, u32>,
+            run_max_step_retries: Map<RunId, u32>,
+            run_ready_frames: Map<RunId, Seq<FrameId>>,
+            run_ready_frame_membership: Map<RunId, Set<FrameId>>,
+            run_pending_body_frame_loops: Map<RunId, Seq<LoopInstanceId>>,
+            run_pending_body_frame_loop_membership: Map<RunId, Set<LoopInstanceId>>,
+            run_max_active_nodes: Map<RunId, u32>,
+            run_max_active_frames: Map<RunId, u32>,
+            run_max_frame_depth: Map<RunId, u32>,
+            frame_scope: Map<FrameId, Enum<FrameScope>>,
+            frame_phase: Map<FrameId, Enum<FrameStatus>>,
+            frame_run: Map<FrameId, RunId>,
+            frame_parent_loop: Map<FrameId, Option<LoopInstanceId>>,
+            frame_iteration: Map<FrameId, u32>,
+            frame_tracked_nodes: Map<FrameId, Set<FlowNodeId>>,
+            frame_ordered_nodes: Map<FrameId, Seq<FlowNodeId>>,
+            frame_node_kind: Map<FrameId, Map<FlowNodeId, Enum<FlowNodeKind>>>,
+            frame_node_dependencies: Map<FrameId, Map<FlowNodeId, Seq<FlowNodeId>>>,
+            frame_node_dependency_modes: Map<FrameId, Map<FlowNodeId, Enum<DependencyMode>>>,
+            frame_node_step_ids: Map<FrameId, Map<FlowNodeId, StepId>>,
+            frame_node_loop_ids: Map<FrameId, Map<FlowNodeId, LoopId>>,
+            frame_node_status: Map<FrameId, Map<FlowNodeId, Enum<NodeRunStatus>>>,
+            frame_ready_queue: Map<FrameId, Seq<FlowNodeId>>,
+            frame_output_recorded: Map<FrameId, Map<FlowNodeId, bool>>,
+            frame_node_condition_results: Map<FrameId, Map<FlowNodeId, Option<bool>>>,
+            frame_node_branches: Map<FrameId, Map<FlowNodeId, Option<BranchId>>>,
+            loop_phase: Map<LoopInstanceId, Enum<LoopStatus>>,
+            loop_parent_frame: Map<LoopInstanceId, FrameId>,
+            loop_parent_node: Map<LoopInstanceId, FlowNodeId>,
+            loop_definition: Map<LoopInstanceId, LoopId>,
+            loop_depth: Map<LoopInstanceId, u32>,
+            loop_stage: Map<LoopInstanceId, Enum<LoopIterationStage>>,
+            loop_current_iteration: Map<LoopInstanceId, u64>,
+            loop_last_completed_iteration: Map<LoopInstanceId, u64>,
+            loop_max_iterations: Map<LoopInstanceId, u64>,
+            loop_active_body_frame: Map<LoopInstanceId, Option<FrameId>>,
             pending_spawn_count: u64,
             pending_spawn_sessions: Map<AgentIdentity, SessionId>,
             coordinator_bound: bool,
+            member_startup_binding_requested: Set<AgentRuntimeId>,
+            member_startup_runtime_ready: Set<AgentRuntimeId>,
+            member_startup_ready: Set<AgentRuntimeId>,
+            member_kickoff_pending: Set<String>,
+            member_kickoff_starting: Set<String>,
+            member_kickoff_callback_pending: Set<String>,
+            member_kickoff_started: Set<String>,
+            member_kickoff_failed: Set<String>,
+            member_kickoff_cancelled: Set<String>,
+            member_kickoff_error: Map<String, String>,
             // Per-runtime lifecycle marker (Active vs Retiring). Tracks the
             // draining/retiring sub-state independently of the mob-level
             // lifecycle phase so the shell can decide whether to route fresh
@@ -41,20 +107,7 @@ machine! {
             // updates and illegal status transitions (e.g. Completed→Pending).
             in_progress_task_ids: Set<TaskId>,
             completed_task_ids: Set<TaskId>,
-            // W3-H / dogma #4: canonical identity→bridge-session map for
-            // realtime WS observers. Key absence == Unbound; presence carries
-            // the current bridge session id that identity's realtime channel
-            // should pin to. Respawn updates the value atomically in the same
-            // DSL transition that rebinds the runtime id.
-            //
-            // Track-B (R5): this map is the identity-level "member is bound to
-            // *some* session" fact. Realtime WS observers were the first
-            // consumer; the `RecomputeMobPeerOverlay` composition driver is
-            // the second and reads the same map plus `wiring_edges` to
-            // project peer endpoints onto live sessions.
             member_session_bindings: Map<AgentIdentity, SessionId>,
-            // Runtime ids whose MeerkatMachine peer-ingress ownership must be
-            // detached before this mob may route RequestRuntimeDestroy.
             pending_session_ingress_detach_runtime_ids: Set<AgentRuntimeId>,
             topology_epoch: u64,
         }
@@ -64,9 +117,73 @@ machine! {
             externally_addressable_runtime_ids = EmptySet,
             runtime_fence_tokens = EmptyMap,
             active_run_count = 0,
+            run_status = EmptyMap,
+            run_ordered_steps = EmptyMap,
+            run_tracked_steps = EmptyMap,
+            run_step_status = EmptyMap,
+            run_step_status_flat = EmptyMap,
+            run_output_recorded = EmptyMap,
+            run_step_condition_results = EmptyMap,
+            run_step_has_conditions = EmptyMap,
+            run_step_dependencies = EmptyMap,
+            run_step_dependency_modes = EmptyMap,
+            run_step_branches = EmptyMap,
+            run_step_collection_policies = EmptyMap,
+            run_step_quorum_thresholds = EmptyMap,
+            run_step_target_counts = EmptyMap,
+            run_step_target_success_counts = EmptyMap,
+            run_step_target_terminal_failure_counts = EmptyMap,
+            run_output_recorded_flat = EmptyMap,
+            run_target_retry_counts = EmptyMap,
+            run_escalation_threshold = EmptyMap,
+            run_max_step_retries = EmptyMap,
+            run_ready_frames = EmptyMap,
+            run_ready_frame_membership = EmptyMap,
+            run_pending_body_frame_loops = EmptyMap,
+            run_pending_body_frame_loop_membership = EmptyMap,
+            run_max_active_nodes = EmptyMap,
+            run_max_active_frames = EmptyMap,
+            run_max_frame_depth = EmptyMap,
+            frame_scope = EmptyMap,
+            frame_phase = EmptyMap,
+            frame_run = EmptyMap,
+            frame_parent_loop = EmptyMap,
+            frame_iteration = EmptyMap,
+            frame_tracked_nodes = EmptyMap,
+            frame_ordered_nodes = EmptyMap,
+            frame_node_kind = EmptyMap,
+            frame_node_dependencies = EmptyMap,
+            frame_node_dependency_modes = EmptyMap,
+            frame_node_step_ids = EmptyMap,
+            frame_node_loop_ids = EmptyMap,
+            frame_node_status = EmptyMap,
+            frame_ready_queue = EmptyMap,
+            frame_output_recorded = EmptyMap,
+            frame_node_condition_results = EmptyMap,
+            frame_node_branches = EmptyMap,
+            loop_phase = EmptyMap,
+            loop_parent_frame = EmptyMap,
+            loop_parent_node = EmptyMap,
+            loop_definition = EmptyMap,
+            loop_depth = EmptyMap,
+            loop_stage = EmptyMap,
+            loop_current_iteration = EmptyMap,
+            loop_last_completed_iteration = EmptyMap,
+            loop_max_iterations = EmptyMap,
+            loop_active_body_frame = EmptyMap,
             pending_spawn_count = 0,
             pending_spawn_sessions = EmptyMap,
             coordinator_bound = true,
+            member_startup_binding_requested = EmptySet,
+            member_startup_runtime_ready = EmptySet,
+            member_startup_ready = EmptySet,
+            member_kickoff_pending = EmptySet,
+            member_kickoff_starting = EmptySet,
+            member_kickoff_callback_pending = EmptySet,
+            member_kickoff_started = EmptySet,
+            member_kickoff_failed = EmptySet,
+            member_kickoff_cancelled = EmptySet,
+            member_kickoff_error = EmptyMap,
             member_state_markers = EmptyMap,
             wiring_edges = EmptySet,
             external_peer_edges = EmptySet,
@@ -90,12 +207,96 @@ machine! {
 
         input MobMachineInput {
             RunFlow,
+            CreateRunSeed {
+                run_id: RunId,
+                step_ids: Set<StepId>,
+                ordered_steps: Seq<StepId>,
+                step_has_conditions: Map<StepId, bool>,
+                step_dependencies: Map<StepId, Seq<StepId>>,
+                step_dependency_modes: Map<StepId, Enum<DependencyMode>>,
+                step_branches: Map<StepId, Option<BranchId>>,
+                step_collection_policies: Map<StepId, Enum<CollectionPolicyKind>>,
+                step_quorum_thresholds: Map<StepId, u32>,
+                escalation_threshold: u32,
+                max_step_retries: u32,
+                max_active_nodes: u32,
+                max_active_frames: u32,
+                max_frame_depth: u32,
+            },
+            CreateFrameSeed {
+                run_id: RunId,
+                frame_id: FrameId,
+                frame_scope: Enum<FrameScope>,
+                loop_instance_id: Option<LoopInstanceId>,
+                iteration: u32,
+                tracked_nodes: Set<FlowNodeId>,
+                ordered_nodes: Seq<FlowNodeId>,
+                node_kind: Map<FlowNodeId, Enum<FlowNodeKind>>,
+                node_dependencies: Map<FlowNodeId, Seq<FlowNodeId>>,
+                node_dependency_modes: Map<FlowNodeId, Enum<DependencyMode>>,
+                node_branches: Map<FlowNodeId, Option<BranchId>>,
+            },
+            CreateLoopSeed {
+                loop_instance_id: LoopInstanceId,
+                parent_frame_id: FrameId,
+                parent_node_id: FlowNodeId,
+                loop_id: LoopId,
+                depth: u32,
+                max_iterations: u64,
+            },
+            RecordLoopBodyFrameCompleted {
+                loop_instance_id: LoopInstanceId,
+                iteration: u64,
+            },
+            RecordLoopUntilConditionMet {
+                loop_instance_id: LoopInstanceId,
+                iteration: u64,
+            },
+            RecordLoopUntilConditionFailed {
+                loop_instance_id: LoopInstanceId,
+                iteration: u64,
+            },
+            AuthorizeFlowRunReducerCommand {
+                run_id: RunId,
+                command: Enum<FlowRunReducerCommandKind>,
+                step_id: Option<StepId>,
+                run_step_key: Option<RunStepKey>,
+                step_status: Option<Enum<StepRunStatus>>,
+                target_count: Option<u32>,
+                frame_id: Option<FrameId>,
+                loop_instance_id: Option<LoopInstanceId>,
+                retry_key: Option<String>,
+            },
+            AuthorizeFlowFrameReducerCommand {
+                frame_id: FrameId,
+                command: Enum<FlowFrameReducerCommandKind>,
+                node_id: Option<FlowNodeId>,
+                node_status: Option<Enum<NodeRunStatus>>,
+                ready_queue: Option<Seq<FlowNodeId>>,
+                terminal_status: Option<Enum<FrameStatus>>,
+            },
+            AuthorizeLoopIterationReducerCommand {
+                loop_instance_id: LoopInstanceId,
+                command: Enum<LoopIterationReducerCommandKind>,
+                body_frame_id: Option<FrameId>,
+                body_frame_iteration: Option<u64>,
+            },
             CancelFlow,
             FlowStatus,
             Spawn { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: bool, bridge_session_id: SessionId, replacing: Option<SessionId> },
-            Retire { agent_runtime_id: AgentRuntimeId, agent_identity: AgentIdentity, releasing: Option<SessionId>, session_id: SessionId },
+            EnsureMember { agent_identity: AgentIdentity },
+            Reconcile { desired: Set<AgentIdentity>, retire_stale: bool },
+            Retire { mob_id: MobId, agent_runtime_id: AgentRuntimeId, agent_identity: AgentIdentity, releasing: Option<SessionId>, session_id: SessionId },
             Respawn { agent_runtime_id: AgentRuntimeId },
             RetireAll,
+            // Track-B (R5): explicit identity-level wiring and session-binding
+            // mutation inputs. These drive `wiring_edges` and
+            // `member_session_bindings` directly at DSL authority,
+            // independent of the Spawn/Retire lifecycle.
+            //
+            // The `edge` field on `WireMembers`/`UnwireMembers` carries a
+            // pre-normalized `WiringEdge` (a <= b). Callers construct the
+            // edge via `WiringEdge::new(a, b)` before submitting.
             WireMembers { edge: WiringEdge },
             UnwireMembers { edge: WiringEdge },
             WireExternalPeer { edge: ExternalPeerEdge },
@@ -133,6 +334,15 @@ machine! {
             SetSpawnPolicy,
             Shutdown,
             ForceCancel,
+            KickoffMarkPending { member_id: String },
+            KickoffMarkStarting { member_id: String },
+            StartupMarkReady { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken },
+            KickoffResolveStarted { member_id: String },
+            KickoffResolveCallbackPending { member_id: String },
+            KickoffResolveFailed { member_id: String, error: String },
+            KickoffResolveCancelled { member_id: String },
+            KickoffCancelRequested { member_id: String },
+            KickoffClear { member_id: String },
         }
 
         surface_only [
@@ -186,8 +396,8 @@ machine! {
             RequestRuntimeBinding { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: SessionId },
             RequestRuntimeIngress { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, work_id: WorkId, origin: Enum<WorkOrigin> },
             RequestRuntimeRetire { session_id: SessionId },
-            RequestSessionIngressDetachForMobDestroy { mob_id: MobId, agent_runtime_id: AgentRuntimeId },
             RequestRuntimeDestroy { session_id: SessionId },
+            RequestSessionIngressDetachForMobDestroy { mob_id: MobId, agent_runtime_id: AgentRuntimeId },
             EmitMemberLifecycleNotice { kind: Enum<MemberLifecycleKind> },
             EmitRunLifecycleNotice,
             EmitFlowRunNotice,
@@ -200,6 +410,9 @@ machine! {
             AdmitPeerInput,
             EmitProgressNote,
             EmitTaskNotice,
+            PersistKickoffUpdate { member_id: String, phase: KickoffPhase },
+            PersistKickoffFailureUpdate { member_id: String, phase: KickoffPhase, error: String },
+            EmitKickoffLifecycleNotice { member_id: String, intent: Enum<KickoffIntent> },
             // Track-B (R5): canonical topology-change signals consumed by
             // the `RecomputeMobPeerOverlay` composition driver.
             //
@@ -233,8 +446,8 @@ machine! {
         disposition RequestRuntimeBinding => routed [MeerkatMachine],
         disposition RequestRuntimeIngress => routed [MeerkatMachine],
         disposition RequestRuntimeRetire => routed [MeerkatMachine],
-        disposition RequestSessionIngressDetachForMobDestroy => local handoff mob_destroying_session_ingress,
         disposition RequestRuntimeDestroy => routed [MeerkatMachine],
+        disposition RequestSessionIngressDetachForMobDestroy => external handoff mob_destroying_session_ingress,
         disposition EmitMemberLifecycleNotice => external,
         disposition EmitRunLifecycleNotice => external,
         disposition EmitFlowRunNotice => external,
@@ -247,6 +460,9 @@ machine! {
         disposition AdmitPeerInput => external,
         disposition EmitProgressNote => external,
         disposition EmitTaskNotice => external,
+        disposition PersistKickoffUpdate => local,
+        disposition PersistKickoffFailureUpdate => local,
+        disposition EmitKickoffLifecycleNotice => external,
         disposition WiringGraphChanged => external,
         disposition MemberSessionBindingChanged => external,
         disposition EmitWiringLifecycleNotice => external,
@@ -257,13 +473,585 @@ machine! {
         // =====================================================================
 
         // W3-H / dogma #4: "no zombie realtime binding" — every identity that
-        // has a bound session must appear in `identity_to_runtime` (i.e. must
-        // be an identity MobMachine has spawned). keys(bindings) ⊆
-        // keys(identity_to_runtime). Paired with Retire's `remove` and
-        // Spawn's guard/state consistency.
+        // has a bound session must also appear in `identity_to_runtime` (i.e.
+        // must be an identity MobMachine has spawned). Ensures the binding map
+        // cannot reference identities the machine has never admitted. Paired
+        // with the Retire transition's `member_session_bindings.remove` and
+        // Spawn's guard/state consistency: keys(bindings) ⊆ keys(identity_to_runtime).
         invariant bindings_require_known_identity {
             for_all(id in self.member_session_bindings.keys(), self.identity_to_runtime.contains_key(id))
         }
+
+        // =====================================================================
+        // Direct transitions
+        // =====================================================================
+
+        // W3-H: Spawn splits into two guarded variants — Fresh (no prior
+        // realtime binding for the identity) and Replacing (identity already
+        // has a `BoundToSession`, i.e. this Spawn is the second half of a
+        // shell-orchestrated respawn). Guards check BOTH the input's
+        // `replacing` witness AND the state's `member_session_bindings` key
+        // presence so a caller cannot invoke the wrong branch — the DSL
+        // enforces caller/state consistency, and a mismatched caller fails
+        // loudly with "no transition matched" rather than silently picking a
+        // wrong branch.
+        transition SpawnRunningFresh {
+            on input Spawn { agent_identity, agent_runtime_id, fence_token, generation, external_addressable, bridge_session_id, replacing }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "coordinator_bound" { self.coordinator_bound == true }
+            guard "no_prior_session_binding" { self.member_session_bindings.contains_key(agent_identity) == false }
+            guard "replacing_absent" { replacing == None }
+            update {
+                // Spawn is the "member joined live_runtime_ids" fact. The
+                // pending_spawn_count lifecycle is owned by StageSpawn (+1)
+                // and CompleteSpawn (-1) signals; Spawn itself leaves the
+                // counter untouched. Concurrent spawn batches rely on that
+                // separation — zeroing or double-decrementing here breaks
+                // alignment between DSL pending_spawn_count and the actor's
+                // pending_spawns map
+                // (test_concurrent_spawns_parallelize_provisioning).
+                // active_run_count is unrelated to spawn and stays untouched
+                // (previously zeroed here by mistake).
+                self.live_runtime_ids.insert(agent_runtime_id);
+                if external_addressable {
+                    self.externally_addressable_runtime_ids.insert(agent_runtime_id);
+                } else {
+                    self.externally_addressable_runtime_ids.remove(agent_runtime_id);
+                }
+                self.runtime_fence_tokens.insert(agent_runtime_id, fence_token);
+                self.identity_to_runtime.insert(agent_identity, agent_runtime_id);
+                self.member_startup_binding_requested.insert(agent_runtime_id);
+                self.member_startup_runtime_ready.remove(agent_runtime_id);
+                self.member_startup_ready.remove(agent_runtime_id);
+                self.member_session_bindings.insert(agent_identity, bridge_session_id);
+                self.topology_epoch += 1;
+            }
+            to Running
+            emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation, session_id: bridge_session_id }
+            emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: None, new_session_id: Some(bridge_session_id) }
+            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Spawned }
+        }
+
+        transition SpawnRunningReplacing {
+            on input Spawn { agent_identity, agent_runtime_id, fence_token, generation, external_addressable, bridge_session_id, replacing }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "coordinator_bound" { self.coordinator_bound == true }
+            guard "prior_session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
+            guard "replacing_present" { replacing != None }
+            update {
+                self.live_runtime_ids.insert(agent_runtime_id);
+                if external_addressable {
+                    self.externally_addressable_runtime_ids.insert(agent_runtime_id);
+                } else {
+                    self.externally_addressable_runtime_ids.remove(agent_runtime_id);
+                }
+                self.runtime_fence_tokens.insert(agent_runtime_id, fence_token);
+                self.identity_to_runtime.insert(agent_identity, agent_runtime_id);
+                self.member_startup_binding_requested.insert(agent_runtime_id);
+                self.member_startup_runtime_ready.remove(agent_runtime_id);
+                self.member_startup_ready.remove(agent_runtime_id);
+                self.member_session_bindings.insert(agent_identity, bridge_session_id);
+                self.topology_epoch += 1;
+            }
+            to Running
+            emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation, session_id: bridge_session_id }
+            emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(replacing.get("value")), new_session_id: Some(bridge_session_id) }
+            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Spawned }
+        }
+
+        transition EnsureMemberRunningExisting {
+            on input EnsureMember { agent_identity }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "coordinator_bound" { self.coordinator_bound == true }
+            guard "identity_present" { self.identity_to_runtime.contains_key(agent_identity) == true }
+            update {}
+            to Running
+        }
+
+        transition EnsureMemberRunningMissing {
+            on input EnsureMember { agent_identity }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "coordinator_bound" { self.coordinator_bound == true }
+            guard "identity_absent" { self.identity_to_runtime.contains_key(agent_identity) == false }
+            update {}
+            to Running
+        }
+
+        transition ReconcileRunning {
+            on input Reconcile { desired, retire_stale }
+            guard { self.lifecycle_phase == Phase::Running }
+            update {}
+            to Running
+        }
+
+        transition ReconcileStopped {
+            on input Reconcile { desired, retire_stale }
+            guard { self.lifecycle_phase == Phase::Stopped }
+            update {}
+            to Stopped
+        }
+
+        transition ReconcileCompleted {
+            on input Reconcile { desired, retire_stale }
+            guard { self.lifecycle_phase == Phase::Completed }
+            update {}
+            to Completed
+        }
+
+        transition ObserveRuntimeReady {
+            on signal ObserveRuntimeReady { agent_runtime_id, fence_token }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
+            guard "fence_token_present" { fence_token == fence_token }
+            update {
+                self.member_startup_binding_requested.remove(agent_runtime_id);
+                self.member_startup_runtime_ready.insert(agent_runtime_id);
+                self.member_startup_ready.remove(agent_runtime_id);
+            }
+            to Running
+        }
+
+        transition StartupMarkReady {
+            per_phase [Running, Stopped, Completed]
+            on input StartupMarkReady { agent_runtime_id, fence_token }
+            guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
+            guard "fence_token_present" { fence_token == fence_token }
+            update {
+                self.member_startup_binding_requested.remove(agent_runtime_id);
+                self.member_startup_runtime_ready.remove(agent_runtime_id);
+                self.member_startup_ready.insert(agent_runtime_id);
+            }
+            to Running
+        }
+
+        transition KickoffMarkPending {
+            per_phase [Running, Stopped, Completed]
+            on input KickoffMarkPending { member_id }
+            guard "kickoff_not_started" {
+                !self.member_kickoff_pending.contains(member_id)
+                && !self.member_kickoff_starting.contains(member_id)
+                && !self.member_kickoff_callback_pending.contains(member_id)
+                && !self.member_kickoff_started.contains(member_id)
+                && !self.member_kickoff_failed.contains(member_id)
+                && !self.member_kickoff_cancelled.contains(member_id)
+            }
+            update {
+                self.member_kickoff_pending.insert(member_id);
+                self.member_kickoff_starting.remove(member_id);
+                self.member_kickoff_callback_pending.remove(member_id);
+                self.member_kickoff_started.remove(member_id);
+                self.member_kickoff_failed.remove(member_id);
+                self.member_kickoff_cancelled.remove(member_id);
+                self.member_kickoff_error.remove(member_id);
+            }
+            to Running
+            emit PersistKickoffUpdate { member_id: member_id, phase: KickoffPhase::Pending }
+            emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::Pending }
+        }
+
+        transition KickoffMarkStarting {
+            per_phase [Running, Stopped, Completed]
+            on input KickoffMarkStarting { member_id }
+            guard "kickoff_pending" { self.member_kickoff_pending.contains(member_id) }
+            update {
+                self.member_kickoff_pending.remove(member_id);
+                self.member_kickoff_starting.insert(member_id);
+                self.member_kickoff_callback_pending.remove(member_id);
+                self.member_kickoff_started.remove(member_id);
+                self.member_kickoff_failed.remove(member_id);
+                self.member_kickoff_cancelled.remove(member_id);
+                self.member_kickoff_error.remove(member_id);
+            }
+            to Running
+            emit PersistKickoffUpdate { member_id: member_id, phase: KickoffPhase::Starting }
+            emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::Starting }
+        }
+
+        transition KickoffResolveStarted {
+            per_phase [Running, Stopped, Completed]
+            on input KickoffResolveStarted { member_id }
+            guard "kickoff_starting" { self.member_kickoff_starting.contains(member_id) }
+            update {
+                self.member_kickoff_pending.remove(member_id);
+                self.member_kickoff_starting.remove(member_id);
+                self.member_kickoff_callback_pending.remove(member_id);
+                self.member_kickoff_started.insert(member_id);
+                self.member_kickoff_failed.remove(member_id);
+                self.member_kickoff_cancelled.remove(member_id);
+                self.member_kickoff_error.remove(member_id);
+            }
+            to Running
+            emit PersistKickoffUpdate { member_id: member_id, phase: KickoffPhase::Started }
+            emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::Started }
+        }
+
+        transition KickoffResolveCallbackPending {
+            per_phase [Running, Stopped, Completed]
+            on input KickoffResolveCallbackPending { member_id }
+            guard "kickoff_starting" { self.member_kickoff_starting.contains(member_id) }
+            update {
+                self.member_kickoff_pending.remove(member_id);
+                self.member_kickoff_starting.remove(member_id);
+                self.member_kickoff_callback_pending.insert(member_id);
+                self.member_kickoff_started.remove(member_id);
+                self.member_kickoff_failed.remove(member_id);
+                self.member_kickoff_cancelled.remove(member_id);
+                self.member_kickoff_error.remove(member_id);
+            }
+            to Running
+            emit PersistKickoffUpdate { member_id: member_id, phase: KickoffPhase::CallbackPending }
+            emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::CallbackPending }
+        }
+
+        transition KickoffResolveFailedFromStarting {
+            per_phase [Running, Stopped, Completed]
+            on input KickoffResolveFailed { member_id, error }
+            guard "kickoff_active_failed" {
+                (self.member_kickoff_pending.contains(member_id)
+                    || self.member_kickoff_starting.contains(member_id)
+                    || self.member_kickoff_callback_pending.contains(member_id))
+            }
+            update {
+                self.member_kickoff_pending.remove(member_id);
+                self.member_kickoff_starting.remove(member_id);
+                self.member_kickoff_callback_pending.remove(member_id);
+                self.member_kickoff_started.remove(member_id);
+                self.member_kickoff_failed.insert(member_id);
+                self.member_kickoff_cancelled.remove(member_id);
+                self.member_kickoff_error.insert(member_id, error);
+            }
+            to Running
+            emit PersistKickoffFailureUpdate { member_id: member_id, phase: KickoffPhase::Failed, error: error }
+            emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::Failed }
+        }
+
+        transition KickoffResolveCancelled {
+            per_phase [Running, Stopped, Completed]
+            on input KickoffResolveCancelled { member_id }
+            guard "kickoff_cancelled" { !self.member_kickoff_started.contains(member_id) }
+            update {
+                self.member_kickoff_pending.remove(member_id);
+                self.member_kickoff_starting.remove(member_id);
+                self.member_kickoff_callback_pending.remove(member_id);
+                self.member_kickoff_started.remove(member_id);
+                self.member_kickoff_failed.remove(member_id);
+                self.member_kickoff_cancelled.insert(member_id);
+                self.member_kickoff_error.remove(member_id);
+            }
+            to Running
+            emit PersistKickoffUpdate { member_id: member_id, phase: KickoffPhase::Cancelled }
+            emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::Cancelled }
+        }
+
+        transition KickoffCancelRequested {
+            per_phase [Running, Stopped, Completed]
+            on input KickoffCancelRequested { member_id }
+            guard "kickoff_cancellable" {
+                (self.member_kickoff_pending.contains(member_id)
+                    || self.member_kickoff_starting.contains(member_id)
+                    || self.member_kickoff_callback_pending.contains(member_id))
+            }
+            update {
+                self.member_kickoff_pending.remove(member_id);
+                self.member_kickoff_starting.remove(member_id);
+                self.member_kickoff_callback_pending.remove(member_id);
+                self.member_kickoff_started.remove(member_id);
+                self.member_kickoff_failed.remove(member_id);
+                self.member_kickoff_cancelled.insert(member_id);
+                self.member_kickoff_error.remove(member_id);
+            }
+            to Running
+            emit PersistKickoffUpdate { member_id: member_id, phase: KickoffPhase::Cancelled }
+            emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::Cancelled }
+        }
+
+        transition KickoffClear {
+            per_phase [Running, Stopped, Completed]
+            on input KickoffClear { member_id }
+            update {
+                self.member_kickoff_pending.remove(member_id);
+                self.member_kickoff_starting.remove(member_id);
+                self.member_kickoff_callback_pending.remove(member_id);
+                self.member_kickoff_started.remove(member_id);
+                self.member_kickoff_failed.remove(member_id);
+                self.member_kickoff_cancelled.remove(member_id);
+                self.member_kickoff_error.remove(member_id);
+            }
+            to Running
+        }
+
+        transition SubmitWorkRunningExternal {
+            on input SubmitWork { agent_runtime_id, fence_token, work_id, origin }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "active_members_present" { self.live_runtime_ids != EmptySet }
+            guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
+            guard "external_origin" { origin == WorkOrigin::External }
+            guard "runtime_externally_addressable" { self.externally_addressable_runtime_ids.contains(agent_runtime_id) }
+            update {}
+            to Running
+            emit RequestRuntimeIngress { agent_runtime_id: agent_runtime_id, fence_token: fence_token, work_id: work_id, origin: origin }
+        }
+
+        transition SubmitWorkRunningInternal {
+            on input SubmitWork { agent_runtime_id, fence_token, work_id, origin }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "active_members_present" { self.live_runtime_ids != EmptySet }
+            guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
+            guard "internal_origin" { origin == WorkOrigin::Internal }
+            update {}
+            to Running
+            emit RequestRuntimeIngress { agent_runtime_id: agent_runtime_id, fence_token: fence_token, work_id: work_id, origin: origin }
+        }
+
+        transition RetireMember {
+            on signal RetireMember { agent_runtime_id, fence_token, session_id }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
+            guard "fence_token_present" { fence_token == fence_token }
+            update {
+                self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
+            }
+            to Running
+            emit RequestRuntimeRetire { session_id: session_id }
+        }
+
+        transition ObserveRuntimeRetired {
+            on signal ObserveRuntimeRetired { agent_runtime_id, fence_token }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
+            guard "fence_token_present" { fence_token == fence_token }
+            update {
+                self.live_runtime_ids.remove(agent_runtime_id);
+                self.externally_addressable_runtime_ids.remove(agent_runtime_id);
+                self.runtime_fence_tokens.remove(agent_runtime_id);
+                self.member_startup_binding_requested.remove(agent_runtime_id);
+                self.member_startup_runtime_ready.remove(agent_runtime_id);
+                self.member_startup_ready.remove(agent_runtime_id);
+                self.member_state_markers.remove(agent_runtime_id);
+                self.active_run_count = 0;
+            }
+            to Running
+            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Retired }
+        }
+
+        transition ResetMember {
+            on signal ResetMember { agent_identity, agent_runtime_id, fence_token, generation, external_addressable, session_id }
+            guard {
+                self.lifecycle_phase == Phase::Running
+                || self.lifecycle_phase == Phase::Stopped
+            }
+            update {
+                self.active_run_count = 0;
+                self.pending_spawn_count = 0;
+                self.pending_spawn_sessions = EmptyMap;
+                self.live_runtime_ids.insert(agent_runtime_id);
+                if external_addressable {
+                    self.externally_addressable_runtime_ids.insert(agent_runtime_id);
+                } else {
+                    self.externally_addressable_runtime_ids.remove(agent_runtime_id);
+                }
+                self.runtime_fence_tokens.insert(agent_runtime_id, fence_token);
+                self.identity_to_runtime.insert(agent_identity, agent_runtime_id);
+                self.member_startup_binding_requested.insert(agent_runtime_id);
+                self.member_startup_runtime_ready.remove(agent_runtime_id);
+                self.member_startup_ready.remove(agent_runtime_id);
+            }
+            to Running
+            emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation, session_id: session_id }
+            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Reset }
+        }
+
+        transition RespawnMember {
+            on signal RespawnMember { agent_identity, agent_runtime_id, fence_token, generation, external_addressable, session_id }
+            guard { self.lifecycle_phase == Phase::Running }
+            update {
+                self.active_run_count = 0;
+                self.pending_spawn_count = 0;
+                self.pending_spawn_sessions = EmptyMap;
+                self.live_runtime_ids.insert(agent_runtime_id);
+                if external_addressable {
+                    self.externally_addressable_runtime_ids.insert(agent_runtime_id);
+                } else {
+                    self.externally_addressable_runtime_ids.remove(agent_runtime_id);
+                }
+                self.runtime_fence_tokens.insert(agent_runtime_id, fence_token);
+                self.identity_to_runtime.insert(agent_identity, agent_runtime_id);
+                self.member_startup_binding_requested.insert(agent_runtime_id);
+                self.member_startup_runtime_ready.remove(agent_runtime_id);
+                self.member_startup_ready.remove(agent_runtime_id);
+            }
+            to Running
+            emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation, session_id: session_id }
+            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Respawned }
+        }
+
+        transition MarkCompleted {
+            on signal MarkCompleted
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped }
+            guard "no_active_runs" { self.active_run_count == 0 }
+            update {}
+            to Completed
+            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Completed }
+        }
+
+        transition DestroyMob {
+            on signal DestroyMob { session_id }
+            guard {
+                self.lifecycle_phase == Phase::Running
+                || self.lifecycle_phase == Phase::Stopped
+                || self.lifecycle_phase == Phase::Completed
+            }
+            guard "session_ingress_detaches_closed" { self.pending_session_ingress_detach_runtime_ids == EmptySet }
+            update {
+                self.live_runtime_ids = EmptySet;
+                self.runtime_fence_tokens = EmptyMap;
+                self.member_startup_binding_requested = EmptySet;
+                self.member_startup_runtime_ready = EmptySet;
+                self.member_startup_ready = EmptySet;
+                self.member_state_markers = EmptyMap;
+                self.pending_session_ingress_detach_runtime_ids = EmptySet;
+                self.active_run_count = 0;
+                self.pending_spawn_count = 0;
+                self.pending_spawn_sessions = EmptyMap;
+                self.coordinator_bound = false;
+            }
+            to Destroyed
+            emit RequestRuntimeDestroy { session_id: session_id }
+        }
+
+        transition ObserveRuntimeDestroyed {
+            on signal ObserveRuntimeDestroyed { agent_runtime_id, fence_token }
+            guard {
+                self.lifecycle_phase == Phase::Running
+                || self.lifecycle_phase == Phase::Stopped
+                || self.lifecycle_phase == Phase::Completed
+                || self.lifecycle_phase == Phase::Destroyed
+            }
+            guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
+            guard "fence_token_present" { fence_token == fence_token }
+            update {
+                self.live_runtime_ids = EmptySet;
+                self.runtime_fence_tokens = EmptyMap;
+                self.member_state_markers = EmptyMap;
+                self.active_run_count = 0;
+                self.pending_spawn_count = 0;
+                self.pending_spawn_sessions = EmptyMap;
+                self.coordinator_bound = false;
+            }
+            to Destroyed
+            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Destroyed }
+        }
+
+        // =====================================================================
+        // Absorbed transitions: per-phase self-loops
+        // =====================================================================
+
+        transition RecordOperatorActionProvenanceRunning {
+            on input RecordOperatorActionProvenance
+            guard { self.lifecycle_phase == Phase::Running }
+            update {}
+            to Running
+        }
+        transition RecordOperatorActionProvenanceStopped {
+            on input RecordOperatorActionProvenance
+            guard { self.lifecycle_phase == Phase::Stopped }
+            update {}
+            to Stopped
+        }
+        transition RecordOperatorActionProvenanceCompleted {
+            on input RecordOperatorActionProvenance
+            guard { self.lifecycle_phase == Phase::Completed }
+            update {}
+            to Completed
+        }
+        transition RecordOperatorActionProvenanceDestroyed {
+            on input RecordOperatorActionProvenance
+            guard { self.lifecycle_phase == Phase::Destroyed }
+            update {}
+            to Destroyed
+        }
+
+        transition SetSpawnPolicyRunning {
+            on input SetSpawnPolicy
+            guard { self.lifecycle_phase == Phase::Running }
+            update {}
+            to Running
+        }
+        transition SetSpawnPolicyStopped {
+            on input SetSpawnPolicy
+            guard { self.lifecycle_phase == Phase::Stopped }
+            update {}
+            to Stopped
+        }
+        transition SetSpawnPolicyCompleted {
+            on input SetSpawnPolicy
+            guard { self.lifecycle_phase == Phase::Completed }
+            update {}
+            to Completed
+        }
+        transition SetSpawnPolicyDestroyed {
+            on input SetSpawnPolicy
+            guard { self.lifecycle_phase == Phase::Destroyed }
+            update {}
+            to Destroyed
+        }
+
+        // =====================================================================
+        // Phase-changing transitions
+        // =====================================================================
+
+        transition StopRunning {
+            on input Stop
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "no_active_runs" { self.active_run_count == 0 }
+            update {
+                self.coordinator_bound = false;
+                self.active_run_count = 0;
+            }
+            to Stopped
+            emit EmitRunLifecycleNotice
+        }
+
+        transition ResumeStopped {
+            on input Resume
+            guard { self.lifecycle_phase == Phase::Stopped }
+            update {
+                self.coordinator_bound = true;
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition CompleteRunning {
+            on input Complete
+            guard { self.lifecycle_phase == Phase::Running }
+            update {
+                self.active_run_count = 0;
+            }
+            to Completed
+            emit EmitRunLifecycleNotice
+        }
+
+        transition ResetToRunning {
+            on input Reset
+            guard {
+                self.lifecycle_phase == Phase::Running
+                || self.lifecycle_phase == Phase::Stopped
+                || self.lifecycle_phase == Phase::Completed
+            }
+            update {
+                self.active_run_count = 0;
+                self.pending_spawn_count = 0;
+                self.pending_spawn_sessions = EmptyMap;
+                self.coordinator_bound = true;
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        // =====================================================================
+        // Running self-loops (inputs)
+        // =====================================================================
 
         // =====================================================================
         // Track-B (R5): identity-level wiring mutations.
@@ -355,6 +1143,8 @@ machine! {
             guard { self.lifecycle_phase == Phase::Running }
             guard "identity_has_runtime" { self.identity_to_runtime.contains_key(agent_identity) == true }
             guard "prior_session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
+            // PR #340 review item #5: verify the caller's witness of
+            // the prior session matches the current binding.
             guard "old_session_id_matches_current" {
                 self.member_session_bindings.get_cloned(agent_identity) == Some(old_session_id)
             }
@@ -370,6 +1160,8 @@ machine! {
             on input ReleaseMemberSession { agent_identity, session_id }
             guard { self.lifecycle_phase == Phase::Running }
             guard "prior_session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
+            // PR #340 review item #5: verify the caller's witness of
+            // the session being released matches the current binding.
             guard "session_id_matches_current" {
                 self.member_session_bindings.get_cloned(agent_identity) == Some(session_id)
             }
@@ -381,344 +1173,7 @@ machine! {
             emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(session_id), new_session_id: None }
         }
 
-        // =====================================================================
-        // Direct transitions
-        // =====================================================================
-
-        // Spawn is a Running self-loop: the real runtime starts in Running
-        // and does not expose a durable pre-start top-level phase.
-        //
-        // W3-H: Spawn splits into Fresh (no prior realtime binding) and
-        // Replacing (prior binding present, respawn-style rotation). Guards
-        // check BOTH the input's `replacing` witness AND the state's
-        // `member_session_bindings` key presence so the DSL enforces
-        // caller/state consistency.
-        transition SpawnRunningFresh {
-            on input Spawn { agent_identity, agent_runtime_id, fence_token, generation, external_addressable, bridge_session_id, replacing }
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "coordinator_bound" { self.coordinator_bound == true }
-            guard "no_prior_session_binding" { self.member_session_bindings.contains_key(agent_identity) == false }
-            guard "replacing_absent" { replacing == None }
-            update {
-                // Spawn is the "member joined live_runtime_ids" fact. The
-                // pending_spawn_count lifecycle is owned by StageSpawn (+1)
-                // and CompleteSpawn (-1) signals; Spawn itself leaves the
-                // counter untouched. active_run_count is unrelated to spawn.
-                self.live_runtime_ids.insert(agent_runtime_id);
-                if external_addressable {
-                    self.externally_addressable_runtime_ids.insert(agent_runtime_id);
-                } else {
-                    self.externally_addressable_runtime_ids.remove(agent_runtime_id);
-                }
-                self.runtime_fence_tokens.insert(agent_runtime_id, fence_token);
-                self.identity_to_runtime.insert(agent_identity, agent_runtime_id);
-                self.member_session_bindings.insert(agent_identity, bridge_session_id);
-                self.topology_epoch += 1;
-            }
-            to Running
-            emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation, session_id: bridge_session_id }
-            emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: None, new_session_id: Some(bridge_session_id) }
-            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Spawned }
-        }
-
-        transition SpawnRunningReplacing {
-            on input Spawn { agent_identity, agent_runtime_id, fence_token, generation, external_addressable, bridge_session_id, replacing }
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "coordinator_bound" { self.coordinator_bound == true }
-            guard "prior_session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
-            guard "replacing_present" { replacing != None }
-            update {
-                self.live_runtime_ids.insert(agent_runtime_id);
-                if external_addressable {
-                    self.externally_addressable_runtime_ids.insert(agent_runtime_id);
-                } else {
-                    self.externally_addressable_runtime_ids.remove(agent_runtime_id);
-                }
-                self.runtime_fence_tokens.insert(agent_runtime_id, fence_token);
-                self.identity_to_runtime.insert(agent_identity, agent_runtime_id);
-                self.member_session_bindings.insert(agent_identity, bridge_session_id);
-                self.topology_epoch += 1;
-            }
-            to Running
-            emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation, session_id: bridge_session_id }
-            emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(replacing.get("value")), new_session_id: Some(bridge_session_id) }
-            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Spawned }
-        }
-
-        transition ObserveRuntimeReady {
-            on signal ObserveRuntimeReady { agent_runtime_id, fence_token }
-            guard { self.lifecycle_phase == Phase::Running }
-            update {}
-            to Running
-        }
-
-        // SubmitWork formally requests runtime ingress on the bound member runtime.
-        transition SubmitWorkRunningExternal {
-            on input SubmitWork { agent_runtime_id, fence_token, work_id, origin }
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "active_members_present" { self.live_runtime_ids != EmptySet }
-            guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
-            guard "external_origin" { origin == WorkOrigin::External }
-            guard "runtime_externally_addressable" { self.externally_addressable_runtime_ids.contains(agent_runtime_id) }
-            update {}
-            to Running
-            emit RequestRuntimeIngress { agent_runtime_id: agent_runtime_id, fence_token: fence_token, work_id: work_id, origin: origin }
-        }
-
-        transition SubmitWorkRunningInternal {
-            on input SubmitWork { agent_runtime_id, fence_token, work_id, origin }
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "active_members_present" { self.live_runtime_ids != EmptySet }
-            guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
-            guard "internal_origin" { origin == WorkOrigin::Internal }
-            update {}
-            to Running
-            emit RequestRuntimeIngress { agent_runtime_id: agent_runtime_id, fence_token: fence_token, work_id: work_id, origin: origin }
-        }
-
-        transition RetireMember {
-            on signal RetireMember { agent_runtime_id, fence_token, session_id }
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
-            update {
-                self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
-            }
-            to Running
-            emit RequestRuntimeRetire { session_id: session_id }
-        }
-
-        transition ObserveRuntimeRetired {
-            on signal ObserveRuntimeRetired { agent_runtime_id, fence_token }
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
-            update {
-                self.live_runtime_ids.remove(agent_runtime_id);
-                self.externally_addressable_runtime_ids.remove(agent_runtime_id);
-                self.runtime_fence_tokens.remove(agent_runtime_id);
-                self.member_state_markers.remove(agent_runtime_id);
-                self.active_run_count = 0;
-            }
-            to Running
-            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Retired }
-        }
-
-        transition ResetMember {
-            on signal ResetMember { agent_identity, agent_runtime_id, fence_token, generation, external_addressable, session_id }
-            guard {
-                self.lifecycle_phase == Phase::Running
-                || self.lifecycle_phase == Phase::Stopped
-            }
-            update {
-                self.active_run_count = 0;
-                self.pending_spawn_count = 0;
-                self.pending_spawn_sessions = EmptyMap;
-                self.live_runtime_ids.insert(agent_runtime_id);
-                if external_addressable {
-                    self.externally_addressable_runtime_ids.insert(agent_runtime_id);
-                } else {
-                    self.externally_addressable_runtime_ids.remove(agent_runtime_id);
-                }
-                self.runtime_fence_tokens.insert(agent_runtime_id, fence_token);
-                self.identity_to_runtime.insert(agent_identity, agent_runtime_id);
-            }
-            to Running
-            emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation, session_id: session_id }
-            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Reset }
-        }
-
-        transition RespawnMember {
-            on signal RespawnMember { agent_identity, agent_runtime_id, fence_token, generation, external_addressable, session_id }
-            guard { self.lifecycle_phase == Phase::Running }
-            update {
-                self.active_run_count = 0;
-                self.pending_spawn_count = 0;
-                self.pending_spawn_sessions = EmptyMap;
-                self.live_runtime_ids.insert(agent_runtime_id);
-                if external_addressable {
-                    self.externally_addressable_runtime_ids.insert(agent_runtime_id);
-                } else {
-                    self.externally_addressable_runtime_ids.remove(agent_runtime_id);
-                }
-                self.runtime_fence_tokens.insert(agent_runtime_id, fence_token);
-                self.identity_to_runtime.insert(agent_identity, agent_runtime_id);
-            }
-            to Running
-            emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation, session_id: session_id }
-            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Respawned }
-        }
-
-        transition MarkCompleted {
-            on signal MarkCompleted
-            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped }
-            guard "no_active_runs" { self.active_run_count == 0 }
-            update {}
-            to Completed
-            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Completed }
-        }
-
-        transition DestroyMob {
-            on signal DestroyMob { session_id }
-            guard {
-                self.lifecycle_phase == Phase::Running
-                || self.lifecycle_phase == Phase::Stopped
-                || self.lifecycle_phase == Phase::Completed
-            }
-            guard "session_ingress_detaches_closed" { self.pending_session_ingress_detach_runtime_ids == EmptySet }
-            update {
-                self.live_runtime_ids = EmptySet;
-                self.runtime_fence_tokens = EmptyMap;
-                self.member_state_markers = EmptyMap;
-                self.pending_session_ingress_detach_runtime_ids = EmptySet;
-                self.active_run_count = 0;
-                self.pending_spawn_count = 0;
-                self.pending_spawn_sessions = EmptyMap;
-                self.coordinator_bound = false;
-            }
-            to Destroyed
-            emit RequestRuntimeDestroy { session_id: session_id }
-        }
-
-        transition ObserveRuntimeDestroyed {
-            on signal ObserveRuntimeDestroyed { agent_runtime_id, fence_token }
-            guard {
-                self.lifecycle_phase == Phase::Running
-                || self.lifecycle_phase == Phase::Stopped
-                || self.lifecycle_phase == Phase::Completed
-                || self.lifecycle_phase == Phase::Destroyed
-            }
-            guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
-            update {
-                self.live_runtime_ids = EmptySet;
-                self.runtime_fence_tokens = EmptyMap;
-                self.member_state_markers = EmptyMap;
-                self.active_run_count = 0;
-                self.pending_spawn_count = 0;
-                self.pending_spawn_sessions = EmptyMap;
-                self.coordinator_bound = false;
-            }
-            to Destroyed
-            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Destroyed }
-        }
-
-        // =====================================================================
-        // Absorbed transitions: per-phase self-loops
-        // =====================================================================
-
-        // RecordOperatorActionProvenance: all 4 phases, no guard, no effect
-        transition RecordOperatorActionProvenanceRunning {
-            on input RecordOperatorActionProvenance
-            guard { self.lifecycle_phase == Phase::Running }
-            update {}
-            to Running
-        }
-        transition RecordOperatorActionProvenanceStopped {
-            on input RecordOperatorActionProvenance
-            guard { self.lifecycle_phase == Phase::Stopped }
-            update {}
-            to Stopped
-        }
-        transition RecordOperatorActionProvenanceCompleted {
-            on input RecordOperatorActionProvenance
-            guard { self.lifecycle_phase == Phase::Completed }
-            update {}
-            to Completed
-        }
-        transition RecordOperatorActionProvenanceDestroyed {
-            on input RecordOperatorActionProvenance
-            guard { self.lifecycle_phase == Phase::Destroyed }
-            update {}
-            to Destroyed
-        }
-
-        // SetSpawnPolicy: all 4 phases, no guard, no effect
-        transition SetSpawnPolicyRunning {
-            on input SetSpawnPolicy
-            guard { self.lifecycle_phase == Phase::Running }
-            update {}
-            to Running
-        }
-        transition SetSpawnPolicyStopped {
-            on input SetSpawnPolicy
-            guard { self.lifecycle_phase == Phase::Stopped }
-            update {}
-            to Stopped
-        }
-        transition SetSpawnPolicyCompleted {
-            on input SetSpawnPolicy
-            guard { self.lifecycle_phase == Phase::Completed }
-            update {}
-            to Completed
-        }
-        transition SetSpawnPolicyDestroyed {
-            on input SetSpawnPolicy
-            guard { self.lifecycle_phase == Phase::Destroyed }
-            update {}
-            to Destroyed
-        }
-
-        // =====================================================================
-        // Phase-changing transitions
-        // =====================================================================
-
-        // Stop: Running -> Stopped
-        transition StopRunning {
-            on input Stop
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "no_active_runs" { self.active_run_count == 0 }
-            update {
-                self.coordinator_bound = false;
-                self.active_run_count = 0;
-            }
-            to Stopped
-            emit EmitRunLifecycleNotice
-        }
-
-        // Resume: Stopped -> Running
-        transition ResumeStopped {
-            on input Resume
-            guard { self.lifecycle_phase == Phase::Stopped }
-            update {
-                self.coordinator_bound = true;
-            }
-            to Running
-            emit EmitRunLifecycleNotice
-        }
-
-        // Complete: Running -> Completed
-        transition CompleteRunning {
-            on input Complete
-            guard { self.lifecycle_phase == Phase::Running }
-            update {
-                self.active_run_count = 0;
-            }
-            to Completed
-            emit EmitRunLifecycleNotice
-        }
-
-        // Reset: Running|Stopped|Completed -> Running
-        transition ResetToRunning {
-            on input Reset
-            guard {
-                self.lifecycle_phase == Phase::Running
-                || self.lifecycle_phase == Phase::Stopped
-                || self.lifecycle_phase == Phase::Completed
-            }
-            update {
-                self.active_run_count = 0;
-                self.pending_spawn_count = 0;
-                self.pending_spawn_sessions = EmptyMap;
-                self.coordinator_bound = true;
-            }
-            to Running
-            emit EmitRunLifecycleNotice
-        }
-
-        // =====================================================================
-        // Running self-loops (inputs)
-        // =====================================================================
-
-        // TaskCreate: real mutator. Rejects duplicate task ids via the
-        // unknown-task guard's inverse (task id not already present).
+        // TaskCreate: real mutator. Rejects duplicate task ids.
         transition TaskCreateRunning {
             on input TaskCreate { task_id, task_payload }
             guard { self.lifecycle_phase == Phase::Running }
@@ -806,7 +1261,6 @@ machine! {
         // Subscribe commands
         // =====================================================================
 
-        // SubscribeAgentEvents: all 4 phases, guard: active_members_present
         transition SubscribeAgentEventsRunning {
             on input SubscribeAgentEvents
             guard { self.lifecycle_phase == Phase::Running }
@@ -836,7 +1290,6 @@ machine! {
             to Destroyed
         }
 
-        // SubscribeAllAgentEvents: all 4 phases, no guard
         transition SubscribeAllAgentEventsRunning {
             on input SubscribeAllAgentEvents
             guard { self.lifecycle_phase == Phase::Running }
@@ -862,7 +1315,6 @@ machine! {
             to Destroyed
         }
 
-        // SubscribeMobEvents: all 4 phases, no guard
         transition SubscribeMobEventsRunning {
             on input SubscribeMobEvents
             guard { self.lifecycle_phase == Phase::Running }
@@ -1138,6 +1590,414 @@ machine! {
             emit EmitFlowRunNotice
         }
 
+        transition CreateRunSeedRunning {
+            on input CreateRunSeed { run_id, step_ids, ordered_steps, step_has_conditions, step_dependencies, step_dependency_modes, step_branches, step_collection_policies, step_quorum_thresholds, escalation_threshold, max_step_retries, max_active_nodes, max_active_frames, max_frame_depth }
+            guard { self.lifecycle_phase == Phase::Running }
+            update {
+                self.run_status.insert(run_id, FlowRunStatus::Pending);
+                self.run_tracked_steps.insert(run_id, step_ids);
+                self.run_ordered_steps.insert(run_id, ordered_steps);
+                self.run_step_status.insert(run_id, EmptyMap);
+                self.run_output_recorded.insert(run_id, EmptyMap);
+                self.run_step_condition_results.insert(run_id, EmptyMap);
+                self.run_step_has_conditions.insert(run_id, step_has_conditions);
+                self.run_step_dependencies.insert(run_id, step_dependencies);
+                self.run_step_dependency_modes.insert(run_id, step_dependency_modes);
+                self.run_step_branches.insert(run_id, step_branches);
+                self.run_step_collection_policies.insert(run_id, step_collection_policies);
+                self.run_step_quorum_thresholds.insert(run_id, step_quorum_thresholds);
+                self.run_step_target_counts.insert(run_id, EmptyMap);
+                self.run_step_target_success_counts.insert(run_id, EmptyMap);
+                self.run_step_target_terminal_failure_counts.insert(run_id, EmptyMap);
+                self.run_target_retry_counts.insert(run_id, EmptyMap);
+                self.run_escalation_threshold.insert(run_id, escalation_threshold);
+                self.run_max_step_retries.insert(run_id, max_step_retries);
+                self.run_ready_frames.insert(run_id, EmptySeq);
+                self.run_ready_frame_membership.insert(run_id, EmptySet);
+                self.run_pending_body_frame_loops.insert(run_id, EmptySeq);
+                self.run_pending_body_frame_loop_membership.insert(run_id, EmptySet);
+                self.run_max_active_nodes.insert(run_id, max_active_nodes);
+                self.run_max_active_frames.insert(run_id, max_active_frames);
+                self.run_max_frame_depth.insert(run_id, max_frame_depth);
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition CreateFrameSeedRunning {
+            on input CreateFrameSeed { run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "body_frame_has_parent_loop" { frame_scope != FrameScope::Body || loop_instance_id != None }
+            update {
+                self.frame_scope.insert(frame_id, frame_scope);
+                self.frame_phase.insert(frame_id, FrameStatus::Running);
+                self.frame_run.insert(frame_id, run_id);
+                self.frame_parent_loop.insert(frame_id, loop_instance_id);
+                self.frame_iteration.insert(frame_id, iteration);
+                self.frame_tracked_nodes.insert(frame_id, tracked_nodes);
+                self.frame_ordered_nodes.insert(frame_id, ordered_nodes);
+                self.frame_node_kind.insert(frame_id, node_kind);
+                self.frame_node_dependencies.insert(frame_id, node_dependencies);
+                self.frame_node_dependency_modes.insert(frame_id, node_dependency_modes);
+                self.frame_node_branches.insert(frame_id, node_branches);
+                self.frame_node_status.insert(frame_id, EmptyMap);
+                self.frame_ready_queue.insert(frame_id, EmptySeq);
+                self.frame_output_recorded.insert(frame_id, EmptyMap);
+                self.frame_node_condition_results.insert(frame_id, EmptyMap);
+                if frame_scope == FrameScope::Body {
+                    self.loop_stage.insert(loop_instance_id.get("value"), LoopIterationStage::BodyFrameActive);
+                    self.loop_active_body_frame.insert(loop_instance_id.get("value"), Some(frame_id));
+                }
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition CreateLoopSeedRunning {
+            on input CreateLoopSeed { loop_instance_id, parent_frame_id, parent_node_id, loop_id, depth, max_iterations }
+            guard { self.lifecycle_phase == Phase::Running }
+            update {
+                self.loop_phase.insert(loop_instance_id, LoopStatus::Running);
+                self.loop_parent_frame.insert(loop_instance_id, parent_frame_id);
+                self.loop_parent_node.insert(loop_instance_id, parent_node_id);
+                self.loop_definition.insert(loop_instance_id, loop_id);
+                self.loop_depth.insert(loop_instance_id, depth);
+                self.loop_stage.insert(loop_instance_id, LoopIterationStage::AwaitingBodyFrame);
+                self.loop_current_iteration.insert(loop_instance_id, 0u64);
+                self.loop_last_completed_iteration.insert(loop_instance_id, 0u64);
+                self.loop_max_iterations.insert(loop_instance_id, max_iterations);
+                self.loop_active_body_frame.insert(loop_instance_id, None);
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition RecordLoopBodyFrameCompletedRunning {
+            on input RecordLoopBodyFrameCompleted { loop_instance_id, iteration }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_loop" { self.loop_phase.contains_key(loop_instance_id) == true }
+            guard "loop_running" { self.loop_phase.get_cloned(loop_instance_id) == Some(LoopStatus::Running) }
+            guard "body_frame_active" { self.loop_stage.get_cloned(loop_instance_id) == Some(LoopIterationStage::BodyFrameActive) }
+            guard "iteration_matches_current" { self.loop_current_iteration.get_cloned(loop_instance_id) == Some(iteration) }
+            update {
+                self.loop_stage.insert(loop_instance_id, LoopIterationStage::AwaitingUntilEvaluation);
+                self.loop_last_completed_iteration.insert(loop_instance_id, iteration);
+                self.loop_current_iteration.insert(loop_instance_id, iteration + 1u64);
+                self.loop_active_body_frame.insert(loop_instance_id, None);
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition RecordLoopUntilConditionMetRunning {
+            on input RecordLoopUntilConditionMet { loop_instance_id, iteration }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_loop" { self.loop_phase.contains_key(loop_instance_id) == true }
+            guard "loop_running" { self.loop_phase.get_cloned(loop_instance_id) == Some(LoopStatus::Running) }
+            guard "awaiting_until_evaluation" { self.loop_stage.get_cloned(loop_instance_id) == Some(LoopIterationStage::AwaitingUntilEvaluation) }
+            guard "iteration_matches_last_completed" { self.loop_last_completed_iteration.get_cloned(loop_instance_id) == Some(iteration) }
+            update {
+                self.loop_phase.insert(loop_instance_id, LoopStatus::Completed);
+                self.loop_active_body_frame.insert(loop_instance_id, None);
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition RecordLoopUntilConditionFailedRunning {
+            on input RecordLoopUntilConditionFailed { loop_instance_id, iteration }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_loop" { self.loop_phase.contains_key(loop_instance_id) == true }
+            guard "loop_running" { self.loop_phase.get_cloned(loop_instance_id) == Some(LoopStatus::Running) }
+            guard "awaiting_until_evaluation" { self.loop_stage.get_cloned(loop_instance_id) == Some(LoopIterationStage::AwaitingUntilEvaluation) }
+            guard "iteration_matches_last_completed" { self.loop_last_completed_iteration.get_cloned(loop_instance_id) == Some(iteration) }
+            guard "iterations_remaining" {
+                self.loop_current_iteration.get_cloned(loop_instance_id).get("value")
+                    < self.loop_max_iterations.get_cloned(loop_instance_id).get("value")
+            }
+            update {
+                self.loop_stage.insert(loop_instance_id, LoopIterationStage::AwaitingBodyFrame);
+                self.loop_active_body_frame.insert(loop_instance_id, None);
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition RecordLoopUntilConditionFailedExhausted {
+            on input RecordLoopUntilConditionFailed { loop_instance_id, iteration }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_loop" { self.loop_phase.contains_key(loop_instance_id) == true }
+            guard "loop_running" { self.loop_phase.get_cloned(loop_instance_id) == Some(LoopStatus::Running) }
+            guard "awaiting_until_evaluation" { self.loop_stage.get_cloned(loop_instance_id) == Some(LoopIterationStage::AwaitingUntilEvaluation) }
+            guard "iteration_matches_last_completed" { self.loop_last_completed_iteration.get_cloned(loop_instance_id) == Some(iteration) }
+            guard "iterations_exhausted" {
+                self.loop_current_iteration.get_cloned(loop_instance_id).get("value")
+                    >= self.loop_max_iterations.get_cloned(loop_instance_id).get("value")
+            }
+            update {
+                self.loop_phase.insert(loop_instance_id, LoopStatus::Exhausted);
+                self.loop_active_body_frame.insert(loop_instance_id, None);
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition AuthorizeFlowRunReducerCommandStartRun {
+            on input AuthorizeFlowRunReducerCommand { run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_run" { self.run_status.contains_key(run_id) == true }
+            guard "start_run_command" { command == FlowRunReducerCommandKind::StartRun }
+            guard "run_pending" { self.run_status.get_cloned(run_id) == Some(FlowRunStatus::Pending) }
+            update {
+                self.run_status.insert(run_id, FlowRunStatus::Running);
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition AuthorizeFlowRunReducerCommandActiveRun {
+            on input AuthorizeFlowRunReducerCommand { run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_run" { self.run_status.contains_key(run_id) == true }
+            guard "run_running" { self.run_status.get_cloned(run_id) == Some(FlowRunStatus::Running) }
+            guard "blocked_until_machine_owned_payload_transition_exists" { false }
+            guard "active_run_command" {
+                command == FlowRunReducerCommandKind::CompleteStep
+                || command == FlowRunReducerCommandKind::RecordStepOutput
+                || command == FlowRunReducerCommandKind::ConditionPassed
+                || command == FlowRunReducerCommandKind::ConditionRejected
+                || command == FlowRunReducerCommandKind::FailStep
+                || command == FlowRunReducerCommandKind::SkipStep
+                || command == FlowRunReducerCommandKind::ProjectFrameStepStatus
+                || command == FlowRunReducerCommandKind::RegisterTargets
+                || command == FlowRunReducerCommandKind::RecordTargetSuccess
+                || command == FlowRunReducerCommandKind::RecordTargetTerminalFailure
+                || command == FlowRunReducerCommandKind::RecordTargetCanceled
+                || command == FlowRunReducerCommandKind::RecordTargetFailure
+                || command == FlowRunReducerCommandKind::RegisterReadyFrame
+                || command == FlowRunReducerCommandKind::PumpNodeScheduler
+                || command == FlowRunReducerCommandKind::RegisterPendingBodyFrame
+                || command == FlowRunReducerCommandKind::PumpFrameScheduler
+                || command == FlowRunReducerCommandKind::NodeExecutionReleased
+                || command == FlowRunReducerCommandKind::FrameTerminated
+            }
+            update {}
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition AuthorizeFlowRunReducerCommandDispatchStep {
+            on input AuthorizeFlowRunReducerCommand { run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_run" { self.run_status.contains_key(run_id) == true }
+            guard "run_running" { self.run_status.get_cloned(run_id) == Some(FlowRunStatus::Running) }
+            guard "dispatch_step_command" { command == FlowRunReducerCommandKind::DispatchStep }
+            guard "has_step_id" { step_id != None }
+            guard "has_run_step_key" { run_step_key != None }
+            guard "dispatched_step_status" { step_status == Some(StepRunStatus::Dispatched) }
+            update {
+                self.run_step_status_flat.insert(run_step_key.get("value"), StepRunStatus::Dispatched);
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition AuthorizeFlowRunReducerCommandCancelStep {
+            on input AuthorizeFlowRunReducerCommand { run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_run" { self.run_status.contains_key(run_id) == true }
+            guard "run_running" { self.run_status.get_cloned(run_id) == Some(FlowRunStatus::Running) }
+            guard "cancel_step_command" { command == FlowRunReducerCommandKind::CancelStep }
+            guard "has_step_id" { step_id != None }
+            guard "has_run_step_key" { run_step_key != None }
+            guard "canceled_step_status" { step_status == Some(StepRunStatus::Canceled) }
+            update {
+                self.run_step_status_flat.insert(run_step_key.get("value"), StepRunStatus::Canceled);
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition AuthorizeFlowRunReducerCommandTerminalCompleted {
+            on input AuthorizeFlowRunReducerCommand { run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_run" { self.run_status.contains_key(run_id) == true }
+            guard "run_running" { self.run_status.get_cloned(run_id) == Some(FlowRunStatus::Running) }
+            guard "terminal_completed_command" { command == FlowRunReducerCommandKind::TerminalizeCompleted }
+            update {
+                self.run_status.insert(run_id, FlowRunStatus::Completed);
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition AuthorizeFlowRunReducerCommandTerminalFailed {
+            on input AuthorizeFlowRunReducerCommand { run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_run" { self.run_status.contains_key(run_id) == true }
+            guard "run_running" { self.run_status.get_cloned(run_id) == Some(FlowRunStatus::Running) }
+            guard "terminal_failed_command" { command == FlowRunReducerCommandKind::TerminalizeFailed }
+            update {
+                self.run_status.insert(run_id, FlowRunStatus::Failed);
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition AuthorizeFlowRunReducerCommandTerminalCanceled {
+            on input AuthorizeFlowRunReducerCommand { run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_run" { self.run_status.contains_key(run_id) == true }
+            guard "run_running" { self.run_status.get_cloned(run_id) == Some(FlowRunStatus::Running) }
+            guard "terminal_canceled_command" { command == FlowRunReducerCommandKind::TerminalizeCanceled }
+            update {
+                self.run_status.insert(run_id, FlowRunStatus::Canceled);
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition AuthorizeFlowFrameReducerCommandActiveFrame {
+            on input AuthorizeFlowFrameReducerCommand { frame_id, command, node_id, node_status, ready_queue, terminal_status }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_frame" { self.frame_phase.contains_key(frame_id) == true }
+            guard "frame_running" { self.frame_phase.get_cloned(frame_id) == Some(FrameStatus::Running) }
+            guard "blocked_until_machine_owned_payload_transition_exists" { false }
+            guard "no_terminal_status" { terminal_status == None }
+            guard "active_frame_command" {
+                command == FlowFrameReducerCommandKind::AdmitNextReadyNode
+                || command == FlowFrameReducerCommandKind::CompleteNode
+                || command == FlowFrameReducerCommandKind::RecordNodeOutput
+                || command == FlowFrameReducerCommandKind::FailNode
+                || command == FlowFrameReducerCommandKind::SkipNode
+                || command == FlowFrameReducerCommandKind::CancelNode
+            }
+            update {}
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition AuthorizeFlowFrameReducerCommandSealFrame {
+            on input AuthorizeFlowFrameReducerCommand { frame_id, command, node_id, node_status, ready_queue, terminal_status }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_frame" { self.frame_phase.contains_key(frame_id) == true }
+            guard "frame_running" { self.frame_phase.get_cloned(frame_id) == Some(FrameStatus::Running) }
+            guard "seal_frame_command" { command == FlowFrameReducerCommandKind::SealFrame }
+            guard "terminal_frame_status" {
+                terminal_status == Some(FrameStatus::Completed)
+                || terminal_status == Some(FrameStatus::Failed)
+                || terminal_status == Some(FrameStatus::Canceled)
+            }
+            update {
+                self.frame_phase.insert(frame_id, terminal_status.get("value"));
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition AuthorizeLoopIterationReducerCommandBodyFrameStarted {
+            on input AuthorizeLoopIterationReducerCommand { loop_instance_id, command, body_frame_id, body_frame_iteration }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_loop" { self.loop_phase.contains_key(loop_instance_id) == true }
+            guard "loop_running" { self.loop_phase.get_cloned(loop_instance_id) == Some(LoopStatus::Running) }
+            guard "body_frame_started_command" { command == LoopIterationReducerCommandKind::BodyFrameStarted }
+            guard "blocked_use_CreateFrameSeed_body_side_effect" { false }
+            guard "no_body_frame_iteration" { body_frame_iteration == None }
+            guard "body_frame_already_active" { self.loop_stage.get_cloned(loop_instance_id) == Some(LoopIterationStage::BodyFrameActive) }
+            update {}
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition AuthorizeLoopIterationReducerCommandBodyFrameCompleted {
+            on input AuthorizeLoopIterationReducerCommand { loop_instance_id, command, body_frame_id, body_frame_iteration }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_loop" { self.loop_phase.contains_key(loop_instance_id) == true }
+            guard "loop_running" { self.loop_phase.get_cloned(loop_instance_id) == Some(LoopStatus::Running) }
+            guard "body_frame_active" { self.loop_stage.get_cloned(loop_instance_id) == Some(LoopIterationStage::BodyFrameActive) }
+            guard "body_frame_completed_command" { command == LoopIterationReducerCommandKind::BodyFrameCompleted }
+            guard "blocked_use_RecordLoopBodyFrameCompleted" { false }
+            guard "body_frame_iteration_present" { body_frame_iteration != None }
+            guard "iteration_matches_current" {
+                self.loop_current_iteration.get_cloned(loop_instance_id) == body_frame_iteration
+            }
+            update {}
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition AuthorizeLoopIterationReducerCommandBodyFrameFailed {
+            on input AuthorizeLoopIterationReducerCommand { loop_instance_id, command, body_frame_id, body_frame_iteration }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_loop" { self.loop_phase.contains_key(loop_instance_id) == true }
+            guard "loop_running" { self.loop_phase.get_cloned(loop_instance_id) == Some(LoopStatus::Running) }
+            guard "body_frame_active" { self.loop_stage.get_cloned(loop_instance_id) == Some(LoopIterationStage::BodyFrameActive) }
+            guard "body_frame_failed_command" { command == LoopIterationReducerCommandKind::BodyFrameFailed }
+            guard "body_frame_iteration_present" { body_frame_iteration != None }
+            guard "iteration_matches_current" {
+                self.loop_current_iteration.get_cloned(loop_instance_id) == body_frame_iteration
+            }
+            update {
+                self.loop_phase.insert(loop_instance_id, LoopStatus::Failed);
+                self.loop_last_completed_iteration.insert(loop_instance_id, body_frame_iteration.get("value"));
+                self.loop_active_body_frame.insert(loop_instance_id, None);
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition AuthorizeLoopIterationReducerCommandBodyFrameCanceled {
+            on input AuthorizeLoopIterationReducerCommand { loop_instance_id, command, body_frame_id, body_frame_iteration }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_loop" { self.loop_phase.contains_key(loop_instance_id) == true }
+            guard "loop_running" { self.loop_phase.get_cloned(loop_instance_id) == Some(LoopStatus::Running) }
+            guard "body_frame_active" { self.loop_stage.get_cloned(loop_instance_id) == Some(LoopIterationStage::BodyFrameActive) }
+            guard "body_frame_canceled_command" { command == LoopIterationReducerCommandKind::BodyFrameCanceled }
+            guard "body_frame_iteration_present" { body_frame_iteration != None }
+            guard "iteration_matches_current" {
+                self.loop_current_iteration.get_cloned(loop_instance_id) == body_frame_iteration
+            }
+            update {
+                self.loop_phase.insert(loop_instance_id, LoopStatus::Canceled);
+                self.loop_last_completed_iteration.insert(loop_instance_id, body_frame_iteration.get("value"));
+                self.loop_active_body_frame.insert(loop_instance_id, None);
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition AuthorizeLoopIterationReducerCommandUntilFeedback {
+            on input AuthorizeLoopIterationReducerCommand { loop_instance_id, command, body_frame_id, body_frame_iteration }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_loop" { self.loop_phase.contains_key(loop_instance_id) == true }
+            guard "loop_running" { self.loop_phase.get_cloned(loop_instance_id) == Some(LoopStatus::Running) }
+            guard "awaiting_until_evaluation" { self.loop_stage.get_cloned(loop_instance_id) == Some(LoopIterationStage::AwaitingUntilEvaluation) }
+            guard "blocked_use_RecordLoopUntilConditionFeedback" { false }
+            guard "no_body_frame_iteration" { body_frame_iteration == None }
+            guard "until_feedback_command" {
+                command == LoopIterationReducerCommandKind::UntilConditionMet
+                || command == LoopIterationReducerCommandKind::UntilConditionFailed
+            }
+            update {}
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
+        transition AuthorizeLoopIterationReducerCommandCancelLoop {
+            on input AuthorizeLoopIterationReducerCommand { loop_instance_id, command, body_frame_id, body_frame_iteration }
+            guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
+            guard "known_loop" { self.loop_phase.contains_key(loop_instance_id) == true }
+            guard "loop_running" { self.loop_phase.get_cloned(loop_instance_id) == Some(LoopStatus::Running) }
+            guard "cancel_loop_command" { command == LoopIterationReducerCommandKind::CancelLoop }
+            guard "no_body_frame_iteration" { body_frame_iteration == None }
+            update {
+                self.loop_phase.insert(loop_instance_id, LoopStatus::Canceled);
+                self.loop_active_body_frame.insert(loop_instance_id, None);
+            }
+            to Running
+            emit EmitRunLifecycleNotice
+        }
+
         transition StartFlowRunning {
             on signal StartFlow
             guard { self.lifecycle_phase == Phase::Running }
@@ -1173,12 +2033,22 @@ machine! {
         // CompleteFlow / FinishRun
         // =====================================================================
         //
-        // The *Zero transitions accept `active_run_count == 0` as a
-        // legitimate terminal convergence (see `cancel_all_flow_tasks`
-        // in meerkat-mob::runtime::actor for why both destroy-driven
-        // cancel and natural FlowFinished cleanup can race each other
-        // to the same terminal state). Modeling convergence in the
-        // authority keeps signal semantics machine-owned.
+        // Two independent flow-terminalization paths drive the authority to
+        // the same state:
+        //   1. Natural completion: a run's task finishes and
+        //      `handle_flow_cleanup` fires `CompleteFlow` + `FinishRun`
+        //      (decrementing `active_run_count`, clearing the run-tracker).
+        //   2. Destroy-driven cancel: `cancel_all_flow_tasks` iterates the
+        //      run-tracker and fires the same signals for any run that has
+        //      not already been cleaned up.
+        // Because actor-command ordering is unordered between these two
+        // paths, they race. Whichever lands first drives
+        // `active_run_count` from 1 → 0; the other arrives with the counter
+        // already at 0. The *Zero transitions below model "CompleteFlow /
+        // FinishRun at count 0" as a legitimate terminal convergence
+        // (no-op update, same target phase) rather than as an error the
+        // caller must paper over — dogma requires that convergence
+        // semantics live in the machine authority.
 
         transition CompleteFlowRunning {
             on signal CompleteFlow
@@ -1225,7 +2095,7 @@ machine! {
         // =====================================================================
 
         transition RetireRunningReleasing {
-            on input Retire { agent_runtime_id, agent_identity, releasing, session_id }
+            on input Retire { mob_id, agent_runtime_id, agent_identity, releasing, session_id }
             guard { self.lifecycle_phase == Phase::Running }
             guard "active_members_present" { self.live_runtime_ids != EmptySet }
             guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
@@ -1239,11 +2109,12 @@ machine! {
             }
             to Running
             emit RequestRuntimeRetire { session_id: session_id }
+            emit RequestSessionIngressDetachForMobDestroy { mob_id: mob_id, agent_runtime_id: agent_runtime_id }
             emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(releasing.get("value")), new_session_id: None }
         }
 
         transition RetireRunningPreservingBinding {
-            on input Retire { agent_runtime_id, agent_identity, releasing, session_id }
+            on input Retire { mob_id, agent_runtime_id, agent_identity, releasing, session_id }
             guard { self.lifecycle_phase == Phase::Running }
             guard "active_members_present" { self.live_runtime_ids != EmptySet }
             guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
@@ -1257,7 +2128,7 @@ machine! {
         }
 
         transition RetireRunningNoBinding {
-            on input Retire { agent_runtime_id, agent_identity, releasing, session_id }
+            on input Retire { mob_id, agent_runtime_id, agent_identity, releasing, session_id }
             guard { self.lifecycle_phase == Phase::Running }
             guard "active_members_present" { self.live_runtime_ids != EmptySet }
             guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
@@ -1271,7 +2142,7 @@ machine! {
         }
 
         transition RetireStoppedReleasing {
-            on input Retire { agent_runtime_id, agent_identity, releasing, session_id }
+            on input Retire { mob_id, agent_runtime_id, agent_identity, releasing, session_id }
             guard { self.lifecycle_phase == Phase::Stopped }
             guard "active_members_present" { self.live_runtime_ids != EmptySet }
             guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
@@ -1285,13 +2156,16 @@ machine! {
             }
             to Stopped
             emit RequestRuntimeRetire { session_id: session_id }
+            emit RequestSessionIngressDetachForMobDestroy { mob_id: mob_id, agent_runtime_id: agent_runtime_id }
             emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(releasing.get("value")), new_session_id: None }
         }
 
+        // MobMachine does not own a mob-id field, so feedback `mob_id` and
+        // failure `reason` remain protocol payload. The machine-owned check is
+        // the pending-detach runtime id opened by the Retire transition.
         transition SessionIngressDetachedForMobDestroyRunning {
             on input SessionIngressDetachedForMobDestroy { mob_id, agent_runtime_id }
             guard { self.lifecycle_phase == Phase::Running }
-            guard "mob_id_present" { mob_id == mob_id }
             guard "pending_detach_present" { self.pending_session_ingress_detach_runtime_ids.contains(agent_runtime_id) == true }
             update {
                 self.pending_session_ingress_detach_runtime_ids.remove(agent_runtime_id);
@@ -1302,7 +2176,6 @@ machine! {
         transition SessionIngressDetachedForMobDestroyStopped {
             on input SessionIngressDetachedForMobDestroy { mob_id, agent_runtime_id }
             guard { self.lifecycle_phase == Phase::Stopped }
-            guard "mob_id_present" { mob_id == mob_id }
             guard "pending_detach_present" { self.pending_session_ingress_detach_runtime_ids.contains(agent_runtime_id) == true }
             update {
                 self.pending_session_ingress_detach_runtime_ids.remove(agent_runtime_id);
@@ -1313,8 +2186,6 @@ machine! {
         transition SessionIngressDetachFailedForMobDestroyRunning {
             on input SessionIngressDetachFailedForMobDestroy { mob_id, agent_runtime_id, reason }
             guard { self.lifecycle_phase == Phase::Running }
-            guard "mob_id_present" { mob_id == mob_id }
-            guard "reason_present" { reason == reason }
             guard "pending_detach_present" { self.pending_session_ingress_detach_runtime_ids.contains(agent_runtime_id) == true }
             update {}
             to Running
@@ -1323,15 +2194,13 @@ machine! {
         transition SessionIngressDetachFailedForMobDestroyStopped {
             on input SessionIngressDetachFailedForMobDestroy { mob_id, agent_runtime_id, reason }
             guard { self.lifecycle_phase == Phase::Stopped }
-            guard "mob_id_present" { mob_id == mob_id }
-            guard "reason_present" { reason == reason }
             guard "pending_detach_present" { self.pending_session_ingress_detach_runtime_ids.contains(agent_runtime_id) == true }
             update {}
             to Stopped
         }
 
         transition RetireStoppedPreservingBinding {
-            on input Retire { agent_runtime_id, agent_identity, releasing, session_id }
+            on input Retire { mob_id, agent_runtime_id, agent_identity, releasing, session_id }
             guard { self.lifecycle_phase == Phase::Stopped }
             guard "active_members_present" { self.live_runtime_ids != EmptySet }
             guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
@@ -1345,7 +2214,7 @@ machine! {
         }
 
         transition RetireStoppedNoBinding {
-            on input Retire { agent_runtime_id, agent_identity, releasing, session_id }
+            on input Retire { mob_id, agent_runtime_id, agent_identity, releasing, session_id }
             guard { self.lifecycle_phase == Phase::Stopped }
             guard "active_members_present" { self.live_runtime_ids != EmptySet }
             guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
@@ -1444,6 +2313,7 @@ machine! {
             guard { self.lifecycle_phase == Phase::Running }
             guard "active_members_present" { self.live_runtime_ids != EmptySet }
             guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
+            guard "fence_token_present" { fence_token == fence_token }
             update {
                 self.active_run_count = 0;
             }
@@ -1452,63 +2322,251 @@ machine! {
         }
 
     }
+        }
+    };
 }
 
-// ---------------------------------------------------------------------------
-// Stub types for compilation
-// ---------------------------------------------------------------------------
+crate::mob_catalog_machine_dsl!("self", "catalog::dsl::mob_machine");
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// ---------------------------------------------------------------------------
+// Bridging newtypes
+// ---------------------------------------------------------------------------
+//
+// These types bridge between the DSL's flat representation and the real mob
+// domain types in `crate::ids`. The DSL needs Ord+Hash+Clone for Set/Map;
+// these newtypes satisfy that while providing From/Into mappings.
+
+/// Bridging type for agent identity. Maps to `crate::ids::AgentIdentity`.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct AgentIdentity(pub String);
+
 impl<T: Into<String>> From<T> for AgentIdentity {
     fn from(s: T) -> Self {
         Self(s.into())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Bridging type for agent runtime ID. Maps to `crate::ids::AgentRuntimeId`.
+///
+/// The real `AgentRuntimeId` is a struct `{ identity: AgentIdentity, generation: Generation }`.
+/// The DSL uses a single string key `"identity:generation"` for Set/Map operations.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct AgentRuntimeId(pub String);
+
 impl<T: Into<String>> From<T> for AgentRuntimeId {
     fn from(s: T) -> Self {
         Self(s.into())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Bridging type for mob id. Maps to `crate::ids::MobId`.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct MobId(pub String);
+
 impl<T: Into<String>> From<T> for MobId {
     fn from(s: T) -> Self {
         Self(s.into())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Bridging type for fence token. Maps to `crate::ids::FenceToken`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FenceToken(pub u64);
+
 impl From<u64> for FenceToken {
     fn from(v: u64) -> Self {
         Self(v)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Bridging type for generation counter. Maps to `crate::ids::Generation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Generation(pub u64);
+
 impl From<u64> for Generation {
     fn from(v: u64) -> Self {
         Self(v)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Bridging type for work reference. Maps to `crate::ids::WorkRef`.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct WorkId(pub String);
+
 impl<T: Into<String>> From<T> for WorkId {
     fn from(s: T) -> Self {
         Self(s.into())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TaskId(pub String);
-impl<T: Into<String>> From<T> for TaskId {
+/// Bridging type for flow run identity. Maps to `crate::ids::RunId`.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct RunId(pub String);
+
+impl<T: Into<String>> From<T> for RunId {
+    fn from(s: T) -> Self {
+        Self(s.into())
+    }
+}
+
+/// Bridging type for frame identity. Maps to `crate::ids::FrameId`.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct FrameId(pub String);
+
+impl<T: Into<String>> From<T> for FrameId {
+    fn from(s: T) -> Self {
+        Self(s.into())
+    }
+}
+impl FrameId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Bridging type for loop instance identity. Maps to `crate::ids::LoopInstanceId`.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct LoopInstanceId(pub String);
+
+impl<T: Into<String>> From<T> for LoopInstanceId {
+    fn from(s: T) -> Self {
+        Self(s.into())
+    }
+}
+impl LoopInstanceId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Bridging type for loop definition identity. Maps to `crate::ids::LoopId`.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct LoopId(pub String);
+
+impl<T: Into<String>> From<T> for LoopId {
+    fn from(s: T) -> Self {
+        Self(s.into())
+    }
+}
+
+/// Bridging type for flow-node identity. Maps to `crate::ids::FlowNodeId`.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct FlowNodeId(pub String);
+
+impl<T: Into<String>> From<T> for FlowNodeId {
+    fn from(s: T) -> Self {
+        Self(s.into())
+    }
+}
+
+/// Bridging type for branch identity. Maps to `crate::ids::BranchId`.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct BranchId(pub String);
+
+impl<T: Into<String>> From<T> for BranchId {
+    fn from(s: T) -> Self {
+        Self(s.into())
+    }
+}
+
+/// Bridging type for step identity. Maps to `crate::ids::StepId`.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct StepId(pub String);
+
+impl<T: Into<String>> From<T> for StepId {
+    fn from(s: T) -> Self {
+        Self(s.into())
+    }
+}
+impl StepId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Composite key for run-scoped step state projected into MobMachine.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct RunStepKey(pub String);
+
+impl<T: Into<String>> From<T> for RunStepKey {
     fn from(s: T) -> Self {
         Self(s.into())
     }
@@ -1516,13 +2574,76 @@ impl<T: Into<String>> From<T> for TaskId {
 
 /// Bridging type for bridge session id. Maps to
 /// `meerkat_core::session::SessionId` — the bridge session a mob member is
-/// attached to for the current runtime generation.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// attached to for the current runtime generation. The DSL only needs the
+/// stringified form for Ord/Hash/Clone/Default; the realtime WS observer
+/// materializes it back into the typed core id.
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct SessionId(pub String);
+
 impl<T: Into<String>> From<T> for SessionId {
     fn from(s: T) -> Self {
         Self(s.into())
     }
+}
+
+impl SessionId {
+    /// Project a real `meerkat_core::types::SessionId` into the DSL bridging type.
+    pub fn from_domain(id: &meerkat_core::types::SessionId) -> Self {
+        Self(id.to_string())
+    }
+}
+
+/// Per-identity realtime binding state. Lives in MobMachine as the canonical
+/// join between identity continuity (MobMachine-owned) and the realtime
+/// attachment's concrete session target (MeerkatMachine-owned).
+///
+/// `Unbound` entries are never actually stored — absence of a key in
+/// `member_session_bindings` is the Unbound state. The variant exists so
+/// that the DSL has a tagged type to reason about and shell consumers can
+/// pattern match on it without relying on map-absence semantics.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum RealtimeBindingState {
+    #[default]
+    Unbound,
+    BoundToSession {
+        session_id: SessionId,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Projection helpers: domain types → bridging types
+// ---------------------------------------------------------------------------
+
+/// Bridging type for task identifier. Maps to a shell-side task reference.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskId(pub String);
+
+impl<T: Into<String>> From<T> for TaskId {
+    fn from(s: T) -> Self {
+        Self(s.into())
+    }
+}
+
+/// Kickoff lifecycle phase for a member's initial autonomous turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum KickoffPhase {
+    Pending,
+    Starting,
+    CallbackPending,
+    Started,
+    Failed,
+    Cancelled,
 }
 
 /// Task lifecycle status. DSL guards enumerate these directly
@@ -1537,6 +2658,165 @@ pub enum TaskStatus {
     InProgress,
     Completed,
     Cancelled,
+}
+
+/// Dependency satisfaction mode for a step or frame node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum DependencyMode {
+    #[default]
+    All,
+    Any,
+}
+
+/// Collection policy for a step's fan-out execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum CollectionPolicyKind {
+    #[default]
+    All,
+    Any,
+    Quorum,
+}
+
+/// Canonical flow-run lifecycle state once run-local semantics are absorbed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum FlowRunStatus {
+    #[default]
+    Absent,
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Canceled,
+}
+
+/// Canonical frame lifecycle state once frame-local semantics are absorbed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum FrameStatus {
+    #[default]
+    Running,
+    Completed,
+    Failed,
+    Canceled,
+}
+
+/// Canonical loop lifecycle state once loop-local semantics are absorbed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LoopStatus {
+    #[default]
+    Running,
+    Completed,
+    Exhausted,
+    Failed,
+    Canceled,
+}
+
+/// Canonical step execution status once run-local semantics are absorbed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum StepRunStatus {
+    #[default]
+    Dispatched,
+    Completed,
+    Failed,
+    Skipped,
+    Canceled,
+}
+
+/// Root-vs-body frame scope for a frame snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum FrameScope {
+    #[default]
+    Root,
+    Body,
+}
+
+/// Flow node kind inside a frame DAG.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum FlowNodeKind {
+    #[default]
+    Step,
+    Loop,
+}
+
+/// Per-node execution status within a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum NodeRunStatus {
+    Pending,
+    #[default]
+    Ready,
+    Running,
+    Completed,
+    Failed,
+    Skipped,
+    Canceled,
+}
+
+/// Loop-body/evaluate lifecycle stage for an active repeat-until node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LoopIterationStage {
+    #[default]
+    AwaitingBodyFrame,
+    BodyFrameActive,
+    AwaitingUntilEvaluation,
+}
+
+/// Flow-run projection reducer command authorized by MobMachine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum FlowRunReducerCommandKind {
+    #[default]
+    CreateRun,
+    StartRun,
+    DispatchStep,
+    CompleteStep,
+    RecordStepOutput,
+    ConditionPassed,
+    ConditionRejected,
+    FailStep,
+    SkipStep,
+    ProjectFrameStepStatus,
+    CancelStep,
+    RegisterTargets,
+    RecordTargetSuccess,
+    RecordTargetTerminalFailure,
+    RecordTargetCanceled,
+    RecordTargetFailure,
+    RegisterReadyFrame,
+    PumpNodeScheduler,
+    RegisterPendingBodyFrame,
+    PumpFrameScheduler,
+    NodeExecutionReleased,
+    FrameTerminated,
+    TerminalizeCompleted,
+    TerminalizeFailed,
+    TerminalizeCanceled,
+}
+
+/// Flow-frame projection reducer command authorized by MobMachine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum FlowFrameReducerCommandKind {
+    #[default]
+    StartRootFrame,
+    StartBodyFrame,
+    AdmitNextReadyNode,
+    CompleteNode,
+    RecordNodeOutput,
+    FailNode,
+    SkipNode,
+    CancelNode,
+    SealFrame,
+}
+
+/// Loop-iteration projection reducer command authorized by MobMachine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LoopIterationReducerCommandKind {
+    #[default]
+    StartLoop,
+    BodyFrameStarted,
+    BodyFrameCompleted,
+    BodyFrameFailed,
+    BodyFrameCanceled,
+    UntilConditionMet,
+    UntilConditionFailed,
+    CancelLoop,
 }
 
 /// Opaque task payload carried through the DSL. The full domain type is
@@ -1561,12 +2841,14 @@ pub enum MobMemberState {
     Retiring,
 }
 
-/// Typed work-origin classification. Closed mirror of the real
-/// `meerkat-mob::ids::WorkOrigin` enum — the DSL uses this for guard-visible
-/// truth on `SubmitWork` and `RequestRuntimeIngress`. The `Ingest` variant
-/// exists only on the receiving side of the admission seam (the runtime
-/// control-plane dispatch); mob-originated work only uses
-/// `External`/`Internal`.
+/// Typed work-origin classification for
+/// [`MobMachineInput::SubmitWork`] / [`MobMachineEffect::RequestRuntimeIngress`].
+/// Closed mirror of [`crate::ids::WorkOrigin`] — the DSL uses this enum as
+/// guard-visible truth instead of the former `origin == "External"` /
+/// `origin == "Internal"` string compares. The `Ingest` variant is only
+/// valid on the receiving side of the admission seam
+/// (`MeerkatMachine::Ingest` fired by the runtime control plane); mob
+/// transitions never produce it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum WorkOrigin {
     #[default]
@@ -1575,8 +2857,13 @@ pub enum WorkOrigin {
     Ingest,
 }
 
-/// Typed member lifecycle notice kind for
-/// `MobMachineEffect::EmitMemberLifecycleNotice`.
+/// Fallible reverse mapping: the `Ingest` variant has no counterpart in the
+/// shell-side [`crate::ids::WorkOrigin`] (which only classifies mob-submitted
+/// work lanes); callers on the mob-domain side assert it away and surface a
+/// domain error if the DSL ever produces it back across the seam.
+/// Typed member lifecycle notice kind. Replaces the former literal-string
+/// `kind` field on [`MobMachineEffect::EmitMemberLifecycleNotice`] — closed
+/// set of observed member-lifecycle transitions the orchestrator emits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum MemberLifecycleKind {
     #[default]
@@ -1589,15 +2876,89 @@ pub enum MemberLifecycleKind {
     Destroyed,
 }
 
+impl MemberLifecycleKind {
+    /// Stable discriminant for logging / wire surfaces.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Spawned => "spawned",
+            Self::Retiring => "retiring",
+            Self::Retired => "retired",
+            Self::Reset => "reset",
+            Self::Respawned => "respawned",
+            Self::Completed => "completed",
+            Self::Destroyed => "destroyed",
+        }
+    }
+}
+
+impl std::fmt::Display for MemberLifecycleKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Typed wiring lifecycle notice kind for
-/// `MobMachineEffect::EmitWiringLifecycleNotice`. Pair-valued (edge-keyed)
-/// counterpart to `MemberLifecycleKind` (member-keyed). Emitted alongside
-/// `WiringGraphChanged` by `WireMembers`/`UnwireMembers` transitions.
+/// [`MobMachineEffect::EmitWiringLifecycleNotice`]. Pair-valued (edge-keyed)
+/// counterpart to [`MemberLifecycleKind`] (member-keyed). Emitted alongside
+/// [`MobMachineEffect::WiringGraphChanged`] by `WireMembers`/`UnwireMembers`
+/// transitions so external observers can reconstruct which identity pair
+/// was wired or unwired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum WiringLifecycleKind {
     #[default]
     Wired,
     Unwired,
+}
+
+impl WiringLifecycleKind {
+    /// Stable discriminant for logging / wire surfaces.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Wired => "wired",
+            Self::Unwired => "unwired",
+        }
+    }
+}
+
+impl std::fmt::Display for WiringLifecycleKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Typed kickoff-notice intent. Replaces the former literal-string `intent`
+/// field on [`MobMachineEffect::EmitKickoffLifecycleNotice`] — closed mirror
+/// of [`KickoffPhase`] with an additional `Started` intent variant for the
+/// `KickoffResolveStarted` input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum KickoffIntent {
+    #[default]
+    Pending,
+    Starting,
+    Started,
+    CallbackPending,
+    Failed,
+    Cancelled,
+}
+
+impl KickoffIntent {
+    /// Stable discriminant for logging / wire surfaces.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Starting => "Starting",
+            Self::Started => "Started",
+            Self::CallbackPending => "CallbackPending",
+            Self::Failed => "Failed",
+            Self::Cancelled => "Cancelled",
+        }
+    }
+}
+
+impl std::fmt::Display for KickoffIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Undirected wiring edge between two identities. Callers MUST normalize
@@ -1623,7 +2984,18 @@ impl WiringEdge {
 /// Descriptor-bearing external peer trust endpoint. Unlike `WiringEdge`, this
 /// preserves the routing id, transport address, and signing key that make an
 /// external trust edge authoritative.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct ExternalPeerEndpoint {
     pub name: PeerName,
     pub peer_id: PeerId,
@@ -1642,7 +3014,9 @@ impl From<&meerkat_core::comms::TrustedPeerDescriptor> for ExternalPeerEndpoint 
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct ExternalPeerEdge {
     pub local: AgentIdentity,
     pub endpoint: ExternalPeerEndpoint,
@@ -1654,7 +3028,18 @@ impl ExternalPeerEdge {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct PeerName(pub String);
 impl<T: Into<String>> From<T> for PeerName {
     fn from(s: T) -> Self {
@@ -1662,7 +3047,18 @@ impl<T: Into<String>> From<T> for PeerName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct PeerId(pub String);
 impl<T: Into<String>> From<T> for PeerId {
     fn from(s: T) -> Self {
@@ -1670,7 +3066,18 @@ impl<T: Into<String>> From<T> for PeerId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct PeerAddress(pub String);
 impl<T: Into<String>> From<T> for PeerAddress {
     fn from(s: T) -> Self {
@@ -1678,7 +3085,19 @@ impl<T: Into<String>> From<T> for PeerAddress {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct PeerSigningKey(pub [u8; 32]);
 impl From<[u8; 32]> for PeerSigningKey {
     fn from(key: [u8; 32]) -> Self {

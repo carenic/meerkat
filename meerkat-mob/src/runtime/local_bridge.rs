@@ -41,12 +41,11 @@ fn runtime_state_to_bridge(state: meerkat_runtime::RuntimeState) -> BridgeMember
         meerkat_runtime::RuntimeState::Retired => BridgeMemberRuntimeState::Retired,
         meerkat_runtime::RuntimeState::Stopped => BridgeMemberRuntimeState::Stopped,
         meerkat_runtime::RuntimeState::Destroyed => BridgeMemberRuntimeState::Destroyed,
-        other => {
+        _ => {
             tracing::warn!(
-                runtime_state = %other,
-                "unmapped runtime state observed over LocalMobRuntimeBridge; projecting idle for compatibility"
+                "unknown RuntimeState observed over LocalMobRuntimeBridge; failing closed as destroyed"
             );
-            BridgeMemberRuntimeState::Idle
+            BridgeMemberRuntimeState::Destroyed
         }
     }
 }

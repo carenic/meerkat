@@ -1,64 +1,131 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use meerkat_machine_kernels::generated::meerkat;
+use std::collections::BTreeMap;
 
-fn prepared_meerkat_state() -> meerkat::State {
-    let initialized = meerkat::transition_signal(
-        &meerkat::initial_state(),
-        meerkat::Signal::Initialize(meerkat::signals::Initialize {}),
-        &meerkat::EmptyContext,
-    )
-    .expect("initialize")
-    .next_state;
-    let registered = meerkat::transition(
-        &initialized,
-        meerkat::Input::RegisterSession(meerkat::inputs::RegisterSession {
-            session_id: "session-1".into(),
-        }),
-        &meerkat::EmptyContext,
-    )
-    .expect("register session")
-    .next_state;
-    meerkat::transition(
-        &registered,
-        meerkat::Input::PrepareBindings(meerkat::inputs::PrepareBindings {
-            agent_runtime_id: "runtime-7".into(),
-            fence_token: meerkat::FenceToken(3),
-            generation: meerkat::Generation(1),
-        }),
-        &meerkat::EmptyContext,
-    )
-    .expect("prepare bindings")
-    .next_state
+use meerkat_machine_kernels::generated::meerkat;
+use meerkat_machine_kernels::test_oracle::{
+    GeneratedMachineKernel, KernelInput, KernelSignal, KernelState, KernelValue,
+};
+use meerkat_machine_schema::identity::{
+    FieldId, InputVariantId, NamedTypeId, PhaseId, SignalVariantId,
+};
+
+fn field(slug: &str) -> FieldId {
+    FieldId::parse(slug).expect("field id")
+}
+
+fn input(slug: &str) -> InputVariantId {
+    InputVariantId::parse(slug).expect("input id")
+}
+
+fn signal(slug: &str) -> SignalVariantId {
+    SignalVariantId::parse(slug).expect("signal id")
+}
+
+fn phase(slug: &str) -> PhaseId {
+    PhaseId::parse(slug).expect("phase id")
+}
+
+fn named_string(type_name: &str, value: &str) -> KernelValue {
+    KernelValue::Named {
+        type_name: NamedTypeId::parse(type_name).expect("type id"),
+        value: Box::new(KernelValue::String(value.into())),
+    }
+}
+
+fn named_u64(type_name: &str, value: u64) -> KernelValue {
+    KernelValue::Named {
+        type_name: NamedTypeId::parse(type_name).expect("type id"),
+        value: Box::new(KernelValue::U64(value)),
+    }
+}
+
+fn prepared_meerkat_state() -> KernelState {
+    let kernel = GeneratedMachineKernel::new(meerkat::schema());
+    let initialized = kernel
+        .transition_signal(
+            &kernel.initial_state().expect("initial state"),
+            &KernelSignal {
+                variant: signal("Initialize"),
+                fields: BTreeMap::new(),
+            },
+        )
+        .expect("initialize")
+        .next_state;
+    let registered = kernel
+        .transition(
+            &initialized,
+            &KernelInput {
+                variant: input("RegisterSession"),
+                fields: BTreeMap::from([(
+                    field("session_id"),
+                    named_string("SessionId", "session-1"),
+                )]),
+            },
+        )
+        .expect("register session")
+        .next_state;
+    kernel
+        .transition(
+            &registered,
+            &KernelInput {
+                variant: input("PrepareBindings"),
+                fields: BTreeMap::from([
+                    (
+                        field("agent_runtime_id"),
+                        named_string("AgentRuntimeId", "runtime-7"),
+                    ),
+                    (field("fence_token"), named_u64("FenceToken", 3)),
+                    (field("generation"), named_u64("Generation", 1)),
+                    (field("session_id"), named_string("SessionId", "session-1")),
+                ]),
+            },
+        )
+        .expect("prepare bindings")
+        .next_state
 }
 
 #[test]
 fn session_turn_admission_kernel_attached_state_reached() {
     let state = prepared_meerkat_state();
-    assert_eq!(state.phase, meerkat::Phase::Attached);
-    assert_eq!(state.active_runtime_id, Some("runtime-7".into()));
+    assert_eq!(state.phase, phase("Attached"));
+    assert_eq!(
+        state.fields.get(&field("active_runtime_id")),
+        Some(&KernelValue::Map(BTreeMap::from([(
+            KernelValue::String("value".into()),
+            named_string("AgentRuntimeId", "runtime-7"),
+        )])))
+    );
 }
 
 #[test]
 fn session_turn_admission_kernel_interrupt_allowed_while_attached() {
+    let kernel = GeneratedMachineKernel::new(meerkat::schema());
     let state = prepared_meerkat_state();
-    let next = meerkat::transition(
-        &state,
-        meerkat::Input::InterruptCurrentRun(meerkat::inputs::InterruptCurrentRun {}),
-        &meerkat::EmptyContext,
-    )
-    .expect("attached sessions should accept interrupts as a self-loop");
-    assert_eq!(next.next_state.phase, meerkat::Phase::Attached);
+    let next = kernel
+        .transition(
+            &state,
+            &KernelInput {
+                variant: input("InterruptCurrentRun"),
+                fields: BTreeMap::new(),
+            },
+        )
+        .expect("attached sessions should accept interrupts as a self-loop");
+    assert_eq!(next.next_state.phase, phase("Attached"));
 }
 
 #[test]
 fn session_turn_admission_kernel_cancel_boundary_allowed_while_attached() {
+    let kernel = GeneratedMachineKernel::new(meerkat::schema());
     let state = prepared_meerkat_state();
-    let next = meerkat::transition(
-        &state,
-        meerkat::Input::CancelAfterBoundary(meerkat::inputs::CancelAfterBoundary {}),
-        &meerkat::EmptyContext,
-    )
-    .expect("attached sessions should accept cancel-after-boundary as a self-loop");
-    assert_eq!(next.next_state.phase, meerkat::Phase::Attached);
+    let next = kernel
+        .transition(
+            &state,
+            &KernelInput {
+                variant: input("CancelAfterBoundary"),
+                fields: BTreeMap::new(),
+            },
+        )
+        .expect("attached sessions should accept cancel-after-boundary as a self-loop");
+    assert_eq!(next.next_state.phase, phase("Attached"));
 }

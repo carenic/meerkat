@@ -3293,6 +3293,89 @@ async fn create_test_mob_with_run_store(
     (handle, service)
 }
 
+async fn seed_test_run_in_mob_machine(handle: &MobHandle, run_id: &RunId) {
+    handle
+        .project_machine_input(
+            crate::machines::mob_machine::MobMachineInput::CreateRunSeed {
+                run_id: crate::machines::mob_machine::RunId::from(run_id.to_string()),
+                step_ids: Default::default(),
+                ordered_steps: Vec::new(),
+                step_has_conditions: Default::default(),
+                step_dependencies: Default::default(),
+                step_dependency_modes: Default::default(),
+                step_branches: Default::default(),
+                step_collection_policies: Default::default(),
+                step_quorum_thresholds: Default::default(),
+                escalation_threshold: 0,
+                max_step_retries: 0,
+                max_active_nodes: 0,
+                max_active_frames: 0,
+                max_frame_depth: 0,
+            },
+        )
+        .await
+        .expect("seed run in MobMachine");
+}
+
+async fn seed_test_loop_in_mob_machine(
+    handle: &MobHandle,
+    loop_instance_id: &crate::ids::LoopInstanceId,
+    parent_frame_id: &crate::ids::FrameId,
+    parent_node_id: &crate::ids::FlowNodeId,
+    loop_id: &crate::ids::LoopId,
+    depth: u32,
+    max_iterations: u64,
+) {
+    handle
+        .project_machine_input(
+            crate::machines::mob_machine::MobMachineInput::CreateLoopSeed {
+                loop_instance_id: crate::machines::mob_machine::LoopInstanceId::from(
+                    loop_instance_id.as_str(),
+                ),
+                parent_frame_id: crate::machines::mob_machine::FrameId::from(
+                    parent_frame_id.as_str(),
+                ),
+                parent_node_id: crate::machines::mob_machine::FlowNodeId::from(
+                    parent_node_id.as_str(),
+                ),
+                loop_id: crate::machines::mob_machine::LoopId::from(loop_id.as_str()),
+                depth,
+                max_iterations,
+            },
+        )
+        .await
+        .expect("seed loop in MobMachine");
+}
+
+async fn seed_test_body_frame_in_mob_machine(
+    handle: &MobHandle,
+    run_id: &RunId,
+    frame_id: &crate::ids::FrameId,
+    loop_instance_id: &crate::ids::LoopInstanceId,
+    iteration: u32,
+) {
+    handle
+        .project_machine_input(
+            crate::machines::mob_machine::MobMachineInput::CreateFrameSeed {
+                run_id: crate::machines::mob_machine::RunId::from(run_id.to_string()),
+                frame_id: crate::machines::mob_machine::FrameId::from(frame_id.as_str()),
+                frame_scope: crate::machines::mob_machine::FrameScope::Body,
+                loop_instance_id: Some(crate::machines::mob_machine::LoopInstanceId::from(
+                    loop_instance_id.as_str(),
+                )),
+                iteration,
+                tracked_nodes: Default::default(),
+                ordered_nodes: Vec::new(),
+                node_kind: Default::default(),
+                node_dependencies: Default::default(),
+                node_dependency_modes: Default::default(),
+                node_branches: Default::default(),
+            },
+        )
+        .await
+        .expect("seed body frame in MobMachine");
+}
+
 fn test_comms_name(profile: &str, agent_identity: &str) -> String {
     format!("test-mob/{profile}/{agent_identity}")
 }
@@ -19558,7 +19641,10 @@ async fn test_flow_with_root_frame_spec_executes_frame_nodes() {
     let executor = Arc::new(ScriptedExecutor {
         outputs: scripted_outputs,
     });
-    let engine = FlowFrameEngine::new(store.clone(), executor, None, 0, 0);
+    let definition = sample_definition();
+    let (handle, _) = create_test_mob_with_run_store(definition, store.clone()).await;
+    seed_test_run_in_mob_machine(&handle, &run_id).await;
+    let engine = FlowFrameEngine::new(store.clone(), executor, handle, 0, 0);
     let context = FlowContext {
         run_id: run_id.clone(),
         activation_params: serde_json::json!({}),
@@ -19983,7 +20069,11 @@ async fn test_resume_running_loop_node_completes_instead_of_failing() {
         FrameSpec { nodes }
     };
 
-    let frame_kernel = crate::runtime::flow_frame_engine::FlowFrameKernel::new(store.clone());
+    let definition = sample_definition();
+    let (handle, _) = create_test_mob_with_run_store(definition, store.clone()).await;
+    seed_test_run_in_mob_machine(&handle, &run_id).await;
+    let frame_kernel =
+        crate::runtime::flow_frame_engine::FlowFrameKernel::new(store.clone(), handle.clone());
     let frame_id = FrameId::from(format!("{run_id}-root").as_str());
     frame_kernel
         .start_frame(&run_id, &frame_id, &root_spec)
@@ -19997,6 +20087,16 @@ async fn test_resume_running_loop_node_completes_instead_of_failing() {
 
     let loop_instance_id =
         crate::ids::LoopInstanceId::from(format!("{frame_id}::loop-node").as_str());
+    seed_test_loop_in_mob_machine(
+        &handle,
+        &loop_instance_id,
+        &frame_id,
+        &crate::ids::FlowNodeId::from("loop-node"),
+        &crate::ids::LoopId::from("retry"),
+        1,
+        3,
+    )
+    .await;
     store
         .upsert_loop_snapshot(
             &run_id,
@@ -20021,7 +20121,13 @@ async fn test_resume_running_loop_node_completes_instead_of_failing() {
         .await
         .expect("seed running loop snapshot");
 
-    let engine = FlowFrameEngine::new(store.clone(), Arc::new(ScriptedExecutor), None, 0, 0);
+    let engine = FlowFrameEngine::new(
+        store.clone(),
+        Arc::new(ScriptedExecutor),
+        handle.clone(),
+        0,
+        0,
+    );
     let context = FlowContext {
         run_id: run_id.clone(),
         activation_params: serde_json::json!({}),
@@ -20120,7 +20226,11 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
         FrameSpec { nodes }
     };
 
-    let frame_kernel = crate::runtime::flow_frame_engine::FlowFrameKernel::new(store.clone());
+    let definition = sample_definition();
+    let (handle, _) = create_test_mob_with_run_store(definition, store.clone()).await;
+    seed_test_run_in_mob_machine(&handle, &run_id).await;
+    let frame_kernel =
+        crate::runtime::flow_frame_engine::FlowFrameKernel::new(store.clone(), handle.clone());
     let frame_id = FrameId::from(format!("{run_id}-root").as_str());
     frame_kernel
         .start_frame(&run_id, &frame_id, &root_spec)
@@ -20135,6 +20245,18 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
     let loop_instance_id =
         crate::ids::LoopInstanceId::from(format!("{frame_id}::loop-node").as_str());
     let body_frame_id = FrameId::from(format!("{loop_instance_id}::iter-0").as_str());
+    seed_test_loop_in_mob_machine(
+        &handle,
+        &loop_instance_id,
+        &frame_id,
+        &crate::ids::FlowNodeId::from("loop-node"),
+        &crate::ids::LoopId::from("retry"),
+        1,
+        3,
+    )
+    .await;
+    seed_test_body_frame_in_mob_machine(&handle, &run_id, &body_frame_id, &loop_instance_id, 0)
+        .await;
     store
         .upsert_loop_snapshot(
             &run_id,
@@ -20178,7 +20300,13 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
         "body frame scope update should succeed"
     );
 
-    let engine = FlowFrameEngine::new(store.clone(), Arc::new(ScriptedExecutor), None, 0, 0);
+    let engine = FlowFrameEngine::new(
+        store.clone(),
+        Arc::new(ScriptedExecutor),
+        handle.clone(),
+        0,
+        0,
+    );
     let context = FlowContext {
         run_id: run_id.clone(),
         activation_params: serde_json::json!({}),

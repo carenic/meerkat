@@ -25,6 +25,7 @@ use meerkat::{
     ForkContextSpec, HelperOptionsSpec, ScheduledMobBackendKind, ScheduledMobRuntimeMode,
 };
 use meerkat_core::agent::AgentToolDispatcher;
+use meerkat_core::handles::ExternalToolSurfaceHandle;
 use meerkat_core::service::{
     CreateSessionRequest, DeferredPromptPolicy, InitialTurnPolicy, SessionBuildOptions,
 };
@@ -152,7 +153,9 @@ impl McpScheduleContext {
 
         let output_schema = create.output_schema.clone();
 
-        let mcp_adapter = self.seed_realm_mcp_adapter().await?;
+        let mcp_adapter = self
+            .seed_realm_mcp_adapter(Arc::clone(&runtime_bindings.external_tool_surface))
+            .await?;
         let mcp_tools: Arc<dyn AgentToolDispatcher> = mcp_adapter.clone();
         let external_tools = compose_external_tool_dispatchers(None, Some(mcp_tools))
             .map_err(ScheduleDomainError::Internal)?;
@@ -261,8 +264,13 @@ impl McpScheduleContext {
         }
     }
 
-    async fn seed_realm_mcp_adapter(&self) -> Result<Arc<McpRouterAdapter>, ScheduleDomainError> {
-        let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new()));
+    async fn seed_realm_mcp_adapter(
+        &self,
+        external_tool_surface: Arc<dyn ExternalToolSurfaceHandle>,
+    ) -> Result<Arc<McpRouterAdapter>, ScheduleDomainError> {
+        let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new_with_surface_handle(
+            external_tool_surface,
+        )));
         let server_configs = self
             .config_runtime
             .get()

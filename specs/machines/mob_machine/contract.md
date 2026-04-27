@@ -11,9 +11,73 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `externally_addressable_runtime_ids`: `Set<AgentRuntimeId>`
 - `runtime_fence_tokens`: `Map<AgentRuntimeId, FenceToken>`
 - `active_run_count`: `u64`
+- `run_status`: `Map<RunId, FlowRunStatus>`
+- `run_ordered_steps`: `Map<RunId, Seq<StepId>>`
+- `run_tracked_steps`: `Map<RunId, Set<StepId>>`
+- `run_step_status`: `Map<RunId, Map<StepId, Option<StepRunStatus>>>`
+- `run_step_status_flat`: `Map<RunStepKey, StepRunStatus>`
+- `run_output_recorded`: `Map<RunId, Map<StepId, Bool>>`
+- `run_step_condition_results`: `Map<RunId, Map<StepId, Option<Bool>>>`
+- `run_step_has_conditions`: `Map<RunId, Map<StepId, Bool>>`
+- `run_step_dependencies`: `Map<RunId, Map<StepId, Seq<StepId>>>`
+- `run_step_dependency_modes`: `Map<RunId, Map<StepId, DependencyMode>>`
+- `run_step_branches`: `Map<RunId, Map<StepId, Option<BranchId>>>`
+- `run_step_collection_policies`: `Map<RunId, Map<StepId, CollectionPolicyKind>>`
+- `run_step_quorum_thresholds`: `Map<RunId, Map<StepId, u32>>`
+- `run_step_target_counts`: `Map<RunId, Map<StepId, u32>>`
+- `run_step_target_success_counts`: `Map<RunId, Map<StepId, u32>>`
+- `run_step_target_terminal_failure_counts`: `Map<RunId, Map<StepId, u32>>`
+- `run_output_recorded_flat`: `Map<RunStepKey, Bool>`
+- `run_target_retry_counts`: `Map<RunId, Map<String, u32>>`
+- `run_escalation_threshold`: `Map<RunId, u32>`
+- `run_max_step_retries`: `Map<RunId, u32>`
+- `run_ready_frames`: `Map<RunId, Seq<FrameId>>`
+- `run_ready_frame_membership`: `Map<RunId, Set<FrameId>>`
+- `run_pending_body_frame_loops`: `Map<RunId, Seq<LoopInstanceId>>`
+- `run_pending_body_frame_loop_membership`: `Map<RunId, Set<LoopInstanceId>>`
+- `run_max_active_nodes`: `Map<RunId, u32>`
+- `run_max_active_frames`: `Map<RunId, u32>`
+- `run_max_frame_depth`: `Map<RunId, u32>`
+- `frame_scope`: `Map<FrameId, FrameScope>`
+- `frame_phase`: `Map<FrameId, FrameStatus>`
+- `frame_run`: `Map<FrameId, RunId>`
+- `frame_parent_loop`: `Map<FrameId, Option<LoopInstanceId>>`
+- `frame_iteration`: `Map<FrameId, u32>`
+- `frame_tracked_nodes`: `Map<FrameId, Set<FlowNodeId>>`
+- `frame_ordered_nodes`: `Map<FrameId, Seq<FlowNodeId>>`
+- `frame_node_kind`: `Map<FrameId, Map<FlowNodeId, FlowNodeKind>>`
+- `frame_node_dependencies`: `Map<FrameId, Map<FlowNodeId, Seq<FlowNodeId>>>`
+- `frame_node_dependency_modes`: `Map<FrameId, Map<FlowNodeId, DependencyMode>>`
+- `frame_node_step_ids`: `Map<FrameId, Map<FlowNodeId, StepId>>`
+- `frame_node_loop_ids`: `Map<FrameId, Map<FlowNodeId, LoopId>>`
+- `frame_node_status`: `Map<FrameId, Map<FlowNodeId, NodeRunStatus>>`
+- `frame_ready_queue`: `Map<FrameId, Seq<FlowNodeId>>`
+- `frame_output_recorded`: `Map<FrameId, Map<FlowNodeId, Bool>>`
+- `frame_node_condition_results`: `Map<FrameId, Map<FlowNodeId, Option<Bool>>>`
+- `frame_node_branches`: `Map<FrameId, Map<FlowNodeId, Option<BranchId>>>`
+- `loop_phase`: `Map<LoopInstanceId, LoopStatus>`
+- `loop_parent_frame`: `Map<LoopInstanceId, FrameId>`
+- `loop_parent_node`: `Map<LoopInstanceId, FlowNodeId>`
+- `loop_definition`: `Map<LoopInstanceId, LoopId>`
+- `loop_depth`: `Map<LoopInstanceId, u32>`
+- `loop_stage`: `Map<LoopInstanceId, LoopIterationStage>`
+- `loop_current_iteration`: `Map<LoopInstanceId, u64>`
+- `loop_last_completed_iteration`: `Map<LoopInstanceId, u64>`
+- `loop_max_iterations`: `Map<LoopInstanceId, u64>`
+- `loop_active_body_frame`: `Map<LoopInstanceId, Option<FrameId>>`
 - `pending_spawn_count`: `u64`
 - `pending_spawn_sessions`: `Map<AgentIdentity, SessionId>`
 - `coordinator_bound`: `Bool`
+- `member_startup_binding_requested`: `Set<AgentRuntimeId>`
+- `member_startup_runtime_ready`: `Set<AgentRuntimeId>`
+- `member_startup_ready`: `Set<AgentRuntimeId>`
+- `member_kickoff_pending`: `Set<String>`
+- `member_kickoff_starting`: `Set<String>`
+- `member_kickoff_callback_pending`: `Set<String>`
+- `member_kickoff_started`: `Set<String>`
+- `member_kickoff_failed`: `Set<String>`
+- `member_kickoff_cancelled`: `Set<String>`
+- `member_kickoff_error`: `Map<String, String>`
 - `member_state_markers`: `Map<AgentRuntimeId, MobMemberState>`
 - `wiring_edges`: `Set<WiringEdge>`
 - `external_peer_edges`: `Set<ExternalPeerEdge>`
@@ -27,10 +91,21 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ## Inputs
 - `RunFlow`
+- `CreateRunSeed`(run_id: RunId, step_ids: Set<StepId>, ordered_steps: Seq<StepId>, step_has_conditions: Map<StepId, Bool>, step_dependencies: Map<StepId, Seq<StepId>>, step_dependency_modes: Map<StepId, DependencyMode>, step_branches: Map<StepId, Option<BranchId>>, step_collection_policies: Map<StepId, CollectionPolicyKind>, step_quorum_thresholds: Map<StepId, u32>, escalation_threshold: u32, max_step_retries: u32, max_active_nodes: u32, max_active_frames: u32, max_frame_depth: u32)
+- `CreateFrameSeed`(run_id: RunId, frame_id: FrameId, frame_scope: FrameScope, loop_instance_id: Option<LoopInstanceId>, iteration: u32, tracked_nodes: Set<FlowNodeId>, ordered_nodes: Seq<FlowNodeId>, node_kind: Map<FlowNodeId, FlowNodeKind>, node_dependencies: Map<FlowNodeId, Seq<FlowNodeId>>, node_dependency_modes: Map<FlowNodeId, DependencyMode>, node_branches: Map<FlowNodeId, Option<BranchId>>)
+- `CreateLoopSeed`(loop_instance_id: LoopInstanceId, parent_frame_id: FrameId, parent_node_id: FlowNodeId, loop_id: LoopId, depth: u32, max_iterations: u64)
+- `RecordLoopBodyFrameCompleted`(loop_instance_id: LoopInstanceId, iteration: u64)
+- `RecordLoopUntilConditionMet`(loop_instance_id: LoopInstanceId, iteration: u64)
+- `RecordLoopUntilConditionFailed`(loop_instance_id: LoopInstanceId, iteration: u64)
+- `AuthorizeFlowRunReducerCommand`(run_id: RunId, command: FlowRunReducerCommandKind, step_id: Option<StepId>, run_step_key: Option<RunStepKey>, step_status: Option<StepRunStatus>, target_count: Option<u32>, frame_id: Option<FrameId>, loop_instance_id: Option<LoopInstanceId>, retry_key: Option<String>)
+- `AuthorizeFlowFrameReducerCommand`(frame_id: FrameId, command: FlowFrameReducerCommandKind, node_id: Option<FlowNodeId>, node_status: Option<NodeRunStatus>, ready_queue: Option<Seq<FlowNodeId>>, terminal_status: Option<FrameStatus>)
+- `AuthorizeLoopIterationReducerCommand`(loop_instance_id: LoopInstanceId, command: LoopIterationReducerCommandKind, body_frame_id: Option<FrameId>, body_frame_iteration: Option<u64>)
 - `CancelFlow`
 - `FlowStatus`
 - `Spawn`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: Bool, bridge_session_id: SessionId, replacing: Option<SessionId>)
-- `Retire`(agent_runtime_id: AgentRuntimeId, agent_identity: AgentIdentity, releasing: Option<SessionId>, session_id: SessionId)
+- `EnsureMember`(agent_identity: AgentIdentity)
+- `Reconcile`(desired: Set<AgentIdentity>, retire_stale: Bool)
+- `Retire`(mob_id: MobId, agent_runtime_id: AgentRuntimeId, agent_identity: AgentIdentity, releasing: Option<SessionId>, session_id: SessionId)
 - `Respawn`(agent_runtime_id: AgentRuntimeId)
 - `RetireAll`
 - `WireMembers`(edge: WiringEdge)
@@ -70,6 +145,15 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `SetSpawnPolicy`
 - `Shutdown`
 - `ForceCancel`
+- `KickoffMarkPending`(member_id: String)
+- `KickoffMarkStarting`(member_id: String)
+- `StartupMarkReady`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
+- `KickoffResolveStarted`(member_id: String)
+- `KickoffResolveCallbackPending`(member_id: String)
+- `KickoffResolveFailed`(member_id: String, error: String)
+- `KickoffResolveCancelled`(member_id: String)
+- `KickoffCancelRequested`(member_id: String)
+- `KickoffClear`(member_id: String)
 
 ## Surface-only Inputs
 - `FlowStatus`
@@ -120,8 +204,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RequestRuntimeBinding`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: SessionId)
 - `RequestRuntimeIngress`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, work_id: WorkId, origin: WorkOrigin)
 - `RequestRuntimeRetire`(session_id: SessionId)
-- `RequestSessionIngressDetachForMobDestroy`(mob_id: MobId, agent_runtime_id: AgentRuntimeId)
 - `RequestRuntimeDestroy`(session_id: SessionId)
+- `RequestSessionIngressDetachForMobDestroy`(mob_id: MobId, agent_runtime_id: AgentRuntimeId)
 - `EmitMemberLifecycleNotice`(kind: MemberLifecycleKind)
 - `EmitRunLifecycleNotice`
 - `EmitFlowRunNotice`
@@ -134,6 +218,9 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `AdmitPeerInput`
 - `EmitProgressNote`
 - `EmitTaskNotice`
+- `PersistKickoffUpdate`(member_id: String, phase: KickoffPhase)
+- `PersistKickoffFailureUpdate`(member_id: String, phase: KickoffPhase, error: String)
+- `EmitKickoffLifecycleNotice`(member_id: String, intent: KickoffIntent)
 - `WiringGraphChanged`(epoch: u64)
 - `MemberSessionBindingChanged`(epoch: u64, agent_identity: AgentIdentity, old_session_id: Option<SessionId>, new_session_id: Option<SessionId>)
 - `EmitWiringLifecycleNotice`(kind: WiringLifecycleKind, edge: WiringEdge)
@@ -143,66 +230,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `bindings_require_known_identity`
 
 ## Transitions
-### `WireMembersRunning`
-- From: `Running`
-- On: `WireMembers`(edge)
-- Guards:
-  - `edge_not_already_wired`
-- Emits: `WiringGraphChanged`, `EmitWiringLifecycleNotice`
-- To: `Running`
-
-### `UnwireMembersRunning`
-- From: `Running`
-- On: `UnwireMembers`(edge)
-- Guards:
-  - `edge_currently_wired`
-- Emits: `WiringGraphChanged`, `EmitWiringLifecycleNotice`
-- To: `Running`
-
-### `WireExternalPeerRunning`
-- From: `Running`
-- On: `WireExternalPeer`(edge)
-- Guards:
-  - `external_peer_not_already_wired`
-- Emits: `WiringGraphChanged`, `EmitExternalPeerWiringLifecycleNotice`
-- To: `Running`
-
-### `UnwireExternalPeerRunning`
-- From: `Running`
-- On: `UnwireExternalPeer`(edge)
-- Guards:
-  - `external_peer_currently_wired`
-- Emits: `WiringGraphChanged`, `EmitExternalPeerWiringLifecycleNotice`
-- To: `Running`
-
-### `BindMemberSessionRunning`
-- From: `Running`
-- On: `BindMemberSession`(agent_identity, session_id)
-- Guards:
-  - `identity_has_runtime`
-  - `no_prior_session_binding`
-- Emits: `MemberSessionBindingChanged`
-- To: `Running`
-
-### `RotateMemberSessionRunning`
-- From: `Running`
-- On: `RotateMemberSession`(agent_identity, old_session_id, new_session_id)
-- Guards:
-  - `identity_has_runtime`
-  - `prior_session_binding_present`
-  - `old_session_id_matches_current`
-- Emits: `MemberSessionBindingChanged`
-- To: `Running`
-
-### `ReleaseMemberSessionRunning`
-- From: `Running`
-- On: `ReleaseMemberSession`(agent_identity, session_id)
-- Guards:
-  - `prior_session_binding_present`
-  - `session_id_matches_current`
-- Emits: `MemberSessionBindingChanged`
-- To: `Running`
-
 ### `SpawnRunningFresh`
 - From: `Running`
 - On: `Spawn`(agent_identity, agent_runtime_id, fence_token, generation, external_addressable, bridge_session_id, replacing)
@@ -223,10 +250,251 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `RequestRuntimeBinding`, `MemberSessionBindingChanged`, `EmitMemberLifecycleNotice`
 - To: `Running`
 
+### `EnsureMemberRunningExisting`
+- From: `Running`
+- On: `EnsureMember`(agent_identity)
+- Guards:
+  - `coordinator_bound`
+  - `identity_present`
+- To: `Running`
+
+### `EnsureMemberRunningMissing`
+- From: `Running`
+- On: `EnsureMember`(agent_identity)
+- Guards:
+  - `coordinator_bound`
+  - `identity_absent`
+- To: `Running`
+
+### `ReconcileRunning`
+- From: `Running`
+- On: `Reconcile`(desired, retire_stale)
+- To: `Running`
+
+### `ReconcileStopped`
+- From: `Stopped`
+- On: `Reconcile`(desired, retire_stale)
+- To: `Stopped`
+
+### `ReconcileCompleted`
+- From: `Completed`
+- On: `Reconcile`(desired, retire_stale)
+- To: `Completed`
+
 ### `ObserveRuntimeReady`
 - From: `Running`
 - On: `ObserveRuntimeReady`(agent_runtime_id, fence_token)
+- Guards:
+  - `current_binding_matches`
+  - `fence_token_present`
 - To: `Running`
+
+### `StartupMarkReadyRunning`
+- From: `Running`
+- On: `StartupMarkReady`(agent_runtime_id, fence_token)
+- Guards:
+  - `current_binding_matches`
+  - `fence_token_present`
+- To: `Running`
+
+### `StartupMarkReadyStopped`
+- From: `Stopped`
+- On: `StartupMarkReady`(agent_runtime_id, fence_token)
+- Guards:
+  - `current_binding_matches`
+  - `fence_token_present`
+- To: `Stopped`
+
+### `StartupMarkReadyCompleted`
+- From: `Completed`
+- On: `StartupMarkReady`(agent_runtime_id, fence_token)
+- Guards:
+  - `current_binding_matches`
+  - `fence_token_present`
+- To: `Completed`
+
+### `KickoffMarkPendingRunning`
+- From: `Running`
+- On: `KickoffMarkPending`(member_id)
+- Guards:
+  - `kickoff_not_started`
+- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Running`
+
+### `KickoffMarkPendingStopped`
+- From: `Stopped`
+- On: `KickoffMarkPending`(member_id)
+- Guards:
+  - `kickoff_not_started`
+- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Stopped`
+
+### `KickoffMarkPendingCompleted`
+- From: `Completed`
+- On: `KickoffMarkPending`(member_id)
+- Guards:
+  - `kickoff_not_started`
+- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Completed`
+
+### `KickoffMarkStartingRunning`
+- From: `Running`
+- On: `KickoffMarkStarting`(member_id)
+- Guards:
+  - `kickoff_pending`
+- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Running`
+
+### `KickoffMarkStartingStopped`
+- From: `Stopped`
+- On: `KickoffMarkStarting`(member_id)
+- Guards:
+  - `kickoff_pending`
+- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Stopped`
+
+### `KickoffMarkStartingCompleted`
+- From: `Completed`
+- On: `KickoffMarkStarting`(member_id)
+- Guards:
+  - `kickoff_pending`
+- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Completed`
+
+### `KickoffResolveStartedRunning`
+- From: `Running`
+- On: `KickoffResolveStarted`(member_id)
+- Guards:
+  - `kickoff_starting`
+- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Running`
+
+### `KickoffResolveStartedStopped`
+- From: `Stopped`
+- On: `KickoffResolveStarted`(member_id)
+- Guards:
+  - `kickoff_starting`
+- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Stopped`
+
+### `KickoffResolveStartedCompleted`
+- From: `Completed`
+- On: `KickoffResolveStarted`(member_id)
+- Guards:
+  - `kickoff_starting`
+- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Completed`
+
+### `KickoffResolveCallbackPendingRunning`
+- From: `Running`
+- On: `KickoffResolveCallbackPending`(member_id)
+- Guards:
+  - `kickoff_starting`
+- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Running`
+
+### `KickoffResolveCallbackPendingStopped`
+- From: `Stopped`
+- On: `KickoffResolveCallbackPending`(member_id)
+- Guards:
+  - `kickoff_starting`
+- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Stopped`
+
+### `KickoffResolveCallbackPendingCompleted`
+- From: `Completed`
+- On: `KickoffResolveCallbackPending`(member_id)
+- Guards:
+  - `kickoff_starting`
+- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Completed`
+
+### `KickoffResolveFailedFromStartingRunning`
+- From: `Running`
+- On: `KickoffResolveFailed`(member_id, error)
+- Guards:
+  - `kickoff_active_failed`
+- Emits: `PersistKickoffFailureUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Running`
+
+### `KickoffResolveFailedFromStartingStopped`
+- From: `Stopped`
+- On: `KickoffResolveFailed`(member_id, error)
+- Guards:
+  - `kickoff_active_failed`
+- Emits: `PersistKickoffFailureUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Stopped`
+
+### `KickoffResolveFailedFromStartingCompleted`
+- From: `Completed`
+- On: `KickoffResolveFailed`(member_id, error)
+- Guards:
+  - `kickoff_active_failed`
+- Emits: `PersistKickoffFailureUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Completed`
+
+### `KickoffResolveCancelledRunning`
+- From: `Running`
+- On: `KickoffResolveCancelled`(member_id)
+- Guards:
+  - `kickoff_cancelled`
+- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Running`
+
+### `KickoffResolveCancelledStopped`
+- From: `Stopped`
+- On: `KickoffResolveCancelled`(member_id)
+- Guards:
+  - `kickoff_cancelled`
+- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Stopped`
+
+### `KickoffResolveCancelledCompleted`
+- From: `Completed`
+- On: `KickoffResolveCancelled`(member_id)
+- Guards:
+  - `kickoff_cancelled`
+- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Completed`
+
+### `KickoffCancelRequestedRunning`
+- From: `Running`
+- On: `KickoffCancelRequested`(member_id)
+- Guards:
+  - `kickoff_cancellable`
+- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Running`
+
+### `KickoffCancelRequestedStopped`
+- From: `Stopped`
+- On: `KickoffCancelRequested`(member_id)
+- Guards:
+  - `kickoff_cancellable`
+- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Stopped`
+
+### `KickoffCancelRequestedCompleted`
+- From: `Completed`
+- On: `KickoffCancelRequested`(member_id)
+- Guards:
+  - `kickoff_cancellable`
+- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Completed`
+
+### `KickoffClearRunning`
+- From: `Running`
+- On: `KickoffClear`(member_id)
+- To: `Running`
+
+### `KickoffClearStopped`
+- From: `Stopped`
+- On: `KickoffClear`(member_id)
+- To: `Stopped`
+
+### `KickoffClearCompleted`
+- From: `Completed`
+- On: `KickoffClear`(member_id)
+- To: `Completed`
 
 ### `SubmitWorkRunningExternal`
 - From: `Running`
@@ -254,6 +522,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `RetireMember`(agent_runtime_id, fence_token, session_id)
 - Guards:
   - `current_binding_matches`
+  - `fence_token_present`
 - Emits: `RequestRuntimeRetire`
 - To: `Running`
 
@@ -262,6 +531,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `ObserveRuntimeRetired`(agent_runtime_id, fence_token)
 - Guards:
   - `current_binding_matches`
+  - `fence_token_present`
 - Emits: `EmitMemberLifecycleNotice`
 - To: `Running`
 
@@ -298,6 +568,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `ObserveRuntimeDestroyed`(agent_runtime_id, fence_token)
 - Guards:
   - `current_binding_matches`
+  - `fence_token_present`
 - Emits: `EmitMemberLifecycleNotice`
 - To: `Destroyed`
 
@@ -365,6 +636,66 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - From: `Running`, `Stopped`, `Completed`
 - On: `Reset`()
 - Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `WireMembersRunning`
+- From: `Running`
+- On: `WireMembers`(edge)
+- Guards:
+  - `edge_not_already_wired`
+- Emits: `WiringGraphChanged`, `EmitWiringLifecycleNotice`
+- To: `Running`
+
+### `UnwireMembersRunning`
+- From: `Running`
+- On: `UnwireMembers`(edge)
+- Guards:
+  - `edge_currently_wired`
+- Emits: `WiringGraphChanged`, `EmitWiringLifecycleNotice`
+- To: `Running`
+
+### `WireExternalPeerRunning`
+- From: `Running`
+- On: `WireExternalPeer`(edge)
+- Guards:
+  - `external_peer_not_already_wired`
+- Emits: `WiringGraphChanged`, `EmitExternalPeerWiringLifecycleNotice`
+- To: `Running`
+
+### `UnwireExternalPeerRunning`
+- From: `Running`
+- On: `UnwireExternalPeer`(edge)
+- Guards:
+  - `external_peer_currently_wired`
+- Emits: `WiringGraphChanged`, `EmitExternalPeerWiringLifecycleNotice`
+- To: `Running`
+
+### `BindMemberSessionRunning`
+- From: `Running`
+- On: `BindMemberSession`(agent_identity, session_id)
+- Guards:
+  - `identity_has_runtime`
+  - `no_prior_session_binding`
+- Emits: `MemberSessionBindingChanged`
+- To: `Running`
+
+### `RotateMemberSessionRunning`
+- From: `Running`
+- On: `RotateMemberSession`(agent_identity, old_session_id, new_session_id)
+- Guards:
+  - `identity_has_runtime`
+  - `prior_session_binding_present`
+  - `old_session_id_matches_current`
+- Emits: `MemberSessionBindingChanged`
+- To: `Running`
+
+### `ReleaseMemberSessionRunning`
+- From: `Running`
+- On: `ReleaseMemberSession`(agent_identity, session_id)
+- Guards:
+  - `prior_session_binding_present`
+  - `session_id_matches_current`
+- Emits: `MemberSessionBindingChanged`
 - To: `Running`
 
 ### `TaskCreateRunning`
@@ -654,6 +985,249 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `EmitFlowRunNotice`
 - To: `Running`
 
+### `CreateRunSeedRunning`
+- From: `Running`
+- On: `CreateRunSeed`(run_id, step_ids, ordered_steps, step_has_conditions, step_dependencies, step_dependency_modes, step_branches, step_collection_policies, step_quorum_thresholds, escalation_threshold, max_step_retries, max_active_nodes, max_active_frames, max_frame_depth)
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `CreateFrameSeedRunning`
+- From: `Running`
+- On: `CreateFrameSeed`(run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches)
+- Guards:
+  - `body_frame_has_parent_loop`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `CreateLoopSeedRunning`
+- From: `Running`
+- On: `CreateLoopSeed`(loop_instance_id, parent_frame_id, parent_node_id, loop_id, depth, max_iterations)
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `RecordLoopBodyFrameCompletedRunning`
+- From: `Running`, `Stopped`, `Completed`
+- On: `RecordLoopBodyFrameCompleted`(loop_instance_id, iteration)
+- Guards:
+  - `known_loop`
+  - `loop_running`
+  - `body_frame_active`
+  - `iteration_matches_current`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `RecordLoopUntilConditionMetRunning`
+- From: `Running`, `Stopped`, `Completed`
+- On: `RecordLoopUntilConditionMet`(loop_instance_id, iteration)
+- Guards:
+  - `known_loop`
+  - `loop_running`
+  - `awaiting_until_evaluation`
+  - `iteration_matches_last_completed`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `RecordLoopUntilConditionFailedRunning`
+- From: `Running`, `Stopped`, `Completed`
+- On: `RecordLoopUntilConditionFailed`(loop_instance_id, iteration)
+- Guards:
+  - `known_loop`
+  - `loop_running`
+  - `awaiting_until_evaluation`
+  - `iteration_matches_last_completed`
+  - `iterations_remaining`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `RecordLoopUntilConditionFailedExhausted`
+- From: `Running`, `Stopped`, `Completed`
+- On: `RecordLoopUntilConditionFailed`(loop_instance_id, iteration)
+- Guards:
+  - `known_loop`
+  - `loop_running`
+  - `awaiting_until_evaluation`
+  - `iteration_matches_last_completed`
+  - `iterations_exhausted`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandStartRun`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `start_run_command`
+  - `run_pending`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandActiveRun`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `blocked_until_machine_owned_payload_transition_exists`
+  - `active_run_command`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandDispatchStep`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `dispatch_step_command`
+  - `has_step_id`
+  - `has_run_step_key`
+  - `dispatched_step_status`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandCancelStep`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `cancel_step_command`
+  - `has_step_id`
+  - `has_run_step_key`
+  - `canceled_step_status`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandTerminalCompleted`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `terminal_completed_command`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandTerminalFailed`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `terminal_failed_command`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandTerminalCanceled`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `terminal_canceled_command`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowFrameReducerCommandActiveFrame`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowFrameReducerCommand`(frame_id, command, node_id, node_status, ready_queue, terminal_status)
+- Guards:
+  - `known_frame`
+  - `frame_running`
+  - `blocked_until_machine_owned_payload_transition_exists`
+  - `no_terminal_status`
+  - `active_frame_command`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowFrameReducerCommandSealFrame`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowFrameReducerCommand`(frame_id, command, node_id, node_status, ready_queue, terminal_status)
+- Guards:
+  - `known_frame`
+  - `frame_running`
+  - `seal_frame_command`
+  - `terminal_frame_status`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeLoopIterationReducerCommandBodyFrameStarted`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeLoopIterationReducerCommand`(loop_instance_id, command, body_frame_id, body_frame_iteration)
+- Guards:
+  - `known_loop`
+  - `loop_running`
+  - `body_frame_started_command`
+  - `blocked_use_CreateFrameSeed_body_side_effect`
+  - `no_body_frame_iteration`
+  - `body_frame_already_active`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeLoopIterationReducerCommandBodyFrameCompleted`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeLoopIterationReducerCommand`(loop_instance_id, command, body_frame_id, body_frame_iteration)
+- Guards:
+  - `known_loop`
+  - `loop_running`
+  - `body_frame_active`
+  - `body_frame_completed_command`
+  - `blocked_use_RecordLoopBodyFrameCompleted`
+  - `body_frame_iteration_present`
+  - `iteration_matches_current`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeLoopIterationReducerCommandBodyFrameFailed`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeLoopIterationReducerCommand`(loop_instance_id, command, body_frame_id, body_frame_iteration)
+- Guards:
+  - `known_loop`
+  - `loop_running`
+  - `body_frame_active`
+  - `body_frame_failed_command`
+  - `body_frame_iteration_present`
+  - `iteration_matches_current`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeLoopIterationReducerCommandBodyFrameCanceled`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeLoopIterationReducerCommand`(loop_instance_id, command, body_frame_id, body_frame_iteration)
+- Guards:
+  - `known_loop`
+  - `loop_running`
+  - `body_frame_active`
+  - `body_frame_canceled_command`
+  - `body_frame_iteration_present`
+  - `iteration_matches_current`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeLoopIterationReducerCommandUntilFeedback`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeLoopIterationReducerCommand`(loop_instance_id, command, body_frame_id, body_frame_iteration)
+- Guards:
+  - `known_loop`
+  - `loop_running`
+  - `awaiting_until_evaluation`
+  - `blocked_use_RecordLoopUntilConditionFeedback`
+  - `no_body_frame_iteration`
+  - `until_feedback_command`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeLoopIterationReducerCommandCancelLoop`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeLoopIterationReducerCommand`(loop_instance_id, command, body_frame_id, body_frame_iteration)
+- Guards:
+  - `known_loop`
+  - `loop_running`
+  - `cancel_loop_command`
+  - `no_body_frame_iteration`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
 ### `StartFlowRunning`
 - From: `Running`
 - On: `StartFlow`()
@@ -708,18 +1282,18 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RetireRunningReleasing`
 - From: `Running`
-- On: `Retire`(agent_runtime_id, agent_identity, releasing, session_id)
+- On: `Retire`(mob_id, agent_runtime_id, agent_identity, releasing, session_id)
 - Guards:
   - `active_members_present`
   - `runtime_id_present`
   - `prior_session_binding_present`
   - `releasing_present`
-- Emits: `RequestRuntimeRetire`, `MemberSessionBindingChanged`
+- Emits: `RequestRuntimeRetire`, `RequestSessionIngressDetachForMobDestroy`, `MemberSessionBindingChanged`
 - To: `Running`
 
 ### `RetireRunningPreservingBinding`
 - From: `Running`
-- On: `Retire`(agent_runtime_id, agent_identity, releasing, session_id)
+- On: `Retire`(mob_id, agent_runtime_id, agent_identity, releasing, session_id)
 - Guards:
   - `active_members_present`
   - `runtime_id_present`
@@ -730,7 +1304,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RetireRunningNoBinding`
 - From: `Running`
-- On: `Retire`(agent_runtime_id, agent_identity, releasing, session_id)
+- On: `Retire`(mob_id, agent_runtime_id, agent_identity, releasing, session_id)
 - Guards:
   - `active_members_present`
   - `runtime_id_present`
@@ -741,20 +1315,19 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RetireStoppedReleasing`
 - From: `Stopped`
-- On: `Retire`(agent_runtime_id, agent_identity, releasing, session_id)
+- On: `Retire`(mob_id, agent_runtime_id, agent_identity, releasing, session_id)
 - Guards:
   - `active_members_present`
   - `runtime_id_present`
   - `prior_session_binding_present`
   - `releasing_present`
-- Emits: `RequestRuntimeRetire`, `MemberSessionBindingChanged`
+- Emits: `RequestRuntimeRetire`, `RequestSessionIngressDetachForMobDestroy`, `MemberSessionBindingChanged`
 - To: `Stopped`
 
 ### `SessionIngressDetachedForMobDestroyRunning`
 - From: `Running`
 - On: `SessionIngressDetachedForMobDestroy`(mob_id, agent_runtime_id)
 - Guards:
-  - `mob_id_present`
   - `pending_detach_present`
 - To: `Running`
 
@@ -762,7 +1335,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - From: `Stopped`
 - On: `SessionIngressDetachedForMobDestroy`(mob_id, agent_runtime_id)
 - Guards:
-  - `mob_id_present`
   - `pending_detach_present`
 - To: `Stopped`
 
@@ -770,8 +1342,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - From: `Running`
 - On: `SessionIngressDetachFailedForMobDestroy`(mob_id, agent_runtime_id, reason)
 - Guards:
-  - `mob_id_present`
-  - `reason_present`
   - `pending_detach_present`
 - To: `Running`
 
@@ -779,14 +1349,12 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - From: `Stopped`
 - On: `SessionIngressDetachFailedForMobDestroy`(mob_id, agent_runtime_id, reason)
 - Guards:
-  - `mob_id_present`
-  - `reason_present`
   - `pending_detach_present`
 - To: `Stopped`
 
 ### `RetireStoppedPreservingBinding`
 - From: `Stopped`
-- On: `Retire`(agent_runtime_id, agent_identity, releasing, session_id)
+- On: `Retire`(mob_id, agent_runtime_id, agent_identity, releasing, session_id)
 - Guards:
   - `active_members_present`
   - `runtime_id_present`
@@ -797,7 +1365,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RetireStoppedNoBinding`
 - From: `Stopped`
-- On: `Retire`(agent_runtime_id, agent_identity, releasing, session_id)
+- On: `Retire`(mob_id, agent_runtime_id, agent_identity, releasing, session_id)
 - Guards:
   - `active_members_present`
   - `runtime_id_present`
@@ -849,19 +1417,20 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `active_members_present`
   - `current_binding_matches`
+  - `fence_token_present`
 - Emits: `FlowTerminalized`
 - To: `Running`
 
 ## Coverage
 ### Code Anchors
-- `meerkat-mob/src/runtime/handle.rs` — identity-first public MobMachine handle surface
-- `meerkat-mob/src/runtime/actor.rs` — MobMachine actor authority and command execution for wire, unwire, bind, rotate, release, spawn, observe runtime, submit work, retire, reset, respawn, complete, mark completed, stop/stopped, resume, task, force cancel, subscribe events, shutdown, destroy, terminalized member, record operator action provenance, flow, run, orchestrator, coordinator, cleanup, append failure ledger, escalate supervisor, peer, progress, notices, wiring graph, and session binding
+- `meerkat-mob/src/runtime/handle.rs` — identity-first public MobMachine handle surface for ensure member, reconcile, and member command routing
+- `meerkat-mob/src/runtime/actor.rs` — MobMachine actor authority and command execution for wire, unwire, bind, rotate, release, spawn, ensure member, reconcile, observe runtime, submit work, retire, reset, respawn, complete, mark completed, stop/stopped, resume, task, force cancel, subscribe events, shutdown, destroy, terminalized member, record operator action provenance, flow, run, create frame seed, create loop seed, project frame phase, project loop state, orchestrator, coordinator, cleanup, append failure ledger, escalate supervisor, peer, progress, notices, kickoff resolve started/callback pending/failed/cancelled/clear, wiring graph, and session binding
 
 ### Scenarios
-- `spawn-work-terminal` — member spawn, runtime-ready observation, work submission, and terminal work closure
+- `spawn-work-terminal` — member spawn, ensure member, reconcile, runtime-ready observation, work submission, and terminal work closure
 - `retire-respawn-destroy` — member retires, resets, respawns with a new runtime incarnation, stops/stopped, resumes, shuts down, destroys cleanly, and resets to running when reusable
 - `wiring-and-session-binding` — wire and unwire members, bind rotate release member session, enforce known identity for bindings, expose pending spawn, member session binding changed, and wiring lifecycle notices
-- `task-flow-and-run-lifecycle` — task create or update pending/in progress/completed/cancelled, run flow, start flow, create run, start run, complete flow, finish run, mark completed, flow terminalized, and force cancel running work
+- `task-flow-and-run-lifecycle` — task create or update pending/in progress/completed/cancelled, run flow, start flow, create run, create frame seed, create loop seed, project frame phase, project loop state, start run, complete flow, finish run, mark completed, kickoff resolve started or failed, kickoff clear, flow terminalized, and force cancel running work
 - `event-subscriptions-and-notices` — subscribe agent, all agent, and mob events; emit member, run, flow, progress, task, terminal, and wiring notices
 - `orchestrator-coordinator-cleanup` — initialize, stop, resume, and destroy orchestrator; bind or unbind coordinator; begin and finish cleanup; notify coordinator and escalate supervisor
 - `operator-provenance-and-peer-input` — record operator action provenance, trust operation peer, admit peer input, append failure ledger, and surface peer-exposed member inputs

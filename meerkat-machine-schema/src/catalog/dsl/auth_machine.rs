@@ -1,5 +1,3 @@
-use meerkat_machine_dsl::machine;
-
 // AuthMachine — per-binding auth lease lifecycle (Phase 1.5-rev,
 // refactored from the original "absorbed into MeerkatMachine"
 // design after review).
@@ -21,145 +19,152 @@ use meerkat_machine_dsl::machine;
 // semantic fact, one owner" (each lease IS a distinct fact), and lets
 // auth be orthogonal to MeerkatMachine — which is what Luka flagged
 // when reviewing the absorbed design.
-machine! {
-    machine AuthMachine {
-        version: 1,
-        rust: "self" / "catalog::dsl::auth_machine",
+#[macro_export]
+macro_rules! auth_catalog_machine_dsl {
+    ($rust_crate:literal, $rust_module:literal) => {
+        meerkat_machine_dsl::machine! {
+        machine AuthMachine {
+            version: 1,
+            rust: $rust_crate / $rust_module,
 
-        state {
-            lifecycle_phase: AuthLifecyclePhase,
-            expires_at: Option<u64>,
-            last_refresh: Option<u64>,
-            refresh_attempt: u64,
-        }
-
-        init(Valid) {
-            expires_at = None,
-            last_refresh = None,
-            refresh_attempt = 0,
-        }
-
-        terminal [Released]
-
-        phase AuthLifecyclePhase {
-            Valid,
-            Expiring,
-            Refreshing,
-            ReauthRequired,
-            Released,
-        }
-
-        input AuthMachineInput {
-            Acquire { expires_at_ts: Option<u64> },
-            MarkExpiring,
-            BeginRefresh,
-            CompleteRefresh { new_expires_at: Option<u64>, now_ts: u64 },
-            RefreshFailedTransient,
-            RefreshFailedPermanent,
-            MarkReauthRequired,
-            Release,
-        }
-
-        effect AuthMachineEffect {
-            EmitLifecycleEvent { new_state: AuthLifecyclePhase },
-            WakeRefreshLoop,
-        }
-
-        disposition EmitLifecycleEvent => external handoff auth_lease_lifecycle_publication,
-        disposition WakeRefreshLoop => local,
-
-        // --- Transitions ---
-
-        transition Acquire {
-            on input Acquire { expires_at_ts }
-            update {
-                self.expires_at = expires_at_ts;
-                self.refresh_attempt = 0;
+            state {
+                lifecycle_phase: AuthLifecyclePhase,
+                expires_at: Option<u64>,
+                last_refresh: Option<u64>,
+                refresh_attempt: u64,
             }
-            to Valid
-            emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-        }
 
-        transition MarkExpiring {
-            on input MarkExpiring
-            guard { self.lifecycle_phase == Phase::Valid }
-            to Expiring
-            emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-        }
-
-        transition BeginRefreshFromValid {
-            on input BeginRefresh
-            guard { self.lifecycle_phase == Phase::Valid }
-            to Refreshing
-            emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-            emit WakeRefreshLoop
-        }
-
-        transition BeginRefreshFromExpiring {
-            on input BeginRefresh
-            guard { self.lifecycle_phase == Phase::Expiring }
-            to Refreshing
-            emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-            emit WakeRefreshLoop
-        }
-
-        transition CompleteRefresh {
-            on input CompleteRefresh { new_expires_at, now_ts }
-            guard { self.lifecycle_phase == Phase::Refreshing }
-            update {
-                self.expires_at = new_expires_at;
-                self.last_refresh = Some(now_ts);
-                self.refresh_attempt = 0;
+            init(Valid) {
+                expires_at = None,
+                last_refresh = None,
+                refresh_attempt = 0,
             }
-            to Valid
-            emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-        }
 
-        transition RefreshFailedTransient {
-            on input RefreshFailedTransient
-            guard { self.lifecycle_phase == Phase::Refreshing }
-            update {
-                self.refresh_attempt = self.refresh_attempt + 1;
+            terminal [Released]
+
+            phase AuthLifecyclePhase {
+                Valid,
+                Expiring,
+                Refreshing,
+                ReauthRequired,
+                Released,
             }
-            to Expiring
-            emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-        }
 
-        transition RefreshFailedPermanent {
-            on input RefreshFailedPermanent
-            guard { self.lifecycle_phase == Phase::Refreshing }
-            update {
-                self.refresh_attempt = self.refresh_attempt + 1;
+            input AuthMachineInput {
+                Acquire { expires_at_ts: Option<u64> },
+                MarkExpiring,
+                BeginRefresh,
+                CompleteRefresh { new_expires_at: Option<u64>, now_ts: u64 },
+                RefreshFailedTransient,
+                RefreshFailedPermanent,
+                MarkReauthRequired,
+                Release,
             }
-            to ReauthRequired
-            emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-        }
 
-        transition MarkReauthRequiredFromValid {
-            on input MarkReauthRequired
-            guard { self.lifecycle_phase == Phase::Valid }
-            to ReauthRequired
-            emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-        }
+            effect AuthMachineEffect {
+                EmitLifecycleEvent { new_state: AuthLifecyclePhase },
+                WakeRefreshLoop,
+            }
 
-        transition MarkReauthRequiredFromExpiring {
-            on input MarkReauthRequired
-            guard { self.lifecycle_phase == Phase::Expiring }
-            to ReauthRequired
-            emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-        }
+            disposition EmitLifecycleEvent => external handoff auth_lease_lifecycle_publication,
+            disposition WakeRefreshLoop => local,
 
-        transition MarkReauthRequiredFromRefreshing {
-            on input MarkReauthRequired
-            guard { self.lifecycle_phase == Phase::Refreshing }
-            to ReauthRequired
-            emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-        }
+            // --- Transitions ---
 
-        transition Release {
-            on input Release
-            to Released
-            emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
+            transition Acquire {
+                on input Acquire { expires_at_ts }
+                update {
+                    self.expires_at = expires_at_ts;
+                    self.refresh_attempt = 0;
+                }
+                to Valid
+                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
+            }
+
+            transition MarkExpiring {
+                on input MarkExpiring
+                guard { self.lifecycle_phase == Phase::Valid }
+                to Expiring
+                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
+            }
+
+            transition BeginRefreshFromValid {
+                on input BeginRefresh
+                guard { self.lifecycle_phase == Phase::Valid }
+                to Refreshing
+                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
+                emit WakeRefreshLoop
+            }
+
+            transition BeginRefreshFromExpiring {
+                on input BeginRefresh
+                guard { self.lifecycle_phase == Phase::Expiring }
+                to Refreshing
+                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
+                emit WakeRefreshLoop
+            }
+
+            transition CompleteRefresh {
+                on input CompleteRefresh { new_expires_at, now_ts }
+                guard { self.lifecycle_phase == Phase::Refreshing }
+                update {
+                    self.expires_at = new_expires_at;
+                    self.last_refresh = Some(now_ts);
+                    self.refresh_attempt = 0;
+                }
+                to Valid
+                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
+            }
+
+            transition RefreshFailedTransient {
+                on input RefreshFailedTransient
+                guard { self.lifecycle_phase == Phase::Refreshing }
+                update {
+                    self.refresh_attempt = self.refresh_attempt + 1;
+                }
+                to Expiring
+                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
+            }
+
+            transition RefreshFailedPermanent {
+                on input RefreshFailedPermanent
+                guard { self.lifecycle_phase == Phase::Refreshing }
+                update {
+                    self.refresh_attempt = self.refresh_attempt + 1;
+                }
+                to ReauthRequired
+                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
+            }
+
+            transition MarkReauthRequiredFromValid {
+                on input MarkReauthRequired
+                guard { self.lifecycle_phase == Phase::Valid }
+                to ReauthRequired
+                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
+            }
+
+            transition MarkReauthRequiredFromExpiring {
+                on input MarkReauthRequired
+                guard { self.lifecycle_phase == Phase::Expiring }
+                to ReauthRequired
+                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
+            }
+
+            transition MarkReauthRequiredFromRefreshing {
+                on input MarkReauthRequired
+                guard { self.lifecycle_phase == Phase::Refreshing }
+                to ReauthRequired
+                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
+            }
+
+            transition Release {
+                on input Release
+                to Released
+                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
+            }
         }
-    }
+            }
+    };
 }
+
+crate::auth_catalog_machine_dsl!("self", "catalog::dsl::auth_machine");

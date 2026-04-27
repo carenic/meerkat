@@ -9,6 +9,7 @@ use super::mob_runtime_bridge_authority::{MobRuntimeBridgeAuthority, MobRuntimeB
 use super::provision_guard::PendingProvision;
 use super::transaction::LifecycleRollback;
 use super::*;
+use crate::generated::protocol_mob_destroying_session_ingress::MobDestroyingSessionIngressObligation;
 use crate::ids::{AgentIdentity, Generation};
 use crate::machines::mob_machine as mob_dsl;
 #[cfg(target_arch = "wasm32")]
@@ -37,17 +38,6 @@ impl InitialTurnHandle {
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_PARALLEL_REMOTE_MEMBER_TEARDOWNS: usize = 64;
 const MAX_LIFECYCLE_NOTIFICATION_TASKS: usize = 16;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum MobDestroySessionIngressBridgeEffect {
-    RequestSessionIngressDetachForMobDestroy {
-        mob_id: mob_dsl::MobId,
-        agent_runtime_id: mob_dsl::AgentRuntimeId,
-    },
-    #[doc(hidden)]
-    __NonExhaustive,
-}
 
 #[derive(Clone)]
 enum WiringEndpoint {
@@ -1063,8 +1053,18 @@ impl MobActor {
         input: mob_dsl::MobMachineInput,
         context: &str,
     ) -> Result<(), MobError> {
+        self.apply_dsl_input_collect_effects(input, context)
+            .map(|_| ())
+    }
+
+    fn apply_dsl_input_collect_effects(
+        &mut self,
+        input: mob_dsl::MobMachineInput,
+        context: &str,
+    ) -> Result<Vec<mob_dsl::MobMachineEffect>, MobError> {
         let transition = mob_dsl::MobMachineMutator::apply(&mut self.dsl_authority, input)
             .map_err(|e| MobError::Internal(format!("DSL authority ({context}): {e}")))?;
+        let effects = transition.effects.clone();
         self.queue_routed_effects_from(&transition.effects);
         if transition.from_phase != transition.to_phase {
             self.dsl_authority.state.lifecycle_phase = transition.to_phase;
@@ -1072,7 +1072,7 @@ impl MobActor {
             // the sole write seam for the dogma-#13 projection watch.
             let _ = self.phase_watch_tx.send(self.state());
         }
-        Ok(())
+        Ok(effects)
     }
 
     fn apply_dsl_signal(
@@ -2826,7 +2826,9 @@ impl MobActor {
                     let _ = reply_tx.send(result);
                 }
                 MobCommand::ProjectMachineInput { input, reply_tx } => {
-                    let result = self.apply_dsl_input(*input, "project_machine_input");
+                    let result = self
+                        .apply_dsl_input(*input, "project_machine_input")
+                        .map(|_| self.dsl_authority.state.clone());
                     let _ = reply_tx.send(result);
                 }
                 MobCommand::ProjectMachineSignal { signal } => {
@@ -4541,6 +4543,7 @@ impl MobActor {
                 Err(error) => {
                     let _ = self.apply_dsl_input(
                         mob_dsl::MobMachineInput::Retire {
+                            mob_id: mob_dsl::MobId::from_domain(&self.definition.id),
                             agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(
                                 &agent_runtime_id,
                             ),
@@ -4590,6 +4593,7 @@ impl MobActor {
                 }
                 let _ = self.apply_dsl_input(
                     mob_dsl::MobMachineInput::Retire {
+                        mob_id: mob_dsl::MobId::from_domain(&self.definition.id),
                         agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&agent_runtime_id),
                         agent_identity: dsl_identity.clone(),
                         releasing: self
@@ -4653,6 +4657,7 @@ impl MobActor {
             }
             let _ = self.apply_dsl_input(
                 mob_dsl::MobMachineInput::Retire {
+                    mob_id: mob_dsl::MobId::from_domain(&self.definition.id),
                     agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&agent_runtime_id),
                     agent_identity: dsl_identity.clone(),
                     releasing: self
@@ -6606,24 +6611,12 @@ impl MobActor {
 
     async fn detach_session_ingress_for_mob_destroy(
         &mut self,
-        entry: &RosterEntry,
         session_id: &SessionId,
+        obligation: MobDestroyingSessionIngressObligation,
     ) -> Result<(), MobError> {
         use crate::generated::protocol_mob_destroying_session_ingress::{
-            extract_obligations, submit_session_ingress_detach_failed_for_mob_destroy,
+            submit_session_ingress_detach_failed_for_mob_destroy,
             submit_session_ingress_detached_for_mob_destroy,
-        };
-
-        let effect =
-            MobDestroySessionIngressBridgeEffect::RequestSessionIngressDetachForMobDestroy {
-                mob_id: mob_dsl::MobId::from_domain(&self.definition.id),
-                agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id),
-            };
-        let mut obligations = extract_obligations(std::slice::from_ref(&effect));
-        let Some(obligation) = obligations.pop() else {
-            return Err(MobError::Internal(
-                "mob_destroying_session_ingress produced no detach obligation".to_string(),
-            ));
         };
 
         let detach_result = self.detach_runtime_session_ingress(session_id).await;
@@ -6691,8 +6684,9 @@ impl MobActor {
         let session_id_for_route = releasing
             .clone()
             .unwrap_or_else(mob_dsl::SessionId::default);
-        self.apply_dsl_input(
+        let effects = self.apply_dsl_input_collect_effects(
             mob_dsl::MobMachineInput::Retire {
+                mob_id: mob_dsl::MobId::from_domain(&self.definition.id),
                 agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id),
                 agent_identity: dsl_identity,
                 releasing: releasing.clone(),
@@ -6701,13 +6695,11 @@ impl MobActor {
             "destroy_mark_member_retiring",
         )?;
 
-        let runtime_id = mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id);
-        let detach_obligation_open = self
-            .dsl_authority
-            .state
-            .pending_session_ingress_detach_runtime_ids
-            .contains(&runtime_id);
-        if detach_obligation_open {
+        let mut detach_obligations =
+            crate::generated::protocol_mob_destroying_session_ingress::extract_obligations(
+                &effects,
+            );
+        if let Some(obligation) = detach_obligations.pop() {
             let detach_session_id = entry
                 .member_ref
                 .bridge_session_id()
@@ -6718,7 +6710,7 @@ impl MobActor {
                         "destroy retire for member '{agent_identity}' opened a session ingress detach obligation without a bridge session id"
                     ))
                 })?;
-            self.detach_session_ingress_for_mob_destroy(entry, &detach_session_id)
+            self.detach_session_ingress_for_mob_destroy(&detach_session_id, obligation)
                 .await?;
         }
 
@@ -6791,8 +6783,9 @@ impl MobActor {
                     .cloned()
             })
             .unwrap_or_else(mob_dsl::SessionId::default);
-        self.apply_dsl_input(
+        let effects = self.apply_dsl_input_collect_effects(
             mob_dsl::MobMachineInput::Retire {
+                mob_id: mob_dsl::MobId::from_domain(&self.definition.id),
                 agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id),
                 agent_identity: dsl_identity,
                 releasing,
@@ -6800,14 +6793,13 @@ impl MobActor {
             },
             "handle_retire_inner_mark_retiring",
         )?;
-        let runtime_id = mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id);
-        let detach_obligation_open = self
-            .dsl_authority
-            .state
-            .pending_session_ingress_detach_runtime_ids
-            .contains(&runtime_id);
-        if let (true, Some(session_id)) = (detach_obligation_open, detach_session_id) {
-            self.detach_session_ingress_for_mob_destroy(&entry, &session_id)
+        let mut detach_obligations =
+            crate::generated::protocol_mob_destroying_session_ingress::extract_obligations(
+                &effects,
+            );
+        if let (Some(obligation), Some(session_id)) = (detach_obligations.pop(), detach_session_id)
+        {
+            self.detach_session_ingress_for_mob_destroy(&session_id, obligation)
                 .await?;
         }
 
@@ -8632,30 +8624,20 @@ impl MobActor {
         self.ensure_flow_tracker_alignment("handle_run_flow preflight")
             .await?;
         let config = FlowRunConfig::from_definition(flow_id, &self.definition)?;
-        let run_id = self
-            .create_pending_run(&config, activation_params.clone())
-            .await?;
+        let run_id = RunId::new();
         let create_run_seed = MobRun::create_run_seed_input(&run_id, &config)?;
         if let Err(error) = self.apply_dsl_input(create_run_seed, "create_run_seed") {
-            if let Err(terminalize_error) = self
-                .flow_engine
-                .terminalize_failed(
-                    run_id.clone(),
-                    config.flow_id.clone(),
-                    format!(
-                        "canonical CreateRunSeed transition failed during flow admission: {error}"
-                    ),
-                )
-                .await
-            {
-                return Err(MobError::Internal(format!(
-                    "canonical CreateRunSeed transition failed during flow admission: {error}; additionally failed to terminalize pending run: {terminalize_error}"
-                )));
-            }
             return Err(MobError::Internal(format!(
                 "canonical CreateRunSeed transition failed during flow admission: {error}"
             )));
         }
+        self.create_pending_run(
+            run_id.clone(),
+            &config,
+            &self.dsl_authority.state,
+            activation_params.clone(),
+        )
+        .await?;
         if self.has_orchestrator
             && let Err(error) =
                 self.apply_dsl_signal(mob_dsl::MobMachineSignal::StartFlow, "start_flow")
@@ -8811,17 +8793,20 @@ impl MobActor {
 
     async fn create_pending_run(
         &self,
+        run_id: RunId,
         config: &FlowRunConfig,
+        machine_state: &mob_dsl::MobMachineState,
         activation_params: serde_json::Value,
     ) -> Result<RunId, MobError> {
-        let flow_state = MobRun::flow_state_for_config(config)?;
-        let run = MobRun::pending(
+        let flow_state =
+            MobRun::flow_state_for_config_with_authority(&run_id, config, machine_state)?;
+        let run = MobRun::pending_with_run_id(
+            run_id.clone(),
             self.definition.id.clone(),
             config.flow_id.clone(),
             flow_state,
             activation_params,
         );
-        let run_id = run.run_id.clone();
         self.run_store.create_run(run).await?;
         Ok(run_id)
     }
@@ -9107,6 +9092,7 @@ impl MobActor {
             let session_id_for_route = releasing.clone().unwrap_or_default();
             if let Err(error) = self.apply_dsl_input(
                 mob_dsl::MobMachineInput::Retire {
+                    mob_id: mob_dsl::MobId::from_domain(&self.definition.id),
                     agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id),
                     agent_identity: dsl_identity,
                     releasing,

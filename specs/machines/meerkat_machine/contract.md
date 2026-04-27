@@ -11,7 +11,26 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `active_runtime_id`: `Option<AgentRuntimeId>`
 - `active_fence_token`: `Option<FenceToken>`
 - `current_run_id`: `Option<RunId>`
-- `pre_run_phase`: `Option<String>`
+- `pre_run_phase`: `Option<PreRunPhase>`
+- `turn_phase`: `TurnPhase`
+- `primitive_kind`: `Option<TurnPrimitiveKind>`
+- `admitted_content_shape`: `Option<String>`
+- `vision_enabled`: `Bool`
+- `image_tool_results_enabled`: `Bool`
+- `tool_calls_pending`: `u64`
+- `pending_op_refs`: `Set<String>`
+- `barrier_operation_ids`: `Set<String>`
+- `has_barrier_ops`: `Bool`
+- `barrier_satisfied`: `Bool`
+- `boundary_count`: `u64`
+- `cancel_after_boundary`: `Bool`
+- `terminal_outcome`: `Option<TurnTerminalOutcome>`
+- `extraction_attempts`: `u64`
+- `max_extraction_retries`: `u64`
+- `llm_retry_attempt`: `u64`
+- `llm_retry_max_retries`: `u64`
+- `llm_retry_selected_delay_ms`: `u64`
+- `llm_retry_last_failure_kind`: `Option<LlmRetryFailureKind>`
 - `silent_intent_overrides`: `Set<String>`
 - `model_routing_baseline_model`: `Option<String>`
 - `model_routing_baseline_realtime`: `Option<Bool>`
@@ -40,6 +59,63 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `model_routing_image_denials`: `Map<String, RoutingDenialReason>`
 - `model_routing_approval_phases`: `Map<String, RoutingApprovalPhase>`
 - `model_routing_approval_parent_kind`: `Map<String, RoutingApprovalParentKind>`
+- `registration_phase`: `RegistrationPhase`
+- `drain_phase`: `DrainPhase`
+- `drain_mode`: `Option<DrainMode>`
+- `next_staged_visibility_revision`: `u64`
+- `active_filter`: `ToolFilter`
+- `staged_filter`: `ToolFilter`
+- `active_visibility_revision`: `u64`
+- `staged_visibility_revision`: `u64`
+- `active_deferred_names`: `Set<String>`
+- `staged_deferred_names`: `Set<String>`
+- `input_phases`: `Map<String, InputPhase>`
+- `input_terminal_kind`: `Map<String, InputTerminalKind>`
+- `input_superseded_by`: `Map<String, String>`
+- `input_aggregate_id`: `Map<String, String>`
+- `input_abandon_reason`: `Map<String, InputAbandonReason>`
+- `input_abandon_attempt_count`: `Map<String, u64>`
+- `input_attempt_counts`: `Map<String, u64>`
+- `input_run_associations`: `Map<String, String>`
+- `input_boundary_sequences`: `Map<String, u64>`
+- `next_admission_seq`: `u64`
+- `input_admission_seq`: `Map<String, u64>`
+- `input_lane`: `Map<String, InputLane>`
+- `op_statuses`: `Map<String, OperationStatus>`
+- `op_completion_seq`: `Map<String, u64>`
+- `op_terminal_outcomes`: `Map<String, OperationTerminalOutcomeKind>`
+- `op_terminal_payload`: `Map<String, String>`
+- `op_kinds`: `Map<String, OperationKind>`
+- `op_peer_ready`: `Map<String, Bool>`
+- `op_progress_counts`: `Map<String, u64>`
+- `active_op_count`: `u64`
+- `wait_active`: `Bool`
+- `wait_request_id`: `Option<WaitRequestId>`
+- `wait_operation_ids`: `Set<String>`
+- `wait_operation_id_tokens`: `Set<OperationId>`
+- `next_completion_seq`: `u64`
+- `known_surfaces`: `Set<String>`
+- `active_surfaces`: `Set<String>`
+- `visible_surfaces`: `Set<String>`
+- `surface_base_state`: `Map<String, ExternalToolSurfaceBaseState>`
+- `surface_pending_op`: `Map<String, SurfacePendingOp>`
+- `surface_staged_op`: `Map<String, SurfaceStagedOp>`
+- `reload_staged_surfaces`: `Set<String>`
+- `surface_staged_intent_sequence`: `Map<String, u64>`
+- `next_staged_intent_sequence`: `u64`
+- `surface_pending_task_sequence`: `Map<String, u64>`
+- `next_pending_task_sequence`: `u64`
+- `surface_pending_lineage_sequence`: `Map<String, u64>`
+- `surface_inflight_calls`: `Map<String, u64>`
+- `surface_last_delta_operation`: `Map<String, ExternalToolSurfaceDeltaOperation>`
+- `surface_last_delta_phase`: `Map<String, ExternalToolSurfaceDeltaPhase>`
+- `snapshot_epoch`: `u64`
+- `snapshot_aligned_epoch`: `u64`
+- `surface_draining_since_ms`: `Map<String, u64>`
+- `surface_removal_timeout_at_ms`: `Map<String, u64>`
+- `surface_removal_applied_at_turn`: `Map<String, u64>`
+- `surface_phase`: `SurfacePhase`
+- `removal_timeout_ms`: `u64`
 - `realtime_intent_present`: `Bool`
 - `realtime_binding_state`: `RealtimeBindingState`
 - `realtime_binding_authority_epoch`: `Option<u64>`
@@ -79,7 +155,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ReconfigureSessionLlmIdentity`(previous_identity: SessionLlmIdentity, previous_visibility_state: SessionToolVisibilityState, previous_capability_surface: Option<SessionLlmCapabilitySurface>, previous_capability_surface_status: SessionLlmCapabilitySurfaceStatus, target_identity: SessionLlmIdentity, target_capability_surface: SessionLlmCapabilitySurface, next_visibility_state: SessionToolVisibilityState, next_capability_base_filter: ToolFilter, next_active_visibility_revision: u64, tool_visibility_delta: SessionToolVisibilityDelta)
 - `PrepareBindings`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: SessionId)
 - `SetPeerIngressContext`(keep_alive: Bool)
-- `NotifyDrainExited`(reason: String)
+- `NotifyDrainExited`(reason: DrainExitReason)
 - `InterruptCurrentRun`
 - `CancelAfterBoundary`
 - `StagePersistentFilter`(filter: ToolFilter, witnesses: Map<String, ToolVisibilityWitness>)
@@ -89,8 +165,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `Retire`(session_id: SessionId)
 - `Reset`
 - `StopRuntimeExecutor`
+- `RuntimeExecutorExited`
 - `Destroy`(session_id: SessionId)
-- `RecoverInputLifecycle`(input_id: InputId, phase: InputPhase, terminal_kind: Option<InputTerminalKind>, superseded_by: Option<InputId>, aggregate_id: Option<String>, abandon_reason: Option<InputAbandonReason>, abandon_attempt_count: u64, attempt_count: u64, run_id: Option<RunId>, boundary_sequence: Option<BoundarySequence>, lane: Option<InputLane>)
 - `EnsureSessionWithExecutor`(session_id: SessionId)
 - `SetSilentIntents`(session_id: SessionId, intents: Set<String>)
 - `ContainsSession`(session_id: SessionId)
@@ -104,7 +180,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `Wait`(session_id: SessionId)
 - `Ingest`(runtime_id: AgentRuntimeId, work_id: WorkId, origin: WorkOrigin)
 - `PublishEvent`(kind: String)
-- `RuntimeState`(runtime_id: AgentRuntimeId)
+- `RuntimeState`(runtime_id: String)
 - `RuntimeRealtimeAttachmentStatus`(session_id: SessionId)
 - `ModelRoutingStatus`(session_id: SessionId)
 - `SetModelRoutingBaseline`(baseline_model: String, realtime_capable: Bool)
@@ -116,13 +192,93 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ActivateImageOperationOverride`(operation_id: String, target_model: String, target_realtime_capable: Bool)
 - `CompleteImageOperation`(operation_id: String, terminal: RoutingImageTerminal, terminal_payload: String)
 - `RestoreImageOperationOverride`(operation_id: String)
-- `LoadBoundaryReceipt`(runtime_id: AgentRuntimeId, sequence: BoundarySequence)
-- `AcceptWithCompletion`(input_id: InputId, request_immediate_processing: Bool, interrupt_yielding: Bool, wake_if_idle: Bool, run_id: RunId)
+- `LoadBoundaryReceipt`(runtime_id: String, sequence: u64)
+- `AcceptWithCompletion`(input_id: InputId, request_immediate_processing: Bool, interrupt_yielding: Bool, wake_if_idle: Bool)
 - `AcceptWithoutWake`(input_id: InputId)
 - `Prepare`(session_id: SessionId, run_id: RunId)
 - `Commit`(input_id: InputId, run_id: RunId)
 - `Fail`(run_id: RunId)
 - `Recycle`
+- `StartConversationRun`(run_id: RunId, primitive_kind: TurnPrimitiveKind, admitted_content_shape: String, vision_enabled: Bool, image_tool_results_enabled: Bool, max_extraction_retries: u64)
+- `StartImmediateAppend`(run_id: RunId, admitted_content_shape: String)
+- `StartImmediateContext`(run_id: RunId, admitted_content_shape: String)
+- `PrimitiveApplied`
+- `LlmReturnedToolCalls`(tool_count: u64)
+- `LlmReturnedTerminal`
+- `RegisterPendingOps`(op_refs: Set<String>, barrier_operation_ids: Set<String>)
+- `ToolCallsResolved`
+- `OpsBarrierSatisfied`(operation_ids: Set<String>)
+- `BoundaryContinue`
+- `BoundaryComplete`
+- `EnterExtraction`(max_extraction_retries: u64)
+- `ExtractionStart`
+- `ExtractionValidationPassed`
+- `ExtractionValidationFailed`(error: String)
+- `RecoverableFailure`(failure_kind: LlmRetryFailureKind, retry_attempt: u64, max_retries: u64, selected_delay_ms: u64, error: String)
+- `FatalFailure`(error: String)
+- `RetryRequested`(retry_attempt: u64)
+- `CancelNow`
+- `RequestCancelAfterBoundary`
+- `CancellationObserved`
+- `AcknowledgeTerminal`(outcome: TurnTerminalOutcome)
+- `TurnLimitReached`
+- `BudgetExhausted`
+- `TimeBudgetExceeded`
+- `ForceCancelNoRun`
+- `RunCompleted`(run_id: RunId)
+- `RunFailed`(run_id: RunId, error: String)
+- `RunCancelled`(run_id: RunId)
+- `RecoverInputLifecycle`(input_id: String, phase: InputPhase, terminal_kind: Option<InputTerminalKind>, superseded_by: Option<String>, aggregate_id: Option<String>, abandon_reason: Option<InputAbandonReason>, abandon_attempt_count: u64, attempt_count: u64, run_id: Option<String>, boundary_sequence: Option<u64>, lane: Option<InputLane>)
+- `QueueAccepted`(input_id: String)
+- `SteerAccepted`(input_id: String)
+- `ChangeLane`(input_id: String, new_lane: InputLane)
+- `StageForRun`(input_id: String, run_id: String)
+- `IncrementAttemptCount`(input_id: String)
+- `RollbackStaged`(input_id: String, lane: InputLane)
+- `MarkApplied`(input_id: String)
+- `MarkAppliedPendingConsumption`(input_id: String)
+- `ConsumeInput`(input_id: String)
+- `ConsumeOnAccept`(input_id: String)
+- `SupersedeInput`(input_id: String, superseded_by: String)
+- `CoalesceInput`(input_id: String, aggregate_id: String)
+- `AbandonInput`(input_id: String, reason: InputAbandonReason, attempt_count: u64)
+- `RecordBoundarySeq`(input_id: String, seq: u64)
+- `RegisterOp`(operation_id: String, kind: OperationKind)
+- `StartOp`(operation_id: String)
+- `CompleteOp`(operation_id: String, outcome: OperationTerminalOutcomeKind, payload: String)
+- `FailOp`(operation_id: String, outcome: OperationTerminalOutcomeKind, payload: String)
+- `CancelOp`(operation_id: String, outcome: OperationTerminalOutcomeKind, payload: String)
+- `AbortOp`(operation_id: String, outcome: OperationTerminalOutcomeKind, payload: String)
+- `PeerReadyOp`(operation_id: String)
+- `ProgressReportedOp`(operation_id: String)
+- `RetireRequestedOp`(operation_id: String)
+- `RetireCompletedOp`(operation_id: String, outcome: OperationTerminalOutcomeKind, payload: String)
+- `TerminateOp`(operation_id: String, outcome: OperationTerminalOutcomeKind, payload: String)
+- `RequestWaitAll`(wait_request_id: WaitRequestId, operation_ids: Set<String>, operation_id_tokens: Set<OperationId>)
+- `SatisfyWaitAll`
+- `CancelWaitAll`
+- `SpawnDrain`(mode: DrainMode)
+- `StopDrain`
+- `DrainExitedClean`
+- `DrainExitedRespawnable`
+- `StageVisibilityFilter`(filter: ToolFilter)
+- `CommitVisibilityFilter`(filter: ToolFilter, revision: u64)
+- `StageDeferredNames`(names: Set<String>)
+- `CommitDeferredNames`(names: Set<String>)
+- `SyncVisibilityRevisions`(active_revision: u64, staged_revision: u64)
+- `SurfaceRegister`(surface_id: String)
+- `SurfaceStageAdd`(surface_id: String, now_ms: u64)
+- `SurfaceStageRemove`(surface_id: String, now_ms: u64)
+- `SurfaceStageReload`(surface_id: String, now_ms: u64)
+- `SurfaceApplyBoundary`(surface_id: String, now_ms: u64, staged_intent_sequence: u64, applied_at_turn: u64)
+- `SurfaceMarkPendingSucceeded`(surface_id: String, pending_task_sequence: u64, staged_intent_sequence: u64)
+- `SurfaceMarkPendingFailed`(surface_id: String, pending_task_sequence: u64, staged_intent_sequence: u64, reason: String)
+- `SurfaceCallStarted`(surface_id: String)
+- `SurfaceCallFinished`(surface_id: String)
+- `SurfaceFinalizeRemovalClean`(surface_id: String)
+- `SurfaceFinalizeRemovalForced`(surface_id: String)
+- `SurfaceSnapshotAligned`(epoch: u64)
+- `SurfaceShutdown`
 - `ProjectRealtimeIntent`(present: Bool)
 - `BeginRealtimeBinding`
 - `ReplaceRealtimeBinding`
@@ -132,7 +288,13 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `PublishRealtimeSignal`(authority_epoch: u64, next_binding_state: RealtimeBindingState)
 - `ProjectRealtimeReconnectProgress`(attempt_count: u64, next_retry_at_ms: Option<u64>, deadline_at_ms: Option<u64>)
 - `ClearRealtimeReconnectProgress`
-- `OpsBarrierSatisfied`(operation_ids: Set<OperationId>)
+- `BeginLiveTopologyReconfigure`(authority_epoch: u64)
+- `MarkLiveTopologyDetached`
+- `ApplyLiveTopologyIdentity`
+- `ApplyLiveTopologyVisibility`
+- `CompleteLiveTopology`
+- `AbortLiveTopologyBeforeDetach`
+- `FailLiveTopologyAfterDetach`
 - `McpServerConnectPending`(server_id: McpServerId)
 - `McpServerConnected`(server_id: McpServerId)
 - `McpServerFailed`(server_id: McpServerId, error: String)
@@ -161,13 +323,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ClassifyRealtimeClientInputSubmitted`
 - `ClassifyRealtimeMidTurnActivity`
 - `ClassifyRealtimeTurnTerminated`
-- `BeginLiveTopologyReconfigure`(authority_epoch: u64)
-- `MarkLiveTopologyDetached`
-- `ApplyLiveTopologyIdentity`
-- `ApplyLiveTopologyVisibility`
-- `CompleteLiveTopology`
-- `AbortLiveTopologyBeforeDetach`
-- `FailLiveTopologyAfterDetach`
 - `AttachSessionIngress`(comms_runtime_id: CommsRuntimeId)
 - `AttachMobIngress`(comms_runtime_id: CommsRuntimeId, mob_id: MobId)
 - `DetachIngress`
@@ -183,9 +338,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `AddDirectPeerEndpoint`(endpoint: PeerEndpoint)
 - `RemoveDirectPeerEndpoint`(endpoint: PeerEndpoint)
 - `ApplyMobPeerOverlay`(epoch: u64, endpoints: Set<PeerEndpoint>)
-- `PendingSucceeded`(surface_id: SurfaceId, pending_task_sequence: u64, staged_intent_sequence: u64)
-- `PendingFailed`(surface_id: SurfaceId, pending_task_sequence: u64, reason: String)
-- `SnapshotAligned`(snapshot_epoch: u64)
 
 ## Surface-only Inputs
 - `ContainsSession`
@@ -198,32 +350,25 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RuntimeRealtimeAttachmentStatus`
 - `ModelRoutingStatus`
 - `LoadBoundaryReceipt`
-- `Recover`
 
 ## Signals
 - `Initialize`
 - `BoundaryApplied`(revision: u64)
 - `DrainQueuedRun`(run_id: RunId)
-- `StartConversationRun`
-- `StartImmediateAppend`
-- `StartImmediateContext`
 - `ClassifyExternalEnvelope`
 - `ClassifyPlainEvent`
 - `EnsureDrainRunning`
-- `StageAdd`
-- `StageRemove`
-- `StageReload`
-- `ApplySurfaceBoundary`(surface_id: SurfaceId, operation: SurfaceDeltaOperation, pending_task_sequence: u64, staged_intent_sequence: u64, applied_at_turn: TurnNumber)
-- `CallStarted`
-- `CallFinished`
-- `FinalizeRemovalClean`
-- `FinalizeRemovalForced`
-- `ShutdownSurface`
 
 ## Effects
 - `RuntimeBound`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
 - `RuntimeRetired`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
 - `RuntimeDestroyed`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
+- `TurnRunStarted`(run_id: RunId)
+- `TurnBoundaryApplied`(run_id: RunId, boundary_sequence: u64)
+- `TurnRunCompleted`(run_id: RunId, outcome: TurnTerminalOutcome)
+- `TurnRunFailed`(run_id: RunId, error: String)
+- `TurnRunCancelled`(run_id: RunId, reason: TurnCancellationReason)
+- `TurnCheckCompaction`
 - `RequestCancellationAtBoundary`
 - `WakeInterrupt`
 - `CommittedVisibleSetPublished`(revision: u64)
@@ -253,24 +398,27 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RecordTerminalOutcome`
 - `RecordRunAssociation`
 - `RecordBoundarySequence`
-- `SubmitOpEvent`
-- `NotifyOpWatcher`
-- `ExposeOperationPeer`
-- `RetainTerminalRecord`
-- `EvictCompletedRecord`
+- `SubmitOpEvent`(operation_id: String)
+- `NotifyOpWatcher`(operation_id: String)
+- `ExposeOperationPeer`(operation_id: String)
+- `RetainTerminalRecord`(operation_id: String)
+- `EvictCompletedRecord`(operation_id: String)
 - `CompletionProduced`(seq: u64, operation_id: OperationId, kind: OperationKind)
 - `WaitAllSatisfied`(wait_request_id: WaitRequestId, operation_ids: Set<OperationId>)
 - `CollectCompletedResult`
 - `EnqueueClassifiedEntry`
 - `SpawnDrainTask`
-- `ScheduleSurfaceCompletion`(surface_id: SurfaceId, operation: SurfaceDeltaOperation, pending_task_sequence: u64, staged_intent_sequence: u64, applied_at_turn: TurnNumber)
+- `ScheduleSurfaceCompletion`(surface_id: String, operation: ExternalToolSurfaceDeltaOperation, pending_task_sequence: u64, staged_intent_sequence: u64, applied_at_turn: u64)
 - `RefreshVisibleSurfaceSet`(snapshot_epoch: u64)
-- `EmitExternalToolDelta`
-- `CloseSurfaceConnection`
-- `RejectSurfaceCall`
+- `EmitExternalToolDelta`(surface_id: String, operation: ExternalToolSurfaceDeltaOperation, phase: ExternalToolSurfaceDeltaPhase)
+- `CloseSurfaceConnection`(surface_id: String)
+- `RejectSurfaceCall`(surface_id: String, reason: String)
+- `PublishSupervisorTrustEdge`(peer_id: String, name: String, address: String, signing_public_key: Option<String>, epoch: u64)
+- `RevokeSupervisorTrustEdge`(peer_id: String, epoch: u64)
 - `RealtimeIntentProjected`(present: Bool)
 - `RealtimeBindingRotated`(authority_epoch: u64)
 - `RealtimeReconnectProgressProjected`(attempt_count: u64, next_retry_at_ms: Option<u64>, deadline_at_ms: Option<u64>)
+- `LiveTopologyPhaseChanged`
 - `McpServerStateChanged`(server_id: McpServerId, new_state: McpServerState)
 - `McpServerReloadRequested`(server_id: McpServerId)
 - `PeerInteractionStateChanged`(corr_id: PeerCorrelationId, new_state: OutboundPeerRequestState)
@@ -282,17 +430,16 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RealtimeProductTurnPhaseChanged`(new_phase: RealtimeProductTurnPhase)
 - `RealtimeProjectionFreshnessChanged`(new_freshness: RealtimeProjectionFreshness, frontier_ms: u64)
 - `RealtimeReconnectPolicyChanged`(new_policy: RealtimeReconnectPolicy)
-- `LiveTopologyPhaseChanged`
 - `LocalEndpointChanged`(endpoint: Option<PeerEndpoint>)
 - `PeerProjectionChanged`(peer_projection_epoch: u64)
 - `CommsTrustReconcileRequested`(peer_projection_epoch: u64)
-- `PublishSupervisorTrustEdge`(peer_id: PeerId, name: String, address: String, signing_public_key: Option<String>, epoch: u64)
-- `RevokeSupervisorTrustEdge`(peer_id: PeerId, epoch: u64)
 
 ## Invariants
 - `fence_requires_bound_runtime`
 - `running_has_current_run`
 - `current_run_only_while_running_or_retired`
+- `staged_surface_ops_are_known_and_sequenced`
+- `staged_reload_surfaces_are_active`
 - `realtime_binding_epoch_consistency`
 - `peer_ingress_owner_consistency`
 - `supervisor_binding_consistency`
@@ -1285,42 +1432,69 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `RuntimeNotice`
 - To: `Running`
 
+### `RuntimeExecutorExitedFromAttached`
+- From: `Attached`
+- On: `RuntimeExecutorExited`()
+- Emits: `RuntimeNotice`
+- To: `Stopped`
+
+### `RuntimeExecutorExitedFromRunning`
+- From: `Running`
+- On: `RuntimeExecutorExited`()
+- Emits: `RuntimeNotice`
+- To: `Stopped`
+
+### `RuntimeExecutorExitedFromIdle`
+- From: `Idle`
+- On: `RuntimeExecutorExited`()
+- Emits: `RuntimeNotice`
+- To: `Stopped`
+
+### `RuntimeExecutorExitedFromRetired`
+- From: `Retired`
+- On: `RuntimeExecutorExited`()
+- Emits: `RuntimeNotice`
+- To: `Stopped`
+
+### `RuntimeExecutorExitedFromStopped`
+- From: `Stopped`
+- On: `RuntimeExecutorExited`()
+- To: `Stopped`
+
 ### `Destroy`
 - From: `Initializing`, `Idle`, `Attached`, `Running`, `Retired`, `Stopped`
 - On: `Destroy`(session_id)
-- Guards:
-  - `runtime_is_bound`
 - Emits: `RuntimeDestroyed`
 - To: `Destroyed`
 
-### `RecoverInputLifecycleIdle`
+### `RecoverInitializing`
+- From: `Initializing`
+- On: `Recover`()
+- Emits: `RuntimeNotice`
+- To: `Initializing`
+
+### `RecoverIdle`
 - From: `Idle`
-- On: `RecoverInputLifecycle`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, lane)
-- Emits: `InputLifecycleNotice`
+- On: `Recover`()
+- Emits: `RuntimeNotice`
 - To: `Idle`
 
-### `RecoverInputLifecycleAttached`
+### `RecoverAttached`
 - From: `Attached`
-- On: `RecoverInputLifecycle`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, lane)
-- Emits: `InputLifecycleNotice`
+- On: `Recover`()
+- Emits: `RuntimeNotice`
 - To: `Attached`
 
-### `RecoverInputLifecycleRunning`
-- From: `Running`
-- On: `RecoverInputLifecycle`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, lane)
-- Emits: `InputLifecycleNotice`
-- To: `Running`
-
-### `RecoverInputLifecycleRetired`
+### `RecoverRetired`
 - From: `Retired`
-- On: `RecoverInputLifecycle`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, lane)
-- Emits: `InputLifecycleNotice`
+- On: `Recover`()
+- Emits: `RuntimeNotice`
 - To: `Retired`
 
-### `RecoverInputLifecycleStopped`
+### `RecoverStopped`
 - From: `Stopped`
-- On: `RecoverInputLifecycle`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, lane)
-- Emits: `InputLifecycleNotice`
+- On: `Recover`()
+- Emits: `RuntimeNotice`
 - To: `Stopped`
 
 ### `EnsureSessionWithExecutorIdle`
@@ -1560,7 +1734,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AcceptWithCompletionIdleQueued`
 - From: `Idle`
-- On: `AcceptWithCompletion`(input_id, request_immediate_processing, interrupt_yielding, wake_if_idle, run_id)
+- On: `AcceptWithCompletion`(input_id, request_immediate_processing, interrupt_yielding, wake_if_idle)
 - Guards:
   - `session_registered`
   - `request_immediate_processing`
@@ -1570,7 +1744,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AcceptWithCompletionIdleImmediate`
 - From: `Idle`
-- On: `AcceptWithCompletion`(input_id, request_immediate_processing, interrupt_yielding, wake_if_idle, run_id)
+- On: `AcceptWithCompletion`(input_id, request_immediate_processing, interrupt_yielding, wake_if_idle)
 - Guards:
   - `session_registered`
   - `request_immediate_processing`
@@ -1580,17 +1754,17 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AcceptWithCompletionAttachedImmediate`
 - From: `Attached`
-- On: `AcceptWithCompletion`(input_id, request_immediate_processing, interrupt_yielding, wake_if_idle, run_id)
+- On: `AcceptWithCompletion`(input_id, request_immediate_processing, interrupt_yielding, wake_if_idle)
 - Guards:
   - `session_registered`
   - `request_immediate_processing`
   - `interrupt_yielding`
 - Emits: `IngressAccepted`, `PostAdmissionSignal`, `SubmitRunPrimitive`
-- To: `Running`
+- To: `Attached`
 
 ### `AcceptWithCompletionAttachedQueued`
 - From: `Attached`
-- On: `AcceptWithCompletion`(input_id, request_immediate_processing, interrupt_yielding, wake_if_idle, run_id)
+- On: `AcceptWithCompletion`(input_id, request_immediate_processing, interrupt_yielding, wake_if_idle)
 - Guards:
   - `session_registered`
   - `request_immediate_processing`
@@ -1600,7 +1774,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AcceptWithCompletionRunningQueuedPassive`
 - From: `Running`
-- On: `AcceptWithCompletion`(input_id, request_immediate_processing, interrupt_yielding, wake_if_idle, run_id)
+- On: `AcceptWithCompletion`(input_id, request_immediate_processing, interrupt_yielding, wake_if_idle)
 - Guards:
   - `session_registered`
   - `request_immediate_processing`
@@ -1611,7 +1785,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AcceptWithCompletionRunningQueuedWakeIfIdle`
 - From: `Running`
-- On: `AcceptWithCompletion`(input_id, request_immediate_processing, interrupt_yielding, wake_if_idle, run_id)
+- On: `AcceptWithCompletion`(input_id, request_immediate_processing, interrupt_yielding, wake_if_idle)
 - Guards:
   - `session_registered`
   - `request_immediate_processing`
@@ -1622,7 +1796,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AcceptWithCompletionRunningInterruptYielding`
 - From: `Running`
-- On: `AcceptWithCompletion`(input_id, request_immediate_processing, interrupt_yielding, wake_if_idle, run_id)
+- On: `AcceptWithCompletion`(input_id, request_immediate_processing, interrupt_yielding, wake_if_idle)
 - Guards:
   - `session_registered`
   - `request_immediate_processing`
@@ -1632,7 +1806,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AcceptWithCompletionRunningImmediate`
 - From: `Running`
-- On: `AcceptWithCompletion`(input_id, request_immediate_processing, interrupt_yielding, wake_if_idle, run_id)
+- On: `AcceptWithCompletion`(input_id, request_immediate_processing, interrupt_yielding, wake_if_idle)
 - Guards:
   - `session_registered`
   - `request_immediate_processing`
@@ -1718,29 +1892,634 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `SubmitRunPrimitive`
 - To: `Running`
 
+### `StartConversationRunInitializing`
+- From: `Initializing`
+- On: `StartConversationRun`(run_id, primitive_kind, admitted_content_shape, vision_enabled, image_tool_results_enabled, max_extraction_retries)
+- Guards:
+  - `turn_resettable`
+- Emits: `TurnRunStarted`
+- To: `Running`
+
 ### `StartConversationRunAttached`
 - From: `Attached`
-- On: `StartConversationRun`()
+- On: `StartConversationRun`(run_id, primitive_kind, admitted_content_shape, vision_enabled, image_tool_results_enabled, max_extraction_retries)
 - Guards:
-  - `session_registered`
-- Emits: `SubmitRunPrimitive`
-- To: `Attached`
+  - `turn_resettable`
+- Emits: `TurnRunStarted`
+- To: `Running`
+
+### `StartConversationRunRunning`
+- From: `Running`
+- On: `StartConversationRun`(run_id, primitive_kind, admitted_content_shape, vision_enabled, image_tool_results_enabled, max_extraction_retries)
+- Guards:
+  - `turn_resettable`
+- Emits: `TurnRunStarted`
+- To: `Running`
+
+### `StartImmediateAppendInitializing`
+- From: `Initializing`
+- On: `StartImmediateAppend`(run_id, admitted_content_shape)
+- Guards:
+  - `turn_resettable`
+- Emits: `TurnRunStarted`
+- To: `Running`
 
 ### `StartImmediateAppendAttached`
 - From: `Attached`
-- On: `StartImmediateAppend`()
+- On: `StartImmediateAppend`(run_id, admitted_content_shape)
 - Guards:
-  - `session_registered`
-- Emits: `SubmitRunPrimitive`
-- To: `Attached`
+  - `turn_resettable`
+- Emits: `TurnRunStarted`
+- To: `Running`
+
+### `StartImmediateAppendRunning`
+- From: `Running`
+- On: `StartImmediateAppend`(run_id, admitted_content_shape)
+- Guards:
+  - `turn_resettable`
+- Emits: `TurnRunStarted`
+- To: `Running`
+
+### `StartImmediateContextInitializing`
+- From: `Initializing`
+- On: `StartImmediateContext`(run_id, admitted_content_shape)
+- Guards:
+  - `turn_resettable`
+- Emits: `TurnRunStarted`
+- To: `Running`
 
 ### `StartImmediateContextAttached`
 - From: `Attached`
-- On: `StartImmediateContext`()
+- On: `StartImmediateContext`(run_id, admitted_content_shape)
 - Guards:
-  - `session_registered`
-- Emits: `SubmitRunPrimitive`
+  - `turn_resettable`
+- Emits: `TurnRunStarted`
+- To: `Running`
+
+### `StartImmediateContextRunning`
+- From: `Running`
+- On: `StartImmediateContext`(run_id, admitted_content_shape)
+- Guards:
+  - `turn_resettable`
+- Emits: `TurnRunStarted`
+- To: `Running`
+
+### `PrimitiveAppliedConversation`
+- From: `Running`
+- On: `PrimitiveApplied`()
+- Guards:
+  - `turn_applying_conversation`
+- Emits: `TurnCheckCompaction`
+- To: `Running`
+
+### `PrimitiveAppliedImmediate`
+- From: `Running`
+- On: `PrimitiveApplied`()
+- Guards:
+  - `turn_applying_immediate`
+- Emits: `TurnBoundaryApplied`, `TurnRunCompleted`, `TurnCheckCompaction`
+- To: `Running`
+
+### `LlmReturnedToolCallsPositive`
+- From: `Running`
+- On: `LlmReturnedToolCalls`(tool_count)
+- Guards:
+  - `turn_calling_llm`
+  - `tool_count_positive`
+- To: `Running`
+
+### `LlmReturnedToolCallsZero`
+- From: `Running`
+- On: `LlmReturnedToolCalls`(tool_count)
+- Guards:
+  - `turn_calling_llm`
+  - `tool_count_zero`
+- To: `Running`
+
+### `LlmReturnedTerminal`
+- From: `Running`
+- On: `LlmReturnedTerminal`()
+- Guards:
+  - `turn_calling_llm`
+- To: `Running`
+
+### `RegisterPendingOps`
+- From: `Running`
+- On: `RegisterPendingOps`(op_refs, barrier_operation_ids)
+- Guards:
+  - `turn_waiting_or_calling`
+- To: `Running`
+
+### `ToolCallsResolvedToCalling`
+- From: `Running`
+- On: `ToolCallsResolved`()
+- Guards:
+  - `turn_waiting_for_ops`
+  - `barrier_not_satisfied`
+- To: `Running`
+
+### `ToolCallsResolvedToBoundary`
+- From: `Running`
+- On: `ToolCallsResolved`()
+- Guards:
+  - `turn_waiting_for_ops`
+  - `barrier_satisfied`
+- To: `Running`
+
+### `OpsBarrierSatisfied`
+- From: `Running`
+- On: `OpsBarrierSatisfied`(operation_ids)
+- Guards:
+  - `turn_waiting_for_ops`
+  - `matching_barrier_ids`
+- To: `Running`
+
+### `BoundaryContinue`
+- From: `Running`
+- On: `BoundaryContinue`()
+- Guards:
+  - `turn_draining_boundary`
+- Emits: `TurnBoundaryApplied`, `TurnCheckCompaction`
+- To: `Running`
+
+### `BoundaryComplete`
+- From: `Running`
+- On: `BoundaryComplete`()
+- Guards:
+  - `turn_draining_boundary`
+- Emits: `TurnBoundaryApplied`, `TurnRunCompleted`, `TurnCheckCompaction`
+- To: `Running`
+
+### `EnterExtraction`
+- From: `Running`
+- On: `EnterExtraction`(max_extraction_retries)
+- Guards:
+  - `turn_draining_boundary`
+- To: `Running`
+
+### `ExtractionStart`
+- From: `Running`
+- On: `ExtractionStart`()
+- Guards:
+  - `turn_extracting`
+- To: `Running`
+
+### `ExtractionValidationPassed`
+- From: `Running`
+- On: `ExtractionValidationPassed`()
+- Guards:
+  - `turn_extracting`
+- Emits: `TurnRunCompleted`, `TurnCheckCompaction`
+- To: `Running`
+
+### `ExtractionValidationFailedRetry`
+- From: `Running`
+- On: `ExtractionValidationFailed`(error)
+- Guards:
+  - `turn_extracting`
+  - `retries_remaining`
+- Emits: `TurnCheckCompaction`
+- To: `Running`
+
+### `ExtractionValidationFailedExhausted`
+- From: `Running`
+- On: `ExtractionValidationFailed`(error)
+- Guards:
+  - `turn_extracting`
+  - `retries_exhausted`
+- Emits: `TurnRunFailed`
+- To: `Running`
+
+### `RecoverableFailure`
+- From: `Running`
+- On: `RecoverableFailure`(failure_kind, retry_attempt, max_retries, selected_delay_ms, error)
+- Guards:
+  - `turn_non_terminal`
+  - `retry_attempt_present`
+- To: `Running`
+
+### `FatalFailure`
+- From: `Running`
+- On: `FatalFailure`(error)
+- Guards:
+  - `turn_not_terminal`
+- Emits: `TurnRunFailed`
+- To: `Running`
+
+### `RetryRequested`
+- From: `Running`
+- On: `RetryRequested`(retry_attempt)
+- Guards:
+  - `turn_error_recovery`
+  - `retry_attempt_matches`
+- Emits: `TurnCheckCompaction`
+- To: `Running`
+
+### `CancelNow`
+- From: `Running`
+- On: `CancelNow`()
+- Guards:
+  - `turn_cancellable`
+- To: `Running`
+
+### `RequestCancelAfterBoundary`
+- From: `Running`
+- On: `RequestCancelAfterBoundary`()
+- Guards:
+  - `turn_cancellable`
+- To: `Running`
+
+### `CancellationObserved`
+- From: `Running`
+- On: `CancellationObserved`()
+- Guards:
+  - `turn_cancelling`
+- Emits: `TurnRunCancelled`
+- To: `Running`
+
+### `AcknowledgeTerminal`
+- From: `Running`
+- On: `AcknowledgeTerminal`(outcome)
+- Guards:
+  - `turn_terminal`
+- To: `Running`
+
+### `TurnLimitReached`
+- From: `Running`
+- On: `TurnLimitReached`()
+- Guards:
+  - `turn_not_terminal`
+- Emits: `TurnRunFailed`
+- To: `Running`
+
+### `BudgetExhausted`
+- From: `Running`
+- On: `BudgetExhausted`()
+- Guards:
+  - `turn_not_terminal`
+- Emits: `TurnRunFailed`
+- To: `Running`
+
+### `TimeBudgetExceeded`
+- From: `Running`
+- On: `TimeBudgetExceeded`()
+- Guards:
+  - `turn_not_terminal`
+- Emits: `TurnRunFailed`
+- To: `Running`
+
+### `ForceCancelNoRun`
+- From: `Running`
+- On: `ForceCancelNoRun`()
+- Guards:
+  - `no_run_bound`
+  - `turn_ready`
+- To: `Running`
+
+### `RunCompleted`
+- From: `Running`
+- On: `RunCompleted`(run_id)
+- Guards:
+  - `run_matches_binding`
+- To: `Running`
+
+### `RunFailed`
+- From: `Running`
+- On: `RunFailed`(run_id, error)
+- Guards:
+  - `run_matches_binding`
+- To: `Running`
+
+### `RunCancelled`
+- From: `Running`
+- On: `RunCancelled`(run_id)
+- Guards:
+  - `run_matches_binding`
+- To: `Running`
+
+### `SurfaceRegisterAttached`
+- From: `Attached`
+- On: `SurfaceRegister`(surface_id)
 - To: `Attached`
+
+### `SurfaceRegisterRunning`
+- From: `Running`
+- On: `SurfaceRegister`(surface_id)
+- To: `Running`
+
+### `SurfaceStageAddAttached`
+- From: `Attached`
+- On: `SurfaceStageAdd`(surface_id, now_ms)
+- Guards:
+  - `surface_operating`
+- To: `Attached`
+
+### `SurfaceStageAddRunning`
+- From: `Running`
+- On: `SurfaceStageAdd`(surface_id, now_ms)
+- Guards:
+  - `surface_operating`
+- To: `Running`
+
+### `SurfaceStageRemoveAttached`
+- From: `Attached`
+- On: `SurfaceStageRemove`(surface_id, now_ms)
+- Guards:
+  - `surface_operating`
+- To: `Attached`
+
+### `SurfaceStageRemoveRunning`
+- From: `Running`
+- On: `SurfaceStageRemove`(surface_id, now_ms)
+- Guards:
+  - `surface_operating`
+- To: `Running`
+
+### `SurfaceStageReloadAttached`
+- From: `Attached`
+- On: `SurfaceStageReload`(surface_id, now_ms)
+- Guards:
+  - `surface_operating`
+  - `surface_active`
+- To: `Attached`
+
+### `SurfaceStageReloadRunning`
+- From: `Running`
+- On: `SurfaceStageReload`(surface_id, now_ms)
+- Guards:
+  - `surface_operating`
+  - `surface_active`
+- To: `Running`
+
+### `SurfaceApplyBoundaryAddAttached`
+- From: `Attached`
+- On: `SurfaceApplyBoundary`(surface_id, now_ms, staged_intent_sequence, applied_at_turn)
+- Guards:
+  - `surface_operating`
+  - `staged_add`
+  - `staged_sequence_matches`
+  - `no_pending_surface_op`
+  - `base_accepts_add`
+- Emits: `ScheduleSurfaceCompletion`, `EmitExternalToolDelta`
+- To: `Attached`
+
+### `SurfaceApplyBoundaryAddRunning`
+- From: `Running`
+- On: `SurfaceApplyBoundary`(surface_id, now_ms, staged_intent_sequence, applied_at_turn)
+- Guards:
+  - `surface_operating`
+  - `staged_add`
+  - `staged_sequence_matches`
+  - `no_pending_surface_op`
+  - `base_accepts_add`
+- Emits: `ScheduleSurfaceCompletion`, `EmitExternalToolDelta`
+- To: `Running`
+
+### `SurfaceApplyBoundaryReloadAttached`
+- From: `Attached`
+- On: `SurfaceApplyBoundary`(surface_id, now_ms, staged_intent_sequence, applied_at_turn)
+- Guards:
+  - `surface_operating`
+  - `staged_reload`
+  - `staged_sequence_matches`
+  - `surface_active`
+  - `base_active`
+  - `no_pending_surface_op`
+- Emits: `ScheduleSurfaceCompletion`, `EmitExternalToolDelta`
+- To: `Attached`
+
+### `SurfaceApplyBoundaryReloadRunning`
+- From: `Running`
+- On: `SurfaceApplyBoundary`(surface_id, now_ms, staged_intent_sequence, applied_at_turn)
+- Guards:
+  - `surface_operating`
+  - `staged_reload`
+  - `staged_sequence_matches`
+  - `surface_active`
+  - `base_active`
+  - `no_pending_surface_op`
+- Emits: `ScheduleSurfaceCompletion`, `EmitExternalToolDelta`
+- To: `Running`
+
+### `SurfaceApplyBoundaryRemoveDrainingAttached`
+- From: `Attached`
+- On: `SurfaceApplyBoundary`(surface_id, now_ms, staged_intent_sequence, applied_at_turn)
+- Guards:
+  - `surface_operating`
+  - `staged_remove`
+  - `staged_sequence_matches`
+  - `base_active`
+  - `no_pending_surface_op`
+- Emits: `RefreshVisibleSurfaceSet`, `EmitExternalToolDelta`
+- To: `Attached`
+
+### `SurfaceApplyBoundaryRemoveDrainingRunning`
+- From: `Running`
+- On: `SurfaceApplyBoundary`(surface_id, now_ms, staged_intent_sequence, applied_at_turn)
+- Guards:
+  - `surface_operating`
+  - `staged_remove`
+  - `staged_sequence_matches`
+  - `base_active`
+  - `no_pending_surface_op`
+- Emits: `RefreshVisibleSurfaceSet`, `EmitExternalToolDelta`
+- To: `Running`
+
+### `SurfaceApplyBoundaryRemoveNoopAttached`
+- From: `Attached`
+- On: `SurfaceApplyBoundary`(surface_id, now_ms, staged_intent_sequence, applied_at_turn)
+- Guards:
+  - `surface_operating`
+  - `staged_remove`
+  - `staged_sequence_matches`
+  - `base_not_active`
+  - `no_pending_surface_op`
+- To: `Attached`
+
+### `SurfaceApplyBoundaryRemoveNoopRunning`
+- From: `Running`
+- On: `SurfaceApplyBoundary`(surface_id, now_ms, staged_intent_sequence, applied_at_turn)
+- Guards:
+  - `surface_operating`
+  - `staged_remove`
+  - `staged_sequence_matches`
+  - `base_not_active`
+  - `no_pending_surface_op`
+- To: `Running`
+
+### `SurfaceMarkPendingSucceededAddAttached`
+- From: `Attached`
+- On: `SurfaceMarkPendingSucceeded`(surface_id, pending_task_sequence, staged_intent_sequence)
+- Guards:
+  - `pending_add`
+  - `pending_sequence_matches`
+  - `pending_lineage_matches`
+- Emits: `RefreshVisibleSurfaceSet`, `EmitExternalToolDelta`
+- To: `Attached`
+
+### `SurfaceMarkPendingSucceededAddRunning`
+- From: `Running`
+- On: `SurfaceMarkPendingSucceeded`(surface_id, pending_task_sequence, staged_intent_sequence)
+- Guards:
+  - `pending_add`
+  - `pending_sequence_matches`
+  - `pending_lineage_matches`
+- Emits: `RefreshVisibleSurfaceSet`, `EmitExternalToolDelta`
+- To: `Running`
+
+### `SurfaceMarkPendingSucceededReloadAttached`
+- From: `Attached`
+- On: `SurfaceMarkPendingSucceeded`(surface_id, pending_task_sequence, staged_intent_sequence)
+- Guards:
+  - `pending_reload`
+  - `pending_sequence_matches`
+  - `pending_lineage_matches`
+- Emits: `RefreshVisibleSurfaceSet`, `EmitExternalToolDelta`
+- To: `Attached`
+
+### `SurfaceMarkPendingSucceededReloadRunning`
+- From: `Running`
+- On: `SurfaceMarkPendingSucceeded`(surface_id, pending_task_sequence, staged_intent_sequence)
+- Guards:
+  - `pending_reload`
+  - `pending_sequence_matches`
+  - `pending_lineage_matches`
+- Emits: `RefreshVisibleSurfaceSet`, `EmitExternalToolDelta`
+- To: `Running`
+
+### `SurfaceMarkPendingFailedAttached`
+- From: `Attached`
+- On: `SurfaceMarkPendingFailed`(surface_id, pending_task_sequence, staged_intent_sequence, reason)
+- Guards:
+  - `pending_sequence_matches`
+  - `pending_lineage_matches`
+- Emits: `EmitExternalToolDelta`
+- To: `Attached`
+
+### `SurfaceMarkPendingFailedRunning`
+- From: `Running`
+- On: `SurfaceMarkPendingFailed`(surface_id, pending_task_sequence, staged_intent_sequence, reason)
+- Guards:
+  - `pending_sequence_matches`
+  - `pending_lineage_matches`
+- Emits: `EmitExternalToolDelta`
+- To: `Running`
+
+### `SurfaceCallStartedActiveAttached`
+- From: `Attached`
+- On: `SurfaceCallStarted`(surface_id)
+- Guards:
+  - `surface_active`
+- To: `Attached`
+
+### `SurfaceCallStartedActiveRunning`
+- From: `Running`
+- On: `SurfaceCallStarted`(surface_id)
+- Guards:
+  - `surface_active`
+- To: `Running`
+
+### `SurfaceCallStartedRejectRemovingAttached`
+- From: `Attached`
+- On: `SurfaceCallStarted`(surface_id)
+- Guards:
+  - `surface_removing`
+- Emits: `RejectSurfaceCall`
+- To: `Attached`
+
+### `SurfaceCallStartedRejectRemovingRunning`
+- From: `Running`
+- On: `SurfaceCallStarted`(surface_id)
+- Guards:
+  - `surface_removing`
+- Emits: `RejectSurfaceCall`
+- To: `Running`
+
+### `SurfaceCallStartedRejectUnavailableAttached`
+- From: `Attached`
+- On: `SurfaceCallStarted`(surface_id)
+- Guards:
+  - `surface_unavailable`
+- Emits: `RejectSurfaceCall`
+- To: `Attached`
+
+### `SurfaceCallStartedRejectUnavailableRunning`
+- From: `Running`
+- On: `SurfaceCallStarted`(surface_id)
+- Guards:
+  - `surface_unavailable`
+- Emits: `RejectSurfaceCall`
+- To: `Running`
+
+### `SurfaceCallFinishedAttached`
+- From: `Attached`
+- On: `SurfaceCallFinished`(surface_id)
+- Guards:
+  - `surface_active_or_removing`
+  - `inflight_calls_remain`
+- To: `Attached`
+
+### `SurfaceCallFinishedRunning`
+- From: `Running`
+- On: `SurfaceCallFinished`(surface_id)
+- Guards:
+  - `surface_active_or_removing`
+  - `inflight_calls_remain`
+- To: `Running`
+
+### `SurfaceFinalizeRemovalCleanAttached`
+- From: `Attached`
+- On: `SurfaceFinalizeRemovalClean`(surface_id)
+- Guards:
+  - `surface_removing`
+  - `no_inflight_calls_remain`
+- Emits: `CloseSurfaceConnection`, `RefreshVisibleSurfaceSet`, `EmitExternalToolDelta`
+- To: `Attached`
+
+### `SurfaceFinalizeRemovalCleanRunning`
+- From: `Running`
+- On: `SurfaceFinalizeRemovalClean`(surface_id)
+- Guards:
+  - `surface_removing`
+  - `no_inflight_calls_remain`
+- Emits: `CloseSurfaceConnection`, `RefreshVisibleSurfaceSet`, `EmitExternalToolDelta`
+- To: `Running`
+
+### `SurfaceFinalizeRemovalForcedAttached`
+- From: `Attached`
+- On: `SurfaceFinalizeRemovalForced`(surface_id)
+- Guards:
+  - `surface_removing`
+- Emits: `CloseSurfaceConnection`, `RefreshVisibleSurfaceSet`, `EmitExternalToolDelta`
+- To: `Attached`
+
+### `SurfaceFinalizeRemovalForcedRunning`
+- From: `Running`
+- On: `SurfaceFinalizeRemovalForced`(surface_id)
+- Guards:
+  - `surface_removing`
+- Emits: `CloseSurfaceConnection`, `RefreshVisibleSurfaceSet`, `EmitExternalToolDelta`
+- To: `Running`
+
+### `SurfaceSnapshotAlignedAttached`
+- From: `Attached`
+- On: `SurfaceSnapshotAligned`(epoch)
+- To: `Attached`
+
+### `SurfaceSnapshotAlignedRunning`
+- From: `Running`
+- On: `SurfaceSnapshotAligned`(epoch)
+- To: `Running`
+
+### `SurfaceShutdownAttached`
+- From: `Attached`
+- On: `SurfaceShutdown`()
+- To: `Attached`
+
+### `SurfaceShutdownRunning`
+- From: `Running`
+- On: `SurfaceShutdown`()
+- To: `Running`
 
 ### `CommitRunningToIdle`
 - From: `Running`
@@ -1793,194 +2572,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `RecordTerminalOutcome`
 - To: `Retired`
 
-### `StageAddAttached`
-- From: `Attached`
-- On: `StageAdd`()
-- Guards:
-  - `session_registered`
-- Emits: `EmitExternalToolDelta`
-- To: `Attached`
-
-### `StageAddRunning`
-- From: `Running`
-- On: `StageAdd`()
-- Guards:
-  - `session_registered`
-- Emits: `EmitExternalToolDelta`
-- To: `Running`
-
-### `StageRemoveAttached`
-- From: `Attached`
-- On: `StageRemove`()
-- Guards:
-  - `session_registered`
-- Emits: `EmitExternalToolDelta`
-- To: `Attached`
-
-### `StageRemoveRunning`
-- From: `Running`
-- On: `StageRemove`()
-- Guards:
-  - `session_registered`
-- Emits: `EmitExternalToolDelta`
-- To: `Running`
-
-### `StageReloadAttached`
-- From: `Attached`
-- On: `StageReload`()
-- Guards:
-  - `session_registered`
-- Emits: `EmitExternalToolDelta`
-- To: `Attached`
-
-### `StageReloadRunning`
-- From: `Running`
-- On: `StageReload`()
-- Guards:
-  - `session_registered`
-- Emits: `EmitExternalToolDelta`
-- To: `Running`
-
-### `ApplySurfaceBoundaryAttached`
-- From: `Attached`
-- On: `ApplySurfaceBoundary`(surface_id, operation, pending_task_sequence, staged_intent_sequence, applied_at_turn)
-- Guards:
-  - `session_registered`
-- Emits: `ScheduleSurfaceCompletion`
-- To: `Attached`
-
-### `ApplySurfaceBoundaryRunning`
-- From: `Running`
-- On: `ApplySurfaceBoundary`(surface_id, operation, pending_task_sequence, staged_intent_sequence, applied_at_turn)
-- Guards:
-  - `session_registered`
-- Emits: `ScheduleSurfaceCompletion`
-- To: `Running`
-
-### `PendingSucceededAttached`
-- From: `Attached`
-- On: `PendingSucceeded`(surface_id, pending_task_sequence, staged_intent_sequence)
-- Guards:
-  - `session_registered`
-- Emits: `EmitExternalToolDelta`
-- To: `Attached`
-
-### `PendingSucceededRunning`
-- From: `Running`
-- On: `PendingSucceeded`(surface_id, pending_task_sequence, staged_intent_sequence)
-- Guards:
-  - `session_registered`
-- Emits: `EmitExternalToolDelta`
-- To: `Running`
-
-### `PendingFailedAttached`
-- From: `Attached`
-- On: `PendingFailed`(surface_id, pending_task_sequence, reason)
-- Guards:
-  - `session_registered`
-- Emits: `EmitExternalToolDelta`
-- To: `Attached`
-
-### `PendingFailedRunning`
-- From: `Running`
-- On: `PendingFailed`(surface_id, pending_task_sequence, reason)
-- Guards:
-  - `session_registered`
-- Emits: `EmitExternalToolDelta`
-- To: `Running`
-
-### `CallStartedAttached`
-- From: `Attached`
-- On: `CallStarted`()
-- Guards:
-  - `session_registered`
-- To: `Attached`
-
-### `CallStartedRunning`
-- From: `Running`
-- On: `CallStarted`()
-- Guards:
-  - `session_registered`
-- To: `Running`
-
-### `CallFinishedAttached`
-- From: `Attached`
-- On: `CallFinished`()
-- Guards:
-  - `session_registered`
-- To: `Attached`
-
-### `CallFinishedRunning`
-- From: `Running`
-- On: `CallFinished`()
-- Guards:
-  - `session_registered`
-- To: `Running`
-
-### `FinalizeRemovalCleanAttached`
-- From: `Attached`
-- On: `FinalizeRemovalClean`()
-- Guards:
-  - `session_registered`
-- Emits: `EmitExternalToolDelta`
-- To: `Attached`
-
-### `FinalizeRemovalCleanRunning`
-- From: `Running`
-- On: `FinalizeRemovalClean`()
-- Guards:
-  - `session_registered`
-- Emits: `EmitExternalToolDelta`
-- To: `Running`
-
-### `FinalizeRemovalForcedAttached`
-- From: `Attached`
-- On: `FinalizeRemovalForced`()
-- Guards:
-  - `session_registered`
-- Emits: `EmitExternalToolDelta`
-- To: `Attached`
-
-### `FinalizeRemovalForcedRunning`
-- From: `Running`
-- On: `FinalizeRemovalForced`()
-- Guards:
-  - `session_registered`
-- Emits: `EmitExternalToolDelta`
-- To: `Running`
-
-### `SnapshotAlignedAttached`
-- From: `Attached`
-- On: `SnapshotAligned`(snapshot_epoch)
-- Guards:
-  - `session_registered`
-- Emits: `EmitExternalToolDelta`
-- To: `Attached`
-
-### `SnapshotAlignedRunning`
-- From: `Running`
-- On: `SnapshotAligned`(snapshot_epoch)
-- Guards:
-  - `session_registered`
-- Emits: `EmitExternalToolDelta`
-- To: `Running`
-
-### `ShutdownSurfaceAttached`
-- From: `Attached`
-- On: `ShutdownSurface`()
-- Guards:
-  - `session_registered`
-- Emits: `EmitExternalToolDelta`
-- To: `Attached`
-
-### `ShutdownSurfaceRunning`
-- From: `Running`
-- On: `ShutdownSurface`()
-- Guards:
-  - `session_registered`
-- Emits: `EmitExternalToolDelta`
-- To: `Running`
-
 ### `RecycleFromIdleOrRetired`
 - From: `Idle`, `Retired`
 - On: `Recycle`()
@@ -1996,6 +2587,1471 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_registered`
 - Emits: `InitiateRecycle`
 - To: `Attached`
+
+### `RecoverInputLifecycleIdle`
+- From: `Idle`
+- On: `RecoverInputLifecycle`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, lane)
+- Emits: `InputLifecycleNotice`
+- To: `Idle`
+
+### `RecoverInputLifecycleAttached`
+- From: `Attached`
+- On: `RecoverInputLifecycle`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, lane)
+- Emits: `InputLifecycleNotice`
+- To: `Attached`
+
+### `RecoverInputLifecycleRunning`
+- From: `Running`
+- On: `RecoverInputLifecycle`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, lane)
+- Emits: `InputLifecycleNotice`
+- To: `Running`
+
+### `RecoverInputLifecycleRetired`
+- From: `Retired`
+- On: `RecoverInputLifecycle`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, lane)
+- Emits: `InputLifecycleNotice`
+- To: `Retired`
+
+### `RecoverInputLifecycleStopped`
+- From: `Stopped`
+- On: `RecoverInputLifecycle`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, lane)
+- Emits: `InputLifecycleNotice`
+- To: `Stopped`
+
+### `QueueAcceptedIdle`
+- From: `Idle`
+- On: `QueueAccepted`(input_id)
+- Guards:
+  - `not_already_tracked`
+- Emits: `IngressAccepted`
+- To: `Idle`
+
+### `QueueAcceptedAttached`
+- From: `Attached`
+- On: `QueueAccepted`(input_id)
+- Guards:
+  - `not_already_tracked`
+- Emits: `IngressAccepted`
+- To: `Attached`
+
+### `QueueAcceptedRunning`
+- From: `Running`
+- On: `QueueAccepted`(input_id)
+- Guards:
+  - `not_already_tracked`
+- Emits: `IngressAccepted`
+- To: `Running`
+
+### `QueueAcceptedRetired`
+- From: `Retired`
+- On: `QueueAccepted`(input_id)
+- Guards:
+  - `not_already_tracked`
+- Emits: `IngressAccepted`
+- To: `Retired`
+
+### `QueueAcceptedStopped`
+- From: `Stopped`
+- On: `QueueAccepted`(input_id)
+- Guards:
+  - `not_already_tracked`
+- Emits: `IngressAccepted`
+- To: `Stopped`
+
+### `SteerAcceptedIdle`
+- From: `Idle`
+- On: `SteerAccepted`(input_id)
+- Guards:
+  - `not_already_tracked`
+- Emits: `IngressAccepted`
+- To: `Idle`
+
+### `SteerAcceptedAttached`
+- From: `Attached`
+- On: `SteerAccepted`(input_id)
+- Guards:
+  - `not_already_tracked`
+- Emits: `IngressAccepted`
+- To: `Attached`
+
+### `SteerAcceptedRunning`
+- From: `Running`
+- On: `SteerAccepted`(input_id)
+- Guards:
+  - `not_already_tracked`
+- Emits: `IngressAccepted`
+- To: `Running`
+
+### `SteerAcceptedRetired`
+- From: `Retired`
+- On: `SteerAccepted`(input_id)
+- Guards:
+  - `not_already_tracked`
+- Emits: `IngressAccepted`
+- To: `Retired`
+
+### `SteerAcceptedStopped`
+- From: `Stopped`
+- On: `SteerAccepted`(input_id)
+- Guards:
+  - `not_already_tracked`
+- Emits: `IngressAccepted`
+- To: `Stopped`
+
+### `ChangeLaneIdle`
+- From: `Idle`
+- On: `ChangeLane`(input_id, new_lane)
+- Guards:
+  - `input_tracked`
+- To: `Idle`
+
+### `ChangeLaneAttached`
+- From: `Attached`
+- On: `ChangeLane`(input_id, new_lane)
+- Guards:
+  - `input_tracked`
+- To: `Attached`
+
+### `ChangeLaneRunning`
+- From: `Running`
+- On: `ChangeLane`(input_id, new_lane)
+- Guards:
+  - `input_tracked`
+- To: `Running`
+
+### `ChangeLaneRetired`
+- From: `Retired`
+- On: `ChangeLane`(input_id, new_lane)
+- Guards:
+  - `input_tracked`
+- To: `Retired`
+
+### `ChangeLaneStopped`
+- From: `Stopped`
+- On: `ChangeLane`(input_id, new_lane)
+- Guards:
+  - `input_tracked`
+- To: `Stopped`
+
+### `StageForRunIdle`
+- From: `Idle`
+- On: `StageForRun`(input_id, run_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordRunAssociation`
+- To: `Idle`
+
+### `StageForRunAttached`
+- From: `Attached`
+- On: `StageForRun`(input_id, run_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordRunAssociation`
+- To: `Attached`
+
+### `StageForRunRunning`
+- From: `Running`
+- On: `StageForRun`(input_id, run_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordRunAssociation`
+- To: `Running`
+
+### `StageForRunRetired`
+- From: `Retired`
+- On: `StageForRun`(input_id, run_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordRunAssociation`
+- To: `Retired`
+
+### `StageForRunStopped`
+- From: `Stopped`
+- On: `StageForRun`(input_id, run_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordRunAssociation`
+- To: `Stopped`
+
+### `IncrementAttemptCountIdle`
+- From: `Idle`
+- On: `IncrementAttemptCount`(input_id)
+- Guards:
+  - `input_tracked`
+- To: `Idle`
+
+### `IncrementAttemptCountAttached`
+- From: `Attached`
+- On: `IncrementAttemptCount`(input_id)
+- Guards:
+  - `input_tracked`
+- To: `Attached`
+
+### `IncrementAttemptCountRunning`
+- From: `Running`
+- On: `IncrementAttemptCount`(input_id)
+- Guards:
+  - `input_tracked`
+- To: `Running`
+
+### `IncrementAttemptCountRetired`
+- From: `Retired`
+- On: `IncrementAttemptCount`(input_id)
+- Guards:
+  - `input_tracked`
+- To: `Retired`
+
+### `IncrementAttemptCountStopped`
+- From: `Stopped`
+- On: `IncrementAttemptCount`(input_id)
+- Guards:
+  - `input_tracked`
+- To: `Stopped`
+
+### `RollbackStagedIdle`
+- From: `Idle`
+- On: `RollbackStaged`(input_id, lane)
+- Guards:
+  - `input_tracked`
+- Emits: `InputLifecycleNotice`
+- To: `Idle`
+
+### `RollbackStagedAttached`
+- From: `Attached`
+- On: `RollbackStaged`(input_id, lane)
+- Guards:
+  - `input_tracked`
+- Emits: `InputLifecycleNotice`
+- To: `Attached`
+
+### `RollbackStagedRunning`
+- From: `Running`
+- On: `RollbackStaged`(input_id, lane)
+- Guards:
+  - `input_tracked`
+- Emits: `InputLifecycleNotice`
+- To: `Running`
+
+### `RollbackStagedRetired`
+- From: `Retired`
+- On: `RollbackStaged`(input_id, lane)
+- Guards:
+  - `input_tracked`
+- Emits: `InputLifecycleNotice`
+- To: `Retired`
+
+### `RollbackStagedStopped`
+- From: `Stopped`
+- On: `RollbackStaged`(input_id, lane)
+- Guards:
+  - `input_tracked`
+- Emits: `InputLifecycleNotice`
+- To: `Stopped`
+
+### `MarkAppliedIdle`
+- From: `Idle`
+- On: `MarkApplied`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `InputLifecycleNotice`
+- To: `Idle`
+
+### `MarkAppliedAttached`
+- From: `Attached`
+- On: `MarkApplied`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `InputLifecycleNotice`
+- To: `Attached`
+
+### `MarkAppliedRunning`
+- From: `Running`
+- On: `MarkApplied`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `InputLifecycleNotice`
+- To: `Running`
+
+### `MarkAppliedRetired`
+- From: `Retired`
+- On: `MarkApplied`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `InputLifecycleNotice`
+- To: `Retired`
+
+### `MarkAppliedStopped`
+- From: `Stopped`
+- On: `MarkApplied`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `InputLifecycleNotice`
+- To: `Stopped`
+
+### `MarkAppliedPendingConsumptionIdle`
+- From: `Idle`
+- On: `MarkAppliedPendingConsumption`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `InputLifecycleNotice`
+- To: `Idle`
+
+### `MarkAppliedPendingConsumptionAttached`
+- From: `Attached`
+- On: `MarkAppliedPendingConsumption`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `InputLifecycleNotice`
+- To: `Attached`
+
+### `MarkAppliedPendingConsumptionRunning`
+- From: `Running`
+- On: `MarkAppliedPendingConsumption`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `InputLifecycleNotice`
+- To: `Running`
+
+### `MarkAppliedPendingConsumptionRetired`
+- From: `Retired`
+- On: `MarkAppliedPendingConsumption`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `InputLifecycleNotice`
+- To: `Retired`
+
+### `MarkAppliedPendingConsumptionStopped`
+- From: `Stopped`
+- On: `MarkAppliedPendingConsumption`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `InputLifecycleNotice`
+- To: `Stopped`
+
+### `ConsumeOnAcceptIdle`
+- From: `Idle`
+- On: `ConsumeOnAccept`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Idle`
+
+### `ConsumeOnAcceptAttached`
+- From: `Attached`
+- On: `ConsumeOnAccept`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Attached`
+
+### `ConsumeOnAcceptRunning`
+- From: `Running`
+- On: `ConsumeOnAccept`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Running`
+
+### `ConsumeOnAcceptRetired`
+- From: `Retired`
+- On: `ConsumeOnAccept`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Retired`
+
+### `ConsumeOnAcceptStopped`
+- From: `Stopped`
+- On: `ConsumeOnAccept`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Stopped`
+
+### `RecordBoundarySeqIdle`
+- From: `Idle`
+- On: `RecordBoundarySeq`(input_id, seq)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordBoundarySequence`
+- To: `Idle`
+
+### `RecordBoundarySeqAttached`
+- From: `Attached`
+- On: `RecordBoundarySeq`(input_id, seq)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordBoundarySequence`
+- To: `Attached`
+
+### `RecordBoundarySeqRunning`
+- From: `Running`
+- On: `RecordBoundarySeq`(input_id, seq)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordBoundarySequence`
+- To: `Running`
+
+### `RecordBoundarySeqRetired`
+- From: `Retired`
+- On: `RecordBoundarySeq`(input_id, seq)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordBoundarySequence`
+- To: `Retired`
+
+### `RecordBoundarySeqStopped`
+- From: `Stopped`
+- On: `RecordBoundarySeq`(input_id, seq)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordBoundarySequence`
+- To: `Stopped`
+
+### `ConsumeInputIdle`
+- From: `Idle`
+- On: `ConsumeInput`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Idle`
+
+### `ConsumeInputAttached`
+- From: `Attached`
+- On: `ConsumeInput`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Attached`
+
+### `ConsumeInputRunning`
+- From: `Running`
+- On: `ConsumeInput`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Running`
+
+### `ConsumeInputRetired`
+- From: `Retired`
+- On: `ConsumeInput`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Retired`
+
+### `ConsumeInputStopped`
+- From: `Stopped`
+- On: `ConsumeInput`(input_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Stopped`
+
+### `SupersedeInputIdle`
+- From: `Idle`
+- On: `SupersedeInput`(input_id, superseded_by)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Idle`
+
+### `SupersedeInputAttached`
+- From: `Attached`
+- On: `SupersedeInput`(input_id, superseded_by)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Attached`
+
+### `SupersedeInputRunning`
+- From: `Running`
+- On: `SupersedeInput`(input_id, superseded_by)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Running`
+
+### `SupersedeInputRetired`
+- From: `Retired`
+- On: `SupersedeInput`(input_id, superseded_by)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Retired`
+
+### `SupersedeInputStopped`
+- From: `Stopped`
+- On: `SupersedeInput`(input_id, superseded_by)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Stopped`
+
+### `CoalesceInputIdle`
+- From: `Idle`
+- On: `CoalesceInput`(input_id, aggregate_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Idle`
+
+### `CoalesceInputAttached`
+- From: `Attached`
+- On: `CoalesceInput`(input_id, aggregate_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Attached`
+
+### `CoalesceInputRunning`
+- From: `Running`
+- On: `CoalesceInput`(input_id, aggregate_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Running`
+
+### `CoalesceInputRetired`
+- From: `Retired`
+- On: `CoalesceInput`(input_id, aggregate_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Retired`
+
+### `CoalesceInputStopped`
+- From: `Stopped`
+- On: `CoalesceInput`(input_id, aggregate_id)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Stopped`
+
+### `AbandonInputIdle`
+- From: `Idle`
+- On: `AbandonInput`(input_id, reason, attempt_count)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Idle`
+
+### `AbandonInputAttached`
+- From: `Attached`
+- On: `AbandonInput`(input_id, reason, attempt_count)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Attached`
+
+### `AbandonInputRunning`
+- From: `Running`
+- On: `AbandonInput`(input_id, reason, attempt_count)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Running`
+
+### `AbandonInputRetired`
+- From: `Retired`
+- On: `AbandonInput`(input_id, reason, attempt_count)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Retired`
+
+### `AbandonInputStopped`
+- From: `Stopped`
+- On: `AbandonInput`(input_id, reason, attempt_count)
+- Guards:
+  - `input_tracked`
+- Emits: `RecordTerminalOutcome`
+- To: `Stopped`
+
+### `RegisterOpIdle`
+- From: `Idle`
+- On: `RegisterOp`(operation_id, kind)
+- Guards:
+  - `not_already_registered`
+- Emits: `SubmitOpEvent`
+- To: `Idle`
+
+### `RegisterOpAttached`
+- From: `Attached`
+- On: `RegisterOp`(operation_id, kind)
+- Guards:
+  - `not_already_registered`
+- Emits: `SubmitOpEvent`
+- To: `Attached`
+
+### `RegisterOpRunning`
+- From: `Running`
+- On: `RegisterOp`(operation_id, kind)
+- Guards:
+  - `not_already_registered`
+- Emits: `SubmitOpEvent`
+- To: `Running`
+
+### `RegisterOpRetired`
+- From: `Retired`
+- On: `RegisterOp`(operation_id, kind)
+- Guards:
+  - `not_already_registered`
+- Emits: `SubmitOpEvent`
+- To: `Retired`
+
+### `RegisterOpStopped`
+- From: `Stopped`
+- On: `RegisterOp`(operation_id, kind)
+- Guards:
+  - `not_already_registered`
+- Emits: `SubmitOpEvent`
+- To: `Stopped`
+
+### `StartOpIdle`
+- From: `Idle`
+- On: `StartOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Idle`
+
+### `StartOpAttached`
+- From: `Attached`
+- On: `StartOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Attached`
+
+### `StartOpRunning`
+- From: `Running`
+- On: `StartOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Running`
+
+### `StartOpRetired`
+- From: `Retired`
+- On: `StartOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Retired`
+
+### `StartOpStopped`
+- From: `Stopped`
+- On: `StartOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Stopped`
+
+### `CompleteOpIdle`
+- From: `Idle`
+- On: `CompleteOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Idle`
+
+### `CompleteOpAttached`
+- From: `Attached`
+- On: `CompleteOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Attached`
+
+### `CompleteOpRunning`
+- From: `Running`
+- On: `CompleteOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Running`
+
+### `CompleteOpRetired`
+- From: `Retired`
+- On: `CompleteOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Retired`
+
+### `CompleteOpStopped`
+- From: `Stopped`
+- On: `CompleteOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Stopped`
+
+### `FailOpIdle`
+- From: `Idle`
+- On: `FailOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Idle`
+
+### `FailOpAttached`
+- From: `Attached`
+- On: `FailOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Attached`
+
+### `FailOpRunning`
+- From: `Running`
+- On: `FailOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Running`
+
+### `FailOpRetired`
+- From: `Retired`
+- On: `FailOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Retired`
+
+### `FailOpStopped`
+- From: `Stopped`
+- On: `FailOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Stopped`
+
+### `CancelOpIdle`
+- From: `Idle`
+- On: `CancelOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Idle`
+
+### `CancelOpAttached`
+- From: `Attached`
+- On: `CancelOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Attached`
+
+### `CancelOpRunning`
+- From: `Running`
+- On: `CancelOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Running`
+
+### `CancelOpRetired`
+- From: `Retired`
+- On: `CancelOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Retired`
+
+### `CancelOpStopped`
+- From: `Stopped`
+- On: `CancelOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Stopped`
+
+### `AbortOpIdle`
+- From: `Idle`
+- On: `AbortOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Idle`
+
+### `AbortOpAttached`
+- From: `Attached`
+- On: `AbortOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Attached`
+
+### `AbortOpRunning`
+- From: `Running`
+- On: `AbortOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Running`
+
+### `AbortOpRetired`
+- From: `Retired`
+- On: `AbortOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Retired`
+
+### `AbortOpStopped`
+- From: `Stopped`
+- On: `AbortOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Stopped`
+
+### `PeerReadyOpIdle`
+- From: `Idle`
+- On: `PeerReadyOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `kind_is_mob_member_child`
+  - `not_already_peer_ready`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Idle`
+
+### `PeerReadyOpAttached`
+- From: `Attached`
+- On: `PeerReadyOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `kind_is_mob_member_child`
+  - `not_already_peer_ready`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Attached`
+
+### `PeerReadyOpRunning`
+- From: `Running`
+- On: `PeerReadyOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `kind_is_mob_member_child`
+  - `not_already_peer_ready`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Running`
+
+### `PeerReadyOpRetired`
+- From: `Retired`
+- On: `PeerReadyOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `kind_is_mob_member_child`
+  - `not_already_peer_ready`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Retired`
+
+### `PeerReadyOpStopped`
+- From: `Stopped`
+- On: `PeerReadyOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `kind_is_mob_member_child`
+  - `not_already_peer_ready`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Stopped`
+
+### `ProgressReportedOpIdle`
+- From: `Idle`
+- On: `ProgressReportedOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Idle`
+
+### `ProgressReportedOpAttached`
+- From: `Attached`
+- On: `ProgressReportedOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Attached`
+
+### `ProgressReportedOpRunning`
+- From: `Running`
+- On: `ProgressReportedOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Running`
+
+### `ProgressReportedOpRetired`
+- From: `Retired`
+- On: `ProgressReportedOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Retired`
+
+### `ProgressReportedOpStopped`
+- From: `Stopped`
+- On: `ProgressReportedOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Stopped`
+
+### `RetireRequestedOpIdle`
+- From: `Idle`
+- On: `RetireRequestedOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Idle`
+
+### `RetireRequestedOpAttached`
+- From: `Attached`
+- On: `RetireRequestedOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Attached`
+
+### `RetireRequestedOpRunning`
+- From: `Running`
+- On: `RetireRequestedOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Running`
+
+### `RetireRequestedOpRetired`
+- From: `Retired`
+- On: `RetireRequestedOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Retired`
+
+### `RetireRequestedOpStopped`
+- From: `Stopped`
+- On: `RetireRequestedOp`(operation_id)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`
+- To: `Stopped`
+
+### `RetireCompletedOpIdle`
+- From: `Idle`
+- On: `RetireCompletedOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Idle`
+
+### `RetireCompletedOpAttached`
+- From: `Attached`
+- On: `RetireCompletedOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Attached`
+
+### `RetireCompletedOpRunning`
+- From: `Running`
+- On: `RetireCompletedOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Running`
+
+### `RetireCompletedOpRetired`
+- From: `Retired`
+- On: `RetireCompletedOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Retired`
+
+### `RetireCompletedOpStopped`
+- From: `Stopped`
+- On: `RetireCompletedOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Stopped`
+
+### `TerminateOpIdle`
+- From: `Idle`
+- On: `TerminateOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Idle`
+
+### `TerminateOpAttached`
+- From: `Attached`
+- On: `TerminateOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Attached`
+
+### `TerminateOpRunning`
+- From: `Running`
+- On: `TerminateOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Running`
+
+### `TerminateOpRetired`
+- From: `Retired`
+- On: `TerminateOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Retired`
+
+### `TerminateOpStopped`
+- From: `Stopped`
+- On: `TerminateOp`(operation_id, outcome, payload)
+- Guards:
+  - `op_registered`
+  - `from_status_valid`
+- Emits: `SubmitOpEvent`, `NotifyOpWatcher`
+- To: `Stopped`
+
+### `RequestWaitAllIdle`
+- From: `Idle`
+- On: `RequestWaitAll`(wait_request_id, operation_ids, operation_id_tokens)
+- To: `Idle`
+
+### `RequestWaitAllAttached`
+- From: `Attached`
+- On: `RequestWaitAll`(wait_request_id, operation_ids, operation_id_tokens)
+- To: `Attached`
+
+### `RequestWaitAllRunning`
+- From: `Running`
+- On: `RequestWaitAll`(wait_request_id, operation_ids, operation_id_tokens)
+- To: `Running`
+
+### `RequestWaitAllRetired`
+- From: `Retired`
+- On: `RequestWaitAll`(wait_request_id, operation_ids, operation_id_tokens)
+- To: `Retired`
+
+### `RequestWaitAllStopped`
+- From: `Stopped`
+- On: `RequestWaitAll`(wait_request_id, operation_ids, operation_id_tokens)
+- To: `Stopped`
+
+### `SatisfyWaitAllIdle`
+- From: `Idle`
+- On: `SatisfyWaitAll`()
+- Guards:
+  - `wait_is_active`
+  - `all_members_terminal`
+- Emits: `WaitAllSatisfied`
+- To: `Idle`
+
+### `SatisfyWaitAllAttached`
+- From: `Attached`
+- On: `SatisfyWaitAll`()
+- Guards:
+  - `wait_is_active`
+  - `all_members_terminal`
+- Emits: `WaitAllSatisfied`
+- To: `Attached`
+
+### `SatisfyWaitAllRunning`
+- From: `Running`
+- On: `SatisfyWaitAll`()
+- Guards:
+  - `wait_is_active`
+  - `all_members_terminal`
+- Emits: `WaitAllSatisfied`
+- To: `Running`
+
+### `SatisfyWaitAllRetired`
+- From: `Retired`
+- On: `SatisfyWaitAll`()
+- Guards:
+  - `wait_is_active`
+  - `all_members_terminal`
+- Emits: `WaitAllSatisfied`
+- To: `Retired`
+
+### `SatisfyWaitAllStopped`
+- From: `Stopped`
+- On: `SatisfyWaitAll`()
+- Guards:
+  - `wait_is_active`
+  - `all_members_terminal`
+- Emits: `WaitAllSatisfied`
+- To: `Stopped`
+
+### `CancelWaitAllIdle`
+- From: `Idle`
+- On: `CancelWaitAll`()
+- Guards:
+  - `wait_is_active`
+- To: `Idle`
+
+### `CancelWaitAllAttached`
+- From: `Attached`
+- On: `CancelWaitAll`()
+- Guards:
+  - `wait_is_active`
+- To: `Attached`
+
+### `CancelWaitAllRunning`
+- From: `Running`
+- On: `CancelWaitAll`()
+- Guards:
+  - `wait_is_active`
+- To: `Running`
+
+### `CancelWaitAllRetired`
+- From: `Retired`
+- On: `CancelWaitAll`()
+- Guards:
+  - `wait_is_active`
+- To: `Retired`
+
+### `CancelWaitAllStopped`
+- From: `Stopped`
+- On: `CancelWaitAll`()
+- Guards:
+  - `wait_is_active`
+- To: `Stopped`
+
+### `SpawnDrainIdle`
+- From: `Idle`
+- On: `SpawnDrain`(mode)
+- Guards:
+  - `drain_can_spawn`
+- Emits: `SpawnDrainTask`
+- To: `Idle`
+
+### `SpawnDrainAttached`
+- From: `Attached`
+- On: `SpawnDrain`(mode)
+- Guards:
+  - `drain_can_spawn`
+- Emits: `SpawnDrainTask`
+- To: `Attached`
+
+### `SpawnDrainRunning`
+- From: `Running`
+- On: `SpawnDrain`(mode)
+- Guards:
+  - `drain_can_spawn`
+- Emits: `SpawnDrainTask`
+- To: `Running`
+
+### `SpawnDrainRetired`
+- From: `Retired`
+- On: `SpawnDrain`(mode)
+- Guards:
+  - `drain_can_spawn`
+- Emits: `SpawnDrainTask`
+- To: `Retired`
+
+### `SpawnDrainStopped`
+- From: `Stopped`
+- On: `SpawnDrain`(mode)
+- Guards:
+  - `drain_can_spawn`
+- Emits: `SpawnDrainTask`
+- To: `Stopped`
+
+### `StopDrainIdle`
+- From: `Idle`
+- On: `StopDrain`()
+- Guards:
+  - `drain_is_running`
+- To: `Idle`
+
+### `StopDrainAttached`
+- From: `Attached`
+- On: `StopDrain`()
+- Guards:
+  - `drain_is_running`
+- To: `Attached`
+
+### `StopDrainRunning`
+- From: `Running`
+- On: `StopDrain`()
+- Guards:
+  - `drain_is_running`
+- To: `Running`
+
+### `StopDrainRetired`
+- From: `Retired`
+- On: `StopDrain`()
+- Guards:
+  - `drain_is_running`
+- To: `Retired`
+
+### `StopDrainStopped`
+- From: `Stopped`
+- On: `StopDrain`()
+- Guards:
+  - `drain_is_running`
+- To: `Stopped`
+
+### `DrainExitedCleanIdle`
+- From: `Idle`
+- On: `DrainExitedClean`()
+- To: `Idle`
+
+### `DrainExitedCleanAttached`
+- From: `Attached`
+- On: `DrainExitedClean`()
+- To: `Attached`
+
+### `DrainExitedCleanRunning`
+- From: `Running`
+- On: `DrainExitedClean`()
+- To: `Running`
+
+### `DrainExitedCleanRetired`
+- From: `Retired`
+- On: `DrainExitedClean`()
+- To: `Retired`
+
+### `DrainExitedCleanStopped`
+- From: `Stopped`
+- On: `DrainExitedClean`()
+- To: `Stopped`
+
+### `DrainExitedRespawnableIdle`
+- From: `Idle`
+- On: `DrainExitedRespawnable`()
+- To: `Idle`
+
+### `DrainExitedRespawnableAttached`
+- From: `Attached`
+- On: `DrainExitedRespawnable`()
+- To: `Attached`
+
+### `DrainExitedRespawnableRunning`
+- From: `Running`
+- On: `DrainExitedRespawnable`()
+- To: `Running`
+
+### `DrainExitedRespawnableRetired`
+- From: `Retired`
+- On: `DrainExitedRespawnable`()
+- To: `Retired`
+
+### `DrainExitedRespawnableStopped`
+- From: `Stopped`
+- On: `DrainExitedRespawnable`()
+- To: `Stopped`
+
+### `StageVisibilityFilterIdle`
+- From: `Idle`
+- On: `StageVisibilityFilter`(filter)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Idle`
+
+### `StageVisibilityFilterAttached`
+- From: `Attached`
+- On: `StageVisibilityFilter`(filter)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Attached`
+
+### `StageVisibilityFilterRunning`
+- From: `Running`
+- On: `StageVisibilityFilter`(filter)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Running`
+
+### `StageVisibilityFilterRetired`
+- From: `Retired`
+- On: `StageVisibilityFilter`(filter)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Retired`
+
+### `StageVisibilityFilterStopped`
+- From: `Stopped`
+- On: `StageVisibilityFilter`(filter)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Stopped`
+
+### `CommitVisibilityFilterIdle`
+- From: `Idle`
+- On: `CommitVisibilityFilter`(filter, revision)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Idle`
+
+### `CommitVisibilityFilterAttached`
+- From: `Attached`
+- On: `CommitVisibilityFilter`(filter, revision)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Attached`
+
+### `CommitVisibilityFilterRunning`
+- From: `Running`
+- On: `CommitVisibilityFilter`(filter, revision)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Running`
+
+### `CommitVisibilityFilterRetired`
+- From: `Retired`
+- On: `CommitVisibilityFilter`(filter, revision)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Retired`
+
+### `CommitVisibilityFilterStopped`
+- From: `Stopped`
+- On: `CommitVisibilityFilter`(filter, revision)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Stopped`
+
+### `StageDeferredNamesIdle`
+- From: `Idle`
+- On: `StageDeferredNames`(names)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Idle`
+
+### `StageDeferredNamesAttached`
+- From: `Attached`
+- On: `StageDeferredNames`(names)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Attached`
+
+### `StageDeferredNamesRunning`
+- From: `Running`
+- On: `StageDeferredNames`(names)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Running`
+
+### `StageDeferredNamesRetired`
+- From: `Retired`
+- On: `StageDeferredNames`(names)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Retired`
+
+### `StageDeferredNamesStopped`
+- From: `Stopped`
+- On: `StageDeferredNames`(names)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Stopped`
+
+### `CommitDeferredNamesIdle`
+- From: `Idle`
+- On: `CommitDeferredNames`(names)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Idle`
+
+### `CommitDeferredNamesAttached`
+- From: `Attached`
+- On: `CommitDeferredNames`(names)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Attached`
+
+### `CommitDeferredNamesRunning`
+- From: `Running`
+- On: `CommitDeferredNames`(names)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Running`
+
+### `CommitDeferredNamesRetired`
+- From: `Retired`
+- On: `CommitDeferredNames`(names)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Retired`
+
+### `CommitDeferredNamesStopped`
+- From: `Stopped`
+- On: `CommitDeferredNames`(names)
+- Emits: `RefreshVisibleSurfaceSet`
+- To: `Stopped`
+
+### `SyncVisibilityRevisionsIdle`
+- From: `Idle`
+- On: `SyncVisibilityRevisions`(active_revision, staged_revision)
+- Guards:
+  - `counter_advances`
+- To: `Idle`
+
+### `SyncVisibilityRevisionsAttached`
+- From: `Attached`
+- On: `SyncVisibilityRevisions`(active_revision, staged_revision)
+- Guards:
+  - `counter_advances`
+- To: `Attached`
+
+### `SyncVisibilityRevisionsRunning`
+- From: `Running`
+- On: `SyncVisibilityRevisions`(active_revision, staged_revision)
+- Guards:
+  - `counter_advances`
+- To: `Running`
+
+### `SyncVisibilityRevisionsRetired`
+- From: `Retired`
+- On: `SyncVisibilityRevisions`(active_revision, staged_revision)
+- Guards:
+  - `counter_advances`
+- To: `Retired`
+
+### `SyncVisibilityRevisionsStopped`
+- From: `Stopped`
+- On: `SyncVisibilityRevisions`(active_revision, staged_revision)
+- Guards:
+  - `counter_advances`
+- To: `Stopped`
 
 ### `ProjectRealtimeIntentIdle`
 - From: `Idle`
@@ -2360,6 +4416,331 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `session_registered`
 - Emits: `RealtimeReconnectProgressProjected`
+- To: `Stopped`
+
+### `BeginLiveTopologyReconfigureIdle`
+- From: `Idle`
+- On: `BeginLiveTopologyReconfigure`(authority_epoch)
+- Guards:
+  - `session_registered`
+  - `authority_matches_current`
+  - `topology_idle`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Idle`
+
+### `BeginLiveTopologyReconfigureAttached`
+- From: `Attached`
+- On: `BeginLiveTopologyReconfigure`(authority_epoch)
+- Guards:
+  - `session_registered`
+  - `authority_matches_current`
+  - `topology_idle`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Attached`
+
+### `BeginLiveTopologyReconfigureRunning`
+- From: `Running`
+- On: `BeginLiveTopologyReconfigure`(authority_epoch)
+- Guards:
+  - `session_registered`
+  - `authority_matches_current`
+  - `topology_idle`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Running`
+
+### `BeginLiveTopologyReconfigureRetired`
+- From: `Retired`
+- On: `BeginLiveTopologyReconfigure`(authority_epoch)
+- Guards:
+  - `session_registered`
+  - `authority_matches_current`
+  - `topology_idle`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Retired`
+
+### `BeginLiveTopologyReconfigureStopped`
+- From: `Stopped`
+- On: `BeginLiveTopologyReconfigure`(authority_epoch)
+- Guards:
+  - `session_registered`
+  - `authority_matches_current`
+  - `topology_idle`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Stopped`
+
+### `MarkLiveTopologyDetachedIdle`
+- From: `Idle`
+- On: `MarkLiveTopologyDetached`()
+- Guards:
+  - `session_registered`
+  - `topology_reconfiguring`
+  - `turn_at_safe_boundary`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Idle`
+
+### `MarkLiveTopologyDetachedAttached`
+- From: `Attached`
+- On: `MarkLiveTopologyDetached`()
+- Guards:
+  - `session_registered`
+  - `topology_reconfiguring`
+  - `turn_at_safe_boundary`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Attached`
+
+### `MarkLiveTopologyDetachedRunning`
+- From: `Running`
+- On: `MarkLiveTopologyDetached`()
+- Guards:
+  - `session_registered`
+  - `topology_reconfiguring`
+  - `turn_at_safe_boundary`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Running`
+
+### `MarkLiveTopologyDetachedRetired`
+- From: `Retired`
+- On: `MarkLiveTopologyDetached`()
+- Guards:
+  - `session_registered`
+  - `topology_reconfiguring`
+  - `turn_at_safe_boundary`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Retired`
+
+### `MarkLiveTopologyDetachedStopped`
+- From: `Stopped`
+- On: `MarkLiveTopologyDetached`()
+- Guards:
+  - `session_registered`
+  - `topology_reconfiguring`
+  - `turn_at_safe_boundary`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Stopped`
+
+### `ApplyLiveTopologyIdentityIdle`
+- From: `Idle`
+- On: `ApplyLiveTopologyIdentity`()
+- Guards:
+  - `session_registered`
+  - `topology_detached`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Idle`
+
+### `ApplyLiveTopologyIdentityAttached`
+- From: `Attached`
+- On: `ApplyLiveTopologyIdentity`()
+- Guards:
+  - `session_registered`
+  - `topology_detached`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Attached`
+
+### `ApplyLiveTopologyIdentityRunning`
+- From: `Running`
+- On: `ApplyLiveTopologyIdentity`()
+- Guards:
+  - `session_registered`
+  - `topology_detached`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Running`
+
+### `ApplyLiveTopologyIdentityRetired`
+- From: `Retired`
+- On: `ApplyLiveTopologyIdentity`()
+- Guards:
+  - `session_registered`
+  - `topology_detached`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Retired`
+
+### `ApplyLiveTopologyIdentityStopped`
+- From: `Stopped`
+- On: `ApplyLiveTopologyIdentity`()
+- Guards:
+  - `session_registered`
+  - `topology_detached`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Stopped`
+
+### `ApplyLiveTopologyVisibilityIdle`
+- From: `Idle`
+- On: `ApplyLiveTopologyVisibility`()
+- Guards:
+  - `session_registered`
+  - `host_identity_applied`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Idle`
+
+### `ApplyLiveTopologyVisibilityAttached`
+- From: `Attached`
+- On: `ApplyLiveTopologyVisibility`()
+- Guards:
+  - `session_registered`
+  - `host_identity_applied`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Attached`
+
+### `ApplyLiveTopologyVisibilityRunning`
+- From: `Running`
+- On: `ApplyLiveTopologyVisibility`()
+- Guards:
+  - `session_registered`
+  - `host_identity_applied`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Running`
+
+### `ApplyLiveTopologyVisibilityRetired`
+- From: `Retired`
+- On: `ApplyLiveTopologyVisibility`()
+- Guards:
+  - `session_registered`
+  - `host_identity_applied`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Retired`
+
+### `ApplyLiveTopologyVisibilityStopped`
+- From: `Stopped`
+- On: `ApplyLiveTopologyVisibility`()
+- Guards:
+  - `session_registered`
+  - `host_identity_applied`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Stopped`
+
+### `CompleteLiveTopologyIdle`
+- From: `Idle`
+- On: `CompleteLiveTopology`()
+- Guards:
+  - `session_registered`
+  - `host_visibility_applied`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Idle`
+
+### `CompleteLiveTopologyAttached`
+- From: `Attached`
+- On: `CompleteLiveTopology`()
+- Guards:
+  - `session_registered`
+  - `host_visibility_applied`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Attached`
+
+### `CompleteLiveTopologyRunning`
+- From: `Running`
+- On: `CompleteLiveTopology`()
+- Guards:
+  - `session_registered`
+  - `host_visibility_applied`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Running`
+
+### `CompleteLiveTopologyRetired`
+- From: `Retired`
+- On: `CompleteLiveTopology`()
+- Guards:
+  - `session_registered`
+  - `host_visibility_applied`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Retired`
+
+### `CompleteLiveTopologyStopped`
+- From: `Stopped`
+- On: `CompleteLiveTopology`()
+- Guards:
+  - `session_registered`
+  - `host_visibility_applied`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Stopped`
+
+### `AbortLiveTopologyBeforeDetachIdle`
+- From: `Idle`
+- On: `AbortLiveTopologyBeforeDetach`()
+- Guards:
+  - `session_registered`
+  - `topology_reconfiguring`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Idle`
+
+### `AbortLiveTopologyBeforeDetachAttached`
+- From: `Attached`
+- On: `AbortLiveTopologyBeforeDetach`()
+- Guards:
+  - `session_registered`
+  - `topology_reconfiguring`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Attached`
+
+### `AbortLiveTopologyBeforeDetachRunning`
+- From: `Running`
+- On: `AbortLiveTopologyBeforeDetach`()
+- Guards:
+  - `session_registered`
+  - `topology_reconfiguring`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Running`
+
+### `AbortLiveTopologyBeforeDetachRetired`
+- From: `Retired`
+- On: `AbortLiveTopologyBeforeDetach`()
+- Guards:
+  - `session_registered`
+  - `topology_reconfiguring`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Retired`
+
+### `AbortLiveTopologyBeforeDetachStopped`
+- From: `Stopped`
+- On: `AbortLiveTopologyBeforeDetach`()
+- Guards:
+  - `session_registered`
+  - `topology_reconfiguring`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Stopped`
+
+### `FailLiveTopologyAfterDetachIdle`
+- From: `Idle`
+- On: `FailLiveTopologyAfterDetach`()
+- Guards:
+  - `session_registered`
+  - `topology_past_detach`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Idle`
+
+### `FailLiveTopologyAfterDetachAttached`
+- From: `Attached`
+- On: `FailLiveTopologyAfterDetach`()
+- Guards:
+  - `session_registered`
+  - `topology_past_detach`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Attached`
+
+### `FailLiveTopologyAfterDetachRunning`
+- From: `Running`
+- On: `FailLiveTopologyAfterDetach`()
+- Guards:
+  - `session_registered`
+  - `topology_past_detach`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Running`
+
+### `FailLiveTopologyAfterDetachRetired`
+- From: `Retired`
+- On: `FailLiveTopologyAfterDetach`()
+- Guards:
+  - `session_registered`
+  - `topology_past_detach`
+- Emits: `LiveTopologyPhaseChanged`
+- To: `Retired`
+
+### `FailLiveTopologyAfterDetachStopped`
+- From: `Stopped`
+- On: `FailLiveTopologyAfterDetach`()
+- Guards:
+  - `session_registered`
+  - `topology_past_detach`
+- Emits: `LiveTopologyPhaseChanged`
 - To: `Stopped`
 
 ### `McpServerConnectPendingIdle`
@@ -3835,331 +6216,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `RealtimeReconnectPolicyChanged`, `RealtimeProjectionFreshnessChanged`
 - To: `Stopped`
 
-### `BeginLiveTopologyReconfigureIdle`
-- From: `Idle`
-- On: `BeginLiveTopologyReconfigure`(authority_epoch)
-- Guards:
-  - `session_registered`
-  - `authority_matches_current`
-  - `topology_idle`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Idle`
-
-### `BeginLiveTopologyReconfigureAttached`
-- From: `Attached`
-- On: `BeginLiveTopologyReconfigure`(authority_epoch)
-- Guards:
-  - `session_registered`
-  - `authority_matches_current`
-  - `topology_idle`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Attached`
-
-### `BeginLiveTopologyReconfigureRunning`
-- From: `Running`
-- On: `BeginLiveTopologyReconfigure`(authority_epoch)
-- Guards:
-  - `session_registered`
-  - `authority_matches_current`
-  - `topology_idle`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Running`
-
-### `BeginLiveTopologyReconfigureRetired`
-- From: `Retired`
-- On: `BeginLiveTopologyReconfigure`(authority_epoch)
-- Guards:
-  - `session_registered`
-  - `authority_matches_current`
-  - `topology_idle`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Retired`
-
-### `BeginLiveTopologyReconfigureStopped`
-- From: `Stopped`
-- On: `BeginLiveTopologyReconfigure`(authority_epoch)
-- Guards:
-  - `session_registered`
-  - `authority_matches_current`
-  - `topology_idle`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Stopped`
-
-### `MarkLiveTopologyDetachedIdle`
-- From: `Idle`
-- On: `MarkLiveTopologyDetached`()
-- Guards:
-  - `session_registered`
-  - `topology_reconfiguring`
-  - `no_active_run`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Idle`
-
-### `MarkLiveTopologyDetachedAttached`
-- From: `Attached`
-- On: `MarkLiveTopologyDetached`()
-- Guards:
-  - `session_registered`
-  - `topology_reconfiguring`
-  - `no_active_run`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Attached`
-
-### `MarkLiveTopologyDetachedRunning`
-- From: `Running`
-- On: `MarkLiveTopologyDetached`()
-- Guards:
-  - `session_registered`
-  - `topology_reconfiguring`
-  - `no_active_run`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Running`
-
-### `MarkLiveTopologyDetachedRetired`
-- From: `Retired`
-- On: `MarkLiveTopologyDetached`()
-- Guards:
-  - `session_registered`
-  - `topology_reconfiguring`
-  - `no_active_run`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Retired`
-
-### `MarkLiveTopologyDetachedStopped`
-- From: `Stopped`
-- On: `MarkLiveTopologyDetached`()
-- Guards:
-  - `session_registered`
-  - `topology_reconfiguring`
-  - `no_active_run`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Stopped`
-
-### `ApplyLiveTopologyIdentityIdle`
-- From: `Idle`
-- On: `ApplyLiveTopologyIdentity`()
-- Guards:
-  - `session_registered`
-  - `topology_detached`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Idle`
-
-### `ApplyLiveTopologyIdentityAttached`
-- From: `Attached`
-- On: `ApplyLiveTopologyIdentity`()
-- Guards:
-  - `session_registered`
-  - `topology_detached`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Attached`
-
-### `ApplyLiveTopologyIdentityRunning`
-- From: `Running`
-- On: `ApplyLiveTopologyIdentity`()
-- Guards:
-  - `session_registered`
-  - `topology_detached`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Running`
-
-### `ApplyLiveTopologyIdentityRetired`
-- From: `Retired`
-- On: `ApplyLiveTopologyIdentity`()
-- Guards:
-  - `session_registered`
-  - `topology_detached`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Retired`
-
-### `ApplyLiveTopologyIdentityStopped`
-- From: `Stopped`
-- On: `ApplyLiveTopologyIdentity`()
-- Guards:
-  - `session_registered`
-  - `topology_detached`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Stopped`
-
-### `ApplyLiveTopologyVisibilityIdle`
-- From: `Idle`
-- On: `ApplyLiveTopologyVisibility`()
-- Guards:
-  - `session_registered`
-  - `host_identity_applied`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Idle`
-
-### `ApplyLiveTopologyVisibilityAttached`
-- From: `Attached`
-- On: `ApplyLiveTopologyVisibility`()
-- Guards:
-  - `session_registered`
-  - `host_identity_applied`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Attached`
-
-### `ApplyLiveTopologyVisibilityRunning`
-- From: `Running`
-- On: `ApplyLiveTopologyVisibility`()
-- Guards:
-  - `session_registered`
-  - `host_identity_applied`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Running`
-
-### `ApplyLiveTopologyVisibilityRetired`
-- From: `Retired`
-- On: `ApplyLiveTopologyVisibility`()
-- Guards:
-  - `session_registered`
-  - `host_identity_applied`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Retired`
-
-### `ApplyLiveTopologyVisibilityStopped`
-- From: `Stopped`
-- On: `ApplyLiveTopologyVisibility`()
-- Guards:
-  - `session_registered`
-  - `host_identity_applied`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Stopped`
-
-### `CompleteLiveTopologyIdle`
-- From: `Idle`
-- On: `CompleteLiveTopology`()
-- Guards:
-  - `session_registered`
-  - `host_visibility_applied`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Idle`
-
-### `CompleteLiveTopologyAttached`
-- From: `Attached`
-- On: `CompleteLiveTopology`()
-- Guards:
-  - `session_registered`
-  - `host_visibility_applied`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Attached`
-
-### `CompleteLiveTopologyRunning`
-- From: `Running`
-- On: `CompleteLiveTopology`()
-- Guards:
-  - `session_registered`
-  - `host_visibility_applied`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Running`
-
-### `CompleteLiveTopologyRetired`
-- From: `Retired`
-- On: `CompleteLiveTopology`()
-- Guards:
-  - `session_registered`
-  - `host_visibility_applied`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Retired`
-
-### `CompleteLiveTopologyStopped`
-- From: `Stopped`
-- On: `CompleteLiveTopology`()
-- Guards:
-  - `session_registered`
-  - `host_visibility_applied`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Stopped`
-
-### `AbortLiveTopologyBeforeDetachIdle`
-- From: `Idle`
-- On: `AbortLiveTopologyBeforeDetach`()
-- Guards:
-  - `session_registered`
-  - `topology_reconfiguring`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Idle`
-
-### `AbortLiveTopologyBeforeDetachAttached`
-- From: `Attached`
-- On: `AbortLiveTopologyBeforeDetach`()
-- Guards:
-  - `session_registered`
-  - `topology_reconfiguring`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Attached`
-
-### `AbortLiveTopologyBeforeDetachRunning`
-- From: `Running`
-- On: `AbortLiveTopologyBeforeDetach`()
-- Guards:
-  - `session_registered`
-  - `topology_reconfiguring`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Running`
-
-### `AbortLiveTopologyBeforeDetachRetired`
-- From: `Retired`
-- On: `AbortLiveTopologyBeforeDetach`()
-- Guards:
-  - `session_registered`
-  - `topology_reconfiguring`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Retired`
-
-### `AbortLiveTopologyBeforeDetachStopped`
-- From: `Stopped`
-- On: `AbortLiveTopologyBeforeDetach`()
-- Guards:
-  - `session_registered`
-  - `topology_reconfiguring`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Stopped`
-
-### `FailLiveTopologyAfterDetachIdle`
-- From: `Idle`
-- On: `FailLiveTopologyAfterDetach`()
-- Guards:
-  - `session_registered`
-  - `topology_past_detach`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Idle`
-
-### `FailLiveTopologyAfterDetachAttached`
-- From: `Attached`
-- On: `FailLiveTopologyAfterDetach`()
-- Guards:
-  - `session_registered`
-  - `topology_past_detach`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Attached`
-
-### `FailLiveTopologyAfterDetachRunning`
-- From: `Running`
-- On: `FailLiveTopologyAfterDetach`()
-- Guards:
-  - `session_registered`
-  - `topology_past_detach`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Running`
-
-### `FailLiveTopologyAfterDetachRetired`
-- From: `Retired`
-- On: `FailLiveTopologyAfterDetach`()
-- Guards:
-  - `session_registered`
-  - `topology_past_detach`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Retired`
-
-### `FailLiveTopologyAfterDetachStopped`
-- From: `Stopped`
-- On: `FailLiveTopologyAfterDetach`()
-- Guards:
-  - `session_registered`
-  - `topology_past_detach`
-- Emits: `LiveTopologyPhaseChanged`
-- To: `Stopped`
-
 ### `AttachSessionIngressIdle`
 - From: `Idle`
 - On: `AttachSessionIngress`(comms_runtime_id)
@@ -4280,6 +6336,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `BindSupervisor`(name, peer_id, address, epoch)
 - Guards:
   - `supervisor_unbound`
+- Emits: `PublishSupervisorTrustEdge`
 - To: `Idle`
 
 ### `BindSupervisorAttached`
@@ -4287,6 +6344,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `BindSupervisor`(name, peer_id, address, epoch)
 - Guards:
   - `supervisor_unbound`
+- Emits: `PublishSupervisorTrustEdge`
 - To: `Attached`
 
 ### `BindSupervisorRunning`
@@ -4294,6 +6352,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `BindSupervisor`(name, peer_id, address, epoch)
 - Guards:
   - `supervisor_unbound`
+- Emits: `PublishSupervisorTrustEdge`
 - To: `Running`
 
 ### `BindSupervisorRetired`
@@ -4301,6 +6360,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `BindSupervisor`(name, peer_id, address, epoch)
 - Guards:
   - `supervisor_unbound`
+- Emits: `PublishSupervisorTrustEdge`
 - To: `Retired`
 
 ### `BindSupervisorStopped`
@@ -4308,6 +6368,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `BindSupervisor`(name, peer_id, address, epoch)
 - Guards:
   - `supervisor_unbound`
+- Emits: `PublishSupervisorTrustEdge`
 - To: `Stopped`
 
 ### `AuthorizeSupervisorIdle`
@@ -4315,6 +6376,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `AuthorizeSupervisor`(name, peer_id, address, epoch)
 - Guards:
   - `supervisor_bound`
+- Emits: `PublishSupervisorTrustEdge`
 - To: `Idle`
 
 ### `AuthorizeSupervisorAttached`
@@ -4322,6 +6384,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `AuthorizeSupervisor`(name, peer_id, address, epoch)
 - Guards:
   - `supervisor_bound`
+- Emits: `PublishSupervisorTrustEdge`
 - To: `Attached`
 
 ### `AuthorizeSupervisorRunning`
@@ -4329,6 +6392,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `AuthorizeSupervisor`(name, peer_id, address, epoch)
 - Guards:
   - `supervisor_bound`
+- Emits: `PublishSupervisorTrustEdge`
 - To: `Running`
 
 ### `AuthorizeSupervisorRetired`
@@ -4336,6 +6400,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `AuthorizeSupervisor`(name, peer_id, address, epoch)
 - Guards:
   - `supervisor_bound`
+- Emits: `PublishSupervisorTrustEdge`
 - To: `Retired`
 
 ### `AuthorizeSupervisorStopped`
@@ -4343,6 +6408,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `AuthorizeSupervisor`(name, peer_id, address, epoch)
 - Guards:
   - `supervisor_bound`
+- Emits: `PublishSupervisorTrustEdge`
 - To: `Stopped`
 
 ### `RevokeSupervisorIdle`
@@ -4352,6 +6418,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `supervisor_bound`
   - `peer_id_matches_current`
   - `epoch_matches_current`
+- Emits: `RevokeSupervisorTrustEdge`
 - To: `Idle`
 
 ### `RevokeSupervisorAttached`
@@ -4361,6 +6428,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `supervisor_bound`
   - `peer_id_matches_current`
   - `epoch_matches_current`
+- Emits: `RevokeSupervisorTrustEdge`
 - To: `Attached`
 
 ### `RevokeSupervisorRunning`
@@ -4370,6 +6438,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `supervisor_bound`
   - `peer_id_matches_current`
   - `epoch_matches_current`
+- Emits: `RevokeSupervisorTrustEdge`
 - To: `Running`
 
 ### `RevokeSupervisorRetired`
@@ -4379,6 +6448,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `supervisor_bound`
   - `peer_id_matches_current`
   - `epoch_matches_current`
+- Emits: `RevokeSupervisorTrustEdge`
 - To: `Retired`
 
 ### `RevokeSupervisorStopped`
@@ -4388,6 +6458,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `supervisor_bound`
   - `peer_id_matches_current`
   - `epoch_matches_current`
+- Emits: `RevokeSupervisorTrustEdge`
 - To: `Stopped`
 
 ### `SupervisorTrustEdgePublishedIdle`
@@ -4570,20 +6641,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `epoch_matches_current`
 - To: `Stopped`
 
-### `OpsBarrierSatisfiedAttached`
-- From: `Attached`
-- On: `OpsBarrierSatisfied`(operation_ids)
-- Guards:
-  - `session_registered`
-- To: `Attached`
-
-### `OpsBarrierSatisfiedRunning`
-- From: `Running`
-- On: `OpsBarrierSatisfied`(operation_ids)
-- Guards:
-  - `session_registered`
-- To: `Running`
-
 ### `PublishLocalEndpointIdle`
 - From: `Idle`
 - On: `PublishLocalEndpoint`(endpoint)
@@ -4700,7 +6757,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ## Coverage
 ### Code Anchors
-- `meerkat-runtime/src/meerkat_machine/mod.rs` — authoritative MeerkatMachine command dispatch and state ownership for initialize, register, unregister, reconfigure, stage filters and tools, prepare bindings, drain, interrupt, cancel boundary, cancellation, abort, wait, ingest, publish event, accept input, classify envelope, append/context starts, run preparation, commit, fail, pending/call/finalize tool surface, retire/retired, reset, stop/stopped executor, destroy/destroyed, ensure executor, runtime notice, silent intents, recycle, realtime binding, MCP server, interaction stream, product turn, live topology, ingress, supervisor, trust reconcile, ops barrier, local endpoint, admission, completion, compaction, submit op event, notify op watcher, collect/enqueue, terminal records, model routing status, set model routing baseline, finite switch turn, until changed switch turn, assistant turn admission, image operation begin activate complete restore, routing approval, routing denial, scoped override, and persistent reconfigure
+- `meerkat-runtime/src/meerkat_machine/mod.rs` — authoritative MeerkatMachine command dispatch and state ownership for initialize, recover initializing, register, unregister, reconfigure, stage filters and tools, prepare bindings, drain, interrupt, cancel boundary, cancellation, abort, wait, ingest, publish event, accept input, recover input lifecycle, classify envelope, append/context starts, run preparation, primitive applied conversation/immediate, enter extraction, extraction validation passed/failed retry/exhausted, recoverable/fatal failure, retry requested, budget exhausted, steer accepted, increment attempt count, rollback staged, consume on accept, commit, fail, pending/call/finalize tool surface, retire/retired, reset, stop/stopped executor, destroy/destroyed, ensure executor, runtime notice, silent intents, recycle, realtime binding, MCP server, interaction stream, product turn, live topology, ingress, supervisor, trust reconcile, ops barrier, local endpoint, admission, completion, compaction, submit op event, progress reported op, terminate op, notify op watcher, collect/enqueue, terminal records, model routing status, set model routing baseline, finite switch turn, until changed switch turn, assistant turn admission, image operation begin activate complete restore, routing approval, routing denial, scoped override, sync visibility revisions, and persistent reconfigure
 - `meerkat/src/meerkat_machine.rs` — MeerkatMachine snapshot/diagnostic facade
 - `meerkat-comms/src/peer_directory_reachability_authority.rs` — peer directory reachability state now owned as a MeerkatMachine-internal region
 
@@ -4710,8 +6767,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `staged_visibility_apply` — tool visibility staged state promotes into the committed visible revision at a boundary
 - `turn_interrupt_and_shutdown` — running work records interrupt and shutdown intent without escaping the Meerkat authority boundary
 - `peer_reachability_probe` — resolved peer directory updates and send outcomes mutate Meerkat-owned peer reachability state
-- `session_registration_and_binding` — initialize, register, unregister, reconfigure session identity, prepare bindings, ensure executor, attach session ingress, detach ingress, drain exit, and runtime bound/retired/destroyed notices
-- `input_admission_and_queueing` — ingest and publish event, accept input with or without completion, classify external envelope or plain event, prepare run work, enqueue classified entry, resolve admission, submit admitted ingress effect, post admission signal, and input or ingress notices
+- `session_registration_and_binding` — initialize, recover initializing, register, unregister, reconfigure session identity, prepare bindings, ensure executor, attach session ingress, detach ingress, drain exit, and runtime bound/retired/destroyed notices
+- `input_admission_and_queueing` — ingest and publish event, accept input with or without completion, classify external envelope or plain event, prepare run work, primitive applied conversation or immediate, enter extraction, extraction validation passed, recoverable or fatal failure, budget exhausted, steer accepted, increment attempt count, consume on accept, enqueue classified entry, resolve admission, submit admitted ingress effect, post admission signal, and input or ingress notices
 - `ops_completion_and_waiters` — abort, wait, abort all, request cancellation at boundary, completion produced/resolved, wait all satisfied, collect completed result, submit op event, notify op watcher, reject surface call, retain or evict completed terminal records
 - `realtime_connection_projection` — project realtime intent, begin replace detach binding, require reattach, publish signal, reconnect progress, MCP server connect/connected/failed/disconnected/reload, advance session context, interaction stream reserved/attached/completed/expired/closed early, freshness, policy, and binding rotation
 - `product_turn_streaming` — product turn in flight, committed, output started, interrupted, terminal, realtime projection advance/refreshed/reset, client input submitted, mid turn activity, and turn terminated classification

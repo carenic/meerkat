@@ -359,6 +359,28 @@ impl AgentToolDispatcher for ToolGateway {
             .find_map(|entry| entry.dispatcher.external_tool_surface_snapshot())
     }
 
+    fn bind_mcp_server_lifecycle_handle(
+        &self,
+        handle: Arc<dyn crate::handles::McpServerLifecycleHandle>,
+    ) {
+        for entry in &self.entries {
+            entry
+                .dispatcher
+                .bind_mcp_server_lifecycle_handle(Arc::clone(&handle));
+        }
+    }
+
+    fn bind_external_tool_surface_handle(
+        &self,
+        handle: Arc<dyn crate::handles::ExternalToolSurfaceHandle>,
+    ) {
+        for entry in &self.entries {
+            entry
+                .dispatcher
+                .bind_external_tool_surface_handle(Arc::clone(&handle));
+        }
+    }
+
     /// Aggregate external updates across all dispatcher entries.
     ///
     /// Deduplicates by server name for pending, by `(server, operation, status)`
@@ -572,6 +594,24 @@ impl AgentToolDispatcher for DynamicToolComposite {
         self.dispatchers
             .iter()
             .find_map(|dispatcher| dispatcher.external_tool_surface_snapshot())
+    }
+
+    fn bind_mcp_server_lifecycle_handle(
+        &self,
+        handle: Arc<dyn crate::handles::McpServerLifecycleHandle>,
+    ) {
+        for dispatcher in &self.dispatchers {
+            dispatcher.bind_mcp_server_lifecycle_handle(Arc::clone(&handle));
+        }
+    }
+
+    fn bind_external_tool_surface_handle(
+        &self,
+        handle: Arc<dyn crate::handles::ExternalToolSurfaceHandle>,
+    ) {
+        for dispatcher in &self.dispatchers {
+            dispatcher.bind_external_tool_surface_handle(Arc::clone(&handle));
+        }
     }
 
     fn bind_ops_lifecycle(

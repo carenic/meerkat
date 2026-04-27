@@ -502,6 +502,11 @@ pub fn render_machine_ci_cfg(schema: &MachineSchema, deep: bool) -> String {
     let domains = collect_binding_domains(schema);
     let named_samples = collect_machine_named_type_samples(schema);
     let named_bindings = collect_machine_named_bindings(schema);
+    let sample_cardinality = if !deep && schema.ci_step_limit == Some(1) {
+        0
+    } else {
+        default_sample_cardinality(deep)
+    };
 
     pushln!(&mut out, "SPECIFICATION Spec");
     if !domains.is_empty() {
@@ -519,7 +524,7 @@ pub fn render_machine_ci_cfg(schema: &MachineSchema, deep: bool) -> String {
                 name,
                 render_default_domain_assignment(
                     &ty,
-                    default_sample_cardinality(deep),
+                    sample_cardinality,
                     &named_samples,
                     &named_bindings,
                     false,
@@ -2427,6 +2432,7 @@ fn render_default_domain_assignment(
                 "{1}".into()
             }
         }
+        TypeRef::String if sample_cardinality == 0 => "{}".into(),
         TypeRef::String => format!(
             "{{{}}}",
             collected_string_samples(sample_cardinality, named_samples, include_string_samples)
@@ -2530,6 +2536,10 @@ fn render_named_domain_assignment(
         };
     }
 
+    if sample_cardinality == 0 {
+        return "{}".into();
+    }
+
     if name == "ToolFilter" {
         let target_cardinality = sample_cardinality.max(2);
         let mut values = named_samples
@@ -2577,6 +2587,7 @@ fn sample_values(
                 vec!["1".into()]
             }
         }
+        TypeRef::String if sample_cardinality == 0 => Vec::new(),
         TypeRef::String => {
             collected_string_samples(sample_cardinality, named_samples, include_string_samples)
                 .into_iter()
@@ -2597,6 +2608,7 @@ fn sample_values(
                 vec!["1".into()]
             }
         }
+        TypeRef::Named(_) if sample_cardinality == 0 => Vec::new(),
         TypeRef::Named(name) => {
             let name = name.as_str();
             if let Some(samples) = named_samples.get(name) {
@@ -2614,6 +2626,7 @@ fn sample_values(
                 .map(|idx| tla_string(format!("{}_{}", tla_ident(name).to_lowercase(), idx)))
                 .collect()
         }
+        TypeRef::Enum(_) if sample_cardinality == 0 => Vec::new(),
         TypeRef::Enum(name) => {
             let name = name.as_str();
             if let Some(samples) = named_samples.get(name) {
@@ -2733,6 +2746,39 @@ fn render_map_domain_definition(key: &TypeRef, value: &TypeRef) -> String {
     format!(
         "{{{empty_map}}} \\cup {{ [x \\in {{k}} |-> v] : k \\in {key_domain}, v \\in {value_domain} }}"
     )
+}
+
+fn ordered_composite_domain_definitions(
+    constants: &BTreeMap<String, TypeRef>,
+) -> Vec<(&String, &TypeRef)> {
+    let mut domains = constants
+        .iter()
+        .filter(|(_, ty)| {
+            matches!(
+                ty,
+                TypeRef::Seq(_) | TypeRef::Option(_) | TypeRef::Map(_, _)
+            )
+        })
+        .collect::<Vec<_>>();
+    domains.sort_by_key(|(name, ty)| (domain_dependency_depth(ty), (*name).clone()));
+    domains
+}
+
+fn domain_dependency_depth(ty: &TypeRef) -> usize {
+    match ty {
+        TypeRef::Option(inner) | TypeRef::Seq(inner) | TypeRef::Set(inner) => {
+            1 + domain_dependency_depth(inner)
+        }
+        TypeRef::Map(key, value) => {
+            1 + domain_dependency_depth(key).max(domain_dependency_depth(value))
+        }
+        TypeRef::Bool
+        | TypeRef::U32
+        | TypeRef::U64
+        | TypeRef::String
+        | TypeRef::Named(_)
+        | TypeRef::Enum(_) => 0,
+    }
 }
 
 fn render_type_domain_expr(ty: &TypeRef) -> String {
@@ -2865,38 +2911,14 @@ impl<'a> CompositionTlaCompiler<'a> {
             .expect("write to string");
         writeln!(&mut out, "Some(v) == [tag |-> \"some\", value |-> v]");
         pushln!(&mut out);
-        for (name, ty) in &constants {
-            if let TypeRef::Seq(inner) = ty {
-                writeln!(
-                    &mut out,
-                    "{} == {}",
-                    name,
-                    render_sequence_domain_definition(inner)
-                )
-                .expect("write to string");
-            }
-        }
-        for (name, ty) in &constants {
-            if let TypeRef::Option(inner) = ty {
-                writeln!(
-                    &mut out,
-                    "{} == {}",
-                    name,
-                    render_option_domain_definition(inner)
-                )
-                .expect("write to string");
-            }
-        }
-        for (name, ty) in &constants {
-            if let TypeRef::Map(key, value) = ty {
-                writeln!(
-                    &mut out,
-                    "{} == {}",
-                    name,
-                    render_map_domain_definition(key, value)
-                )
-                .expect("write to string");
-            }
+        for (name, ty) in ordered_composite_domain_definitions(&constants) {
+            let definition = match ty {
+                TypeRef::Seq(inner) => render_sequence_domain_definition(inner),
+                TypeRef::Option(inner) => render_option_domain_definition(inner),
+                TypeRef::Map(key, value) => render_map_domain_definition(key, value),
+                _ => continue,
+            };
+            writeln!(&mut out, "{} == {}", name, definition).expect("write to string");
         }
         if constants.values().any(|ty| {
             matches!(
@@ -2914,6 +2936,16 @@ impl<'a> CompositionTlaCompiler<'a> {
         writeln!(
             &mut out,
             "MapSet(map, key, value) == [x \\in DOMAIN map \\cup {{key}} |-> IF x = key THEN value ELSE map[x]]"
+        )
+        .expect("write to string");
+        writeln!(
+            &mut out,
+            "MapIncrement(map, key, amount) == [x \\in DOMAIN map \\cup {{key}} |-> IF x = key THEN (IF key \\in DOMAIN map THEN map[key] ELSE 0) + amount ELSE map[x]]"
+        )
+        .expect("write to string");
+        writeln!(
+            &mut out,
+            "MapDecrement(map, key, amount) == [x \\in DOMAIN map \\cup {{key}} |-> IF x = key THEN (IF key \\in DOMAIN map THEN map[key] ELSE 0) - amount ELSE map[x]]"
         )
         .expect("write to string");
         writeln!(
@@ -5247,38 +5279,14 @@ impl<'a> MachineTlaCompiler<'a> {
         pushln!(&mut out, "None == [tag |-> \"none\", value |-> \"none\"]");
         writeln!(&mut out, "Some(v) == [tag |-> \"some\", value |-> v]");
         pushln!(&mut out);
-        for (name, ty) in &constants {
-            if let TypeRef::Seq(inner) = ty {
-                writeln!(
-                    &mut out,
-                    "{} == {}",
-                    name,
-                    render_sequence_domain_definition(inner)
-                )
-                .expect("write to string");
-            }
-        }
-        for (name, ty) in &constants {
-            if let TypeRef::Option(inner) = ty {
-                writeln!(
-                    &mut out,
-                    "{} == {}",
-                    name,
-                    render_option_domain_definition(inner)
-                )
-                .expect("write to string");
-            }
-        }
-        for (name, ty) in &constants {
-            if let TypeRef::Map(key, value) = ty {
-                writeln!(
-                    &mut out,
-                    "{} == {}",
-                    name,
-                    render_map_domain_definition(key, value)
-                )
-                .expect("write to string");
-            }
+        for (name, ty) in ordered_composite_domain_definitions(&constants) {
+            let definition = match ty {
+                TypeRef::Seq(inner) => render_sequence_domain_definition(inner),
+                TypeRef::Option(inner) => render_option_domain_definition(inner),
+                TypeRef::Map(key, value) => render_map_domain_definition(key, value),
+                _ => continue,
+            };
+            writeln!(&mut out, "{} == {}", name, definition).expect("write to string");
         }
         if constants.values().any(|ty| {
             matches!(
@@ -5296,6 +5304,16 @@ impl<'a> MachineTlaCompiler<'a> {
         writeln!(
             &mut out,
             "MapSet(map, key, value) == [x \\in DOMAIN map \\cup {{key}} |-> IF x = key THEN value ELSE map[x]]"
+        )
+        .expect("write to string");
+        writeln!(
+            &mut out,
+            "MapIncrement(map, key, amount) == [x \\in DOMAIN map \\cup {{key}} |-> IF x = key THEN (IF key \\in DOMAIN map THEN map[key] ELSE 0) + amount ELSE map[x]]"
+        )
+        .expect("write to string");
+        writeln!(
+            &mut out,
+            "MapDecrement(map, key, amount) == [x \\in DOMAIN map \\cup {{key}} |-> IF x = key THEN (IF key \\in DOMAIN map THEN map[key] ELSE 0) - amount ELSE map[x]]"
         )
         .expect("write to string");
         writeln!(
@@ -6348,12 +6366,19 @@ impl<'a> MachineTlaCompiler<'a> {
                 self.render_expr_with_types(inner, env, binding_env, binding_types)
             ),
             Expr::MapGet { map, key } => format!(
-                "(IF {} \\in DOMAIN {} THEN {}[{}] ELSE {})",
-                self.render_expr_with_types(key, env, binding_env, binding_types),
-                self.render_expr_with_types(map, env, binding_env, binding_types),
-                self.render_expr_with_types(map, env, binding_env, binding_types),
-                self.render_expr_with_types(key, env, binding_env, binding_types),
-                self.map_absent_value_expr(map, binding_types)
+                "{}",
+                if self.is_scalar_value_projection(map, key, binding_types) {
+                    self.render_expr_with_types(map, env, binding_env, binding_types)
+                } else {
+                    format!(
+                        "(IF {} \\in DOMAIN {} THEN {}[{}] ELSE {})",
+                        self.render_expr_with_types(key, env, binding_env, binding_types),
+                        self.render_expr_with_types(map, env, binding_env, binding_types),
+                        self.render_expr_with_types(map, env, binding_env, binding_types),
+                        self.render_expr_with_types(key, env, binding_env, binding_types),
+                        self.map_absent_value_expr(map, binding_types)
+                    )
+                }
             ),
             Expr::Some(inner) => format!(
                 "Some({})",
@@ -6464,6 +6489,7 @@ impl<'a> MachineTlaCompiler<'a> {
             Expr::U64(_) => Some(TypeRef::U64),
             Expr::String(_) | Expr::Phase(_) | Expr::Variant(_) => Some(TypeRef::String),
             Expr::NamedVariant { enum_name, .. } => Some(TypeRef::Enum(enum_name.clone())),
+            Expr::MapGet { map, .. } => self.map_value_type(map, binding_types),
             Expr::Field(name) => self
                 .schema
                 .state
@@ -6475,6 +6501,26 @@ impl<'a> MachineTlaCompiler<'a> {
             Expr::Binding(name) => binding_types.get(name).cloned(),
             _ => None,
         }
+    }
+
+    fn is_scalar_value_projection(
+        &self,
+        map: &Expr,
+        key: &Expr,
+        binding_types: &BTreeMap<String, TypeRef>,
+    ) -> bool {
+        matches!(key, Expr::String(value) if value == "value")
+            && matches!(
+                self.scalar_expr_type(map, binding_types),
+                Some(
+                    TypeRef::Bool
+                        | TypeRef::U32
+                        | TypeRef::U64
+                        | TypeRef::String
+                        | TypeRef::Enum(_)
+                        | TypeRef::Named(_)
+                )
+            )
     }
 
     fn map_value_type(

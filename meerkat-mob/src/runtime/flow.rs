@@ -16,8 +16,9 @@ use crate::error::MobError;
 use crate::ids::{AgentIdentity, FlowId, MeerkatId, RunId, StepId};
 use crate::run::flow_run;
 use crate::run::{
-    FailureLedgerEntry, FlowContext, FlowRunConfig, MobRun, MobRunStatus, StepLedgerEntry,
-    StepRunStatus,
+    FailureLedgerEntry, FlowContext, FlowRunConfig, MobMachineFlowAuthorityToken,
+    MobMachineFlowRunCommand, MobRun, MobRunStatus, StepLedgerEntry, StepRunStatus,
+    apply_mob_machine_flow_run_command,
 };
 use crate::runtime::flow_frame_engine::FlowFrameTerminalPhase;
 use crate::store::{MobEventStore, MobRunStore};
@@ -115,15 +116,6 @@ impl FlowEngine {
         if !transitioned && !self.is_run_running(&run_id).await? {
             return Ok(());
         }
-        if transitioned {
-            self.handle
-                .project_machine_input(crate::run::MobRun::create_run_status_input(
-                    &run_id,
-                    crate::machines::mob_machine::FlowRunStatus::Running,
-                ))
-                .await?;
-        }
-
         self.emitter
             .flow_started(
                 run_id.clone(),
@@ -168,7 +160,7 @@ impl FlowEngine {
             let frame_engine = super::flow_frame_engine::FlowFrameEngine::new(
                 self.run_store.clone(),
                 Arc::new(adapter),
-                Some(self.handle.clone()),
+                self.handle.clone(),
                 max_depth,
                 max_active_frames,
             );
@@ -601,12 +593,6 @@ impl FlowEngine {
             if let TerminalizationOutcome::Transitioned =
                 self.terminalize_canceled(run_id.clone(), flow_id).await?
             {
-                self.handle
-                    .project_machine_input(crate::run::MobRun::create_run_status_input(
-                        &run_id,
-                        crate::machines::mob_machine::FlowRunStatus::Canceled,
-                    ))
-                    .await?;
                 tracing::debug!(run_id = %run_id, "flow canceled terminalization applied");
             }
             return Ok(());
@@ -619,12 +605,6 @@ impl FlowEngine {
                 .terminalize_failed(run_id.clone(), flow_id, reason)
                 .await?
             {
-                self.handle
-                    .project_machine_input(crate::run::MobRun::create_run_status_input(
-                        &run_id,
-                        crate::machines::mob_machine::FlowRunStatus::Failed,
-                    ))
-                    .await?;
                 tracing::debug!(run_id = %run_id, "flow failed terminalization applied");
             }
             return Ok(());
@@ -634,12 +614,6 @@ impl FlowEngine {
         if let TerminalizationOutcome::Transitioned =
             self.terminalize_completed(run_id.clone(), flow_id).await?
         {
-            self.handle
-                .project_machine_input(crate::run::MobRun::create_run_status_input(
-                    &run_id,
-                    crate::machines::mob_machine::FlowRunStatus::Completed,
-                ))
-                .await?;
             tracing::debug!(run_id = %run_id, "flow completed terminalization applied");
         }
 
@@ -1272,17 +1246,9 @@ impl FlowEngine {
     ) -> Result<(), MobError> {
         let reason = error.to_string();
         self.fail_dispatched_steps(run_id).await?;
-        if let TerminalizationOutcome::Transitioned = self
+        let _ = self
             .terminalize_failed(run_id.clone(), flow_id.clone(), reason)
-            .await?
-        {
-            self.handle
-                .project_machine_input(crate::run::MobRun::create_run_status_input(
-                    run_id,
-                    crate::machines::mob_machine::FlowRunStatus::Failed,
-                ))
-                .await?;
-        }
+            .await?;
         Ok(())
     }
 
@@ -1359,14 +1325,6 @@ impl FlowEngine {
                 },
             )
             .await?;
-        self.handle
-            .project_machine_input(crate::run::MobRun::create_run_step_status_input(
-                run_id,
-                step_id,
-                mob_step_status(&effects.step_status),
-                effects.persist_output,
-            ))
-            .await?;
         match effects.step_status {
             StepRunStatus::Completed => {}
             StepRunStatus::Skipped => {
@@ -1417,7 +1375,6 @@ impl FlowEngine {
             return Ok(());
         };
         if let Some(step_notice) = find_step_notice_effect(&effects, step_id)? {
-            let projected_status = step_notice.status.clone();
             self.run_store
                 .append_step_entry(
                     run_id,
@@ -1429,14 +1386,6 @@ impl FlowEngine {
                         timestamp: Utc::now(),
                     },
                 )
-                .await?;
-            self.handle
-                .project_machine_input(crate::run::MobRun::create_run_step_status_input(
-                    run_id,
-                    step_id,
-                    mob_step_status(&projected_status),
-                    false,
-                ))
                 .await?;
             self.emitter
                 .step_skipped(run_id.clone(), step_id.clone(), reason)
@@ -1457,7 +1406,6 @@ impl FlowEngine {
             return Ok(false);
         };
         if let Some(step_notice) = find_step_notice_effect(&effects, step_id)? {
-            let projected_status = step_notice.status.clone();
             self.run_store
                 .append_step_entry(
                     run_id,
@@ -1469,14 +1417,6 @@ impl FlowEngine {
                         timestamp: Utc::now(),
                     },
                 )
-                .await?;
-            self.handle
-                .project_machine_input(crate::run::MobRun::create_run_step_status_input(
-                    run_id,
-                    step_id,
-                    mob_step_status(&projected_status),
-                    false,
-                ))
                 .await?;
             self.emitter
                 .step_failed(run_id.clone(), step_id.clone(), reason.clone())
@@ -1529,12 +1469,21 @@ impl FlowEngine {
         if run.status != MobRunStatus::Pending {
             return Ok(false);
         }
-        let next_state = flow_run::transition(
+        let command = MobMachineFlowRunCommand::StartRun(flow_run::inputs::StartRun {});
+        let authority_input = command.authority_input(run_id);
+        let machine_state = self
+            .handle
+            .project_machine_input(authority_input.clone())
+            .await?;
+        let authority =
+            MobMachineFlowAuthorityToken::from_accepted_mob_machine_input(&authority_input)?;
+        let next_state = apply_mob_machine_flow_run_command(
             &run.flow_state,
-            flow_run::Input::StartRun(flow_run::inputs::StartRun {}),
-            &flow_run::EmptyContext,
-        )
-        .map_err(|error| MobError::Internal(format!("flow_run transition refused: {error:?}")))?
+            &machine_state,
+            run_id,
+            command,
+            authority,
+        )?
         .next_state;
         self.run_store
             .cas_run_snapshot(
@@ -1662,15 +1611,24 @@ impl FlowEngine {
     async fn cas_flow_input_with_effects(
         &self,
         run_id: &RunId,
-        input: flow_run::Input,
+        command: MobMachineFlowRunCommand,
     ) -> Result<Option<Vec<flow_run::Effect>>, MobError> {
+        let authority_input = command.authority_input(run_id);
+        let machine_state = self
+            .handle
+            .project_machine_input(authority_input.clone())
+            .await?;
+        let authority =
+            MobMachineFlowAuthorityToken::from_accepted_mob_machine_input(&authority_input)?;
         for attempt in 0..5u32 {
             let run = self.run_snapshot(run_id).await?;
-            let outcome =
-                flow_run::transition(&run.flow_state, input.clone(), &flow_run::EmptyContext)
-                    .map_err(|error| {
-                        MobError::Internal(format!("flow_run transition refused: {error:?}"))
-                    })?;
+            let outcome = apply_mob_machine_flow_run_command(
+                &run.flow_state,
+                &machine_state,
+                run_id,
+                command.clone(),
+                authority,
+            )?;
             let transitioned = self
                 .run_store
                 .cas_flow_state(run_id, &run.flow_state, &outcome.next_state)
@@ -1691,7 +1649,7 @@ impl FlowEngine {
         Ok(self
             .cas_flow_input_with_effects(
                 run_id,
-                flow_run::Input::ConditionPassed(flow_run::inputs::ConditionPassed {
+                MobMachineFlowRunCommand::ConditionPassed(flow_run::inputs::ConditionPassed {
                     step_id: step_id.clone(),
                 }),
             )
@@ -1706,7 +1664,7 @@ impl FlowEngine {
     ) -> Result<Option<Vec<flow_run::Effect>>, MobError> {
         self.cas_flow_input_with_effects(
             run_id,
-            flow_run::Input::SkipStep(flow_run::inputs::SkipStep {
+            MobMachineFlowRunCommand::SkipStep(flow_run::inputs::SkipStep {
                 step_id: step_id.clone(),
             }),
         )
@@ -1720,7 +1678,7 @@ impl FlowEngine {
     ) -> Result<Option<Vec<flow_run::Effect>>, MobError> {
         self.cas_flow_input_with_effects(
             run_id,
-            flow_run::Input::FailStep(flow_run::inputs::FailStep {
+            MobMachineFlowRunCommand::FailStep(flow_run::inputs::FailStep {
                 step_id: step_id.clone(),
             }),
         )
@@ -1736,7 +1694,7 @@ impl FlowEngine {
                 let _ = self
                     .cas_flow_input_with_effects(
                         run_id,
-                        flow_run::Input::CancelStep(flow_run::inputs::CancelStep {
+                        MobMachineFlowRunCommand::CancelStep(flow_run::inputs::CancelStep {
                             step_id: step_id.clone(),
                         }),
                     )
@@ -1755,7 +1713,7 @@ impl FlowEngine {
                 let _ = self
                     .cas_flow_input_with_effects(
                         run_id,
-                        flow_run::Input::FailStep(flow_run::inputs::FailStep {
+                        MobMachineFlowRunCommand::FailStep(flow_run::inputs::FailStep {
                             step_id: step_id.clone(),
                         }),
                     )
@@ -1772,7 +1730,7 @@ impl FlowEngine {
     ) -> Result<Option<Vec<flow_run::Effect>>, MobError> {
         self.cas_flow_input_with_effects(
             run_id,
-            flow_run::Input::DispatchStep(flow_run::inputs::DispatchStep {
+            MobMachineFlowRunCommand::DispatchStep(flow_run::inputs::DispatchStep {
                 step_id: step_id.clone(),
             }),
         )
@@ -1786,7 +1744,7 @@ impl FlowEngine {
     ) -> Result<Option<Vec<flow_run::Effect>>, MobError> {
         self.cas_flow_input_with_effects(
             run_id,
-            flow_run::Input::CompleteStep(flow_run::inputs::CompleteStep {
+            MobMachineFlowRunCommand::CompleteStep(flow_run::inputs::CompleteStep {
                 step_id: step_id.clone(),
             }),
         )
@@ -1800,7 +1758,7 @@ impl FlowEngine {
     ) -> Result<Option<Vec<flow_run::Effect>>, MobError> {
         self.cas_flow_input_with_effects(
             run_id,
-            flow_run::Input::RecordStepOutput(flow_run::inputs::RecordStepOutput {
+            MobMachineFlowRunCommand::RecordStepOutput(flow_run::inputs::RecordStepOutput {
                 step_id: step_id.clone(),
             }),
         )
@@ -1814,7 +1772,7 @@ impl FlowEngine {
     ) -> Result<Option<Vec<flow_run::Effect>>, MobError> {
         self.cas_flow_input_with_effects(
             run_id,
-            flow_run::Input::ConditionRejected(flow_run::inputs::ConditionRejected {
+            MobMachineFlowRunCommand::ConditionRejected(flow_run::inputs::ConditionRejected {
                 step_id: step_id.clone(),
             }),
         )
@@ -1849,17 +1807,19 @@ impl FlowEngine {
         let effects = self
             .cas_flow_input_with_effects(
                 run_id,
-                flow_run::Input::ProjectFrameStepStatus(flow_run::inputs::ProjectFrameStepStatus {
-                    step_id: step_id.clone(),
-                    step_status: match step_status {
-                        StepRunStatus::Dispatched => flow_run::StepRunStatus::Dispatched,
-                        StepRunStatus::Completed => flow_run::StepRunStatus::Completed,
-                        StepRunStatus::Failed => flow_run::StepRunStatus::Failed,
-                        StepRunStatus::Skipped => flow_run::StepRunStatus::Skipped,
-                        StepRunStatus::Canceled => flow_run::StepRunStatus::Canceled,
+                MobMachineFlowRunCommand::ProjectFrameStepStatus(
+                    flow_run::inputs::ProjectFrameStepStatus {
+                        step_id: step_id.clone(),
+                        step_status: match step_status {
+                            StepRunStatus::Dispatched => flow_run::StepRunStatus::Dispatched,
+                            StepRunStatus::Completed => flow_run::StepRunStatus::Completed,
+                            StepRunStatus::Failed => flow_run::StepRunStatus::Failed,
+                            StepRunStatus::Skipped => flow_run::StepRunStatus::Skipped,
+                            StepRunStatus::Canceled => flow_run::StepRunStatus::Canceled,
+                        },
+                        append_failure_ledger: requested_failure_ledger_append,
                     },
-                    append_failure_ledger: requested_failure_ledger_append,
-                }),
+                ),
             )
             .await?
             .ok_or_else(|| {
@@ -1973,17 +1933,24 @@ impl FlowEngine {
         target: TerminalizationTarget,
     ) -> Result<TerminalizationOutcome, MobError> {
         let input = match &target {
-            TerminalizationTarget::Completed => {
-                flow_run::Input::TerminalizeCompleted(flow_run::inputs::TerminalizeCompleted {})
-            }
+            TerminalizationTarget::Completed => MobMachineFlowRunCommand::TerminalizeCompleted(
+                flow_run::inputs::TerminalizeCompleted {},
+            ),
             TerminalizationTarget::Failed { .. } => {
-                flow_run::Input::TerminalizeFailed(flow_run::inputs::TerminalizeFailed {})
+                MobMachineFlowRunCommand::TerminalizeFailed(flow_run::inputs::TerminalizeFailed {})
             }
-            TerminalizationTarget::Canceled => {
-                flow_run::Input::TerminalizeCanceled(flow_run::inputs::TerminalizeCanceled {})
-            }
+            TerminalizationTarget::Canceled => MobMachineFlowRunCommand::TerminalizeCanceled(
+                flow_run::inputs::TerminalizeCanceled {},
+            ),
         };
         let next_status = target.status();
+        let authority_input = input.authority_input(&run_id);
+        let machine_state = self
+            .handle
+            .project_machine_input(authority_input.clone())
+            .await?;
+        let authority =
+            MobMachineFlowAuthorityToken::from_accepted_mob_machine_input(&authority_input)?;
 
         for attempt in 0..5u32 {
             let run = self.run_snapshot(&run_id).await?;
@@ -1995,12 +1962,14 @@ impl FlowEngine {
             {
                 return Ok(TerminalizationOutcome::Noop);
             }
-            let next_state =
-                flow_run::transition(&run.flow_state, input.clone(), &flow_run::EmptyContext)
-                    .map_err(|error| {
-                        MobError::Internal(format!("flow_run transition refused: {error:?}"))
-                    })?
-                    .next_state;
+            let next_state = apply_mob_machine_flow_run_command(
+                &run.flow_state,
+                &machine_state,
+                &run_id,
+                input.clone(),
+                authority,
+            )?
+            .next_state;
             let transitioned = self
                 .run_store
                 .cas_run_snapshot(
@@ -2012,7 +1981,9 @@ impl FlowEngine {
                 )
                 .await?;
             if transitioned {
-                self.verify_terminal_run_steps(&run_id).await?;
+                if !matches!(target, TerminalizationTarget::Canceled) {
+                    self.verify_terminal_run_steps(&run_id).await?;
+                }
                 return self
                     .terminalization
                     .record_persisted_terminalization(run_id, flow_id, target)
@@ -2291,16 +2262,6 @@ fn step_status_from_flow_run(status: flow_run::StepRunStatus) -> StepRunStatus {
         flow_run::StepRunStatus::Failed => StepRunStatus::Failed,
         flow_run::StepRunStatus::Skipped => StepRunStatus::Skipped,
         flow_run::StepRunStatus::Canceled => StepRunStatus::Canceled,
-    }
-}
-
-fn mob_step_status(status: &StepRunStatus) -> crate::machines::mob_machine::StepRunStatus {
-    match status {
-        StepRunStatus::Dispatched => crate::machines::mob_machine::StepRunStatus::Dispatched,
-        StepRunStatus::Completed => crate::machines::mob_machine::StepRunStatus::Completed,
-        StepRunStatus::Failed => crate::machines::mob_machine::StepRunStatus::Failed,
-        StepRunStatus::Skipped => crate::machines::mob_machine::StepRunStatus::Skipped,
-        StepRunStatus::Canceled => crate::machines::mob_machine::StepRunStatus::Canceled,
     }
 }
 

@@ -122,10 +122,25 @@ pub use meerkat_machine_types::{
 pub use meerkat_machine_types::{
     MeerkatAdmittedInputSnapshot, MeerkatBindingSnapshot, MeerkatCompletionWaiterSnapshot,
     MeerkatCompletionWaitersSnapshot, MeerkatControlSnapshot, MeerkatCursorSnapshot,
-    MeerkatDrainSnapshot, MeerkatDriverKind, MeerkatInputsSnapshot, MeerkatMachineSpineSnapshot,
-    MeerkatOpsSnapshot, canonical_meerkat_machine_command_manifest,
+    MeerkatDrainSnapshot, MeerkatDriverKind, MeerkatInputsSnapshot, MeerkatMachineCatalogInput,
+    MeerkatMachineCommandClassification, MeerkatMachineCommandClassificationRecord,
+    MeerkatMachineShellMechanicReason, MeerkatMachineSpineSnapshot, MeerkatOpsSnapshot,
+    canonical_meerkat_machine_command_classifications, canonical_meerkat_machine_command_manifest,
 };
 pub use ops_lifecycle::{OpsLifecycleConfig, PersistedOpsSnapshot, RuntimeOpsLifecycleRegistry};
+
+#[doc(hidden)]
+pub mod machine_schema_exports {
+    pub fn meerkat_machine_schema() -> meerkat_machine_schema::MachineSchema {
+        meerkat_machine_schema::catalog::dsl::meerkat_machine_schema_metadata()
+            .attach_to(crate::meerkat_machine::dsl::MeerkatMachineState::schema())
+    }
+
+    pub fn auth_machine_schema() -> meerkat_machine_schema::MachineSchema {
+        meerkat_machine_schema::catalog::dsl::auth_machine_schema_metadata()
+            .attach_to(crate::auth_machine::dsl::AuthMachineState::schema())
+    }
+}
 pub use peer_handling_mode::{PeerHandlingModeError, validate_peer_handling_mode};
 pub use policy::{
     ApplyMode, ConsumePoint, DrainPolicy, PolicyDecision, QueueMode, RoutingDisposition, WakeMode,

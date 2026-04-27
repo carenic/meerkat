@@ -30,8 +30,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use meerkat_mob::machines::mob_machine::{
-    AgentIdentity, AgentRuntimeId, FenceToken, Generation, MobMachineAuthority, MobMachineEffect,
-    MobMachineInput, MobMachineMutator, SessionId,
+    AgentIdentity, AgentRuntimeId, FenceToken, Generation, MobId, MobMachineAuthority,
+    MobMachineEffect, MobMachineInput, MobMachineMutator, SessionId,
 };
 
 fn identity(name: &str) -> AgentIdentity {
@@ -70,6 +70,7 @@ fn retire_input(
 ) -> MobMachineInput {
     let session_id_for_route = releasing.clone().unwrap_or_else(SessionId::default);
     MobMachineInput::Retire {
+        mob_id: MobId("test-mob".to_string()),
         agent_runtime_id: runtime_id(identity_name, generation),
         agent_identity: identity(identity_name),
         releasing,

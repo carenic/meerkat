@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
-use quote::quote;
-use syn::{Data, DeriveInput, Fields, parse_macro_input};
+use quote::{format_ident, quote};
+use syn::{Data, DeriveInput, parse_macro_input};
 
 #[proc_macro_derive(CommandManifest)]
 pub fn derive_command_manifest(input: TokenStream) -> TokenStream {
@@ -17,15 +17,29 @@ pub fn derive_command_manifest(input: TokenStream) -> TokenStream {
     };
 
     let mut variant_names = Vec::with_capacity(data_enum.variants.len());
+    let mut variant_idents = Vec::with_capacity(data_enum.variants.len());
     for variant in data_enum.variants {
-        match variant.fields {
-            Fields::Named(_) | Fields::Unnamed(_) | Fields::Unit => {
-                variant_names.push(variant.ident.to_string());
-            }
-        }
+        variant_names.push(variant.ident.to_string());
+        variant_idents.push(variant.ident);
     }
+    let variant_enum_ident = format_ident!("{enum_ident}Variant");
 
     let expanded = quote! {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum #variant_enum_ident {
+            #( #variant_idents ),*
+        }
+
+        impl #variant_enum_ident {
+            #[doc(hidden)]
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    #( Self::#variant_idents => stringify!(#variant_idents), )*
+                }
+            }
+        }
+
         impl #enum_ident {
             #[doc(hidden)]
             pub const COMMAND_MANIFEST: &'static [&'static str] = &[
@@ -33,9 +47,20 @@ pub fn derive_command_manifest(input: TokenStream) -> TokenStream {
             ];
 
             #[doc(hidden)]
+            pub const COMMAND_VARIANT_MANIFEST: &'static [#variant_enum_ident] = &[
+                #( #variant_enum_ident::#variant_idents ),*
+            ];
+
+            #[doc(hidden)]
             #[must_use]
             pub fn command_manifest() -> &'static [&'static str] {
                 Self::COMMAND_MANIFEST
+            }
+
+            #[doc(hidden)]
+            #[must_use]
+            pub fn command_variant_manifest() -> &'static [#variant_enum_ident] {
+                Self::COMMAND_VARIANT_MANIFEST
             }
         }
     };

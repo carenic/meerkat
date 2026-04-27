@@ -3,18 +3,18 @@
 // Closure policy: AckRequired
 // Liveness: eventual feedback under surface connection liveness
 
-use crate::external_tool_surface_authority::{
-    ExternalToolSurfaceEffect, SurfaceDeltaOperation, SurfaceId, TurnNumber,
+use meerkat_core::handles::{
+    DslTransitionError, ExternalToolSurfaceEffect, ExternalToolSurfaceHandle,
 };
-use meerkat_core::handles::{DslTransitionError, ExternalToolSurfaceHandle};
+use meerkat_core::tool_scope::ExternalToolSurfaceDeltaOperation;
 
 #[derive(Debug, Clone)]
 pub struct SurfaceCompletionObligation {
-    pub surface_id: SurfaceId,
-    pub operation: SurfaceDeltaOperation,
+    pub surface_id: String,
+    pub operation: ExternalToolSurfaceDeltaOperation,
     pub pending_task_sequence: u64,
     pub staged_intent_sequence: u64,
-    pub applied_at_turn: TurnNumber,
+    pub applied_at_turn: u64,
 }
 
 pub fn extract_obligations(
@@ -41,21 +41,26 @@ pub fn extract_obligations(
         .collect()
 }
 
-pub fn submit_pending_succeeded(
+pub fn submit_surface_mark_pending_succeeded(
     handle: &(impl ExternalToolSurfaceHandle + ?Sized),
     obligation: SurfaceCompletionObligation,
 ) -> Result<(), DslTransitionError> {
     handle.mark_pending_succeeded(
-        obligation.surface_id.0,
+        obligation.surface_id,
         obligation.pending_task_sequence,
         obligation.staged_intent_sequence,
     )
 }
 
-pub fn submit_pending_failed(
+pub fn submit_surface_mark_pending_failed(
     handle: &(impl ExternalToolSurfaceHandle + ?Sized),
     obligation: SurfaceCompletionObligation,
     reason: impl Into<String>,
 ) -> Result<(), DslTransitionError> {
-    handle.mark_pending_failed(obligation.surface_id.0, reason.into())
+    handle.mark_pending_failed(
+        obligation.surface_id,
+        obligation.pending_task_sequence,
+        obligation.staged_intent_sequence,
+        reason.into(),
+    )
 }

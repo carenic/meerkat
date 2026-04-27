@@ -346,9 +346,14 @@ impl<T: Into<String>> From<T> for DeliveryReceipt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OccurrenceFailureClass {
-    Timeout,
-    TargetUnavailable,
+    TargetMaterializationFailed,
+    TargetMissing,
+    TargetBusy,
+    RuntimeRejected,
+    MobRejected,
+    LeaseLost,
+    TransportError,
     InternalError,
 }

@@ -232,7 +232,7 @@ pub(super) enum MobCommand {
     },
     ProjectMachineInput {
         input: Box<mob_dsl::MobMachineInput>,
-        reply_tx: oneshot::Sender<Result<(), MobError>>,
+        reply_tx: oneshot::Sender<Result<mob_dsl::MobMachineState, MobError>>,
     },
     ProjectMachineSignal {
         signal: mob_dsl::MobMachineSignal,

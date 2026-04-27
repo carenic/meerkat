@@ -1,366 +1,484 @@
-mod source {
-    #![allow(dead_code, clippy::expect_used, clippy::assign_op_pattern)]
-    use meerkat_machine_dsl::machine;
-
-    machine! {
-        machine OccurrenceLifecycleMachine {
-            version: 1,
-            rust: "meerkat-schedule" / "machines::occurrence_lifecycle",
-
-            state {
-                lifecycle_phase: OccurrenceLifecycleState,
-                occurrence_id: OccurrenceId,
-                schedule_id: ScheduleId,
-                schedule_revision: u64,
-                occurrence_ordinal: u64,
-                target_binding_key: String,
-                due_at_utc_ms: u64,
-                claimed_by: Option<String>,
-                lease_expires_at_utc_ms: Option<u64>,
-                claimed_at_utc_ms: Option<u64>,
-                claim_token: Option<ClaimToken>,
-                delivery_correlation_id: Option<String>,
-                last_receipt: Option<DeliveryReceipt>,
-                failure_class: Option<Enum<FailureClass>>,
-                failure_detail: Option<String>,
-                dispatched_at_utc_ms: Option<u64>,
-                completed_at_utc_ms: Option<u64>,
-                attempt_count: u64,
-                superseded_by_revision: Option<u64>,
-            }
-
-            init(Pending) {
-                occurrence_id = "occurrence-0",
-                schedule_id = "schedule-0",
-                schedule_revision = 1,
-                occurrence_ordinal = 0,
-                target_binding_key = "target-0",
-                due_at_utc_ms = 1,
-                claimed_by = None,
-                lease_expires_at_utc_ms = None,
-                claimed_at_utc_ms = None,
-                claim_token = None,
-                delivery_correlation_id = None,
-                last_receipt = None,
-                failure_class = None,
-                failure_detail = None,
-                dispatched_at_utc_ms = None,
-                completed_at_utc_ms = None,
-                attempt_count = 0,
-                superseded_by_revision = None,
-            }
-
-            terminal [Completed, Skipped, Misfired, Superseded, DeliveryFailed]
-
-            phase OccurrenceLifecycleState {
-                Pending,
-                Claimed,
-                Dispatching,
-                AwaitingCompletion,
-                Completed,
-                Skipped,
-                Misfired,
-                Superseded,
-                DeliveryFailed,
-            }
-
-            input OccurrenceLifecycleInput {
-                Claim { owner_id: String, at_utc_ms: u64, lease_expires_at_utc_ms: u64, claim_token: ClaimToken },
-                DispatchStarted { correlation_id: Option<String>, at_utc_ms: u64 },
-                AwaitCompletion { at_utc_ms: u64 },
-                Complete { receipt: DeliveryReceipt, at_utc_ms: u64 },
-                Skip { detail: Option<String>, failure_class: Option<Enum<FailureClass>>, at_utc_ms: u64 },
-                Misfire { detail: Option<String>, failure_class: Option<Enum<FailureClass>>, at_utc_ms: u64 },
-                Supersede { superseded_by_revision: u64, at_utc_ms: u64 },
-                DeliveryFailed { receipt: Option<DeliveryReceipt>, failure_class: Enum<FailureClass>, detail: Option<String>, at_utc_ms: u64 },
-                LeaseExpired { at_utc_ms: u64 },
-            }
-
-            effect OccurrenceLifecycleEffect {
-                Claimed,
-                DispatchStarted,
-                AwaitingCompletion,
-                Completed,
-                Skipped,
-                Misfired,
-                Superseded,
-                DeliveryFailed,
-                LeaseExpired,
-            }
-
-            helper is_live_claim_phase(phase: OccurrenceLifecycleState) -> bool {
-                phase == Phase::Claimed || phase == Phase::Dispatching || phase == Phase::AwaitingCompletion
-            }
-
-            invariant live_claim_requires_owner {
-                !is_live_claim_phase(self.lifecycle_phase) || self.claimed_by != None
-            }
-
-            invariant superseded_records_revision {
-                self.lifecycle_phase != Phase::Superseded || self.superseded_by_revision != None
-            }
-
-            invariant delivery_failed_records_failure_class {
-                self.lifecycle_phase != Phase::DeliveryFailed || self.failure_class != None
-            }
-
-            disposition Claimed => external,
-            disposition DispatchStarted => external,
-            disposition AwaitingCompletion => external,
-            disposition Completed => external,
-            disposition Skipped => external,
-            disposition Misfired => external,
-            disposition Superseded => external,
-            disposition DeliveryFailed => external,
-            disposition LeaseExpired => external,
-
-            // --- Claim ---
-
-            transition ClaimPending {
-                on input Claim { owner_id, at_utc_ms, lease_expires_at_utc_ms, claim_token }
-                guard { self.lifecycle_phase == Phase::Pending }
-                update {
-                    self.claimed_by = Some(owner_id);
-                    self.lease_expires_at_utc_ms = Some(lease_expires_at_utc_ms);
-                    self.claimed_at_utc_ms = Some(at_utc_ms);
-                    self.claim_token = Some(claim_token);
-                    self.delivery_correlation_id = None;
-                    self.last_receipt = None;
-                    self.failure_class = None;
-                    self.failure_detail = None;
-                    self.dispatched_at_utc_ms = None;
-                    self.completed_at_utc_ms = None;
-                    self.attempt_count += 1;
-                }
-                to Claimed
-                emit Claimed
-            }
-
-            // --- Dispatch ---
-
-            transition DispatchStartedFromClaimed {
-                on input DispatchStarted { correlation_id, at_utc_ms }
-                guard { self.lifecycle_phase == Phase::Claimed }
-                update {
-                    self.delivery_correlation_id = correlation_id;
-                    self.dispatched_at_utc_ms = Some(at_utc_ms);
-                }
-                to Dispatching
-                emit DispatchStarted
-            }
-
-            // --- Await completion ---
-
-            transition AwaitCompletionFromDispatching {
-                on input AwaitCompletion { at_utc_ms }
-                guard { self.lifecycle_phase == Phase::Dispatching }
-                update {
-                    self.dispatched_at_utc_ms = Some(at_utc_ms);
-                }
-                to AwaitingCompletion
-                emit AwaitingCompletion
-            }
-
-            // --- Complete ---
-
-            transition CompleteFromDispatchingOrAwaiting {
-                on input Complete { receipt, at_utc_ms }
-                guard { self.lifecycle_phase == Phase::Dispatching || self.lifecycle_phase == Phase::AwaitingCompletion }
-                update {
-                    self.last_receipt = Some(receipt);
-                    self.completed_at_utc_ms = Some(at_utc_ms);
-                }
-                to Completed
-                emit Completed
-            }
-
-            // --- Skip (from Pending or live claim phases) ---
-
-            transition SkipFromPendingOrLive {
-                on input Skip { detail, failure_class, at_utc_ms }
-                guard {
-                    self.lifecycle_phase == Phase::Pending
-                    || self.lifecycle_phase == Phase::Claimed
-                    || self.lifecycle_phase == Phase::Dispatching
-                    || self.lifecycle_phase == Phase::AwaitingCompletion
-                }
-                update {
-                    self.failure_detail = detail;
-                    self.failure_class = failure_class;
-                    self.completed_at_utc_ms = Some(at_utc_ms);
-                    self.claimed_by = None;
-                    self.lease_expires_at_utc_ms = None;
-                    self.claim_token = None;
-                    self.delivery_correlation_id = None;
-                }
-                to Skipped
-                emit Skipped
-            }
-
-            // --- Misfire ---
-
-            transition MisfireFromPendingOrLive {
-                on input Misfire { detail, failure_class, at_utc_ms }
-                guard {
-                    self.lifecycle_phase == Phase::Pending
-                    || self.lifecycle_phase == Phase::Claimed
-                    || self.lifecycle_phase == Phase::Dispatching
-                    || self.lifecycle_phase == Phase::AwaitingCompletion
-                }
-                update {
-                    self.failure_detail = detail;
-                    self.failure_class = failure_class;
-                    self.completed_at_utc_ms = Some(at_utc_ms);
-                    self.claimed_by = None;
-                    self.lease_expires_at_utc_ms = None;
-                    self.claim_token = None;
-                    self.delivery_correlation_id = None;
-                }
-                to Misfired
-                emit Misfired
-            }
-
-            // --- Supersede ---
-
-            transition SupersedePendingOrLive {
-                on input Supersede { superseded_by_revision, at_utc_ms }
-                guard {
-                    self.lifecycle_phase == Phase::Pending
-                    || self.lifecycle_phase == Phase::Claimed
-                    || self.lifecycle_phase == Phase::Dispatching
-                    || self.lifecycle_phase == Phase::AwaitingCompletion
-                }
-                update {
-                    self.superseded_by_revision = Some(superseded_by_revision);
-                    self.completed_at_utc_ms = Some(at_utc_ms);
-                }
-                to Superseded
-                emit Superseded
-            }
-
-            // --- Delivery failed ---
-
-            transition DeliveryFailedFromClaimedOrLive {
-                on input DeliveryFailed { receipt, failure_class, detail, at_utc_ms }
-                guard {
-                    self.lifecycle_phase == Phase::Claimed
-                    || self.lifecycle_phase == Phase::Dispatching
-                    || self.lifecycle_phase == Phase::AwaitingCompletion
-                }
-                update {
-                    self.last_receipt = receipt;
-                    self.failure_class = Some(failure_class);
-                    self.failure_detail = detail;
-                    self.completed_at_utc_ms = Some(at_utc_ms);
-                }
-                to DeliveryFailed
-                emit DeliveryFailed
-            }
-
-            // --- Lease expired (one per source phase, returns to Pending) ---
-
-            transition LeaseExpiredFromClaimed {
-                on input LeaseExpired { at_utc_ms }
-                guard { self.lifecycle_phase == Phase::Claimed }
-                guard "lease_expiry_timestamp_present" { at_utc_ms == at_utc_ms }
-                update {
-                    self.claimed_by = None;
-                    self.lease_expires_at_utc_ms = None;
-                    self.claim_token = None;
-                    self.delivery_correlation_id = None;
-                    self.claimed_at_utc_ms = None;
-                    self.dispatched_at_utc_ms = None;
-                }
-                to Pending
-                emit LeaseExpired
-            }
-
-            transition LeaseExpiredFromDispatching {
-                on input LeaseExpired { at_utc_ms }
-                guard { self.lifecycle_phase == Phase::Dispatching }
-                guard "lease_expiry_timestamp_present" { at_utc_ms == at_utc_ms }
-                update {
-                    self.claimed_by = None;
-                    self.lease_expires_at_utc_ms = None;
-                    self.claim_token = None;
-                    self.delivery_correlation_id = None;
-                    self.claimed_at_utc_ms = None;
-                    self.dispatched_at_utc_ms = None;
-                }
-                to Pending
-                emit LeaseExpired
-            }
-
-            transition LeaseExpiredFromAwaitingCompletion {
-                on input LeaseExpired { at_utc_ms }
-                guard { self.lifecycle_phase == Phase::AwaitingCompletion }
-                guard "lease_expiry_timestamp_present" { at_utc_ms == at_utc_ms }
-                update {
-                    self.claimed_by = None;
-                    self.lease_expires_at_utc_ms = None;
-                    self.claim_token = None;
-                    self.delivery_correlation_id = None;
-                    self.claimed_at_utc_ms = None;
-                    self.dispatched_at_utc_ms = None;
-                }
-                to Pending
-                emit LeaseExpired
-            }
-        }
-    }
-
-    // DSL proxy types — lightweight wrappers used by the generated state struct.
-    // The authority projects/converts between these and the real domain types.
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct OccurrenceId(pub String);
-    impl<T: Into<String>> From<T> for OccurrenceId {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct ScheduleId(pub String);
-    impl<T: Into<String>> From<T> for ScheduleId {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct ClaimToken(pub String);
-    impl<T: Into<String>> From<T> for ClaimToken {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-
-    /// DSL proxy for delivery receipts — stored as opaque serialized JSON.
-    /// The authority round-trips through serde to preserve all receipt fields.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct DeliveryReceipt(pub String);
-    impl<T: Into<String>> From<T> for DeliveryReceipt {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-
-    /// DSL proxy for the occurrence failure class enum.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum FailureClass {
-        TargetMaterializationFailed,
-        TargetMissing,
-        TargetBusy,
-        RuntimeRejected,
-        MobRejected,
-        LeaseLost,
-        TransportError,
-        InternalError,
-    }
-}
-pub use source::*;
+// Generated by `cargo xtask machine-codegen --all`.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::implicit_clone,
+    clippy::unnecessary_cast,
+    clippy::redundant_clone
+)]
 
 pub fn schema() -> meerkat_machine_schema::MachineSchema {
     meerkat_machine_schema::catalog::dsl::dsl_occurrence_lifecycle_machine()
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct ClaimToken(pub String);
+impl From<String> for ClaimToken {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for ClaimToken {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for ClaimToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct DeliveryReceipt(pub String);
+impl From<String> for DeliveryReceipt {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for DeliveryReceipt {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for DeliveryReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct OccurrenceFailureClass(pub String);
+impl From<String> for OccurrenceFailureClass {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for OccurrenceFailureClass {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for OccurrenceFailureClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct OccurrenceId(pub String);
+impl From<String> for OccurrenceId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for OccurrenceId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for OccurrenceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct OccurrenceLifecycleState(pub String);
+impl From<String> for OccurrenceLifecycleState {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for OccurrenceLifecycleState {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for OccurrenceLifecycleState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct ScheduleId(pub String);
+impl From<String> for ScheduleId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for ScheduleId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for ScheduleId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+pub trait Context {}
+pub struct EmptyContext;
+impl Context for EmptyContext {}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Phase {
+    Pending,
+    Claimed,
+    Dispatching,
+    AwaitingCompletion,
+    Completed,
+    Skipped,
+    Misfired,
+    Superseded,
+    DeliveryFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct State {
+    pub phase: Phase,
+    pub occurrence_id: OccurrenceId,
+    pub schedule_id: ScheduleId,
+    pub schedule_revision: u64,
+    pub occurrence_ordinal: u64,
+    pub target_binding_key: String,
+    pub due_at_utc_ms: u64,
+    pub claimed_by: Option<String>,
+    pub lease_expires_at_utc_ms: Option<u64>,
+    pub claimed_at_utc_ms: Option<u64>,
+    pub claim_token: Option<ClaimToken>,
+    pub delivery_correlation_id: Option<String>,
+    pub last_receipt: Option<DeliveryReceipt>,
+    pub failure_class: Option<OccurrenceFailureClass>,
+    pub failure_detail: Option<String>,
+    pub dispatched_at_utc_ms: Option<u64>,
+    pub completed_at_utc_ms: Option<u64>,
+    pub attempt_count: u64,
+    pub superseded_by_revision: Option<u64>,
+}
+impl Default for State {
+    fn default() -> Self {
+        initial_state()
+    }
+}
+
+pub mod inputs {
+    #[allow(unused_imports)]
+    use super::*;
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Claim {
+        pub owner_id: String,
+        pub at_utc_ms: u64,
+        pub lease_expires_at_utc_ms: u64,
+        pub claim_token: ClaimToken,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct DispatchStarted {
+        pub correlation_id: Option<String>,
+        pub at_utc_ms: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AwaitCompletion {
+        pub at_utc_ms: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Complete {
+        pub receipt: DeliveryReceipt,
+        pub at_utc_ms: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Skip {
+        pub detail: Option<String>,
+        pub failure_class: Option<OccurrenceFailureClass>,
+        pub at_utc_ms: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Misfire {
+        pub detail: Option<String>,
+        pub failure_class: Option<OccurrenceFailureClass>,
+        pub at_utc_ms: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Supersede {
+        pub superseded_by_revision: u64,
+        pub at_utc_ms: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct DeliveryFailed {
+        pub receipt: Option<DeliveryReceipt>,
+        pub failure_class: OccurrenceFailureClass,
+        pub detail: Option<String>,
+        pub at_utc_ms: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LeaseExpired {
+        pub at_utc_ms: u64,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Input {
+    Claim(inputs::Claim),
+    DispatchStarted(inputs::DispatchStarted),
+    AwaitCompletion(inputs::AwaitCompletion),
+    Complete(inputs::Complete),
+    Skip(inputs::Skip),
+    Misfire(inputs::Misfire),
+    Supersede(inputs::Supersede),
+    DeliveryFailed(inputs::DeliveryFailed),
+    LeaseExpired(inputs::LeaseExpired),
+}
+impl Input {
+    pub fn kind(&self) -> InputKind {
+        match self {
+            Self::Claim(_) => InputKind::Claim,
+            Self::DispatchStarted(_) => InputKind::DispatchStarted,
+            Self::AwaitCompletion(_) => InputKind::AwaitCompletion,
+            Self::Complete(_) => InputKind::Complete,
+            Self::Skip(_) => InputKind::Skip,
+            Self::Misfire(_) => InputKind::Misfire,
+            Self::Supersede(_) => InputKind::Supersede,
+            Self::DeliveryFailed(_) => InputKind::DeliveryFailed,
+            Self::LeaseExpired(_) => InputKind::LeaseExpired,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum InputKind {
+    Claim,
+    DispatchStarted,
+    AwaitCompletion,
+    Complete,
+    Skip,
+    Misfire,
+    Supersede,
+    DeliveryFailed,
+    LeaseExpired,
+}
+
+pub mod effects {
+    #[allow(unused_imports)]
+    use super::*;
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Claimed {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct DispatchStarted {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AwaitingCompletion {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Completed {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Skipped {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Misfired {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Superseded {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct OccurrencesSuperseded {
+        pub occurrence_id: OccurrenceId,
+        pub superseding_revision: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct DeliveryFailed {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LeaseExpired {}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Effect {
+    Claimed(effects::Claimed),
+    DispatchStarted(effects::DispatchStarted),
+    AwaitingCompletion(effects::AwaitingCompletion),
+    Completed(effects::Completed),
+    Skipped(effects::Skipped),
+    Misfired(effects::Misfired),
+    Superseded(effects::Superseded),
+    OccurrencesSuperseded(effects::OccurrencesSuperseded),
+    DeliveryFailed(effects::DeliveryFailed),
+    LeaseExpired(effects::LeaseExpired),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EffectKind {
+    Claimed,
+    DispatchStarted,
+    AwaitingCompletion,
+    Completed,
+    Skipped,
+    Misfired,
+    Superseded,
+    OccurrencesSuperseded,
+    DeliveryFailed,
+    LeaseExpired,
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TransitionId {
+    ClaimPending,
+    DispatchStartedFromClaimed,
+    AwaitCompletionFromDispatching,
+    CompleteFromDispatchingOrAwaiting,
+    SkipFromPendingOrLive,
+    MisfireFromPendingOrLive,
+    SupersedePendingOrLive,
+    DeliveryFailedFromClaimedOrLive,
+    LeaseExpiredFromClaimed,
+    LeaseExpiredFromDispatching,
+    LeaseExpiredFromAwaitingCompletion,
+}
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum GuardId {
+    None,
+}
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HelperId {
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GuardRejection {
+    pub transition_id: TransitionId,
+    pub guard_id: GuardId,
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TriggerDiscriminant {
+    Input(InputKind),
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TransitionRefusal {
+    NoMatchingTransition {
+        phase: Phase,
+        trigger: TriggerDiscriminant,
+    },
+    GuardRejected {
+        rejections: Vec<GuardRejection>,
+    },
+    AmbiguousTransition {
+        transitions: Vec<TransitionId>,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum KernelError {
+    ContextViolation {
+        transition_id: TransitionId,
+        detail: String,
+    },
+    HelperEvaluation {
+        helper_id: HelperId,
+        detail: String,
+    },
+    CodegenInvariant {
+        detail: String,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TransitionError {
+    Refusal(TransitionRefusal),
+    Kernel(KernelError),
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Outcome {
+    pub transition_id: TransitionId,
+    pub next_state: State,
+    pub effects: Vec<Effect>,
+}
+
+pub mod helpers {
+    #[allow(unused_imports)]
+    use super::*;
+    pub fn none<C: Context>(_: &State, context: &C) -> Result<(), KernelError> {
+        let _ = context;
+        Ok(())
+    }
+}
+
+pub fn initial_state() -> State {
+    State {
+        phase: Phase::Pending,
+        occurrence_id: OccurrenceId::default(),
+        schedule_id: ScheduleId::default(),
+        schedule_revision: 0,
+        occurrence_ordinal: 0,
+        target_binding_key: String::new(),
+        due_at_utc_ms: 0,
+        claimed_by: None,
+        lease_expires_at_utc_ms: None,
+        claimed_at_utc_ms: None,
+        claim_token: None,
+        delivery_correlation_id: None,
+        last_receipt: None,
+        failure_class: None,
+        failure_detail: None,
+        dispatched_at_utc_ms: None,
+        completed_at_utc_ms: None,
+        attempt_count: 0,
+        superseded_by_revision: None,
+    }
 }

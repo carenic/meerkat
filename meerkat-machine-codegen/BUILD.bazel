@@ -46,8 +46,6 @@ rust_library(
     ),
     deps = [
         "//meerkat-machine-schema:meerkat_machine_schema",
-        "//meerkat-mob:meerkat_mob",
-        "//meerkat-runtime:meerkat_runtime",
     ] + all_crate_deps(
         package_name = "meerkat-machine-codegen",
         normal = True,
@@ -93,8 +91,6 @@ rust_test(
     ),
     deps = [
         "//meerkat-machine-schema:meerkat_machine_schema",
-        "//meerkat-mob:meerkat_mob",
-        "//meerkat-runtime:meerkat_runtime",
     ] + all_crate_deps(
         package_name = "meerkat-machine-codegen",
         normal = True,
@@ -144,6 +140,7 @@ rust_test(
         "//meerkat-machine-schema:meerkat_machine_schema",
         "//meerkat-mob:meerkat_mob",
         "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-schedule:meerkat_schedule",
     ] + all_crate_deps(
         package_name = "meerkat-machine-codegen",
         normal = True,
@@ -193,6 +190,7 @@ rust_test(
         "//meerkat-machine-schema:meerkat_machine_schema",
         "//meerkat-mob:meerkat_mob",
         "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-schedule:meerkat_schedule",
     ] + all_crate_deps(
         package_name = "meerkat-machine-codegen",
         normal = True,
@@ -229,7 +227,10 @@ rust_test(
     ],
     size = "small",
     data = [
+        ":package_runfiles",
+        "//meerkat-mob:package_runfiles",
         "//meerkat-runtime:package_runfiles",
+        "//meerkat-schedule:package_runfiles",
     ],
     env = {
         "RUST_MIN_STACK": "16777216",
@@ -244,6 +245,7 @@ rust_test(
         "//meerkat-machine-schema:meerkat_machine_schema",
         "//meerkat-mob:meerkat_mob",
         "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-schedule:meerkat_schedule",
     ] + all_crate_deps(
         package_name = "meerkat-machine-codegen",
         normal = True,
@@ -295,6 +297,7 @@ rust_test(
         "//meerkat-machine-schema:meerkat_machine_schema",
         "//meerkat-mob:meerkat_mob",
         "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-schedule:meerkat_schedule",
     ] + all_crate_deps(
         package_name = "meerkat-machine-codegen",
         normal = True,
@@ -330,6 +333,60 @@ rust_test(
         "fast",
     ],
     size = "small",
+    data = [
+        ":package_runfiles",
+        "//meerkat-mob:package_runfiles",
+        "//meerkat-runtime:package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-machine-codegen",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-machine-codegen:meerkat_machine_codegen",
+        "//meerkat-machine-schema:meerkat_machine_schema",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-schedule:meerkat_schedule",
+    ] + all_crate_deps(
+        package_name = "meerkat-machine-codegen",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "runtime_schema_parity_test",
+    aliases = aliases(
+        package_name = "meerkat-machine-codegen",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "runtime_schema_parity",
+    crate_root = "tests/runtime_schema_parity.rs",
+    crate_features = [],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/runtime_schema_parity.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_BIN_NAME": "runtime_schema_parity",
+        "CARGO_MANIFEST_DIR": "./meerkat-machine-codegen",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
     data = [],
     env = {
         "RUST_MIN_STACK": "16777216",
@@ -344,6 +401,7 @@ rust_test(
         "//meerkat-machine-schema:meerkat_machine_schema",
         "//meerkat-mob:meerkat_mob",
         "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-schedule:meerkat_schedule_machine_schema_exports",
     ] + all_crate_deps(
         package_name = "meerkat-machine-codegen",
         normal = True,
@@ -360,5 +418,6 @@ test_suite(
         ":render_contracts_test",
         ":routed_effect_module_shape_test",
         ":runtime_alphabet_parity_test",
+        ":runtime_schema_parity_test",
     ],
 )

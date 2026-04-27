@@ -7,7 +7,7 @@ use crate::meerkat_machine::dsl::{MeerkatMachineEffect, PeerId};
 
 #[derive(Debug, Clone)]
 pub struct SupervisorTrustRevokeObligation {
-    pub peer_id: PeerId,
+    pub peer_id: String,
     pub epoch: u64,
 }
 
