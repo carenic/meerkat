@@ -41,7 +41,7 @@ impl Pack for ArchitectPack {
         profiles.insert(
             ProfileName::from("planner"),
             turn_driven_profile(
-                resolve_model(overrides, "planner", "claude-opus-4-6"),
+                resolve_model(overrides, "planner", "claude-opus-4-7"),
                 "planner-skill",
                 "Architecture planner",
                 pp,
@@ -50,7 +50,7 @@ impl Pack for ArchitectPack {
         profiles.insert(
             ProfileName::from("critic"),
             turn_driven_profile(
-                resolve_model(overrides, "critic", "gpt-5.4"),
+                resolve_model(overrides, "critic", "gpt-5.5"),
                 "critic-skill",
                 "Architecture critic",
                 pp,

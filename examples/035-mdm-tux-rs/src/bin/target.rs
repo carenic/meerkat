@@ -2222,7 +2222,7 @@ mod tests {
 
     #[test]
     fn provider_override_requires_model_and_provider_together() {
-        let err = parse_provider_override(&["--model".into(), "gpt-5.4".into()]).unwrap_err();
+        let err = parse_provider_override(&["--model".into(), "gpt-5.5".into()]).unwrap_err();
         assert!(err.to_string().contains("--model requires --provider"));
 
         let err = parse_provider_override(&["--provider".into(), "openai".into()]).unwrap_err();
@@ -2233,7 +2233,7 @@ mod tests {
     fn provider_override_parses_explicit_provider() {
         let provider = parse_provider_override(&[
             "--model".into(),
-            "gpt-5.4".into(),
+            "gpt-5.5".into(),
             "--provider".into(),
             "openai".into(),
         ])

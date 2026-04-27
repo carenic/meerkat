@@ -68,7 +68,7 @@ impl Pack for ImplementPack {
         profiles.insert(
             ProfileName::from("reviewer"),
             ProfileBinding::Inline(Profile {
-                model: resolve_model(overrides, "reviewer", "gpt-5.4"),
+                model: resolve_model(overrides, "reviewer", "gpt-5.5"),
                 skills: vec!["gate-reviewer-skill".to_string()],
                 tools: tools.clone(),
                 peer_description: "Quality gate reviewer — approves or requests revision"

@@ -49,7 +49,7 @@ impl Pack for ReviewPack {
                 "security",
                 "security-skill",
                 "Security-focused reviewer",
-                "gpt-5.4",
+                "gpt-5.5",
             ),
             (
                 "perf",
@@ -61,7 +61,7 @@ impl Pack for ReviewPack {
                 "synthesizer",
                 "synthesizer-skill",
                 "Review synthesizer",
-                "claude-opus-4-6",
+                "claude-opus-4-7",
             ),
         ];
 

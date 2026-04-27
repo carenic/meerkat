@@ -200,7 +200,7 @@ provider from the model name or available API keys:
 
 | Env var | Provider | Default model |
 |---------|----------|---------------|
-| `OPENAI_API_KEY` | OpenAI | `gpt-5.4` |
+| `OPENAI_API_KEY` | OpenAI | `gpt-5.5` |
 | `ANTHROPIC_API_KEY` | Anthropic | `claude-sonnet-4-6` |
 | `GEMINI_API_KEY` | Gemini | `gemini-3.1-flash-lite-preview` |
 

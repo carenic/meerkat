@@ -58,14 +58,14 @@ impl Pack for RctPack {
                 "orchestrator",
                 "rct-orchestrator-skill",
                 "RCT pipeline orchestrator",
-                "claude-opus-4-6",
+                "claude-opus-4-7",
                 tools_with_shell.clone(),
             ),
             (
                 "implementer",
                 "rct-implementer-skill",
                 "Implementation agent",
-                "gpt-5.4",
+                "gpt-5.5",
                 tools_with_shell.clone(),
             ),
             (

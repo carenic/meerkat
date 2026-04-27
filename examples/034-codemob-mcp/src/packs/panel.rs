@@ -48,7 +48,7 @@ impl Pack for PanelPack {
                 "moderator",
                 "moderator-skill",
                 "Neutral moderator — keeps discussion productive",
-                resolve_model(overrides, "moderator", "claude-opus-4-6"),
+                resolve_model(overrides, "moderator", "claude-opus-4-7"),
             ),
             (
                 "purist",
@@ -60,7 +60,7 @@ impl Pack for PanelPack {
                 "pragmatist",
                 "pragmatist-skill",
                 "Pragmatist — ship it and iterate",
-                resolve_model(overrides, "pragmatist", "gpt-5.4"),
+                resolve_model(overrides, "pragmatist", "gpt-5.5"),
             ),
             (
                 "skeptic",

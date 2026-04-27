@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Duration;
 
@@ -320,6 +320,7 @@ async fn run_flow(
     }
 
     let last_completed = Arc::new(AtomicUsize::new(0));
+    let last_progress = Arc::new(Mutex::new(None::<(usize, String)>));
     let progress_token = progress_token.cloned();
 
     let run = match poll_flow_until_terminal(
@@ -333,8 +334,10 @@ async fn run_flow(
         },
         {
             let last_completed = Arc::clone(&last_completed);
+            let last_progress = Arc::clone(&last_progress);
             move |run| {
                 let last_completed = Arc::clone(&last_completed);
+                let last_progress = Arc::clone(&last_progress);
                 let progress_token = progress_token.clone();
                 async move {
                     // Count unique completed step IDs (not ledger entries, which can
@@ -367,7 +370,27 @@ async fn run_flow(
                             } else {
                                 "waiting".into()
                             };
-                            send_progress(progress_notifier, token, completed, total_steps, &label);
+                            let should_send = {
+                                let mut last = last_progress
+                                    .lock()
+                                    .expect("flow progress lock poisoned");
+                                let current = (completed, label.clone());
+                                if last.as_ref() == Some(&current) {
+                                    false
+                                } else {
+                                    *last = Some(current);
+                                    true
+                                }
+                            };
+                            if should_send {
+                                send_progress(
+                                    progress_notifier,
+                                    token,
+                                    completed,
+                                    total_steps,
+                                    &label,
+                                );
+                            }
                         }
                     }
 

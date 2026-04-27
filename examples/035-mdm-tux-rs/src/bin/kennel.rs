@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
         );
         std::process::exit(1);
     }
-    let hive_model = find_flag(&args, "--hive-model").unwrap_or_else(|| "gpt-5.4".to_string());
+    let hive_model = find_flag(&args, "--hive-model").unwrap_or_else(|| "gpt-5.5".to_string());
     let hive_provider = match find_flag(&args, "--hive-provider") {
         Some(provider) => Some(
             provider

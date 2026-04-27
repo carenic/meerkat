@@ -44,7 +44,7 @@ Quick opinion from a single agent. Returns a `session_id` for multi-turn convers
 
 ```
 consult(question: "Should I use a B-tree or hash map for this index?")
-consult(question: "Review this function", context: "<code>", model: "claude-opus-4-6")
+consult(question: "Review this function", context: "<code>", model: "claude-opus-4-7")
 
 # Custom persona
 consult(
@@ -68,7 +68,7 @@ consult(question: "What about the edge case?", session_id: "<id from previous ca
 **Parameters:**
 - `question` (required) — The question or topic
 - `context` — Background information, code snippets, file contents
-- `model` — LLM model (default: `gpt-5.4`)
+- `model` — LLM model (default: `gpt-5.5`)
 - `system_prompt` — Custom persona (default: general technical advisor)
 - `shell` — Enable shell access for running commands
 - `skills` — Inject domain knowledge (e.g. `["meerkat-platform", "rct-methodology"]`)
@@ -121,7 +121,7 @@ CRUD for user-created mob definitions. Saved to `.codemob-mcp/mobs/` and immedia
 
 | Pack | Agents | Pattern | Default Models |
 |------|--------|---------|---------------|
-| **panel** | 5 | Free-form moderated debate (full mesh, moderator authority) | Opus, Gemini 3.1 Pro, GPT-5.4, Gemini 3.1 Flash Lite, Sonnet |
+| **panel** | 5 | Free-form moderated debate (full mesh, moderator authority) | Opus, Gemini 3.1 Pro, GPT-5.5, Gemini 3.1 Flash Lite, Sonnet |
 
 Every agent in every pack uses a distinct model by default — different training data produces genuinely different perspectives.
 
@@ -129,8 +129,8 @@ Every agent in every pack uses a distinct model by default — different trainin
 
 | Model | Provider | Strengths | Used as default for |
 |-------|----------|-----------|-------------------|
-| `claude-opus-4-6` | Anthropic | Strongest reasoning | Judge, moderator, synthesizer, orchestrator |
-| `gpt-5.4` | OpenAI | Strongest general + code | Implementer, critic, advisor, security reviewer |
+| `claude-opus-4-7` | Anthropic | Strongest reasoning | Judge, moderator, synthesizer, orchestrator |
+| `gpt-5.5` | OpenAI | Strongest general + code | Implementer, critic, advisor, security reviewer |
 | `gemini-3.1-pro-preview` | Google | Strong general | General reviewer, purist, guardian |
 | `gemini-3.1-flash-lite-preview` | Google | Fastest | Advocate, skeptic, perf reviewer, contrarian |
 | `claude-sonnet-4-6` | Anthropic | Fast + capable | RCT aggregator, implementer |
@@ -169,7 +169,7 @@ Override the default model for any role in a pack:
 deliberate(
   pack: "review",
   task: "...",
-  model_overrides: {"security": "claude-opus-4-6", "perf": "gpt-5.2-pro"}
+  model_overrides: {"security": "claude-opus-4-7", "perf": "gpt-5.2-pro"}
 )
 ```
 

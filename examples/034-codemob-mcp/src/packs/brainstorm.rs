@@ -49,7 +49,7 @@ impl Pack for BrainstormPack {
                 "ideator_b",
                 "ideator-b-skill",
                 "Creative ideator",
-                "gpt-5.4",
+                "gpt-5.5",
             ),
             (
                 "ideator_c",
@@ -61,7 +61,7 @@ impl Pack for BrainstormPack {
                 "synthesizer",
                 "synthesizer-skill",
                 "Idea synthesizer",
-                "claude-opus-4-6",
+                "claude-opus-4-7",
             ),
         ];
 
