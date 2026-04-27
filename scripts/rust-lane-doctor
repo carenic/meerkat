@@ -72,7 +72,7 @@ else
   bad "Cargo home changes across same-repo lanes"
 fi
 
-fast_profile_output="$(./scripts/repo-cargo nextest show-config test-groups --profile fast 2>&1 || true)"
+fast_profile_output="$(./scripts/repo-cargo nextest show-config version --profile fast --color never --no-pager 2>&1 || true)"
 if grep -q '\[profile.fast\]' .config/nextest.toml &&
   grep -q 'default-filter' .config/nextest.toml &&
   [[ "${fast_profile_output}" != *"error:"* ]]; then
