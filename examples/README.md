@@ -1,6 +1,6 @@
 # Meerkat Examples Library
 
-33 examples covering every Meerkat surface and feature,
+34 examples covering every Meerkat surface and feature,
 from "Hello World" to production multi-agent systems.
 
 ## Quick Start
@@ -47,8 +47,8 @@ branch.
 
 | Status | Examples |
 |--------|----------|
-| **Live-ran** | 001, 002, 003, 007, 008, 010, 021, 022, 023, 028, 029, 030 |
-| **Build-verified** | Registered Rust examples via `cargo check`; 031, 032, 033 via Vite builds; 034 via `cargo check` |
+| **Live-ran** | 001, 002, 003, 007, 008, 010, 021, 022, 023, 028, 029, 030, 034 via MCP stdio, 035 via Docker/TUX hive suite |
+| **Build-verified** | Registered Rust examples via `cargo check`; 031, 032, 033 via Vite builds |
 | **Syntax-checked / recipe-oriented** | 004 and shell entrypoints that are safe but intentionally operational rather than fully automated |
 
 ## Examples by Level
@@ -109,6 +109,7 @@ branch.
 | 031 | [wasm-mini-diplomacy-sh](031-wasm-mini-diplomacy-sh/) | Shell + Web | 9 autonomous agents across 4 WASM mobs wage a 3-faction territory war with strategy, diplomacy, and deception |
 | 032 | [wasm-webcm-agent](032-wasm-webcm-agent/) | Web (WASM) | Multi-provider coding agent mob in the browser — 4 agents (Anthropic + OpenAI + Gemini) collaborate via comms in a sandboxed Linux VM |
 | 034 | [codemob-mcp](034-codemob-mcp/) | Rust (MCP) | Multi-agent MCP server — 7 mobpacks (advisor, review, architect, brainstorm, red-team, panel, rct) with flow and comms execution, progress notifications, multi-provider model diversity |
+| 035 | [mdm-tux-rs](035-mdm-tux-rs/) | Rust + TUI + Docker | Meerkat Device Manager: TUX terminal controller, kennel rendezvous, remote targets, hive coordination, peer comms, and scheduler wakeups |
 
 ## Examples by Feature
 
@@ -125,23 +126,25 @@ branch.
 | **Compaction** | 013 |
 | **Semantic Memory** | 014 |
 | **Persistence** | 015 |
-| **Mobs** | 017, 018, 019, 028, 029, 030, 031, 032, 034 |
+| **Mobs** | 017, 018, 019, 028, 029, 030, 031, 032, 034, 035 |
 | **Mobpack** | 028, 029, 030, 031, 034 |
 | **WASM Web Build** | 029, 030, 031, 032 |
-| **Comms** | 020, 024, 032, 034 |
-| **Keep-alive / long-lived sessions** | 024, 032, 034 |
-| **Multi-Provider** | 021, 032, 034 |
+| **Comms** | 020, 024, 032, 034, 035 |
+| **Keep-alive / long-lived sessions** | 024, 032, 034, 035 |
+| **Multi-Provider** | 021, 032, 034, 035 |
 | **MCP Server** | 034 |
 | **Flow Engine** | 034 |
+| **Remote Computer Control** | 035 |
+| **Scheduling** | 035 |
 | **REST API** | 022 |
-| **JSON-RPC** | 023 |
+| **JSON-RPC** | 023, 035 |
 | **Structured Output** | 008 |
 
 ## Examples by Surface
 
 | Surface | Examples |
 |---------|----------|
-| **Rust SDK** | 001, 005, 006, 009, 011-020, 024, 025, 034 |
+| **Rust SDK** | 001, 005, 006, 009, 011-020, 024, 025, 034, 035 |
 | **Python SDK** | 002, 007, 021, 022, 026 |
 | **TypeScript SDK** | 003, 008, 023, 027 |
 | **CLI (Shell)** | 004, 010, 028, 029, 030, 031 |
@@ -173,8 +176,8 @@ cd examples && npm install
 ### API Keys
 ```bash
 export ANTHROPIC_API_KEY=sk-...     # Required for most examples
-export OPENAI_API_KEY=sk-...        # Optional (examples 021, 034)
-export GEMINI_API_KEY=...           # Optional (examples 021, 034)
+export OPENAI_API_KEY=sk-...        # Optional (examples 021, 034, 035 live suite)
+export GEMINI_API_KEY=...           # Optional (examples 021, 034, 035 live suite)
 ```
 
 ## Architecture Overview
