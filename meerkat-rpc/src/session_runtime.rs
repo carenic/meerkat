@@ -1829,6 +1829,25 @@ impl SessionRuntime {
             .await;
     }
 
+    /// Wire an external comms runtime and eagerly attach the runtime executor.
+    ///
+    /// Long-lived autonomous hosts, such as remote TUX targets, must drain
+    /// incoming peer requests even when no user-driven `turn/start` is
+    /// currently active. This keeps peer ingress on the same runtime surface
+    /// used by RPC/TUX turns instead of relying on a separate helper surface.
+    #[cfg(feature = "comms")]
+    pub async fn enable_autonomous_comms_drain(
+        self: &Arc<Self>,
+        session_id: &meerkat_core::types::SessionId,
+        comms_runtime: Arc<dyn meerkat_core::agent::CommsRuntime>,
+    ) -> Result<(), RpcError> {
+        self.ensure_runtime_executor(session_id).await?;
+        self.runtime_adapter
+            .update_peer_ingress_context(session_id, true, Some(comms_runtime))
+            .await;
+        Ok(())
+    }
+
     pub fn set_skill_identity_registry(&self, registry: SourceIdentityRegistry) {
         if let Ok(mut slot) = self.skill_identity_registry.write() {
             slot.registry = registry;

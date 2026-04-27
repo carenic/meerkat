@@ -1287,7 +1287,7 @@ async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
     let jsonl_store = Arc::clone(&surface.jsonl_store);
     let mob_state = Arc::clone(&surface.mob_state);
     let system_prompt = SYSTEM_PROMPT.replace("{name}", &name);
-    let _current_session_id = create_or_resume_session(
+    let current_session_id = create_or_resume_session(
         &service,
         &runtime_adapter,
         &jsonl_store,
@@ -1296,7 +1296,7 @@ async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
         &mob_state,
         &provider,
         mcp_external_tools.as_ref().cloned(),
-        Some(Arc::clone(&comms_runtime)),
+        None,
     )
     .await?;
 
@@ -1367,6 +1367,14 @@ async fn run_kennel_mode(args: &[String]) -> anyhow::Result<()> {
         });
         rpc_runtime
     };
+    rpc_session_runtime.ensure_schedule_host_started().await?;
+    rpc_session_runtime
+        .enable_autonomous_comms_drain(
+            &current_session_id,
+            Arc::clone(&comms_runtime) as Arc<dyn meerkat_core::agent::CommsRuntime>,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("enable RPC comms drain: {}", error.message))?;
     let _ = rpc_session_runtime; // keep alive
 
     println!("=== MDM Target: {name} ===");
