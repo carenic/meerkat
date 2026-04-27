@@ -98,25 +98,6 @@ jobs:
       - name: Verify SDK wrapper freshness
         run: make verify-sdk-wrapper-freshness
 
-  rust-release-packaging:
-    name: Rust release packaging
-    if: ${{ github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: rust-release-packaging
-
-      - name: Verify release crate packaging
-        run: make check-rust-release-packaging
-
   machine-authority:
     name: Machine authority workflow
     runs-on: ubuntu-latest

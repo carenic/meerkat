@@ -155,12 +155,10 @@ Use `--dry-run` to inspect the selected packages or paths before paying the
 build cost. The Cargo and BuildBuddy gates accept `--staged`, `--committed`,
 and `--working-tree` for hook and CI routing. When using Make, pass gate flags
 with `AGENT_GATE_ARGS='--dry-run --working-tree'`.
-The optional BuildBuddy workflow remains opt-in and uses
-`scripts/buildbuddy-ci-dispatch` to choose a full workspace gate or a changed
-branch/path gate. It can be run manually, or from normal CI by setting the
-repository variable `MEERKAT_BUILDBUDDY=true` (or `1`) and adding the
-`BUILDBUDDY_API_KEY` repository secret. Without that variable, GitHub CI stays
-on the Cargo path.
+The optional BuildBuddy workflow remains opt-in and mirrors the standard Cargo
+CI lanes. It can be run manually, or from normal CI by setting the repository
+variable `MEERKAT_BUILDBUDDY=true` (or `1`) and adding the `BUILDBUDDY_API_KEY`
+repository secret. Without that variable, GitHub CI stays on the Cargo path.
 
 Default CI requires `unit`, `int`, `e2e-fast`, and `e2e-system`. Live-provider lanes stay opt-in.
 

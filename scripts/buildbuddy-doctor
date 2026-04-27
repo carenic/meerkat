@@ -253,6 +253,9 @@ if grep -Fq 'full-fresh' .github/workflows/buildbuddy.yml &&
   grep -Fq 'integration-fast:' .github/workflows/buildbuddy.yml &&
   grep -Fq 'e2e-system:' .github/workflows/buildbuddy.yml &&
   grep -Fq 'SDK suites + parity gates' .github/workflows/buildbuddy.yml &&
+  ! grep -Fq 'changed-gate:' .github/workflows/buildbuddy.yml &&
+  ! grep -Fq 'Changed-path gate (Bazel/RBE)' .github/workflows/buildbuddy.yml &&
+  ! grep -Fq 'rust-release-packaging:' .github/workflows/buildbuddy.yml &&
   ! grep -Fq 'e2e-smoke:' .github/workflows/buildbuddy.yml &&
   grep -Fq 'BuildBuddy E2E smoke lane' .github/workflows/live-e2e.yml &&
   ! grep -Fq 'Build + clippy (Bazel/RBE)' .github/workflows/buildbuddy.yml &&
@@ -310,8 +313,8 @@ else
   bad "BuildBuddy full lanes still contain placeholder test routing"
 fi
 
-if grep -Fq 'rust-release-packaging:' .github/workflows/ci.yml &&
-  grep -Fq "github.event_name == 'workflow_dispatch'" .github/workflows/ci.yml &&
+if ! grep -Fq 'rust-release-packaging:' .github/workflows/ci.yml &&
+  grep -Fq 'Verify Rust release packaging' .github/workflows/release.yml &&
   grep -Fq 'e2e-system' .github/workflows/ci.yml &&
   ! grep -Fq 'e2e-live:' .github/workflows/ci.yml &&
   ! grep -Fq 'e2e-smoke:' .github/workflows/ci.yml &&

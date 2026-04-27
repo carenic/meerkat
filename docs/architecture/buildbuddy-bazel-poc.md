@@ -153,12 +153,8 @@ Bazel output root, and cleans up the temporary output roots. Use `--warm` to
 reuse a stable output root for repeated local or agent gates. The optional
 `.github/workflows/buildbuddy.yml` workflow can run manually or as a reusable
 workflow called by CI, requires a `BUILDBUDDY_API_KEY` secret, installs the
-pinned `bb` binary, dispatches through `scripts/buildbuddy-ci-dispatch`, and
-uploads the BuildBuddy log directory as a workflow artifact. The dispatcher
-writes `dispatch-context.txt` and `dispatch-inputs.txt` when
-`MEERKAT_BUILDBUDDY_LOG_ROOT` is set, so changed-path runs have
-commit/toolchain context even when they do not use the workspace CI summary
-writer. Normal GitHub CI remains Cargo-based unless the repository variable
+pinned `bb` binary, and exposes the same standard lane boundaries as Cargo CI.
+Normal GitHub CI remains Cargo-based unless the repository variable
 `MEERKAT_BUILDBUDDY=true` (or `1`) enables the optional CI job.
 
 The dispatch modes are:
@@ -167,10 +163,10 @@ The dispatch modes are:
   roots.
 - `workspace-warm`: full optional BuildBuddy workspace CI with a reusable output
   root.
-- `changed-committed`: changed-path BuildBuddy gate for branch commits relative
-  to a base revision.
-- `changed-paths`: changed-path BuildBuddy gate for explicit whitespace or
-  newline separated paths.
+- `changed-committed`: local changed-path BuildBuddy gate for branch commits
+  relative to a base revision, via `scripts/buildbuddy-ci-dispatch`.
+- `changed-paths`: local changed-path BuildBuddy gate for explicit whitespace or
+  newline separated paths, via `scripts/buildbuddy-ci-dispatch`.
 
 Use `owned` for the smallest honest changed-path closure, or `affected` when a
 change touches shared crates and you want reverse-dependency confidence.
@@ -391,16 +387,16 @@ to roughly `4-6s` once those lanes were prepared.
 - For the remote-compatible BuildBuddy gate, run `make buildbuddy-ci`, or
   `make buildbuddy-ci-warm` when repeated agents can reuse a stable output root.
 - To mirror the manual GitHub workflow locally, run
-  `scripts/buildbuddy-ci-dispatch --mode workspace-fresh`,
-  `scripts/buildbuddy-ci-dispatch --mode changed-committed --base origin/main`,
-  or `scripts/buildbuddy-ci-dispatch --mode changed-paths --paths '<paths>'`.
+  `scripts/buildbuddy-ci-dispatch --mode workspace-fresh`. For local changed
+  path checks, run
+  `scripts/buildbuddy-ci-dispatch --mode changed-committed --base origin/main`
+  or
+  `scripts/buildbuddy-ci-dispatch --mode changed-paths --paths '<paths>'`.
 - To enable the optional BuildBuddy job inside normal GitHub CI, add the
   `BUILDBUDDY_API_KEY` repository secret and set the repository variable
   `MEERKAT_BUILDBUDDY=true` (or `1`). The default reusable-workflow mode is
-  `full-fresh`; override it with `MEERKAT_BUILDBUDDY_CI_MODE`,
-  `MEERKAT_BUILDBUDDY_CHANGED_MODE`, `MEERKAT_BUILDBUDDY_BASE`, or
-  `MEERKAT_BUILDBUDDY_CHANGED_PATHS` when a branch or rollout needs a broader
-  gate.
+  `full-fresh`; override it with `MEERKAT_BUILDBUDDY_CI_MODE` when a manual or
+  reusable run needs a single standard lane.
 - For same-checkout multi-agent work, prefer a distinct `RUST_LANE_ID` per
   agent for stable warm lanes. `scripts/repo-cargo` also falls back to
   `MEERKAT_AGENT_LANE` and `CODEX_AGENT_ID`, so Codex-style agent processes get

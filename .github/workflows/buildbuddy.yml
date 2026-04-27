@@ -12,21 +12,6 @@ on:
         required: false
         default: full-fresh
         type: string
-      changed_mode:
-        description: Changed-path selector breadth
-        required: false
-        default: owned
-        type: string
-      base:
-        description: Base revision for changed-committed mode
-        required: false
-        default: origin/main
-        type: string
-      paths:
-        description: Whitespace or newline separated paths for changed-paths mode
-        required: false
-        default: ""
-        type: string
     secrets:
       BUILDBUDDY_API_KEY:
         required: true
@@ -58,7 +43,6 @@ on:
           - workspace-warm
           - fmt-lint
           - sdk-suites
-          - rust-release-packaging
           - machine-authority
           - rmat-audit
           - seam-inventory
@@ -74,25 +58,6 @@ on:
           - test-feature-matrix-surface-checks
           - wasm-check
           - audit
-          - changed-committed
-          - changed-paths
-      changed_mode:
-        description: Changed-path selector breadth
-        required: true
-        default: owned
-        type: choice
-        options:
-          - owned
-          - affected
-      base:
-        description: Base revision for changed-committed mode
-        required: false
-        default: origin/main
-        type: string
-      paths:
-        description: Whitespace or newline separated paths for changed-paths mode
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -201,21 +166,6 @@ jobs:
       - uses: ./.github/actions/run-buildbuddy-ci-lane
         with:
           lane: sdk-suites
-          profile: native
-          mode: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh') || 'full-fresh' }}
-
-  rust-release-packaging:
-    name: Rust release packaging
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'rust-release-packaging' }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: ./.github/actions/run-buildbuddy-ci-lane
-        with:
-          lane: rust-release-packaging
           profile: native
           mode: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh') || 'full-fresh' }}
 
@@ -368,41 +318,6 @@ jobs:
           lane: audit
           profile: native
           mode: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh') || 'full-fresh' }}
-
-  changed-gate:
-    name: Changed-path gate (Bazel/RBE)
-    if: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.mode == 'changed-committed' || inputs.mode == 'changed-paths') }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup BuildBuddy CI
-        uses: ./.github/actions/setup-buildbuddy-ci
-        with:
-          profile: native
-
-      - name: Changed-path gate
-        env:
-          MEERKAT_BUILDBUDDY_CI_MODE: ${{ inputs.mode }}
-          MEERKAT_BUILDBUDDY_CHANGED_MODE: ${{ inputs.changed_mode || vars.MEERKAT_BUILDBUDDY_CHANGED_MODE || 'owned' }}
-          MEERKAT_BUILDBUDDY_BASE: ${{ inputs.base || vars.MEERKAT_BUILDBUDDY_BASE || 'origin/main' }}
-          MEERKAT_BUILDBUDDY_CHANGED_PATHS: ${{ inputs.paths || vars.MEERKAT_BUILDBUDDY_CHANGED_PATHS || '' }}
-          MEERKAT_BUILDBUDDY_LOG_ROOT: ${{ runner.temp }}/buildbuddy-logs
-        run: |
-          set -o pipefail
-          mkdir -p "${MEERKAT_BUILDBUDDY_LOG_ROOT}"
-          scripts/buildbuddy-ci-dispatch 2>&1 | tee "${MEERKAT_BUILDBUDDY_LOG_ROOT}/dispatch.log"
-
-      - name: Upload BuildBuddy logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: buildbuddy-logs-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/buildbuddy-logs
-          if-no-files-found: ignore
 
   gate:
     name: BuildBuddy CI gate
