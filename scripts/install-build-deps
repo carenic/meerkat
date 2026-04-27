@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "${script_dir}/.." && git rev-parse --path-format=absolute --show-toplevel)"
+toolchain_file="${repo_root}/rust-toolchain.toml"
+
+usage() {
+  cat <<'EOF'
+usage: scripts/install-build-deps
+
+Installs the Rust toolchain needed by the default Make/Cargo lanes.
+The Rust version and components come from rust-toolchain.toml.
+EOF
+}
+
+if [[ "${1-}" == "-h" || "${1-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+rust_channel="$(
+  awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' "${toolchain_file}"
+)"
+
+if [[ -z "${rust_channel}" ]]; then
+  echo "error: could not read Rust channel from ${toolchain_file}" >&2
+  exit 1
+fi
+
+cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
+export CARGO_HOME="${cargo_home}"
+export PATH="${CARGO_HOME}/bin:${PATH}"
+
+download_rustup_init() {
+  local output="$1"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o "${output}"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "${output}" https://sh.rustup.rs
+  else
+    echo "error: curl or wget is required to install rustup" >&2
+    exit 1
+  fi
+}
+
+if ! command -v rustup >/dev/null 2>&1; then
+  tmp_rustup="$(mktemp)"
+  trap 'rm -f "${tmp_rustup}"' EXIT
+
+  echo "Installing rustup into ${CARGO_HOME}..."
+  download_rustup_init "${tmp_rustup}"
+  sh "${tmp_rustup}" -y --no-modify-path --profile minimal --default-toolchain none
+  hash -r
+fi
+
+echo "Installing Rust ${rust_channel} with rustfmt and clippy..."
+rustup toolchain install "${rust_channel}" \
+  --profile minimal \
+  --component rustfmt \
+  --component clippy
+
+echo
+rustup run "${rust_channel}" cargo --version
+rustup run "${rust_channel}" rustc --version
+rustup run "${rust_channel}" rustfmt --version
+rustup run "${rust_channel}" cargo clippy --version
+
+echo
+echo "Rust build dependencies are installed."
+echo "For interactive shells, add ${CARGO_HOME}/bin to PATH or source ${CARGO_HOME}/env."
