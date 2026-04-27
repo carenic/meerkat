@@ -25,22 +25,22 @@ pub enum ProviderKind {
     Gemini,
 }
 
+pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
+pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3.1-flash-lite-preview";
+
 /// Probe env vars in priority order and return `(model, provider, api_key)`.
 ///
 /// Checks `OPENAI_API_KEY` → `ANTHROPIC_API_KEY` → `GEMINI_API_KEY`.
 pub fn auto_detect() -> Option<(String, ProviderKind, String)> {
     if let Ok(k) = std::env::var("OPENAI_API_KEY") {
-        return Some(("gpt-5.5".into(), ProviderKind::Openai, k));
+        return Some((DEFAULT_OPENAI_MODEL.into(), ProviderKind::Openai, k));
     }
     if let Ok(k) = std::env::var("ANTHROPIC_API_KEY") {
-        return Some(("claude-sonnet-4-6".into(), ProviderKind::Anthropic, k));
+        return Some((DEFAULT_ANTHROPIC_MODEL.into(), ProviderKind::Anthropic, k));
     }
     if let Ok(k) = std::env::var("GEMINI_API_KEY") {
-        return Some((
-            "gemini-3.1-flash-lite-preview".into(),
-            ProviderKind::Gemini,
-            k,
-        ));
+        return Some((DEFAULT_GEMINI_MODEL.into(), ProviderKind::Gemini, k));
     }
     None
 }

@@ -393,3 +393,18 @@ pub async fn handle_tool_call(
         ))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advertised_model_defaults_are_current() {
+        let schema = serde_json::to_string(&tools_list()).expect("tools schema serializes");
+
+        assert!(schema.contains("gpt-5.5"));
+        assert!(schema.contains("claude-opus-4-7"));
+        assert!(!schema.contains("gpt-5.4"));
+        assert!(!schema.contains("claude-opus-4-6"));
+    }
+}

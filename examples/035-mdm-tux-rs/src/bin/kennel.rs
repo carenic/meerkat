@@ -10,7 +10,7 @@ use mdm_tux::machines::kennel_target_control::{
 use mdm_tux::{
     ClaimGrant, KennelPayload, KennelTargetState, LeaseTerminationReason, LeaseView, ListScope,
     ProviderKind, SignedKennelEnvelope, TargetListEntry, TargetRegistrationRejectReason,
-    build_signed_envelope, load_or_generate_keypair, read_envelope, verify_envelope,
+    DEFAULT_OPENAI_MODEL, build_signed_envelope, load_or_generate_keypair, read_envelope, verify_envelope,
     write_envelope,
 };
 use meerkat_mob::definition::{BackendConfig, ExternalBackendConfig, WiringRules};
@@ -79,7 +79,8 @@ async fn main() -> anyhow::Result<()> {
         );
         std::process::exit(1);
     }
-    let hive_model = find_flag(&args, "--hive-model").unwrap_or_else(|| "gpt-5.5".to_string());
+    let hive_model =
+        find_flag(&args, "--hive-model").unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string());
     let hive_provider = match find_flag(&args, "--hive-provider") {
         Some(provider) => Some(
             provider

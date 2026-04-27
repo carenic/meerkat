@@ -195,3 +195,41 @@ pub fn mob_definition(
     definition.spawn_policy = spawn_policy;
     definition
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn built_in_pack_defaults_use_current_generation_models() {
+        let registry = PackRegistry::new();
+        let mut models = Vec::new();
+
+        for pack in registry.all() {
+            let definition = pack.definition("check defaults", "", &BTreeMap::new(), None);
+            for binding in definition.profiles.values() {
+                let profile = binding
+                    .as_inline()
+                    .expect("built-in packs should use inline profiles");
+                models.push(profile.model.clone());
+            }
+        }
+
+        assert!(
+            models.iter().any(|model| model == "gpt-5.5"),
+            "OpenAI default should include gpt-5.5: {models:?}"
+        );
+        assert!(
+            models.iter().any(|model| model == "claude-opus-4-7"),
+            "Anthropic default should include claude-opus-4-7: {models:?}"
+        );
+        assert!(
+            !models.iter().any(|model| model == "gpt-5.4"),
+            "advanced packs should not regress to gpt-5.4: {models:?}"
+        );
+        assert!(
+            !models.iter().any(|model| model == "claude-opus-4-6"),
+            "advanced packs should not regress to claude-opus-4-6: {models:?}"
+        );
+    }
+}
