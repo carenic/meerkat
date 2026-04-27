@@ -179,13 +179,15 @@ fi
 
 if grep -Fq '/vendor/oai-rt-rs' scripts/buildbuddy-bazel-poc &&
   grep -Fq 'original.replace' scripts/buildbuddy-bazel-poc &&
-  grep -Fq -- '--lockfile_mode=refresh' scripts/buildbuddy-bazel-poc &&
+  grep -Fq -- '--lockfile_mode="${BUILDBUDDY_LOCKFILE_MODE:-error}"' scripts/buildbuddy-bazel-poc &&
+  ! grep -Fq -- '--lockfile_mode=refresh' scripts/buildbuddy-bazel-poc &&
   grep -Fq 'restore_module_lock' scripts/buildbuddy-bazel-poc &&
   grep -Fq 'local_oai_vendor_build' scripts/buildbuddy-bazel-poc &&
-  grep -Fq 'BUILDBUDDY_KEEP_LOCK_REFRESH' scripts/buildbuddy-bazel-poc; then
-  pass "BuildBuddy launcher refreshes stale local path dependency locks without dirtying the worktree"
+  grep -Fq 'local_oai_vendor_build_backup' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'git -C "${workspace_root}" status --porcelain -- vendor/oai-rt-rs/BUILD.bazel' scripts/buildbuddy-bazel-poc; then
+  pass "BuildBuddy launcher rebases stale local path locks and restores vendored BUILD bytes"
 else
-  bad "BuildBuddy launcher does not refresh stale local path dependency locks safely"
+  bad "BuildBuddy launcher does not rebase stale local path dependency locks safely"
 fi
 
 if grep -Fq 'name = "package_runfiles"' vendor/oai-rt-rs/BUILD.bazel &&

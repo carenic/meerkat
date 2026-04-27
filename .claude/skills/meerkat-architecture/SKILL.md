@@ -38,9 +38,12 @@ Architectural split:
   explicit `make buildbuddy-*` targets for local RBE lanes; avoid raw `bb`
   except when debugging the wrapper.
 - `scripts/buildbuddy-bazel-poc` is the lower-level Bazel launcher and
-  compatibility layer. It may temporarily refresh Bazel lock metadata for local
-  absolute path dependencies, then restores checked-in generated files unless
-  `BUILDBUDDY_KEEP_LOCK_REFRESH=1` is set.
+  compatibility layer. It may temporarily rebase stale absolute local path
+  dependencies in `MODULE.bazel.lock`, runs local lanes with
+  `--lockfile_mode=error` against checked-in Bazel metadata, and restores the
+  checked-in lockfile plus vendored generated BUILD bytes after Bazel exits.
+  Persistent BUILD regeneration and module-lock updates are explicit maintenance
+  steps, not normal local BuildBuddy lane behavior.
 - `.github/workflows/ci.yml` selects exactly one backend. Cargo and BuildBuddy
   reusable workflows remain separate so CI lanes stay visible and comparable.
 
