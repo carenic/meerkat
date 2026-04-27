@@ -281,6 +281,14 @@ where
                         })?;
                     visibility_changed = true;
                 }
+                crate::ops::SessionEffect::AppendAssistantBlocks { blocks } => {
+                    self.session.push(crate::types::Message::BlockAssistant(
+                        crate::types::BlockAssistantMessage {
+                            blocks: blocks.clone(),
+                            stop_reason: crate::types::StopReason::EndTurn,
+                        },
+                    ));
+                }
             }
         }
 

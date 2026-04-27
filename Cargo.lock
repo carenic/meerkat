@@ -2371,6 +2371,7 @@ dependencies = [
  "schemars 1.2.1",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -2422,6 +2423,7 @@ dependencies = [
  "strum",
  "thiserror 2.0.18",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -2458,6 +2460,7 @@ version = "0.6.0"
 dependencies = [
  "async-stream",
  "async-trait",
+ "axum",
  "base64",
  "chrono",
  "futures",
@@ -2471,6 +2474,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tokio_with_wasm",
 ]
 
@@ -3009,6 +3013,7 @@ dependencies = [
  "meerkat-comms",
  "meerkat-contracts",
  "meerkat-core",
+ "meerkat-llm-core",
  "meerkat-mcp",
  "meerkat-runtime",
  "meerkat-skills",
