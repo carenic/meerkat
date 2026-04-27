@@ -504,6 +504,15 @@ pub enum ImageGenerationWarning {
         requested: NonZeroU32,
         returned: NonZeroU32,
     },
+    ProviderExecutionFailed {
+        message: String,
+    },
+    BlobCommitFailed {
+        message: String,
+    },
+    ProviderTextCaptureFailed {
+        message: String,
+    },
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -1395,6 +1404,15 @@ mod tests {
         roundtrip(ImageGenerationWarning::ProviderReturnedFewerImages {
             requested: NonZeroU32::new(2).unwrap(),
             returned: NonZeroU32::new(1).unwrap(),
+        });
+        roundtrip(ImageGenerationWarning::ProviderExecutionFailed {
+            message: "provider unavailable".into(),
+        });
+        roundtrip(ImageGenerationWarning::BlobCommitFailed {
+            message: "blob store unavailable".into(),
+        });
+        roundtrip(ImageGenerationWarning::ProviderTextCaptureFailed {
+            message: "text capture unavailable".into(),
         });
 
         roundtrip(ProviderImageMetadata::NotEmitted);

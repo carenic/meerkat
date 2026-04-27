@@ -34,6 +34,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `model_routing_image_operation_phases`: `Map<String, RoutingImageOperationPhase>`
 - `model_routing_image_operation_target_models`: `Map<String, String>`
 - `model_routing_image_operation_realtime`: `Map<String, Bool>`
+- `model_routing_image_operation_requires_scoped_override`: `Map<String, Bool>`
 - `model_routing_image_terminals`: `Map<String, RoutingImageTerminal>`
 - `model_routing_image_terminal_payloads`: `Map<String, String>`
 - `model_routing_image_denials`: `Map<String, RoutingDenialReason>`
@@ -111,7 +112,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RequestUntilChangedSwitchTurn`(request_id: String, target_model: String, target_realtime_capable: Bool, requires_approval: Bool, approval_available: Bool, approval_denied: Bool, realtime_detach_allowed: Bool)
 - `CompleteUntilChangedSwitchTurnReconfigure`(request_id: String)
 - `AdmitModelRoutingAssistantTurn`
-- `BeginImageOperation`(operation_id: String, target_model: String, target_realtime_capable: Bool, requires_approval: Bool, approval_available: Bool, approval_denied: Bool, realtime_detach_allowed: Bool)
+- `BeginImageOperation`(operation_id: String, target_model: String, target_realtime_capable: Bool, requires_approval: Bool, approval_available: Bool, approval_denied: Bool, realtime_detach_allowed: Bool, requires_scoped_override: Bool)
 - `ActivateImageOperationOverride`(operation_id: String, target_model: String, target_realtime_capable: Bool)
 - `CompleteImageOperation`(operation_id: String, terminal: RoutingImageTerminal, terminal_payload: String)
 - `RestoreImageOperationOverride`(operation_id: String)
@@ -750,7 +751,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginImageOperationScopedConflictIdle`
 - From: `Idle`
-- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed)
+- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed, requires_scoped_override)
 - Guards:
   - `operation_in_operation_conflict`
 - Emits: `ImageOperationDenied`
@@ -758,7 +759,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginImageOperationScopedConflictAttached`
 - From: `Attached`
-- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed)
+- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed, requires_scoped_override)
 - Guards:
   - `operation_in_operation_conflict`
 - Emits: `ImageOperationDenied`
@@ -766,7 +767,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginImageOperationScopedConflictRunning`
 - From: `Running`
-- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed)
+- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed, requires_scoped_override)
 - Guards:
   - `operation_in_operation_conflict`
 - Emits: `ImageOperationDenied`
@@ -774,7 +775,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginImageOperationRealtimeConflictIdle`
 - From: `Idle`
-- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed)
+- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed, requires_scoped_override)
 - Guards:
   - `realtime_conflict`
 - Emits: `ImageOperationDenied`
@@ -782,7 +783,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginImageOperationRealtimeConflictAttached`
 - From: `Attached`
-- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed)
+- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed, requires_scoped_override)
 - Guards:
   - `realtime_conflict`
 - Emits: `ImageOperationDenied`
@@ -790,7 +791,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginImageOperationRealtimeConflictRunning`
 - From: `Running`
-- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed)
+- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed, requires_scoped_override)
 - Guards:
   - `realtime_conflict`
 - Emits: `ImageOperationDenied`
@@ -798,7 +799,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginImageOperationApprovalUnavailableIdle`
 - From: `Idle`
-- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed)
+- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed, requires_scoped_override)
 - Guards:
   - `approval_unavailable`
 - Emits: `ImageOperationDenied`
@@ -806,7 +807,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginImageOperationApprovalUnavailableAttached`
 - From: `Attached`
-- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed)
+- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed, requires_scoped_override)
 - Guards:
   - `approval_unavailable`
 - Emits: `ImageOperationDenied`
@@ -814,7 +815,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginImageOperationApprovalUnavailableRunning`
 - From: `Running`
-- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed)
+- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed, requires_scoped_override)
 - Guards:
   - `approval_unavailable`
 - Emits: `ImageOperationDenied`
@@ -822,7 +823,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginImageOperationApprovalDeniedIdle`
 - From: `Idle`
-- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed)
+- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed, requires_scoped_override)
 - Guards:
   - `approval_denied`
 - Emits: `ImageOperationDenied`, `ModelRoutingApprovalTerminalized`
@@ -830,7 +831,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginImageOperationApprovalDeniedAttached`
 - From: `Attached`
-- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed)
+- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed, requires_scoped_override)
 - Guards:
   - `approval_denied`
 - Emits: `ImageOperationDenied`, `ModelRoutingApprovalTerminalized`
@@ -838,7 +839,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginImageOperationApprovalDeniedRunning`
 - From: `Running`
-- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed)
+- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed, requires_scoped_override)
 - Guards:
   - `approval_denied`
 - Emits: `ImageOperationDenied`, `ModelRoutingApprovalTerminalized`
@@ -846,7 +847,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginImageOperationAcceptedIdle`
 - From: `Idle`
-- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed)
+- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed, requires_scoped_override)
 - Guards:
   - `baseline_known`
   - `no_operation_in_operation`
@@ -857,7 +858,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginImageOperationAcceptedAttached`
 - From: `Attached`
-- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed)
+- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed, requires_scoped_override)
 - Guards:
   - `baseline_known`
   - `no_operation_in_operation`
@@ -868,7 +869,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginImageOperationAcceptedRunning`
 - From: `Running`
-- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed)
+- On: `BeginImageOperation`(operation_id, target_model, target_realtime_capable, requires_approval, approval_available, approval_denied, realtime_detach_allowed, requires_scoped_override)
 - Guards:
   - `baseline_known`
   - `no_operation_in_operation`
@@ -882,6 +883,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `ActivateImageOperationOverride`(operation_id, target_model, target_realtime_capable)
 - Guards:
   - `operation_plan_resolved`
+  - `operation_requires_scoped_override`
   - `no_operation_override_active`
 - Emits: `ImageOperationPhaseChanged`, `ModelRoutingStatusChanged`
 - To: `Idle`
@@ -891,6 +893,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `ActivateImageOperationOverride`(operation_id, target_model, target_realtime_capable)
 - Guards:
   - `operation_plan_resolved`
+  - `operation_requires_scoped_override`
   - `no_operation_override_active`
 - Emits: `ImageOperationPhaseChanged`, `ModelRoutingStatusChanged`
 - To: `Attached`
@@ -900,6 +903,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `ActivateImageOperationOverride`(operation_id, target_model, target_realtime_capable)
 - Guards:
   - `operation_plan_resolved`
+  - `operation_requires_scoped_override`
   - `no_operation_override_active`
 - Emits: `ImageOperationPhaseChanged`, `ModelRoutingStatusChanged`
 - To: `Running`
@@ -909,6 +913,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `CompleteImageOperation`(operation_id, terminal, terminal_payload)
 - Guards:
   - `operation_active`
+  - `operation_requires_scoped_override`
 - Emits: `ImageOperationPhaseChanged`
 - To: `Idle`
 
@@ -917,6 +922,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `CompleteImageOperation`(operation_id, terminal, terminal_payload)
 - Guards:
   - `operation_active`
+  - `operation_requires_scoped_override`
 - Emits: `ImageOperationPhaseChanged`
 - To: `Attached`
 
@@ -925,6 +931,37 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `CompleteImageOperation`(operation_id, terminal, terminal_payload)
 - Guards:
   - `operation_active`
+  - `operation_requires_scoped_override`
+- Emits: `ImageOperationPhaseChanged`
+- To: `Running`
+
+### `CompleteImageOperationWithoutScopedOverrideIdle`
+- From: `Idle`
+- On: `CompleteImageOperation`(operation_id, terminal, terminal_payload)
+- Guards:
+  - `operation_plan_resolved`
+  - `operation_does_not_require_scoped_override`
+  - `no_operation_override_active`
+- Emits: `ImageOperationPhaseChanged`
+- To: `Idle`
+
+### `CompleteImageOperationWithoutScopedOverrideAttached`
+- From: `Attached`
+- On: `CompleteImageOperation`(operation_id, terminal, terminal_payload)
+- Guards:
+  - `operation_plan_resolved`
+  - `operation_does_not_require_scoped_override`
+  - `no_operation_override_active`
+- Emits: `ImageOperationPhaseChanged`
+- To: `Attached`
+
+### `CompleteImageOperationWithoutScopedOverrideRunning`
+- From: `Running`
+- On: `CompleteImageOperation`(operation_id, terminal, terminal_payload)
+- Guards:
+  - `operation_plan_resolved`
+  - `operation_does_not_require_scoped_override`
+  - `no_operation_override_active`
 - Emits: `ImageOperationPhaseChanged`
 - To: `Running`
 

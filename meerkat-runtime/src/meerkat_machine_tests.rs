@@ -79,6 +79,7 @@ fn image_request(n: u128, target_model: &str) -> ImageOperationRoutingRequest {
         target_realtime: realtime_policy(true),
         approval: ModelRoutingApprovalDisposition::NotRequired,
         approval_reason: None,
+        requires_scoped_override: true,
     }
 }
 

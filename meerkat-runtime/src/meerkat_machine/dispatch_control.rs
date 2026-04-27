@@ -711,6 +711,7 @@ impl MeerkatMachine {
                             crate::meerkat_machine_types::ModelRoutingApprovalDisposition::DeniedByUser
                         ),
                         realtime_detach_allowed: request.target_realtime.allow_realtime_detach,
+                        requires_scoped_override: request.requires_scoped_override,
                     },
                     "BeginImageOperation",
                 )
@@ -780,10 +781,11 @@ impl MeerkatMachine {
                 operation_id,
                 terminal,
             } => {
+                let operation_key = image_operation_key(operation_id);
                 self.apply_session_dsl_input(
                     &session_id,
                     crate::meerkat_machine::dsl::MeerkatMachineInput::CompleteImageOperation {
-                        operation_id: image_operation_key(operation_id),
+                        operation_id: operation_key.clone(),
                         terminal: routing_image_terminal(terminal.clone()),
                         terminal_payload: serde_json::to_string(&terminal).map_err(|err| {
                             RuntimeControlPlaneError::Internal(format!(
@@ -795,9 +797,21 @@ impl MeerkatMachine {
                 )
                 .await
                 .map_err(RuntimeControlPlaneError::Internal)?;
-                Ok(MeerkatMachineCommandResult::ImageOperationPhase(
-                    meerkat_core::image_generation::ImageOperationPhase::RestoringScopedOverride,
-                ))
+                let state = self.session_dsl_state(&session_id).await?;
+                let phase = if state
+                    .model_routing_image_operation_phases
+                    .get(&operation_key)
+                    .is_some_and(|phase| {
+                        matches!(
+                            phase,
+                            crate::meerkat_machine::dsl::RoutingImageOperationPhase::Terminal
+                        )
+                    }) {
+                    meerkat_core::image_generation::ImageOperationPhase::Terminal { terminal }
+                } else {
+                    meerkat_core::image_generation::ImageOperationPhase::RestoringScopedOverride
+                };
+                Ok(MeerkatMachineCommandResult::ImageOperationPhase(phase))
             }
             MeerkatMachineCommand::RestoreImageOperationOverride {
                 session_id,

@@ -262,6 +262,15 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `CompleteImageOperationRunning`
   - anchors: `meerkat_machine`
   - scenarios: `model_routing_and_image_operation`
+- `CompleteImageOperationWithoutScopedOverrideIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `model_routing_and_image_operation`
+- `CompleteImageOperationWithoutScopedOverrideAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `model_routing_and_image_operation`
+- `CompleteImageOperationWithoutScopedOverrideRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `model_routing_and_image_operation`
 - `RestoreImageOperationOverrideIdle`
   - anchors: `meerkat_machine`
   - scenarios: `model_routing_and_image_operation`

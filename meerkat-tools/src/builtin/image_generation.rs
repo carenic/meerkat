@@ -2,10 +2,13 @@
 
 use crate::builtin::{BuiltinTool, BuiltinToolError, ToolOutput};
 use async_trait::async_trait;
+use base64::Engine;
 use meerkat_core::image_generation::{
-    AssistantImageId, AssistantImageRef, GenerateImageRequest, ImageGenerationResolvedPlan,
-    ImageGenerationToolResult, ImageOperationDenialReason, ImageOperationId, ImageOperationPhase,
-    ImageOperationTerminalClass, ProviderTextDisposition,
+    AssistantImageId, AssistantImageRef, GenerateImageExecutionPlan, GenerateImageRequest,
+    ImageGenerationResolvedPlan, ImageGenerationToolResult, ImageOperationApprovalReason,
+    ImageOperationDenialReason, ImageOperationId, ImageOperationPhase, ImageOperationTerminalClass,
+    PostActivationImageDenialReason, PostActivationImageTerminal, ProviderTextDisposition,
+    TextArtifactRef,
 };
 use meerkat_core::ops::SessionEffect;
 use meerkat_core::types::{AssistantBlock, ToolDef, ToolProvenance, ToolSourceKind};
@@ -22,6 +25,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
+use tracing::warn;
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -208,6 +212,9 @@ impl BuiltinTool for GenerateImageTool {
             }
         };
 
+        let requires_scoped_override = execution_plan_requires_scoped_override(&resolved_plan);
+        let (approval, approval_reason) = approval_for_resolved_plan(&resolved_plan);
+
         match self
             .runtime
             .machine
@@ -220,8 +227,9 @@ impl BuiltinTool for GenerateImageTool {
                         target_realtime_capable: resolved_plan.machine_routing_realtime_capable,
                         allow_realtime_detach: false,
                     },
-                    approval: ModelRoutingApprovalDisposition::NotRequired,
-                    approval_reason: None,
+                    approval,
+                    approval_reason,
+                    requires_scoped_override,
                 },
             )
             .await
@@ -243,11 +251,13 @@ impl BuiltinTool for GenerateImageTool {
             ImageOperationRoutingResult::Accepted { .. } => {}
         }
 
-        self.runtime
-            .machine
-            .activate_image_operation_override(&self.runtime.session_id, operation_id)
-            .await
-            .map_err(|err| BuiltinToolError::execution_failed(err.to_string()))?;
+        if requires_scoped_override {
+            self.runtime
+                .machine
+                .activate_image_operation_override(&self.runtime.session_id, operation_id)
+                .await
+                .map_err(|err| BuiltinToolError::execution_failed(err.to_string()))?;
+        }
 
         let provider_output = self
             .runtime
@@ -270,56 +280,95 @@ impl BuiltinTool for GenerateImageTool {
                         (output, images, terminal)
                     }
                     Err(err) => {
-                        let mut output = output;
-                        output.terminal = ImageOperationTerminalClass::Failed;
-                        output.images.clear();
-                        let _ = err;
-                        (output, Vec::new(), ImageOperationTerminalClass::Failed)
+                        warn!(
+                            ?operation_id,
+                            error = %err,
+                            "failed to commit generated image blobs"
+                        );
+                        let mut failed = failed_provider_output(operation_id);
+                        failed.warnings.push(
+                            meerkat_core::ImageGenerationWarning::BlobCommitFailed { message: err },
+                        );
+                        (failed, Vec::new(), ImageOperationTerminalClass::Failed)
                     }
                 }
             }
-            Err(err) => (
-                ProviderImageGenerationOutput {
-                    operation_id,
-                    terminal: ImageOperationTerminalClass::Failed,
-                    images: Vec::new(),
-                    provider_text: None,
-                    revised_prompt:
-                        meerkat_core::image_generation::RevisedPromptDisposition::NotRequested,
-                    native_metadata:
-                        meerkat_core::image_generation::ProviderImageMetadata::NotEmitted,
-                    warnings: Vec::new(),
-                },
-                Vec::new(),
-                {
-                    let _ = err;
-                    ImageOperationTerminalClass::Failed
-                },
-            ),
+            Err(err) => {
+                warn!(
+                    ?operation_id,
+                    error = %err,
+                    "image generation provider execution failed"
+                );
+                let mut failed = failed_provider_output(operation_id);
+                failed.warnings.push(
+                    meerkat_core::ImageGenerationWarning::ProviderExecutionFailed {
+                        message: err.to_string(),
+                    },
+                );
+                (failed, Vec::new(), ImageOperationTerminalClass::Failed)
+            }
         };
 
-        self.runtime
+        let completed = match self
+            .runtime
             .machine
             .complete_image_operation(&self.runtime.session_id, operation_id, terminal)
             .await
-            .map_err(|err| BuiltinToolError::execution_failed(err.to_string()))?;
-        let restored = self
-            .runtime
-            .machine
-            .restore_image_operation_override(&self.runtime.session_id, operation_id)
-            .await
-            .map_err(|err| BuiltinToolError::execution_failed(err.to_string()))?;
-        let terminal = match restored {
-            ImageOperationPhase::Terminal { terminal } => terminal,
-            _ => provider_output.terminal.clone(),
+        {
+            Ok(phase) => phase,
+            Err(err) => {
+                if requires_scoped_override
+                    && let Err(restore_err) = self
+                        .runtime
+                        .machine
+                        .restore_image_operation_override(&self.runtime.session_id, operation_id)
+                        .await
+                {
+                    warn!(
+                        ?operation_id,
+                        error = %restore_err,
+                        "failed to restore image operation override after completion error"
+                    );
+                }
+                return Err(BuiltinToolError::execution_failed(err.to_string()));
+            }
         };
 
-        let provider_text = provider_output
-            .provider_text
-            .as_ref()
-            .map(|_| ProviderTextDisposition::EmittedButNotStored)
-            .unwrap_or(ProviderTextDisposition::NotEmitted);
-        let result = provider_output.to_tool_result(committed_images.clone(), provider_text);
+        let terminal = if requires_scoped_override {
+            let restored = self
+                .runtime
+                .machine
+                .restore_image_operation_override(&self.runtime.session_id, operation_id)
+                .await
+                .map_err(|err| BuiltinToolError::execution_failed(err.to_string()))?;
+            match restored {
+                ImageOperationPhase::Terminal { terminal } => terminal,
+                phase => {
+                    return Err(BuiltinToolError::execution_failed(format!(
+                        "image operation machine did not terminalize after scoped restore: {phase:?}"
+                    )));
+                }
+            }
+        } else {
+            match completed {
+                ImageOperationPhase::Terminal { terminal } => terminal,
+                phase => {
+                    return Err(BuiltinToolError::execution_failed(format!(
+                        "image operation machine did not terminalize without scoped override: {phase:?}"
+                    )));
+                }
+            }
+        };
+
+        let (provider_text, provider_text_warning) = capture_provider_text(
+            &*self.runtime.blob_store,
+            provider_output.provider_text.as_deref(),
+        )
+        .await;
+        let mut result = provider_output.to_tool_result(committed_images.clone(), provider_text);
+        if let Some(warning) = provider_text_warning {
+            result.warnings.push(warning);
+        }
         let result = ImageGenerationToolResult { terminal, ..result };
         let blocks = committed_images
             .into_iter()
@@ -371,6 +420,140 @@ async fn commit_images(
     Ok(committed)
 }
 
+fn execution_plan_requires_scoped_override(plan: &ImageGenerationResolvedPlan) -> bool {
+    matches!(
+        plan.execution_plan,
+        GenerateImageExecutionPlan::GeminiNativeImageModel { .. }
+    )
+}
+
+fn approval_for_resolved_plan(
+    plan: &ImageGenerationResolvedPlan,
+) -> (
+    ModelRoutingApprovalDisposition,
+    Option<ImageOperationApprovalReason>,
+) {
+    let session_provider =
+        meerkat_core::Provider::infer_from_model(plan.machine_routing_model.as_str());
+    let target_provider = meerkat_core::Provider::infer_from_model(plan.provider_model.as_str());
+
+    if session_provider.is_some()
+        && target_provider.is_some()
+        && session_provider != target_provider
+    {
+        (
+            ModelRoutingApprovalDisposition::RequiredButUnavailable,
+            Some(ImageOperationApprovalReason::CrossProvider),
+        )
+    } else {
+        (ModelRoutingApprovalDisposition::NotRequired, None)
+    }
+}
+
+async fn capture_provider_text(
+    blob_store: &dyn BlobStore,
+    provider_text: Option<&str>,
+) -> (
+    ProviderTextDisposition,
+    Option<meerkat_core::ImageGenerationWarning>,
+) {
+    let Some(provider_text) = provider_text.filter(|text| !text.is_empty()) else {
+        return (ProviderTextDisposition::NotEmitted, None);
+    };
+    let data = base64::engine::general_purpose::STANDARD.encode(provider_text.as_bytes());
+    match blob_store
+        .put_image("text/plain; charset=utf-8", &data)
+        .await
+    {
+        Ok(blob_ref) => (
+            ProviderTextDisposition::Captured {
+                text_artifact_ref: TextArtifactRef::new(blob_ref.blob_id.to_string()),
+            },
+            None,
+        ),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to capture provider image text artifact"
+            );
+            (
+                ProviderTextDisposition::EmittedButNotStored,
+                Some(
+                    meerkat_core::ImageGenerationWarning::ProviderTextCaptureFailed {
+                        message: err.to_string(),
+                    },
+                ),
+            )
+        }
+    }
+}
+
+fn failed_provider_output(operation_id: ImageOperationId) -> ProviderImageGenerationOutput {
+    ProviderImageGenerationOutput {
+        operation_id,
+        terminal: ImageOperationTerminalClass::Failed,
+        images: Vec::new(),
+        provider_text: None,
+        revised_prompt: meerkat_core::image_generation::RevisedPromptDisposition::NotRequested,
+        native_metadata: meerkat_core::image_generation::ProviderImageMetadata::NotEmitted,
+        warnings: Vec::new(),
+    }
+}
+
+#[allow(dead_code)]
+fn post_activation_terminal(terminal: &ImageOperationTerminalClass) -> PostActivationImageTerminal {
+    match terminal {
+        ImageOperationTerminalClass::Generated => PostActivationImageTerminal::Generated,
+        ImageOperationTerminalClass::EmptyResult { .. } => PostActivationImageTerminal::EmptyResult,
+        ImageOperationTerminalClass::Denied { reason } => match reason {
+            ImageOperationDenialReason::CostPolicy => PostActivationImageTerminal::Denied {
+                reason: PostActivationImageDenialReason::CostPolicy,
+            },
+            ImageOperationDenialReason::SafetyPolicy => PostActivationImageTerminal::Denied {
+                reason: PostActivationImageDenialReason::SafetyPolicy,
+            },
+            ImageOperationDenialReason::DeniedDuringApproval { approvable } => {
+                PostActivationImageTerminal::Denied {
+                    reason: PostActivationImageDenialReason::DeniedDuringApproval {
+                        approvable: *approvable,
+                    },
+                }
+            }
+            ImageOperationDenialReason::ScopedOverrideConflict => {
+                PostActivationImageTerminal::Denied {
+                    reason: PostActivationImageDenialReason::ScopedOverrideConflict,
+                }
+            }
+            ImageOperationDenialReason::RealtimeTransportConflict => {
+                PostActivationImageTerminal::Denied {
+                    reason: PostActivationImageDenialReason::RealtimeTransportConflict,
+                }
+            }
+            ImageOperationDenialReason::ProjectionUnsupported => {
+                PostActivationImageTerminal::Denied {
+                    reason: PostActivationImageDenialReason::ProjectionUnsupported,
+                }
+            }
+            ImageOperationDenialReason::UnsupportedTarget
+            | ImageOperationDenialReason::UnsupportedCount
+            | ImageOperationDenialReason::CapabilityPolicy
+            | ImageOperationDenialReason::ApprovalRequiredButUnavailable => {
+                PostActivationImageTerminal::Failed
+            }
+        },
+        ImageOperationTerminalClass::RefusedByProvider => {
+            PostActivationImageTerminal::RefusedByProvider
+        }
+        ImageOperationTerminalClass::SafetyFiltered => PostActivationImageTerminal::SafetyFiltered,
+        ImageOperationTerminalClass::Failed
+        | ImageOperationTerminalClass::ScopedRestoreFailed { .. } => {
+            PostActivationImageTerminal::Failed
+        }
+        ImageOperationTerminalClass::Cancelled => PostActivationImageTerminal::Cancelled,
+        ImageOperationTerminalClass::Timeout => PostActivationImageTerminal::Timeout,
+    }
+}
+
 fn json_result(result: ImageGenerationToolResult) -> Result<ToolOutput, BuiltinToolError> {
     serde_json::to_value(result)
         .map(ToolOutput::Json)
@@ -399,6 +582,7 @@ mod tests {
     struct FakeMachine {
         completed: Mutex<Option<ImageOperationTerminalClass>>,
         calls: Mutex<Vec<&'static str>>,
+        requires_scoped_override: Mutex<bool>,
     }
 
     #[async_trait]
@@ -442,6 +626,7 @@ mod tests {
             request: ImageOperationRoutingRequest,
         ) -> Result<ImageOperationRoutingResult, RuntimeDriverError> {
             self.calls.lock().unwrap().push("begin");
+            *self.requires_scoped_override.lock().unwrap() = request.requires_scoped_override;
             Ok(ImageOperationRoutingResult::Accepted {
                 operation_id: request.operation_id,
                 phase: ImageOperationPhase::PlanResolved,
@@ -465,7 +650,18 @@ mod tests {
         ) -> Result<ImageOperationPhase, RuntimeDriverError> {
             self.calls.lock().unwrap().push("complete");
             *self.completed.lock().unwrap() = Some(terminal);
-            Ok(ImageOperationPhase::RestoringScopedOverride)
+            if *self.requires_scoped_override.lock().unwrap() {
+                Ok(ImageOperationPhase::RestoringScopedOverride)
+            } else {
+                Ok(ImageOperationPhase::Terminal {
+                    terminal: self
+                        .completed
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or(ImageOperationTerminalClass::Failed),
+                })
+            }
         }
 
         async fn restore_image_operation_override(
@@ -533,7 +729,7 @@ mod tests {
                     width: 1,
                     height: 1,
                 }],
-                provider_text: None,
+                provider_text: Some("caption".to_string()),
                 revised_prompt: RevisedPromptDisposition::NotRequested,
                 native_metadata: meerkat_core::image_generation::ProviderImageMetadata::NotEmitted,
                 warnings: Vec::new(),
@@ -601,11 +797,17 @@ mod tests {
 
         assert_eq!(
             machine.calls.lock().unwrap().as_slice(),
-            ["resolve_plan", "begin", "activate", "complete", "restore"]
+            ["resolve_plan", "begin", "complete"]
         );
         assert_eq!(
             blob_store.writes.lock().unwrap().as_slice(),
-            [("image/png".to_string(), "iVBORw0KGgo=".to_string())]
+            [
+                ("image/png".to_string(), "iVBORw0KGgo=".to_string()),
+                (
+                    "text/plain; charset=utf-8".to_string(),
+                    "Y2FwdGlvbg==".to_string()
+                )
+            ]
         );
         assert_eq!(outcome.session_effects.len(), 1);
         let SessionEffect::AppendAssistantBlocks { blocks } = &outcome.session_effects[0] else {
@@ -621,6 +823,10 @@ mod tests {
             ImageOperationTerminalClass::Generated
         ));
         assert_eq!(result.images.len(), 1);
+        assert!(matches!(
+            result.provider_text,
+            ProviderTextDisposition::Captured { .. }
+        ));
     }
 
     #[tokio::test]

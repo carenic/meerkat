@@ -12473,6 +12473,54 @@
               "returned"
             ],
             "type": "object"
+          },
+          {
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "warning": {
+                "const": "provider_execution_failed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "warning",
+              "message"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "warning": {
+                "const": "blob_commit_failed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "warning",
+              "message"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "warning": {
+                "const": "provider_text_capture_failed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "warning",
+              "message"
+            ],
+            "type": "object"
           }
         ]
       },

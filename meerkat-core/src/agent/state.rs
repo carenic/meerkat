@@ -2005,19 +2005,29 @@ where
                             .iter()
                             .any(|r| r.wait_policy == crate::ops::WaitPolicy::Barrier);
 
-                        // Apply session effects from tool dispatch before
-                        // appending ToolResults. This ensures the canonical
-                        // session state is updated before the next boundary,
-                        // so an invariant failure doesn't occur after
-                        // ToolResults is already in the transcript.
-                        if !accumulated_session_effects.is_empty() {
-                            self.apply_session_effects(&accumulated_session_effects)?;
+                        // Apply state-mutating effects before ToolResults, but
+                        // defer transcript-producing assistant blocks until
+                        // after ToolResults so provider tool-call adjacency is
+                        // preserved.
+                        let (post_tool_effects, pre_tool_effects): (Vec<_>, Vec<_>) =
+                            accumulated_session_effects.into_iter().partition(|effect| {
+                                matches!(
+                                    effect,
+                                    crate::ops::SessionEffect::AppendAssistantBlocks { .. }
+                                )
+                            });
+                        if !pre_tool_effects.is_empty() {
+                            self.apply_session_effects(&pre_tool_effects)?;
                         }
 
                         // Add tool results to session
                         self.session.push(Message::ToolResults {
                             results: tool_results,
                         });
+
+                        if !post_tool_effects.is_empty() {
+                            self.apply_session_effects(&post_tool_effects)?;
+                        }
 
                         self.observe_cancel_after_boundary_request(&run_id)?;
 
@@ -4554,6 +4564,63 @@ mod tests {
                         .any(|block| matches!(block, AssistantBlock::Image { .. }))
             )),
             "hook-denied tool session effects must not append assistant image blocks"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_image_session_effects_preserve_tool_result_adjacency() {
+        let client = Arc::new(ImageEffectClient {
+            call_count: Mutex::new(0),
+        });
+        let tools = Arc::new(ImageEffectDispatcher::new());
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .build(client, tools, Arc::new(NoopStore))
+            .await;
+        agent.config.max_turns = Some(2);
+
+        let result = agent.run("prompt".to_string().into()).await.unwrap();
+        assert_eq!(result.text, "done");
+
+        let messages = agent.session().messages();
+        let tool_use_index = messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    Message::BlockAssistant(blocks)
+                        if blocks
+                            .blocks
+                            .iter()
+                            .any(|block| matches!(block, AssistantBlock::ToolUse { .. }))
+                )
+            })
+            .expect("assistant tool use should be recorded");
+        let tool_results_index = messages
+            .iter()
+            .position(|message| matches!(message, Message::ToolResults { .. }))
+            .expect("tool results should be recorded");
+        let image_index = messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    Message::BlockAssistant(blocks)
+                        if blocks
+                            .blocks
+                            .iter()
+                            .any(|block| matches!(block, AssistantBlock::Image { .. }))
+                )
+            })
+            .expect("assistant image block should be recorded");
+
+        assert_eq!(
+            tool_results_index,
+            tool_use_index + 1,
+            "tool results must remain adjacent to the tool-use assistant message"
+        );
+        assert!(
+            image_index > tool_results_index,
+            "assistant image blocks should be appended after tool results"
         );
     }
 

@@ -2008,6 +2008,7 @@ machine! {
             model_routing_image_operation_phases: Map<String, Enum<RoutingImageOperationPhase>>,
             model_routing_image_operation_target_models: Map<String, String>,
             model_routing_image_operation_realtime: Map<String, bool>,
+            model_routing_image_operation_requires_scoped_override: Map<String, bool>,
             model_routing_image_terminals: Map<String, Enum<RoutingImageTerminal>>,
             model_routing_image_terminal_payloads: Map<String, String>,
             model_routing_image_denials: Map<String, Enum<RoutingDenialReason>>,
@@ -2340,6 +2341,7 @@ machine! {
             model_routing_image_operation_phases = EmptyMap,
             model_routing_image_operation_target_models = EmptyMap,
             model_routing_image_operation_realtime = EmptyMap,
+            model_routing_image_operation_requires_scoped_override = EmptyMap,
             model_routing_image_terminals = EmptyMap,
             model_routing_image_terminal_payloads = EmptyMap,
             model_routing_image_denials = EmptyMap,
@@ -2534,6 +2536,7 @@ machine! {
                 approval_available: bool,
                 approval_denied: bool,
                 realtime_detach_allowed: bool,
+                requires_scoped_override: bool,
             },
             ActivateImageOperationOverride { operation_id: String, target_model: String, target_realtime_capable: bool },
             CompleteImageOperation { operation_id: String, terminal: Enum<RoutingImageTerminal>, terminal_payload: String },
@@ -3591,7 +3594,7 @@ machine! {
             on input BeginImageOperation {
                 operation_id, target_model, target_realtime_capable,
                 requires_approval, approval_available, approval_denied,
-                realtime_detach_allowed
+                realtime_detach_allowed, requires_scoped_override
             }
             guard "operation_in_operation_conflict" { self.model_routing_operation_override_id != None }
             update {
@@ -3608,7 +3611,7 @@ machine! {
             on input BeginImageOperation {
                 operation_id, target_model, target_realtime_capable,
                 requires_approval, approval_available, approval_denied,
-                realtime_detach_allowed
+                realtime_detach_allowed, requires_scoped_override
             }
             guard "realtime_conflict" {
                 self.realtime_intent_present && !target_realtime_capable && !realtime_detach_allowed
@@ -3627,7 +3630,7 @@ machine! {
             on input BeginImageOperation {
                 operation_id, target_model, target_realtime_capable,
                 requires_approval, approval_available, approval_denied,
-                realtime_detach_allowed
+                realtime_detach_allowed, requires_scoped_override
             }
             guard "approval_unavailable" { requires_approval && !approval_available }
             update {
@@ -3644,7 +3647,7 @@ machine! {
             on input BeginImageOperation {
                 operation_id, target_model, target_realtime_capable,
                 requires_approval, approval_available, approval_denied,
-                realtime_detach_allowed
+                realtime_detach_allowed, requires_scoped_override
             }
             guard "approval_denied" { requires_approval && approval_available && approval_denied }
             update {
@@ -3664,7 +3667,7 @@ machine! {
             on input BeginImageOperation {
                 operation_id, target_model, target_realtime_capable,
                 requires_approval, approval_available, approval_denied,
-                realtime_detach_allowed
+                realtime_detach_allowed, requires_scoped_override
             }
             guard "baseline_known" { self.model_routing_baseline_model != None }
             guard "no_operation_in_operation" { self.model_routing_operation_override_id == None }
@@ -3680,6 +3683,9 @@ machine! {
                 self.model_routing_image_operation_phases.insert(operation_id, RoutingImageOperationPhase::PlanResolved);
                 self.model_routing_image_operation_target_models.insert(operation_id, target_model);
                 self.model_routing_image_operation_realtime.insert(operation_id, target_realtime_capable);
+                if requires_scoped_override {
+                    self.model_routing_image_operation_requires_scoped_override.insert(operation_id, true);
+                }
             }
             to Idle
             emit ImageOperationPhaseChanged { operation_id: operation_id, phase: RoutingImageOperationPhase::PlanResolved }
@@ -3689,6 +3695,9 @@ machine! {
             per_phase [Idle, Attached, Running]
             on input ActivateImageOperationOverride { operation_id, target_model, target_realtime_capable }
             guard "operation_plan_resolved" { self.model_routing_image_operation_target_models.contains_key(operation_id) }
+            guard "operation_requires_scoped_override" {
+                self.model_routing_image_operation_requires_scoped_override.contains_key(operation_id)
+            }
             guard "no_operation_override_active" { self.model_routing_operation_override_id == None }
             update {
                 self.model_routing_operation_override_id = Some(operation_id);
@@ -3706,6 +3715,9 @@ machine! {
             per_phase [Idle, Attached, Running]
             on input CompleteImageOperation { operation_id, terminal, terminal_payload }
             guard "operation_active" { self.model_routing_operation_override_id == Some(operation_id) }
+            guard "operation_requires_scoped_override" {
+                self.model_routing_image_operation_requires_scoped_override.contains_key(operation_id)
+            }
             update {
                 self.model_routing_image_operation_phases.insert(operation_id, RoutingImageOperationPhase::RestoringScopedOverride);
                 self.model_routing_image_terminals.insert(operation_id, terminal);
@@ -3713,6 +3725,26 @@ machine! {
             }
             to Idle
             emit ImageOperationPhaseChanged { operation_id: operation_id, phase: RoutingImageOperationPhase::RestoringScopedOverride }
+        }
+
+        transition CompleteImageOperationWithoutScopedOverride {
+            per_phase [Idle, Attached, Running]
+            on input CompleteImageOperation { operation_id, terminal, terminal_payload }
+            guard "operation_plan_resolved" { self.model_routing_image_operation_target_models.contains_key(operation_id) }
+            guard "operation_does_not_require_scoped_override" {
+                !self.model_routing_image_operation_requires_scoped_override.contains_key(operation_id)
+            }
+            guard "no_operation_override_active" { self.model_routing_operation_override_id == None }
+            update {
+                self.model_routing_image_operation_phases.insert(operation_id, RoutingImageOperationPhase::Terminal);
+                self.model_routing_image_terminals.insert(operation_id, terminal);
+                self.model_routing_image_terminal_payloads.insert(operation_id, terminal_payload);
+                self.model_routing_image_operation_target_models.remove(operation_id);
+                self.model_routing_image_operation_realtime.remove(operation_id);
+                self.model_routing_image_operation_requires_scoped_override.remove(operation_id);
+            }
+            to Idle
+            emit ImageOperationPhaseChanged { operation_id: operation_id, phase: RoutingImageOperationPhase::Terminal }
         }
 
         transition RestoreImageOperationOverride {
@@ -3726,6 +3758,7 @@ machine! {
                 self.model_routing_image_operation_phases.insert(operation_id, RoutingImageOperationPhase::Terminal);
                 self.model_routing_image_operation_target_models.remove(operation_id);
                 self.model_routing_image_operation_realtime.remove(operation_id);
+                self.model_routing_image_operation_requires_scoped_override.remove(operation_id);
                 self.model_routing_topology_epoch = self.model_routing_topology_epoch + 1;
             }
             to Idle

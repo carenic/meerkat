@@ -11,9 +11,10 @@ use meerkat_core::lifecycle::run_primitive::{
 use meerkat_core::schema::{CompiledSchema, SchemaError};
 use meerkat_core::{
     AssistantBlock, ContentBlock, ImageData, ImageFormatPreference, ImageGenerationIntent,
-    ImageGenerationWarning, ImageOperationTerminalClass, Message, OpenAiImageMetadata,
-    OpenAiImagesApiEndpoint, OutputSchema, ProviderImageMetadata, ProviderMeta,
-    RevisedPromptDisposition, RevisedPromptSource, StopReason, Usage,
+    ImageGenerationWarning, ImageOperationTerminalClass, ImageQualityPreference,
+    ImageSizePreference, Message, OpenAiImageMetadata, OpenAiImagesApiEndpoint, OutputSchema,
+    ProviderImageMetadata, ProviderMeta, RevisedPromptDisposition, RevisedPromptSource, StopReason,
+    Usage,
 };
 use meerkat_llm_core::BlockAssembler;
 use meerkat_llm_core::LlmError;
@@ -52,6 +53,25 @@ pub struct OpenAiClient {
     /// invocation. Used for ExternalAuthorizer flows that produce a
     /// DynamicAuthorizer envelope (host-managed OAuth refresh, etc.).
     authorizer: Option<std::sync::Arc<dyn meerkat_core::HttpAuthorizer>>,
+}
+
+fn openai_image_size(size: &ImageSizePreference) -> String {
+    match size {
+        ImageSizePreference::Auto => "auto".to_string(),
+        ImageSizePreference::Square1024 => "1024x1024".to_string(),
+        ImageSizePreference::Portrait1024x1536 => "1024x1536".to_string(),
+        ImageSizePreference::Landscape1536x1024 => "1536x1024".to_string(),
+        ImageSizePreference::Custom { width, height } => format!("{width}x{height}"),
+    }
+}
+
+fn openai_image_quality(quality: ImageQualityPreference) -> &'static str {
+    match quality {
+        ImageQualityPreference::Auto => "auto",
+        ImageQualityPreference::Low => "low",
+        ImageQualityPreference::Medium => "medium",
+        ImageQualityPreference::High => "high",
+    }
 }
 
 impl OpenAiClient {
@@ -490,10 +510,16 @@ impl OpenAiClient {
         } else {
             Self::convert_to_responses_input(&request.projected_messages)?
         };
+        let mut tool = serde_json::Map::new();
+        tool.insert(
+            "type".to_string(),
+            serde_json::Value::String("image_generation".to_string()),
+        );
+        Self::apply_image_output_options(&mut tool, &request);
         let body = serde_json::json!({
             "model": request.model,
             "input": input,
-            "tools": [{"type": "image_generation"}],
+            "tools": [serde_json::Value::Object(tool)],
             "stream": false,
         });
         let endpoint = format!("{}/v1/responses", self.base_url);
@@ -519,17 +545,7 @@ impl OpenAiClient {
         });
         if let Some(obj) = body.as_object_mut() {
             if request.model.starts_with("gpt-image") {
-                obj.insert(
-                    "output_format".to_string(),
-                    serde_json::Value::String(
-                        match request.generate_request.format {
-                            ImageFormatPreference::Jpeg => "jpeg",
-                            ImageFormatPreference::Webp => "webp",
-                            ImageFormatPreference::Auto | ImageFormatPreference::Png => "png",
-                        }
-                        .to_string(),
-                    ),
-                );
+                Self::apply_image_output_options(obj, &request);
             } else {
                 obj.insert(
                     "response_format".to_string(),
@@ -541,6 +557,33 @@ impl OpenAiClient {
         let response = self.post_json_to_openai(&endpoint, &body).await?;
         self.normalize_openai_image_response(request, response, false)
             .await
+    }
+
+    fn apply_image_output_options(
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+        request: &ProviderImageGenerationRequest,
+    ) {
+        obj.insert(
+            "size".to_string(),
+            serde_json::Value::String(openai_image_size(&request.generate_request.size)),
+        );
+        obj.insert(
+            "quality".to_string(),
+            serde_json::Value::String(
+                openai_image_quality(request.generate_request.quality).to_string(),
+            ),
+        );
+        obj.insert(
+            "output_format".to_string(),
+            serde_json::Value::String(
+                match request.generate_request.format {
+                    ImageFormatPreference::Jpeg => "jpeg",
+                    ImageFormatPreference::Webp => "webp",
+                    ImageFormatPreference::Auto | ImageFormatPreference::Png => "png",
+                }
+                .to_string(),
+            ),
+        );
     }
 
     async fn normalize_openai_image_response(
@@ -1294,8 +1337,8 @@ mod tests {
                     "reference_images": []
                 },
                 "target": {"target": "auto"},
-                "size": {"size": "square1024"},
-                "quality": "auto",
+                "size": {"size": "landscape1536x1024"},
+                "quality": "low",
                 "format": "png",
                 "count": 2
             },
@@ -1317,6 +1360,22 @@ mod tests {
                 "image_continuity_tokens": "unsupported"
             },
             "plan": {"tool_name": "image_generation"}
+        })
+    }
+
+    fn images_api_openai_plan_json() -> Value {
+        serde_json::json!({
+            "plan_type": "open_ai_images_api",
+            "model": "gpt-image-1",
+            "max_count": 4,
+            "capabilities": {
+                "hosted_image_generation_tool": false,
+                "native_image_output": true,
+                "custom_tools": false,
+                "image_search_grounding": false,
+                "image_continuity_tokens": "unsupported"
+            },
+            "plan": {"endpoint": "generations"}
         })
     }
 
@@ -1359,7 +1418,7 @@ mod tests {
         assert_eq!(output.images[0].media_type.as_str(), "image/png");
         assert_eq!(
             (output.images[0].width, output.images[0].height),
-            (1024, 1024)
+            (1536, 1024)
         );
         assert_eq!(output.provider_text.as_deref(), Some("Provider caption"));
         assert!(matches!(
@@ -1383,7 +1442,44 @@ mod tests {
         let body = bodies.first().expect("captured OpenAI image request");
         assert_eq!(body["model"], "gpt-4.1-mini");
         assert_eq!(body["tools"][0]["type"], "image_generation");
+        assert_eq!(body["tools"][0]["size"], "1536x1024");
+        assert_eq!(body["tools"][0]["quality"], "low");
+        assert_eq!(body["tools"][0]["output_format"], "png");
         assert!(body.get("stream").and_then(Value::as_bool) == Some(false));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_images_api_executor_sends_output_options()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let response = serde_json::json!({
+            "created": 1713833628,
+            "data": [{"b64_json": "data:image/png;base64,aGVsbG8="}]
+        });
+        let (base_url, handle) = spawn_openai_image_stub(response, seen.clone()).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let mut request = image_executor_request_json(images_api_openai_plan_json());
+        request.model = "gpt-image-1".to_string();
+
+        let output = client.execute_image_generation(request).await?;
+
+        assert!(matches!(
+            output.terminal,
+            ImageOperationTerminalClass::Generated
+        ));
+        assert_eq!(
+            (output.images[0].width, output.images[0].height),
+            (1536, 1024)
+        );
+        let bodies = seen.lock().expect("seen mutex");
+        let body = bodies.first().expect("captured OpenAI image request");
+        assert_eq!(body["model"], "gpt-image-1");
+        assert_eq!(body["size"], "1536x1024");
+        assert_eq!(body["quality"], "low");
+        assert_eq!(body["output_format"], "png");
 
         handle.abort();
         Ok(())

@@ -272,6 +272,7 @@ pub struct ImageOperationRoutingRequest {
     pub target_realtime: ModelRoutingRealtimePolicy,
     pub approval: ModelRoutingApprovalDisposition,
     pub approval_reason: Option<ImageOperationApprovalReason>,
+    pub requires_scoped_override: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

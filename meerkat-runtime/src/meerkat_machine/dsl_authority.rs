@@ -169,6 +169,7 @@ pub(crate) fn project_state(
         model_routing_image_operation_phases: std::collections::BTreeMap::new(),
         model_routing_image_operation_target_models: std::collections::BTreeMap::new(),
         model_routing_image_operation_realtime: std::collections::BTreeMap::new(),
+        model_routing_image_operation_requires_scoped_override: std::collections::BTreeMap::new(),
         model_routing_image_terminals: std::collections::BTreeMap::new(),
         model_routing_image_terminal_payloads: std::collections::BTreeMap::new(),
         model_routing_image_denials: std::collections::BTreeMap::new(),
