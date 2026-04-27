@@ -2406,6 +2406,32 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
                 all_features: false,
             },
         }),
+        73 => Some(&Spec {
+            id: Some(73),
+            lane: Lane::Smoke,
+            title: "CLI generate_image OpenAI default",
+            timeout_secs: 900,
+            required_env: &[&["RKAT_OPENAI_API_KEY", "OPENAI_API_KEY"]],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &["rkat"],
+            pre_commands: &[&[
+                "cargo",
+                "build",
+                "-p",
+                "rkat",
+                "--features",
+                "session-store,openai,gemini,skills,comms,mcp,schedule,mob",
+            ]],
+            command: CommandSpec::CargoTest {
+                package: "rkat",
+                test_target: "live_smoke_cli",
+                test_name: "e2e_scenario_73_cli_generate_image_openai_default",
+                features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
         _ => None,
     }
 }

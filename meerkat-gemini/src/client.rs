@@ -434,6 +434,7 @@ impl GeminiClient {
     fn build_image_request_body(
         &self,
         request: &ProviderImageGenerationRequest,
+        output: &meerkat_core::GeminiImageOutputOptions,
     ) -> Result<Value, LlmError> {
         let messages = if request.projected_messages.is_empty() {
             vec![Message::User(meerkat_core::UserMessage::text(
@@ -444,10 +445,9 @@ impl GeminiClient {
         };
         let llm_request = LlmRequest::new(&request.model, messages);
         let mut body = self.build_request_body(&llm_request)?;
-        body["generationConfig"]["responseModalities"] = Value::Array(vec![
-            Value::String("TEXT".into()),
-            Value::String("IMAGE".into()),
-        ]);
+        body["generationConfig"]["responseModalities"] =
+            Value::Array(vec![Value::String("IMAGE".into())]);
+        body["generationConfig"]["imageConfig"] = gemini_image_config(output);
         Ok(body)
     }
 
@@ -467,8 +467,9 @@ impl GeminiClient {
     async fn execute_native_image(
         &self,
         request: ProviderImageGenerationRequest,
+        plan: meerkat_core::GeminiImageTurnPlan,
     ) -> Result<ProviderImageGenerationOutput, LlmError> {
-        let body = self.build_image_request_body(&request)?;
+        let body = self.build_image_request_body(&request, &plan.output)?;
         let url = format!(
             "{}/v1beta/models/{}:generateContent",
             self.base_url, request.model
@@ -593,6 +594,21 @@ impl GeminiClient {
     }
 }
 
+fn gemini_image_config(output: &meerkat_core::GeminiImageOutputOptions) -> serde_json::Value {
+    let mut config = serde_json::Map::new();
+    config.insert(
+        "aspectRatio".to_string(),
+        Value::String(output.aspect_ratio.as_wire_value().to_string()),
+    );
+    if let Some(image_size) = output.image_size {
+        config.insert(
+            "imageSize".to_string(),
+            Value::String(image_size.as_wire_value().to_string()),
+        );
+    }
+    Value::Object(config)
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl ImageGenerationExecutor for GeminiClient {
@@ -601,8 +617,8 @@ impl ImageGenerationExecutor for GeminiClient {
         request: ProviderImageGenerationRequest,
     ) -> Result<ProviderImageGenerationOutput, LlmError> {
         match request.execution_plan.clone() {
-            meerkat_core::GenerateImageExecutionPlan::GeminiNativeImageModel { .. } => {
-                self.execute_native_image(request).await
+            meerkat_core::GenerateImageExecutionPlan::GeminiNativeImageModel { plan, .. } => {
+                self.execute_native_image(request, plan).await
             }
             other => Err(LlmError::InvalidRequest {
                 message: format!("Gemini image executor cannot run plan {other:?}"),
@@ -1334,6 +1350,10 @@ mod tests {
                 "/v1beta/models/gemini-2.5-flash-image:generateContent",
                 post(gemini_image_stub),
             )
+            .route(
+                "/v1beta/models/gemini-3.1-flash-image-preview:generateContent",
+                post(gemini_image_stub),
+            )
             .with_state(GeminiImageStubState { response, seen });
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1377,7 +1397,11 @@ mod tests {
                     "image_continuity_tokens": "same_provider_only"
                 },
                 "plan": {
-                    "projection_snapshot_id": "00000000-0000-0000-0000-000000000203"
+                    "projection_snapshot_id": "00000000-0000-0000-0000-000000000203",
+                    "output": {
+                        "aspect_ratio": "landscape16x9",
+                        "image_size": null
+                    }
                 }
             },
             "projected_messages": []
@@ -1466,11 +1490,69 @@ mod tests {
         let body = bodies.first().expect("captured Gemini image request");
         assert_eq!(
             body["generationConfig"]["responseModalities"],
-            serde_json::json!(["TEXT", "IMAGE"])
+            serde_json::json!(["IMAGE"])
+        );
+        assert_eq!(
+            body["generationConfig"]["imageConfig"],
+            serde_json::json!({
+                "aspectRatio": "16:9"
+            })
         );
         assert_eq!(
             body["contents"][0]["parts"][0]["text"],
             "draw a small blue boat"
+        );
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gemini_preview_image_executor_includes_image_size()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let response = serde_json::json!({
+            "responseId": "gem_resp_1",
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "inlineData": {
+                            "mimeType": "image/png",
+                            "data": "data:image/png;base64,aGVsbG8="
+                        }
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let (base_url, handle) = spawn_gemini_image_stub(response, seen.clone()).await;
+        let client = GeminiClient::new_with_base_url("test-key".to_string(), base_url);
+        let mut request = gemini_image_executor_request_json();
+        request.model = "gemini-3.1-flash-image-preview".to_string();
+        request.generate_request.size = meerkat_core::ImageSizePreference::Portrait1024x1536;
+        if let meerkat_core::GenerateImageExecutionPlan::GeminiNativeImageModel { plan, .. } =
+            &mut request.execution_plan
+        {
+            plan.output = meerkat_core::GeminiImageOutputOptions {
+                aspect_ratio: meerkat_core::GeminiImageAspectRatio::Portrait9x16,
+                image_size: Some(meerkat_core::GeminiImageSize::OneK),
+            };
+        }
+
+        let output = client.execute_image_generation(request).await?;
+        assert!(matches!(
+            output.terminal,
+            ImageOperationTerminalClass::Generated
+        ));
+
+        let bodies = seen.lock().expect("seen mutex");
+        let body = bodies.first().expect("captured Gemini image request");
+        assert_eq!(
+            body["generationConfig"]["imageConfig"],
+            serde_json::json!({
+                "aspectRatio": "9:16",
+                "imageSize": "1K"
+            })
         );
 
         handle.abort();

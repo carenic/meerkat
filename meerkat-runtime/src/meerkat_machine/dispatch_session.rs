@@ -101,6 +101,9 @@ impl MeerkatMachine {
                 session_admission: Arc::new(crate::handles::RuntimeSessionAdmissionHandle::new(
                     Arc::clone(&shared_handle_authority),
                 )),
+                model_routing: Arc::new(crate::handles::RuntimeModelRoutingHandle::new(
+                    Arc::clone(&shared_handle_authority),
+                )),
                 auth_lease: Arc::new(crate::handles::RuntimeAuthLeaseHandle::new()),
                 mcp_server_lifecycle: Arc::new(
                     crate::handles::RuntimeMcpServerLifecycleHandle::new(Arc::clone(

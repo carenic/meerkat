@@ -15,8 +15,9 @@ use uuid::Uuid;
 use crate::completion_feed::CompletionSeq;
 use crate::handles::{
     AuthLeaseHandle, CommsDrainHandle, ExternalToolSurfaceHandle, InteractionStreamHandle,
-    McpServerLifecycleHandle, PeerCommsHandle, PeerInteractionHandle, RealtimeProductTurnHandle,
-    SessionAdmissionHandle, SessionClaimHandle, SessionContextHandle, TurnStateHandle,
+    McpServerLifecycleHandle, ModelRoutingHandle, PeerCommsHandle, PeerInteractionHandle,
+    RealtimeProductTurnHandle, SessionAdmissionHandle, SessionClaimHandle, SessionContextHandle,
+    TurnStateHandle,
 };
 use crate::ops_lifecycle::OpsLifecycleRegistry;
 use crate::tool_scope::ToolVisibilityOwner;
@@ -168,6 +169,11 @@ pub struct SessionRuntimeBindings {
     pub peer_comms: Arc<dyn PeerCommsHandle>,
     /// Session turn-admission DSL handle (Phase 5F/0 addition).
     pub session_admission: Arc<dyn SessionAdmissionHandle>,
+    /// Session model-routing baseline DSL handle.
+    ///
+    /// The factory sets this after resolving the concrete LLM identity so
+    /// runtime-backed tool resolution observes a machine-owned baseline.
+    pub model_routing: Arc<dyn ModelRoutingHandle>,
     /// Auth lease lifecycle DSL handle (Phase 1.5-rev addition).
     pub auth_lease: Arc<dyn AuthLeaseHandle>,
     /// MCP server lifecycle DSL handle (Phase 5G / T5g addition).
@@ -229,6 +235,7 @@ impl Clone for SessionRuntimeBindings {
             external_tool_surface: Arc::clone(&self.external_tool_surface),
             peer_comms: Arc::clone(&self.peer_comms),
             session_admission: Arc::clone(&self.session_admission),
+            model_routing: Arc::clone(&self.model_routing),
             auth_lease: Arc::clone(&self.auth_lease),
             mcp_server_lifecycle: Arc::clone(&self.mcp_server_lifecycle),
             peer_interaction: self.peer_interaction.as_ref().map(Arc::clone),
@@ -253,6 +260,7 @@ impl std::fmt::Debug for SessionRuntimeBindings {
             .field("external_tool_surface", &"<dyn ExternalToolSurfaceHandle>")
             .field("peer_comms", &"<dyn PeerCommsHandle>")
             .field("session_admission", &"<dyn SessionAdmissionHandle>")
+            .field("model_routing", &"<dyn ModelRoutingHandle>")
             .field("auth_lease", &"<dyn AuthLeaseHandle>")
             .field("mcp_server_lifecycle", &"<dyn McpServerLifecycleHandle>")
             .field(

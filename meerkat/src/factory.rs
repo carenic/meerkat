@@ -2139,6 +2139,20 @@ impl AgentFactory {
 
         // 4. Create LLM adapter (with optional provider_params, event channel, and shared event tap)
         let model = build_config.model.clone();
+        let model_profile = registry.profile_for(&model);
+        if let meerkat_core::RuntimeBuildMode::SessionOwned(bindings) =
+            &build_config.runtime_build_mode
+        {
+            bindings
+                .model_routing
+                .set_baseline(
+                    meerkat_core::lifecycle::run_primitive::ModelId::new(model.clone()),
+                    model_profile
+                        .as_ref()
+                        .is_some_and(|profile| profile.realtime),
+                )
+                .map_err(|err| BuildAgentError::Config(format!("model routing baseline: {err}")))?;
+        }
         let event_tap = meerkat_core::new_event_tap();
         let mut llm_adapter_inner = match build_config.event_tx.clone() {
             Some(tx) => LlmClientAdapter::with_event_channel(llm_client, model.clone(), tx),
@@ -2360,7 +2374,6 @@ impl AgentFactory {
         let _comms_runtime: Option<()> = None;
 
         // Resolve model profile for capability gating and runtime defaults.
-        let model_profile = registry.profile_for(&model);
         let _image_tool_results = model_profile.as_ref().is_none_or(|p| p.image_tool_results);
 
         if let Some(profile) = model_profile.as_ref() {

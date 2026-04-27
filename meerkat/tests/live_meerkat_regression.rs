@@ -256,7 +256,7 @@ mod image_generation_substrate {
             return;
         };
         let model =
-            std::env::var("RKAT_OPENAI_IMAGE_MODEL").unwrap_or_else(|_| "gpt-image-1".into());
+            std::env::var("RKAT_OPENAI_IMAGE_MODEL").unwrap_or_else(|_| "gpt-image-2".into());
         run_live_generate_image_substrate(
             "openai",
             &model,
@@ -292,7 +292,7 @@ mod image_generation_substrate {
             return;
         };
         let model =
-            std::env::var("RKAT_OPENAI_IMAGE_MODEL").unwrap_or_else(|_| "gpt-image-1".into());
+            std::env::var("RKAT_OPENAI_IMAGE_MODEL").unwrap_or_else(|_| "gpt-image-2".into());
         let temp_dir = TempDir::new().unwrap();
         let runtime = Arc::new(MeerkatMachine::ephemeral());
         let blob_store = Arc::new(MemoryBlobStore::default());

@@ -57,6 +57,10 @@ fn anthropic_api_key() -> Option<String> {
     first_env(&["RKAT_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"])
 }
 
+fn openai_api_key() -> Option<String> {
+    first_env(&["RKAT_OPENAI_API_KEY", "OPENAI_API_KEY"])
+}
+
 fn first_env(vars: &[&str]) -> Option<String> {
     for name in vars {
         if let Ok(value) = std::env::var(name)
@@ -90,6 +94,18 @@ fn skip_if_no_api_prereqs() -> bool {
         eprintln!(
             "Skipping: no Anthropic API key (set ANTHROPIC_API_KEY or RKAT_ANTHROPIC_API_KEY)"
         );
+        return true;
+    }
+    false
+}
+
+/// Returns `true` if OpenAI API prereqs (binary + key) are missing.
+fn skip_if_no_openai_api_prereqs() -> bool {
+    if skip_if_no_prereqs() {
+        return true;
+    }
+    if openai_api_key().is_none() {
+        eprintln!("Skipping: no OpenAI API key (set OPENAI_API_KEY or RKAT_OPENAI_API_KEY)");
         return true;
     }
     false
@@ -353,6 +369,105 @@ async fn inner_e2e_cli_shell_tool() -> Result<(), Box<dyn std::error::Error>> {
     assert!(
         structured["structured_output"]["answer"].is_number(),
         "structured output should contain a numeric answer, got: {structured}"
+    );
+
+    Ok(())
+}
+
+// ===========================================================================
+// Scenario 73: CLI generate_image with OpenAI image default
+// ===========================================================================
+
+#[tokio::test]
+#[ignore = "lane:e2e-smoke"]
+async fn e2e_scenario_73_cli_generate_image_openai_default()
+-> Result<(), Box<dyn std::error::Error>> {
+    if skip_if_no_openai_api_prereqs() {
+        return Ok(());
+    }
+
+    if std::env::var("RUN_TEST_E2E_SMOKE_73_INNER").is_ok() {
+        return inner_e2e_cli_generate_image_openai_default().await;
+    }
+
+    let temp_dir = TempDir::new()?;
+    let project_dir = temp_dir.path().join("project");
+    tokio::fs::create_dir_all(project_dir.join(".rkat")).await?;
+
+    let data_dir = temp_dir.path().join("data");
+    tokio::fs::create_dir_all(&data_dir).await?;
+    let rkat = rkat_binary_path().ok_or("rkat binary not found")?;
+
+    let status = Command::new(std::env::current_exe()?)
+        .arg("e2e_scenario_73_cli_generate_image_openai_default")
+        .arg("--ignored")
+        .env("RUN_TEST_E2E_SMOKE_73_INNER", "1")
+        .env("CARGO_BIN_EXE_rkat", &rkat)
+        .env("HOME", temp_dir.path())
+        .env("XDG_DATA_HOME", &data_dir)
+        .env("TEST_PROJECT_DIR", &project_dir)
+        .env("TEST_DATA_DIR", &data_dir)
+        .status()
+        .await?;
+
+    assert!(status.success(), "inner test failed");
+    Ok(())
+}
+
+async fn inner_e2e_cli_generate_image_openai_default() -> Result<(), Box<dyn std::error::Error>> {
+    let project_dir = PathBuf::from(std::env::var("TEST_PROJECT_DIR")?);
+
+    std::env::set_current_dir(&project_dir)?;
+    write_smoke_config(&project_dir).await?;
+
+    let rkat = rkat_binary_path().ok_or("rkat binary not found")?;
+    let output = timeout(
+        Duration::from_secs(240),
+        Command::new(&rkat)
+            .current_dir(&project_dir)
+            .args([
+                "run",
+                "Hello. Please create a picture of a cat using generate_image",
+                "--model",
+                "gpt-5.5",
+            ])
+            .output(),
+    )
+    .await??;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        output.status.success(),
+        "rkat generate_image run failed (exit {:?}): {combined}",
+        output.status.code()
+    );
+    for failure in [
+        "unsupported_target",
+        "guard rejected",
+        "invalid_arguments",
+        "execution_failed",
+        "internal image operation state error",
+        "currently unavailable",
+        "don't currently have access",
+        "isn't currently available",
+        "couldn't create",
+        "failed in this session",
+        "\"terminal\":\"denied\"",
+        "\"terminal\": \"denied\"",
+    ] {
+        assert!(
+            !combined.to_ascii_lowercase().contains(failure),
+            "CLI generate_image smoke hit failure marker {failure:?}: {combined}"
+        );
+    }
+    let lower = combined.to_ascii_lowercase();
+    assert!(
+        (lower.contains("generated") || lower.contains("created"))
+            && lower.contains("cat")
+            && lower.contains("picture"),
+        "CLI generate_image smoke should report a generated cat picture, got: {combined}"
     );
 
     Ok(())

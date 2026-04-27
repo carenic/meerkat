@@ -158,20 +158,21 @@ Use a simple request shape unless you explicitly need the canonical internal sha
 
 Routing and defaults:
 - target defaults to "auto".
-- On OpenAI sessions such as gpt-5.5, auto uses the current session model with OpenAI Responses hosted image generation.
+- On OpenAI sessions such as gpt-5.5, auto uses the OpenAI image default: gpt-image-2 through the Responses image_generation tool. The tool model is pinned to gpt-image-2; the provider call uses the supported Responses host model.
 - On Gemini sessions, auto uses the Gemini image default: gemini-3.1-flash-image-preview.
 - On non-image-capable session providers, auto is unsupported; set provider:"openai" or provider:"gemini".
-- provider:"openai" defaults to the current OpenAI session model when already on OpenAI, otherwise gpt-image-1.
+- provider:"openai" defaults to gpt-image-2 through the Responses image_generation tool.
 - provider:"gemini" defaults to gemini-3.1-flash-image-preview.
-- To force a model, pass provider plus model, for example provider:"openai", model:"gpt-image-1" or provider:"gemini", model:"gemini-3.1-flash-image-preview".
+- Available image model targets today are OpenAI gpt-image-2 (default, Responses image_generation tool), older OpenAI gpt-image-* and dall-e-* Images API models when explicitly requested, OpenAI text/Responses host models with the hosted image_generation tool when explicitly requested (for example model:"gpt-5.5"), and Gemini gemini-3.1-flash-image-preview (default).
+- To force a model, pass provider plus model, for example provider:"openai", model:"gpt-image-2" or provider:"gemini", model:"gemini-3.1-flash-image-preview". Passing only model is accepted for known/provider-shaped OpenAI and Gemini image models.
 
 Supported request fields:
 - intent: "generate" for a new image, "edit" only with source_images. If omitted and prompt is present, intent defaults to "generate".
 - prompt: text prompt for generation.
 - instruction: edit instruction for edit requests.
-- size: "auto", "1024x1024", "1024x1536", "1536x1024", or "WIDTHxHEIGHT". Prefer the named sizes for portability. OpenAI receives size directly; Gemini currently treats size as a Meerkat preference/metadata and may choose its own exact output dimensions.
-- quality: "auto", "low", "medium", or "high". OpenAI receives quality directly; Gemini may ignore it.
-- format: "auto", "png", "jpeg", "jpg", or "webp". OpenAI receives output_format directly; Gemini returns its native image media type.
+- size: "auto", "1024x1024", "1024x1536", "1536x1024", or "WIDTHxHEIGHT". Size support is model/provider dependent. gpt-image-2 supports auto plus the named 1024/1536 sizes; custom sizes are passed through and may be rejected by the provider. Gemini currently treats size as a Meerkat preference/metadata and may choose its own exact output dimensions.
+- quality: "auto", "low", "medium", or "high". Quality support is model/provider dependent. gpt-image-2 receives quality directly; Gemini may ignore it.
+- format: "auto", "png", "jpeg", "jpg", or "webp". Format support is model/provider dependent. gpt-image-2 receives output_format directly; Gemini returns its native image media type.
 - count/n: currently only 1 is supported.
 
 Do not pass size as a bare top-level string outside request. Do not use intent:{type:"create"} unless you mean the compatibility alias for generate; prefer intent:"generate"."#;
@@ -659,10 +660,28 @@ fn parse_simple_target(
         (Some(provider), None) => Ok(ImageGenerationTargetPreference::ProviderDefault {
             provider: ProviderId::new(provider),
         }),
-        (None, Some(_)) => Err(BuiltinToolError::invalid_args(
-            "request.model requires request.provider",
-        )),
+        (None, Some(model)) => {
+            let provider = infer_image_model_provider(model).ok_or_else(|| {
+                BuiltinToolError::invalid_args(
+                    "request.model requires request.provider unless the model is a known OpenAI or Gemini image model",
+                )
+            })?;
+            Ok(ImageGenerationTargetPreference::Model {
+                provider: ProviderId::new(provider),
+                model: ModelId::new(model),
+            })
+        }
         (None, None) => Ok(ImageGenerationTargetPreference::Auto),
+    }
+}
+
+fn infer_image_model_provider(model: &str) -> Option<&'static str> {
+    match meerkat_core::Provider::infer_from_model(model) {
+        Some(meerkat_core::Provider::OpenAI) => Some("openai"),
+        Some(meerkat_core::Provider::Gemini) => Some("gemini"),
+        _ if model.starts_with("gpt-image") || model.starts_with("dall-e") => Some("openai"),
+        _ if model.starts_with("gemini-") => Some("gemini"),
+        _ => None,
     }
 }
 
@@ -1141,12 +1160,13 @@ mod tests {
         let description = GenerateImageTool::new(runtime).def().description;
 
         for expected in [
-            "gpt-image-1",
+            "gpt-image-2",
             "gemini-3.1-flash-image-preview",
-            "On OpenAI sessions such as gpt-5.5",
+            "OpenAI image default: gpt-image-2",
+            "Available image model targets today",
             "count/n: currently only 1 is supported",
-            "OpenAI receives size directly",
-            "Gemini currently treats size as a Meerkat preference/metadata",
+            "Size support is model/provider dependent",
+            "gpt-image-2 supports auto plus the named 1024/1536 sizes",
         ] {
             assert!(
                 description.contains(expected),
@@ -1180,6 +1200,41 @@ mod tests {
         assert_eq!(parsed.quality, ImageQualityPreference::High);
         assert_eq!(parsed.format, ImageFormatPreference::Png);
         assert_eq!(parsed.count, NonZeroU32::new(1).unwrap());
+    }
+
+    #[test]
+    fn generate_image_accepts_model_only_for_known_image_models() {
+        let parsed = parse_generate_image_request(
+            json!({
+                "intent": "generate",
+                "prompt": "draw a cozy tabby cat",
+                "model": "gpt-image-2"
+            }),
+            ImageOperationId::new(uuid::Uuid::new_v4()),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            parsed.target,
+            ImageGenerationTargetPreference::Model { ref provider, ref model }
+                if provider.0 == "openai" && model.as_str() == "gpt-image-2"
+        ));
+
+        let parsed = parse_generate_image_request(
+            json!({
+                "intent": "generate",
+                "prompt": "draw a cozy tabby cat",
+                "model": "gemini-3.1-flash-image-preview"
+            }),
+            ImageOperationId::new(uuid::Uuid::new_v4()),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            parsed.target,
+            ImageGenerationTargetPreference::Model { ref provider, ref model }
+                if provider.0 == "gemini" && model.as_str() == "gemini-3.1-flash-image-preview"
+        ));
     }
 
     #[test]

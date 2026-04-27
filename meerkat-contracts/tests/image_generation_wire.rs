@@ -16,14 +16,14 @@ use meerkat_core::{
     ImageGenerationTargetPreference, ImageGenerationToolResult, ImageOperationApprovalReason,
     ImageOperationDenialReason, ImageOperationId, ImageOperationPhase, ImageOperationTerminalClass,
     ImageQualityPreference, ImageSizePreference, MediaType, ModelRoutingApprovalPhase,
-    ModelRoutingApprovalRequest, ModelRoutingApprovalTerminalClass, OpenAiImagesApiEndpoint,
-    OpenAiImagesApiPlan, OpenAiResponsesImagePlan, PromptSource, PromptText, ProviderId,
-    ProviderImageMetadata, ProviderTextDisposition, RevisedPromptDisposition, ScopedModelOverride,
-    ScopedModelOverrideId, ScopedModelOverrideKind, ScopedModelOverrideSummary,
-    SwitchTurnApprovalReason, SwitchTurnControlResult, SwitchTurnDenialReason, SwitchTurnDuration,
-    SwitchTurnIntent, SwitchTurnOrigin, SwitchTurnPhase, SwitchTurnPolicyReason,
-    SwitchTurnReasonText, SwitchTurnReasonTextDisposition, SwitchTurnRequestId,
-    SwitchTurnTerminalClass, TextArtifactRef, ToolCallId, TopologyEpoch,
+    ModelRoutingApprovalRequest, ModelRoutingApprovalTerminalClass, OpenAiImageOutputOptions,
+    OpenAiImagesApiEndpoint, OpenAiImagesApiPlan, OpenAiResponsesImagePlan, PromptSource,
+    PromptText, ProviderId, ProviderImageMetadata, ProviderTextDisposition,
+    RevisedPromptDisposition, ScopedModelOverride, ScopedModelOverrideId, ScopedModelOverrideKind,
+    ScopedModelOverrideSummary, SwitchTurnApprovalReason, SwitchTurnControlResult,
+    SwitchTurnDenialReason, SwitchTurnDuration, SwitchTurnIntent, SwitchTurnOrigin,
+    SwitchTurnPhase, SwitchTurnPolicyReason, SwitchTurnReasonText, SwitchTurnReasonTextDisposition,
+    SwitchTurnRequestId, SwitchTurnTerminalClass, TextArtifactRef, ToolCallId, TopologyEpoch,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -101,6 +101,8 @@ fn image_generation_wire_aliases_roundtrip() {
             },
             plan: OpenAiResponsesImagePlan {
                 tool_name: "image_generation".into(),
+                model: ModelId::new("gpt-image-2"),
+                output: OpenAiImageOutputOptions::default(),
             },
         };
     let encoded = serde_json::to_string(&plan).unwrap();
@@ -119,6 +121,7 @@ fn image_generation_wire_aliases_roundtrip() {
         },
         plan: OpenAiImagesApiPlan {
             endpoint: OpenAiImagesApiEndpoint::Edits,
+            output: OpenAiImageOutputOptions::default(),
         },
     };
     roundtrip(edits_plan);
@@ -136,6 +139,7 @@ fn image_generation_wire_aliases_roundtrip() {
             },
             plan: GeminiImageTurnPlan {
                 projection_snapshot_id: meerkat_core::ProjectionSnapshotId::new(uuid(2)),
+                output: meerkat_core::GeminiImageOutputOptions::default(),
             },
         };
     let encoded = serde_json::to_string(&gemini_plan).unwrap();

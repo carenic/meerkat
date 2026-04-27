@@ -75,6 +75,7 @@ smoke_scenario!(
     e2e_smoke_s72_rust_sdk_realtime_audio_member_model_switch_continuity,
     72
 );
+smoke_scenario!(e2e_smoke_s73_cli_generate_image_openai_default, 73);
 smoke_suite!(e2e_smoke_rpc_dynamic_tool_pickup, "rpc-dynamic-tool-pickup");
 smoke_suite!(
     e2e_smoke_rpc_deferred_catalog_session,

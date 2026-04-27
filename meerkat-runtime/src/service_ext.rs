@@ -19,6 +19,9 @@ use crate::meerkat_machine_types::{
 use crate::runtime_state::RuntimeState;
 use crate::traits::{ResetReport, RetireReport, RuntimeDriverError};
 
+const OPENAI_RESPONSES_IMAGE_HOST_MODEL: &str = "gpt-5.4";
+const OPENAI_RESPONSES_IMAGE_TOOL_MODEL: &str = "gpt-image-2";
+
 /// Runtime mode for a session service instance.
 ///
 /// This branch is runtime-backed only. All sessions use v9 runtime.
@@ -247,25 +250,28 @@ pub fn resolve_image_generation_plan_from_status(
         ImageGenerationTargetPreference::Model { model, .. } => Some(model.clone()),
         _ => None,
     };
-    let provider_model = explicit_model.unwrap_or_else(|| match provider_key.as_str() {
+    let requested_provider_model = explicit_model.unwrap_or_else(|| match provider_key.as_str() {
         "gemini" | "google" => ModelId::new("gemini-3.1-flash-image-preview"),
-        "openai" if matches!(effective_provider, Some(meerkat_core::Provider::OpenAI)) => {
-            status.effective_model.clone()
-        }
-        "openai" => ModelId::new("gpt-image-1"),
+        "openai" => ModelId::new(OPENAI_RESPONSES_IMAGE_TOOL_MODEL),
         _ => status.effective_model.clone(),
     });
     if matches!(
         request.target,
         ImageGenerationTargetPreference::Model { .. }
-    ) && !explicit_image_model_matches_provider(provider_key.as_str(), provider_model.as_str())
-    {
+    ) && !explicit_image_model_matches_provider(
+        provider_key.as_str(),
+        requested_provider_model.as_str(),
+    ) {
         return Err(ImageOperationDenialReason::UnsupportedTarget);
     }
-    let execution_plan = match provider_key.as_str() {
+    let (provider_model, execution_plan) = match provider_key.as_str() {
         "openai" => {
-            let is_images_api = provider_model.as_str().starts_with("gpt-image")
-                || provider_model.as_str().starts_with("dall-e");
+            let output = openai_image_output_options(request);
+            let is_gpt_image_2 =
+                requested_provider_model.as_str() == OPENAI_RESPONSES_IMAGE_TOOL_MODEL;
+            let is_images_api = !is_gpt_image_2
+                && (requested_provider_model.as_str().starts_with("gpt-image")
+                    || requested_provider_model.as_str().starts_with("dall-e"));
             if is_images_api {
                 if matches!(request.intent, ImageGenerationIntent::Edit { .. }) {
                     return Err(ImageOperationDenialReason::ProjectionUnsupported);
@@ -279,32 +285,53 @@ pub fn resolve_image_generation_plan_from_status(
                 ) {
                     return Err(ImageOperationDenialReason::ProjectionUnsupported);
                 }
-                GenerateImageExecutionPlan::OpenAiImagesApi {
-                    model: provider_model.clone(),
-                    max_count: one,
-                    capabilities,
-                    plan: OpenAiImagesApiPlan {
-                        endpoint: OpenAiImagesApiEndpoint::Generations,
+                (
+                    requested_provider_model.clone(),
+                    GenerateImageExecutionPlan::OpenAiImagesApi {
+                        model: requested_provider_model,
+                        max_count: one,
+                        capabilities,
+                        plan: OpenAiImagesApiPlan {
+                            endpoint: OpenAiImagesApiEndpoint::Generations,
+                            output,
+                        },
                     },
-                }
+                )
             } else {
-                GenerateImageExecutionPlan::OpenAiHostedResponsesImageTool {
-                    max_count: one,
-                    capabilities,
-                    plan: OpenAiResponsesImagePlan {
-                        tool_name: "image_generation".to_string(),
+                let host_model = if is_gpt_image_2 {
+                    ModelId::new(OPENAI_RESPONSES_IMAGE_HOST_MODEL)
+                } else {
+                    requested_provider_model
+                };
+                (
+                    host_model,
+                    GenerateImageExecutionPlan::OpenAiHostedResponsesImageTool {
+                        max_count: one,
+                        capabilities,
+                        plan: OpenAiResponsesImagePlan {
+                            tool_name: "image_generation".to_string(),
+                            model: ModelId::new(OPENAI_RESPONSES_IMAGE_TOOL_MODEL),
+                            output,
+                        },
                     },
-                }
+                )
             }
         }
-        "gemini" | "google" => GenerateImageExecutionPlan::GeminiNativeImageModel {
-            model: provider_model.clone(),
-            max_count: one,
-            capabilities,
-            plan: GeminiImageTurnPlan {
-                projection_snapshot_id: ProjectionSnapshotId::new(operation_id.0),
+        "gemini" | "google" => (
+            requested_provider_model.clone(),
+            GenerateImageExecutionPlan::GeminiNativeImageModel {
+                model: requested_provider_model.clone(),
+                max_count: one,
+                capabilities,
+                plan: GeminiImageTurnPlan {
+                    projection_snapshot_id: ProjectionSnapshotId::new(operation_id.0),
+                    output: gemini_image_output_options(
+                        requested_provider_model.as_str(),
+                        &request.size,
+                    ),
+                },
             },
-        },
+        ),
         _ => return Err(ImageOperationDenialReason::UnsupportedTarget),
     };
     if request.count > one {
@@ -334,6 +361,82 @@ fn explicit_image_model_matches_provider(provider_key: &str, model: &str) -> boo
             "gemini" | "google" => model.starts_with("gemini-"),
             _ => false,
         },
+    }
+}
+
+fn openai_image_output_options(
+    request: &meerkat_core::image_generation::GenerateImageRequest,
+) -> meerkat_core::image_generation::OpenAiImageOutputOptions {
+    use meerkat_core::image_generation::{
+        ImageFormatPreference, ImageQualityPreference, ImageSizePreference,
+        OpenAiImageOutputFormat, OpenAiImageOutputOptions, OpenAiImageQuality, OpenAiImageSize,
+    };
+    let size = match &request.size {
+        ImageSizePreference::Auto => OpenAiImageSize::Square1024,
+        ImageSizePreference::Square1024 => OpenAiImageSize::Square1024,
+        ImageSizePreference::Portrait1024x1536 => OpenAiImageSize::Portrait1024x1536,
+        ImageSizePreference::Landscape1536x1024 => OpenAiImageSize::Landscape1536x1024,
+        ImageSizePreference::Custom { width, height } => OpenAiImageSize::Custom {
+            width: *width,
+            height: *height,
+        },
+    };
+    let quality = match request.quality {
+        ImageQualityPreference::Auto => OpenAiImageQuality::Auto,
+        ImageQualityPreference::Low => OpenAiImageQuality::Low,
+        ImageQualityPreference::Medium => OpenAiImageQuality::Medium,
+        ImageQualityPreference::High => OpenAiImageQuality::High,
+    };
+    let output_format = match request.format {
+        ImageFormatPreference::Auto | ImageFormatPreference::Png => OpenAiImageOutputFormat::Png,
+        ImageFormatPreference::Jpeg => OpenAiImageOutputFormat::Jpeg,
+        ImageFormatPreference::Webp => OpenAiImageOutputFormat::Webp,
+    };
+    OpenAiImageOutputOptions {
+        size,
+        quality,
+        output_format,
+    }
+}
+
+fn gemini_image_output_options(
+    model: &str,
+    size: &meerkat_core::image_generation::ImageSizePreference,
+) -> meerkat_core::image_generation::GeminiImageOutputOptions {
+    use meerkat_core::image_generation::{
+        GeminiImageAspectRatio, GeminiImageOutputOptions, GeminiImageSize, ImageSizePreference,
+    };
+    let aspect_ratio = match size {
+        ImageSizePreference::Portrait1024x1536 => GeminiImageAspectRatio::Portrait9x16,
+        ImageSizePreference::Landscape1536x1024 => GeminiImageAspectRatio::Landscape16x9,
+        ImageSizePreference::Custom { width, height } if width > height => {
+            GeminiImageAspectRatio::Landscape16x9
+        }
+        ImageSizePreference::Custom { width, height } if height > width => {
+            GeminiImageAspectRatio::Portrait9x16
+        }
+        _ => GeminiImageAspectRatio::Square1x1,
+    };
+    let image_size = if model == "gemini-2.5-flash-image" {
+        None
+    } else {
+        Some(match size {
+            ImageSizePreference::Custom { width, height } => {
+                let edge = width.get().max(height.get());
+                if edge > 2048 {
+                    GeminiImageSize::FourK
+                } else if edge > 1024 {
+                    GeminiImageSize::TwoK
+                } else {
+                    GeminiImageSize::OneK
+                }
+            }
+            _ => GeminiImageSize::OneK,
+        })
+    };
+    GeminiImageOutputOptions {
+        aspect_ratio,
+        image_size,
     }
 }
 
@@ -415,16 +518,20 @@ mod tests {
         let plan = resolve_image_generation_plan_from_status(
             &status,
             operation_id,
-            &image_request("openai", "gpt-image-1"),
+            &image_request("openai", "gpt-image-2"),
         )
         .expect("openai image target should resolve");
 
-        assert_eq!(plan.provider_model.as_str(), "gpt-image-1");
+        assert_eq!(plan.provider_model.as_str(), "gpt-5.4");
         assert_eq!(plan.machine_routing_model.as_str(), "gpt-5.4");
-        assert!(matches!(
-            plan.execution_plan,
-            GenerateImageExecutionPlan::OpenAiImagesApi { .. }
-        ));
+        assert!(
+            matches!(
+                plan.execution_plan,
+                GenerateImageExecutionPlan::OpenAiHostedResponsesImageTool { ref plan, .. }
+                    if plan.model.as_str() == "gpt-image-2"
+            ),
+            "gpt-image-2 should route through the hosted Responses image tool"
+        );
         assert_eq!(plan.projected_messages.len(), 1);
         assert!(matches!(
             &plan.projected_messages[0],
@@ -479,6 +586,28 @@ mod tests {
     }
 
     #[test]
+    fn auto_image_plan_on_openai_session_uses_openai_image_default() {
+        let status = SessionModelRoutingStatus::new(ModelId::new("gpt-5.5"), None, None, None);
+        let plan = resolve_image_generation_plan_from_status(
+            &status,
+            ImageOperationId::new(uuid::Uuid::nil()),
+            &auto_image_request(),
+        )
+        .expect("OpenAI auto image routing should use the default image model");
+
+        assert_eq!(plan.provider_model.as_str(), "gpt-5.4");
+        assert_eq!(plan.machine_routing_model.as_str(), "gpt-5.5");
+        assert!(
+            matches!(
+                plan.execution_plan,
+                GenerateImageExecutionPlan::OpenAiHostedResponsesImageTool { ref plan, .. }
+                    if plan.model.as_str() == "gpt-image-2"
+            ),
+            "OpenAI auto should pin gpt-image-2 inside the Responses image tool"
+        );
+    }
+
+    #[test]
     fn provider_default_openai_uses_known_image_default_when_session_model_is_not_openai() {
         let status =
             SessionModelRoutingStatus::new(ModelId::new("claude-sonnet-4-5"), None, None, None);
@@ -493,12 +622,16 @@ mod tests {
         )
         .expect("provider-default OpenAI should choose a known image backend model");
 
-        assert_eq!(plan.provider_model.as_str(), "gpt-image-1");
+        assert_eq!(plan.provider_model.as_str(), "gpt-5.4");
         assert_eq!(plan.machine_routing_model.as_str(), "claude-sonnet-4-5");
-        assert!(matches!(
-            plan.execution_plan,
-            GenerateImageExecutionPlan::OpenAiImagesApi { .. }
-        ));
+        assert!(
+            matches!(
+                plan.execution_plan,
+                GenerateImageExecutionPlan::OpenAiHostedResponsesImageTool { ref plan, .. }
+                    if plan.model.as_str() == "gpt-image-2"
+            ),
+            "OpenAI provider default should use hosted Responses with gpt-image-2"
+        );
     }
 
     #[test]
@@ -519,7 +652,7 @@ mod tests {
         let denied = resolve_image_generation_plan_from_status(
             &status,
             ImageOperationId::new(uuid::Uuid::nil()),
-            &image_request("gemini", "gpt-image-1"),
+            &image_request("gemini", "gpt-image-2"),
         )
         .expect_err("Gemini target must not accept an OpenAI image model");
 

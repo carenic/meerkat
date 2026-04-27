@@ -431,12 +431,107 @@ pub enum GenerateImageExecutionPlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiResponsesImagePlan {
     pub tool_name: String,
+    #[cfg_attr(feature = "schema", schemars(with = "String"))]
+    #[serde(default = "default_openai_responses_image_model")]
+    pub model: ModelId,
+    #[serde(default)]
+    pub output: OpenAiImageOutputOptions,
+}
+
+fn default_openai_responses_image_model() -> ModelId {
+    ModelId::new("gpt-image-2")
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiImagesApiPlan {
     pub endpoint: OpenAiImagesApiEndpoint,
+    #[serde(default)]
+    pub output: OpenAiImageOutputOptions,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiImageOutputOptions {
+    pub size: OpenAiImageSize,
+    pub quality: OpenAiImageQuality,
+    pub output_format: OpenAiImageOutputFormat,
+}
+
+impl Default for OpenAiImageOutputOptions {
+    fn default() -> Self {
+        Self {
+            size: OpenAiImageSize::Square1024,
+            quality: OpenAiImageQuality::Auto,
+            output_format: OpenAiImageOutputFormat::Png,
+        }
+    }
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiImageSize {
+    Auto,
+    Square1024,
+    Portrait1024x1536,
+    Landscape1536x1024,
+    Custom {
+        width: NonZeroU32,
+        height: NonZeroU32,
+    },
+}
+
+impl OpenAiImageSize {
+    pub fn as_wire_value(&self) -> String {
+        match self {
+            Self::Auto => "auto".to_string(),
+            Self::Square1024 => "1024x1024".to_string(),
+            Self::Portrait1024x1536 => "1024x1536".to_string(),
+            Self::Landscape1536x1024 => "1536x1024".to_string(),
+            Self::Custom { width, height } => format!("{width}x{height}"),
+        }
+    }
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiImageQuality {
+    Auto,
+    Low,
+    Medium,
+    High,
+}
+
+impl OpenAiImageQuality {
+    pub fn as_wire_value(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiImageOutputFormat {
+    Png,
+    Jpeg,
+    Webp,
+}
+
+impl OpenAiImageOutputFormat {
+    pub fn as_wire_value(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpeg",
+            Self::Webp => "webp",
+        }
+    }
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -451,6 +546,63 @@ pub enum OpenAiImagesApiEndpoint {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeminiImageTurnPlan {
     pub projection_snapshot_id: ProjectionSnapshotId,
+    #[serde(default)]
+    pub output: GeminiImageOutputOptions,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeminiImageOutputOptions {
+    pub aspect_ratio: GeminiImageAspectRatio,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_size: Option<GeminiImageSize>,
+}
+
+impl Default for GeminiImageOutputOptions {
+    fn default() -> Self {
+        Self {
+            aspect_ratio: GeminiImageAspectRatio::Square1x1,
+            image_size: Some(GeminiImageSize::OneK),
+        }
+    }
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeminiImageAspectRatio {
+    Square1x1,
+    Landscape16x9,
+    Portrait9x16,
+}
+
+impl GeminiImageAspectRatio {
+    pub fn as_wire_value(self) -> &'static str {
+        match self {
+            Self::Square1x1 => "1:1",
+            Self::Landscape16x9 => "16:9",
+            Self::Portrait9x16 => "9:16",
+        }
+    }
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeminiImageSize {
+    OneK,
+    TwoK,
+    FourK,
+}
+
+impl GeminiImageSize {
+    pub fn as_wire_value(self) -> &'static str {
+        match self {
+            Self::OneK => "1K",
+            Self::TwoK => "2K",
+            Self::FourK => "4K",
+        }
+    }
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -1081,6 +1233,8 @@ mod tests {
                 capabilities: caps.clone(),
                 plan: OpenAiResponsesImagePlan {
                     tool_name: "image_generation".into(),
+                    model: ModelId::new("gpt-image-2"),
+                    output: OpenAiImageOutputOptions::default(),
                 },
             },
             GenerateImageExecutionPlan::OpenAiImagesApi {
@@ -1089,6 +1243,7 @@ mod tests {
                 capabilities: caps.clone(),
                 plan: OpenAiImagesApiPlan {
                     endpoint: OpenAiImagesApiEndpoint::Generations,
+                    output: OpenAiImageOutputOptions::default(),
                 },
             },
             GenerateImageExecutionPlan::OpenAiImagesApi {
@@ -1097,6 +1252,7 @@ mod tests {
                 capabilities: caps.clone(),
                 plan: OpenAiImagesApiPlan {
                     endpoint: OpenAiImagesApiEndpoint::Edits,
+                    output: OpenAiImageOutputOptions::default(),
                 },
             },
             GenerateImageExecutionPlan::GeminiNativeImageModel {
@@ -1111,6 +1267,7 @@ mod tests {
                 },
                 plan: GeminiImageTurnPlan {
                     projection_snapshot_id: ProjectionSnapshotId::new(uuid(50)),
+                    output: GeminiImageOutputOptions::default(),
                 },
             },
         ];

@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use crate::LoopState;
 use crate::comms::InputSource;
+use crate::lifecycle::run_primitive::ModelId;
 use crate::lifecycle::{InputId, RunId};
 use crate::peer_correlation::{
     InboundPeerRequestState, InteractionStreamState, OutboundPeerRequestState, PeerCorrelationId,
@@ -69,6 +70,21 @@ pub enum DrainExitReason {
     Failed,
     Aborted,
     SessionShutdown,
+}
+
+/// Session model-routing baseline handle.
+///
+/// Runtime-backed surfaces create sessions before the factory has resolved the
+/// final LLM identity. The factory uses this handle after resolution so the DSL
+/// owns the canonical baseline model before tools such as `generate_image`
+/// resolve `Auto` provider targets.
+pub trait ModelRoutingHandle: Send + Sync {
+    /// Set the session's canonical model-routing baseline.
+    fn set_baseline(
+        &self,
+        baseline_model: ModelId,
+        realtime_capable: bool,
+    ) -> Result<(), DslTransitionError>;
 }
 
 impl DrainExitReason {
