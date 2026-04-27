@@ -186,6 +186,23 @@ repository secret. Without that variable, GitHub CI stays on the Cargo path.
 
 Default CI requires `unit`, `int`, `e2e-fast`, and `e2e-system`. Live-provider lanes stay opt-in.
 
+## Development Setup
+
+Install the Rust toolchain required by the default local build lanes:
+
+```bash
+make install-build-deps
+```
+
+The installer reads `rust-toolchain.toml`, installs the pinned Rust toolchain
+with `rustfmt` and `clippy` through `rustup`, and leaves optional BuildBuddy
+setup to `make buildbuddy-doctor`. If your shell does not already include
+Cargo's bin directory, run:
+
+```bash
+source "$HOME/.cargo/env"
+```
+
 ## Capabilities
 
 **Providers and streaming.** Anthropic, OpenAI, and Gemini through a unified streaming interface. Provider is resolved from the built-in model catalog or configured self-hosted aliases -- switch models with a flag, not a code change.

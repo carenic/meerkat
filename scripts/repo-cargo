@@ -68,4 +68,22 @@ EOF
 fi
 
 cd "${workspace_root}"
-exec cargo "$@"
+
+if [[ -n "${CARGO_BIN:-}" ]]; then
+  cargo_cmd="${CARGO_BIN}"
+elif command -v cargo >/dev/null 2>&1; then
+  cargo_cmd="$(command -v cargo)"
+elif [[ -x "${HOME}/.cargo/bin/cargo" ]]; then
+  cargo_cmd="${HOME}/.cargo/bin/cargo"
+  export PATH="${HOME}/.cargo/bin:${PATH}"
+else
+  cat >&2 <<'EOF'
+error: cargo was not found on PATH.
+
+Run `make install-build-deps` to install the Rust toolchain pinned by
+rust-toolchain.toml, or set CARGO_BIN to an explicit cargo binary.
+EOF
+  exit 127
+fi
+
+exec "${cargo_cmd}" "$@"
