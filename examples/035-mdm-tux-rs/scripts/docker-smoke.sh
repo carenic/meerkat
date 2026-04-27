@@ -10,6 +10,12 @@ compose=(docker compose -f "${compose_file}")
 
 cd "${example_dir}"
 
+remove_stale_tux_runs() {
+  docker ps -a --format '{{.Names}}' \
+    | grep -E '^mdm-tux-smoke-tux-run-' \
+    | xargs -r docker rm -f >/dev/null 2>&1 || true
+}
+
 usage() {
   cat <<'EOF'
 Usage: scripts/docker-smoke.sh [smoke|tux|tmux|logs|down|clean]
@@ -100,6 +106,7 @@ PY
 }
 
 smoke() {
+  remove_stale_tux_runs
   "${compose[@]}" build kennel
   "${compose[@]}" up -d kennel target-a target-b
   wait_for_log kennel 'listen[[:space:]]*:'
@@ -155,8 +162,8 @@ case "${1:-smoke}" in
   tux) run_tux ;;
   tmux) run_tmux ;;
   logs) "${compose[@]}" logs -f kennel target-a target-b ;;
-  down) "${compose[@]}" down ;;
-  clean) "${compose[@]}" down -v ;;
+  down) remove_stale_tux_runs; "${compose[@]}" down ;;
+  clean) remove_stale_tux_runs; "${compose[@]}" down -v ;;
   help|--help|-h) usage ;;
   *)
     usage >&2

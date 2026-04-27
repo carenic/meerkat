@@ -1590,10 +1590,15 @@ async fn spawn_kennel_client(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let mut rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into());
+    if !rust_log
+        .split(',')
+        .any(|directive| directive.trim_start().starts_with("tui_markdown"))
+    {
+        rust_log.push_str(",tui_markdown=error");
+    }
     tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "warn,tui_markdown=error".into()),
-        )
+        .with_env_filter(rust_log)
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();

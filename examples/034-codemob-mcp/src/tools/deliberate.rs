@@ -740,13 +740,20 @@ mod tests {
     }
 
     #[test]
-    fn derive_flow_watchdog_timeout_uses_step_budget_and_slack() {
+    fn derive_flow_watchdog_timeout_clamps_small_flows_to_default_step_timeout() {
         let flow = sample_flow_spec(1_000);
+        let timeout = derive_flow_watchdog_timeout_from_spec(&flow, None, 1);
+        assert_eq!(timeout, Duration::from_millis(DEFAULT_FLOW_STEP_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn derive_flow_watchdog_timeout_uses_step_budget_and_slack() {
+        let flow = sample_flow_spec(300_000);
         let timeout = derive_flow_watchdog_timeout_from_spec(&flow, None, 1);
         assert_eq!(
             timeout,
             Duration::from_millis(
-                1_000 * 2 // step budget * attempts
+                300_000 * 2 // step budget * attempts
                     + FLOW_WATCHDOG_BASE_SLACK_MS
                     + FLOW_WATCHDOG_PER_STEP_SLACK_MS
             )

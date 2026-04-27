@@ -1782,7 +1782,7 @@ async fn run_adopted_loop_inner(
         );
 
         tokio::select! {
-            msg = comms_runtime.recv_message() => {
+            msg = comms_runtime.recv_message(), if matches!(machine_state.attachment, TaState::Attaching { .. }) => {
                 let Some(msg) = msg else {
                     if let Some(h) = heartbeat.take() { h.abort(); }
                     let (s, effects) = target_kennel_control::transition(
@@ -1823,10 +1823,11 @@ async fn run_adopted_loop_inner(
                     .await?;
                     continue;
                 }
-                // All other comms messages (inter-agent traffic from delegate
-                // helpers, mob members, etc.) are handled by the runtime
-                // adapter's peer ingress — no manual routing needed here.
-                tracing::debug!(from = %msg.from_peer, "ignoring comms message in adopted loop (handled by peer ingress)");
+                // Once attached, ordinary peer traffic is left entirely to
+                // the runtime adapter's peer ingress drain. This branch only
+                // exists to receive the direct attach ACK during the short
+                // Attaching phase.
+                tracing::debug!(from = %msg.from_peer, "ignoring non-control comms message while attaching");
             }
             _ = kennel_heartbeat.tick(), if poll_kennel => {
                 let kennel_hb = build_signed_envelope(
