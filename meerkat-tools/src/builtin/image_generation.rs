@@ -5,11 +5,14 @@ use async_trait::async_trait;
 use base64::Engine;
 use meerkat_core::image_generation::{
     AssistantImageId, AssistantImageRef, GenerateImageExecutionPlan, GenerateImageRequest,
-    ImageGenerationResolvedPlan, ImageGenerationToolResult, ImageOperationApprovalReason,
+    ImageFormatPreference, ImageGenerationIntent, ImageGenerationResolvedPlan,
+    ImageGenerationTargetPreference, ImageGenerationToolResult, ImageOperationApprovalReason,
     ImageOperationDenialReason, ImageOperationId, ImageOperationPhase, ImageOperationTerminalClass,
-    PostActivationImageDenialReason, PostActivationImageTerminal, ProviderTextDisposition,
-    TextArtifactRef,
+    ImageQualityPreference, ImageSizePreference, ImageSourceRef, PostActivationImageDenialReason,
+    PostActivationImageTerminal, PromptSource, PromptText, ProviderId, ProviderTextDisposition,
+    TextArtifactRef, ToolCallId,
 };
+use meerkat_core::lifecycle::run_primitive::ModelId;
 use meerkat_core::ops::SessionEffect;
 use meerkat_core::types::{AssistantBlock, ToolDef, ToolProvenance, ToolSourceKind};
 use meerkat_core::{BlobStore, SessionId};
@@ -24,6 +27,7 @@ use meerkat_runtime::{RuntimeDriverError, SessionServiceRuntimeExt};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -147,6 +151,31 @@ pub struct GenerateImageTool {
     runtime: ImageGenerationToolRuntime,
 }
 
+const GENERATE_IMAGE_TOOL_DOCUMENTATION: &str = r#"Generate or edit an assistant image through the session-owned image substrate.
+
+Use a simple request shape unless you explicitly need the canonical internal shape:
+{"request":{"intent":"generate","prompt":"a cozy tabby cat by a sunlit window","size":"1024x1024","quality":"auto","format":"png","count":1}}
+
+Routing and defaults:
+- target defaults to "auto".
+- On OpenAI sessions such as gpt-5.5, auto uses the current session model with OpenAI Responses hosted image generation.
+- On Gemini sessions, auto uses the Gemini image default: gemini-3.1-flash-image-preview.
+- On non-image-capable session providers, auto is unsupported; set provider:"openai" or provider:"gemini".
+- provider:"openai" defaults to the current OpenAI session model when already on OpenAI, otherwise gpt-image-1.
+- provider:"gemini" defaults to gemini-3.1-flash-image-preview.
+- To force a model, pass provider plus model, for example provider:"openai", model:"gpt-image-1" or provider:"gemini", model:"gemini-3.1-flash-image-preview".
+
+Supported request fields:
+- intent: "generate" for a new image, "edit" only with source_images. If omitted and prompt is present, intent defaults to "generate".
+- prompt: text prompt for generation.
+- instruction: edit instruction for edit requests.
+- size: "auto", "1024x1024", "1024x1536", "1536x1024", or "WIDTHxHEIGHT". Prefer the named sizes for portability. OpenAI receives size directly; Gemini currently treats size as a Meerkat preference/metadata and may choose its own exact output dimensions.
+- quality: "auto", "low", "medium", or "high". OpenAI receives quality directly; Gemini may ignore it.
+- format: "auto", "png", "jpeg", "jpg", or "webp". OpenAI receives output_format directly; Gemini returns its native image media type.
+- count/n: currently only 1 is supported.
+
+Do not pass size as a bare top-level string outside request. Do not use intent:{type:"create"} unless you mean the compatibility alias for generate; prefer intent:"generate"."#;
+
 impl GenerateImageTool {
     pub fn new(runtime: ImageGenerationToolRuntime) -> Self {
         Self { runtime }
@@ -155,8 +184,78 @@ impl GenerateImageTool {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GenerateImageToolArgs {
-    #[schemars(with = "serde_json::Value")]
-    request: GenerateImageRequest,
+    #[schemars(
+        with = "GenerateImageToolRequestSchema",
+        description = "Image request. For normal generation, use {\"intent\":\"generate\",\"prompt\":\"...\",\"size\":\"1024x1024\",\"quality\":\"auto\",\"format\":\"png\",\"count\":1}. Omit optional fields to use automatic defaults. Provider/model and size behavior is described in the tool description."
+    )]
+    request: Value,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, JsonSchema)]
+struct GenerateImageToolRequestSchema {
+    #[schemars(
+        description = "Use \"generate\" for a new image. Use \"edit\" only when source_images are provided. Defaults to \"generate\" when prompt is present."
+    )]
+    intent: Option<String>,
+    #[schemars(description = "Text prompt for a new image. Required for intent=\"generate\".")]
+    prompt: Option<String>,
+    #[schemars(description = "Edit instruction. Required for intent=\"edit\".")]
+    instruction: Option<String>,
+    #[schemars(
+        description = "Optional source images for edits, using Meerkat image references from earlier assistant images or blobs."
+    )]
+    source_images: Option<Vec<ImageSourceRef>>,
+    #[schemars(
+        description = "Optional reference images for generation, using Meerkat image references from earlier assistant images or blobs."
+    )]
+    reference_images: Option<Vec<ImageSourceRef>>,
+    #[schemars(
+        description = "Optional size: \"auto\", \"1024x1024\", \"1024x1536\", \"1536x1024\", or \"WIDTHxHEIGHT\"."
+    )]
+    size: Option<String>,
+    #[schemars(description = "Optional quality: \"auto\", \"low\", \"medium\", or \"high\".")]
+    quality: Option<String>,
+    #[schemars(
+        description = "Optional output format: \"auto\", \"png\", \"jpeg\", \"jpg\", or \"webp\"."
+    )]
+    format: Option<String>,
+    #[schemars(description = "Optional number of images to generate. Defaults to 1.")]
+    count: Option<u32>,
+    #[schemars(description = "Optional provider override such as \"openai\" or \"gemini\".")]
+    provider: Option<String>,
+    #[schemars(description = "Optional model override for the selected provider.")]
+    model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SimpleGenerateImageToolRequest {
+    #[serde(default)]
+    intent: Option<Value>,
+    #[serde(default)]
+    prompt: Option<Value>,
+    #[serde(default)]
+    instruction: Option<Value>,
+    #[serde(default)]
+    source_images: Vec<ImageSourceRef>,
+    #[serde(default)]
+    reference_images: Vec<ImageSourceRef>,
+    #[serde(default)]
+    size: Option<Value>,
+    #[serde(default)]
+    quality: Option<String>,
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    count: Option<NonZeroU32>,
+    #[serde(default, alias = "n")]
+    n: Option<NonZeroU32>,
+    #[serde(default)]
+    target: Option<Value>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -169,9 +268,7 @@ impl BuiltinTool for GenerateImageTool {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: self.name().into(),
-            description:
-                "Generate or edit an assistant image through the session-owned image substrate."
-                    .into(),
+            description: GENERATE_IMAGE_TOOL_DOCUMENTATION.into(),
             input_schema: crate::schema::schema_for::<GenerateImageToolArgs>(),
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Builtin,
@@ -188,11 +285,12 @@ impl BuiltinTool for GenerateImageTool {
         let args: GenerateImageToolArgs = serde_json::from_value(args)
             .map_err(|err| BuiltinToolError::invalid_args(err.to_string()))?;
         let operation_id = ImageOperationId::new(uuid::Uuid::new_v4());
+        let request = parse_generate_image_request(args.request, operation_id)?;
 
         let resolved_plan = match self
             .runtime
             .machine
-            .resolve_image_generation_plan(&self.runtime.session_id, operation_id, &args.request)
+            .resolve_image_generation_plan(&self.runtime.session_id, operation_id, &request)
             .await
             .map_err(|err| BuiltinToolError::execution_failed(err.to_string()))?
         {
@@ -265,7 +363,7 @@ impl BuiltinTool for GenerateImageTool {
             .execute_image_generation(ProviderImageGenerationRequest {
                 operation_id,
                 model: resolved_plan.provider_model.to_string(),
-                generate_request: args.request,
+                generate_request: request,
                 execution_plan: resolved_plan.execution_plan,
                 projected_messages: resolved_plan.projected_messages,
             })
@@ -394,6 +492,252 @@ impl BuiltinTool for GenerateImageTool {
             },
         })
     }
+}
+
+fn parse_generate_image_request(
+    request: Value,
+    operation_id: ImageOperationId,
+) -> Result<GenerateImageRequest, BuiltinToolError> {
+    if let Ok(canonical) = serde_json::from_value::<GenerateImageRequest>(request.clone()) {
+        return Ok(canonical);
+    }
+
+    let simple: SimpleGenerateImageToolRequest = serde_json::from_value(request)
+        .map_err(|err| BuiltinToolError::invalid_args(format!("invalid image request: {err}")))?;
+
+    let intent_kind = parse_simple_intent_kind(simple.intent.as_ref(), &simple)?;
+    let source = PromptSource::ModelDistilled {
+        tool_call_id: ToolCallId::new(format!("generate_image:{}", operation_id.0)),
+    };
+    let intent = match intent_kind {
+        SimpleImageIntentKind::Generate => {
+            let prompt = extract_text_field(
+                "prompt",
+                simple.prompt.as_ref().or_else(|| {
+                    simple
+                        .intent
+                        .as_ref()
+                        .and_then(|intent| intent.get("prompt"))
+                }),
+            )?;
+            ImageGenerationIntent::Generate {
+                prompt: PromptText::new(prompt)
+                    .map_err(|err| BuiltinToolError::invalid_args(err.to_string()))?,
+                prompt_source: source,
+                reference_images: simple.reference_images,
+            }
+        }
+        SimpleImageIntentKind::Edit => {
+            let instruction = extract_text_field(
+                "instruction",
+                simple.instruction.as_ref().or_else(|| {
+                    simple
+                        .intent
+                        .as_ref()
+                        .and_then(|intent| intent.get("instruction"))
+                }),
+            )?;
+            ImageGenerationIntent::Edit {
+                instruction: PromptText::new(instruction)
+                    .map_err(|err| BuiltinToolError::invalid_args(err.to_string()))?,
+                instruction_source: source,
+                source_images: simple.source_images,
+            }
+        }
+    };
+
+    GenerateImageRequest::new(
+        intent,
+        parse_simple_target(
+            simple.target.as_ref(),
+            simple.provider.as_deref(),
+            simple.model.as_deref(),
+        )?,
+        parse_simple_size(simple.size.as_ref())?,
+        parse_simple_quality(simple.quality.as_deref())?,
+        parse_simple_format(simple.format.as_deref())?,
+        simple.count.or(simple.n).unwrap_or(NonZeroU32::MIN),
+    )
+    .map_err(|err| BuiltinToolError::invalid_args(err.to_string()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimpleImageIntentKind {
+    Generate,
+    Edit,
+}
+
+fn parse_simple_intent_kind(
+    intent: Option<&Value>,
+    request: &SimpleGenerateImageToolRequest,
+) -> Result<SimpleImageIntentKind, BuiltinToolError> {
+    let Some(intent) = intent else {
+        return if request.instruction.is_some() || !request.source_images.is_empty() {
+            Ok(SimpleImageIntentKind::Edit)
+        } else {
+            Ok(SimpleImageIntentKind::Generate)
+        };
+    };
+    match intent {
+        Value::String(value) => parse_intent_name(value),
+        Value::Object(map) => map
+            .get("intent")
+            .or_else(|| map.get("type"))
+            .and_then(Value::as_str)
+            .map(parse_intent_name)
+            .unwrap_or_else(|| {
+                Err(BuiltinToolError::invalid_args(
+                    "request.intent object must include intent=\"generate\" or intent=\"edit\"",
+                ))
+            }),
+        _ => Err(BuiltinToolError::invalid_args(
+            "request.intent must be \"generate\", \"edit\", or an object with an intent field",
+        )),
+    }
+}
+
+fn parse_intent_name(value: &str) -> Result<SimpleImageIntentKind, BuiltinToolError> {
+    match normalize_choice(value).as_str() {
+        "generate" | "create" | "new" => Ok(SimpleImageIntentKind::Generate),
+        "edit" | "modify" => Ok(SimpleImageIntentKind::Edit),
+        other => Err(BuiltinToolError::invalid_args(format!(
+            "unsupported image intent '{other}'; use 'generate' or 'edit'"
+        ))),
+    }
+}
+
+fn extract_text_field(
+    field: &'static str,
+    value: Option<&Value>,
+) -> Result<String, BuiltinToolError> {
+    match value {
+        Some(Value::String(text)) => Ok(text.clone()),
+        Some(Value::Object(map)) => map
+            .get("content")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                BuiltinToolError::invalid_args(format!(
+                    "request.{field} object must include a string content field"
+                ))
+            }),
+        Some(_) => Err(BuiltinToolError::invalid_args(format!(
+            "request.{field} must be a string"
+        ))),
+        None => Err(BuiltinToolError::invalid_args(format!(
+            "request.{field} is required"
+        ))),
+    }
+}
+
+fn parse_simple_target(
+    target: Option<&Value>,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<ImageGenerationTargetPreference, BuiltinToolError> {
+    if let Some(target) = target {
+        if let Ok(canonical) =
+            serde_json::from_value::<ImageGenerationTargetPreference>(target.clone())
+        {
+            return Ok(canonical);
+        }
+        if let Some(value) = target.as_str() {
+            if normalize_choice(value) == "auto" {
+                return Ok(ImageGenerationTargetPreference::Auto);
+            }
+            return Ok(ImageGenerationTargetPreference::ProviderDefault {
+                provider: ProviderId::new(value),
+            });
+        }
+    }
+
+    match (provider, model) {
+        (Some(provider), Some(model)) => Ok(ImageGenerationTargetPreference::Model {
+            provider: ProviderId::new(provider),
+            model: ModelId::new(model),
+        }),
+        (Some(provider), None) => Ok(ImageGenerationTargetPreference::ProviderDefault {
+            provider: ProviderId::new(provider),
+        }),
+        (None, Some(_)) => Err(BuiltinToolError::invalid_args(
+            "request.model requires request.provider",
+        )),
+        (None, None) => Ok(ImageGenerationTargetPreference::Auto),
+    }
+}
+
+fn parse_simple_size(size: Option<&Value>) -> Result<ImageSizePreference, BuiltinToolError> {
+    let Some(size) = size else {
+        return Ok(ImageSizePreference::Auto);
+    };
+    if let Ok(canonical) = serde_json::from_value::<ImageSizePreference>(size.clone()) {
+        return Ok(canonical);
+    }
+    let value = size.as_str().ok_or_else(|| {
+        BuiltinToolError::invalid_args("request.size must be a string or canonical size object")
+    })?;
+    let normalized = normalize_choice(value);
+    match normalized.as_str() {
+        "auto" => Ok(ImageSizePreference::Auto),
+        "square" | "square1024" | "1024x1024" => Ok(ImageSizePreference::Square1024),
+        "portrait" | "portrait1024x1536" | "1024x1536" => {
+            Ok(ImageSizePreference::Portrait1024x1536)
+        }
+        "landscape" | "landscape1536x1024" | "1536x1024" => {
+            Ok(ImageSizePreference::Landscape1536x1024)
+        }
+        custom => parse_custom_size(custom),
+    }
+}
+
+fn parse_custom_size(value: &str) -> Result<ImageSizePreference, BuiltinToolError> {
+    let Some((width, height)) = value.split_once('x') else {
+        return Err(BuiltinToolError::invalid_args(format!(
+            "unsupported image size '{value}'; use auto, 1024x1024, 1024x1536, 1536x1024, or WIDTHxHEIGHT"
+        )));
+    };
+    let width = width
+        .parse::<u32>()
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or_else(|| BuiltinToolError::invalid_args("custom image width must be non-zero"))?;
+    let height = height
+        .parse::<u32>()
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or_else(|| BuiltinToolError::invalid_args("custom image height must be non-zero"))?;
+    Ok(ImageSizePreference::Custom { width, height })
+}
+
+fn parse_simple_quality(quality: Option<&str>) -> Result<ImageQualityPreference, BuiltinToolError> {
+    match quality.map(normalize_choice).as_deref() {
+        None | Some("auto") => Ok(ImageQualityPreference::Auto),
+        Some("low") => Ok(ImageQualityPreference::Low),
+        Some("medium") => Ok(ImageQualityPreference::Medium),
+        Some("high") => Ok(ImageQualityPreference::High),
+        Some(other) => Err(BuiltinToolError::invalid_args(format!(
+            "unsupported image quality '{other}'; use auto, low, medium, or high"
+        ))),
+    }
+}
+
+fn parse_simple_format(format: Option<&str>) -> Result<ImageFormatPreference, BuiltinToolError> {
+    match format.map(normalize_choice).as_deref() {
+        None | Some("auto") => Ok(ImageFormatPreference::Auto),
+        Some("png") => Ok(ImageFormatPreference::Png),
+        Some("jpeg" | "jpg") => Ok(ImageFormatPreference::Jpeg),
+        Some("webp") => Ok(ImageFormatPreference::Webp),
+        Some(other) => Err(BuiltinToolError::invalid_args(format!(
+            "unsupported image format '{other}'; use auto, png, jpeg, jpg, or webp"
+        ))),
+    }
+}
+
+fn normalize_choice(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', '-', ' '], "")
 }
 
 async fn commit_images(
@@ -753,6 +1097,128 @@ mod tests {
             NonZeroU32::new(1).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn generate_image_schema_documents_simple_model_facing_request() {
+        let schema = crate::schema::schema_for::<GenerateImageToolArgs>();
+        let request = schema
+            .pointer("/properties/request")
+            .expect("request schema should be present");
+        assert!(
+            request
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|description| {
+                    description.contains("\"intent\":\"generate\"")
+                        && description.contains("\"size\":\"1024x1024\"")
+                }),
+            "request description should include a model-usable example: {request:#?}"
+        );
+        let request = schema
+            .pointer("/$defs/GenerateImageToolRequestSchema")
+            .expect("request schema definition should be present");
+        assert!(
+            request.pointer("/properties/prompt").is_some(),
+            "request schema should expose prompt directly: {request:#?}"
+        );
+        assert!(
+            request.pointer("/properties/size").is_some(),
+            "request schema should expose size directly: {request:#?}"
+        );
+    }
+
+    #[test]
+    fn generate_image_description_documents_model_routing_defaults() {
+        let runtime = ImageGenerationToolRuntime {
+            session_id: SessionId::new(),
+            machine: Arc::new(FakeMachine::default()),
+            blob_store: Arc::new(FakeBlobStore {
+                writes: Mutex::new(Vec::new()),
+            }),
+            executor: Arc::new(FakeExecutor),
+        };
+        let description = GenerateImageTool::new(runtime).def().description;
+
+        for expected in [
+            "gpt-image-1",
+            "gemini-3.1-flash-image-preview",
+            "On OpenAI sessions such as gpt-5.5",
+            "count/n: currently only 1 is supported",
+            "OpenAI receives size directly",
+            "Gemini currently treats size as a Meerkat preference/metadata",
+        ] {
+            assert!(
+                description.contains(expected),
+                "tool description should document {expected:?}: {description}"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_image_accepts_simple_generate_request() {
+        let parsed = parse_generate_image_request(
+            json!({
+                "intent": "generate",
+                "prompt": "draw a cozy tabby cat",
+                "size": "1024x1024",
+                "quality": "high",
+                "format": "png",
+                "n": 1
+            }),
+            ImageOperationId::new(uuid::Uuid::new_v4()),
+        )
+        .unwrap();
+
+        match parsed.intent {
+            ImageGenerationIntent::Generate { prompt, .. } => {
+                assert_eq!(prompt.content, "draw a cozy tabby cat");
+            }
+            other => panic!("expected generate intent, got {other:?}"),
+        }
+        assert_eq!(parsed.size, ImageSizePreference::Square1024);
+        assert_eq!(parsed.quality, ImageQualityPreference::High);
+        assert_eq!(parsed.format, ImageFormatPreference::Png);
+        assert_eq!(parsed.count, NonZeroU32::new(1).unwrap());
+    }
+
+    #[test]
+    fn generate_image_defaults_intent_for_prompt_only_request() {
+        let parsed = parse_generate_image_request(
+            json!({
+                "prompt": "draw a cozy tabby cat"
+            }),
+            ImageOperationId::new(uuid::Uuid::new_v4()),
+        )
+        .unwrap();
+
+        match parsed.intent {
+            ImageGenerationIntent::Generate { prompt, .. } => {
+                assert_eq!(prompt.content, "draw a cozy tabby cat");
+            }
+            other => panic!("expected generate intent, got {other:?}"),
+        }
+        assert_eq!(parsed.size, ImageSizePreference::Auto);
+        assert_eq!(parsed.quality, ImageQualityPreference::Auto);
+        assert_eq!(parsed.format, ImageFormatPreference::Auto);
+        assert_eq!(parsed.count, NonZeroU32::new(1).unwrap());
+    }
+
+    #[test]
+    fn generate_image_accepts_create_intent_object() {
+        let parsed = parse_generate_image_request(
+            json!({
+                "intent": { "type": "create" },
+                "prompt": "draw a cozy tabby cat"
+            }),
+            ImageOperationId::new(uuid::Uuid::new_v4()),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            parsed.intent,
+            ImageGenerationIntent::Generate { .. }
+        ));
     }
 
     #[tokio::test]

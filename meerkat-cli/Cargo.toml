@@ -118,6 +118,7 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 serde_json = { workspace = true }
 meerkat-comms = { workspace = true }
+meerkat-llm-core = { workspace = true }
 tokio-tungstenite = "0.28"
 
 [package.metadata.cargo-machete]

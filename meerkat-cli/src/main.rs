@@ -4963,12 +4963,63 @@ fn compose_external_tool_dispatchers(
 }
 
 /// Build an `EphemeralSessionService` backed by the factory.
+#[derive(Default)]
+struct CliServiceBuildDefaults {
+    default_schedule_tools: Option<Arc<dyn AgentToolDispatcher>>,
+    image_generation_machine: Option<Arc<meerkat_runtime::MeerkatMachine>>,
+    default_blob_store: Option<Arc<dyn meerkat_core::BlobStore>>,
+    #[cfg(test)]
+    default_image_generation_executor: Option<Arc<dyn meerkat_llm_core::ImageGenerationExecutor>>,
+}
+
+impl CliServiceBuildDefaults {
+    fn runtime_owned(
+        default_schedule_tools: Option<Arc<dyn AgentToolDispatcher>>,
+        image_generation_machine: Arc<meerkat_runtime::MeerkatMachine>,
+        default_blob_store: Arc<dyn meerkat_core::BlobStore>,
+    ) -> Self {
+        Self {
+            default_schedule_tools,
+            image_generation_machine: Some(image_generation_machine),
+            default_blob_store: Some(default_blob_store),
+            #[cfg(test)]
+            default_image_generation_executor: None,
+        }
+    }
+}
+
+fn build_cli_service_with_defaults(
+    factory: AgentFactory,
+    config: Config,
+    defaults: CliServiceBuildDefaults,
+) -> EphemeralSessionService<FactoryAgentBuilder> {
+    let mut builder = FactoryAgentBuilder::new(factory, config);
+    if let Some(machine) = defaults.image_generation_machine {
+        builder = builder.with_image_generation_machine(machine);
+    }
+    builder.default_blob_store = defaults.default_blob_store;
+    #[cfg(test)]
+    {
+        builder.default_image_generation_executor = defaults.default_image_generation_executor;
+    }
+    meerkat::surface::set_default_schedule_tools(&builder, defaults.default_schedule_tools);
+    meerkat::surface::build_embedded_service_from_builder(builder, 64)
+}
+
+#[cfg(test)]
 fn build_cli_service(
     factory: AgentFactory,
     config: Config,
     default_schedule_tools: Option<Arc<dyn AgentToolDispatcher>>,
 ) -> EphemeralSessionService<FactoryAgentBuilder> {
-    meerkat::surface::build_embedded_service(factory, config, 64, default_schedule_tools)
+    build_cli_service_with_defaults(
+        factory,
+        config,
+        CliServiceBuildDefaults {
+            default_schedule_tools,
+            ..Default::default()
+        },
+    )
 }
 
 #[cfg(all(feature = "mob", feature = "session-store"))]
@@ -5292,11 +5343,20 @@ async fn run_agent(
 
         // Build the parent session service with the same explicit scheduler tools the
         // persistent CLI surface injects on resumed/runtime-backed paths.
+        let runtime_adapter = persistence.runtime_adapter();
         let schedule_service = ScheduleService::new(persistence.schedule_store());
         let default_schedule_tools =
             Some(Arc::new(ScheduleToolDispatcher::new(schedule_service))
                 as Arc<dyn AgentToolDispatcher>);
-        let service = build_cli_service(factory, config.clone(), default_schedule_tools);
+        let service = build_cli_service_with_defaults(
+            factory,
+            config.clone(),
+            CliServiceBuildDefaults::runtime_owned(
+                default_schedule_tools,
+                runtime_adapter.clone(),
+                persistence.blob_store(),
+            ),
+        );
 
         if keep_alive {
             eprintln!(
@@ -5349,8 +5409,8 @@ async fn run_agent(
         let output_pipeline =
             CliOutputPipeline::new(stream, verbose, stream_policy.clone(), primary_scope_path)?;
 
-        // Create ephemeral runtime adapter and prepare epoch-local bindings.
-        let runtime_adapter = std::sync::Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
+        // Prepare epoch-local bindings on the same runtime adapter the service
+        // uses for runtime-owned tool surfaces.
         let bindings = runtime_adapter
             .prepare_bindings(session_id.clone())
             .await
@@ -9629,6 +9689,21 @@ mod tests {
         }
     }
 
+    struct FakeImageGenerationExecutor;
+
+    #[async_trait]
+    impl meerkat_llm_core::ImageGenerationExecutor for FakeImageGenerationExecutor {
+        async fn execute_image_generation(
+            &self,
+            _request: meerkat_llm_core::ProviderImageGenerationRequest,
+        ) -> Result<meerkat_llm_core::ProviderImageGenerationOutput, meerkat_llm_core::LlmError>
+        {
+            Err(meerkat_llm_core::LlmError::InvalidRequest {
+                message: "fake image generation executor should not be called".to_string(),
+            })
+        }
+    }
+
     struct TestCommsRuntime {
         key: String,
         trusted: RwLock<HashSet<String>>,
@@ -12494,6 +12569,72 @@ capabilities = ["definitely_missing_capability"]
         assert!(names.contains("meerkat_schedule_create"));
         assert!(names.contains("meerkat_schedule_list"));
         assert!(names.contains("meerkat_schedule_occurrences"));
+    }
+
+    #[tokio::test]
+    async fn test_run_session_build_wires_generate_image_for_runtime_owned_one_shot() {
+        let temp = tempfile::tempdir().expect("tempdir must be created");
+        let runtime_adapter = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
+        let factory = AgentFactory::new(temp.path().join("sessions")).builtins(true);
+        let service = Arc::new(build_cli_service_with_defaults(
+            factory,
+            Config::default(),
+            CliServiceBuildDefaults {
+                image_generation_machine: Some(runtime_adapter.clone()),
+                default_blob_store: Some(Arc::new(meerkat_store::MemoryBlobStore::default())),
+                default_image_generation_executor: Some(Arc::new(FakeImageGenerationExecutor)),
+                ..Default::default()
+            },
+        ));
+
+        let captured_tool_names = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_system_prompt = Arc::new(Mutex::new(None::<String>));
+        let llm_override: Arc<dyn LlmClient> = Arc::new(CapturingLlmClient::new(
+            captured_tool_names.clone(),
+            captured_system_prompt,
+        ));
+
+        let session = Session::new();
+        let session_id = session.id().clone();
+        let bindings = runtime_adapter
+            .prepare_bindings(session_id)
+            .await
+            .expect("runtime bindings should be prepared");
+
+        let req = CreateSessionRequest {
+            model: "gpt-5.4".to_string(),
+            prompt: "list tools".to_string().into(),
+            render_metadata: None,
+            system_prompt: None,
+            max_tokens: Some(32),
+            event_tx: None,
+            skill_references: None,
+            initial_turn: meerkat_core::service::InitialTurnPolicy::RunImmediately,
+            deferred_prompt_policy: DeferredPromptPolicy::Discard,
+            build: Some(SessionBuildOptions {
+                resume_session: Some(session),
+                runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
+                llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
+                    llm_override,
+                )),
+                ..SessionBuildOptions::default()
+            }),
+            labels: None,
+        };
+
+        service
+            .create_session(req)
+            .await
+            .expect("session should run with llm override");
+
+        let names: std::collections::BTreeSet<String> = captured_tool_names
+            .lock()
+            .expect("captured tool mutex should not be poisoned")
+            .iter()
+            .cloned()
+            .collect();
+
+        assert!(names.contains("generate_image"));
     }
 
     #[cfg(feature = "mob")]
